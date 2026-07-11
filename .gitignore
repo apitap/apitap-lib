@@ -1,0 +1,13 @@
+/target
+**/__pycache__/
+*.pyc
+.venv/
+dist/
+*.so
+*.egg-info/
+.DS_Store
+benchmarks/.env
+benchmarks/wheels/
+pgo-data/
+merged.profdata
+*.profraw

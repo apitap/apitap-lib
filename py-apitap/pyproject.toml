@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "apitap"
+description = "Move whole tables between databases at wire speed, in bounded memory"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Abdul Haris Djafar" }]
+keywords = ["etl", "postgres", "data-engineering", "copy", "replication"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://apitap.dev"
+
+[tool.maturin]
+module-name = "apitap._apitap"
+python-source = "python"

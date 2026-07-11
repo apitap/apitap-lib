@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/apitap-core", "py-apitap"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/apitap/apitap-lib"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Lever #1 (perf research 2026-07-11): sqlx-core with a 512 KiB socket buffer instead
+# of the 8 KiB default — see vendor/sqlx-core/src/net/socket/buffered.rs. Same version
+# as the lockfile pin; drop this patch when/if sqlx makes the size configurable.
+[patch.crates-io]
+sqlx-core = { path = "vendor/sqlx-core" }

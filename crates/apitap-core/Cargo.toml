@@ -1,0 +1,28 @@
+[package]
+name = "apitap-core"
+description = "Blazing-fast database-to-database transfer engine (the apitap core)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "mysql",
+    "chrono",
+    "runtime-tokio-rustls",
+] }
+chrono = { version = "0.4", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+thiserror = "2"
+num_cpus = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

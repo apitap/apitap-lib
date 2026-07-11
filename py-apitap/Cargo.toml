@@ -1,0 +1,16 @@
+[package]
+name = "apitap-python"
+description = "Python bindings for the apitap transfer engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_apitap"
+crate-type = ["cdylib"]
+
+[dependencies]
+apitap-core = { path = "../crates/apitap-core" }
+pyo3 = { version = "0.24", features = ["abi3-py39", "extension-module"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
