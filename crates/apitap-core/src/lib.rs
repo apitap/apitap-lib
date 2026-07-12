@@ -32,6 +32,37 @@ mod rowbinary;
 
 pub use error::{Error, Result};
 
+/// How rows land in the destination table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Full refresh: load into staging, atomically swap the whole table (default).
+    #[default]
+    Replace,
+    /// Incremental append: load only rows with `cursor >` the destination's current
+    /// `max(cursor)` and add them to the existing table. Stateless — the watermark
+    /// lives in the destination data itself. If the destination table doesn't exist
+    /// yet, the run bootstraps as a full `Replace`.
+    Append,
+    /// Incremental upsert (Postgres destinations): rows with `cursor >=` the
+    /// watermark are merged by the destination's primary key
+    /// (`INSERT … ON CONFLICT DO UPDATE`). Bootstraps like `Append`.
+    Merge,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "replace" => Ok(Mode::Replace),
+            "append" => Ok(Mode::Append),
+            "merge" => Ok(Mode::Merge),
+            other => Err(Error::InvalidInput(format!(
+                "mode must be 'replace', 'append' or 'merge' (got '{other}')"
+            ))),
+        }
+    }
+}
+
 /// Tuning for [`transfer`]. `Default` = auto: parallelism from the CPU count and the
 /// cgroup memory budget, 4 MiB send coalescing, cursor auto-detected from the table's
 /// integer primary key.
@@ -52,8 +83,12 @@ pub struct TransferOptions {
     /// roughly halves the destination's write cost — and the swapped-in table REMAINS
     /// unlogged: Postgres truncates it during crash recovery until you run
     /// `ALTER TABLE … SET LOGGED`. Default `true` (fully durable). Other destinations
-    /// ignore the flag.
+    /// ignore the flag. Incremental delta runs always stage UNLOGGED (their staging
+    /// never becomes the final table) and never change the final table's durability;
+    /// a bootstrap run is an effective replace and honors this flag.
     pub durable: bool,
+    /// Replace (default), incremental append, or incremental merge — see [`Mode`].
+    pub mode: Mode,
 }
 
 impl Default for TransferOptions {
@@ -64,6 +99,7 @@ impl Default for TransferOptions {
             dest_table: None,
             chunk_bytes: 4 * 1024 * 1024,
             durable: true,
+            mode: Mode::Replace,
         }
     }
 }

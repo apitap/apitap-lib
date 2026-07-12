@@ -63,6 +63,10 @@ pub(crate) struct TablePlan {
     pub cols: Vec<ColumnPlan>,
     /// Range-split column (caller's choice or the auto-detected integer PK).
     pub cursor: Option<String>,
+    /// The source's full primary-key column list (any types, composite included) —
+    /// a merge-mode bootstrap recreates it on the destination so the NEXT run can
+    /// upsert against it.
+    pub pk_cols: Vec<String>,
 }
 
 impl TablePlan {
@@ -114,4 +118,26 @@ pub(crate) struct LaneCol {
 pub(crate) struct Lane {
     pub format: WireFormat,
     pub cols: Vec<LaneCol>,
+}
+
+/// Incremental delta filter, pushed into every source read statement (the min/max
+/// probe, every range span, the PK-less fallbacks, and the single-stream statement).
+#[derive(Clone, Debug)]
+pub(crate) struct Delta {
+    /// Cursor column name (source-side).
+    pub col: String,
+    /// `>` for append (rows at the watermark are already loaded), `>=` for merge
+    /// (the upsert dedupes, so re-reading the boundary is safe and loses nothing).
+    pub op: &'static str,
+    /// Watermark as a ready-to-embed SQL literal (quoted if the type needs it).
+    pub literal: String,
+}
+
+/// What the destination looks like before an incremental run.
+#[derive(Clone, Debug)]
+pub(crate) struct DestState {
+    /// Does the final table exist? `false` → the run bootstraps as a full replace.
+    pub exists: bool,
+    /// `max(cursor)` in the destination as text; `None` when the table is empty.
+    pub watermark: Option<String>,
 }

@@ -8,7 +8,7 @@
 use crate::driver::{pop, spans, Loader, Source, WorkQueue};
 use crate::error::{Error, Result};
 use crate::pgcopy as pgc;
-use crate::plan::{ColumnPlan, Delivered, Lane, LaneCol, TablePlan, WireFormat};
+use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::rowbinary::varint;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::Row;
@@ -498,10 +498,14 @@ impl Source for MySqlSource {
             )));
         }
         let mut cols = Vec::with_capacity(rows.len());
+        let mut pk_cols: Vec<String> = Vec::new();
         for r in &rows {
             let dt: String = r.get("dt");
             let nullable: String = r.get("nullable");
             let ckey: String = r.get("ckey");
+            if ckey == "PRI" {
+                pk_cols.push(r.get::<String, _>("name"));
+            }
             let col = ColumnPlan {
                 name: r.get("name"),
                 nullable: nullable == "YES",
@@ -529,6 +533,7 @@ impl Source for MySqlSource {
             engine: "mysql",
             cols,
             cursor: None,
+            pk_cols,
         })
     }
 
@@ -569,6 +574,7 @@ impl Source for MySqlSource {
         plan: &TablePlan,
         lane: &Lane,
         want: usize,
+        delta: Option<&Delta>,
     ) -> Result<Vec<String>> {
         let src_t = my_ident_path(table);
         let select_list = lane
@@ -577,29 +583,50 @@ impl Source for MySqlSource {
             .map(|c| c.select.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        // Incremental predicate — pushed into every statement, min/max probe included.
+        let dpred = delta
+            .map(|d| format!(" AND {} {} {}", my_ident(&d.col), d.op, d.literal))
+            .unwrap_or_default();
+        // Integer cursors range-split; timestamp cursors (valid for incremental
+        // watermarks) fall through to a single filtered stream.
+        let int_cursor = plan.cursor.as_deref().and_then(|c| {
+            plan.cols
+                .iter()
+                .find(|pc| pc.name == c)
+                .filter(|pc| {
+                    matches!(
+                        pc.udt.as_str(),
+                        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+                    )
+                })
+                .map(|_| c.to_string())
+        });
         let mut stmts: Vec<String> = Vec::new();
         if want > 1 {
-            if let Some(col) = &plan.cursor {
+            if let Some(col) = &int_cursor {
                 let qcol = my_ident(col);
-                let (lo, hi): (Option<i64>, Option<i64>) =
-                    sqlx::query_as(&format!("SELECT MIN({qcol}), MAX({qcol}) FROM {src_t}"))
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            Error::InvalidInput(format!("min/max of cursor {col}: {e}"))
-                        })?;
+                let (lo, hi): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+                    "SELECT MIN({qcol}), MAX({qcol}) FROM {src_t} WHERE true{dpred}"
+                ))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::InvalidInput(format!("min/max of cursor {col}: {e}")))?;
                 if let (Some(lo), Some(hi)) = (lo, hi) {
                     for (rlo, rhi) in spans(lo, hi, want) {
                         stmts.push(format!(
                             "SELECT {select_list} FROM {src_t} \
-                             WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}"
+                             WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}"
                         ));
                     }
+                } else if delta.is_some() {
+                    stmts.push(format!("SELECT {select_list} FROM {src_t} WHERE false"));
                 }
             }
         }
         if stmts.is_empty() {
-            stmts.push(format!("SELECT {select_list} FROM {src_t}"));
+            stmts.push(format!(
+                "SELECT {select_list} FROM {src_t} WHERE true{dpred}"
+            ));
         }
         Ok(stmts)
     }
