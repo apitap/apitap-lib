@@ -111,7 +111,9 @@ use it for rebuildable destinations.
       decimals, UTC-normalized timestamps)
 - [x] MySQL → Postgres (wire decode → binary COPY; exact NUMERIC encoding up to
       DECIMAL(65), `BIGINT UNSIGNED`→`numeric(20,0)`, JSON→`jsonb`)
-- [ ] Incremental sync (cursor-based append & merge)
+- [x] Incremental sync — `mode="append"` (stateless watermark, atomic delta landing)
+      and `mode="merge"` (upsert by primary key); cost proportional to the delta,
+      not the table
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
 - [ ] Postgres → Snowflake / BigQuery
 - [ ] MySQL → MySQL
