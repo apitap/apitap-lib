@@ -109,6 +109,7 @@ use it for rebuildable destinations.
       decimals, UTC-normalized timestamps)
 - [x] MySQL → Postgres (wire decode → binary COPY; exact NUMERIC encoding up to
       DECIMAL(65), `BIGINT UNSIGNED`→`numeric(20,0)`, JSON→`jsonb`)
+- [ ] Incremental sync (cursor-based append & merge)
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
 - [ ] Postgres → Snowflake / BigQuery
 - [ ] MySQL → MySQL
@@ -135,5 +136,5 @@ transcode) *are* the product.
 
 ## License
 
-MIT. The managed cloud (scheduling, per-tenant workers, incremental sync, a UI) is
-[apitap.dev](https://apitap.dev).
+MIT. The managed cloud (scheduling, always-on per-tenant workers, monitoring, a UI)
+is [apitap.dev](https://apitap.dev).

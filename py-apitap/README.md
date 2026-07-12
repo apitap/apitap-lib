@@ -85,6 +85,7 @@ troubleshooting:
 ## Roadmap
 
 - [x] Postgres → Postgres · Postgres → ClickHouse · MySQL → ClickHouse · MySQL → Postgres
+- [ ] Incremental sync (cursor-based append & merge)
 - [ ] `read_postgres()` → Arrow / Polars
 - [ ] Snowflake / BigQuery destinations
 - [ ] aarch64 + macOS wheels
@@ -92,5 +93,5 @@ troubleshooting:
 ## License
 
 MIT. Source: [github.com/apitap/apitap-lib](https://github.com/apitap/apitap-lib).
-The managed cloud (scheduling, per-tenant workers, incremental sync, a UI) is
+The managed cloud (scheduling, always-on per-tenant workers, monitoring, a UI) is
 [apitap.dev](https://apitap.dev).

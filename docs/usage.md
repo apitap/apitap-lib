@@ -200,8 +200,8 @@ Unsupported source types fail **at probe time** with the type named — never mi
 
 ## Current limitations
 
-- Full-table replace only — incremental/merge sync is the managed cloud's job
-  ([apitap.dev](https://apitap.dev)).
+- Full-table replace today — incremental sync (cursor-based append & merge) is on
+  the roadmap.
 - Wheels: Linux x86-64 today (aarch64 and macOS planned).
 - One table per call — loop for many (or run several calls in parallel: each call
   holds `parallel`+1 connections per side).
