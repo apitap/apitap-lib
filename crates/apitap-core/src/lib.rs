@@ -199,6 +199,7 @@ pub async fn transfer(
     let src_scheme = src_url.split("://").next().unwrap_or("");
     let dst_scheme = dst_url.split("://").next().unwrap_or("");
     let dest_table = opts.dest_table.as_deref().unwrap_or(table);
+    let source_id = driver::source_identity(src_url, table);
 
     match (src_scheme, dst_scheme) {
         ("postgres" | "postgresql", "postgres" | "postgresql") => {
@@ -209,7 +210,10 @@ pub async fn transfer(
             let (chunk, parallel) = driver::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
             let sink = PgSink::connect(dst_url, dest_table, parallel + 1, true).await?;
-            driver::run(src, sink, table, opts, &profile, chunk, parallel, started).await
+            driver::run(
+                src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
+            )
+            .await
         }
         ("postgres" | "postgresql", "clickhouse" | "clickhouse+https") => {
             let profile = Profile {
@@ -219,7 +223,10 @@ pub async fn transfer(
             let (chunk, parallel) = driver::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
             let sink = ChSink::connect(dst_url, dest_table)?;
-            driver::run(src, sink, table, opts, &profile, chunk, parallel, started).await
+            driver::run(
+                src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
+            )
+            .await
         }
         ("mysql", "clickhouse" | "clickhouse+https") => {
             let profile = Profile {
@@ -229,7 +236,10 @@ pub async fn transfer(
             let (chunk, parallel) = driver::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, parallel + 1).await?;
             let sink = ChSink::connect(dst_url, dest_table)?;
-            driver::run(src, sink, table, opts, &profile, chunk, parallel, started).await
+            driver::run(
+                src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
+            )
+            .await
         }
         ("mysql", "postgres" | "postgresql") => {
             let profile = Profile {
@@ -241,7 +251,10 @@ pub async fn transfer(
             // Serial sends: this feeder's per-row encode is CPU-heavy and overlapping
             // it with the send was measured slower (see PgSink::overlap_send).
             let sink = PgSink::connect(dst_url, dest_table, parallel + 1, false).await?;
-            driver::run(src, sink, table, opts, &profile, chunk, parallel, started).await
+            driver::run(
+                src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
+            )
+            .await
         }
         (s, d) => Err(Error::InvalidInput(format!(
             "unsupported route {s}:// → {d}:// (supported: postgres→postgres, \

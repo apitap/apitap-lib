@@ -579,6 +579,15 @@ pub(crate) struct PgSink {
     bootstrap_pk: bool,
     /// Cursor column (incremental modes), for deterministic merge dedup ordering.
     cursor_col: Option<String>,
+    /// Credential-free source identity — half of the state row's key.
+    source_id: Option<String>,
+    /// Cursor column's source type — picks the dialect-neutral watermark rendering.
+    wm_udt: Option<String>,
+    /// Canonical unquoted `schema.table` — the state row's other key half.
+    dest_key: String,
+    /// Was dest_table schema-qualified by the caller? Unqualified names get their
+    /// schema resolved from the live connection in dest_state.
+    qualified: bool,
     /// Plan column names in order, stashed at `prepare` for the merge upsert.
     col_names: Vec<String>,
     copy_in_sql: String,
@@ -596,6 +605,7 @@ impl PgSink {
         max_conns: usize,
         overlap_send: bool,
     ) -> Result<Self> {
+        let qualified = dest_table.contains('.');
         let (schema_pfx, bare) = match dest_table.rsplit_once('.') {
             Some((s, t)) => (format!("{s}."), t.to_string()),
             None => (String::new(), dest_table.to_string()),
@@ -616,12 +626,16 @@ impl PgSink {
             final_t: quote_ident_path(dest_table),
             copy_in_sql: format!("COPY {staging_t} FROM STDIN (FORMAT binary)"),
             staging_t,
+            dest_key: format!("{schema}.{bare}"),
             bare,
             schema,
+            qualified,
             restore_ddl: Vec::new(),
             merge_keys: Vec::new(),
             bootstrap_pk: false,
             cursor_col: None,
+            source_id: None,
+            wm_udt: None,
             col_names: Vec::new(),
             overlap_send,
         })
@@ -648,6 +662,101 @@ impl PgSink {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| Error::Transfer(format!("dest columns: {e}")))
+    }
+}
+
+impl PgSink {
+    fn state_table(&self) -> String {
+        format!("{}.\"_apitap_state\"", quote_ident(&self.schema))
+    }
+
+    /// Dialect-neutral watermark SELECT for a cursor of type `udt` against `table`.
+    fn wm_expr(udt: &str, qcur: &str, table: &str) -> String {
+        match udt {
+            "timestamptz" => format!(
+                "SELECT to_char(max({qcur}) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM {table}"
+            ),
+            "timestamp" | "datetime" => format!(
+                "SELECT to_char(max({qcur}), 'YYYY-MM-DD HH24:MI:SS.US') FROM {table}"
+            ),
+            _ => format!("SELECT max({qcur})::text FROM {table}"),
+        }
+    }
+
+    async fn ensure_state_table(&self) -> Result<()> {
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+                dest_table  text NOT NULL, \
+                source_id   text NOT NULL, \
+                cursor_col  text NOT NULL, \
+                watermark   text NOT NULL, \
+                mode        text NOT NULL, \
+                last_rows   bigint NOT NULL, \
+                synced_at   timestamptz NOT NULL DEFAULT now(), \
+                PRIMARY KEY (dest_table, source_id))",
+            self.state_table()
+        ))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .or_else(|e| {
+            // Two concurrent first-runs can both pass IF NOT EXISTS — the loser's
+            // error is harmless, the table exists either way.
+            let msg = e.to_string();
+            if msg.contains("already exists") || msg.contains("duplicate key") {
+                Ok(())
+            } else {
+                Err(Error::Transfer(format!("state table: {e}")))
+            }
+        })
+    }
+
+    /// Upsert the state row inside `tx` — same transaction as the data landing, so
+    /// state and data can never drift apart.
+    async fn write_state(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        watermark: &str,
+        mode: Mode,
+        rows: u64,
+    ) -> Result<()> {
+        let (Some(cursor), Some(source_id)) = (&self.cursor_col, &self.source_id) else {
+            return Ok(()); // plain replace without incremental context: no state
+        };
+        sqlx::query(&format!(
+            "INSERT INTO {} \
+             (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, now()) \
+             ON CONFLICT (dest_table, source_id) DO UPDATE SET \
+               cursor_col = EXCLUDED.cursor_col, watermark = EXCLUDED.watermark, \
+               mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()",
+            self.state_table()
+        ))
+        .bind(&self.dest_key)
+        .bind(source_id)
+        .bind(cursor)
+        .bind(watermark)
+        .bind(match mode {
+            Mode::Replace => "replace",
+            Mode::Append => "append",
+            Mode::Merge => "merge",
+        })
+        .bind(rows as i64)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Error::Transfer(format!("state write: {e}")))?;
+        Ok(())
+    }
+
+    /// Watermark of what a table currently holds, rendered dialect-neutrally.
+    async fn table_watermark(&self, table: &str) -> Result<Option<String>> {
+        let (Some(cursor), Some(udt)) = (&self.cursor_col, &self.wm_udt) else {
+            return Ok(None);
+        };
+        sqlx::query_scalar(&Self::wm_expr(udt, &quote_ident(cursor), table))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("watermark: {e}")))
     }
 }
 
@@ -823,9 +932,40 @@ impl crate::driver::Sink for PgSink {
         plan: &TablePlan,
         mode: Mode,
         cursor: &str,
+        source_id: &str,
     ) -> Result<DestState> {
         self.cursor_col = Some(cursor.to_string());
-        if !self.final_exists().await? {
+        self.source_id = Some(source_id.to_string());
+        self.wm_udt = plan
+            .cols
+            .iter()
+            .find(|c| c.name == cursor)
+            .map(|c| c.udt.clone());
+        let exists = self.final_exists().await?;
+        // An unqualified dest name follows search_path — resolve the REAL schema so
+        // the state table and its keys land next to the actual data.
+        if !self.qualified {
+            let resolved: String = if exists {
+                sqlx::query_scalar(
+                    "SELECT n.nspname FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.oid = to_regclass($1)",
+                )
+                .bind(&self.final_t)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?
+            } else {
+                sqlx::query_scalar("SELECT current_schema()")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?
+            };
+            self.dest_key = format!("{resolved}.{}", self.bare);
+            self.schema = resolved;
+        }
+        self.ensure_state_table().await?;
+        if !exists {
             if mode == Mode::Merge {
                 if plan.pk_cols.is_empty() {
                     return Err(Error::InvalidInput(
@@ -869,30 +1009,57 @@ impl crate::driver::Sink for PgSink {
                 ));
             }
         }
-        // Render the watermark dialect-neutrally: timestamptz would ::text with a
-        // '+00' offset suffix that MySQL's datetime grammar refuses, so temporal
-        // cursors are formatted as offset-free UTC wall time (both source sessions
-        // are pinned to UTC, so the comparison frame matches).
-        let qcur = quote_ident(cursor);
-        let wm_expr = match plan
-            .cols
-            .iter()
-            .find(|c| c.name == cursor)
-            .map(|c| c.udt.as_str())
-        {
-            Some("timestamptz") => {
-                format!("to_char(max({qcur}) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')")
-            }
-            Some("timestamp") | Some("datetime") => {
-                format!("to_char(max({qcur}), 'YYYY-MM-DD HH24:MI:SS.US')")
-            }
-            _ => format!("max({qcur})::text"),
-        };
-        let watermark: Option<String> =
-            sqlx::query_scalar(&format!("SELECT {wm_expr} FROM {}", self.final_t))
+        // An EMPTY table cannot carry a watermark, whatever the state row says —
+        // TRUNCATE-to-resync must work.
+        let has_rows: bool =
+            sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM {})", self.final_t))
                 .fetch_one(&self.pool)
                 .await
-                .map_err(|e| Error::Transfer(format!("watermark: {e}")))?;
+                .map_err(|e| Error::Transfer(format!("dest emptiness: {e}")))?;
+        if !has_rows {
+            return Ok(DestState {
+                exists: true,
+                watermark: None,
+            });
+        }
+        // The state row is authoritative: it survives destination-side writes,
+        // precision differences, and enables per-source watermarks (fan-in). Only a
+        // missing row (pre-state-table destinations, or a fresh dest built by plain
+        // replace) falls back to deriving the watermark from the data itself.
+        let from_state: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT watermark FROM {} WHERE dest_table = $1 AND source_id = $2",
+            self.state_table()
+        ))
+        .bind(&self.dest_key)
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("state read: {e}")))?;
+        let watermark = match from_state {
+            Some(wm) => Some(wm),
+            None => {
+                // Fan-in guard: if OTHER sources hold state rows here, the global
+                // data-max belongs to the most advanced of them — falling back would
+                // silently skip THIS source's backlog. Fail loudly instead.
+                let siblings: i64 = sqlx::query_scalar(&format!(
+                    "SELECT count(*) FROM {} WHERE dest_table = $1",
+                    self.state_table()
+                ))
+                .bind(&self.dest_key)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Transfer(format!("state read: {e}")))?;
+                if siblings > 0 {
+                    return Err(Error::InvalidInput(format!(
+                        "destination {} has state rows from other sources but none for \
+                         '{source_id}' — a data-derived watermark would be wrong here. \
+                         Run mode='replace' to rebuild, or seed a state row manually",
+                        self.dest_key
+                    )));
+                }
+                self.table_watermark(&self.final_t).await?
+            }
+        };
         Ok(DestState {
             exists: true,
             watermark,
@@ -921,6 +1088,9 @@ impl crate::driver::Sink for PgSink {
                 .await;
             return Ok(());
         }
+        // Watermark of what THIS run staged — computed before staging is consumed,
+        // recorded in the state row alongside the data it describes.
+        let staged_wm = self.table_watermark(&self.staging_t).await?;
         match mode {
             Mode::Replace => {
                 let mut tx = self
@@ -940,6 +1110,27 @@ impl crate::driver::Sink for PgSink {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Transfer(format!("rename staging: {e}")))?;
+                // Replace destroyed every source's rows — stale state rows would
+                // make the next incremental run skip data. Clear them all; the
+                // bootstrap (if any) re-inserts its own row below.
+                let has_state: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(self.state_table())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("state lookup: {e}")))?;
+                if has_state {
+                    sqlx::query(&format!(
+                        "DELETE FROM {} WHERE dest_table = $1",
+                        self.state_table()
+                    ))
+                    .bind(&self.dest_key)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("state clear: {e}")))?;
+                }
+                if let Some(wm) = &staged_wm {
+                    self.write_state(&mut tx, wm, mode, rows).await?;
+                }
                 tx.commit()
                     .await
                     .map_err(|e| Error::Transfer(format!("swap commit: {e}")))?;
@@ -971,6 +1162,9 @@ impl crate::driver::Sink for PgSink {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Transfer(format!("append insert: {e}")))?;
+                if let Some(wm) = &staged_wm {
+                    self.write_state(&mut tx, wm, mode, rows).await?;
+                }
                 sqlx::query(&format!("DROP TABLE {}", self.staging_t))
                     .execute(&mut *tx)
                     .await
@@ -1026,6 +1220,9 @@ impl crate::driver::Sink for PgSink {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Transfer(format!("merge upsert: {e}")))?;
+                if let Some(wm) = &staged_wm {
+                    self.write_state(&mut tx, wm, mode, rows).await?;
+                }
                 sqlx::query(&format!("DROP TABLE {}", self.staging_t))
                     .execute(&mut *tx)
                     .await

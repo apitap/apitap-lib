@@ -122,6 +122,61 @@ pub(crate) fn ch_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "\\`"))
 }
 
+/// Pick the higher of two watermarks. For numeric cursors the compare is numeric;
+/// `None < Some` in Option's ordering means an UNPARSEABLE state watermark loses to
+/// the data — the safe direction (worst case is a bounded re-read, never a skip).
+fn wm_pick(numeric: bool, state: String, data: String) -> String {
+    let state_wins = if numeric {
+        state.parse::<i128>().ok() >= data.parse::<i128>().ok() && state.parse::<i128>().is_ok()
+    } else {
+        state >= data // ISO datetime text compares correctly lexicographically
+    };
+    if state_wins {
+        state
+    } else {
+        data
+    }
+}
+
+/// Escape a string for a single-quoted ClickHouse literal.
+fn ch_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+impl ChSink {
+    async fn ensure_state_table(&self) -> Result<()> {
+        self.ch
+            .exec(
+                "CREATE TABLE IF NOT EXISTS `_apitap_state` (\
+                   dest_table String, source_id String, cursor_col String, \
+                   watermark String, mode String, last_rows UInt64, \
+                   synced_at DateTime64(6, 'UTC') DEFAULT now64(6)) \
+                 ENGINE = ReplacingMergeTree(synced_at) ORDER BY (dest_table, source_id)",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn write_state(&self, watermark: &str, rows: u64) -> Result<()> {
+        let (Some(cursor), Some(source_id)) = (&self.cursor_col, &self.source_id) else {
+            return Ok(());
+        };
+        self.ch
+            .exec(&format!(
+                "INSERT INTO `_apitap_state` \
+                 (dest_table, source_id, cursor_col, watermark, mode, last_rows) \
+                 VALUES ('{}', '{}', '{}', '{}', '{}', {rows})",
+                ch_str(&self.final_bare),
+                ch_str(source_id),
+                ch_str(cursor),
+                ch_str(watermark),
+                self.mode_str,
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
 /// ClickHouse column type for a delivered value.
 fn ch_type_of(d: &Delivered) -> String {
     match d {
@@ -154,6 +209,10 @@ pub(crate) struct ChSink {
     staging_t: String,
     /// Unquoted final table name, for system.tables/system.columns lookups.
     final_bare: String,
+    /// Incremental context for the state row (set in dest_state).
+    source_id: Option<String>,
+    cursor_col: Option<String>,
+    mode_str: &'static str,
     /// `INSERT INTO staging FORMAT …`, fixed at prepare time.
     insert_sql: String,
 }
@@ -168,6 +227,9 @@ impl ChSink {
             final_t: ch_ident(dest_bare),
             staging_t: ch_ident(&format!("{dest_bare}__apitap_staging")),
             final_bare: dest_bare.to_string(),
+            source_id: None,
+            cursor_col: None,
+            mode_str: "replace",
             insert_sql: String::new(),
         })
     }
@@ -257,6 +319,7 @@ impl crate::driver::Sink for ChSink {
         plan: &TablePlan,
         mode: Mode,
         cursor: &str,
+        source_id: &str,
     ) -> Result<DestState> {
         if mode == Mode::Merge {
             return Err(Error::InvalidInput(
@@ -265,6 +328,26 @@ impl crate::driver::Sink for ChSink {
                     .into(),
             ));
         }
+        self.source_id = Some(source_id.to_string());
+        self.cursor_col = Some(cursor.to_string());
+        self.mode_str = if mode == Mode::Append {
+            "append"
+        } else {
+            "merge"
+        };
+        // Numeric vs temporal comparison for greatest(state, data) below.
+        let numeric_cursor = plan
+            .cols
+            .iter()
+            .find(|c| c.name == cursor)
+            .map(|c| {
+                !matches!(
+                    c.udt.as_str(),
+                    "date" | "timestamp" | "timestamptz" | "datetime"
+                )
+            })
+            .unwrap_or(false);
+        self.ensure_state_table().await?;
         let lit = self.final_bare.replace('\\', "\\\\").replace('\'', "\\'");
         let exists = self
             .ch
@@ -307,9 +390,15 @@ impl crate::driver::Sink for ChSink {
             .trim()
             .parse()
             .map_err(|e| Error::Transfer(format!("dest count parse: {e}")))?;
-        let watermark = if n == 0 {
-            None // max() of an empty ClickHouse table returns the type's zero, not NULL
-        } else {
+        // An EMPTY table cannot carry a watermark, whatever the state row says —
+        // TRUNCATE-to-resync must work.
+        if n == 0 {
+            return Ok(DestState {
+                exists: true,
+                watermark: None,
+            });
+        }
+        let data_wm = {
             Some(
                 self.ch
                     .exec(&format!(
@@ -321,6 +410,50 @@ impl crate::driver::Sink for ChSink {
                     .trim()
                     .to_string(),
             )
+        };
+        // ClickHouse can't update the state row atomically with the ATTACH, so a
+        // crash can leave the state one run behind. The effective watermark is the
+        // GREATEST of state and data: a stale-low state row then merely re-reads a
+        // delta the data already shows (loud, bounded), never skips ahead.
+        let state_wm: Option<String> = {
+            let out = self
+                .ch
+                .exec(&format!(
+                    "SELECT watermark FROM `_apitap_state` FINAL \
+                     WHERE dest_table = '{}' AND source_id = '{}'",
+                    ch_str(&self.final_bare),
+                    ch_str(source_id)
+                ))
+                .await?;
+            let t = out.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        let watermark = match (state_wm, data_wm) {
+            (Some(a), Some(b)) => Some(wm_pick(numeric_cursor, a, b)),
+            (None, data) => {
+                // Fan-in guard: other sources' state rows mean the global data-max
+                // is not ours — a fallback would skip this source's backlog.
+                let siblings: u64 = self
+                    .ch
+                    .exec(&format!(
+                        "SELECT count() FROM `_apitap_state` FINAL WHERE dest_table = '{}'",
+                        ch_str(&self.final_bare)
+                    ))
+                    .await?
+                    .trim()
+                    .parse()
+                    .map_err(|e| Error::Transfer(format!("state count parse: {e}")))?;
+                if siblings > 0 {
+                    return Err(Error::InvalidInput(format!(
+                        "destination {} has state rows from other sources but none for \
+                         '{source_id}' — run mode='replace' to rebuild, or seed a state \
+                         row manually",
+                        self.final_bare
+                    )));
+                }
+                data
+            }
+            (state, None) => state,
         };
         Ok(DestState {
             exists: true,
@@ -337,6 +470,21 @@ impl crate::driver::Sink for ChSink {
                 .await;
             return Ok(());
         }
+        // Watermark of what THIS run staged (session is UTC-pinned).
+        let staged_wm = match &self.cursor_col {
+            Some(c) => Some(
+                self.ch
+                    .exec(&format!(
+                        "SELECT toString(max({})) FROM {}",
+                        ch_ident(c),
+                        self.staging_t
+                    ))
+                    .await?
+                    .trim()
+                    .to_string(),
+            ),
+            None => None,
+        };
         match mode {
             Mode::Replace => {
                 self.ch
@@ -354,6 +502,18 @@ impl crate::driver::Sink for ChSink {
                 self.ch
                     .exec(&format!("DROP TABLE {}", self.staging_t))
                     .await?;
+                // Replace destroyed every source's rows — clear ALL stale state rows
+                // for this destination before the bootstrap (if any) re-inserts its own.
+                self.ensure_state_table().await?;
+                self.ch
+                    .exec(&format!(
+                        "DELETE FROM `_apitap_state` WHERE dest_table = '{}'",
+                        ch_str(&self.final_bare)
+                    ))
+                    .await?;
+                if let Some(wm) = &staged_wm {
+                    self.write_state(wm, rows).await?;
+                }
                 Ok(())
             }
             Mode::Append => {
@@ -371,6 +531,9 @@ impl crate::driver::Sink for ChSink {
                 self.ch
                     .exec(&format!("DROP TABLE {}", self.staging_t))
                     .await?;
+                if let Some(wm) = &staged_wm {
+                    self.write_state(wm, rows).await?;
+                }
                 Ok(())
             }
             Mode::Merge => Err(Error::InvalidInput(
@@ -465,6 +628,26 @@ mod tests {
             .unwrap()
             .base
             .starts_with("https://"));
+    }
+
+    #[test]
+    fn wm_pick_prefers_data_when_state_is_garbage() {
+        // numeric: plain compares
+        assert_eq!(wm_pick(true, "1000".into(), "500".into()), "1000");
+        assert_eq!(wm_pick(true, "500".into(), "1000".into()), "1000");
+        // unparseable STATE must lose to data (bounded re-read, never a skip)
+        assert_eq!(wm_pick(true, "garbage".into(), "500".into()), "500");
+        // unparseable DATA: state wins (numeric state parses, data doesn't)
+        assert_eq!(wm_pick(true, "500".into(), "garbage".into()), "500");
+        // temporal: ISO text compare
+        assert_eq!(
+            wm_pick(
+                false,
+                "2026-02-01 00:00:00".into(),
+                "2026-01-01 00:00:00".into()
+            ),
+            "2026-02-01 00:00:00"
+        );
     }
 
     #[test]
