@@ -1,0 +1,24 @@
+# Publish the committed release wheel to PyPI via Trusted Publishing (OIDC — no token).
+# Triggered by pushing a v* tag. The wheel in dist/ is the PGO release build produced
+# by benchmarks/pgo-build.sh (see that script for the build provenance).
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show what will be published
+        run: ls -la dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
