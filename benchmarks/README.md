@@ -192,12 +192,16 @@ backends, against the same seeds, same box, same caps (16 vCPU / 4 GB each), aut
 settings on both sides. apitap here is the PGO release wheel; every completed result
 below checksum-validated:
 
-| route | apitap | dlt (default) | dlt + pyarrow | dlt + connectorx |
+| route | apitap (PyPI wheel) | dlt (default) | dlt + pyarrow | dlt + connectorx |
 |---|---|---|---|---|
-| Postgres → Postgres | **20.8 s** | 2 602 s (43 min) | 694 s | OOM-killed |
-| Postgres → ClickHouse | **10.2 s** | 1 941 s | 360 s | OOM-killed |
-| MySQL → ClickHouse | **10.8 s** | 2 268 s | failed (type inference) | OOM-killed |
-| MySQL → Postgres | **22.6 s** | 2 900 s (48 min) | failed (type inference) | OOM-killed |
+| Postgres → Postgres | **20.2 s** | 2 604 s (43 min) | 708 s | OOM-killed |
+| Postgres → ClickHouse | **9.9 s** | 1 893 s | 360 s | OOM-killed |
+| MySQL → ClickHouse | **10.4 s** | 2 231 s | failed (type inference) | OOM-killed |
+| MySQL → Postgres | **22.5 s** | 2 899 s (48 min) | failed (type inference) | OOM-killed |
+
+(Re-run in full after apitap 0.1.0 shipped, with apitap installed from PyPI like any
+user would — `pip install apitap`, wheel sha256 verified identical to the release
+build. dlt's numbers reproduced within 0.1–2% of the previous day's run.)
 
 Notes, all reproducible:
 
@@ -230,6 +234,18 @@ Notes, all reproducible:
   first attempt at every CH leg failed on TLS port 8443 until we did).
 - The two dlt-default `→ Postgres` legs outlived our first 40-minute timeout; they
   were left to finish and their full wall times are reported.
+
+**"But dltHub's own benchmark says 360M rows/hour?"** It does — and both numbers are
+right. Rows are not a unit: their TPC-H rows average **185 bytes** (43.3M rows = 8 GB);
+this benchmark's rows average **462 bytes** (10M rows = 4.41 GB, measured with
+`pg_table_size`). Normalize to bytes and their tuned headline is **68 GB/hour** while
+dlt+pyarrow measured here does **44 GB/hour** on one wide table — the same class once
+you account for the remaining two differences: TPC-H is *eight* tables (dlt's workers
+parallelize across tables, so their extract ran 8 streams where a single-table job
+gets one), and their destination is BigQuery, which ingests uploaded parquet files
+server-side, outside the measured pipeline. apitap on the same single table moves
+**~1.6 TB/hour** (4.41 GB in 9.9 s) — ~23× their headline per byte, untuned, from the
+published wheel.
 
 ### M2 Pro laptop, uncapped (2026-07-10)
 

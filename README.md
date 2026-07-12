@@ -41,15 +41,16 @@ yourself:
 ```
 
 **10M rows, both tools at 16 vCPU / 4 GB** (auto settings, no tuning for either tool;
-apitap = the PGO release wheel, mean of two runs; every number checksum-validated the
-same day on the same box):
+apitap = the published wheel, installed with `pip install apitap` — its sha256 matches
+the PGO release build byte for byte; mean of two runs; every number checksum-validated
+in the same session on the same box):
 
 | route | apitap 0.1.0 | ingestr 1.0.75 | speedup |
 |---|---|---|---|
-| Postgres → Postgres | **21.2 s** | 508 s | **24×** |
-| Postgres → ClickHouse | **10.5 s** | 110 s | 10× |
-| MySQL → ClickHouse | **11.1 s** | 94 s | 8× |
-| MySQL → Postgres | **23.3 s** | 480 s | 21× |
+| Postgres → Postgres | **20.2 s** | 500 s | **25×** |
+| Postgres → ClickHouse | **9.9 s** | 111 s | 11× |
+| MySQL → ClickHouse | **10.4 s** | 97 s | 9× |
+| MySQL → Postgres | **22.5 s** | 481 s | 21× |
 
 **On a tiny 0.5 vCPU / 256 MB container** — the box you'd actually pay for — apitap
 completes every route (memory-bounded by design; the pipe count auto-sizes to the
