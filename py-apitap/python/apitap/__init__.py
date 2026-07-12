@@ -41,6 +41,7 @@ def transfer(
     cursor: str | None = None,
     chunk_bytes: int | None = None,
     durable: bool = True,
+    mode: str = "replace",
 ) -> TransferReport:
     """Copy ``table`` from ``src`` to ``dst``, atomically replacing the destination table.
 
@@ -67,6 +68,15 @@ def transfer(
             primary key. PK-less Postgres tables fall back to TID ranges; other
             sources to a single stream.
         chunk_bytes: Bytes coalesced per send (default 4 MiB).
+        mode: ``"replace"`` (default, full refresh + atomic swap), ``"append"``
+            (incremental: only rows with cursor past the destination's current
+            ``max(cursor)`` are loaded — stateless, the watermark lives in the data;
+            bootstraps as replace when the table doesn't exist), or ``"merge"``
+            (Postgres destinations: incremental upsert by the destination's
+            PRIMARY KEY). Incremental modes require a cursor (integer or
+            timestamp column). Append assumes the cursor is monotonic with
+            COMMIT order — for update-prone or concurrently-written tables use
+            merge with an ``updated_at`` cursor. See docs/usage.md.
         durable: Postgres destinations only. ``False`` loads through an UNLOGGED
             table — skipping WAL roughly halves the destination's write cost — and the
             swapped-in table REMAINS unlogged: Postgres truncates it during crash
@@ -82,5 +92,6 @@ def transfer(
         cursor=cursor,
         chunk_bytes=chunk_bytes,
         durable=durable,
+        mode=mode,
     )
     return TransferReport(rows=rows, elapsed_ms=elapsed_ms, parallel=used)

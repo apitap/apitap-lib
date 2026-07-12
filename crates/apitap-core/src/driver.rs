@@ -10,8 +10,8 @@
 //! register the scheme in [`crate::transfer`]'s dispatch — nothing here changes.
 
 use crate::error::{Error, Result};
-use crate::plan::{Lane, TablePlan, WireFormat};
-use crate::{TransferOptions, TransferReport};
+use crate::plan::{Delta, DestState, Lane, TablePlan, WireFormat};
+use crate::{Mode, TransferOptions, TransferReport};
 use std::future::Future;
 
 /// Work-stealing statement queue: many small spans, N workers pull until it drains.
@@ -74,12 +74,15 @@ pub(crate) trait Source: Sized + Send + Sync {
     fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane;
     /// Read statements covering the table: cursor ranges, then any source-specific
     /// PK-less fallback, then a single full statement. `want` is the target span count.
+    /// `delta` (incremental modes) must be pushed into EVERY statement, including the
+    /// min/max probe and the fallbacks — a span that forgets it re-reads the world.
     fn span_stmts(
         &self,
         table: &str,
         plan: &TablePlan,
         lane: &Lane,
         want: usize,
+        delta: Option<&Delta>,
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
     /// Spawn one worker per loader over a shared span queue; return rows reported by
     /// the loaders (0 when the sink counts server-side). Implementations own the hot
@@ -102,21 +105,59 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// Sink-specific plan constraints, applied before lane planning so the DDL and the
     /// encoders agree (e.g. ClickHouse: the ORDER BY column must be non-nullable).
     fn adjust_plan(&self, plan: &mut TablePlan);
-    /// Create the staging table for this lane.
+    /// Create the staging table for this lane. `mode` is the effective mode: replace
+    /// honors `durable`; incremental modes always stage UNLOGGED (staging never
+    /// becomes the final table). Replace implementations should also capture whatever
+    /// the swap would destroy (indexes, constraints, grants) for re-application.
     fn prepare(
         &mut self,
         plan: &TablePlan,
         lane: &Lane,
         durable: bool,
+        mode: Mode,
     ) -> impl Future<Output = Result<()>> + Send;
     /// One ingest stream into staging (called once per worker).
     fn loader(&self) -> impl Future<Output = Result<Self::Loader>> + Send;
     /// Rows now in staging. `loaded` is the loaders' own count — sinks whose protocol
     /// reports rows return it as-is; others count server-side.
     fn rows_staged(&self, loaded: u64) -> impl Future<Output = Result<u64>> + Send;
-    /// Atomic swap-in — or, when `rows == 0`, drop staging and leave the existing
-    /// destination untouched (the 0-row guard).
-    fn finalize(&self, rows: u64) -> impl Future<Output = Result<()>> + Send;
+    /// Incremental modes only: inspect the destination BEFORE staging. Returns whether
+    /// the final table exists and its current `max(cursor)` as text. Implementations
+    /// must also (a) verify the destination's columns match the plan (schema drift →
+    /// a clear error, never a silent mis-append), (b) reject unsupported modes early
+    /// (e.g. merge on ClickHouse), and (c) stash whatever finalize will need (merge
+    /// keys). Never called for `Mode::Replace`.
+    fn dest_state(
+        &mut self,
+        plan: &TablePlan,
+        mode: Mode,
+        cursor: &str,
+    ) -> impl Future<Output = Result<DestState>> + Send;
+    /// Land the staged rows: `Replace` = atomic swap; `Append` = move staged rows into
+    /// the existing table; `Merge` = upsert them by primary key. When `rows == 0`,
+    /// drop staging and leave the destination untouched (the 0-row guard) in every
+    /// mode. `mode` here is the EFFECTIVE mode (a bootstrapped incremental run gets
+    /// `Replace`).
+    fn finalize(&self, rows: u64, mode: Mode) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Is this source type usable as an incremental cursor, and does its SQL literal
+/// need quoting? Integers embed raw; date/time types embed as quoted text (both
+/// Postgres `::text` and ClickHouse `toString` round-trip them losslessly at
+/// microsecond precision). Anything else is rejected up front.
+pub(crate) fn cursor_literal_quoted(udt: &str) -> Result<bool> {
+    match udt {
+        // integers (postgres udt names + mysql DATA_TYPE names)
+        "int2" | "int4" | "int8" | "tinyint" | "smallint" | "mediumint" | "int" | "bigint" => {
+            Ok(false)
+        }
+        // date/time
+        "date" | "timestamp" | "timestamptz" | "datetime" => Ok(true),
+        other => Err(Error::InvalidInput(format!(
+            "cursor type '{other}' is not usable for append/merge — use an integer or \
+             timestamp column"
+        ))),
+    }
 }
 
 /// Per-route tuning that is legitimately different between routes (measured, not
@@ -160,6 +201,48 @@ pub(crate) async fn run<S: Source, K: Sink>(
     plan.cursor = opts.cursor.clone().or_else(|| plan.single_int_pk());
     sink.adjust_plan(&mut plan);
 
+    // Incremental resolution: find the watermark in the DESTINATION (stateless — no
+    // side files, no meta tables), or bootstrap as a full replace when the table
+    // doesn't exist yet.
+    let mut mode = opts.mode;
+    let mut delta: Option<Delta> = None;
+    if mode != Mode::Replace {
+        let cursor = plan.cursor.clone().ok_or_else(|| {
+            Error::InvalidInput(
+                "append/merge needs a cursor column: pass cursor=... (integer or \
+                 timestamp) or give the table a single-column integer primary key"
+                    .into(),
+            )
+        })?;
+        let col = plan.cols.iter().find(|c| c.name == cursor).ok_or_else(|| {
+            Error::InvalidInput(format!("cursor column '{cursor}' not in source table"))
+        })?;
+        let quoted = cursor_literal_quoted(&col.udt)?;
+        let st = sink.dest_state(&plan, mode, &cursor).await?;
+        if !st.exists {
+            mode = Mode::Replace; // first run: bootstrap the table with a full load
+        } else if let Some(wm) = st.watermark {
+            let literal = if quoted {
+                format!("'{}'", wm.replace('\'', "''"))
+            } else {
+                // The watermark comes from destination DATA — never embed it raw
+                // without proving it is the number it claims to be.
+                wm.parse::<i128>().map_err(|_| {
+                    Error::InvalidInput(format!(
+                        "destination watermark '{wm}' is not an integer — the cursor \
+                         column's types have drifted; run once with mode='replace'"
+                    ))
+                })?;
+                wm
+            };
+            delta = Some(Delta {
+                col: cursor,
+                op: if mode == Mode::Merge { ">=" } else { ">" },
+                literal,
+            });
+        } // exists but empty: full read, incremental landing
+    }
+
     let format = sink
         .accepts()
         .iter()
@@ -173,14 +256,16 @@ pub(crate) async fn run<S: Source, K: Sink>(
         })?;
     let lane = src.plan_lane(&plan, format);
 
-    sink.prepare(&plan, &lane, opts.durable).await?;
+    sink.prepare(&plan, &lane, opts.durable, mode).await?;
 
     let want = if parallel > 1 {
         parallel * profile.span_mult
     } else {
         1
     };
-    let stmts = src.span_stmts(table, &plan, &lane, want).await?;
+    let stmts = src
+        .span_stmts(table, &plan, &lane, want, delta.as_ref())
+        .await?;
     let used = parallel.min(stmts.len()).max(1);
     let mut loaders = Vec::with_capacity(used);
     for _ in 0..used {
@@ -189,7 +274,7 @@ pub(crate) async fn run<S: Source, K: Sink>(
 
     let loaded = src.run_workers(&plan, &lane, stmts, loaders, chunk).await?;
     let rows = sink.rows_staged(loaded).await?;
-    sink.finalize(rows).await?;
+    sink.finalize(rows, mode).await?;
 
     Ok(TransferReport {
         rows,

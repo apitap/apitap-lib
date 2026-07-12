@@ -18,8 +18,9 @@
 
 use crate::driver::{pop, spans, Loader, Source, WorkQueue};
 use crate::error::{Error, Result};
-use crate::plan::{ColumnPlan, Delivered, Lane, LaneCol, TablePlan, WireFormat};
+use crate::plan::{ColumnPlan, Delivered, Delta, DestState, Lane, LaneCol, TablePlan, WireFormat};
 use crate::rowbinary::{rb_type, RbType, Transcoder};
+use crate::Mode;
 use futures::TryStreamExt;
 use sqlx::postgres::{PgPoolCopyExt, PgPoolOptions};
 use sqlx::{PgPool, Row};
@@ -109,12 +110,15 @@ impl Source for PgSource {
             "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS ty \
              FROM pg_index i \
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-             WHERE i.indrelid = $1::regclass AND i.indisprimary",
+             WHERE i.indrelid = $1::regclass AND i.indisprimary \
+               AND array_position(i.indkey, a.attnum) < i.indnkeyatts \
+             ORDER BY array_position(i.indkey, a.attnum)",
         )
         .bind(&t)
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
+        let pk_cols: Vec<String> = pk.iter().map(|r| r.get::<String, _>("name")).collect();
         let int_pk_name: Option<String> = if pk.len() == 1 {
             let name: String = pk[0].get("name");
             let ty: String = pk[0].get("ty");
@@ -142,6 +146,7 @@ impl Source for PgSource {
             engine: "postgres",
             cols,
             cursor: None,
+            pk_cols,
         })
     }
 
@@ -215,6 +220,7 @@ impl Source for PgSource {
         plan: &TablePlan,
         lane: &Lane,
         want: usize,
+        delta: Option<&Delta>,
     ) -> Result<Vec<String>> {
         let src_t = quote_ident_path(table);
         let select_list = lane
@@ -227,17 +233,30 @@ impl Source for PgSource {
             WireFormat::TabSeparated => "FORMAT text",
             WireFormat::PgCopyBinary | WireFormat::RowBinary => "FORMAT binary",
         };
+        // Incremental predicate — appended to EVERY statement in this fn, including
+        // the min/max probe and the ctid fallback.
+        let dpred = delta
+            .map(|d| format!(" AND {} {} {}", quote_ident(&d.col), d.op, d.literal))
+            .unwrap_or_default();
 
         // Span strategy, in measured order of preference: integer-cursor ranges (index
         // scan on a correlated PK beat TID ranges by ~4% at 16 pipes), then CTID page
-        // ranges (TID Range Scan, PG 14+ — no index needed, so PK-LESS tables still
-        // get full parallelism), then a single stream.
+        // ranges (TID Range Scan, PG 14+ — no index needed, so PK-LESS tables and
+        // timestamp-cursor deltas still get full parallelism), then a single stream.
+        let int_cursor = plan.cursor.as_deref().and_then(|c| {
+            plan.cols
+                .iter()
+                .find(|pc| pc.name == c)
+                .filter(|pc| matches!(pc.udt.as_str(), "int2" | "int4" | "int8"))
+                .map(|_| c.to_string())
+        });
         let mut stmts: Vec<String> = Vec::new();
         if want > 1 {
-            if let Some(col) = &plan.cursor {
+            if let Some(col) = &int_cursor {
                 let qcol = quote_ident(col);
                 let (lo, hi): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
-                    "SELECT min({qcol})::int8, max({qcol})::int8 FROM {src_t}"
+                    "SELECT min({qcol})::int8, max({qcol})::int8 FROM {src_t} \
+                     WHERE true{dpred}"
                 ))
                 .fetch_one(&self.pool)
                 .await
@@ -250,9 +269,17 @@ impl Source for PgSource {
                     for (rlo, rhi) in spans(lo, hi, want) {
                         stmts.push(format!(
                             "COPY (SELECT {select_list} FROM {src_t} \
-                             WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}) TO STDOUT ({copy_opts})"
+                             WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}) \
+                             TO STDOUT ({copy_opts})"
                         ));
                     }
+                } else if delta.is_some() {
+                    // Empty delta: no rows past the watermark. One statement that
+                    // reads nothing keeps the pipeline uniform.
+                    stmts.push(format!(
+                        "COPY (SELECT {select_list} FROM {src_t} WHERE false) \
+                         TO STDOUT ({copy_opts})"
+                    ));
                 }
             }
             if stmts.is_empty() {
@@ -268,7 +295,7 @@ impl Source for PgSource {
                     for (plo, phi) in spans(0, npages - 1, want) {
                         stmts.push(format!(
                             "COPY (SELECT {select_list} FROM {src_t} \
-                             WHERE ctid >= '({plo},0)'::tid AND ctid < '({},0)'::tid) \
+                             WHERE ctid >= '({plo},0)'::tid AND ctid < '({},0)'::tid{dpred}) \
                              TO STDOUT ({copy_opts})",
                             phi + 1
                         ));
@@ -278,7 +305,8 @@ impl Source for PgSource {
         }
         if stmts.is_empty() {
             stmts.push(format!(
-                "COPY (SELECT {select_list} FROM {src_t}) TO STDOUT ({copy_opts})"
+                "COPY (SELECT {select_list} FROM {src_t} WHERE true{dpred}) \
+                 TO STDOUT ({copy_opts})"
             ));
         }
         Ok(stmts)
@@ -539,6 +567,20 @@ pub(crate) struct PgSink {
     final_t: String,
     staging_t: String,
     bare: String,
+    /// Unquoted schema name, for catalog lookups (`public` when unqualified).
+    schema: String,
+    /// DDL captured from the pre-swap table (indexes, constraints, grants) — the swap
+    /// destroys them, so replace mode re-applies these after the commit.
+    restore_ddl: Vec<String>,
+    /// Destination primary-key columns (merge mode), introspected in `dest_state`.
+    merge_keys: Vec<String>,
+    /// Set when a merge run has to bootstrap (dest missing): the swap then also
+    /// recreates the SOURCE's primary key so the next merge run can upsert.
+    bootstrap_pk: bool,
+    /// Cursor column (incremental modes), for deterministic merge dedup ordering.
+    cursor_col: Option<String>,
+    /// Plan column names in order, stashed at `prepare` for the merge upsert.
+    col_names: Vec<String>,
     copy_in_sql: String,
     /// Double-buffer sends through a small channel so the source keeps being read
     /// WHILE the previous buffer is in flight (−11% on the byte-relay route). Row
@@ -559,6 +601,12 @@ impl PgSink {
             None => (String::new(), dest_table.to_string()),
         };
         let staging_t = quote_ident_path(&format!("{schema_pfx}{bare}__apitap_staging"));
+        let schema = schema_pfx.trim_end_matches('.').to_string();
+        let schema = if schema.is_empty() {
+            "public".into()
+        } else {
+            schema
+        };
         Ok(Self {
             pool: PgPoolOptions::new()
                 .max_connections(max_conns as u32)
@@ -569,8 +617,37 @@ impl PgSink {
             copy_in_sql: format!("COPY {staging_t} FROM STDIN (FORMAT binary)"),
             staging_t,
             bare,
+            schema,
+            restore_ddl: Vec::new(),
+            merge_keys: Vec::new(),
+            bootstrap_pk: false,
+            cursor_col: None,
+            col_names: Vec::new(),
             overlap_send,
         })
+    }
+}
+
+impl PgSink {
+    async fn final_exists(&self) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&self.final_t)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("dest lookup: {e}")))
+    }
+
+    /// Destination column names in ordinal order.
+    async fn final_columns(&self) -> Result<Vec<String>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT a.attname FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+        )
+        .bind(&self.final_t)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("dest columns: {e}")))
     }
 }
 
@@ -618,7 +695,96 @@ impl crate::driver::Sink for PgSink {
 
     fn adjust_plan(&self, _plan: &mut TablePlan) {}
 
-    async fn prepare(&mut self, plan: &TablePlan, lane: &Lane, durable: bool) -> Result<()> {
+    async fn prepare(
+        &mut self,
+        plan: &TablePlan,
+        lane: &Lane,
+        durable: bool,
+        mode: Mode,
+    ) -> Result<()> {
+        self.col_names = plan.cols.iter().map(|c| c.name.clone()).collect();
+
+        // Replace destroys the old table's indexes, constraints and grants with it —
+        // capture them now so finalize can re-apply after the swap. (Column DEFAULTs
+        // and identity/serial ownership are NOT preserved; documented.)
+        if mode == Mode::Replace && self.final_exists().await? {
+            // Resolve the table's ACTUAL namespace — an unqualified dest name follows
+            // search_path everywhere else; hardcoding 'public' here would silently
+            // skip the index/grant capture for such tables.
+            let schema: String = sqlx::query_scalar(
+                "SELECT n.nspname FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.oid = to_regclass($1)",
+            )
+            .bind(&self.final_t)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?;
+            let mut ddl: Vec<String> = Vec::new();
+            let cons: Vec<(String, String)> = sqlx::query_as(
+                "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conrelid = $1::regclass AND contype IN ('p','u','f','c','x') \
+                 ORDER BY contype = 'f', conname",
+            )
+            .bind(&self.final_t)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("capture constraints: {e}")))?;
+            for (name, def) in &cons {
+                ddl.push(format!(
+                    "ALTER TABLE {} ADD CONSTRAINT {} {}",
+                    self.final_t,
+                    quote_ident(name),
+                    def
+                ));
+            }
+            // Plain indexes (constraint-backed ones come back via ADD CONSTRAINT).
+            let idx: Vec<String> = sqlx::query_scalar(
+                "SELECT indexdef FROM pg_indexes \
+                 WHERE schemaname = $1 AND tablename = $2 AND indexname NOT IN \
+                 (SELECT conname FROM pg_constraint WHERE conrelid = $3::regclass)",
+            )
+            .bind(&schema)
+            .bind(&self.bare)
+            .bind(&self.final_t)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("capture indexes: {e}")))?;
+            ddl.extend(idx); // indexdef names the same table the swap re-creates
+            let grants: Vec<(String, String)> = sqlx::query_as(
+                "SELECT grantee, string_agg(DISTINCT privilege_type, ', ') \
+                 FROM information_schema.role_table_grants \
+                 WHERE table_schema = $1 AND table_name = $2 AND grantee <> current_user \
+                 GROUP BY grantee",
+            )
+            .bind(&schema)
+            .bind(&self.bare)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("capture grants: {e}")))?;
+            for (grantee, privs) in &grants {
+                let who = if grantee == "PUBLIC" {
+                    "PUBLIC".to_string()
+                } else {
+                    quote_ident(grantee)
+                };
+                ddl.push(format!("GRANT {privs} ON {} TO {who}", self.final_t));
+            }
+            self.restore_ddl = ddl;
+        }
+        if self.bootstrap_pk {
+            let keys = plan
+                .pk_cols
+                .iter()
+                .map(|k| quote_ident(k))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.restore_ddl.push(format!(
+                "ALTER TABLE {} ADD PRIMARY KEY ({keys})",
+                self.final_t
+            ));
+        }
+
         // Binary COPY is positional + type-strict. Same-engine transfers mirror the
         // source's exact type spellings; anything else maps the lane's deliveries.
         let cols_ddl = plan
@@ -639,12 +805,98 @@ impl crate::driver::Sink for PgSink {
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Transfer(format!("drop staging: {e}")))?;
-        let unlogged = if durable { "" } else { "UNLOGGED " };
+        // Incremental staging never becomes the final table — always skip its WAL.
+        let unlogged = if durable && mode == Mode::Replace {
+            ""
+        } else {
+            "UNLOGGED "
+        };
         sqlx::query(&format!("CREATE {unlogged}TABLE {st} ({cols_ddl})"))
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Transfer(format!("create staging: {e}")))?;
         Ok(())
+    }
+
+    async fn dest_state(
+        &mut self,
+        plan: &TablePlan,
+        mode: Mode,
+        cursor: &str,
+    ) -> Result<DestState> {
+        self.cursor_col = Some(cursor.to_string());
+        if !self.final_exists().await? {
+            if mode == Mode::Merge {
+                if plan.pk_cols.is_empty() {
+                    return Err(Error::InvalidInput(
+                        "merge bootstrap needs a primary key on the SOURCE table \
+                         (the destination is created with the same key)"
+                            .into(),
+                    ));
+                }
+                self.bootstrap_pk = true; // prepare() adds ADD PRIMARY KEY post-swap
+            }
+            return Ok(DestState {
+                exists: false,
+                watermark: None,
+            });
+        }
+        // Schema drift is an error, never a silent mis-append: binary COPY is
+        // positional, so the column lists must match exactly.
+        let dest_cols = self.final_columns().await?;
+        let src_cols: Vec<String> = plan.cols.iter().map(|c| c.name.clone()).collect();
+        if dest_cols != src_cols {
+            return Err(Error::InvalidInput(format!(
+                "destination columns {dest_cols:?} don't match the source {src_cols:?} — \
+                 run once with mode='replace' to realign the schema"
+            )));
+        }
+        if mode == Mode::Merge {
+            self.merge_keys = sqlx::query_scalar(
+                "SELECT a.attname FROM pg_index i \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                 WHERE i.indrelid = $1::regclass AND i.indisprimary \
+                   AND array_position(i.indkey, a.attnum) < i.indnkeyatts \
+                 ORDER BY array_position(i.indkey, a.attnum)",
+            )
+            .bind(&self.final_t)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("dest pk: {e}")))?;
+            if self.merge_keys.is_empty() {
+                return Err(Error::InvalidInput(
+                    "merge needs a PRIMARY KEY on the destination table".into(),
+                ));
+            }
+        }
+        // Render the watermark dialect-neutrally: timestamptz would ::text with a
+        // '+00' offset suffix that MySQL's datetime grammar refuses, so temporal
+        // cursors are formatted as offset-free UTC wall time (both source sessions
+        // are pinned to UTC, so the comparison frame matches).
+        let qcur = quote_ident(cursor);
+        let wm_expr = match plan
+            .cols
+            .iter()
+            .find(|c| c.name == cursor)
+            .map(|c| c.udt.as_str())
+        {
+            Some("timestamptz") => {
+                format!("to_char(max({qcur}) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')")
+            }
+            Some("timestamp") | Some("datetime") => {
+                format!("to_char(max({qcur}), 'YYYY-MM-DD HH24:MI:SS.US')")
+            }
+            _ => format!("max({qcur})::text"),
+        };
+        let watermark: Option<String> =
+            sqlx::query_scalar(&format!("SELECT {wm_expr} FROM {}", self.final_t))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Transfer(format!("watermark: {e}")))?;
+        Ok(DestState {
+            exists: true,
+            watermark,
+        })
     }
 
     async fn loader(&self) -> Result<PgCopyLoader> {
@@ -661,34 +913,128 @@ impl crate::driver::Sink for PgSink {
         Ok(loaded)
     }
 
-    async fn finalize(&self, rows: u64) -> Result<()> {
-        // Atomic swap-in; a 0-row source leaves the existing destination untouched.
+    async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        // 0-row guard, every mode: an empty load never touches the destination.
         if rows == 0 {
             let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
                 .execute(&self.pool)
                 .await;
             return Ok(());
         }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Error::Transfer(format!("swap begin: {e}")))?;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.final_t))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Transfer(format!("drop dest: {e}")))?;
-        sqlx::query(&format!(
-            "ALTER TABLE {} RENAME TO {}",
-            self.staging_t,
-            quote_ident(&self.bare)
-        ))
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Transfer(format!("rename staging: {e}")))?;
-        tx.commit()
-            .await
-            .map_err(|e| Error::Transfer(format!("swap commit: {e}")))
+        match mode {
+            Mode::Replace => {
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("swap begin: {e}")))?;
+                sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.final_t))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("drop dest: {e}")))?;
+                sqlx::query(&format!(
+                    "ALTER TABLE {} RENAME TO {}",
+                    self.staging_t,
+                    quote_ident(&self.bare)
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Transfer(format!("rename staging: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("swap commit: {e}")))?;
+                // Re-apply what the swap destroyed. Runs AFTER the commit so index
+                // builds don't extend the exclusive-lock window; the data is already
+                // live. A failure here is reported with the exact statement — the
+                // rows are correct, only the post-DDL needs attention.
+                for ddl in &self.restore_ddl {
+                    sqlx::query(ddl).execute(&self.pool).await.map_err(|e| {
+                        Error::Transfer(format!(
+                            "rows landed, but restoring destination DDL failed: `{ddl}`: {e}"
+                        ))
+                    })?;
+                }
+                Ok(())
+            }
+            Mode::Append => {
+                // Stage → one INSERT..SELECT in a transaction: readers see the whole
+                // delta or none of it.
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("append begin: {e}")))?;
+                sqlx::query(&format!(
+                    "INSERT INTO {} SELECT * FROM {}",
+                    self.final_t, self.staging_t
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Transfer(format!("append insert: {e}")))?;
+                sqlx::query(&format!("DROP TABLE {}", self.staging_t))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("drop staging: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("append commit: {e}")))
+            }
+            Mode::Merge => {
+                let keys = self
+                    .merge_keys
+                    .iter()
+                    .map(|k| quote_ident(k))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let cols = self
+                    .col_names
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let updates = self
+                    .col_names
+                    .iter()
+                    .filter(|c| !self.merge_keys.contains(c))
+                    .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let action = if updates.is_empty() {
+                    "DO NOTHING".to_string()
+                } else {
+                    format!("DO UPDATE SET {updates}")
+                };
+                // Parallel spans share no snapshot: a row UPDATEd mid-run can land
+                // in staging twice (old and new version) and ON CONFLICT refuses to
+                // touch the same row twice. Dedupe deterministically — keep the
+                // highest cursor value per key.
+                let order = match &self.cursor_col {
+                    Some(c) => format!("{keys}, {} DESC", quote_ident(c)),
+                    None => keys.clone(),
+                };
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("merge begin: {e}")))?;
+                sqlx::query(&format!(
+                    "INSERT INTO {} ({cols}) \
+                     SELECT DISTINCT ON ({keys}) {cols} FROM {} ORDER BY {order} \
+                     ON CONFLICT ({keys}) {action}",
+                    self.final_t, self.staging_t
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Transfer(format!("merge upsert: {e}")))?;
+                sqlx::query(&format!("DROP TABLE {}", self.staging_t))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("drop staging: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("merge commit: {e}")))
+            }
+        }
     }
 }
 

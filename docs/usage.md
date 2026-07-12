@@ -123,6 +123,60 @@ Pass `cursor="some_int_column"` to split on any other numeric column (works for
 non-PK columns; rows where the cursor is NULL are not covered by range predicates —
 prefer NOT NULL columns).
 
+## Incremental sync (append & merge)
+
+```python
+# only rows past the destination's current max(cursor) — stateless watermark
+apitap.transfer(src, dst, table="public.events", mode="append")
+
+# upsert changed + new rows by the destination's PRIMARY KEY
+apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_at")
+```
+
+- **The watermark is the destination data itself** — `max(cursor)` is read from the
+  destination before each run. No state files, no meta tables, nothing to lose or
+  drift; re-running after any failure is safe.
+- **`append`** loads rows with `cursor >` watermark and lands them atomically
+  (Postgres: one transaction; ClickHouse: a metadata-only partition attach — the
+  append-mode sibling of `EXCHANGE TABLES`). Cost is proportional to the delta, not
+  the table: 1M new rows appended onto a 10M-row table in ~10 s.
+- **`merge`** (Postgres destinations) loads rows with `cursor >=` watermark and
+  upserts them by the destination's PRIMARY KEY (`INSERT … ON CONFLICT DO UPDATE`,
+  deduplicated per key on the highest cursor value). Use a `last_updated`-style
+  cursor so updated rows re-enter the delta.
+- **Bootstrap**: if the destination table doesn't exist, the run is a full replace —
+  and a merge bootstrap also recreates the source's PRIMARY KEY on the destination
+  so the next run can upsert.
+- **Cursors** may be integer or date/time columns. Integer cursors parallelize the
+  delta over ranges; timestamp cursors parallelize via Postgres TID ranges (other
+  sources read the delta in one stream — deltas are small).
+- **Schema drift** (source columns ≠ destination columns) fails with a clear error;
+  run once with `mode="replace"` to realign.
+
+### Incremental semantics you must know
+
+- **Append assumes the cursor is monotonic with COMMIT order.** Cursor values are
+  assigned before commit — a transaction that commits late with a lower id/timestamp
+  than an already-loaded row is *permanently skipped* by `cursor > watermark`. This
+  is inherent to stateless cursor incremental (every such tool shares it). For
+  update-prone or concurrently-written tables, prefer `merge` with a fine-grained
+  `updated_at` cursor, or schedule runs with a safety lag behind the writers.
+- **Same-cursor ties**: `append`'s strict `>` skips rows that share the exact
+  watermark value but arrive later — don't use coarse cursors (`date`, second-
+  precision timestamps under heavy write rates) with append; `merge`'s `>=` re-reads
+  the boundary and dedupes instead.
+- **Rows with a NULL cursor are never synced** by incremental modes.
+- **ClickHouse**: incremental requires ClickHouse ≥ 23.6 (the session timezone is
+  pinned to UTC so naive-datetime watermarks are frame-exact on any server timezone).
+  `merge` on ClickHouse is not supported yet.
+- Parallel delta spans don't share a snapshot: a row updated *while the run reads*
+  can appear in two spans. `merge` dedupes this; under `append`, treat the source
+  table as insert-only (that's what append is for).
+- On replace, index/constraint/grant restore runs *after* the atomic swap — a crash
+  in that narrow window loses the captured DDL (the data is intact). Column DEFAULTs,
+  identity ownership, triggers, RLS policies, and grants invisible to the connecting
+  role are not preserved.
+
 ## Durability
 
 `durable=False` (Postgres destinations only) loads through an **UNLOGGED** staging

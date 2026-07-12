@@ -4,7 +4,8 @@
 
 use crate::driver::Loader;
 use crate::error::{Error, Result};
-use crate::plan::{Delivered, Lane, TablePlan, WireFormat};
+use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
+use crate::Mode;
 
 /// A ClickHouse HTTP endpoint parsed from a `clickhouse://user:pass@host:port/db` URL
 /// (`clickhouse+https://` or port 8443 → TLS; port defaults to 8123).
@@ -47,11 +48,17 @@ impl ChConn {
     /// Common query params. `wait_end_of_query=1` buffers the response until the
     /// statement fully completed, so the HTTP status is trustworthy (otherwise an
     /// insert can fail after a 200 was already sent).
-    fn params<'a>(&'a self, extra: &'a str) -> [(&'a str, &'a str); 4] {
+    fn params<'a>(&'a self, extra: &'a str) -> [(&'a str, &'a str); 5] {
         [
             ("database", self.database.as_str()),
             ("wait_end_of_query", "1"),
             ("date_time_input_format", "best_effort"),
+            // Naive datetimes travel as-if-UTC on the binary lanes; pinning the
+            // session makes the text lane parse AND `toString(max(cursor))` render in
+            // the same frame — otherwise a non-UTC ClickHouse server shifts the
+            // incremental watermark by its offset (silent loss or duplicates).
+            // Requires ClickHouse ≥ 23.6.
+            ("session_timezone", "UTC"),
             ("query", extra),
         ]
     }
@@ -64,7 +71,7 @@ impl ChConn {
             .client
             .post(&self.base)
             .basic_auth(&self.user, Some(&self.password))
-            .query(&self.params("")[..3])
+            .query(&self.params("")[..4])
             .body(query.to_string())
             .send()
             .await
@@ -145,6 +152,8 @@ pub(crate) struct ChSink {
     ch: ChConn,
     final_t: String,
     staging_t: String,
+    /// Unquoted final table name, for system.tables/system.columns lookups.
+    final_bare: String,
     /// `INSERT INTO staging FORMAT …`, fixed at prepare time.
     insert_sql: String,
 }
@@ -158,6 +167,7 @@ impl ChSink {
             ch: ChConn::parse(url)?,
             final_t: ch_ident(dest_bare),
             staging_t: ch_ident(&format!("{dest_bare}__apitap_staging")),
+            final_bare: dest_bare.to_string(),
             insert_sql: String::new(),
         })
     }
@@ -183,7 +193,13 @@ impl crate::driver::Sink for ChSink {
         }
     }
 
-    async fn prepare(&mut self, plan: &TablePlan, lane: &Lane, _durable: bool) -> Result<()> {
+    async fn prepare(
+        &mut self,
+        plan: &TablePlan,
+        lane: &Lane,
+        _durable: bool,
+        _mode: Mode,
+    ) -> Result<()> {
         let ddl_list = plan
             .cols
             .iter()
@@ -236,8 +252,84 @@ impl crate::driver::Sink for ChSink {
             .unwrap_or(0))
     }
 
-    async fn finalize(&self, rows: u64) -> Result<()> {
-        // Atomic swap-in; a 0-row source leaves any existing destination untouched.
+    async fn dest_state(
+        &mut self,
+        plan: &TablePlan,
+        mode: Mode,
+        cursor: &str,
+    ) -> Result<DestState> {
+        if mode == Mode::Merge {
+            return Err(Error::InvalidInput(
+                "merge is not supported for ClickHouse destinations yet — use append, \
+                 or replace with a ReplacingMergeTree downstream"
+                    .into(),
+            ));
+        }
+        let lit = self.final_bare.replace('\\', "\\\\").replace('\'', "\\'");
+        let exists = self
+            .ch
+            .exec(&format!(
+                "SELECT count() FROM system.tables \
+                 WHERE database = currentDatabase() AND name = '{lit}'"
+            ))
+            .await?
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| Error::Transfer(format!("dest lookup parse: {e}")))?
+            > 0;
+        if !exists {
+            return Ok(DestState {
+                exists: false,
+                watermark: None,
+            });
+        }
+        let dest_cols: Vec<String> = self
+            .ch
+            .exec(&format!(
+                "SELECT name FROM system.columns \
+                 WHERE database = currentDatabase() AND table = '{lit}' ORDER BY position"
+            ))
+            .await?
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        let src_cols: Vec<String> = plan.cols.iter().map(|c| c.name.clone()).collect();
+        if dest_cols != src_cols {
+            return Err(Error::InvalidInput(format!(
+                "destination columns {dest_cols:?} don't match the source {src_cols:?} — \
+                 run once with mode='replace' to realign the schema"
+            )));
+        }
+        let n: u64 = self
+            .ch
+            .exec(&format!("SELECT count() FROM {}", self.final_t))
+            .await?
+            .trim()
+            .parse()
+            .map_err(|e| Error::Transfer(format!("dest count parse: {e}")))?;
+        let watermark = if n == 0 {
+            None // max() of an empty ClickHouse table returns the type's zero, not NULL
+        } else {
+            Some(
+                self.ch
+                    .exec(&format!(
+                        "SELECT toString(max({})) FROM {}",
+                        ch_ident(cursor),
+                        self.final_t
+                    ))
+                    .await?
+                    .trim()
+                    .to_string(),
+            )
+        };
+        Ok(DestState {
+            exists: true,
+            watermark,
+        })
+    }
+
+    async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        // 0-row guard, every mode.
         if rows == 0 {
             let _ = self
                 .ch
@@ -245,22 +337,46 @@ impl crate::driver::Sink for ChSink {
                 .await;
             return Ok(());
         }
-        self.ch
-            .exec(&format!(
-                "CREATE TABLE IF NOT EXISTS {} AS {}",
-                self.final_t, self.staging_t
-            ))
-            .await?;
-        self.ch
-            .exec(&format!(
-                "EXCHANGE TABLES {} AND {}",
-                self.staging_t, self.final_t
-            ))
-            .await?;
-        self.ch
-            .exec(&format!("DROP TABLE {}", self.staging_t))
-            .await?;
-        Ok(())
+        match mode {
+            Mode::Replace => {
+                self.ch
+                    .exec(&format!(
+                        "CREATE TABLE IF NOT EXISTS {} AS {}",
+                        self.final_t, self.staging_t
+                    ))
+                    .await?;
+                self.ch
+                    .exec(&format!(
+                        "EXCHANGE TABLES {} AND {}",
+                        self.staging_t, self.final_t
+                    ))
+                    .await?;
+                self.ch
+                    .exec(&format!("DROP TABLE {}", self.staging_t))
+                    .await?;
+                Ok(())
+            }
+            Mode::Append => {
+                // Metadata-only part attach — the append-mode sibling of EXCHANGE:
+                // near-instant and atomic per partition (our tables are unpartitioned,
+                // so 'all' is the single partition). Requires identical structure and
+                // ORDER BY, which staging shares with any table this engine created;
+                // a hand-made destination that differs fails here loudly.
+                self.ch
+                    .exec(&format!(
+                        "ALTER TABLE {} ATTACH PARTITION ID 'all' FROM {}",
+                        self.final_t, self.staging_t
+                    ))
+                    .await?;
+                self.ch
+                    .exec(&format!("DROP TABLE {}", self.staging_t))
+                    .await?;
+                Ok(())
+            }
+            Mode::Merge => Err(Error::InvalidInput(
+                "merge is not supported for ClickHouse destinations yet".into(),
+            )),
+        }
     }
 }
 
