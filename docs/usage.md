@@ -189,6 +189,29 @@ every type Postgres can COPY, including extension types.
 
 Unsupported source types fail **at probe time** with the type named — never mid-copy.
 
+## Schema changes
+
+There is nothing to configure: **every transfer re-derives the schema from the
+source**. The staging table is built from a fresh catalog probe, so added columns,
+dropped columns, renames, and type changes all propagate on the next run — the
+destination is always an exact mirror of the source's current schema. (Tools that
+append into existing tables need "schema evolution" machinery; replace semantics
+make the problem disappear.)
+
+Three honest caveats:
+
+- **Dependent views (Postgres destinations)**: the atomic swap `DROP`s the old
+  table, which Postgres refuses if views depend on it. The transfer fails *safely*
+  (old table and staging both intact) — drop/recreate dependent views around the
+  load for now.
+- **Indexes, constraints, and grants on the destination are not carried over** —
+  staging is created bare, so the swapped-in table has none of the old table's
+  indexes or permissions. Recreate them after the load (loading bare + building
+  indexes afterwards is also faster than loading into an indexed table).
+- Incremental sync (on the roadmap) will need real drift handling; today's
+  replace-based behavior is documented here precisely so that design can be honest
+  about the difference.
+
 ## Guarantees
 
 - **Atomic** — readers of the destination never see a partial load; a mid-run
