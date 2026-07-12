@@ -19,6 +19,9 @@ dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://apitap.dev"
+Repository = "https://github.com/apitap/apitap-lib"
+Documentation = "https://github.com/apitap/apitap-lib/blob/main/docs/usage.md"
+Benchmarks = "https://github.com/apitap/apitap-lib/blob/main/benchmarks/README.md"
 
 [tool.maturin]
 module-name = "apitap._apitap"

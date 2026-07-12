@@ -22,6 +22,11 @@ report = apitap.transfer(
 print(f"{report.rows:,} rows in {report.elapsed_ms} ms over {report.parallel} pipes")
 ```
 
+## Documentation
+
+The full usage guide — connection URLs, every option, per-route type mappings,
+durability semantics, troubleshooting — lives in [docs/usage.md](docs/usage.md).
+
 ## Why it's fast
 
 - **No per-row decode.** Postgres→Postgres pipes raw `COPY (FORMAT binary)` bytes

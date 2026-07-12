@@ -44,20 +44,29 @@ def transfer(
 ) -> TransferReport:
     """Copy ``table`` from ``src`` to ``dst``, atomically replacing the destination table.
 
-    Raw ``COPY (FORMAT binary)`` passthrough — no per-row decode — through N concurrent
-    range pipes, staged and swapped in a single transaction. Atomic (readers never see a
-    partial load), 0-row-guarded (an empty source never wipes a good table), and
-    memory-bounded (streams with TCP backpressure).
+    The URL schemes pick the route — ``postgres://``/``postgresql://``, ``mysql://``
+    sources; ``postgres://``, ``clickhouse://`` (``clickhouse+https://`` for TLS)
+    destinations — and each pair negotiates its fastest wire format (raw binary COPY
+    passthrough, in-flight RowBinary transcode, or raw wire decode). N concurrent
+    range pipes feed a staging table that is swapped in atomically. Atomic (readers
+    never see a partial load), 0-row-guarded (an empty source never wipes a good
+    table), and memory-bounded (streams with TCP backpressure).
+
+    Full guide: https://github.com/apitap/apitap-lib/blob/main/docs/usage.md
 
     Args:
-        src: Source Postgres DSN, e.g. ``postgres://user:pass@host:5432/db``.
-        dst: Destination Postgres DSN.
+        src: Source URL, e.g. ``postgres://user:pass@host:5432/db`` or
+            ``mysql://user:pass@host:3306/db``.
+        dst: Destination URL (Postgres or ClickHouse).
         table: Source table, optionally schema-qualified (``public.events``).
         dest_table: Destination table; defaults to ``table``.
-        parallel: Concurrent range pipes; default auto (CPU count, clamped 1–8).
+        parallel: Concurrent range pipes; default auto — a route-specific CPU
+            heuristic capped by the cgroup's memory limit. An explicit value is
+            never overridden.
         cursor: Numeric column to range-split on; default auto-detects the integer
-            primary key. With no usable cursor the copy runs single-stream.
-        chunk_bytes: Bytes coalesced per COPY send (default 4 MiB).
+            primary key. PK-less Postgres tables fall back to TID ranges; other
+            sources to a single stream.
+        chunk_bytes: Bytes coalesced per send (default 4 MiB).
         durable: Postgres destinations only. ``False`` loads through an UNLOGGED
             table — skipping WAL roughly halves the destination's write cost — and the
             swapped-in table REMAINS unlogged: Postgres truncates it during crash

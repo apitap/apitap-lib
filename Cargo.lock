@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "apitap-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "apitap-python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "apitap-core",
  "pyo3",
