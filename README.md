@@ -24,6 +24,8 @@ print(f"{report.rows:,} rows in {report.elapsed_ms} ms over {report.parallel} pi
 
 ## Documentation
 
+**📰 Launch post:** [*I moved 10 million rows in 9.9 seconds with pip install apitap — and learned why your ELT benchmark is probably lying to you*](https://medium.com/p/i-moved-10-million-rows-in-9-9-seconds-with-pip-install-apitap-e3c6a826b253) — the origin story, the full showdown vs ingestr and dlt, and three lessons about "rows per hour".
+
 The full usage guide — connection URLs, every option, per-route type mappings,
 durability semantics, troubleshooting — lives in [docs/usage.md](docs/usage.md).
 
