@@ -247,6 +247,15 @@ server-side, outside the measured pipeline. apitap on the same single table move
 **~1.6 TB/hour** (4.41 GB in 9.9 s) — ~23× their headline per byte, untuned, from the
 published wheel.
 
+### Scale check — 100M rows / 46 GB, one transfer (2026-07-12)
+
+To make the throughput claim honest beyond a 10-second burst, the pg→ch route was
+re-run at 10× the size: 100M rows (46.4 GB by `pg_table_size`, same 464-byte rows),
+apitap installed from PyPI, same 16 vCPU / 4 GB cap. **139.2 s, 32 pipes,
+checksum-MATCH — a measured 1.2 TB/hour**, sustained past the source's page cache
+(the 10M table fits in RAM; this one doesn't, so real disk reads are included).
+Row-rate: ~2.6 billion rows/hour.
+
 ### M2 Pro laptop, uncapped (2026-07-10)
 
 MacBook M2 Pro (10 cores / 16 GB), docker PG, no resource caps, 100k rows, warm
