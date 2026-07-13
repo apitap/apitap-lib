@@ -133,9 +133,30 @@ apitap.transfer(src, dst, table="public.events", mode="append")
 apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_at")
 ```
 
-- **The watermark is the destination data itself** — `max(cursor)` is read from the
-  destination before each run. No state files, no meta tables, nothing to lose or
-  drift; re-running after any failure is safe.
+- **The watermark lives in `_apitap_state`, a small table in the destination
+  database** — one row per (destination table, source), holding the exact
+  `max(cursor)` value of the last successful load, the mode, row count, and sync
+  time. On Postgres it is written **in the same transaction** as the data, so state
+  and data can never drift apart; because it lives in the destination DB it is also
+  backed up and restored *together with* the data (restore from a backup and the
+  watermark rewinds with it). The source key is credential-free
+  (`postgres://host:5432/db::table`). Per-source rows make fan-in safe: two sources
+  appending into one table keep independent watermarks. If the state row is missing
+  (tables built by older versions, or by plain replace), the run falls back once to
+  deriving the watermark from the data and writes the row.
+- Because the watermark comes from the state row — not from `max()` over the data —
+  **other processes may write to the destination table without corrupting the
+  sync**.
+- **Resets behave sanely**: `mode="replace"` clears every state row for the
+  destination (all sources — the swap destroyed their rows too), and a `TRUNCATE`d
+  destination is treated as watermark-less (full resync on the next incremental
+  run). Adding a *second* source to a destination that already has state rows
+  requires an explicit choice — the run fails loudly instead of guessing a
+  watermark; seed a state row manually or rebuild with replace.
+- Avoid running two syncs of the same (source, destination) pair concurrently —
+  they would each read the same watermark and land the same delta twice. (The
+  ClickHouse state table is a `ReplacingMergeTree`; it self-compacts old state
+  versions in the background.)
 - **`append`** loads rows with `cursor >` watermark and lands them atomically
   (Postgres: one transaction; ClickHouse: a metadata-only partition attach — the
   append-mode sibling of `EXCHANGE TABLES`). Cost is proportional to the delta, not
@@ -168,7 +189,10 @@ apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_a
 - **Rows with a NULL cursor are never synced** by incremental modes.
 - **ClickHouse**: incremental requires ClickHouse ≥ 23.6 (the session timezone is
   pinned to UTC so naive-datetime watermarks are frame-exact on any server timezone).
-  `merge` on ClickHouse is not supported yet.
+  `merge` on ClickHouse is not supported yet. The state row can't be written
+  atomically with the partition attach, so the effective watermark is the GREATEST
+  of the state row and the data — a crash between the two merely re-reads a bounded
+  delta, never skips ahead.
 - Parallel delta spans don't share a snapshot: a row updated *while the run reads*
   can appear in two spans. `merge` dedupes this; under `append`, treat the source
   table as insert-only (that's what append is for).

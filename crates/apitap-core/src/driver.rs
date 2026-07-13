@@ -132,6 +132,7 @@ pub(crate) trait Sink: Sized + Send + Sync {
         plan: &TablePlan,
         mode: Mode,
         cursor: &str,
+        source_id: &str,
     ) -> impl Future<Output = Result<DestState>> + Send;
     /// Land the staged rows: `Replace` = atomic swap; `Append` = move staged rows into
     /// the existing table; `Merge` = upsert them by primary key. When `rows == 0`,
@@ -139,6 +140,41 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// mode. `mode` here is the EFFECTIVE mode (a bootstrapped incremental run gets
     /// `Replace`).
     fn finalize(&self, rows: u64, mode: Mode) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Credential-free source identity for the destination's state table:
+/// `scheme://host:port/db::table`. NEVER includes userinfo.
+pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
+    match reqwest::Url::parse(src_url) {
+        Ok(u) => {
+            // Normalize so equivalent URLs yield ONE identity — a scheme alias or an
+            // elided default port must not silently fork the watermark.
+            let scheme = match u.scheme() {
+                "postgresql" => "postgres",
+                other => other,
+            };
+            let host = u.host_str().unwrap_or("unknown");
+            let port = u.port().unwrap_or(match scheme {
+                "postgres" => 5432,
+                "mysql" => 3306,
+                _ => 0,
+            });
+            let db = u.path().trim_matches('/');
+            // Qualify the table half so 'events' and 'public.events' (the same
+            // Postgres table) share one identity.
+            let table = if scheme == "postgres" && !table.contains('.') {
+                format!("public.{table}")
+            } else {
+                table.to_string()
+            };
+            format!("{scheme}://{host}:{port}/{db}::{table}")
+        }
+        // Defensive: strip anything before '@' so credentials can never leak.
+        Err(_) => format!(
+            "{}::{table}",
+            src_url.rsplit('@').next().unwrap_or("unknown")
+        ),
+    }
 }
 
 /// Is this source type usable as an incremental cursor, and does its SQL literal
@@ -196,6 +232,7 @@ pub(crate) async fn run<S: Source, K: Sink>(
     chunk: usize,
     parallel: usize,
     started: std::time::Instant,
+    source_id: &str,
 ) -> Result<TransferReport> {
     let mut plan = src.probe(table).await?;
     plan.cursor = opts.cursor.clone().or_else(|| plan.single_int_pk());
@@ -218,7 +255,7 @@ pub(crate) async fn run<S: Source, K: Sink>(
             Error::InvalidInput(format!("cursor column '{cursor}' not in source table"))
         })?;
         let quoted = cursor_literal_quoted(&col.udt)?;
-        let st = sink.dest_state(&plan, mode, &cursor).await?;
+        let st = sink.dest_state(&plan, mode, &cursor, source_id).await?;
         if !st.exists {
             mode = Mode::Replace; // first run: bootstrap the table with a full load
         } else if let Some(wm) = st.watermark {
@@ -286,6 +323,22 @@ pub(crate) async fn run<S: Source, K: Sink>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_identity_is_normalized_and_credential_free() {
+        let a = source_identity("postgres://user:s3cret@db.example:5432/prod", "public.t");
+        let b = source_identity("postgresql://other:pw@db.example/prod", "public.t");
+        assert_eq!(a, b); // scheme alias + elided default port normalize away
+        assert_eq!(a, "postgres://db.example:5432/prod::public.t");
+        // unqualified and public-qualified Postgres tables share one identity
+        assert_eq!(
+            source_identity("postgres://x:y@h/db", "t"),
+            source_identity("postgres://h/db", "public.t")
+        );
+        assert!(!a.contains("s3cret") && !a.contains("user"));
+        let m = source_identity("mysql://root:pw@127.0.0.1/bench", "events");
+        assert_eq!(m, "mysql://127.0.0.1:3306/bench::events");
+    }
 
     #[test]
     fn spans_cover_the_range_without_overlap() {
