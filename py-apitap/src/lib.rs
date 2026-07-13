@@ -16,7 +16,7 @@ fn rt() -> &'static Runtime {
 
 /// Returns `(rows, elapsed_ms, parallel)`; the Python wrapper turns it into a report.
 #[pyfunction]
-#[pyo3(signature = (src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace"))]
+#[pyo3(signature = (src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None))]
 #[allow(clippy::too_many_arguments)]
 fn transfer(
     py: Python<'_>,
@@ -29,6 +29,9 @@ fn transfer(
     chunk_bytes: Option<usize>,
     durable: bool,
     mode: &str,
+    engine: Option<String>,
+    order_by: Option<String>,
+    on_cluster: Option<String>,
 ) -> PyResult<(u64, u64, usize)> {
     let mode: apitap_core::Mode = mode
         .parse()
@@ -40,6 +43,9 @@ fn transfer(
         chunk_bytes: chunk_bytes.unwrap_or(4 * 1024 * 1024),
         durable,
         mode,
+        engine,
+        order_by,
+        on_cluster,
     };
     let out = py.allow_threads(|| rt().block_on(apitap_core::transfer(&src, &dst, &table, &opts)));
     match out {

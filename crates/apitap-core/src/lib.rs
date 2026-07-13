@@ -89,6 +89,20 @@ pub struct TransferOptions {
     pub durable: bool,
     /// Replace (default), incremental append, or incremental merge — see [`Mode`].
     pub mode: Mode,
+    /// ClickHouse destinations only: engine of the table apitap creates, any
+    /// MergeTree-family spelling incl. Replicated, e.g.
+    /// `"ReplacingMergeTree(ins_dt)"` or
+    /// `"ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/db/t', '{replica}', v)"`.
+    /// `None` = plain `MergeTree`. Ignored when the destination table already exists
+    /// (the existing table is the structural authority).
+    pub engine: Option<String>,
+    /// ClickHouse destinations only: ORDER BY clause of the created table
+    /// (e.g. `"id"` or `"client_id, id"`). `None` = the cursor column, else `tuple()`.
+    pub order_by: Option<String>,
+    /// ClickHouse destinations only: run the final table's DDL `ON CLUSTER` this
+    /// cluster. Requires a `Replicated*` engine (data reaches other replicas through
+    /// replication, not through the insert).
+    pub on_cluster: Option<String>,
 }
 
 impl Default for TransferOptions {
@@ -100,6 +114,9 @@ impl Default for TransferOptions {
             chunk_bytes: 4 * 1024 * 1024,
             durable: true,
             mode: Mode::Replace,
+            engine: None,
+            order_by: None,
+            on_cluster: None,
         }
     }
 }
@@ -200,6 +217,18 @@ pub async fn transfer(
     let dst_scheme = dst_url.split("://").next().unwrap_or("");
     let dest_table = opts.dest_table.as_deref().unwrap_or(table);
     let source_id = driver::source_identity(src_url, table);
+    if !matches!(dst_scheme, "clickhouse" | "clickhouse+https")
+        && (opts.engine.is_some() || opts.order_by.is_some() || opts.on_cluster.is_some())
+    {
+        return Err(Error::InvalidInput(
+            "engine/order_by/on_cluster only apply to ClickHouse destinations".into(),
+        ));
+    }
+    let ch_ddl = connectors::clickhouse::ChDdl {
+        engine: opts.engine.clone(),
+        order_by: opts.order_by.clone(),
+        on_cluster: opts.on_cluster.clone(),
+    };
 
     match (src_scheme, dst_scheme) {
         ("postgres" | "postgresql", "postgres" | "postgresql") => {
@@ -222,7 +251,7 @@ pub async fn transfer(
             };
             let (chunk, parallel) = driver::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
-            let sink = ChSink::connect(dst_url, dest_table)?;
+            let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
             driver::run(
                 src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
             )
@@ -235,7 +264,7 @@ pub async fn transfer(
             };
             let (chunk, parallel) = driver::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, parallel + 1).await?;
-            let sink = ChSink::connect(dst_url, dest_table)?;
+            let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
             driver::run(
                 src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
             )
