@@ -127,9 +127,13 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// a clear error, never a silent mis-append), (b) reject unsupported modes early
     /// (e.g. merge on ClickHouse), and (c) stash whatever finalize will need (merge
     /// keys). Never called for `Mode::Replace`.
+    /// May also CONFORM the plan to the existing destination (e.g. ClickHouse
+    /// mirrors the dest's column nullability so staging's structure matches for
+    /// ATTACH — a view-sourced plan reports everything nullable, but the dest is
+    /// the structural authority once it exists).
     fn dest_state(
         &mut self,
-        plan: &TablePlan,
+        plan: &mut TablePlan,
         mode: Mode,
         cursor: &str,
         source_id: &str,
@@ -255,7 +259,7 @@ pub(crate) async fn run<S: Source, K: Sink>(
             Error::InvalidInput(format!("cursor column '{cursor}' not in source table"))
         })?;
         let quoted = cursor_literal_quoted(&col.udt)?;
-        let st = sink.dest_state(&plan, mode, &cursor, source_id).await?;
+        let st = sink.dest_state(&mut plan, mode, &cursor, source_id).await?;
         if !st.exists {
             mode = Mode::Replace; // first run: bootstrap the table with a full load
         } else if let Some(wm) = st.watermark {

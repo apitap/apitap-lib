@@ -100,6 +100,9 @@ impl ChConn {
             .query(&[
                 ("min_insert_block_size_rows", "1048576"),
                 ("min_insert_block_size_bytes", "536870912"),
+                // The text lane must fail on \\N into a non-Nullable column exactly
+                // like the RowBinary lane does — never coerce NULL to 0/''.
+                ("input_format_null_as_default", "0"),
             ])
             .body(body)
             .send()
@@ -120,6 +123,73 @@ impl ChConn {
 /// `` ` ``-quote a ClickHouse identifier.
 pub(crate) fn ch_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "\\`"))
+}
+
+/// Strip wrappers/metadata that don't change the wire encoding so an existing
+/// destination column can be compared against what this source delivers:
+/// Nullable/LowCardinality are transparent in RowBinary, and timezone on
+/// DateTime/DateTime64 is display metadata (values are epoch-based; text
+/// parsing is pinned by session_timezone=UTC).
+fn ch_strip_wrappers(t: &str) -> &str {
+    let mut t = t.trim();
+    loop {
+        let mut stripped = false;
+        for w in ["Nullable(", "LowCardinality("] {
+            if let Some(rest) = t.strip_prefix(w).and_then(|r| r.strip_suffix(')')) {
+                t = rest;
+                stripped = true;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    t
+}
+
+/// Column-level nullability regardless of wrapper order — ClickHouse spells the
+/// idiomatic form `LowCardinality(Nullable(T))` with Nullable INSIDE, and the
+/// RowBinary null-flag byte follows the Nullable, not the outermost wrapper.
+fn ch_wrapped_nullable(t: &str) -> bool {
+    let mut t = t.trim();
+    while let Some(rest) = t
+        .strip_prefix("LowCardinality(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        t = rest;
+    }
+    t.starts_with("Nullable(")
+}
+
+/// The explicit timezone argument of a DateTime/DateTime64 column, if any.
+fn ch_explicit_tz(t: &str) -> Option<String> {
+    let t = ch_strip_wrappers(t);
+    let args = t
+        .strip_prefix("DateTime64(")
+        .or_else(|| t.strip_prefix("DateTime("))
+        .and_then(|r| r.strip_suffix(')'))?;
+    args.split(',')
+        .map(str::trim)
+        .find_map(|a| a.strip_prefix('\'')?.strip_suffix('\'').map(str::to_string))
+}
+
+fn ch_base_type(t: &str) -> String {
+    let t = ch_strip_wrappers(t);
+    if let Some(args) = t
+        .strip_prefix("DateTime64(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let precision = args.split(',').next().unwrap_or(args).trim();
+        return format!("DateTime64({precision})");
+    }
+    if t.starts_with("DateTime") && !t.starts_with("DateTime64") {
+        return "DateTime".to_string();
+    }
+    // Bool and UInt8 share the RowBinary wire format — don't reject one for the other.
+    if t == "Bool" {
+        return "UInt8".to_string();
+    }
+    t.to_string()
 }
 
 /// Pick the higher of two watermarks. For numeric cursors the compare is numeric;
@@ -213,6 +283,12 @@ pub(crate) struct ChSink {
     source_id: Option<String>,
     cursor_col: Option<String>,
     mode_str: &'static str,
+    /// (name, type) of the EXISTING destination — staging mirrors it verbatim so
+    /// the append ATTACH can never hit INCOMPATIBLE_COLUMNS.
+    dest_structure: Vec<(String, String)>,
+    /// Sorting/primary keys of the existing destination (ATTACH requires them equal).
+    dest_sorting_key: Option<String>,
+    dest_primary_key: Option<String>,
     /// `INSERT INTO staging FORMAT …`, fixed at prepare time.
     insert_sql: String,
 }
@@ -230,6 +306,9 @@ impl ChSink {
             source_id: None,
             cursor_col: None,
             mode_str: "replace",
+            dest_structure: Vec::new(),
+            dest_sorting_key: None,
+            dest_primary_key: None,
             insert_sql: String::new(),
         })
     }
@@ -262,31 +341,78 @@ impl crate::driver::Sink for ChSink {
         _durable: bool,
         _mode: Mode,
     ) -> Result<()> {
-        let ddl_list = plan
-            .cols
-            .iter()
-            .zip(lane.cols.iter())
-            .map(|(c, lc)| {
-                let ty = ch_type_of(&lc.delivered);
-                let ty = if c.nullable {
-                    format!("Nullable({ty})")
-                } else {
-                    ty
-                };
-                format!("{} {}", ch_ident(&c.name), ty)
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let order_by = plan
-            .cursor
+        let ddl_list = if self.dest_structure.is_empty() {
+            plan.cols
+                .iter()
+                .zip(lane.cols.iter())
+                .map(|(c, lc)| {
+                    let ty = ch_type_of(&lc.delivered);
+                    let ty = if c.nullable {
+                        format!("Nullable({ty})")
+                    } else {
+                        ty
+                    };
+                    format!("{} {}", ch_ident(&c.name), ty)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            // Appending into an existing table: staging mirrors the destination
+            // verbatim so ATTACH PARTITION sees an identical structure. The bytes
+            // we send must still parse as those types — check base types up front
+            // instead of corrupting data or hitting INCOMPATIBLE_COLUMNS later.
+            for (lc, (name, dest_ty)) in lane.cols.iter().zip(self.dest_structure.iter()) {
+                let want = ch_type_of(&lc.delivered);
+                if ch_base_type(dest_ty) != ch_base_type(&want) {
+                    return Err(Error::InvalidInput(format!(
+                        "destination column {name} is {dest_ty} but this source delivers \
+                         {want} — align the destination type or run once with mode='replace'"
+                    )));
+                }
+                // The text lane parses offset-less timestamps in the COLUMN's
+                // timezone (the session pin only covers tz-less columns) — every
+                // stored instant would silently shift.
+                if lane.format == WireFormat::TabSeparated
+                    && lc.delivered == (Delivered::DateTime { utc: false })
+                    && ch_explicit_tz(dest_ty).is_some_and(|tz| tz != "UTC")
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "destination column {name} is {dest_ty}: this transfer uses \
+                         the text lane, which would parse naive timestamps in that \
+                         timezone and shift every value — declare the column \
+                         DateTime64(6) or DateTime64(6, 'UTC')"
+                    )));
+                }
+            }
+            self.dest_structure
+                .iter()
+                .map(|(n, t)| format!("{} {}", ch_ident(n), t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // ATTACH PARTITION FROM requires equal sorting/primary keys, so a mirrored
+        // staging table must copy the destination's keys, not guess from the cursor.
+        let order_by = match self.dest_sorting_key.as_deref() {
+            Some("") => "tuple()".to_string(),
+            Some(keys) => format!("({keys})"),
+            None => plan
+                .cursor
+                .as_deref()
+                .map_or("tuple()".to_string(), ch_ident),
+        };
+        let primary_key = self
+            .dest_primary_key
             .as_deref()
-            .map_or("tuple()".to_string(), ch_ident);
+            .filter(|pk| Some(*pk) != self.dest_sorting_key.as_deref())
+            .map(|pk| format!(" PRIMARY KEY ({pk})"))
+            .unwrap_or_default();
         self.ch
             .exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
             .await?;
         self.ch
             .exec(&format!(
-                "CREATE TABLE {} ({ddl_list}) ENGINE = MergeTree ORDER BY {order_by}",
+                "CREATE TABLE {} ({ddl_list}) ENGINE = MergeTree{primary_key} \
+                 ORDER BY {order_by}",
                 self.staging_t
             ))
             .await?;
@@ -316,7 +442,7 @@ impl crate::driver::Sink for ChSink {
 
     async fn dest_state(
         &mut self,
-        plan: &TablePlan,
+        plan: &mut TablePlan,
         mode: Mode,
         cursor: &str,
         source_id: &str,
@@ -366,23 +492,85 @@ impl crate::driver::Sink for ChSink {
                 watermark: None,
             });
         }
-        let dest_cols: Vec<String> = self
+        let dest_cols: Vec<(String, String)> = self
             .ch
             .exec(&format!(
-                "SELECT name FROM system.columns \
-                 WHERE database = currentDatabase() AND table = '{lit}' ORDER BY position"
+                // TabSeparatedRaw: type strings contain quotes ('UTC') that
+                // plain TSV output would backslash-escape.
+                "SELECT name, type FROM system.columns \
+                 WHERE database = currentDatabase() AND table = '{lit}' \
+                 ORDER BY position FORMAT TabSeparatedRaw"
             ))
             .await?
             .lines()
-            .map(|l| l.to_string())
+            .filter_map(|l| {
+                l.split_once('\t')
+                    .map(|(n, t)| (n.to_string(), t.to_string()))
+            })
             .collect();
+        let dest_names: Vec<&str> = dest_cols.iter().map(|(n, _)| n.as_str()).collect();
         let src_cols: Vec<String> = plan.cols.iter().map(|c| c.name.clone()).collect();
-        if dest_cols != src_cols {
+        if dest_names != src_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
             return Err(Error::InvalidInput(format!(
-                "destination columns {dest_cols:?} don't match the source {src_cols:?} — \
+                "destination columns {dest_names:?} don't match the source {src_cols:?} — \
                  run once with mode='replace' to realign the schema"
             )));
         }
+        // The EXISTING destination is the structural authority: mirror its
+        // nullability into the plan (so the encoders agree — a view-sourced plan
+        // reports every column nullable, the pre-created destination knows better)
+        // and remember its full structure; prepare() builds staging from it verbatim
+        // so ATTACH PARTITION always sees an identical structure.
+        for (pc, (_, dest_ty)) in plan.cols.iter_mut().zip(dest_cols.iter()) {
+            pc.nullable = ch_wrapped_nullable(dest_ty);
+        }
+        // The watermark round-trips through toString(max(cursor)), which renders in
+        // the COLUMN's timezone — session_timezone only pins tz-less columns. A
+        // non-UTC cursor would poison every delta with local-time text.
+        if let Some((name, ty)) = dest_cols.iter().find(|(n, _)| n == cursor) {
+            if let Some(tz) = ch_explicit_tz(ty) {
+                if tz != "UTC" {
+                    return Err(Error::InvalidInput(format!(
+                        "destination cursor column {name} is {ty} — a non-UTC column \
+                         timezone renders the watermark as local time and silently \
+                         skips or duplicates rows; declare it DateTime64(6) or \
+                         DateTime64(6, 'UTC')"
+                    )));
+                }
+            }
+        }
+        self.dest_structure = dest_cols;
+        // ATTACH PARTITION FROM also requires matching keys, so mirror them too —
+        // and fail fast on a partitioned destination (we attach one unpartitioned
+        // part) instead of streaming everything and dying at the ATTACH.
+        let keys = self
+            .ch
+            .exec(&format!(
+                "SELECT partition_key, sorting_key, primary_key FROM system.tables \
+                 WHERE database = currentDatabase() AND name = '{lit}' \
+                 FORMAT TabSeparatedRaw"
+            ))
+            .await?;
+        let mut keys = keys.trim_end_matches('\n').split('\t');
+        let (part_key, sort_key, prim_key) = (
+            keys.next().unwrap_or("").to_string(),
+            keys.next().unwrap_or("").to_string(),
+            keys.next().unwrap_or("").to_string(),
+        );
+        if !part_key.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "destination {} has PARTITION BY ({part_key}) — append attaches a \
+                 single unpartitioned part; drop the partition key or run with \
+                 mode='replace'",
+                self.final_t
+            )));
+        }
+        self.dest_sorting_key = Some(sort_key);
+        self.dest_primary_key = if prim_key.is_empty() {
+            None
+        } else {
+            Some(prim_key)
+        };
         let n: u64 = self
             .ch
             .exec(&format!("SELECT count() FROM {}", self.final_t))
@@ -628,6 +816,47 @@ mod tests {
             .unwrap()
             .base
             .starts_with("https://"));
+    }
+
+    #[test]
+    fn base_type_strips_wrappers_and_tz() {
+        assert_eq!(ch_base_type("Nullable(Int64)"), "Int64");
+        assert_eq!(ch_base_type("LowCardinality(String)"), "String");
+        assert_eq!(ch_base_type("LowCardinality(Nullable(String))"), "String");
+        assert_eq!(ch_base_type("Bool"), ch_base_type("UInt8"));
+        assert_eq!(ch_base_type("DateTime64(6, 'UTC')"), "DateTime64(6)");
+        assert_eq!(ch_base_type("Nullable(DateTime64(6))"), "DateTime64(6)");
+        assert_eq!(ch_base_type("DateTime('Europe/Vilnius')"), "DateTime");
+        assert_eq!(ch_base_type("Decimal(38, 9)"), "Decimal(38, 9)");
+        // precision differences must NOT be smoothed over
+        assert_ne!(ch_base_type("DateTime64(3)"), ch_base_type("DateTime64(6)"));
+        assert_ne!(ch_base_type("Int32"), ch_base_type("Int64"));
+    }
+
+    #[test]
+    fn nullability_follows_the_inner_nullable() {
+        assert!(ch_wrapped_nullable("Nullable(String)"));
+        assert!(ch_wrapped_nullable("LowCardinality(Nullable(String))"));
+        assert!(!ch_wrapped_nullable("LowCardinality(String)"));
+        assert!(!ch_wrapped_nullable("Int64"));
+    }
+
+    #[test]
+    fn explicit_tz_is_extracted() {
+        assert_eq!(
+            ch_explicit_tz("DateTime64(6, 'Europe/Vilnius')").as_deref(),
+            Some("Europe/Vilnius")
+        );
+        assert_eq!(
+            ch_explicit_tz("DateTime64(6, 'UTC')").as_deref(),
+            Some("UTC")
+        );
+        assert_eq!(
+            ch_explicit_tz("Nullable(DateTime('America/New_York'))").as_deref(),
+            Some("America/New_York")
+        );
+        assert_eq!(ch_explicit_tz("DateTime64(6)"), None);
+        assert_eq!(ch_explicit_tz("Int64"), None);
     }
 
     #[test]
