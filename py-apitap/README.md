@@ -74,12 +74,14 @@ apitap.transfer(
 ) -> TransferReport      # .rows, .elapsed_ms, .parallel
 ```
 
-`mode="append"` loads only rows past the destination's current `max(cursor)` —
-the watermark is the destination data itself, so there are no state files to manage
-and any failed run is safely re-runnable. `mode="merge"` (Postgres destinations)
-upserts the delta by the destination's primary key. A 1M-row delta lands on a
-10M-row table in ~10 s — cost is proportional to the delta, not the table. See the
-usage guide for the semantics that stateless cursor incremental implies.
+`mode="append"` loads only rows past the last synced watermark; `mode="merge"`
+(Postgres destinations) upserts the delta by the destination's primary key. The
+watermark lives in **`_apitap_state`** — a plain, queryable table in the destination
+database, one row per (table, source), written **in the same transaction as the
+data** on Postgres. No local state files, no opaque blobs, no extra columns injected
+into your rows: state that is backed up, restored, and debugged together with the
+data it describes. A 1M-row delta lands on a 10M-row table in ~10 s — cost is
+proportional to the delta, not the table.
 
 The GIL is released for the whole transfer. Errors are `ValueError` for bad input
 (unknown table, unsupported type — always at probe time, never mid-copy) and
@@ -92,7 +94,7 @@ troubleshooting:
 ## Roadmap
 
 - [x] Postgres → Postgres · Postgres → ClickHouse · MySQL → ClickHouse · MySQL → Postgres
-- [x] Incremental sync — `mode="append"` / `mode="merge"` (stateless watermark)
+- [x] Incremental sync — `mode="append"` / `mode="merge"` (transactional state table)
 - [ ] `read_postgres()` → Arrow / Polars
 - [ ] Snowflake / BigQuery destinations
 - [ ] aarch64 + macOS wheels
