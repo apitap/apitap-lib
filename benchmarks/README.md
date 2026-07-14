@@ -274,11 +274,16 @@ required to MATCH Postgres before a time counts. The BigQuery project is a
 
 | tool | wall time | vs apitap | validated |
 |---|---|---|---|
-| **apitap** (this repo) | **85.1 s** | — | 9/9 MATCH |
-| ingestr 1.0.75 | 860 s | 10.1× slower | 9/9 MATCH |
-| dlt 1.x default (`sql_database`, no backend hint) | 2,160 s | 25.4× slower | 9/9 MATCH |
+| **apitap** (this repo) | **41.7 s** | — | 9/9 MATCH |
+| ingestr 1.0.75 | 860 s | 20.6× slower | 9/9 MATCH |
+| dlt 1.x default (`sql_database`, no backend hint) | 2,160 s | 51.8× slower | 9/9 MATCH |
 
-Uncapped, apitap does the same transfer in **71.2 s** over 8 pipes.
+Uncapped, apitap does the same transfer in **37.2 s** over 8 pipes.
+
+The apitap number was 85.1 s when this table was first recorded; the
+optimization pass below (same day, same environment, re-validated) halved
+it. The ingestr/dlt numbers predate that pass but their tooling didn't
+change; the ranking wasn't close either way.
 
 Scripts: [`run-bigquery.sh`](run-bigquery.sh) (all three tools, env-driven
 caps/rows/backend) + [`validate-bigquery.sh`](validate-bigquery.sh) (the 9
@@ -314,7 +319,7 @@ has billing enabled and validation queries are billed), each tool capped at
 
 | tool | outcome | validated |
 |---|---|---|
-| **apitap** | **27.4 s**, 2 pipes | 9/9 MATCH |
+| **apitap** | **16–18 s**, 2 pipes (27.4 s before the optimization pass) | 9/9 MATCH |
 | ingestr 1.0.75 | **OOM-killed** (exit 137) ~100k rows in; its own progress log read 310 MB just before the kernel killed it | no table landed |
 | dlt 1.x + pyarrow backend | **OOM-killed** (exit 137) during extract | no table landed |
 
@@ -324,6 +329,32 @@ table size, so the same 256 MB container that moves 1M rows also moves 100M.
 ingestr at 2 vCPU / 2 GB reported a 556 MB peak on the 10M run — it needs the
 headroom; at 256 MB it cannot finish 1M. Both failures were rerun once to
 capture the real exit codes; neither is a harness artifact this time.
+
+### The BigQuery optimization pass (2026-07-15) — instrument first, then cut
+
+Per-phase instrumentation (`APITAP_DEBUG=1`) on the tiny box showed the time
+was NOT where intuition said (gzip was 1.4 s): the wall was `job_wait` —
+gzip files aren't splittable, so BigQuery parsed each worker's single big
+file single-threaded while apitap sat idle. Levers, one at a time, 3 runs
+each, checksums on every configuration:
+
+1. **File rotation + background job polls** — a new load job every ~12 MiB
+   compressed, polled while the next file streams (job_wait 14–18 s → 5–9 s).
+2. **CSV instead of NDJSON** — probed live that BigQuery CSV keeps the
+   NULL vs empty-string distinction (unquoted empty = NULL, quoted `""` =
+   empty), so the reason for NDJSON was void; ~40% fewer bytes into the
+   compressor, much faster server-side parse (job_wait → 2.7–4 s).
+3. **zlib-rs gzip backend + bulk-run escape loops** (transcode −30%).
+4. **Client-side watermark** — loaders track `MAX(cursor)` during transcode;
+   one less billed query per incremental run.
+5. **Per-worker staging tables + time-gated rotation** — BigQuery allows ~5
+   metadata updates / 10 s / table; fast workers sealing 12 MiB files every
+   second tripped `rateLimitExceeded` at 10M. Each worker now loads into its
+   own staging (one multi-source copy job finalizes) and seals at
+   ≥12 MiB **and** ≥6 s (hard cap 96 MiB).
+
+Net: 10M capped 85.1 s → **41.7 s**; 10M uncapped 71.2 s → **37.2 s**;
+tiny-box 1M 27.4 s → **16–18 s**. All re-validated 9/9.
 
 ## What these runs do NOT show
 

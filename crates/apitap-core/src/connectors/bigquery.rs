@@ -38,12 +38,17 @@ const BQ_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 /// 8 MiB per PUT amortizes round-trips without holding much gzip output.
 const UPLOAD_ALIGN: usize = 256 * 1024;
 const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
-/// Rotate to a NEW load job once a file reaches this many COMPRESSED bytes.
-/// gzip isn't splittable, so BigQuery parses each file single-threaded —
-/// many modest files parallelize server-side, and finished files' jobs poll
-/// in the background while the next file is still streaming (measured: a
-/// single big file left 14-18s of dead job_wait at the end of a 1M run).
+/// Rotate to a NEW load job once a file reaches this many COMPRESSED bytes —
+/// but only if ROTATE_SECS have also passed: BigQuery allows ~5 metadata
+/// updates per 10s PER TABLE, and a fast worker sealing a 12 MiB file every
+/// second tripped rateLimitExceeded at 10M rows. The byte floor keeps files
+/// worth parsing; the time gate caps the per-staging job rate at ~2/10s; the
+/// hard cap bounds the last file's single-threaded parse tail (gzip isn't
+/// splittable — modest files parallelize server-side and their jobs poll in
+/// the background while the next file streams).
 const ROTATE_BYTES: u64 = 12 * 1024 * 1024;
+const ROTATE_SECS: u64 = 6;
+const ROTATE_HARD_BYTES: u64 = 96 * 1024 * 1024;
 const STATE_TABLE: &str = "_apitap_state";
 
 // ============================================================================
@@ -299,6 +304,31 @@ impl BqConn {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Table ids in the dataset starting with `prefix` (one page is plenty —
+    /// worker counts are small).
+    async fn tables_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let v = self
+            .api(
+                reqwest::Method::GET,
+                format!(
+                    "{BQ_BASE}/projects/{}/datasets/{}/tables?maxResults=1000",
+                    self.project, self.dataset
+                ),
+                None,
+            )
+            .await?;
+        Ok(v["tables"]
+            .as_array()
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| t["tableReference"]["tableId"].as_str())
+                    .filter(|id| id.starts_with(prefix))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn ensure_dataset(&self) -> Result<()> {
@@ -759,7 +789,14 @@ fn tsv_to_csv(
 
 pub(crate) struct BqLoader {
     conn: BqConn,
-    job_config: Arc<Value>,
+    job_config: Value,
+    /// This worker's OWN staging table: BigQuery rate-limits table update
+    /// operations PER TABLE (~1.5/s) — many workers' load jobs against one
+    /// shared staging tripped rateLimitExceeded at 10M rows. finalize copies
+    /// every worker staging into the final table in ONE copy job.
+    staging_table: String,
+    registry: Arc<std::sync::Mutex<Vec<String>>>,
+    registered: bool,
     delivered: Arc<Vec<Delivered>>,
     cursor: Option<(usize, bool)>,
     local_wm: Option<String>,
@@ -769,6 +806,7 @@ pub(crate) struct BqLoader {
     /// Completed files' jobs, polling in the background while later files
     /// stream — each resolves to its committed row count.
     pending_jobs: Vec<tokio::task::JoinHandle<Result<u64>>>,
+    last_seal: std::time::Instant,
     /// APITAP_DEBUG=1: cumulative per-phase wall time, reported at finish.
     t_transcode: std::time::Duration,
     t_gzip: std::time::Duration,
@@ -784,20 +822,28 @@ pub(crate) struct BqLoader {
 impl BqLoader {
     fn open(
         conn: BqConn,
-        job_config: Arc<Value>,
+        base_config: &Value,
+        staging_table: String,
+        registry: Arc<std::sync::Mutex<Vec<String>>>,
         delivered: Arc<Vec<Delivered>>,
         cursor: Option<(usize, bool)>,
         shared_wm: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
+        let mut job_config = base_config.clone();
+        job_config["configuration"]["load"]["destinationTable"]["tableId"] = json!(staging_table);
         Self {
             conn,
             job_config,
+            staging_table,
+            registry,
+            registered: false,
             delivered,
             cursor,
             local_wm: None,
             shared_wm,
             file_rows: 0,
             pending_jobs: Vec::new(),
+            last_seal: std::time::Instant::now(),
             t_transcode: Default::default(),
             t_gzip: Default::default(),
             t_upload: Default::default(),
@@ -821,7 +867,7 @@ impl BqLoader {
             .post(&url)
             .bearer_auth(self.conn.bearer().await?)
             .header("X-Upload-Content-Type", "application/octet-stream")
-            .json(self.job_config.as_ref())
+            .json(&self.job_config)
             .send()
             .await
             .map_err(|e| Error::Transfer(format!("bigquery resumable begin: {e}")))?;
@@ -913,6 +959,13 @@ impl BqLoader {
     /// background task so the next file streams while BigQuery parses this
     /// one. `expect_rows` is cross-checked against the job's outputRows.
     async fn seal_file(&mut self) -> Result<()> {
+        if !self.registered {
+            self.registry
+                .lock()
+                .expect("registry lock")
+                .push(self.staging_table.clone());
+            self.registered = true;
+        }
         let tail = std::mem::replace(
             &mut self.gz,
             flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
@@ -989,8 +1042,12 @@ impl Loader for BqLoader {
         self.t_transcode += t1 - t0;
         self.t_gzip += t2 - t1;
         self.drain_aligned().await?;
-        if self.offset + self.gz.get_ref().len() as u64 >= ROTATE_BYTES {
+        let file_bytes = self.offset + self.gz.get_ref().len() as u64;
+        if file_bytes >= ROTATE_HARD_BYTES
+            || (file_bytes >= ROTATE_BYTES && self.last_seal.elapsed().as_secs() >= ROTATE_SECS)
+        {
             self.seal_file().await?;
+            self.last_seal = std::time::Instant::now();
         }
         self.t_upload += t2.elapsed();
         Ok(())
@@ -1061,7 +1118,10 @@ pub(crate) struct BqSink {
     conn: BqConn,
     final_table: String,
     staging_table: String,
-    job_config: Arc<Value>,
+    job_config: Value,
+    /// Worker stagings that actually received data (see BqLoader.staging_table).
+    staging_registry: Arc<std::sync::Mutex<Vec<String>>>,
+    loader_seq: std::sync::atomic::AtomicUsize,
     delivered: Arc<Vec<Delivered>>,
     /// Incremental context for the state row (set in dest_state).
     source_id: Option<String>,
@@ -1091,7 +1151,9 @@ impl BqSink {
             conn,
             final_table: bare.to_string(),
             staging_table: format!("{bare}__apitap_staging"),
-            job_config: Arc::new(Value::Null),
+            job_config: Value::Null,
+            staging_registry: Arc::new(std::sync::Mutex::new(Vec::new())),
+            loader_seq: std::sync::atomic::AtomicUsize::new(0),
             delivered: Arc::new(Vec::new()),
             source_id: None,
             cursor_col: None,
@@ -1207,13 +1269,19 @@ impl BqSink {
         }
     }
 
-    async fn copy_staging_into_final(&self, disposition: &str) -> Result<()> {
+    async fn copy_stagings_into_final(&self, sources: &[String], disposition: &str) -> Result<()> {
+        let source_tables: Vec<Value> = sources
+            .iter()
+            .map(|t| {
+                json!({
+                    "projectId": self.conn.project, "datasetId": self.conn.dataset,
+                    "tableId": t,
+                })
+            })
+            .collect();
         let body = json!({
             "configuration": { "copy": {
-                "sourceTable": {
-                    "projectId": self.conn.project, "datasetId": self.conn.dataset,
-                    "tableId": self.staging_table,
-                },
+                "sourceTables": source_tables,
                 "destinationTable": {
                     "projectId": self.conn.project, "datasetId": self.conn.dataset,
                     "tableId": self.final_table,
@@ -1268,10 +1336,10 @@ impl crate::driver::Sink for BqSink {
             }));
             delivered.push(lc.delivered.clone());
         }
-        self.conn.table_delete(&self.staging_table).await?;
-        self.conn
-            .table_create(&self.staging_table, &Value::Array(fields))
-            .await?;
+        // Sweep every leftover worker staging (crashed runs included).
+        for t in self.conn.tables_with_prefix(&self.staging_table).await? {
+            self.conn.table_delete(&t).await?;
+        }
         if let Some(cursor) = plan.cursor.as_deref() {
             if let Some(idx) = plan.cols.iter().position(|c| c.name == cursor) {
                 let numeric = matches!(
@@ -1282,26 +1350,34 @@ impl crate::driver::Sink for BqSink {
             }
         }
         self.delivered = Arc::new(delivered);
-        self.job_config = Arc::new(json!({
+        self.job_config = json!({
             "configuration": { "load": {
                 "destinationTable": {
                     "projectId": self.conn.project, "datasetId": self.conn.dataset,
-                    "tableId": self.staging_table,
+                    "tableId": Value::Null, // per-loader (open() fills it)
                 },
+                // First job per worker CREATES its own staging with this schema.
+                "schema": { "fields": fields },
+                "createDisposition": "CREATE_IF_NEEDED",
                 "sourceFormat": "CSV",
                 // Quoted fields may carry embedded newlines (text columns).
                 "allowQuotedNewlines": true,
                 "writeDisposition": "WRITE_APPEND",
                 "maxBadRecords": 0,
             }}
-        }));
+        });
         Ok(())
     }
 
     async fn loader(&self) -> Result<BqLoader> {
+        let i = self
+            .loader_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(BqLoader::open(
             self.conn.clone(),
-            self.job_config.clone(),
+            &self.job_config,
+            format!("{}_{i}", self.staging_table),
+            self.staging_registry.clone(),
             self.delivered.clone(),
             self.cursor_track,
             self.staged_wm.clone(),
@@ -1428,19 +1504,26 @@ impl crate::driver::Sink for BqSink {
     }
 
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        let stagings: Vec<String> = self.staging_registry.lock().expect("registry lock").clone();
         if rows == 0 {
-            return self.conn.table_delete(&self.staging_table).await;
+            for t in &stagings {
+                self.conn.table_delete(t).await?;
+            }
+            return Ok(());
         }
         // The loaders tracked MAX(cursor) while transcoding — no billed query.
         let staged_wm = self.staged_wm.lock().expect("wm lock").clone();
         let t_fin = std::time::Instant::now();
         match mode {
             Mode::Replace => {
-                self.copy_staging_into_final("WRITE_TRUNCATE").await?;
+                self.copy_stagings_into_final(&stagings, "WRITE_TRUNCATE")
+                    .await?;
                 if std::env::var("APITAP_DEBUG").is_ok() {
                     eprintln!("[bq finalize] copy={:.1}s", t_fin.elapsed().as_secs_f64());
                 }
-                self.conn.table_delete(&self.staging_table).await?;
+                for t in &stagings {
+                    self.conn.table_delete(t).await?;
+                }
                 // Replace destroyed every source's rows — supersede ALL stale
                 // state rows for this destination, EVEN on a plain replace
                 // (dest_state never ran, but a previous append's watermark would
@@ -1459,8 +1542,11 @@ impl crate::driver::Sink for BqSink {
                 Ok(())
             }
             Mode::Append => {
-                self.copy_staging_into_final("WRITE_APPEND").await?;
-                self.conn.table_delete(&self.staging_table).await?;
+                self.copy_stagings_into_final(&stagings, "WRITE_APPEND")
+                    .await?;
+                for t in &stagings {
+                    self.conn.table_delete(t).await?;
+                }
                 if let Some(wm) = &staged_wm {
                     self.write_state(wm, rows).await?;
                 }
