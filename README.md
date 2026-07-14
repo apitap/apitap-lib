@@ -119,7 +119,9 @@ use it for rebuildable destinations.
       destination, written in the same transaction as the data; cost proportional
       to the delta, not the table
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
-- [ ] Postgres → Snowflake / BigQuery
+- [x] Postgres → BigQuery (gzipped NDJSON → parallel resumable load jobs →
+      atomic copy; free-path only, no insertAll)
+- [ ] Postgres → Snowflake
 - [ ] MySQL → MySQL
 
 ## Development

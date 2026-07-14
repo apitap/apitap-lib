@@ -2,6 +2,7 @@
 //! [`crate::driver::Sink`] implementation. Adding a database = adding a file here and
 //! registering its URL scheme in [`crate::transfer`].
 
+pub(crate) mod bigquery;
 pub(crate) mod clickhouse;
 pub(crate) mod mysql;
 pub(crate) mod postgres;

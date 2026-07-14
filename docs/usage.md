@@ -264,6 +264,53 @@ Rules and behavior:
   upsert-like semantics: re-delivered keys resolve to the row with the highest
   version. Pair it with an `updated_at` cursor to capture row updates.
 
+## BigQuery destination
+
+```python
+apitap.transfer(
+    "postgres://user:pass@host:5432/db",
+    "bigquery://my-project/my_dataset?credentials=/path/service-account.json",
+    table="public.events",
+    mode="append", cursor="id",
+)
+```
+
+- **Auth**: a service-account key file via `?credentials=` or the
+  `GOOGLE_APPLICATION_CREDENTIALS` env var. The key is exchanged for a ~1h OAuth2
+  token via the JWT-bearer grant; the private key never leaves the process.
+  Needed roles: BigQuery Data Editor + Job User on the project/dataset.
+- **Ingest path** (built for wall-clock): each parallel pipe transcodes the
+  source's text stream to gzipped NDJSON in-flight and streams it into ONE
+  resumable-upload **load job** (N pipes = N parallel load jobs — free, and far
+  under the 1,500 loads/table/day quota even hourly). Jobs land in a staging
+  table; a **copy job** (atomic, metadata-only, free) moves it into the final
+  table: `WRITE_TRUNCATE` for replace, `WRITE_APPEND` for append. The
+  streaming `insertAll` API is never used — it bills per byte and its buffer
+  is invisible to copies.
+- **Types** (Postgres route): int2/4/8 → INT64; `boolean` → INT64 0/1;
+  float4/8 → FLOAT64; `numeric(p,s)` → NUMERIC or BIGNUMERIC by precision
+  (values are shipped as strings, so they stay EXACT — no double round-trip);
+  unconstrained `numeric` → BIGNUMERIC (a value beyond its 38.38 digits fails
+  the load loudly); `date` → DATE; `timestamptz` → TIMESTAMP; `timestamp` →
+  DATETIME; `json`/`jsonb` → JSON; `uuid`, `text`, and everything else
+  (including `bytea`, as its hex form) → STRING. Explicit schema — nothing is
+  inferred. `?location=EU` pins the location when apitap creates the dataset.
+- **Incremental**: `mode="append"` with the `_apitap_state` watermark table in
+  the dataset, exactly like the other destinations. The state MERGE runs right
+  after the copy job commits (BigQuery has no cross-statement transaction);
+  the effective watermark is `greatest(state, data max)`, so a crash between
+  the two costs a bounded re-read, never a skip. `mode="merge"` is not
+  supported yet.
+- **Cost**: load and copy jobs are free. The billed queries are the
+  watermark reads (`MAX(cursor)` scans one column of the destination and of
+  the staged rows per incremental run) and the tiny state-row statements.
+- **Append semantics**: BigQuery has no cross-statement transaction, so the
+  state row lands right after the copy job. A crash between the two leaves
+  the data ahead of the state — the next run's `greatest(state, data max)`
+  watermark absorbs it (no skip, no duplicate). BigQuery tables don't dedup,
+  so never point two pipelines at one destination table without the fan-in
+  guard tripping first.
+
 ## Durability
 
 `durable=False` (Postgres destinations only) loads through an **UNLOGGED** staging
