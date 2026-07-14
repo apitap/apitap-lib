@@ -280,6 +280,11 @@ required to MATCH Postgres before a time counts. The BigQuery project is a
 
 Uncapped, apitap does the same transfer in **71.2 s** over 8 pipes.
 
+Scripts: [`run-bigquery.sh`](run-bigquery.sh) (all three tools, env-driven
+caps/rows/backend) + [`validate-bigquery.sh`](validate-bigquery.sh) (the 9
+aggregates). The tiny-box run is the same script with
+`ROWS=1000000 CAP_CPUS=0.5 CAP_MEM=256m DLT_BACKEND=pyarrow`.
+
 Honest notes:
 
 - All three tools ingest through BigQuery **load jobs** (free); the gap is in
