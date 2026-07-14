@@ -38,6 +38,12 @@ const BQ_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 /// 8 MiB per PUT amortizes round-trips without holding much gzip output.
 const UPLOAD_ALIGN: usize = 256 * 1024;
 const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
+/// Rotate to a NEW load job once a file reaches this many COMPRESSED bytes.
+/// gzip isn't splittable, so BigQuery parses each file single-threaded —
+/// many modest files parallelize server-side, and finished files' jobs poll
+/// in the background while the next file is still streaming (measured: a
+/// single big file left 14-18s of dead job_wait at the end of a 1M run).
+const ROTATE_BYTES: u64 = 12 * 1024 * 1024;
 const STATE_TABLE: &str = "_apitap_state";
 
 // ============================================================================
@@ -531,10 +537,17 @@ fn check_col_name(name: &str) -> Result<()> {
 fn unescape_into(field: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < field.len() {
-        let b = field[i];
-        if b == b'\\' && i + 1 < field.len() {
-            i += 1;
-            out.push(match field[i] {
+        // Bulk-copy up to the next backslash (rare in real data).
+        let mut j = i;
+        while j < field.len() && field[j] != b'\\' {
+            j += 1;
+        }
+        out.extend_from_slice(&field[i..j]);
+        if j >= field.len() {
+            break;
+        }
+        if j + 1 < field.len() {
+            out.push(match field[j + 1] {
                 b'b' => 0x08,
                 b'f' => 0x0c,
                 b'n' => b'\n',
@@ -543,31 +556,12 @@ fn unescape_into(field: &[u8], out: &mut Vec<u8>) {
                 b'v' => 0x0b,
                 other => other, // covers \\ and any literal escape
             });
+            i = j + 2;
         } else {
-            out.push(b);
-        }
-        i += 1;
-    }
-}
-
-fn json_escape_into(s: &[u8], out: &mut Vec<u8>) {
-    out.push(b'"');
-    for &b in s {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            c if c < 0x20 => {
-                out.extend_from_slice(format!("\\u{c:04x}").as_bytes());
-            }
-            c => out.push(c),
+            out.push(b'\\');
+            i = j + 1;
         }
     }
-    out.push(b'"');
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -603,8 +597,41 @@ fn hex_val(b: u8) -> u8 {
     }
 }
 
-/// Append one field's JSON value for `d`. `raw` is the still-escaped TSV field.
-fn append_json_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+/// Bytes that force a CSV field into quotes.
+static CSV_NEEDS_QUOTE: [bool; 256] = {
+    let mut t = [false; 256];
+    t[b',' as usize] = true;
+    t[b'"' as usize] = true;
+    t[b'\n' as usize] = true;
+    t[b'\r' as usize] = true;
+    t
+};
+
+/// Quote a CSV field: wrap in quotes, double any embedded quote. Bulk-copies
+/// clean runs; embedded newlines are legal (the load sets allowQuotedNewlines).
+fn csv_quote_into(s: &[u8], out: &mut Vec<u8>) {
+    out.push(b'"');
+    let mut i = 0;
+    while i < s.len() {
+        let mut j = i;
+        while j < s.len() && s[j] != b'"' {
+            j += 1;
+        }
+        out.extend_from_slice(&s[i..j]);
+        if j == s.len() {
+            break;
+        }
+        out.extend_from_slice(b"\"\"");
+        i = j + 1;
+    }
+    out.push(b'"');
+}
+
+/// Append one field's CSV form for `d`. `raw` is the still-escaped TSV field.
+/// BigQuery CSV semantics (probed live): unquoted empty = NULL, quoted "" =
+/// empty string — so a present value that is empty or contains a delimiter,
+/// quote, or newline gets quoted; everything else rides raw.
+fn append_csv_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scratch: &mut Vec<u8>) {
     scratch.clear();
     let val: &[u8] = if raw.contains(&b'\\') {
         unescape_into(raw, scratch);
@@ -613,78 +640,75 @@ fn append_json_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scratch: &mut
         raw
     };
     match d {
-        // Exact wide types go QUOTED: BigQuery coerces the string to
-        // NUMERIC/BIGNUMERIC exactly, while a bare JSON number risks a
-        // double-precision round-trip. Signed ints are exact either way.
-        Delivered::Int {
-            bytes: 8,
-            unsigned: true,
-        }
-        | Delivered::Decimal { .. } => {
-            json_escape_into(val, out); // also covers numeric NaN
-        }
-        Delivered::Int { .. } => out.extend_from_slice(val),
-        Delivered::Float32 | Delivered::Float64 => {
-            // NaN/Infinity aren't JSON numbers; BigQuery accepts them quoted.
-            if val.first().is_some_and(|c| c.is_ascii_alphabetic())
-                || val.get(1).is_some_and(|c| c.is_ascii_alphabetic())
-            {
-                json_escape_into(val, out);
-            } else {
-                out.extend_from_slice(val);
-            }
-        }
+        // Numbers, dates, uuids: never contain CSV specials — raw. NaN and
+        // Infinity are accepted FLOAT64 tokens; a NUMERIC NaN fails the load
+        // loudly, same as every other destination.
+        Delivered::Int { .. }
+        | Delivered::Decimal { .. }
+        | Delivered::Float32
+        | Delivered::Float64
+        | Delivered::Date
+        | Delivered::DateTime { utc: false }
+        | Delivered::Uuid => out.extend_from_slice(val),
         Delivered::Bool => out.extend_from_slice(if val == b"t" { b"true" } else { b"false" }),
         Delivered::DateTime { utc: true } => {
             // Postgres (UTC session) renders "…+00"; BigQuery wants a full offset.
-            out.push(b'"');
             out.extend_from_slice(val);
             if val.len() > 3 && matches!(val[val.len() - 3], b'+' | b'-') {
                 out.extend_from_slice(b":00");
             }
-            out.push(b'"');
         }
-        Delivered::Date | Delivered::DateTime { utc: false } | Delivered::Uuid => {
-            out.push(b'"');
-            out.extend_from_slice(val);
-            out.push(b'"');
-        }
-        // jsonb/json text from the source is valid JSON by construction — embed
-        // raw. `json` (not jsonb) preserves stored formatting, so pretty-printed
-        // values carry literal newlines that would split the NDJSON record; in
-        // valid JSON a raw LF/CR can only be inter-token whitespace (PG rejects
-        // raw control chars inside strings), so a space is lossless.
-        Delivered::Json => {
-            if val.iter().any(|&b| matches!(b, b'\n' | b'\r')) {
-                out.extend(
-                    val.iter()
-                        .map(|&b| if matches!(b, b'\n' | b'\r') { b' ' } else { b }),
-                );
-            } else {
-                out.extend_from_slice(val);
-            }
-        }
-        Delivered::Text => json_escape_into(val, out),
         Delivered::Bytes => {
-            // bytea_output=hex: "\x<hex>" (already unescaped to `\x…` here).
+            // bytea_output=hex: "\x<hex>" — base64 has no CSV specials.
             let hex = val.strip_prefix(b"\\x").unwrap_or(val);
             let bytes: Vec<u8> = hex
                 .chunks(2)
                 .map(|p| (hex_val(p[0]) << 4) | p.get(1).map(|&b| hex_val(b)).unwrap_or(0))
                 .collect();
-            out.push(b'"');
             base64_into(&bytes, out);
-            out.push(b'"');
+        }
+        Delivered::Json | Delivered::Text => {
+            if val.is_empty() || val.iter().any(|&b| CSV_NEEDS_QUOTE[b as usize]) {
+                csv_quote_into(val, out);
+            } else {
+                out.extend_from_slice(val);
+            }
         }
     }
 }
 
-/// Transcode record-aligned TSV bytes into NDJSON. Returns rows converted.
-/// NULL fields are omitted entirely (missing key = NULL in BigQuery).
-fn tsv_to_ndjson(
+/// The larger of two watermark texts — numeric cursors compare numerically,
+/// text cursors (timestamps in the source's own rendering) lexicographically.
+fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String> {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let x_wins = if numeric {
+                match (x.parse::<i128>(), y.parse::<i128>()) {
+                    (Ok(xi), Ok(yi)) => xi >= yi,
+                    (Ok(_), Err(_)) => true,
+                    (Err(_), Ok(_)) => false,
+                    _ => x >= y,
+                }
+            } else {
+                x >= y
+            };
+            Some(if x_wins { x } else { y })
+        }
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// Transcode record-aligned TSV bytes into CSV. Returns rows converted.
+/// NULL fields become unquoted-empty (= NULL to BigQuery; probed live), and
+/// `cursor` = (column index, numeric) tracks the running MAX of that column
+/// into `wm` — the staged watermark comes from here for free instead of a
+/// billed MAX() query against the staging table.
+fn tsv_to_csv(
     input: &[u8],
-    keys: &[Vec<u8>],
     delivered: &[Delivered],
+    cursor: Option<(usize, bool)>,
+    wm: &mut Option<String>,
     out: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
 ) -> Result<u64> {
@@ -694,33 +718,36 @@ fn tsv_to_ndjson(
     for piece in input.split_inclusive(|&b| b == b'\n') {
         let line = piece.strip_suffix(b"\n").unwrap_or(piece);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        out.push(b'{');
-        let mut first = true;
         let mut col = 0usize;
         for field in line.split(|&b| b == b'\t') {
-            if col >= keys.len() {
+            if col >= delivered.len() {
                 return Err(Error::Transfer(format!(
                     "tsv row has more fields than the {} planned columns",
-                    keys.len()
+                    delivered.len()
                 )));
             }
+            if col > 0 {
+                out.push(b',');
+            }
             if field != b"\\N" {
-                if !first {
-                    out.push(b',');
+                append_csv_value(field, &delivered[col], out, scratch);
+                if let Some((idx, numeric)) = cursor {
+                    if col == idx {
+                        // Cursor values (ints, timestamps) never carry escapes.
+                        let v = String::from_utf8_lossy(field).into_owned();
+                        *wm = wm_max(wm.take(), Some(v), numeric);
+                    }
                 }
-                first = false;
-                out.extend_from_slice(&keys[col]);
-                append_json_value(field, &delivered[col], out, scratch);
             }
             col += 1;
         }
-        if col != keys.len() {
+        if col != delivered.len() {
             return Err(Error::Transfer(format!(
                 "tsv row has {col} fields, expected {}",
-                keys.len()
+                delivered.len()
             )));
         }
-        out.extend_from_slice(b"}\n");
+        out.push(b'\n');
         rows += 1;
     }
     Ok(rows)
@@ -733,8 +760,19 @@ fn tsv_to_ndjson(
 pub(crate) struct BqLoader {
     conn: BqConn,
     job_config: Arc<Value>,
-    keys: Arc<Vec<Vec<u8>>>,
     delivered: Arc<Vec<Delivered>>,
+    cursor: Option<(usize, bool)>,
+    local_wm: Option<String>,
+    shared_wm: Arc<std::sync::Mutex<Option<String>>>,
+    /// Rows in the CURRENT file (cross-checked against its job's outputRows).
+    file_rows: u64,
+    /// Completed files' jobs, polling in the background while later files
+    /// stream — each resolves to its committed row count.
+    pending_jobs: Vec<tokio::task::JoinHandle<Result<u64>>>,
+    /// APITAP_DEBUG=1: cumulative per-phase wall time, reported at finish.
+    t_transcode: std::time::Duration,
+    t_gzip: std::time::Duration,
+    t_upload: std::time::Duration,
     gz: flate2::write::GzEncoder<Vec<u8>>,
     session_uri: Option<String>,
     offset: u64,
@@ -747,14 +785,22 @@ impl BqLoader {
     fn open(
         conn: BqConn,
         job_config: Arc<Value>,
-        keys: Arc<Vec<Vec<u8>>>,
         delivered: Arc<Vec<Delivered>>,
+        cursor: Option<(usize, bool)>,
+        shared_wm: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
         Self {
             conn,
             job_config,
-            keys,
             delivered,
+            cursor,
+            local_wm: None,
+            shared_wm,
+            file_rows: 0,
+            pending_jobs: Vec::new(),
+            t_transcode: Default::default(),
+            t_gzip: Default::default(),
+            t_upload: Default::default(),
             gz: flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
             session_uri: None,
             offset: 0,
@@ -863,6 +909,49 @@ impl BqLoader {
         }
     }
 
+    /// Close the CURRENT file: final PUT, then poll its load job in a
+    /// background task so the next file streams while BigQuery parses this
+    /// one. `expect_rows` is cross-checked against the job's outputRows.
+    async fn seal_file(&mut self) -> Result<()> {
+        let tail = std::mem::replace(
+            &mut self.gz,
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
+        )
+        .finish()
+        .map_err(|e| Error::Transfer(format!("gzip finish: {e}")))?;
+        let total = self.offset + tail.len() as u64;
+        let job = self
+            .put_chunk(tail, Some(total))
+            .await?
+            .ok_or_else(|| Error::Transfer("bigquery final chunk returned no job".into()))?;
+        let job_id = job["jobReference"]["jobId"]
+            .as_str()
+            .ok_or_else(|| Error::Transfer("bigquery job response missing jobId".into()))?
+            .to_string();
+        let location = job["jobReference"]["location"].as_str().map(str::to_string);
+        let conn = self.conn.clone();
+        let expect_rows = self.file_rows;
+        self.pending_jobs.push(tokio::spawn(async move {
+            let done = conn.poll_job(&job_id, location.as_deref()).await?;
+            let out_rows: u64 = done["statistics"]["load"]["outputRows"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if out_rows != expect_rows {
+                return Err(Error::Transfer(format!(
+                    "bigquery load job {job_id} landed {out_rows} rows, worker \
+                     sent {expect_rows} — refusing to continue on a partial load"
+                )));
+            }
+            Ok(out_rows)
+        }));
+        // Fresh file: new resumable session, offsets from zero.
+        self.session_uri = None;
+        self.offset = 0;
+        self.file_rows = 0;
+        Ok(())
+    }
+
     /// Ship every full 256 KiB-aligned span the gzip buffer holds.
     async fn drain_aligned(&mut self) -> Result<()> {
         loop {
@@ -880,55 +969,78 @@ impl BqLoader {
 impl Loader for BqLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         use std::io::Write;
+        let t0 = std::time::Instant::now();
         self.ndjson.clear();
-        self.rows += tsv_to_ndjson(
+        let added = tsv_to_csv(
             &buf,
-            &self.keys,
             &self.delivered,
+            self.cursor,
+            &mut self.local_wm,
             &mut self.ndjson,
             &mut self.scratch,
         )?;
+        self.rows += added;
+        self.file_rows += added;
+        let t1 = std::time::Instant::now();
         self.gz
             .write_all(&self.ndjson)
             .map_err(|e| Error::Transfer(format!("gzip encode: {e}")))?;
-        self.drain_aligned().await
+        let t2 = std::time::Instant::now();
+        self.t_transcode += t1 - t0;
+        self.t_gzip += t2 - t1;
+        self.drain_aligned().await?;
+        if self.offset + self.gz.get_ref().len() as u64 >= ROTATE_BYTES {
+            self.seal_file().await?;
+        }
+        self.t_upload += t2.elapsed();
+        Ok(())
     }
 
     async fn finish(mut self) -> Result<u64> {
-        if self.rows == 0 && self.session_uri.is_none() {
-            return Ok(0); // nothing streamed: no load job at all
+        if self.file_rows > 0 || self.session_uri.is_some() {
+            self.seal_file().await?;
         }
-        let tail = std::mem::replace(&mut self.gz, {
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast())
-        })
-        .finish()
-        .map_err(|e| Error::Transfer(format!("gzip finish: {e}")))?;
-        let total = self.offset + tail.len() as u64;
-        let job = self
-            .put_chunk(tail, Some(total))
-            .await?
-            .ok_or_else(|| Error::Transfer("bigquery final chunk returned no job".into()))?;
-        let job_id = job["jobReference"]["jobId"]
-            .as_str()
-            .ok_or_else(|| Error::Transfer("bigquery job response missing jobId".into()))?
-            .to_string();
-        let location = job["jobReference"]["location"].as_str().map(str::to_string);
-        let done = self.conn.poll_job(&job_id, location.as_deref()).await?;
-        let out_rows: u64 = done["statistics"]["load"]["outputRows"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if out_rows != self.rows {
+        let t_poll = std::time::Instant::now();
+        let mut committed = 0u64;
+        let n_jobs = self.pending_jobs.len();
+        for handle in std::mem::take(&mut self.pending_jobs) {
+            committed += handle
+                .await
+                .map_err(|e| Error::Transfer(format!("bigquery job task: {e}")))??;
+        }
+        if std::env::var("APITAP_DEBUG").is_ok() {
+            eprintln!(
+                "[bq loader] rows={} files={n_jobs} transcode={:.1}s gzip={:.1}s \
+                 upload={:.1}s job_wait={:.1}s",
+                self.rows,
+                self.t_transcode.as_secs_f64(),
+                self.t_gzip.as_secs_f64(),
+                self.t_upload.as_secs_f64(),
+                t_poll.elapsed().as_secs_f64(),
+            );
+        }
+        if committed != self.rows {
             return Err(Error::Transfer(format!(
-                "bigquery load job {job_id} landed {out_rows} rows, worker sent {} — \
+                "bigquery load jobs landed {committed} rows, worker sent {} — \
                  refusing to continue on a partial load",
                 self.rows
             )));
         }
-        Ok(out_rows)
+        // Only rows the jobs COMMITTED may advance the staged watermark.
+        if let (Some((_, numeric)), Some(local)) = (self.cursor, self.local_wm.take()) {
+            let mut shared = self.shared_wm.lock().expect("wm lock");
+            *shared = wm_max(shared.take(), Some(local), numeric);
+        }
+        Ok(committed)
     }
 
     async fn abort(self, cause: Error) -> Error {
+        // Sealed files' jobs may already have committed into STAGING — harmless,
+        // staging never reaches the final table on a failed run and the next
+        // run's prepare drops it. Just stop polling them.
+        for handle in &self.pending_jobs {
+            handle.abort();
+        }
         // Cancel the resumable session so BigQuery DISCARDS the partial upload —
         // never finalize it into a load job. Google's cancel verb is a DELETE on
         // the session URI; best-effort, the session also just expires.
@@ -950,12 +1062,15 @@ pub(crate) struct BqSink {
     final_table: String,
     staging_table: String,
     job_config: Arc<Value>,
-    keys: Arc<Vec<Vec<u8>>>,
     delivered: Arc<Vec<Delivered>>,
     /// Incremental context for the state row (set in dest_state).
     source_id: Option<String>,
     cursor_col: Option<String>,
     mode_str: &'static str,
+    /// (index, numeric) of the cursor column + the MAX the loaders observed —
+    /// the staged watermark without a billed query against staging.
+    cursor_track: Option<(usize, bool)>,
+    staged_wm: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl BqSink {
@@ -977,11 +1092,12 @@ impl BqSink {
             final_table: bare.to_string(),
             staging_table: format!("{bare}__apitap_staging"),
             job_config: Arc::new(Value::Null),
-            keys: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
             source_id: None,
             cursor_col: None,
             mode_str: "replace",
+            cursor_track: None,
+            staged_wm: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -1061,19 +1177,34 @@ impl BqSink {
     }
 
     /// `MAX(cursor)` of `table` as text, `None` when the table has no rows.
-    async fn max_cursor(&self, table: &str, cursor: &str) -> Result<Option<String>> {
+    /// `expr` renders the max in the SOURCE's own text style (see
+    /// `cursor_max_expr`) so it compares soundly against state rows.
+    async fn max_cursor(&self, table: &str, expr: &str) -> Result<Option<String>> {
         let rows = self
             .conn
-            .query(&format!(
-                "SELECT CAST(MAX(`{cursor}`) AS STRING) FROM {}",
-                self.fq(table)
-            ))
+            .query(&format!("SELECT {expr} FROM {}", self.fq(table)))
             .await?;
         Ok(rows
             .into_iter()
             .next()
             .and_then(|r| r.into_iter().next())
             .flatten())
+    }
+
+    /// PG-style rendering of MAX(cursor): BigQuery's CAST puts 'T' in
+    /// DATETIMEs and renders offsets differently — the state rows carry the
+    /// source's rendering, and mixed formats would misorder lexicographic
+    /// watermark comparisons (a re-read means DUPLICATES here; BigQuery
+    /// tables don't dedup).
+    fn cursor_max_expr(udt: &str, cursor: &str) -> String {
+        let q = format!("`{cursor}`");
+        match udt {
+            "timestamptz" => {
+                format!("FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E*S+00', MAX({q}), 'UTC')")
+            }
+            "timestamp" => format!("FORMAT_DATETIME('%Y-%m-%d %H:%M:%E*S', MAX({q}))"),
+            _ => format!("CAST(MAX({q}) AS STRING)"),
+        }
     }
 
     async fn copy_staging_into_final(&self, disposition: &str) -> Result<()> {
@@ -1129,21 +1260,27 @@ impl crate::driver::Sink for BqSink {
     ) -> Result<()> {
         self.conn.ensure_dataset().await?;
         let mut fields = Vec::new();
-        let mut keys = Vec::new();
         let mut delivered = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             check_col_name(&c.name)?;
             fields.push(json!({
                 "name": c.name, "type": bq_type_of(&lc.delivered), "mode": "NULLABLE",
             }));
-            keys.push(format!("\"{}\":", c.name).into_bytes());
             delivered.push(lc.delivered.clone());
         }
         self.conn.table_delete(&self.staging_table).await?;
         self.conn
             .table_create(&self.staging_table, &Value::Array(fields))
             .await?;
-        self.keys = Arc::new(keys);
+        if let Some(cursor) = plan.cursor.as_deref() {
+            if let Some(idx) = plan.cols.iter().position(|c| c.name == cursor) {
+                let numeric = matches!(
+                    lane.cols[idx].delivered,
+                    Delivered::Int { .. } | Delivered::Decimal { .. }
+                );
+                self.cursor_track = Some((idx, numeric));
+            }
+        }
         self.delivered = Arc::new(delivered);
         self.job_config = Arc::new(json!({
             "configuration": { "load": {
@@ -1151,7 +1288,9 @@ impl crate::driver::Sink for BqSink {
                     "projectId": self.conn.project, "datasetId": self.conn.dataset,
                     "tableId": self.staging_table,
                 },
-                "sourceFormat": "NEWLINE_DELIMITED_JSON",
+                "sourceFormat": "CSV",
+                // Quoted fields may carry embedded newlines (text columns).
+                "allowQuotedNewlines": true,
                 "writeDisposition": "WRITE_APPEND",
                 "maxBadRecords": 0,
             }}
@@ -1163,8 +1302,9 @@ impl crate::driver::Sink for BqSink {
         Ok(BqLoader::open(
             self.conn.clone(),
             self.job_config.clone(),
-            self.keys.clone(),
             self.delivered.clone(),
+            self.cursor_track,
+            self.staged_wm.clone(),
         ))
     }
 
@@ -1214,7 +1354,15 @@ impl crate::driver::Sink for BqSink {
         // An emptied table cannot carry a watermark — resync must work. Query
         // MAX(cursor) directly (table metadata like numRows can lag behind jobs);
         // NULL means empty (or an all-NULL cursor, same conclusion).
-        let data_wm = self.max_cursor(&self.final_table, cursor).await?;
+        let max_expr = Self::cursor_max_expr(
+            plan.cols
+                .iter()
+                .find(|c| c.name == cursor)
+                .map(|c| c.udt.as_str())
+                .unwrap_or(""),
+            cursor,
+        );
+        let data_wm = self.max_cursor(&self.final_table, &max_expr).await?;
         if data_wm.is_none() {
             return Ok(DestState {
                 exists: true,
@@ -1283,13 +1431,15 @@ impl crate::driver::Sink for BqSink {
         if rows == 0 {
             return self.conn.table_delete(&self.staging_table).await;
         }
-        let staged_wm = match &self.cursor_col {
-            Some(c) => self.max_cursor(&self.staging_table, c).await?,
-            None => None,
-        };
+        // The loaders tracked MAX(cursor) while transcoding — no billed query.
+        let staged_wm = self.staged_wm.lock().expect("wm lock").clone();
+        let t_fin = std::time::Instant::now();
         match mode {
             Mode::Replace => {
                 self.copy_staging_into_final("WRITE_TRUNCATE").await?;
+                if std::env::var("APITAP_DEBUG").is_ok() {
+                    eprintln!("[bq finalize] copy={:.1}s", t_fin.elapsed().as_secs_f64());
+                }
                 self.conn.table_delete(&self.staging_table).await?;
                 // Replace destroyed every source's rows — supersede ALL stale
                 // state rows for this destination, EVEN on a plain replace
@@ -1302,6 +1452,9 @@ impl crate::driver::Sink for BqSink {
                 }
                 if let Some(wm) = &staged_wm {
                     self.write_state(wm, rows).await?;
+                }
+                if std::env::var("APITAP_DEBUG").is_ok() {
+                    eprintln!("[bq finalize] total={:.1}s", t_fin.elapsed().as_secs_f64());
                 }
                 Ok(())
             }
@@ -1351,12 +1504,12 @@ mod tests {
     fn t(d: Delivered, raw: &[u8]) -> String {
         let mut out = Vec::new();
         let mut scratch = Vec::new();
-        append_json_value(raw, &d, &mut out, &mut scratch);
+        append_csv_value(raw, &d, &mut out, &mut scratch);
         String::from_utf8(out).unwrap()
     }
 
     #[test]
-    fn json_values_per_type() {
+    fn csv_values_per_type() {
         assert_eq!(
             t(
                 Delivered::Int {
@@ -1370,47 +1523,35 @@ mod tests {
         assert_eq!(t(Delivered::Bool, b"t"), "true");
         assert_eq!(t(Delivered::Bool, b"f"), "false");
         assert_eq!(t(Delivered::Float64, b"1.5"), "1.5");
-        assert_eq!(t(Delivered::Float64, b"NaN"), "\"NaN\"");
-        assert_eq!(t(Delivered::Float64, b"-Infinity"), "\"-Infinity\"");
+        assert_eq!(t(Delivered::Float64, b"NaN"), "NaN");
+        assert_eq!(
+            t(Delivered::Decimal { p: 18, s: 4 }, b"12345.6789"),
+            "12345.6789"
+        );
         assert_eq!(
             t(Delivered::DateTime { utc: true }, b"2026-01-01 00:00:00+00"),
-            "\"2026-01-01 00:00:00+00:00\""
+            "2026-01-01 00:00:00+00:00"
         );
         assert_eq!(
             t(
                 Delivered::DateTime { utc: true },
                 b"2026-01-01 00:00:00+05:30"
             ),
-            "\"2026-01-01 00:00:00+05:30\""
+            "2026-01-01 00:00:00+05:30"
         );
-        assert_eq!(
-            t(Delivered::DateTime { utc: false }, b"2026-01-01 00:00:00"),
-            "\"2026-01-01 00:00:00\""
-        );
-        assert_eq!(t(Delivered::Text, b"a\\tb"), "\"a\\tb\"");
-        assert_eq!(t(Delivered::Json, br#"{"a": 1}"#), r#"{"a": 1}"#);
-        // exact wide types ride as strings (BigQuery coerces exactly)
-        assert_eq!(
-            t(Delivered::Decimal { p: 18, s: 4 }, b"12345.6789"),
-            "\"12345.6789\""
-        );
-        assert_eq!(t(Delivered::Decimal { p: 18, s: 4 }, b"NaN"), "\"NaN\"");
-        assert_eq!(
-            t(
-                Delivered::Int {
-                    bytes: 8,
-                    unsigned: true
-                },
-                b"18446744073709551615"
-            ),
-            "\"18446744073709551615\""
-        );
-        assert_eq!(t(Delivered::Bytes, b"\\\\x4869"), "\"SGk=\"");
+        // text: raw when clean, quoted when empty or holding specials
+        assert_eq!(t(Delivered::Text, b"hello"), "hello");
+        assert_eq!(t(Delivered::Text, b""), "\"\""); // empty string, NOT NULL
+        assert_eq!(t(Delivered::Text, b"a,b"), "\"a,b\"");
+        assert_eq!(t(Delivered::Text, b"say \"hi\""), "\"say \"\"hi\"\"\"");
+        // TSV-escaped newline unescapes, then rides inside quotes
+        assert_eq!(t(Delivered::Text, b"a\\nb"), "\"a\nb\"");
+        assert_eq!(t(Delivered::Json, br#"{"a": 1}"#), "\"{\"\"a\"\": 1}\"");
+        assert_eq!(t(Delivered::Bytes, b"\\\\x4869"), "SGk=");
     }
 
     #[test]
-    fn tsv_rows_to_ndjson_with_null_omission() {
-        let keys = vec![b"\"id\":".to_vec(), b"\"name\":".to_vec()];
+    fn tsv_rows_to_csv_with_null_vs_empty() {
         let delivered = vec![
             Delivered::Int {
                 bytes: 8,
@@ -1420,67 +1561,86 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut scratch = Vec::new();
-        let rows = tsv_to_ndjson(
-            b"1\thello\n2\t\\N\n",
-            &keys,
+        let mut wm = None;
+        let rows = tsv_to_csv(
+            b"1\thello\n2\t\\N\n3\t\n",
             &delivered,
+            None,
+            &mut wm,
             &mut out,
             &mut scratch,
         )
         .unwrap();
-        assert_eq!(rows, 2);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "{\"id\":1,\"name\":\"hello\"}\n{\"id\":2}\n"
-        );
+        assert_eq!(rows, 3);
+        // row 2: NULL -> unquoted empty; row 3: empty string -> quoted ""
+        assert_eq!(String::from_utf8(out).unwrap(), "1,hello\n2,\n3,\"\"\n");
     }
 
     #[test]
     fn empty_line_is_a_real_row_for_single_text_column() {
-        // "\n" alone = one row whose only text column is the empty string —
-        // it must NOT be conflated with the split artifact after the last row.
-        let keys = vec![b"\"name\":".to_vec()];
         let delivered = vec![Delivered::Text];
         let mut out = Vec::new();
         let mut scratch = Vec::new();
-        let rows = tsv_to_ndjson(b"a\n\nb\n", &keys, &delivered, &mut out, &mut scratch).unwrap();
-        assert_eq!(rows, 3);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "{\"name\":\"a\"}\n{\"name\":\"\"}\n{\"name\":\"b\"}\n"
-        );
-    }
-
-    #[test]
-    fn pg_json_embedded_newlines_stay_one_record() {
-        let mut out = Vec::new();
-        let mut scratch = Vec::new();
-        append_json_value(b"{\"a\":  1}", &Delivered::Json, &mut out, &mut scratch);
-        // `json` columns keep stored formatting; raw newlines arrive TSV-escaped
-        // as \n and unescape to real LF — they must not split the NDJSON record.
-        out.clear();
-        append_json_value(
-            br#"{\n  \"a\": 1\n}"#,
-            &Delivered::Json,
+        let mut wm = None;
+        let rows = tsv_to_csv(
+            b"a\n\nb\n",
+            &delivered,
+            None,
+            &mut wm,
             &mut out,
             &mut scratch,
-        );
-        let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains('\n'), "{s:?}");
-        assert_eq!(s, "{   \"a\": 1 }");
+        )
+        .unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(String::from_utf8(out).unwrap(), "a\n\"\"\nb\n");
     }
 
     #[test]
     fn tsv_field_count_mismatch_is_loud() {
-        let keys = vec![b"\"id\":".to_vec()];
         let delivered = vec![Delivered::Int {
             bytes: 8,
             unsigned: false,
         }];
         let mut out = Vec::new();
         let mut scratch = Vec::new();
-        assert!(tsv_to_ndjson(b"1\t2\n", &keys, &delivered, &mut out, &mut scratch).is_err());
-        assert!(tsv_to_ndjson(b"", &keys, &delivered, &mut out, &mut scratch).is_ok());
+        let mut wm = None;
+        assert!(tsv_to_csv(b"1\t2\n", &delivered, None, &mut wm, &mut out, &mut scratch).is_err());
+        assert!(tsv_to_csv(b"", &delivered, None, &mut wm, &mut out, &mut scratch).is_ok());
+    }
+
+    #[test]
+    fn loader_tracks_cursor_max_during_transcode() {
+        let delivered = vec![
+            Delivered::Int {
+                bytes: 8,
+                unsigned: false,
+            },
+            Delivered::Text,
+        ];
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+        let mut wm = None;
+        tsv_to_csv(
+            b"9\ta\n100\tb\n21\tc\n",
+            &delivered,
+            Some((0, true)),
+            &mut wm,
+            &mut out,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(wm.as_deref(), Some("100")); // numeric, not lexicographic
+        let mut wm2 = None;
+        tsv_to_csv(
+            b"\\N\tx\n",
+            &delivered,
+            Some((0, true)),
+            &mut wm2,
+            &mut out,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(wm2, None);
     }
 
     #[test]
@@ -1536,6 +1696,13 @@ mod tests {
         assert!(check_col_name("1digit").is_err());
         assert!(check_col_name("has space").is_err());
         assert!(check_col_name("has-dash").is_err());
+    }
+
+    #[test]
+    fn cursor_max_renders_in_source_style() {
+        assert!(BqSink::cursor_max_expr("timestamptz", "ts").contains("FORMAT_TIMESTAMP"));
+        assert!(BqSink::cursor_max_expr("timestamp", "ts").contains("FORMAT_DATETIME"));
+        assert!(BqSink::cursor_max_expr("int8", "id").starts_with("CAST(MAX"));
     }
 
     #[test]
