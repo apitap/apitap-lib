@@ -301,6 +301,25 @@ Honest notes:
   and dlt add `_dlt_id`/`_dlt_load_id` columns). Checksums compare the 15
   source columns only.
 
+### Postgres → BigQuery on a tiny box — 0.5 vCPU / 256 MB (2026-07-15)
+
+Same environment as above, 1M rows (kept small deliberately — the project now
+has billing enabled and validation queries are billed), each tool capped at
+**0.5 vCPU / 256 MB**:
+
+| tool | outcome | validated |
+|---|---|---|
+| **apitap** | **27.4 s**, 2 pipes | 9/9 MATCH |
+| ingestr 1.0.75 | **OOM-killed** (exit 137) ~100k rows in; its own progress log read 310 MB just before the kernel killed it | no table landed |
+| dlt 1.x + pyarrow backend | **OOM-killed** (exit 137) during extract | no table landed |
+
+This is the point of the streaming design rather than a gotcha: apitap's
+memory is bounded by pipe count × chunk buffers (~tens of MB), independent of
+table size, so the same 256 MB container that moves 1M rows also moves 100M.
+ingestr at 2 vCPU / 2 GB reported a 556 MB peak on the 10M run — it needs the
+headroom; at 256 MB it cannot finish 1M. Both failures were rerun once to
+capture the real exit codes; neither is a harness artifact this time.
+
 ## What these runs do NOT show
 
 Recorded honestly, because a benchmark is only useful if its edges are visible:
