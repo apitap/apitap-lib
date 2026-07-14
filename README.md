@@ -111,6 +111,9 @@ use it for rebuildable destinations.
       decimals, UTC-normalized timestamps)
 - [x] MySQL → Postgres (wire decode → binary COPY; exact NUMERIC encoding up to
       DECIMAL(65), `BIGINT UNSIGNED`→`numeric(20,0)`, JSON→`jsonb`)
+- [x] ClickHouse table engines — `engine="ReplicatedReplacingMergeTree(v)"`,
+      `order_by=`, `on_cluster=`: apitap creates the destination with your engine
+      (full MergeTree family) and appends into pre-created tables as-is
 - [x] Incremental sync — `mode="append"` and `mode="merge"` (upsert by primary
       key); the watermark lives in `_apitap_state`, a queryable table in the
       destination, written in the same transaction as the data; cost proportional
