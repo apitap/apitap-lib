@@ -61,7 +61,7 @@ work as Postgres sources.
 
 ## API
 
-### `apitap.transfer(src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=True) -> TransferReport`
+### `apitap.transfer(src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=True, mode="replace", engine=None, order_by=None, on_cluster=None) -> TransferReport`
 
 | parameter | default | meaning |
 |---|---|---|
@@ -72,6 +72,10 @@ work as Postgres sources.
 | `cursor` | auto | numeric column used to split the table into ranges. Auto-detects a single-column integer primary key. |
 | `chunk_bytes` | 4 MiB | bytes coalesced per network send (floor 64 KiB) |
 | `durable` | `True` | Postgres destinations only — see [Durability](#durability) |
+| `mode` | `"replace"` | `"append"` / `"merge"` — see [Incremental sync](#incremental-sync-append--merge) |
+| `engine` | `MergeTree` | ClickHouse destinations only — see [ClickHouse table engines](#clickhouse-table-engines) |
+| `order_by` | cursor | ClickHouse destinations only — `ORDER BY` of the created table |
+| `on_cluster` | — | ClickHouse destinations only — run the table DDL `ON CLUSTER` |
 
 ### `TransferReport`
 
@@ -200,6 +204,65 @@ apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_a
   in that narrow window loses the captured DDL (the data is intact). Column DEFAULTs,
   identity ownership, triggers, RLS policies, and grants invisible to the connecting
   role are not preserved.
+
+## ClickHouse table engines
+
+By default apitap creates ClickHouse destinations as a plain `MergeTree`. When your
+pipeline's semantics live in the engine — `FINAL` dedup on a `ReplacingMergeTree`,
+replication on a cluster — pick it at the call site:
+
+```python
+apitap.transfer(
+    PG, CH,
+    table="etl.account_v",
+    dest_table="raw_account",
+    mode="append", cursor="id",
+    engine="ReplicatedReplacingMergeTree(ins_dt)",   # any MergeTree-family engine
+    order_by="id",                                   # the Replacing dedup key
+    on_cluster="my_cluster",                         # required for path-less Replicated*
+)
+```
+
+How it works: data still streams into a local `MergeTree` staging table at full
+speed; apitap then creates the final table with **your** engine and moves the parts
+in with a metadata-only `ATTACH` before the atomic name swap. A `Replicated*` engine
+fans those parts out to the other replicas from there.
+
+Rules and behavior:
+
+- Any **MergeTree-family** engine spelling is accepted (`MergeTree`,
+  `ReplacingMergeTree(v)`, `Summing`/`Aggregating`/`Collapsing`/
+  `VersionedCollapsing`/`Graphite`, each also as `Replicated*`). Non-MergeTree
+  engines are rejected — the staging→ATTACH choreography needs part-based storage.
+- `ReplicatedReplacingMergeTree(ins_dt)` **without ZooKeeper-path arguments**
+  requires `on_cluster` (ClickHouse mints the unique `{uuid}` path only for
+  ON CLUSTER DDL on Atomic databases) — recommended. Explicit paths work too, but
+  `mode="replace"` into an **existing** explicit-path table is rejected: the
+  shadow copy would collide on the path — use append, or drop the table first.
+- Columns named in the engine arguments or `order_by` are declared **non-nullable**
+  (ClickHouse requires it for version/sorting columns). An actual `NULL` arriving in
+  one of them fails loudly rather than corrupting the stream.
+- `on_cluster` requires a `Replicated*` engine — with a local engine the other
+  replicas would get the table but never the data.
+- With `mode="append"`, if the destination table **already exists**, it is the
+  structural authority: apitap mirrors its structure and keys into staging and
+  appends into it as-is, checking that the requested engine family/arguments and
+  `order_by` agree with the table (a drifted dedup key errors instead of silently
+  deduping wrong). Pre-creating the table yourself therefore remains fully
+  supported — TTL, codecs, projections and any other DDL you own stay untouched.
+  With `mode="replace"` (the default) the table is **rebuilt** with the requested
+  engine and pre-existing DDL extras are replaced.
+- `on_cluster` accepts single-shard clusters only — apitap loads one replication
+  group and keeps its `_apitap_state` on the connected host. Appending via a
+  different host later is safe (the watermark falls back to the data and a
+  Replacing `FINAL` absorbs the bounded re-read) but keep a stable endpoint for
+  exactly-once deltas.
+- Engines whose merges rewrite rows (`Summing`/`Aggregating`/`Collapsing`/…)
+  accept `mode="append"` only when the cursor is part of the sorting key —
+  otherwise merges could move `max(cursor)` and poison the watermark.
+- `mode="append"` + `ReplacingMergeTree(version)` + reading with `FINAL` gives you
+  upsert-like semantics: re-delivered keys resolve to the row with the highest
+  version. Pair it with an `updated_at` cursor to capture row updates.
 
 ## Durability
 

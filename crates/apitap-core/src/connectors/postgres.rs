@@ -929,7 +929,7 @@ impl crate::driver::Sink for PgSink {
 
     async fn dest_state(
         &mut self,
-        plan: &TablePlan,
+        plan: &mut TablePlan,
         mode: Mode,
         cursor: &str,
         source_id: &str,
