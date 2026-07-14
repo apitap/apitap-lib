@@ -120,7 +120,9 @@ use it for rebuildable destinations.
       to the delta, not the table
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
 - [x] Postgres → BigQuery (gzipped NDJSON → parallel resumable load jobs →
-      atomic copy; free-path only, no insertAll)
+      atomic copy; free-path only, no insertAll — **10M rows in 85 s at
+      2 vCPU vs ingestr 860 s / dlt 2,160 s**, checksum-validated; see
+      [benchmarks](benchmarks/README.md))
 - [ ] Postgres → Snowflake
 - [ ] MySQL → MySQL
 

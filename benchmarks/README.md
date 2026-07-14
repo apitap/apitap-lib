@@ -263,6 +263,44 @@ caches: apitap 0.4 s vs ingestr 1.0.75 2.9 s. Small-row runs flatter apitap (fix
 per-run overhead dominates ingestr at this scale) — treat the capped 10M run above as
 the representative number.
 
+### Postgres → BigQuery — apitap vs ingestr vs dlt (2026-07-15)
+
+Same 10M-row / 15-column table, same VPS (OVH Canada), BigQuery dataset in
+`US`, each tool in its own container capped at **2 vCPU / 2 GB**, timed inside
+the container (image build/install not counted), 9 aggregate checksums
+(count, sums, decimal sum, string lengths, bool count, max timestamp/date)
+required to MATCH Postgres before a time counts. The BigQuery project is a
+**sandbox (no billing)** — every tool used the free load-job path.
+
+| tool | wall time | vs apitap | validated |
+|---|---|---|---|
+| **apitap** (this repo) | **85.1 s** | — | 9/9 MATCH |
+| ingestr 1.0.75 | 860 s | 10.1× slower | 9/9 MATCH |
+| dlt 1.x default (`sql_database`, no backend hint) | 2,160 s | 25.4× slower | 9/9 MATCH |
+
+Uncapped, apitap does the same transfer in **71.2 s** over 8 pipes.
+
+Honest notes:
+
+- All three tools ingest through BigQuery **load jobs** (free); the gap is in
+  the extract/encode leg, not in BigQuery. dlt's default backend extracts
+  row-by-row in Python (one core pegged for ~31 of its 36 minutes); ingestr
+  (dlt underneath, tuned) streams via its own arrow path. apitap reads
+  Postgres text COPY and transcodes to gzipped NDJSON in Rust, N pipes in
+  parallel, each feeding its own resumable load job.
+- Network context matters: the runner is in Canada, the dataset in `US`
+  multi-region. gzip (~5× fewer bytes on the wire) is part of apitap's
+  margin; a runner inside GCP would shrink the upload leg for everyone.
+- Two earlier dlt runs "failed silently" — that was a bug in OUR harness
+  (`docker run` without `-i`, so the pipeline script never reached Python),
+  not in dlt. Fixed, rerun, and the number above is dlt's real one.
+- One ingestr run was discarded because our validator, not ingestr, was
+  wrong (`bool` lands as BOOL vs apitap's INT64; the comparison query needed
+  a cast). Its second run differed by 1.7% (875 s vs 860 s).
+- Types differ slightly across tools (BOOL vs INT64 for `boolean`; ingestr
+  and dlt add `_dlt_id`/`_dlt_load_id` columns). Checksums compare the 15
+  source columns only.
+
 ## What these runs do NOT show
 
 Recorded honestly, because a benchmark is only useful if its edges are visible:
