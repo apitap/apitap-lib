@@ -366,6 +366,64 @@ impl BqConn {
         Ok(rows_of(&v))
     }
 
+    /// Load a handful of NDJSON rows into `table` with one multipart load job.
+    /// Free-tier safe: the state machinery must never need DML (sandbox projects
+    /// reject it), so state rows are APPENDED and readers take the newest.
+    async fn load_rows(&self, table: &str, ndjson: Vec<u8>) -> Result<()> {
+        let config = json!({
+            "configuration": { "load": {
+                "destinationTable": {
+                    "projectId": self.project, "datasetId": self.dataset,
+                    "tableId": table,
+                },
+                "sourceFormat": "NEWLINE_DELIMITED_JSON",
+                "writeDisposition": "WRITE_APPEND",
+                "maxBadRecords": 0,
+            }}
+        });
+        let boundary = "apitap_state_boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
+        body.extend_from_slice(config.to_string().as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&ndjson);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let url = format!(
+            "{BQ_UPLOAD}/projects/{}/jobs?uploadType=multipart",
+            self.project
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(self.bearer().await?)
+            .header(
+                "Content-Type",
+                format!("multipart/related; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Transfer(format!("bigquery state load: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Transfer(format!(
+                "bigquery state load {status}: {}",
+                text.trim()
+            )));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Transfer(format!("bigquery state load response: {e}")))?;
+        let job_id = v["jobReference"]["jobId"]
+            .as_str()
+            .ok_or_else(|| Error::Transfer("bigquery state load missing jobId".into()))?
+            .to_string();
+        let loc = v["jobReference"]["location"].as_str().map(str::to_string);
+        self.poll_job(&job_id, loc.as_deref()).await.map(|_| ())
+    }
+
     /// Poll a load/copy job to DONE; adaptive backoff (dense early — small jobs
     /// finish in seconds; cheap 2s cadence after).
     async fn poll_job(&self, job_id: &str, location: Option<&str>) -> Result<Value> {
@@ -952,27 +1010,54 @@ impl BqSink {
         }
     }
 
+    /// One NDJSON state row. `offset_micros` orders rows written by the same
+    /// run (a replace's barrier must sort OLDER than its own state row).
+    fn state_row(
+        &self,
+        source_id: &str,
+        watermark: Option<&str>,
+        mode: &str,
+        rows: u64,
+        offset_micros: i64,
+    ) -> String {
+        let ts = chrono::Utc::now() + chrono::Duration::microseconds(offset_micros);
+        let mut row = json!({
+            "dest_table": self.final_table,
+            "source_id": source_id,
+            "mode": mode,
+            "last_rows": rows,
+            "synced_at": ts.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        });
+        if let Some(wm) = watermark {
+            row["watermark"] = json!(wm);
+        }
+        if let Some(c) = &self.cursor_col {
+            row["cursor_col"] = json!(c);
+        }
+        let mut line = row.to_string();
+        line.push('\n');
+        line
+    }
+
+    /// Append this run's state row. The state table is APPEND-ONLY (load jobs
+    /// only — DML is rejected on sandbox/free-tier projects); readers take the
+    /// newest row per (dest_table, source_id), and a replace writes a `*`
+    /// barrier row that invalidates everything older.
     async fn write_state(&self, watermark: &str, rows: u64) -> Result<()> {
-        self.ensure_state_table().await?;
-        let (Some(source_id), Some(cursor)) = (&self.source_id, &self.cursor_col) else {
+        let Some(source_id) = self.source_id.clone() else {
             return Ok(());
         };
-        let sql = format!(
-            "MERGE {state} T USING (SELECT '{dt}' AS dest_table, '{sid}' AS source_id) S \
-             ON T.dest_table = S.dest_table AND T.source_id = S.source_id \
-             WHEN MATCHED THEN UPDATE SET cursor_col = '{cur}', watermark = '{wm}', \
-               mode = '{md}', last_rows = {rows}, synced_at = CURRENT_TIMESTAMP() \
-             WHEN NOT MATCHED THEN INSERT \
-               (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
-             VALUES ('{dt}', '{sid}', '{cur}', '{wm}', '{md}', {rows}, CURRENT_TIMESTAMP())",
-            state = self.fq(STATE_TABLE),
-            dt = sql_str(&self.final_table),
-            sid = sql_str(source_id),
-            cur = sql_str(cursor),
-            wm = sql_str(watermark),
-            md = self.mode_str,
-        );
-        self.conn.query(&sql).await.map(|_| ())
+        self.ensure_state_table().await?;
+        let row = self.state_row(&source_id, Some(watermark), self.mode_str, rows, 0);
+        self.conn.load_rows(STATE_TABLE, row.into_bytes()).await
+    }
+
+    /// Replace destroyed every source's rows: a `*` barrier row supersedes all
+    /// older state rows for this destination (the append-only DELETE).
+    async fn write_replace_barrier(&self) -> Result<()> {
+        self.ensure_state_table().await?;
+        let row = self.state_row("*", None, "replace-barrier", 0, -1000);
+        self.conn.load_rows(STATE_TABLE, row.into_bytes()).await
     }
 
     /// `MAX(cursor)` of `table` as text, `None` when the table has no rows.
@@ -1136,23 +1221,34 @@ impl crate::driver::Sink for BqSink {
                 watermark: None,
             });
         }
-        let state_rows = if self.conn.table_get(STATE_TABLE).await?.is_some() {
-            self.conn
-                .query(&format!(
-                    "SELECT watermark, source_id FROM {} WHERE dest_table = '{}'",
-                    self.fq(STATE_TABLE),
-                    sql_str(&self.final_table)
-                ))
-                .await?
+        // The state table is append-only: take MY newest row and check for other
+        // sources' rows, both relative to the newest `*` replace-barrier — all
+        // resolved server-side in one free SELECT (timestamps never round-trip
+        // through text).
+        let (own_state, siblings) = if self.conn.table_get(STATE_TABLE).await?.is_some() {
+            let sql = format!(
+                "WITH s AS (SELECT * FROM {state} WHERE dest_table = '{dt}'), \
+                 b AS (SELECT IFNULL(MAX(synced_at), TIMESTAMP '1970-01-01') AS ts \
+                       FROM s WHERE source_id = '*') \
+                 SELECT \
+                   (SELECT watermark FROM s, b \
+                    WHERE source_id = '{sid}' AND synced_at > b.ts \
+                    ORDER BY synced_at DESC LIMIT 1), \
+                   (SELECT CAST(COUNT(*) > 0 AS STRING) FROM s, b \
+                    WHERE source_id NOT IN ('*', '{sid}') AND synced_at > b.ts)",
+                state = self.fq(STATE_TABLE),
+                dt = sql_str(&self.final_table),
+                sid = sql_str(source_id),
+            );
+            let rows = self.conn.query(&sql).await?;
+            let row = rows.into_iter().next().unwrap_or_default();
+            let own = row.first().cloned().flatten();
+            let sib = row.get(1).cloned().flatten().as_deref() == Some("true");
+            (own, sib)
         } else {
-            Vec::new()
+            (None, false)
         };
-        let own_state = state_rows
-            .iter()
-            .find(|r| r.get(1).and_then(|v| v.as_deref()) == Some(source_id))
-            .and_then(|r| r.first().cloned())
-            .flatten();
-        if own_state.is_none() && !state_rows.is_empty() {
+        if own_state.is_none() && siblings {
             return Err(Error::InvalidInput(format!(
                 "destination {} is fed by other sources (fan-in) but has no state row \
                  for THIS source — appending on the shared data watermark would skip \
@@ -1195,18 +1291,14 @@ impl crate::driver::Sink for BqSink {
             Mode::Replace => {
                 self.copy_staging_into_final("WRITE_TRUNCATE").await?;
                 self.conn.table_delete(&self.staging_table).await?;
-                // Replace destroyed every source's rows — clear ALL stale state
-                // rows for this destination, EVEN on a plain replace (dest_state
-                // never ran, but a previous append's watermark would make the
-                // next append skip everything below it).
-                if self.conn.table_get(STATE_TABLE).await?.is_some() {
-                    self.conn
-                        .query(&format!(
-                            "DELETE FROM {} WHERE dest_table = '{}'",
-                            self.fq(STATE_TABLE),
-                            sql_str(&self.final_table)
-                        ))
-                        .await?;
+                // Replace destroyed every source's rows — supersede ALL stale
+                // state rows for this destination, EVEN on a plain replace
+                // (dest_state never ran, but a previous append's watermark would
+                // make the next append skip everything below it). Append-only:
+                // a `*` barrier row instead of a DELETE, because DML is rejected
+                // on free-tier projects.
+                if self.conn.table_get(STATE_TABLE).await?.is_some() || self.source_id.is_some() {
+                    self.write_replace_barrier().await?;
                 }
                 if let Some(wm) = &staged_wm {
                     self.write_state(wm, rows).await?;
