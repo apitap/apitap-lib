@@ -353,7 +353,17 @@ each, checksums on every configuration:
    own staging (one multi-source copy job finalizes) and seals at
    ≥12 MiB **and** ≥6 s (hard cap 96 MiB).
 
-Net: 10M capped 85.1 s → **41.7 s**; 10M uncapped 71.2 s → **37.2 s**;
+6. **Parquet lane** (binary COPY → typed column chunks → Parquet ZSTD-1, no
+   text round-trip, no `arrow` dependency) — BigQuery's fastest parse
+   (job_wait ~2-3 s at every scale). Its typed builders cost more CPU per
+   row than CSV string-slinging, so it wins where cores exist and loses on
+   half-core boxes: the lane is picked per connection (4+ pipes → Parquet,
+   fewer → CSV). Measured: 10M uncapped 37.2 → **26.9-27.9 s**; 10M at
+   2 vCPU statistically tied (41.7 vs 41.7-45.6); tiny box stays on CSV.
+   `json`/`jsonb` land as STRING on this lane (BigQuery rejects Parquet
+   loads into JSON columns).
+
+Net: 10M capped 85.1 s → **41.7 s**; 10M uncapped 71.2 s → **26.9 s**;
 tiny-box 1M 27.4 s → **16–18 s**. All re-validated 9/9.
 
 ## What these runs do NOT show

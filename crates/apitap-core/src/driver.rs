@@ -100,8 +100,10 @@ pub(crate) trait Source: Sized + Send + Sync {
 pub(crate) trait Sink: Sized + Send + Sync {
     type Loader: Loader;
     /// Ingest formats this sink accepts, best first. Negotiation picks the first one
-    /// the source can produce.
-    fn accepts(&self) -> &'static [WireFormat];
+    /// the source can produce. Non-static so a sink may ORDER lanes per
+    /// connection (BigQuery prefers Parquet when CPU is plentiful, CSV when
+    /// starved — measured, not guessed).
+    fn accepts(&self) -> &[WireFormat];
     /// Sink-specific plan constraints, applied before lane planning so the DDL and the
     /// encoders agree (e.g. ClickHouse: the ORDER BY column must be non-nullable).
     fn adjust_plan(&self, plan: &mut TablePlan);

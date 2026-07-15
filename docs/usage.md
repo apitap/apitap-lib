@@ -279,14 +279,23 @@ apitap.transfer(
   `GOOGLE_APPLICATION_CREDENTIALS` env var. The key is exchanged for a ~1h OAuth2
   token via the JWT-bearer grant; the private key never leaves the process.
   Needed roles: BigQuery Data Editor + Job User on the project/dataset.
-- **Ingest path** (built for wall-clock): each parallel pipe transcodes the
-  source's text stream to gzipped NDJSON in-flight and streams it into ONE
-  resumable-upload **load job** (N pipes = N parallel load jobs — free, and far
-  under the 1,500 loads/table/day quota even hourly). Jobs land in a staging
-  table; a **copy job** (atomic, metadata-only, free) moves it into the final
-  table: `WRITE_TRUNCATE` for replace, `WRITE_APPEND` for append. The
-  streaming `insertAll` API is never used — it bills per byte and its buffer
-  is invisible to copies.
+- **Ingest path** (built for wall-clock, chosen per box): with 4+ pipes each
+  pipe decodes Postgres **binary COPY** straight into **Parquet (ZSTD)**
+  column chunks — no text round-trip, and BigQuery's fastest parse; on small
+  boxes (<4 pipes) a leaner CSV+gzip transcode wins instead (typed builders
+  cost more CPU than the half-core has). Both lanes stream into rotating
+  resumable-upload **load jobs** (free; each worker loads its OWN staging
+  table — BigQuery allows ~5 metadata updates/10s per table — sealed at
+  ≥12 MiB and ≥6s so quotas can't trip). A single multi-source **copy job**
+  (atomic, metadata-only, free) lands everything in the final table:
+  `WRITE_TRUNCATE` for replace, `WRITE_APPEND` for append. The streaming
+  `insertAll` API is never used — it bills per byte and its buffer is
+  invisible to copies.
+- **Parquet lane type notes**: exact `NUMERIC` as 16-byte decimals;
+  `json`/`jsonb` land as **STRING** (BigQuery rejects Parquet loads into
+  JSON-typed columns — the text is valid JSON; `PARSE_JSON` works on read);
+  exotic types (arrays, ranges, `inet`, …) are rejected loudly — cast them
+  in a source view. The CSV lane keeps the JSON column type.
 - **Types** (Postgres route): int2/4/8 → INT64; `boolean` → INT64 0/1;
   float4/8 → FLOAT64; `numeric(p,s)` → NUMERIC or BIGNUMERIC by precision
   (values are shipped as strings, so they stay EXACT — no double round-trip);

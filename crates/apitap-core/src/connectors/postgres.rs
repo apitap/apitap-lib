@@ -798,7 +798,7 @@ fn pg_type_of(d: &Delivered) -> String {
 impl crate::driver::Sink for PgSink {
     type Loader = PgCopyLoader;
 
-    fn accepts(&self) -> &'static [WireFormat] {
+    fn accepts(&self) -> &[WireFormat] {
         &[WireFormat::PgCopyBinary]
     }
 

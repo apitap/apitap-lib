@@ -707,6 +707,11 @@ fn append_csv_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scratch: &mut 
     }
 }
 
+/// Re-export for the parquet encoder (bqparquet.rs tracks its own cursor max).
+pub(crate) fn wm_max_pub(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String> {
+    wm_max(a, b, numeric)
+}
+
 /// The larger of two watermark texts — numeric cursors compare numerically,
 /// text cursors (timestamps in the source's own rendering) lexicographically.
 fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String> {
@@ -801,6 +806,8 @@ pub(crate) struct BqLoader {
     cursor: Option<(usize, bool)>,
     local_wm: Option<String>,
     shared_wm: Arc<std::sync::Mutex<Option<String>>>,
+    /// Parquet lane encoder; None = the CSV/gzip lane.
+    pq: Option<crate::bqparquet::ParquetEncoder>,
     /// Rows in the CURRENT file (cross-checked against its job's outputRows).
     file_rows: u64,
     /// Completed files' jobs, polling in the background while later files
@@ -820,23 +827,36 @@ pub(crate) struct BqLoader {
 }
 
 impl BqLoader {
+    #[allow(clippy::too_many_arguments)]
     fn open(
         conn: BqConn,
         base_config: &Value,
         staging_table: String,
         registry: Arc<std::sync::Mutex<Vec<String>>>,
+        names: &[String],
         delivered: Arc<Vec<Delivered>>,
+        parquet_lane: bool,
         cursor: Option<(usize, bool)>,
         shared_wm: Arc<std::sync::Mutex<Option<String>>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut job_config = base_config.clone();
         job_config["configuration"]["load"]["destinationTable"]["tableId"] = json!(staging_table);
-        Self {
+        let pq = if parquet_lane {
+            Some(crate::bqparquet::ParquetEncoder::new(
+                names.to_vec(),
+                delivered.as_ref().clone(),
+                cursor,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
             conn,
             job_config,
             staging_table,
             registry,
             registered: false,
+            pq,
             delivered,
             cursor,
             local_wm: None,
@@ -853,6 +873,28 @@ impl BqLoader {
             rows: 0,
             ndjson: Vec::new(),
             scratch: Vec::new(),
+        })
+    }
+
+    /// Bytes waiting in the current file's encoder output.
+    fn pending_len(&self) -> usize {
+        match &self.pq {
+            Some(pq) => pq.out.0.lock().expect("parquet buf").len(),
+            None => self.gz.get_ref().len(),
+        }
+    }
+
+    /// Take up to `take` buffered output bytes (caller picks an aligned count).
+    fn take_pending(&mut self, take: usize) -> Vec<u8> {
+        match &mut self.pq {
+            Some(pq) => pq
+                .out
+                .0
+                .lock()
+                .expect("parquet buf")
+                .drain(..take)
+                .collect(),
+            None => self.gz.get_mut().drain(..take).collect(),
         }
     }
 
@@ -966,12 +1008,21 @@ impl BqLoader {
                 .push(self.staging_table.clone());
             self.registered = true;
         }
-        let tail = std::mem::replace(
-            &mut self.gz,
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
-        )
-        .finish()
-        .map_err(|e| Error::Transfer(format!("gzip finish: {e}")))?;
+        let tail: Vec<u8> = match &mut self.pq {
+            Some(pq) => {
+                // Footer lands in the shared buffer; a fresh writer starts the
+                // next file.
+                pq.finish_file()?;
+                let mut b = pq.out.0.lock().expect("parquet buf");
+                b.drain(..).collect()
+            }
+            None => std::mem::replace(
+                &mut self.gz,
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
+            )
+            .finish()
+            .map_err(|e| Error::Transfer(format!("gzip finish: {e}")))?,
+        };
         let total = self.offset + tail.len() as u64;
         let job = self
             .put_chunk(tail, Some(total))
@@ -1005,15 +1056,15 @@ impl BqLoader {
         Ok(())
     }
 
-    /// Ship every full 256 KiB-aligned span the gzip buffer holds.
+    /// Ship every full 256 KiB-aligned span the encoder's buffer holds.
     async fn drain_aligned(&mut self) -> Result<()> {
         loop {
-            let ready = self.gz.get_ref().len();
+            let ready = self.pending_len();
             if ready < UPLOAD_CHUNK {
                 return Ok(());
             }
             let take = (ready / UPLOAD_ALIGN) * UPLOAD_ALIGN;
-            let chunk: Vec<u8> = self.gz.get_mut().drain(..take).collect();
+            let chunk = self.take_pending(take);
             self.put_chunk(chunk, None).await?;
         }
     }
@@ -1023,26 +1074,38 @@ impl Loader for BqLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         use std::io::Write;
         let t0 = std::time::Instant::now();
-        self.ndjson.clear();
-        let added = tsv_to_csv(
-            &buf,
-            &self.delivered,
-            self.cursor,
-            &mut self.local_wm,
-            &mut self.ndjson,
-            &mut self.scratch,
-        )?;
-        self.rows += added;
-        self.file_rows += added;
-        let t1 = std::time::Instant::now();
-        self.gz
-            .write_all(&self.ndjson)
-            .map_err(|e| Error::Transfer(format!("gzip encode: {e}")))?;
-        let t2 = std::time::Instant::now();
-        self.t_transcode += t1 - t0;
-        self.t_gzip += t2 - t1;
+        let t2;
+        match &mut self.pq {
+            Some(pq) => {
+                let added = pq.push(&buf)?;
+                self.rows += added;
+                self.file_rows += added;
+                t2 = std::time::Instant::now();
+                self.t_transcode += t2 - t0;
+            }
+            None => {
+                self.ndjson.clear();
+                let added = tsv_to_csv(
+                    &buf,
+                    &self.delivered,
+                    self.cursor,
+                    &mut self.local_wm,
+                    &mut self.ndjson,
+                    &mut self.scratch,
+                )?;
+                self.rows += added;
+                self.file_rows += added;
+                let t1 = std::time::Instant::now();
+                self.gz
+                    .write_all(&self.ndjson)
+                    .map_err(|e| Error::Transfer(format!("gzip encode: {e}")))?;
+                t2 = std::time::Instant::now();
+                self.t_transcode += t1 - t0;
+                self.t_gzip += t2 - t1;
+            }
+        }
         self.drain_aligned().await?;
-        let file_bytes = self.offset + self.gz.get_ref().len() as u64;
+        let file_bytes = self.offset + self.pending_len() as u64;
         if file_bytes >= ROTATE_HARD_BYTES
             || (file_bytes >= ROTATE_BYTES && self.last_seal.elapsed().as_secs() >= ROTATE_SECS)
         {
@@ -1084,6 +1147,9 @@ impl Loader for BqLoader {
             )));
         }
         // Only rows the jobs COMMITTED may advance the staged watermark.
+        if let Some(pq) = &mut self.pq {
+            self.local_wm = pq.wm.take();
+        }
         if let (Some((_, numeric)), Some(local)) = (self.cursor, self.local_wm.take()) {
             let mut shared = self.shared_wm.lock().expect("wm lock");
             *shared = wm_max(shared.take(), Some(local), numeric);
@@ -1122,6 +1188,13 @@ pub(crate) struct BqSink {
     /// Worker stagings that actually received data (see BqLoader.staging_table).
     staging_registry: Arc<std::sync::Mutex<Vec<String>>>,
     loader_seq: std::sync::atomic::AtomicUsize,
+    names: Vec<String>,
+    parquet_lane: bool,
+    /// Lane preference, decided at connect from the pipe count: Parquet's
+    /// typed builders cost more CPU per row but upload less and parse fastest
+    /// server-side — it wins from ~4 pipes up; the CSV lane wins on starved
+    /// half-core boxes (measured on 1M/10M, see benchmarks/README).
+    lane_order: [WireFormat; 2],
     delivered: Arc<Vec<Delivered>>,
     /// Incremental context for the state row (set in dest_state).
     source_id: Option<String>,
@@ -1134,8 +1207,13 @@ pub(crate) struct BqSink {
 }
 
 impl BqSink {
-    pub(crate) async fn connect(url: &str, dest_table: &str) -> Result<Self> {
+    pub(crate) async fn connect(url: &str, dest_table: &str, parallel: usize) -> Result<Self> {
         let conn = BqConn::parse(url).await?;
+        let lane_order = if parallel >= 4 {
+            [WireFormat::PgCopyBinary, WireFormat::TabSeparated]
+        } else {
+            [WireFormat::TabSeparated, WireFormat::PgCopyBinary]
+        };
         let bare = match dest_table.rsplit_once('.') {
             Some((qual, t)) if qual == conn.dataset => t,
             Some((qual, _)) => {
@@ -1154,6 +1232,9 @@ impl BqSink {
             job_config: Value::Null,
             staging_registry: Arc::new(std::sync::Mutex::new(Vec::new())),
             loader_seq: std::sync::atomic::AtomicUsize::new(0),
+            names: Vec::new(),
+            parquet_lane: false,
+            lane_order,
             delivered: Arc::new(Vec::new()),
             source_id: None,
             cursor_col: None,
@@ -1313,8 +1394,8 @@ impl BqSink {
 impl crate::driver::Sink for BqSink {
     type Loader = BqLoader;
 
-    fn accepts(&self) -> &'static [WireFormat] {
-        &[WireFormat::TabSeparated]
+    fn accepts(&self) -> &[WireFormat] {
+        &self.lane_order
     }
 
     fn adjust_plan(&self, _plan: &mut TablePlan) {}
@@ -1327,15 +1408,34 @@ impl crate::driver::Sink for BqSink {
         _mode: Mode,
     ) -> Result<()> {
         self.conn.ensure_dataset().await?;
+        self.parquet_lane = lane.format == WireFormat::PgCopyBinary;
         let mut fields = Vec::new();
         let mut delivered = Vec::new();
+        let mut names = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             check_col_name(&c.name)?;
+            if self.parquet_lane && !crate::bqparquet::parquet_decodable(&c.udt) {
+                return Err(Error::InvalidInput(format!(
+                    "column {} has type {} — the binary lane can't decode it; \
+                     cast it in a source view (e.g. {}::text)",
+                    c.name, c.udt, c.name
+                )));
+            }
+            // BigQuery rejects Parquet loads into JSON-typed columns outright
+            // ("Unsupported field type: JSON") — the binary lane lands json/jsonb
+            // as STRING (still valid JSON text; PARSE_JSON works on read).
+            let bq_type = if self.parquet_lane && lc.delivered == Delivered::Json {
+                "STRING"
+            } else {
+                bq_type_of(&lc.delivered)
+            };
             fields.push(json!({
-                "name": c.name, "type": bq_type_of(&lc.delivered), "mode": "NULLABLE",
+                "name": c.name, "type": bq_type, "mode": "NULLABLE",
             }));
+            names.push(c.name.clone());
             delivered.push(lc.delivered.clone());
         }
+        self.names = names;
         // Sweep every leftover worker staging (crashed runs included).
         for t in self.conn.tables_with_prefix(&self.staging_table).await? {
             self.conn.table_delete(&t).await?;
@@ -1359,9 +1459,9 @@ impl crate::driver::Sink for BqSink {
                 // First job per worker CREATES its own staging with this schema.
                 "schema": { "fields": fields },
                 "createDisposition": "CREATE_IF_NEEDED",
-                "sourceFormat": "CSV",
-                // Quoted fields may carry embedded newlines (text columns).
-                "allowQuotedNewlines": true,
+                "sourceFormat": if self.parquet_lane { "PARQUET" } else { "CSV" },
+                // CSV only: quoted fields may carry embedded newlines.
+                "allowQuotedNewlines": !self.parquet_lane,
                 "writeDisposition": "WRITE_APPEND",
                 "maxBadRecords": 0,
             }}
@@ -1373,15 +1473,17 @@ impl crate::driver::Sink for BqSink {
         let i = self
             .loader_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(BqLoader::open(
+        BqLoader::open(
             self.conn.clone(),
             &self.job_config,
             format!("{}_{i}", self.staging_table),
             self.staging_registry.clone(),
+            &self.names,
             self.delivered.clone(),
+            self.parquet_lane,
             self.cursor_track,
             self.staged_wm.clone(),
-        ))
+        )
     }
 
     async fn rows_staged(&self, loaded: u64) -> Result<u64> {

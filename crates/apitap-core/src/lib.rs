@@ -23,6 +23,7 @@
 //! # Ok(()) }
 //! ```
 
+mod bqparquet;
 mod connectors;
 mod driver;
 mod error;
@@ -270,7 +271,7 @@ pub async fn transfer(
             };
             let (chunk, parallel) = driver::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
-            let sink = connectors::bigquery::BqSink::connect(dst_url, dest_table).await?;
+            let sink = connectors::bigquery::BqSink::connect(dst_url, dest_table, parallel).await?;
             driver::run(
                 src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
             )

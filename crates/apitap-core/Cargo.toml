@@ -30,6 +30,9 @@ jsonwebtoken = "9"
 # zlib-rs backend: ~2-4x faster than the default miniz_oxide at the same
 # ratio — the gzip leg is the CPU wall on small cores (BigQuery route).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Low-level writer only (no arrow): the BigQuery Parquet lane builds column
+# chunks straight from Postgres binary COPY values. snap = SNAPPY pages.
+parquet = { version = "54", default-features = false, features = ["snap", "zstd"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
