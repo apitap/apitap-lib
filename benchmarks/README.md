@@ -263,6 +263,109 @@ caches: apitap 0.4 s vs ingestr 1.0.75 2.9 s. Small-row runs flatter apitap (fix
 per-run overhead dominates ingestr at this scale) — treat the capped 10M run above as
 the representative number.
 
+### Postgres → BigQuery — apitap vs ingestr vs dlt (2026-07-15)
+
+Same 10M-row / 15-column table, same VPS (OVH Canada), BigQuery dataset in
+`US`, each tool in its own container capped at **2 vCPU / 2 GB**, timed inside
+the container (image build/install not counted), 9 aggregate checksums
+(count, sums, decimal sum, string lengths, bool count, max timestamp/date)
+required to MATCH Postgres before a time counts. The BigQuery project is a
+**sandbox (no billing)** — every tool used the free load-job path.
+
+| tool | wall time | vs apitap | validated |
+|---|---|---|---|
+| **apitap** (this repo) | **41.7 s** | — | 9/9 MATCH |
+| ingestr 1.0.75 | 860 s | 20.6× slower | 9/9 MATCH |
+| dlt 1.x default (`sql_database`, no backend hint) | 2,160 s | 51.8× slower | 9/9 MATCH |
+
+Uncapped, apitap does the same transfer in **37.2 s** over 8 pipes.
+
+The apitap number was 85.1 s when this table was first recorded; the
+optimization pass below (same day, same environment, re-validated) halved
+it. The ingestr/dlt numbers predate that pass but their tooling didn't
+change; the ranking wasn't close either way.
+
+Scripts: [`run-bigquery.sh`](run-bigquery.sh) (all three tools, env-driven
+caps/rows/backend) + [`validate-bigquery.sh`](validate-bigquery.sh) (the 9
+aggregates). The tiny-box run is the same script with
+`ROWS=1000000 CAP_CPUS=0.5 CAP_MEM=256m DLT_BACKEND=pyarrow`.
+
+Honest notes:
+
+- All three tools ingest through BigQuery **load jobs** (free); the gap is in
+  the extract/encode leg, not in BigQuery. dlt's default backend extracts
+  row-by-row in Python (one core pegged for ~31 of its 36 minutes); ingestr
+  (dlt underneath, tuned) streams via its own arrow path. apitap reads
+  Postgres text COPY and transcodes to gzipped NDJSON in Rust, N pipes in
+  parallel, each feeding its own resumable load job.
+- Network context matters: the runner is in Canada, the dataset in `US`
+  multi-region. gzip (~5× fewer bytes on the wire) is part of apitap's
+  margin; a runner inside GCP would shrink the upload leg for everyone.
+- Two earlier dlt runs "failed silently" — that was a bug in OUR harness
+  (`docker run` without `-i`, so the pipeline script never reached Python),
+  not in dlt. Fixed, rerun, and the number above is dlt's real one.
+- One ingestr run was discarded because our validator, not ingestr, was
+  wrong (`bool` lands as BOOL vs apitap's INT64; the comparison query needed
+  a cast). Its second run differed by 1.7% (875 s vs 860 s).
+- Types differ slightly across tools (BOOL vs INT64 for `boolean`; ingestr
+  and dlt add `_dlt_id`/`_dlt_load_id` columns). Checksums compare the 15
+  source columns only.
+
+### Postgres → BigQuery on a tiny box — 0.5 vCPU / 256 MB (2026-07-15)
+
+Same environment as above, 1M rows (kept small deliberately — the project now
+has billing enabled and validation queries are billed), each tool capped at
+**0.5 vCPU / 256 MB**:
+
+| tool | outcome | validated |
+|---|---|---|
+| **apitap** | **16–18 s**, 2 pipes (27.4 s before the optimization pass) | 9/9 MATCH |
+| ingestr 1.0.75 | **OOM-killed** (exit 137) ~100k rows in; its own progress log read 310 MB just before the kernel killed it | no table landed |
+| dlt 1.x + pyarrow backend | **OOM-killed** (exit 137) during extract | no table landed |
+
+This is the point of the streaming design rather than a gotcha: apitap's
+memory is bounded by pipe count × chunk buffers (~tens of MB), independent of
+table size, so the same 256 MB container that moves 1M rows also moves 100M.
+ingestr at 2 vCPU / 2 GB reported a 556 MB peak on the 10M run — it needs the
+headroom; at 256 MB it cannot finish 1M. Both failures were rerun once to
+capture the real exit codes; neither is a harness artifact this time.
+
+### The BigQuery optimization pass (2026-07-15) — instrument first, then cut
+
+Per-phase instrumentation (`APITAP_DEBUG=1`) on the tiny box showed the time
+was NOT where intuition said (gzip was 1.4 s): the wall was `job_wait` —
+gzip files aren't splittable, so BigQuery parsed each worker's single big
+file single-threaded while apitap sat idle. Levers, one at a time, 3 runs
+each, checksums on every configuration:
+
+1. **File rotation + background job polls** — a new load job every ~12 MiB
+   compressed, polled while the next file streams (job_wait 14–18 s → 5–9 s).
+2. **CSV instead of NDJSON** — probed live that BigQuery CSV keeps the
+   NULL vs empty-string distinction (unquoted empty = NULL, quoted `""` =
+   empty), so the reason for NDJSON was void; ~40% fewer bytes into the
+   compressor, much faster server-side parse (job_wait → 2.7–4 s).
+3. **zlib-rs gzip backend + bulk-run escape loops** (transcode −30%).
+4. **Client-side watermark** — loaders track `MAX(cursor)` during transcode;
+   one less billed query per incremental run.
+5. **Per-worker staging tables + time-gated rotation** — BigQuery allows ~5
+   metadata updates / 10 s / table; fast workers sealing 12 MiB files every
+   second tripped `rateLimitExceeded` at 10M. Each worker now loads into its
+   own staging (one multi-source copy job finalizes) and seals at
+   ≥12 MiB **and** ≥6 s (hard cap 96 MiB).
+
+6. **Parquet lane** (binary COPY → typed column chunks → Parquet ZSTD-1, no
+   text round-trip, no `arrow` dependency) — BigQuery's fastest parse
+   (job_wait ~2-3 s at every scale). Its typed builders cost more CPU per
+   row than CSV string-slinging, so it wins where cores exist and loses on
+   half-core boxes: the lane is picked per connection (4+ pipes → Parquet,
+   fewer → CSV). Measured: 10M uncapped 37.2 → **26.9-27.9 s**; 10M at
+   2 vCPU statistically tied (41.7 vs 41.7-45.6); tiny box stays on CSV.
+   `json`/`jsonb` land as STRING on this lane (BigQuery rejects Parquet
+   loads into JSON columns).
+
+Net: 10M capped 85.1 s → **41.7 s**; 10M uncapped 71.2 s → **26.9 s**;
+tiny-box 1M 27.4 s → **16–18 s**. All re-validated 9/9.
+
 ## What these runs do NOT show
 
 Recorded honestly, because a benchmark is only useful if its edges are visible:

@@ -551,7 +551,7 @@ impl ChSink {
 impl crate::driver::Sink for ChSink {
     type Loader = ChLoader;
 
-    fn accepts(&self) -> &'static [WireFormat] {
+    fn accepts(&self) -> &[WireFormat] {
         // Best first: binary when the source can transcode every column, else text.
         &[WireFormat::RowBinary, WireFormat::TabSeparated]
     }

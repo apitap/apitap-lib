@@ -49,9 +49,10 @@ def transfer(
     """Copy ``table`` from ``src`` to ``dst``, atomically replacing the destination table.
 
     The URL schemes pick the route — ``postgres://``/``postgresql://``, ``mysql://``
-    sources; ``postgres://``, ``clickhouse://`` (``clickhouse+https://`` for TLS)
-    destinations — and each pair negotiates its fastest wire format (raw binary COPY
-    passthrough, in-flight RowBinary transcode, or raw wire decode). N concurrent
+    sources; ``postgres://``, ``clickhouse://`` (``clickhouse+https://`` for TLS),
+    ``bigquery://<project>/<dataset>?credentials=/path/key.json`` destinations — and
+    each pair negotiates its fastest wire format (raw binary COPY passthrough,
+    in-flight RowBinary transcode, raw wire decode, or gzipped parallel load jobs). N concurrent
     range pipes feed a staging table that is swapped in atomically. Atomic (readers
     never see a partial load), 0-row-guarded (an empty source never wipes a good
     table), and memory-bounded (streams with TCP backpressure).

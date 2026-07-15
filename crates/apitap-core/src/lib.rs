@@ -23,6 +23,7 @@
 //! # Ok(()) }
 //! ```
 
+mod bqparquet;
 mod connectors;
 mod driver;
 mod error;
@@ -183,6 +184,12 @@ fn to_ch_parallel(cores: usize) -> usize {
 fn my_pg_parallel(cores: usize) -> usize {
     (cores * 4).clamp(2, 16)
 }
+// BigQuery pipes: PG read + gzip (~fast level, light CPU) + upload; each is one
+// parallel load job. Upload bandwidth saturates quickly — more pipes past 8 just
+// shard the same uplink.
+fn to_bq_parallel(cores: usize) -> usize {
+    (cores * 2).clamp(2, 8)
+}
 
 /// Copy `table` from the source database to the destination, atomically replacing the
 /// destination table. The route is picked by the URL schemes; each pair negotiates the
@@ -252,6 +259,19 @@ pub async fn transfer(
             let (chunk, parallel) = driver::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
             let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
+            driver::run(
+                src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
+            )
+            .await
+        }
+        ("postgres" | "postgresql", "bigquery") => {
+            let profile = Profile {
+                auto_parallel: to_bq_parallel,
+                span_mult: 6,
+            };
+            let (chunk, parallel) = driver::knobs(opts, &profile)?;
+            let src = PgSource::connect(src_url, parallel + 1).await?;
+            let sink = connectors::bigquery::BqSink::connect(dst_url, dest_table, parallel).await?;
             driver::run(
                 src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
             )

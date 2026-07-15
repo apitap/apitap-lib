@@ -16,8 +16,8 @@
 use crate::error::{Error, Result};
 
 /// PG epoch (2000-01-01) → Unix epoch, in days / microseconds.
-const PG_EPOCH_DAYS: i32 = 10_957;
-const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
+pub(crate) const PG_EPOCH_DAYS: i32 = 10_957;
+pub(crate) const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
 /// How to transcode one column. Field order mirrors the SELECT / DDL order.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -305,7 +305,7 @@ fn bad(what: &str) -> Error {
 
 /// PG binary NUMERIC (ndigits, weight, sign, dscale + base-10000 digit groups) → an
 /// integer scaled to exactly `scale` decimal places.
-fn numeric_to_scaled_i128(f: &[u8], scale: u32) -> Result<i128> {
+pub(crate) fn numeric_to_scaled_i128(f: &[u8], scale: u32) -> Result<i128> {
     let (acc_scaled_dscale, dscale) = numeric_to_scaled_i128_raw(f)?;
     // acc is scaled to dscale places; rescale to the declared scale.
     let diff = scale as i32 - dscale;
@@ -327,8 +327,12 @@ fn numeric_to_scaled_i128_raw(f: &[u8]) -> Result<(i128, i32)> {
     let weight = i16::from_be_bytes(f[2..4].try_into().unwrap()) as i32;
     let sign = u16::from_be_bytes(f[4..6].try_into().unwrap());
     let dscale = u16::from_be_bytes(f[6..8].try_into().unwrap()) as i32;
-    if sign == 0xC000 {
-        return Err(bad("numeric NaN"));
+    match sign {
+        0x0000 | 0x4000 => {}
+        0xC000 => return Err(bad("numeric NaN")),
+        // pinf/ninf sentinels — decoding them as 0 would be silent corruption.
+        0xD000 | 0xF000 => return Err(bad("numeric Infinity")),
+        _ => return Err(bad("numeric sign")),
     }
     if f.len() < 8 + (ndigits as usize) * 2 {
         return Err(bad("numeric digits"));
