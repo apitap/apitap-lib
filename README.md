@@ -37,6 +37,9 @@ durability semantics, troubleshooting — lives in [docs/usage.md](docs/usage.md
   primary key (auto-detected) and each range streams concurrently.
 - **Bounded memory.** Bytes stream with TCP backpressure; memory is
   `parallel × chunk_bytes`, not the table size. A 256 MB container moves 10M+ rows.
+- **Warehouse-native ingestion.** BigQuery gets rotating parallel load jobs
+  (Parquet or CSV, picked per box) and an atomic copy — the free path end to
+  end, with incremental state that never needs DML (sandbox projects work).
 
 **Measured against [ingestr](https://github.com/bruin-data/ingestr)** — running their
 own benchmark (their exact schema, value generators, and CLI invocation, at their
@@ -58,6 +61,12 @@ in the same session on the same box):
 | Postgres → ClickHouse | **9.9 s** | 111 s | 11× |
 | MySQL → ClickHouse | **10.4 s** | 97 s | 9× |
 | MySQL → Postgres | **22.5 s** | 481 s | 21× |
+| Postgres → BigQuery¹ | **28.4 s** | 860 s | **30×** |
+
+¹ BigQuery route measured at 0.5.0 (8 pipes uncapped; 40.3 s at 2 vCPU / 2 GB —
+the caps the other rows use don't apply cleanly because the wall is upload +
+BigQuery-side parsing, not local CPU). dlt-default: 2,160 s. 100% free-path
+ingestion: load + copy jobs only, works on sandbox (no-billing) projects.
 
 **On a tiny 0.5 vCPU / 256 MB container** — the box you'd actually pay for — apitap
 completes every route (memory-bounded by design; the pipe count auto-sizes to the
@@ -69,6 +78,11 @@ cgroup's CPU *and* memory):
 | Postgres → ClickHouse | **28 s** | 428 s | 15.3× |
 | MySQL → ClickHouse | **53 s** | 399 s | 7.5× |
 | MySQL → Postgres | **58 s** | 849 s | 14.6× |
+| Postgres → BigQuery (1M) | **17.9 s** | OOM-killed | ∞ |
+
+(On the BigQuery row both ingestr and dlt+pyarrow died at exit 137 — the kernel
+OOM-killer — before finishing 1M rows in 256 MB; apitap's memory is bounded by
+pipe buffers, not table size.)
 
 apitap scales with the cores you give it and with the databases'; ingestr barely
 moves between 0.5 and 16 vCPUs — a mostly serial pipeline. Full per-tier numbers and
@@ -119,10 +133,11 @@ use it for rebuildable destinations.
       destination, written in the same transaction as the data; cost proportional
       to the delta, not the table
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
-- [x] Postgres → BigQuery (gzipped NDJSON → parallel resumable load jobs →
-      atomic copy; free-path only, no insertAll — **10M rows in 85 s at
-      2 vCPU vs ingestr 860 s / dlt 2,160 s**, checksum-validated; see
-      [benchmarks](benchmarks/README.md))
+- [x] Postgres → BigQuery (dual lanes picked per box: binary COPY → Parquet
+      ZSTD, or CSV+gzip on small cores; parallel resumable load jobs → atomic
+      multi-source copy; DML-free incremental state, sandbox-safe —
+      **10M in 28.4 s (40.3 s at 2 vCPU) vs ingestr 860 s / dlt 2,160 s**,
+      checksum-validated; see [benchmarks](benchmarks/README.md))
 - [ ] Postgres → Snowflake
 - [ ] MySQL → MySQL
 

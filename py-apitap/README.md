@@ -50,6 +50,13 @@ every number checksum-validated across engines:
 | Postgres → ClickHouse | **9.9 s** | 111 s | 1 893 s | 360 s |
 | MySQL → ClickHouse | **10.4 s** | 97 s | 2 231 s | failed¹ |
 | MySQL → Postgres | **22.5 s** | 481 s | 2 899 s | failed¹ |
+| Postgres → BigQuery² | **28.4 s** | 860 s | 2 160 s | — |
+
+² Measured at 0.5.0, 8 pipes uncapped (40.3 s at 2 vCPU); the wall is upload +
+BigQuery-side parsing, not local CPU. 100% free-path ingestion — load and copy
+jobs only, no `insertAll`, works on sandbox (no-billing) projects. At
+0.5 vCPU / 256 MB apitap moves 1M rows in 17.9 s while ingestr and dlt+pyarrow
+are both OOM-killed before finishing.
 
 ¹ dlt's pyarrow backend refuses MySQL `DOUBLE` without hand-written schema hints;
 its connectorx backend was OOM-killed on all four routes at the same 4 GB cap apitap
@@ -94,9 +101,13 @@ troubleshooting:
 ## Roadmap
 
 - [x] Postgres → Postgres · Postgres → ClickHouse · MySQL → ClickHouse · MySQL → Postgres
+- [x] Postgres → BigQuery — dual Parquet/CSV lanes, free-path load+copy jobs,
+      DML-free incremental state (sandbox-safe)
 - [x] Incremental sync — `mode="append"` / `mode="merge"` (transactional state table)
+- [x] ClickHouse table engines — `engine=`, `order_by=`, `on_cluster=`
+- [ ] MySQL → BigQuery
 - [ ] `read_postgres()` → Arrow / Polars
-- [ ] Snowflake / BigQuery destinations
+- [ ] Snowflake destination
 - [ ] aarch64 + macOS wheels
 
 ## License
