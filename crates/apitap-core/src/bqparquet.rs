@@ -34,6 +34,17 @@ const ROW_GROUP_BYTES: usize = 24 * 1024 * 1024;
 
 /// Postgres binary-COPY udts this lane can decode. Everything else must be
 /// cast in a source view — better a loud, early error than a garbled column.
+/// Column-level go/no-go for the parquet lane: the udt must have a known
+/// binary layout AND numerics must carry an exact ≤38-digit declaration
+/// (unconstrained NUMERIC rides as Float64 whose PG bytes are digit groups,
+/// and >38 digits exceed i128 — both fall back to the text lane).
+pub(crate) fn parquet_col_ok(udt: &str, precision: Option<i32>) -> bool {
+    if !parquet_decodable(udt) {
+        return false;
+    }
+    udt != "numeric" || matches!(precision, Some(p) if (1..=38).contains(&p))
+}
+
 pub(crate) fn parquet_decodable(udt: &str) -> bool {
     matches!(
         udt,
@@ -54,7 +65,6 @@ pub(crate) fn parquet_decodable(udt: &str) -> bool {
             | "varchar"
             | "bpchar"
             | "name"
-            | "bytea"
     )
 }
 
@@ -87,10 +97,15 @@ impl ColBuf {
             Delivered::Float32 => ColBuf::F32(Vec::new()),
             Delivered::Float64 => ColBuf::F64(Vec::new()),
             Delivered::Bool => ColBuf::Bool(Vec::new()),
-            Delivered::Decimal { s, .. } => ColBuf::Dec {
-                vals: Vec::new(),
-                scale: *s as u32,
-            },
+            Delivered::Decimal { p, s } => {
+                // MUST mirror parquet_field's clamping — a value scaled to a
+                // different exponent than the declared scale reads wrong.
+                let precision = if *p == 0 || *p > 38 { 38 } else { *p as u32 };
+                ColBuf::Dec {
+                    vals: Vec::new(),
+                    scale: (*s as u32).min(precision),
+                }
+            }
             Delivered::Date => ColBuf::Date(Vec::new()),
             Delivered::DateTime { .. } => ColBuf::Ts(Vec::new()),
             Delivered::Uuid | Delivered::Json | Delivered::Text | Delivered::Bytes => {
@@ -111,16 +126,18 @@ impl ColBuf {
         }
     }
 
-    /// Rough retained bytes, for row-group sizing.
+    /// RESIDENT bytes, for row-group sizing — ByteArray/FLBA hold a struct
+    /// (~32 B) plus a heap allocation with allocator quantum; undercounting
+    /// here is how a 24 MiB gate turns into a 256 MB OOM at 4 pipes.
     fn bytes(&self) -> usize {
         match self {
             ColBuf::I64(v) => v.len() * 8,
             ColBuf::F32(v) => v.len() * 4,
             ColBuf::F64(v) => v.len() * 8,
             ColBuf::Bool(v) => v.len(),
-            ColBuf::Dec { vals, .. } => vals.len() * 16,
+            ColBuf::Dec { vals, .. } => vals.len() * 48,
             ColBuf::Date(v) | ColBuf::Ts(v) => v.len() * 8,
-            ColBuf::Bytes(v) => v.iter().map(|b| b.len() + 12).sum(),
+            ColBuf::Bytes(v) => v.iter().map(|b| 48 + b.len()).sum(),
         }
     }
 
@@ -158,10 +175,24 @@ impl ColBuf {
             }
             ColBuf::Date(v) => {
                 let days = i32::from_be_bytes(f.try_into().map_err(|_| bad("date"))?);
+                if days == i32::MAX || days == i32::MIN {
+                    return Err(Error::Transfer(
+                        "date 'infinity' has no BigQuery representation — cast or \
+                         filter it in a source view"
+                            .into(),
+                    ));
+                }
                 v.push((days + PG_EPOCH_DAYS) as i64);
             }
             ColBuf::Ts(v) => {
                 let us = i64::from_be_bytes(f.try_into().map_err(|_| bad("timestamp"))?);
+                if us == i64::MAX || us == i64::MIN {
+                    return Err(Error::Transfer(
+                        "timestamp 'infinity' has no BigQuery representation — cast \
+                         or filter it in a source view"
+                            .into(),
+                    ));
+                }
                 v.push(us + PG_EPOCH_MICROS);
             }
             ColBuf::Bytes(v) => match d {
@@ -409,6 +440,11 @@ impl ParquetEncoder {
             }
             let len = i32::from_be_bytes(b[off..off + 4].try_into().unwrap());
             off += 4;
+            if len < -1 {
+                return Err(Error::Transfer(format!(
+                    "pg binary COPY: corrupt field length {len}"
+                )));
+            }
             if len > 0 {
                 if b.len() < off + len as usize {
                     return Ok(None);
@@ -441,7 +477,8 @@ impl ParquetEncoder {
     }
 
     fn group_bytes(&self) -> usize {
-        self.cols.iter().map(|c| c.bytes()).sum()
+        self.cols.iter().map(|c| c.bytes()).sum::<usize>()
+            + self.defs.iter().map(|d| d.len() * 2).sum::<usize>()
     }
 
     pub(crate) fn rows_buffered(&self) -> usize {
@@ -556,6 +593,14 @@ fn render_cursor(d: &Delivered, f: &[u8]) -> Result<String> {
             } else {
                 format!("{base}{frac}")
             }
+        }
+        Delivered::Date => {
+            let days = i32::from_be_bytes(f.try_into().map_err(|_| bad("cursor date"))?);
+            let secs = (days as i64 + PG_EPOCH_DAYS as i64) * 86_400;
+            chrono::DateTime::from_timestamp(secs, 0)
+                .ok_or_else(|| bad("cursor date range"))?
+                .format("%Y-%m-%d")
+                .to_string()
         }
         other => {
             return Err(Error::InvalidInput(format!(
@@ -672,6 +717,16 @@ mod tests {
             .to_string();
         assert!(row.contains("1234.5678"), "{row}");
         assert!(row.contains("2000-01-01"), "{row}");
+    }
+
+    #[test]
+    fn lane_gate_rejects_inexact_columns() {
+        assert!(parquet_col_ok("int8", None));
+        assert!(parquet_col_ok("numeric", Some(18)));
+        assert!(!parquet_col_ok("numeric", None)); // unconstrained -> Float64 bytes
+        assert!(!parquet_col_ok("numeric", Some(50))); // > i128 digits
+        assert!(!parquet_col_ok("bytea", None)); // raw bytes into STRING
+        assert!(!parquet_col_ok("inet", None));
     }
 
     #[test]

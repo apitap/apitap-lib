@@ -327,8 +327,12 @@ fn numeric_to_scaled_i128_raw(f: &[u8]) -> Result<(i128, i32)> {
     let weight = i16::from_be_bytes(f[2..4].try_into().unwrap()) as i32;
     let sign = u16::from_be_bytes(f[4..6].try_into().unwrap());
     let dscale = u16::from_be_bytes(f[6..8].try_into().unwrap()) as i32;
-    if sign == 0xC000 {
-        return Err(bad("numeric NaN"));
+    match sign {
+        0x0000 | 0x4000 => {}
+        0xC000 => return Err(bad("numeric NaN")),
+        // pinf/ninf sentinels — decoding them as 0 would be silent corruption.
+        0xD000 | 0xF000 => return Err(bad("numeric Infinity")),
+        _ => return Err(bad("numeric sign")),
     }
     if f.len() < 8 + (ndigits as usize) * 2 {
         return Err(bad("numeric digits"));

@@ -309,26 +309,33 @@ impl BqConn {
     /// Table ids in the dataset starting with `prefix` (one page is plenty —
     /// worker counts are small).
     async fn tables_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        let v = self
-            .api(
-                reqwest::Method::GET,
-                format!(
-                    "{BQ_BASE}/projects/{}/datasets/{}/tables?maxResults=1000",
-                    self.project, self.dataset
-                ),
-                None,
-            )
-            .await?;
-        Ok(v["tables"]
-            .as_array()
-            .map(|ts| {
-                ts.iter()
-                    .filter_map(|t| t["tableReference"]["tableId"].as_str())
-                    .filter(|id| id.starts_with(prefix))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default())
+        // Follow every page: '_' sorts AFTER digits, so in a dataset full of
+        // date-sharded tables a leftover staging is GUARANTEED off page one —
+        // and a missed leftover would get appended into by the next run.
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "{BQ_BASE}/projects/{}/datasets/{}/tables?maxResults=1000",
+                self.project, self.dataset
+            );
+            if let Some(t) = &token {
+                url.push_str(&format!("&pageToken={t}"));
+            }
+            let v = self.api(reqwest::Method::GET, url, None).await?;
+            if let Some(ts) = v["tables"].as_array() {
+                out.extend(
+                    ts.iter()
+                        .filter_map(|t| t["tableReference"]["tableId"].as_str())
+                        .filter(|id| id.starts_with(prefix))
+                        .map(str::to_string),
+                );
+            }
+            match v["nextPageToken"].as_str() {
+                Some(t) => token = Some(t.to_string()),
+                None => return Ok(out),
+            }
+        }
     }
 
     async fn ensure_dataset(&self) -> Result<()> {
@@ -535,7 +542,9 @@ fn bq_type_of(d: &Delivered) -> &'static str {
         Delivered::DateTime { utc: true } => "TIMESTAMP",
         Delivered::DateTime { utc: false } => "DATETIME",
         Delivered::Uuid => "STRING",
-        Delivered::Json => "JSON",
+        // STRING on BOTH lanes: BigQuery rejects Parquet loads into JSON-typed
+        // columns, and a table's type must not depend on which lane a run used.
+        Delivered::Json => "STRING",
         Delivered::Text => "STRING",
         Delivered::Bytes => "BYTES",
     }
@@ -689,13 +698,18 @@ fn append_csv_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scratch: &mut 
             }
         }
         Delivered::Bytes => {
-            // bytea_output=hex: "\x<hex>" — base64 has no CSV specials.
+            // bytea_output=hex: "\x<hex>" — base64 has no CSV specials. An
+            // EMPTY bytea must land quoted: an unquoted empty field is NULL.
             let hex = val.strip_prefix(b"\\x").unwrap_or(val);
-            let bytes: Vec<u8> = hex
-                .chunks(2)
-                .map(|p| (hex_val(p[0]) << 4) | p.get(1).map(|&b| hex_val(b)).unwrap_or(0))
-                .collect();
-            base64_into(&bytes, out);
+            if hex.is_empty() {
+                out.extend_from_slice(b"\"\"");
+            } else {
+                let bytes: Vec<u8> = hex
+                    .chunks(2)
+                    .map(|p| (hex_val(p[0]) << 4) | p.get(1).map(|&b| hex_val(b)).unwrap_or(0))
+                    .collect();
+                base64_into(&bytes, out);
+            }
         }
         Delivered::Json | Delivered::Text => {
             if val.is_empty() || val.iter().any(|&b| CSV_NEEDS_QUOTE[b as usize]) {
@@ -742,6 +756,7 @@ fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String>
 fn tsv_to_csv(
     input: &[u8],
     delivered: &[Delivered],
+    null_marker: bool,
     cursor: Option<(usize, bool)>,
     wm: &mut Option<String>,
     out: &mut Vec<u8>,
@@ -764,7 +779,20 @@ fn tsv_to_csv(
             if col > 0 {
                 out.push(b',');
             }
-            if field != b"\\N" {
+            if field == b"\\N" {
+                // Single-column tables set an explicit marker: a NULL row would
+                // otherwise be a BLANK line, which CSV parsers drop.
+                if null_marker {
+                    out.extend_from_slice(b"\\N");
+                }
+            } else {
+                // In marker mode a REAL value equal to the marker must be quoted
+                // or it would read back as NULL.
+                if null_marker && field == b"\\\\N" {
+                    out.extend_from_slice(b"\"\\N\"");
+                    col += 1;
+                    continue;
+                }
                 append_csv_value(field, &delivered[col], out, scratch);
                 if let Some((idx, numeric)) = cursor {
                     if col == idx {
@@ -802,6 +830,8 @@ pub(crate) struct BqLoader {
     staging_table: String,
     registry: Arc<std::sync::Mutex<Vec<String>>>,
     registered: bool,
+    stale_dropped: bool,
+    csv_null_marker: bool,
     delivered: Arc<Vec<Delivered>>,
     cursor: Option<(usize, bool)>,
     local_wm: Option<String>,
@@ -836,6 +866,7 @@ impl BqLoader {
         names: &[String],
         delivered: Arc<Vec<Delivered>>,
         parquet_lane: bool,
+        csv_null_marker: bool,
         cursor: Option<(usize, bool)>,
         shared_wm: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Result<Self> {
@@ -856,6 +887,8 @@ impl BqLoader {
             staging_table,
             registry,
             registered: false,
+            stale_dropped: false,
+            csv_null_marker,
             pq,
             delivered,
             cursor,
@@ -899,6 +932,14 @@ impl BqLoader {
     }
 
     async fn begin_session(&mut self) -> Result<()> {
+        // Belt-and-braces vs a leftover staging that slipped past the sweep
+        // (all jobs WRITE_APPEND — appending onto stale rows would be silent
+        // duplication; a TRUNCATE first-job can't fix it because BigQuery does
+        // not order concurrent load-job commits). Once per worker.
+        if !self.stale_dropped {
+            self.conn.table_delete(&self.staging_table).await?;
+            self.stale_dropped = true;
+        }
         let url = format!(
             "{BQ_UPLOAD}/projects/{}/jobs?uploadType=resumable",
             self.conn.project
@@ -1088,6 +1129,7 @@ impl Loader for BqLoader {
                 let added = tsv_to_csv(
                     &buf,
                     &self.delivered,
+                    self.csv_null_marker,
                     self.cursor,
                     &mut self.local_wm,
                     &mut self.ndjson,
@@ -1271,15 +1313,36 @@ impl BqSink {
 
     /// One NDJSON state row. `offset_micros` orders rows written by the same
     /// run (a replace's barrier must sort OLDER than its own state row).
+    /// BigQuery's own clock — state/barrier ordering must NEVER ride client
+    /// wall clocks: two machines feeding one destination (the supported fan-in
+    /// case) with a few seconds of skew could let a stale watermark outlive a
+    /// replace barrier, silently skipping rows. A table-free SELECT bills 0.
+    async fn server_now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
+        let rows = self
+            .conn
+            .query("SELECT FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E6SZ', CURRENT_TIMESTAMP())")
+            .await?;
+        let txt = rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .flatten()
+            .ok_or_else(|| Error::Transfer("bigquery CURRENT_TIMESTAMP returned nothing".into()))?;
+        chrono::DateTime::parse_from_rfc3339(&txt)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| Error::Transfer(format!("bigquery CURRENT_TIMESTAMP parse: {e}")))
+    }
+
     fn state_row(
         &self,
+        base: chrono::DateTime<chrono::Utc>,
         source_id: &str,
         watermark: Option<&str>,
         mode: &str,
         rows: u64,
         offset_micros: i64,
     ) -> String {
-        let ts = chrono::Utc::now() + chrono::Duration::microseconds(offset_micros);
+        let ts = base + chrono::Duration::microseconds(offset_micros);
         let mut row = json!({
             "dest_table": self.final_table,
             "source_id": source_id,
@@ -1307,16 +1370,23 @@ impl BqSink {
             return Ok(());
         };
         self.ensure_state_table().await?;
-        let row = self.state_row(&source_id, Some(watermark), self.mode_str, rows, 0);
+        let now = self.server_now().await?;
+        let row = self.state_row(now, &source_id, Some(watermark), self.mode_str, rows, 0);
         self.conn.load_rows(STATE_TABLE, row.into_bytes()).await
     }
 
-    /// Replace destroyed every source's rows: a `*` barrier row supersedes all
-    /// older state rows for this destination (the append-only DELETE).
-    async fn write_replace_barrier(&self) -> Result<()> {
+    /// Replace's barrier and (when a cursor is tracked) this run's own state
+    /// row land in ONE load job: a BigQuery load commits atomically, so there
+    /// is no window where the barrier exists without the state row (or vice
+    /// versa), and it halves the per-run load count on `_apitap_state`.
+    async fn write_barrier_and_state(&self, watermark: Option<&str>, rows: u64) -> Result<()> {
         self.ensure_state_table().await?;
-        let row = self.state_row("*", None, "replace-barrier", 0, -1000);
-        self.conn.load_rows(STATE_TABLE, row.into_bytes()).await
+        let now = self.server_now().await?;
+        let mut lines = self.state_row(now, "*", None, "replace-barrier", 0, -1000);
+        if let (Some(sid), Some(wm)) = (self.source_id.as_deref(), watermark) {
+            lines.push_str(&self.state_row(now, sid, Some(wm), self.mode_str, rows, 0));
+        }
+        self.conn.load_rows(STATE_TABLE, lines.into_bytes()).await
     }
 
     /// `MAX(cursor)` of `table` as text, `None` when the table has no rows.
@@ -1400,6 +1470,18 @@ impl crate::driver::Sink for BqSink {
 
     fn adjust_plan(&self, _plan: &mut TablePlan) {}
 
+    fn lane_ok(&self, plan: &TablePlan, format: WireFormat) -> bool {
+        match format {
+            // Every column must decode exactly from PG binary — otherwise the
+            // whole table falls through to the text lane instead of erroring.
+            WireFormat::PgCopyBinary => plan
+                .cols
+                .iter()
+                .all(|c| crate::bqparquet::parquet_col_ok(&c.udt, c.precision)),
+            _ => true,
+        }
+    }
+
     async fn prepare(
         &mut self,
         plan: &TablePlan,
@@ -1414,23 +1496,15 @@ impl crate::driver::Sink for BqSink {
         let mut names = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             check_col_name(&c.name)?;
-            if self.parquet_lane && !crate::bqparquet::parquet_decodable(&c.udt) {
+            if self.parquet_lane && !crate::bqparquet::parquet_col_ok(&c.udt, c.precision) {
                 return Err(Error::InvalidInput(format!(
                     "column {} has type {} — the binary lane can't decode it; \
                      cast it in a source view (e.g. {}::text)",
                     c.name, c.udt, c.name
                 )));
             }
-            // BigQuery rejects Parquet loads into JSON-typed columns outright
-            // ("Unsupported field type: JSON") — the binary lane lands json/jsonb
-            // as STRING (still valid JSON text; PARSE_JSON works on read).
-            let bq_type = if self.parquet_lane && lc.delivered == Delivered::Json {
-                "STRING"
-            } else {
-                bq_type_of(&lc.delivered)
-            };
             fields.push(json!({
-                "name": c.name, "type": bq_type, "mode": "NULLABLE",
+                "name": c.name, "type": bq_type_of(&lc.delivered), "mode": "NULLABLE",
             }));
             names.push(c.name.clone());
             delivered.push(lc.delivered.clone());
@@ -1460,7 +1534,14 @@ impl crate::driver::Sink for BqSink {
                 "schema": { "fields": fields },
                 "createDisposition": "CREATE_IF_NEEDED",
                 "sourceFormat": if self.parquet_lane { "PARQUET" } else { "CSV" },
-                // CSV only: quoted fields may carry embedded newlines.
+                // CSV only: quoted fields may carry embedded newlines. A
+                // single-column table needs an explicit NULL marker — a NULL row
+                // would otherwise be a blank line, which CSV parsing drops.
+                "nullMarker": if !self.parquet_lane && plan.cols.len() == 1 {
+                    json!("\\N")
+                } else {
+                    Value::Null
+                },
                 "allowQuotedNewlines": !self.parquet_lane,
                 "writeDisposition": "WRITE_APPEND",
                 "maxBadRecords": 0,
@@ -1481,6 +1562,7 @@ impl crate::driver::Sink for BqSink {
             &self.names,
             self.delivered.clone(),
             self.parquet_lane,
+            !self.parquet_lane && self.names.len() == 1,
             self.cursor_track,
             self.staged_wm.clone(),
         )
@@ -1633,10 +1715,8 @@ impl crate::driver::Sink for BqSink {
                 // a `*` barrier row instead of a DELETE, because DML is rejected
                 // on free-tier projects.
                 if self.conn.table_get(STATE_TABLE).await?.is_some() || self.source_id.is_some() {
-                    self.write_replace_barrier().await?;
-                }
-                if let Some(wm) = &staged_wm {
-                    self.write_state(wm, rows).await?;
+                    self.write_barrier_and_state(staged_wm.as_deref(), rows)
+                        .await?;
                 }
                 if std::env::var("APITAP_DEBUG").is_ok() {
                     eprintln!("[bq finalize] total={:.1}s", t_fin.elapsed().as_secs_f64());
@@ -1753,6 +1833,7 @@ mod tests {
         let rows = tsv_to_csv(
             b"1\thello\n2\t\\N\n3\t\n",
             &delivered,
+            false,
             None,
             &mut wm,
             &mut out,
@@ -1773,6 +1854,7 @@ mod tests {
         let rows = tsv_to_csv(
             b"a\n\nb\n",
             &delivered,
+            false,
             None,
             &mut wm,
             &mut out,
@@ -1792,8 +1874,26 @@ mod tests {
         let mut out = Vec::new();
         let mut scratch = Vec::new();
         let mut wm = None;
-        assert!(tsv_to_csv(b"1\t2\n", &delivered, None, &mut wm, &mut out, &mut scratch).is_err());
-        assert!(tsv_to_csv(b"", &delivered, None, &mut wm, &mut out, &mut scratch).is_ok());
+        assert!(tsv_to_csv(
+            b"1\t2\n",
+            &delivered,
+            false,
+            None,
+            &mut wm,
+            &mut out,
+            &mut scratch
+        )
+        .is_err());
+        assert!(tsv_to_csv(
+            b"",
+            &delivered,
+            false,
+            None,
+            &mut wm,
+            &mut out,
+            &mut scratch
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1811,6 +1911,7 @@ mod tests {
         tsv_to_csv(
             b"9\ta\n100\tb\n21\tc\n",
             &delivered,
+            false,
             Some((0, true)),
             &mut wm,
             &mut out,
@@ -1822,6 +1923,7 @@ mod tests {
         tsv_to_csv(
             b"\\N\tx\n",
             &delivered,
+            false,
             Some((0, true)),
             &mut wm2,
             &mut out,
@@ -1861,7 +1963,7 @@ mod tests {
         );
         assert_eq!(bq_type_of(&Delivered::DateTime { utc: true }), "TIMESTAMP");
         assert_eq!(bq_type_of(&Delivered::DateTime { utc: false }), "DATETIME");
-        assert_eq!(bq_type_of(&Delivered::Json), "JSON");
+        assert_eq!(bq_type_of(&Delivered::Json), "STRING"); // both lanes
     }
 
     #[test]
@@ -1891,6 +1993,32 @@ mod tests {
         assert!(BqSink::cursor_max_expr("timestamptz", "ts").contains("FORMAT_TIMESTAMP"));
         assert!(BqSink::cursor_max_expr("timestamp", "ts").contains("FORMAT_DATETIME"));
         assert!(BqSink::cursor_max_expr("int8", "id").starts_with("CAST(MAX"));
+    }
+
+    #[test]
+    fn empty_bytea_stays_empty_not_null() {
+        assert_eq!(t(Delivered::Bytes, b"\\\\x"), "\"\"");
+        assert_eq!(t(Delivered::Bytes, b"\\\\x4869"), "SGk=");
+    }
+
+    #[test]
+    fn single_column_null_marker_round_trip() {
+        let delivered = vec![Delivered::Text];
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+        let mut wm = None;
+        tsv_to_csv(
+            b"a\n\\N\n\\\\N\n",
+            &delivered,
+            true,
+            None,
+            &mut wm,
+            &mut out,
+            &mut scratch,
+        )
+        .unwrap();
+        // value 'a'; NULL -> marker; literal text "\N" -> quoted
+        assert_eq!(String::from_utf8(out).unwrap(), "a\n\\N\n\"\\N\"\n");
     }
 
     #[test]

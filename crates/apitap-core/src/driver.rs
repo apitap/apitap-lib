@@ -104,6 +104,13 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// connection (BigQuery prefers Parquet when CPU is plentiful, CSV when
     /// starved — measured, not guessed).
     fn accepts(&self) -> &[WireFormat];
+    /// Can this sink take `format` for THIS plan? Default yes; a sink whose
+    /// fast lane can't represent some column (BigQuery's Parquet lane vs
+    /// unconstrained NUMERIC, bytea, exotic udts) declines and negotiation
+    /// falls through to its next lane instead of hard-failing.
+    fn lane_ok(&self, _plan: &TablePlan, _format: WireFormat) -> bool {
+        true
+    }
     /// Sink-specific plan constraints, applied before lane planning so the DDL and the
     /// encoders agree (e.g. ClickHouse: the ORDER BY column must be non-nullable).
     fn adjust_plan(&self, plan: &mut TablePlan);
@@ -290,7 +297,7 @@ pub(crate) async fn run<S: Source, K: Sink>(
         .accepts()
         .iter()
         .copied()
-        .find(|f| src.can_produce(&plan, *f))
+        .find(|f| sink.lane_ok(&plan, *f) && src.can_produce(&plan, *f))
         .ok_or_else(|| {
             Error::InvalidInput(format!(
                 "no common wire format for {} → this destination",
