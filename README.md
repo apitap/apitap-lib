@@ -22,6 +22,30 @@ report = apitap.transfer(
 print(f"{report.rows:,} rows in {report.elapsed_ms} ms over {report.parallel} pipes")
 ```
 
+## Why apitap exists
+
+apitap is built around one simple belief: **moving a lot of data should not
+require a lot of machine.** Most ingestion pipelines burn money twice — once
+in wall-clock hours, once in the oversized workers those hours run on. If a
+transfer engine is careful enough about memory and wire formats, the same job
+that needs gigabytes of RAM elsewhere can finish, faster, on the smallest
+container you can rent. That difference is real cost savings, every hour, on
+every pipeline.
+
+Where that belief stands today, honestly measured: about **1M rows in ~18
+seconds on 0.5 vCPU / 256 MB** (~3.3M rows/minute) — a box where, in our
+benchmarks, the tools we compared against could not finish at all. The goal
+we are quietly working toward is **10M rows per minute on that same tiny
+box**. We are roughly 3× away, and we might never fully get there — but every
+step is taken the same way: one lever at a time, measured, checksum-validated,
+and written down in [benchmarks/README.md](benchmarks/README.md) including
+the caveats and our own mistakes.
+
+If you see a number that looks wrong, an assumption that doesn't hold, or a
+workload where apitap does badly — please open an issue. This project has
+been corrected by its own failed runs more than once, and it is better for
+each of them.
+
 ## Documentation
 
 **📰 Launch post:** [*I moved 10 million rows in 9.9 seconds with pip install apitap — and learned why your ELT benchmark is probably lying to you*](https://medium.com/p/i-moved-10-million-rows-in-9-9-seconds-with-pip-install-apitap-e3c6a826b253) — the origin story, the full showdown vs ingestr and dlt, and three lessons about "rows per hour".
