@@ -46,6 +46,20 @@ for _ in 1 2; do
     train "$MY" "$CH" bench_my_1m
     train "$MY" "$PD" bench_my_1m
 done
+# BigQuery route (both lanes — untrained branches can regress): needs a live
+# project. Set BQ_TRAIN_URL='bigquery://proj/ds?credentials=/sa/key.json' and
+# BQ_TRAIN_SA=/abs/path/key.json to enable; skipped otherwise.
+if [ -n "${BQ_TRAIN_URL:-}" ] && [ -n "${BQ_TRAIN_SA:-}" ]; then
+    for par in 8 2; do  # 8 = parquet lane, 2 = CSV lane
+        docker run --rm --network=host \
+            -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+            -v "$BQ_TRAIN_SA":/sa/key.json:ro \
+            apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$PS', '$BQ_TRAIN_URL', table='public.bench_data_1m',
+                dest_table='pgo_train_bq', parallel=$par)"
+    done
+fi
 
 echo "== 3/3 merge + optimized build =="
 docker run --rm -v "$REPO":/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c \
