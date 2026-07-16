@@ -21,6 +21,7 @@ PS='postgresql://postgres:bench@127.0.0.1:5544/apitap_bench_src'
 PD='postgresql://postgres:bench@127.0.0.1:5545/apitap_bench_dst'
 CH='clickhouse://default:bench@127.0.0.1:8124/default'
 MY='mysql://root:bench@127.0.0.1:3307/bench'
+MYD='mysql://root:bench@127.0.0.1:3308/bench'   # second MySQL for the MySQL->MySQL sink path
 
 rm -rf pgo-data merged.profdata && mkdir -p pgo-data && chmod 777 pgo-data
 
@@ -45,6 +46,7 @@ for _ in 1 2; do
     train "$PS" "$CH" public.bench_data_1m
     train "$MY" "$CH" bench_my_1m
     train "$MY" "$PD" bench_my_1m
+    train "$MY" "$MYD" bench_my_1m
 done
 # BigQuery route (both lanes — untrained branches can regress): needs a live
 # project. Set BQ_TRAIN_URL='bigquery://proj/ds?credentials=/sa/key.json' and

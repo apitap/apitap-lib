@@ -162,8 +162,10 @@ use it for rebuildable destinations.
       multi-source copy; DML-free incremental state, sandbox-safe —
       **10M in 28.4 s (40.3 s at 2 vCPU) vs ingestr 860 s / dlt 2,160 s**,
       checksum-validated; see [benchmarks](benchmarks/README.md))
+- [x] MySQL → MySQL (wire decode → `LOAD DATA LOCAL INFILE`, the only bulk path
+      MySQL exposes; charset/collation preserved into the destination DDL, exact
+      types, binary columns via `UNHEX`, UTC-normalized timestamps)
 - [ ] Postgres → Snowflake
-- [ ] MySQL → MySQL
 
 ## Development
 
