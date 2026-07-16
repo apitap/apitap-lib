@@ -5,4 +5,5 @@
 pub(crate) mod bigquery;
 pub(crate) mod clickhouse;
 pub(crate) mod mysql;
+pub(crate) mod mysql_sink;
 pub(crate) mod postgres;

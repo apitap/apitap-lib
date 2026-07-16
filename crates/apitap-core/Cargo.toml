@@ -18,12 +18,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 futures = "0.3"
 thiserror = "2"
 num_cpus = "1"
+# Fast integer/float formatting for the MySQL text lane (binary read → TSV).
+itoa = "1"
+ryu = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",
     "json",
 ] }
 bytes = "1"
+# LOAD DATA LOCAL INFILE streaming for the MySQL sink — sqlx can't do it.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonwebtoken = "9"

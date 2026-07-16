@@ -184,6 +184,11 @@ fn to_ch_parallel(cores: usize) -> usize {
 fn my_pg_parallel(cores: usize) -> usize {
     (cores * 4).clamp(2, 16)
 }
+// MySQL→MySQL: source decode is real CPU (like MySQL→PG) and the dest LOAD DATA
+// is server-bound; scale with cores, capped for the small tiers.
+fn my_my_parallel(cores: usize) -> usize {
+    (cores * 4).clamp(2, 16)
+}
 // BigQuery pipes: PG read + gzip (~fast level, light CPU) + upload; each is one
 // parallel load job. Upload bandwidth saturates quickly — more pipes past 8 just
 // shard the same uplink.
@@ -290,6 +295,19 @@ pub async fn transfer(
             )
             .await
         }
+        ("mysql", "mysql") => {
+            let profile = Profile {
+                auto_parallel: my_my_parallel,
+                span_mult: 6,
+            };
+            let (chunk, parallel) = driver::knobs(opts, &profile)?;
+            let src = MySqlSource::connect(src_url, parallel + 1).await?;
+            let sink = connectors::mysql_sink::MySqlSink::connect(dst_url, dest_table).await?;
+            driver::run(
+                src, sink, table, opts, &profile, chunk, parallel, started, &source_id,
+            )
+            .await
+        }
         ("mysql", "postgres" | "postgresql") => {
             let profile = Profile {
                 auto_parallel: my_pg_parallel,
@@ -307,7 +325,8 @@ pub async fn transfer(
         }
         (s, d) => Err(Error::InvalidInput(format!(
             "unsupported route {s}:// → {d}:// (supported: postgres→postgres, \
-             postgres→clickhouse, mysql→clickhouse, mysql→postgres)"
+             postgres→clickhouse, postgres→bigquery, mysql→clickhouse, \
+             mysql→postgres, mysql→mysql)"
         ))),
     }
 }

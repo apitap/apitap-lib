@@ -437,6 +437,220 @@ fn encode_pg(row: &MySqlRow, i: usize, enc: PgEnc, out: &mut Vec<u8>) -> Result<
     Ok(())
 }
 
+/// Per-column encoder for the MySQL text lane: read the BINARY wire value and
+/// render the exact text `LOAD DATA` expects, client-side. Reading binary (not
+/// `CAST … AS CHAR`) is ~3x cheaper on the wire and offloads nothing to the
+/// source — the measured win that took mysql→mysql under the CAST-text lane's
+/// floor. Strings/decimals/json are already text on the wire (StrEsc just
+/// escapes); ints/floats/dates/datetimes are decoded + formatted here.
+#[derive(Clone, Copy)]
+enum MyTsv {
+    Int {
+        bytes: u8,
+        unsigned: bool,
+    },
+    F32,
+    F64,
+    /// Already text on the wire (varchar/text/json/enum/set/decimal-as-text,
+    /// and time via CAST) — escape and relay.
+    StrEsc,
+    /// Binary DATE payload → `YYYY-MM-DD`.
+    DateBin,
+    /// Binary DATETIME/TIMESTAMP payload → `YYYY-MM-DD HH:MM:SS[.ffffff]`.
+    DateTimeBin,
+    /// binary/blob/bit → uppercase HEX (the sink UNHEXes it back).
+    Hex,
+}
+
+fn my_tsv(c: &ColumnPlan) -> MyTsv {
+    let unsigned = c.native_ddl.as_deref().unwrap_or("").contains("unsigned");
+    let int = |bytes: u8| MyTsv::Int { bytes, unsigned };
+    match c.udt.as_str() {
+        "tinyint" => int(1),
+        "smallint" | "year" => int(2),
+        "mediumint" | "int" => int(4),
+        "bigint" => int(8),
+        "float" => MyTsv::F32,
+        "double" => MyTsv::F64,
+        "date" => MyTsv::DateBin,
+        "datetime" | "timestamp" => MyTsv::DateTimeBin,
+        u if is_binary_udt(u) => MyTsv::Hex,
+        // char/varchar/text*/enum/set/json/decimal/time → already text (time is
+        // CAST to CHAR in the SELECT; decimal is NEWDECIMAL ascii on the wire).
+        _ => MyTsv::StrEsc,
+    }
+}
+
+const HEXDIG: &[u8; 16] = b"0123456789ABCDEF";
+
+/// Render one non-NULL MySQL binary field as `LOAD DATA` text into `out`.
+fn tsv_write(enc: MyTsv, b: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    match enc {
+        MyTsv::StrEsc => tsv_escape(b, out),
+        MyTsv::Int { bytes, unsigned } => {
+            let mut buf = itoa::Buffer::new();
+            let s = match (bytes, unsigned) {
+                (1, false) => buf.format(i8::from_le_bytes([b[0]]) as i64),
+                (1, true) => buf.format(b[0] as u64),
+                (2, false) => buf.format(i16::from_le_bytes([b[0], b[1]]) as i64),
+                (2, true) => buf.format(u16::from_le_bytes([b[0], b[1]]) as u64),
+                (4, false) => {
+                    buf.format(i32::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as i64)
+                }
+                (4, true) => {
+                    buf.format(u32::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as u64)
+                }
+                (8, false) => buf.format(i64::from_le_bytes(b.try_into().map_err(|_| bad_int())?)),
+                _ => buf.format(u64::from_le_bytes(b.try_into().map_err(|_| bad_int())?)),
+            };
+            out.extend_from_slice(s.as_bytes());
+        }
+        MyTsv::F32 => {
+            let v = f32::from_le_bytes(b.try_into().map_err(|_| bad_int())?);
+            let mut buf = ryu::Buffer::new();
+            out.extend_from_slice(buf.format(v).as_bytes());
+        }
+        MyTsv::F64 => {
+            let v = f64::from_le_bytes(b.try_into().map_err(|_| bad_int())?);
+            let mut buf = ryu::Buffer::new();
+            out.extend_from_slice(buf.format(v).as_bytes());
+        }
+        MyTsv::DateBin => write_date(b, out)?,
+        MyTsv::DateTimeBin => write_datetime(b, out)?,
+        MyTsv::Hex => {
+            out.reserve(b.len() * 2);
+            for &byte in b {
+                out.push(HEXDIG[(byte >> 4) as usize]);
+                out.push(HEXDIG[(byte & 0xf) as usize]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bad_int() -> Error {
+    Error::Transfer("mysql binary numeric: unexpected width".into())
+}
+
+fn w4(out: &mut Vec<u8>, v: u32) {
+    out.push(b'0' + (v / 1000 % 10) as u8);
+    out.push(b'0' + (v / 100 % 10) as u8);
+    out.push(b'0' + (v / 10 % 10) as u8);
+    out.push(b'0' + (v % 10) as u8);
+}
+fn w2(out: &mut Vec<u8>, v: u32) {
+    out.push(b'0' + (v / 10 % 10) as u8);
+    out.push(b'0' + (v % 10) as u8);
+}
+
+/// MySQL binary DATE `[len][year u16 LE][month][day]` → `YYYY-MM-DD`.
+fn write_date(b: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    // Length 0 = MySQL's all-zero date '0000-00-00' (legal under a lax sql_mode);
+    // the dest loads it under the same lax mode, so relay the literal.
+    if b == [0] {
+        out.extend_from_slice(b"0000-00-00");
+        return Ok(());
+    }
+    if b.is_empty() || b[0] < 4 || b.len() < 5 {
+        return Err(Error::Transfer("malformed binary DATE".into()));
+    }
+    let y = u16::from_le_bytes([b[1], b[2]]) as u32;
+    w4(out, y);
+    out.push(b'-');
+    w2(out, b[3] as u32);
+    out.push(b'-');
+    w2(out, b[4] as u32);
+    Ok(())
+}
+
+/// MySQL binary DATETIME/TIMESTAMP `[len][y u16][mon][day]([h][m][s]([micros u32]))`
+/// (len ∈ 4/7/11) → `YYYY-MM-DD HH:MM:SS[.ffffff]`. Trailing zero components are
+/// omitted by MySQL; we mirror that so a DATETIME(0) round-trips without a
+/// spurious `.000000` and a DATETIME(6) keeps its exact fraction.
+fn write_datetime(b: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    if b == [0] {
+        out.extend_from_slice(b"0000-00-00 00:00:00");
+        return Ok(());
+    }
+    if b.is_empty() || b[0] < 4 {
+        return Err(Error::Transfer("malformed binary DATETIME".into()));
+    }
+    write_date(b, out)?;
+    let len = b[0];
+    let (h, mi, s) = if len >= 7 {
+        (b[5] as u32, b[6] as u32, b[7] as u32)
+    } else {
+        (0, 0, 0)
+    };
+    out.push(b' ');
+    w2(out, h);
+    out.push(b':');
+    w2(out, mi);
+    out.push(b':');
+    w2(out, s);
+    if len >= 11 {
+        let micros = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+        if micros > 0 {
+            out.push(b'.');
+            let mut buf = [0u8; 6];
+            let mut m = micros;
+            for i in (0..6).rev() {
+                buf[i] = b'0' + (m % 10) as u8;
+                m /= 10;
+            }
+            out.extend_from_slice(&buf);
+        }
+    }
+    Ok(())
+}
+
+/// MySQL udts whose bytes aren't safe as connection-charset text — the TSV lane
+/// ships them HEX-encoded and the sink UNHEXes them, so binary round-trips exactly.
+/// Kept in one place because the source SELECT (HEX) and the sink LOAD DATA
+/// (UNHEX) must agree column-for-column.
+pub(crate) fn is_binary_udt(udt: &str) -> bool {
+    matches!(
+        udt,
+        "blob"
+            | "tinyblob"
+            | "mediumblob"
+            | "longblob"
+            | "binary"
+            | "varbinary"
+            | "bit"
+            | "geometry"
+    )
+}
+
+/// Escape one field for MySQL `LOAD DATA ... FIELDS ESCAPED BY '\\'`: backslash,
+/// the tab/newline delimiters, CR, NUL and 0x1A get a `\`-prefix; everything else
+/// (UTF-8 text, or uppercase HEX for binary columns) rides literally. NULL is
+/// written by the caller as the whole field `\N`, never routed here.
+fn tsv_escape(field: &[u8], out: &mut Vec<u8>) {
+    let mut i = 0;
+    while i < field.len() {
+        // Bulk-copy the run of clean bytes (the overwhelming common case).
+        let start = i;
+        while i < field.len() && !matches!(field[i], b'\\' | b'\t' | b'\n' | b'\r' | 0 | 0x1a) {
+            i += 1;
+        }
+        out.extend_from_slice(&field[start..i]);
+        if i == field.len() {
+            break;
+        }
+        out.push(b'\\');
+        out.push(match field[i] {
+            b'\t' => b't',
+            b'\n' => b'n',
+            b'\r' => b'r',
+            0 => b'0',
+            0x1a => b'Z',
+            other => other, // backslash
+        });
+        i += 1;
+    }
+}
+
 /// `` ` ``-quote a MySQL identifier / dotted path.
 fn my_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
@@ -482,7 +696,9 @@ impl Source for MySqlSource {
         let rows = sqlx::query(
             "SELECT CAST(COLUMN_NAME AS CHAR) AS name, CAST(DATA_TYPE AS CHAR) AS dt, \
                     CAST(COLUMN_TYPE AS CHAR) AS ct, NUMERIC_PRECISION AS p, NUMERIC_SCALE AS s, \
-                    CAST(IS_NULLABLE AS CHAR) AS nullable, CAST(COLUMN_KEY AS CHAR) AS ckey \
+                    CAST(IS_NULLABLE AS CHAR) AS nullable, CAST(COLUMN_KEY AS CHAR) AS ckey, \
+                    CAST(CHARACTER_SET_NAME AS CHAR) AS charset, \
+                    CAST(COLLATION_NAME AS CHAR) AS collation \
              FROM information_schema.columns \
              WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
              ORDER BY ORDINAL_POSITION",
@@ -514,7 +730,21 @@ impl Source for MySqlSource {
                         dt.as_str(),
                         "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
                     ),
-                native_ddl: Some(r.get::<String, _>("ct")),
+                native_ddl: Some({
+                    // Same-engine mirror: COLUMN_TYPE alone drops CHARACTER SET /
+                    // COLLATE, so a case/accent-SENSITIVE text PK would be rebuilt
+                    // case-insensitive and silently collapse distinct keys. Fold the
+                    // source charset+collation back in (both NULL for numerics).
+                    let ct: String = r.get("ct");
+                    let charset: Option<String> = r.try_get("charset").unwrap_or(None);
+                    let collation: Option<String> = r.try_get("collation").unwrap_or(None);
+                    match (charset, collation) {
+                        (Some(cs), Some(col)) => {
+                            format!("{ct} CHARACTER SET {cs} COLLATE {col}")
+                        }
+                        _ => ct,
+                    }
+                }),
                 udt: dt,
                 precision: r
                     .try_get::<Option<u64>, _>("p")
@@ -538,8 +768,12 @@ impl Source for MySqlSource {
     }
 
     fn can_produce(&self, _plan: &TablePlan, format: WireFormat) -> bool {
-        // Probe already validated every column for both row encoders.
-        matches!(format, WireFormat::RowBinary | WireFormat::PgCopyBinary)
+        // Probe validated every column for the row encoders; the text lane
+        // renders server-side (CAST/HEX) so it handles every column too.
+        matches!(
+            format,
+            WireFormat::RowBinary | WireFormat::PgCopyBinary | WireFormat::TabSeparated
+        )
     }
 
     fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane {
@@ -551,16 +785,39 @@ impl Source for MySqlSource {
                 // TIME arrives in a binary layout the decoders don't cover — cast it
                 // server-side. DECIMAL and JSON need no cast: the raw-bytes path reads
                 // NEWDECIMAL's ASCII digits and JSON's utf8 text straight off the wire.
-                let select = if c.udt == "time" {
-                    format!("CAST({q} AS CHAR)")
-                } else {
-                    q
-                };
-                let delivered = match format {
-                    WireFormat::PgCopyBinary => my_pg(c).expect("validated at probe").1,
-                    WireFormat::RowBinary => my_rb(c).expect("validated at probe").1,
-                    // can_produce() rejects it — negotiation can't get here.
-                    WireFormat::TabSeparated => unreachable!("guarded by can_produce()"),
+                let (select, delivered) = match format {
+                    WireFormat::PgCopyBinary => {
+                        // TIME arrives in a binary layout the decoders don't cover.
+                        let sel = if c.udt == "time" {
+                            format!("CAST({q} AS CHAR)")
+                        } else {
+                            q.clone()
+                        };
+                        (sel, my_pg(c).expect("validated at probe").1)
+                    }
+                    WireFormat::RowBinary => {
+                        let sel = if c.udt == "time" {
+                            format!("CAST({q} AS CHAR)")
+                        } else {
+                            q.clone()
+                        };
+                        (sel, my_rb(c).expect("validated at probe").1)
+                    }
+                    // Same-engine text lane: let MySQL render each value as
+                    // connection-charset text (round-trips exactly on reload),
+                    // HEX for binary so bytes survive the charset. delivered is a
+                    // marker — the sink mirrors native_ddl for its DDL, not this.
+                    WireFormat::TabSeparated => {
+                        // Read BINARY and format client-side (measured ~3x cheaper
+                        // than CAST-to-text on the wire). Only TIME is CAST — its
+                        // binary layout isn't covered by the decoders.
+                        let sel = if c.udt == "time" {
+                            format!("CAST({q} AS CHAR)")
+                        } else {
+                            q.clone()
+                        };
+                        (sel, Delivered::Text)
+                    }
                 };
                 LaneCol { delivered, select }
             })
@@ -652,8 +909,7 @@ impl Source for MySqlSource {
                     .map(|c| (my_rb(c).expect("validated at probe").0, c.nullable))
                     .collect(),
             ),
-            // can_produce() rejects it — negotiation can't get here.
-            WireFormat::TabSeparated => unreachable!("guarded by can_produce()"),
+            WireFormat::TabSeparated => MyEnc::Tsv(plan.cols.iter().map(my_tsv).collect()),
         };
         let queue = crate::driver::work_queue(stmts);
         let mut tasks = Vec::with_capacity(loaders.len());
@@ -680,6 +936,9 @@ impl Source for MySqlSource {
 enum MyEnc {
     RowBinary(Vec<(MyRb, bool)>),
     PgCopy(Vec<PgEnc>),
+    /// MySQL text lane (for the MySQL sink's LOAD DATA): decode the binary wire
+    /// value per column and render the exact LOAD DATA text client-side.
+    Tsv(Vec<MyTsv>),
 }
 
 /// One worker: pulls SELECT statements, decodes rows off the wire, encodes the lane's
@@ -692,6 +951,12 @@ async fn row_worker<L: Loader>(
     chunk: usize,
 ) -> Result<u64> {
     use futures::TryStreamExt;
+    let dbg = std::env::var("APITAP_DEBUG").is_ok();
+    let (mut t_fetch, mut t_enc, mut t_send) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
     let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
     if let MyEnc::PgCopy(_) = &enc {
         pgc::header(&mut out);
@@ -699,6 +964,7 @@ async fn row_worker<L: Loader>(
     while let Some(sql) = pop(&queue) {
         let mut rows = sqlx::query(&sql).fetch(&pool);
         loop {
+            let tf = dbg.then(std::time::Instant::now);
             let row = match rows.try_next().await {
                 Ok(Some(r)) => r,
                 Ok(None) => break,
@@ -708,6 +974,10 @@ async fn row_worker<L: Loader>(
                         .await)
                 }
             };
+            if let Some(tf) = tf {
+                t_fetch += tf.elapsed();
+            }
+            let te = dbg.then(std::time::Instant::now);
             let step = match &enc {
                 MyEnc::RowBinary(plan) => {
                     let mut r = Ok(());
@@ -716,6 +986,31 @@ async fn row_worker<L: Loader>(
                         if r.is_err() {
                             break;
                         }
+                    }
+                    r
+                }
+                MyEnc::Tsv(encs) => {
+                    let mut r = Ok(());
+                    for (i, enc) in encs.iter().enumerate() {
+                        if i > 0 {
+                            out.push(b'\t');
+                        }
+                        match raw_cell(&row, i) {
+                            Ok(None) => out.extend_from_slice(b"\\N"),
+                            Ok(Some(b)) => {
+                                if let Err(e) = tsv_write(*enc, b, &mut out) {
+                                    r = Err(e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                r = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                    if r.is_ok() {
+                        out.push(b'\n');
                     }
                     r
                 }
@@ -731,6 +1026,9 @@ async fn row_worker<L: Loader>(
                     r
                 }
             };
+            if let Some(te) = te {
+                t_enc += te.elapsed();
+            }
             if let Err(e) = step {
                 return Err(loader.abort(e).await);
             }
@@ -738,7 +1036,11 @@ async fn row_worker<L: Loader>(
             // ~1 extra full copy in geometric regrowth.
             if out.len() >= chunk {
                 let full = std::mem::replace(&mut out, Vec::with_capacity(chunk + 64 * 1024));
+                let ts = std::time::Instant::now();
                 loader.send(full).await?;
+                if dbg {
+                    t_send += ts.elapsed();
+                }
             }
         }
     }
@@ -748,12 +1050,116 @@ async fn row_worker<L: Loader>(
     if !out.is_empty() {
         loader.send(out).await?;
     }
+    if dbg {
+        eprintln!(
+            "[my worker] fetch(wire+parse)={:.1}s encode(cpu)={:.1}s send(backpressure)={:.1}s",
+            t_fetch.as_secs_f64(),
+            t_enc.as_secs_f64(),
+            t_send.as_secs_f64()
+        );
+    }
     loader.finish().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn esc(b: &[u8]) -> String {
+        let mut out = Vec::new();
+        tsv_escape(b, &mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn tsv_escape_matches_load_data_dialect() {
+        assert_eq!(esc(b"hello"), "hello"); // clean bytes ride literally
+        assert_eq!(esc(b"a\tb"), "a\\tb"); // tab -> backslash-t
+        assert_eq!(esc(b"a\nb"), "a\\nb"); // newline -> backslash-n
+        assert_eq!(esc(b"a\\b"), "a\\\\b"); // backslash doubles
+        assert_eq!(esc(b"a\rb"), "a\\rb"); // CR -> backslash-r
+        assert_eq!(esc(&[b'a', 0, b'b']), "a\\0b"); // NUL -> backslash-0
+        assert_eq!(esc(&[b'a', 0x1a, b'b']), "a\\Zb"); // 0x1A -> backslash-Z
+        assert_eq!(esc(b""), ""); // empty stays empty (NULL is \N, written elsewhere)
+        assert_eq!(esc(b"4869"), "4869"); // HEX output (uppercase hex) untouched
+    }
+
+    fn tw(enc: MyTsv, b: &[u8]) -> String {
+        let mut o = Vec::new();
+        tsv_write(enc, b, &mut o).unwrap();
+        String::from_utf8(o).unwrap()
+    }
+
+    #[test]
+    fn tsv_formatters_render_load_data_text() {
+        // ints (LE binary → decimal text)
+        assert_eq!(
+            tw(
+                MyTsv::Int {
+                    bytes: 4,
+                    unsigned: false
+                },
+                &(-42i32).to_le_bytes()
+            ),
+            "-42"
+        );
+        assert_eq!(
+            tw(
+                MyTsv::Int {
+                    bytes: 1,
+                    unsigned: true
+                },
+                &[255]
+            ),
+            "255"
+        );
+        assert_eq!(
+            tw(
+                MyTsv::Int {
+                    bytes: 8,
+                    unsigned: true
+                },
+                &u64::MAX.to_le_bytes()
+            ),
+            "18446744073709551615"
+        );
+        // float round-trips via ryu
+        assert_eq!(tw(MyTsv::F64, &1.5f64.to_le_bytes()), "1.5");
+        // hex for binary
+        assert_eq!(tw(MyTsv::Hex, &[0x48, 0x69]), "4869");
+        // DATE: [len=4][year LE][mon][day]
+        assert_eq!(tw(MyTsv::DateBin, &[4, 0xe8, 0x07, 2, 8]), "2024-02-08"); // 2024=0x07e8
+                                                                              // DATETIME no fraction (len=7)
+        assert_eq!(
+            tw(MyTsv::DateTimeBin, &[7, 0xe8, 0x07, 2, 8, 13, 46, 40]),
+            "2024-02-08 13:46:40"
+        );
+        // DATETIME with micros (len=11)
+        assert_eq!(
+            tw(
+                MyTsv::DateTimeBin,
+                &[11, 0xe8, 0x07, 2, 8, 13, 46, 40, 0xa0, 0x86, 1, 0]
+            ),
+            "2024-02-08 13:46:40.100000"
+        ); // 100000 micros = 0x000186a0 LE
+           // date-only datetime (len=4) → time zeros
+        assert_eq!(
+            tw(MyTsv::DateTimeBin, &[4, 0xe8, 0x07, 2, 8]),
+            "2024-02-08 00:00:00"
+        );
+        // StrEsc still escapes
+        assert_eq!(tw(MyTsv::StrEsc, b"a\tb"), "a\\tb");
+    }
+
+    #[test]
+    fn binary_udts_go_via_hex() {
+        assert!(is_binary_udt("blob"));
+        assert!(is_binary_udt("varbinary"));
+        assert!(is_binary_udt("bit"));
+        assert!(!is_binary_udt("varchar"));
+        assert!(!is_binary_udt("json"));
+        assert!(!is_binary_udt("datetime"));
+    }
 
     fn col(udt: &str, ct: &str, p: Option<i32>, s: Option<i32>) -> ColumnPlan {
         ColumnPlan {
