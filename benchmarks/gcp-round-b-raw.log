@@ -1,0 +1,36 @@
+
+##### ROUND B 10M #####
+########## MySQL -> MySQL (bench_my_10m) ##########
+[hb 12:47:50] running=apitap elapsed=00:30 (cap 5min)
+[hb 12:48:20] running=apitap elapsed=01:00 (cap 5min)
+[hb 12:48:50] running=apitap elapsed=01:30 (cap 5min)
+[hb 12:49:20] running=apitap elapsed=02:00 (cap 5min)
+[hb 12:49:50] running=apitap elapsed=02:30 (cap 5min)
+RESULT|apitap    MY->MY|bench_my_10m|wall=2:47.91|cpu=13%|mem=834MB|rc=0|MATCH
+[hb 12:50:50] running=ingestr elapsed=00:28 (cap 5min)
+[hb 12:51:20] running=ingestr elapsed=00:59 (cap 5min)
+[hb 12:51:50] running=ingestr elapsed=01:29 (cap 5min)
+[hb 12:52:20] running=ingestr elapsed=01:59 (cap 5min)
+[hb 12:52:50] running=ingestr elapsed=02:29 (cap 5min)
+[hb 12:53:20] running=ingestr elapsed=02:59 (cap 5min)
+[hb 12:53:50] running=ingestr elapsed=03:29 (cap 5min)
+[hb 12:54:20] running=ingestr elapsed=03:59 (cap 5min)
+[hb 12:54:50] running=ingestr elapsed=04:29 (cap 5min)
+[hb 12:55:20] running=ingestr elapsed=04:59 (cap 5min)
+RESULT|ingestr   MY->MY|bench_my_10m|wall=5:00.00|cpu=0%|mem=1MB|rc=137|CAPPED>5min
+NOTE|dlt MY->MY|bench_my_10m|N/A — dlt has no MySQL destination
+########## MySQL -> ClickHouse (bench_my_10m) ##########
+RESULT|apitap    MY->CH|bench_my_10m|wall=0:03.04|cpu=993%|mem=341MB|rc=0|MATCH
+[hb 12:55:50] running=ingestr elapsed=00:12 (cap 5min)
+[hb 12:56:20] running=ingestr elapsed=00:42 (cap 5min)
+RESULT|ingestr   MY->CH|bench_my_10m|wall=0:47.08|cpu=166%|mem=602MB|rc=0|MATCH
+[hb 12:56:50] running=dlt_run elapsed=00:18 (cap 5min)
+[hb 12:57:20] running=dlt_run elapsed=00:48 (cap 5min)
+[hb 12:57:50] running=dlt_run elapsed=01:18 (cap 5min)
+[hb 12:58:20] running=dlt_run elapsed=01:48 (cap 5min)
+[hb 12:58:50] running=dlt_run elapsed=02:18 (cap 5min)
+[hb 12:59:20] running=dlt_run elapsed=02:48 (cap 5min)
+RESULT|dlt-arrow MY->CH|bench_my_10m|wall=3:13.35|cpu=99%|mem=476MB|rc=1|MISMATCH
+   src=10000000|50000005000000|50000005000000000000|276688897 dst=Code: 60. DB::Exception: Unknown table expression identifier 'default.dltbench___bench_my_10m' in scope SELECT concat(to
+===== DONE ROUND B (bench_my_10m) =====
+[hb] round B done

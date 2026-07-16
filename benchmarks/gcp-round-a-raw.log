@@ -1,0 +1,91 @@
+===== ROUND A: Postgres source (internal IPs 10.142.0.2 -> 10.142.0.4) =====
+########## PG -> PG   (bench_data_1m) ##########
+RESULT|apitap    PG->PG|bench_data_1m|wall=0:03.97|cpu=33%|mem=323MB|rc=0|MATCH
+RESULT|ingestr   PG->PG|bench_data_1m|wall=0:15.57|cpu=86%|mem=222MB|rc=0|MATCH
+RESULT|dlt       PG->PG|bench_data_1m|wall=0:00.01|cpu=100%|mem=8MB|rc=2|MISMATCH
+   src=1000000|500000500000|500000500000000000|26668896 dst=
+RESULT|dlt-arrow PG->PG|bench_data_1m|wall=0:00.01|cpu=100%|mem=8MB|rc=2|MISMATCH
+   src=1000000|500000500000|500000500000000000|26668896 dst=
+########## PG -> ClickHouse  (bench_data_1m) ##########
+RESULT|apitap    PG->CH|bench_data_1m|wall=0:00.40|cpu=516%|mem=260MB|rc=0|MATCH
+RESULT|ingestr   PG->CH|bench_data_1m|wall=0:06.49|cpu=192%|mem=272MB|rc=0|MATCH
+RESULT|dlt       PG->CH|bench_data_1m|wall=0:00.01|cpu=92%|mem=8MB|rc=2|MISMATCH
+   src=1000000|500000500000|500000500000000000|26668896 dst=Code: 60. DB::Exception: Unknown table expression identifier 'bench_data_1m' in scope SELECT concat(toString(count()), '|', toString(sum(toInt128(id))), '|', toString(sum(toInt128(big_int))), '|', toString(sum(length(medium_str)))) FROM bench_data_1m. (UNKNOWN_TABLE) (version 24.8.14.39 (official build))
+RESULT|dlt-arrow PG->CH|bench_data_1m|wall=0:00.01|cpu=92%|mem=8MB|rc=2|MISMATCH
+   src=1000000|500000500000|500000500000000000|26668896 dst=Code: 60. DB::Exception: Unknown table expression identifier 'bench_data_1m' in scope SELECT concat(toString(count()), '|', toString(sum(toInt128(id))), '|', toString(sum(toInt128(big_int))), '|', toString(sum(length(medium_str)))) FROM bench_data_1m. (UNKNOWN_TABLE) (version 24.8.14.39 (official build))
+########## PG -> PG   (bench_data_10m) ##########
+RESULT|apitap    PG->PG|bench_data_10m|wall=0:30.76|cpu=22%|mem=510MB|rc=0|MATCH
+RESULT|ingestr   PG->PG|bench_data_10m|wall=3:04.94|cpu=68%|mem=622MB|rc=0|MATCH
+RESULT|dlt       PG->PG|bench_data_10m|wall=0:00.01|cpu=100%|mem=8MB|rc=2|MISMATCH
+   src=10000000|50000005000000|50000005000000000000|276688897 dst=
+RESULT|dlt-arrow PG->PG|bench_data_10m|wall=0:00.01|cpu=92%|mem=8MB|rc=2|MISMATCH
+   src=10000000|50000005000000|50000005000000000000|276688897 dst=
+########## PG -> ClickHouse  (bench_data_10m) ##########
+RESULT|apitap    PG->CH|bench_data_10m|wall=0:01.71|cpu=986%|mem=674MB|rc=0|MATCH
+RESULT|ingestr   PG->CH|bench_data_10m|wall=1:01.70|cpu=194%|mem=273MB|rc=0|MATCH
+RESULT|dlt       PG->CH|bench_data_10m|wall=0:00.01|cpu=100%|mem=8MB|rc=2|MISMATCH
+   src=10000000|50000005000000|50000005000000000000|276688897 dst=Code: 60. DB::Exception: Unknown table expression identifier 'bench_data_10m' in scope SELECT concat(toString(count()), '|', toString(sum(toInt128(id))), '|', toString(sum(toInt128(big_int))), '|', toString(sum(length(medium_str)))) FROM bench_data_10m. (UNKNOWN_TABLE) (version 24.8.14.39 (official build))
+RESULT|dlt-arrow PG->CH|bench_data_10m|wall=0:00.01|cpu=92%|mem=8MB|rc=2|MISMATCH
+   src=10000000|50000005000000|50000005000000000000|276688897 dst=Code: 60. DB::Exception: Unknown table expression identifier 'bench_data_10m' in scope SELECT concat(toString(count()), '|', toString(sum(toInt128(id))), '|', toString(sum(toInt128(big_int))), '|', toString(sum(length(medium_str)))) FROM bench_data_10m. (UNKNOWN_TABLE) (version 24.8.14.39 (official build))
+===== DONE ROUND A =====
+
+##### DLT RE-RUN (fixed) #####
+########## dlt bench_data_1m ##########
+RESULT|dlt       PG->PG|bench_data_1m|wall=2:58.55|cpu=82%|mem=469MB|rc=0|MATCH
+RESULT|dlt-arrow PG->PG|bench_data_1m|wall=0:48.57|cpu=89%|mem=636MB|rc=0|MATCH
+RESULT|dlt       PG->CH|bench_data_1m|wall=0:01.30|cpu=95%|mem=107MB|rc=1|MISMATCH
+   src=1000000|500000500000|500000500000000000|26668896 dst=Code: 81. DB::Exception: Database dltbench does not exist. (UNKNOWN_DATABASE) (version 24.8.14.39 (official build))
+RESULT|dlt-arrow PG->CH|bench_data_1m|wall=0:01.29|cpu=95%|mem=107MB|rc=1|MISMATCH
+   src=1000000|500000500000|500000500000000000|26668896 dst=Code: 81. DB::Exception: Database dltbench does not exist. (UNKNOWN_DATABASE) (version 24.8.14.39 (official build))
+########## dlt bench_data_10m ##########
+[heartbeat 11:34:28] dlt bench_data_10m/default elapsed=03:50 extract_workdir=258M dst_rows=0
+[heartbeat 11:34:58] dlt bench_data_10m/default elapsed=04:20 extract_workdir=293M dst_rows=0
+[heartbeat 11:35:28] dlt bench_data_10m/default elapsed=04:50 extract_workdir=328M dst_rows=0
+[heartbeat 11:35:58] dlt bench_data_10m/default elapsed=05:20 extract_workdir=361M dst_rows=0
+[heartbeat 11:36:28] dlt bench_data_10m/default elapsed=05:50 extract_workdir=396M dst_rows=0
+[heartbeat 11:36:58] dlt bench_data_10m/default elapsed=06:20 extract_workdir=431M dst_rows=0
+[heartbeat 11:37:28] dlt bench_data_10m/default elapsed=06:51 extract_workdir=463M dst_rows=0
+[heartbeat 11:37:58] dlt bench_data_10m/default elapsed=07:21 extract_workdir=499M dst_rows=0
+[heartbeat 11:38:28] dlt bench_data_10m/default elapsed=07:51 extract_workdir=519M dst_rows=0
+[heartbeat 11:38:58] dlt bench_data_10m/default elapsed=08:21 extract_workdir=537M dst_rows=0
+[heartbeat 11:39:28] dlt bench_data_10m/default elapsed=08:51 extract_workdir=556M dst_rows=0
+[heartbeat 11:39:59] dlt bench_data_10m/default elapsed=09:21 extract_workdir=575M dst_rows=0
+[heartbeat 11:40:29] dlt bench_data_10m/default elapsed=09:51 extract_workdir=593M dst_rows=0
+[heartbeat] dlt harness done
+
+##### ROUND A dlt PYARROW (default backend capped, per user) #####
+########## dlt-pyarrow bench_data_1m ##########
+[heartbeat 11:46:38] dlt-pyarrow bench_data_1m elapsed=00:25 extract_workdir=84M (cap 5min)
+RESULT|dlt-arrow PG->PG|bench_data_1m|wall=0:47.71|cpu=91%|mem=634MB|rc=0|MATCH
+RESULT|dlt-arrow PG->CH|bench_data_1m|wall=0:01.30|cpu=95%|mem=107MB|rc=1|MISMATCH
+   src=1000000|500000500000|500000500000000000|26668896 dst=Code: 60. DB::Exception: Unknown table expression identifier 'dltbench.bench_data_1m' in scope SELECT concat(toString(count()), '|', toStrin
+   	Signals delivered: 0
+   	Page size (bytes): 4096
+   	Exit status: 1
+########## dlt-pyarrow bench_data_10m ##########
+[heartbeat 11:47:28] dlt-pyarrow bench_data_10m elapsed=00:24 extract_workdir=85M (cap 5min)
+[heartbeat 11:47:53] dlt-pyarrow bench_data_10m elapsed=00:49 extract_workdir=177M (cap 5min)
+[heartbeat 11:48:18] dlt-pyarrow bench_data_10m elapsed=01:14 extract_workdir=269M (cap 5min)
+[heartbeat 11:48:43] dlt-pyarrow bench_data_10m elapsed=01:39 extract_workdir=361M (cap 5min)
+[heartbeat 11:49:08] dlt-pyarrow bench_data_10m elapsed=02:04 extract_workdir=453M (cap 5min)
+[heartbeat 11:49:33] dlt-pyarrow bench_data_10m elapsed=02:29 extract_workdir=545M (cap 5min)
+[heartbeat 11:49:58] dlt-pyarrow bench_data_10m elapsed=02:54 extract_workdir=637M (cap 5min)
+[heartbeat 11:50:23] dlt-pyarrow bench_data_10m elapsed=03:19 extract_workdir=729M (cap 5min)
+[heartbeat 11:50:48] dlt-pyarrow bench_data_10m elapsed=03:44 extract_workdir=807M (cap 5min)
+[heartbeat 11:51:13] dlt-pyarrow bench_data_10m elapsed=04:09 extract_workdir=874M (cap 5min)
+[heartbeat 11:51:38] dlt-pyarrow bench_data_10m elapsed=04:34 extract_workdir=940M (cap 5min)
+[heartbeat 11:52:03] dlt-pyarrow bench_data_10m elapsed=04:59 extract_workdir=1006M (cap 5min)
+[heartbeat 11:52:28] dlt-pyarrow bench_data_10m elapsed=05:25 extract_workdir=1.1G (cap 5min)
+[heartbeat 11:52:53] dlt-pyarrow bench_data_10m elapsed=05:50 extract_workdir=1.2G (cap 5min)
+[heartbeat 11:53:18] dlt-pyarrow bench_data_10m elapsed=06:15 extract_workdir=1.2G (cap 5min)
+RESULT|dlt-arrow PG->PG|bench_data_10m|wall=6:27.98|cpu=99%|mem=681MB|rc=124|TIMEOUT>5min
+RESULT|dlt-arrow PG->CH|bench_data_10m|wall=0:01.32|cpu=94%|mem=107MB|rc=1|MISMATCH
+   src=10000000|50000005000000|50000005000000000000|276688897 dst=Code: 60. DB::Exception: Unknown table expression identifier 'dltbench.bench_data_10m' in scope SELECT concat(toString(count()), '|', toStri
+   	Signals delivered: 0
+   	Page size (bytes): 4096
+   	Exit status: 1
+===== DONE ROUND A PYARROW =====
+[heartbeat] pyarrow harness done
+RESULT|dlt-arrow PG->PG|bench_data_10m|wall=>5:00|cpu=~95%|mem=~1GB+|rc=killed|CAPPED (pyarrow extract still running at 6:15, ~1.2/4.6GB done — est ~12min)
+RESULT|dlt-arrow PG->CH|bench_data_10m|wall=>5:00|cpu=-|mem=-|rc=skipped|CAPPED (same extract wall as PG->PG; and dlt CH load fails — see 1M)
+##### 10M dlt runs capped per user 5-min rule #####
