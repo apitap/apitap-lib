@@ -16,7 +16,7 @@
 
 use crate::error::{Error, Result};
 use crate::plan::Delivered;
-use crate::rowbinary::{numeric_to_scaled_i128, PG_EPOCH_DAYS, PG_EPOCH_MICROS};
+use crate::wire::rowbinary::{numeric_to_scaled_i128, PG_EPOCH_DAYS, PG_EPOCH_MICROS};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use parquet::data_type::{
     BoolType, ByteArray, ByteArrayType, DoubleType, FixedLenByteArray, FixedLenByteArrayType,
@@ -469,7 +469,7 @@ impl ParquetEncoder {
                 if i == idx {
                     let v = render_cursor(&self.delivered[i], f)?;
                     self.wm =
-                        crate::connectors::bigquery::wm_max_pub(self.wm.take(), Some(v), numeric);
+                        crate::sink::bigquery::wm_max_pub(self.wm.take(), Some(v), numeric);
                 }
             }
         }

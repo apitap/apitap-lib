@@ -2,7 +2,7 @@
 //! (or TabSeparated for the text fallback lane) into a staging MergeTree, swapped in
 //! atomically with `EXCHANGE TABLES`.
 
-use crate::driver::Loader;
+use crate::sink::Loader;
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
@@ -429,7 +429,7 @@ impl ChDdl {
         let mut out = std::collections::HashSet::new();
         let mut in_quote = false;
         let mut cur = String::new();
-        let mut push = |cur: &mut String, out: &mut std::collections::HashSet<String>| {
+        let push = |cur: &mut String, out: &mut std::collections::HashSet<String>| {
             if !cur.is_empty() && !cur.chars().all(|c| c.is_ascii_digit()) {
                 out.insert(std::mem::take(cur));
             }
@@ -555,7 +555,7 @@ impl ChSink {
     }
 }
 
-impl crate::driver::Sink for ChSink {
+impl crate::sink::Sink for ChSink {
     type Loader = ChLoader;
 
     fn accepts(&self) -> &[WireFormat] {

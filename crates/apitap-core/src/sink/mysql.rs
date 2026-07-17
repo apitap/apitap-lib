@@ -6,7 +6,7 @@
 //! handler takes a `Stream<io::Result<Bytes>>`: each worker feeds one streaming
 //! `LOAD DATA` off a channel, exactly like the Postgres COPY loader.
 //!
-//! The lane is the MySQL text lane (see [`super::mysql`] `MyEnc::Tsv`): the source
+//! The lane is the MySQL text lane (see [`crate::source::mysql`] `MyEnc::Tsv`): the source
 //! renders every value server-side (`CAST … AS CHAR`, `HEX` for binary), so the
 //! bytes round-trip exactly on reload (same engine) and the sink only has to
 //! `UNHEX` the binary columns back. Fields are tab-separated, `\N` is NULL,
@@ -17,7 +17,8 @@
 //! append. Incremental state lives in `_apitap_state`, upserted in the same
 //! statement family as the other sinks.
 
-use crate::driver::Loader;
+use crate::sink::Loader;
+use crate::dialect::mysql::{is_binary_udt, my_ident};
 use crate::error::{Error, Result};
 use crate::plan::{DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
@@ -33,9 +34,6 @@ use std::sync::{Arc, Mutex};
 
 type Registry = Arc<Mutex<HashMap<u64, mpsc::Receiver<std::io::Result<Bytes>>>>>;
 
-fn my_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
-}
 
 /// Escape a string as a MySQL SQL single-quoted literal body (no surrounding
 /// quotes). Only used for the tiny state-row writes, never the bulk path.
@@ -212,7 +210,7 @@ impl MySqlSink {
     }
 }
 
-impl crate::driver::Sink for MySqlSink {
+impl crate::sink::Sink for MySqlSink {
     type Loader = MySqlLoader;
 
     fn accepts(&self) -> &[WireFormat] {
@@ -260,7 +258,7 @@ impl crate::driver::Sink for MySqlSink {
         self.cols = plan
             .cols
             .iter()
-            .map(|c| (c.name.clone(), super::mysql::is_binary_udt(&c.udt)))
+            .map(|c| (c.name.clone(), is_binary_udt(&c.udt)))
             .collect();
         Ok(())
     }

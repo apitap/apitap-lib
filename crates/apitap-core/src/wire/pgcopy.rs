@@ -1,4 +1,4 @@
-//! Postgres binary-COPY ENCODER — the inverse of the parser in [`crate::rowbinary`],
+//! Postgres binary-COPY ENCODER — the inverse of the parser in [`crate::wire::rowbinary`],
 //! used by routes that write INTO Postgres from a non-Postgres source. Binary beats
 //! text here for the same reason twice over: the destination skips text parsing, and
 //! the encoder has no escaping rules to get wrong.
@@ -142,7 +142,7 @@ mod tests {
         let mut out = Vec::new();
         numeric_field_from_str(s, &mut out).unwrap();
         // Strip the 4-byte length header; the rest is the numeric payload.
-        crate::rowbinary::numeric_to_scaled_i128_for_tests(&out[4..], scale).unwrap()
+        crate::wire::rowbinary::numeric_to_scaled_i128_for_tests(&out[4..], scale).unwrap()
     }
 
     #[test]

@@ -5,11 +5,14 @@
 //! wire format directly — ClickHouse RowBinary or Postgres binary COPY, no
 //! intermediate text, no Arrow.
 
-use crate::driver::{pop, spans, Loader, Source, WorkQueue};
+use crate::pipeline::{pop, spans, WorkQueue};
+use crate::sink::Loader;
+use crate::source::Source;
 use crate::error::{Error, Result};
-use crate::pgcopy as pgc;
+use crate::wire::pgcopy as pgc;
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
-use crate::rowbinary::varint;
+use crate::wire::rowbinary::varint;
+use crate::dialect::mysql::{is_binary_udt, my_ident, my_ident_path};
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::Row;
 
@@ -604,23 +607,6 @@ fn write_datetime(b: &[u8], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// MySQL udts whose bytes aren't safe as connection-charset text — the TSV lane
-/// ships them HEX-encoded and the sink UNHEXes them, so binary round-trips exactly.
-/// Kept in one place because the source SELECT (HEX) and the sink LOAD DATA
-/// (UNHEX) must agree column-for-column.
-pub(crate) fn is_binary_udt(udt: &str) -> bool {
-    matches!(
-        udt,
-        "blob"
-            | "tinyblob"
-            | "mediumblob"
-            | "longblob"
-            | "binary"
-            | "varbinary"
-            | "bit"
-            | "geometry"
-    )
-}
 
 /// Escape one field for MySQL `LOAD DATA ... FIELDS ESCAPED BY '\\'`: backslash,
 /// the tab/newline delimiters, CR, NUL and 0x1A get a `\`-prefix; everything else
@@ -651,13 +637,6 @@ fn tsv_escape(field: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// `` ` ``-quote a MySQL identifier / dotted path.
-fn my_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
-}
-fn my_ident_path(path: &str) -> String {
-    path.split('.').map(my_ident).collect::<Vec<_>>().join(".")
-}
 
 // ---------------------------------------------------------------------------------
 // Source
@@ -1016,7 +995,7 @@ impl Source for MySqlSource {
             ),
             WireFormat::TabSeparated => MyEnc::Tsv(plan.cols.iter().map(my_tsv).collect()),
         };
-        let queue = crate::driver::work_queue(stmts);
+        let queue = crate::pipeline::work_queue(stmts);
         let mut tasks = Vec::with_capacity(loaders.len());
         for loader in loaders {
             tasks.push(tokio::spawn(row_worker(

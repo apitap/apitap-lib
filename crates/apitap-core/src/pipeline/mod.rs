@@ -9,9 +9,13 @@
 //! Adding a connector = implement `Source` and/or `Sink` in `connectors/<name>.rs` and
 //! register the scheme in [`crate::transfer`]'s dispatch — nothing here changes.
 
+pub(crate) mod dispatch;
+
 use crate::error::{Error, Result};
-use crate::plan::{Delta, DestState, Lane, TablePlan, WireFormat};
+use crate::plan::Delta;
 use crate::{Mode, TableResult, TransferOptions, TransferReport};
+use crate::sink::Sink;
+use crate::source::Source;
 use std::future::Future;
 
 /// Work-stealing statement queue: many small spans, N workers pull until it drains.
@@ -44,128 +48,6 @@ pub(crate) fn spans(lo: i64, hi: i64, n: usize) -> Vec<(i64, i64)> {
     out
 }
 
-/// Per-worker stream consumer on the sink side. One loader = one physical ingest
-/// stream (one `COPY … FROM STDIN`, one ClickHouse `INSERT` body).
-pub(crate) trait Loader: Send + 'static {
-    /// Ship one coalesced buffer. The worker owns coalescing (~chunk bytes per send —
-    /// tiny sends are syscall/protocol overhead, huge ones just buffer memory).
-    ///
-    /// Framing contract: for row-oriented formats (RowBinary, TabSeparated) buffers
-    /// end on a RECORD boundary — a loader that splits its input into files/batches
-    /// (object-store staging, multi-row INSERT) may rely on that. Byte-relay formats
-    /// (PgCopyBinary) give NO alignment guarantee; such loaders must treat the stream
-    /// as opaque bytes.
-    fn send(&mut self, buf: Vec<u8>) -> impl Future<Output = Result<()>> + Send;
-    /// Close the stream cleanly. Returns rows ingested if this sink reports them
-    /// (Postgres COPY does; ClickHouse counts via [`Sink::rows_staged`] instead).
-    fn finish(self) -> impl Future<Output = Result<u64>> + Send;
-    /// Source-side failure: make the sink DISCARD the partial stream (a clean close
-    /// could commit it), then hand the cause back for propagation.
-    fn abort(self, cause: Error) -> impl Future<Output = Error> + Send;
-}
-
-pub(crate) trait Source: Sized + Send + Sync {
-    /// Probe the table: columns, native types, PK facts. Must work on empty tables.
-    fn probe(&self, table: &str) -> impl Future<Output = Result<TablePlan>> + Send;
-    /// One catalog query for a multi-table run: `(name, estimated rows)` for either
-    /// an explicit `tables` list (names echoed back exactly as given, every name
-    /// verified to exist — loud-fail, never a silent skip) or a whole `schema`
-    /// (apitap's own `__apitap_staging`/`_apitap_state` artifacts excluded).
-    /// Estimates come from the planner's statistics (`reltuples`, `TABLE_ROWS`) —
-    /// they only order/size the work, never gate correctness; `-1` = unknown
-    /// (treated as large).
-    fn catalog(
-        &self,
-        schema: Option<&str>,
-        tables: Option<&[String]>,
-    ) -> impl Future<Output = Result<Vec<(String, i64)>>> + Send;
-    /// Can this source produce `format` for this plan? (e.g. Postgres → RowBinary only
-    /// when every column has a binary transcoding.)
-    fn can_produce(&self, plan: &TablePlan, format: WireFormat) -> bool;
-    /// Per-column delivery + SELECT expressions for a producible format.
-    fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane;
-    /// Read statements covering the table: cursor ranges, then any source-specific
-    /// PK-less fallback, then a single full statement. `want` is the target span count.
-    /// `delta` (incremental modes) must be pushed into EVERY statement, including the
-    /// min/max probe and the fallbacks — a span that forgets it re-reads the world.
-    fn span_stmts(
-        &self,
-        table: &str,
-        plan: &TablePlan,
-        lane: &Lane,
-        want: usize,
-        delta: Option<&Delta>,
-    ) -> impl Future<Output = Result<Vec<String>>> + Send;
-    /// Spawn one worker per loader over a shared span queue; return rows reported by
-    /// the loaders (0 when the sink counts server-side). Implementations own the hot
-    /// loop: pull span → read → encode → coalesce → `loader.send`.
-    fn run_workers<L: Loader>(
-        &self,
-        plan: &TablePlan,
-        lane: &Lane,
-        stmts: Vec<String>,
-        loaders: Vec<L>,
-        chunk: usize,
-    ) -> impl Future<Output = Result<u64>> + Send;
-}
-
-pub(crate) trait Sink: Sized + Send + Sync {
-    type Loader: Loader;
-    /// Ingest formats this sink accepts, best first. Negotiation picks the first one
-    /// the source can produce. Non-static so a sink may ORDER lanes per
-    /// connection (BigQuery prefers Parquet when CPU is plentiful, CSV when
-    /// starved — measured, not guessed).
-    fn accepts(&self) -> &[WireFormat];
-    /// Can this sink take `format` for THIS plan? Default yes; a sink whose
-    /// fast lane can't represent some column (BigQuery's Parquet lane vs
-    /// unconstrained NUMERIC, bytea, exotic udts) declines and negotiation
-    /// falls through to its next lane instead of hard-failing.
-    fn lane_ok(&self, _plan: &TablePlan, _format: WireFormat) -> bool {
-        true
-    }
-    /// Sink-specific plan constraints, applied before lane planning so the DDL and the
-    /// encoders agree (e.g. ClickHouse: the ORDER BY column must be non-nullable).
-    fn adjust_plan(&self, plan: &mut TablePlan);
-    /// Create the staging table for this lane. `mode` is the effective mode: replace
-    /// honors `durable`; incremental modes always stage UNLOGGED (staging never
-    /// becomes the final table). Replace implementations should also capture whatever
-    /// the swap would destroy (indexes, constraints, grants) for re-application.
-    fn prepare(
-        &mut self,
-        plan: &TablePlan,
-        lane: &Lane,
-        durable: bool,
-        mode: Mode,
-    ) -> impl Future<Output = Result<()>> + Send;
-    /// One ingest stream into staging (called once per worker).
-    fn loader(&self) -> impl Future<Output = Result<Self::Loader>> + Send;
-    /// Rows now in staging. `loaded` is the loaders' own count — sinks whose protocol
-    /// reports rows return it as-is; others count server-side.
-    fn rows_staged(&self, loaded: u64) -> impl Future<Output = Result<u64>> + Send;
-    /// Incremental modes only: inspect the destination BEFORE staging. Returns whether
-    /// the final table exists and its current `max(cursor)` as text. Implementations
-    /// must also (a) verify the destination's columns match the plan (schema drift →
-    /// a clear error, never a silent mis-append), (b) reject unsupported modes early
-    /// (e.g. merge on ClickHouse), and (c) stash whatever finalize will need (merge
-    /// keys). Never called for `Mode::Replace`.
-    /// May also CONFORM the plan to the existing destination (e.g. ClickHouse
-    /// mirrors the dest's column nullability so staging's structure matches for
-    /// ATTACH — a view-sourced plan reports everything nullable, but the dest is
-    /// the structural authority once it exists).
-    fn dest_state(
-        &mut self,
-        plan: &mut TablePlan,
-        mode: Mode,
-        cursor: &str,
-        source_id: &str,
-    ) -> impl Future<Output = Result<DestState>> + Send;
-    /// Land the staged rows: `Replace` = atomic swap; `Append` = move staged rows into
-    /// the existing table; `Merge` = upsert them by primary key. When `rows == 0`,
-    /// drop staging and leave the destination untouched (the 0-row guard) in every
-    /// mode. `mode` here is the EFFECTIVE mode (a bootstrapped incremental run gets
-    /// `Replace`).
-    fn finalize(&self, rows: u64, mode: Mode) -> impl Future<Output = Result<()>> + Send;
-}
 
 /// Credential-free source identity for the destination's state table:
 /// `scheme://host:port/db::table`. NEVER includes userinfo.
@@ -239,7 +121,7 @@ pub(crate) fn knobs(opts: &TransferOptions, profile: &Profile) -> Result<(usize,
     }
     let chunk = opts.chunk_bytes.max(64 * 1024);
     let parallel = opts.parallel.unwrap_or_else(|| {
-        crate::mem_capped_parallel((profile.auto_parallel)(num_cpus::get()), chunk)
+        dispatch::mem_capped_parallel((profile.auto_parallel)(num_cpus::get()), chunk)
     });
     Ok((chunk, parallel))
 }

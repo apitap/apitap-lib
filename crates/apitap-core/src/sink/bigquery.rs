@@ -24,7 +24,7 @@
 //! is `greatest(state, data)`, so a crash between the two costs a bounded
 //! re-read, never a skip.
 
-use crate::driver::Loader;
+use crate::sink::Loader;
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
@@ -837,7 +837,7 @@ pub(crate) struct BqLoader {
     local_wm: Option<String>,
     shared_wm: Arc<std::sync::Mutex<Option<String>>>,
     /// Parquet lane encoder; None = the CSV/gzip lane.
-    pq: Option<crate::bqparquet::ParquetEncoder>,
+    pq: Option<crate::wire::bqparquet::ParquetEncoder>,
     /// Rows in the CURRENT file (cross-checked against its job's outputRows).
     file_rows: u64,
     /// Completed files' jobs, polling in the background while later files
@@ -873,7 +873,7 @@ impl BqLoader {
         let mut job_config = base_config.clone();
         job_config["configuration"]["load"]["destinationTable"]["tableId"] = json!(staging_table);
         let pq = if parquet_lane {
-            Some(crate::bqparquet::ParquetEncoder::new(
+            Some(crate::wire::bqparquet::ParquetEncoder::new(
                 names.to_vec(),
                 delivered.as_ref().clone(),
                 cursor,
@@ -1467,7 +1467,7 @@ impl BqSink {
     }
 }
 
-impl crate::driver::Sink for BqSink {
+impl crate::sink::Sink for BqSink {
     type Loader = BqLoader;
 
     fn accepts(&self) -> &[WireFormat] {
@@ -1483,7 +1483,7 @@ impl crate::driver::Sink for BqSink {
             WireFormat::PgCopyBinary => plan
                 .cols
                 .iter()
-                .all(|c| crate::bqparquet::parquet_col_ok(&c.udt, c.precision)),
+                .all(|c| crate::wire::bqparquet::parquet_col_ok(&c.udt, c.precision)),
             _ => true,
         }
     }
@@ -1502,7 +1502,7 @@ impl crate::driver::Sink for BqSink {
         let mut names = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             check_col_name(&c.name)?;
-            if self.parquet_lane && !crate::bqparquet::parquet_col_ok(&c.udt, c.precision) {
+            if self.parquet_lane && !crate::wire::bqparquet::parquet_col_ok(&c.udt, c.precision) {
                 return Err(Error::InvalidInput(format!(
                     "column {} has type {} — the binary lane can't decode it; \
                      cast it in a source view (e.g. {}::text)",
