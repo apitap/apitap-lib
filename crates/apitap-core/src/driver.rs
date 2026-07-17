@@ -353,6 +353,7 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
 
 /// One table of a multi-table run: source name (as the user gave it / the catalog
 /// listed it) and the planner's row estimate (`-1` = unknown).
+#[derive(Debug)]
 pub(crate) struct TableJob {
     pub table: String,
     pub est_rows: i64,
@@ -420,10 +421,15 @@ impl<'a> Grant<'a> {
                 self.count -= take;
             }
         }
-        if self.count < target {
-            if let Ok(extra) = self.sem.try_acquire_many((target - self.count) as u32) {
-                self.count += extra.num_permits();
-                self.held.push(extra);
+        // Grow one permit at a time: try_acquire_many is all-or-nothing, and a
+        // partial top-up (3 free when 5 were wanted) is still worth taking.
+        while self.count < target {
+            match self.sem.try_acquire() {
+                Ok(p) => {
+                    self.held.push(p);
+                    self.count += 1;
+                }
+                Err(_) => break,
             }
         }
         self.count
@@ -544,6 +550,62 @@ mod tests {
         assert!(!a.contains("s3cret") && !a.contains("user"));
         let m = source_identity("mysql://root:pw@127.0.0.1/bench", "events");
         assert_eq!(m, "mysql://127.0.0.1:3306/bench::events");
+    }
+
+    #[test]
+    fn desired_pipes_sizes_the_ask() {
+        // Unknown (-1) asks for the whole budget: a never-analyzed big table
+        // throttled to one pipe is the worse failure mode.
+        assert_eq!(desired_pipes(-1, 8), 8);
+        // Tiny and empty tables ask for exactly one.
+        assert_eq!(desired_pipes(0, 8), 1);
+        assert_eq!(desired_pipes(100, 8), 1);
+        assert_eq!(desired_pipes(ROWS_PER_PIPE - 1, 8), 1);
+        // Scales by ROWS_PER_PIPE, clamped to the budget.
+        assert_eq!(desired_pipes(ROWS_PER_PIPE * 3, 8), 3);
+        assert_eq!(desired_pipes(i64::MAX, 8), 8);
+    }
+
+    #[tokio::test]
+    async fn grant_acquires_atomically_and_resizes_both_ways() {
+        let sem = tokio::sync::Semaphore::new(8);
+        let mut g = Grant::acquire(&sem, 5).await;
+        assert_eq!(g.count, 5);
+        assert_eq!(sem.available_permits(), 3);
+
+        // Shrink releases the excess back to the siblings immediately.
+        assert_eq!(g.resize(2), 2);
+        assert_eq!(sem.available_permits(), 6);
+
+        // Grow is BEST-EFFORT PARTIAL: wanting 100 with 6 free takes the 6
+        // (try_acquire_many alone would be all-or-nothing and take zero).
+        assert_eq!(g.resize(100), 8);
+        assert_eq!(sem.available_permits(), 0);
+
+        // Floor is one pipe — a grant never resizes to nothing.
+        assert_eq!(g.resize(0), 1);
+        assert_eq!(sem.available_permits(), 7);
+
+        // Dropping the grant returns everything.
+        drop(g);
+        assert_eq!(sem.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn grant_queued_waiter_wakes_with_its_whole_ask() {
+        // The bug this design exists to prevent: a queued table waking with one
+        // permit and a dead top-up. acquire_many is atomic — the front waiter
+        // gets its FULL ask when permits free up.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let first = Grant::acquire(&sem, 4).await; // drains the budget
+        let sem2 = sem.clone();
+        let waiter = tokio::spawn(async move {
+            let g = Grant::acquire(&sem2, 3).await;
+            g.count
+        });
+        tokio::task::yield_now().await; // waiter is queued behind the drain
+        drop(first); // release all 4
+        assert_eq!(waiter.await.unwrap(), 3); // woke with 3, not 1
     }
 
     #[test]

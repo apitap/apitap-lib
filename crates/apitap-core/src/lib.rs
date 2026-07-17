@@ -646,3 +646,113 @@ async fn multi(
         tables: results,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{Delta, Lane, TablePlan, WireFormat};
+
+    /// A Source that only answers catalog() — jobs_for touches nothing else.
+    struct FakeCatalog(Vec<(&'static str, i64)>);
+    impl driver::Source for FakeCatalog {
+        async fn probe(&self, _t: &str) -> Result<TablePlan> {
+            unimplemented!()
+        }
+        async fn catalog(
+            &self,
+            _schema: Option<&str>,
+            _tables: Option<&[String]>,
+        ) -> Result<Vec<(String, i64)>> {
+            Ok(self.0.iter().map(|(n, e)| (n.to_string(), *e)).collect())
+        }
+        fn can_produce(&self, _p: &TablePlan, _f: WireFormat) -> bool {
+            unimplemented!()
+        }
+        fn plan_lane(&self, _p: &TablePlan, _f: WireFormat) -> Lane {
+            unimplemented!()
+        }
+        async fn span_stmts(
+            &self,
+            _t: &str,
+            _p: &TablePlan,
+            _l: &Lane,
+            _w: usize,
+            _d: Option<&Delta>,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn run_workers<L: driver::Loader>(
+            &self,
+            _p: &TablePlan,
+            _l: &Lane,
+            _s: Vec<String>,
+            _ld: Vec<L>,
+            _c: usize,
+        ) -> Result<u64> {
+            unimplemented!()
+        }
+    }
+
+    fn names(src: Vec<(&'static str, i64)>) -> FakeCatalog {
+        FakeCatalog(src)
+    }
+
+    #[tokio::test]
+    async fn jobs_for_passes_names_and_estimates_through() {
+        let src = names(vec![("public.big", 1_000_000), ("public.small", -1)]);
+        let jobs = jobs_for(&src, &TableSel::Schema(Some("public")), false)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].table, "public.big");
+        assert_eq!(jobs[0].est_rows, 1_000_000);
+        assert_eq!(jobs[1].est_rows, -1);
+    }
+
+    #[tokio::test]
+    async fn jobs_for_rejects_empty_list_before_touching_the_source() {
+        let src = names(vec![]);
+        let err = jobs_for(&src, &TableSel::List(&[]), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn bare_dest_collision_is_caught_up_front() {
+        // ClickHouse/MySQL/BigQuery sinks drop the qualifier — a.events and
+        // b.events would silently overwrite each other.
+        let src = names(vec![("a.events", 10), ("b.events", 10)]);
+        let err = jobs_for(&src, &TableSel::Schema(Some("x")), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("events"));
+    }
+
+    #[tokio::test]
+    async fn pg_alias_of_one_relation_is_caught() {
+        // 'events' and 'public.events' are ONE Postgres relation under the
+        // default search_path — racing two loads into one staging table.
+        let src = names(vec![("events", 10), ("public.events", 10)]);
+        let err = jobs_for(&src, &TableSel::Schema(Some("public")), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("public.events"));
+        // Distinct schemas stay distinct on PG dests (qualifiers are kept).
+        let src = names(vec![("a.events", 10), ("b.events", 10)]);
+        assert!(jobs_for(&src, &TableSel::Schema(Some("x")), false)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn apitap_staging_namespace_is_reserved() {
+        // A sibling named like another table's staging artifact would get
+        // DROPped by that table's prepare mid-run.
+        let src = names(vec![("foo", 10), ("foo__apitap_staging", 10)]);
+        let err = jobs_for(&src, &TableSel::Schema(Some("public")), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("staging artifacts"));
+    }
+}
