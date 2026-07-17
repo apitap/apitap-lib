@@ -174,6 +174,32 @@ actually ran with.
   land on bare `events`) and `events` + `public.events` on Postgres (one
   relation under two spellings).
 
+**Mixing full and incremental tables.** `mode=` applies to the whole call, so
+group your tables by how they should land — one call per group, each group
+moving through its own budget:
+
+```python
+# dimensions / small tables → full refresh
+apitap.transfer(src, dst,
+    tables=["public.dim_products", "public.dim_regions"], mode="replace")
+
+# append-only facts (events, logs) → incremental append,
+# per-table watermark auto-detected from the integer PK
+apitap.transfer(src, dst,
+    tables=["public.events", "public.api_logs"], mode="append")
+
+# update-prone tables → merge (upsert by PK), updated_at cursor so
+# UPDATEs travel; start these with mode="merge" from their FIRST run
+apitap.transfer(src, dst,
+    tables=["public.orders", "public.customers"],
+    mode="merge", cursor="updated_at")
+```
+
+Rule of thumb: `replace` for dimensions and PK-less tables, `append` for
+append-only facts, `merge` + an `updated_at` cursor for anything that gets
+UPDATEd. Group merge tables that share the cursor column (one `cursor=` serves
+the whole call).
+
 **Incremental across many tables.** `mode="append"`/`"merge"` apply per table —
 each table keeps its own watermark, so a delta run moves exactly each table's
 delta (verified: +50k on one table and +1k on another moved 51,000 rows, not a
