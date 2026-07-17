@@ -174,9 +174,22 @@ actually ran with.
   land on bare `events`) and `events` + `public.events` on Postgres (one
   relation under two spellings).
 
-**Incremental across many tables.** `mode="append"`/`"merge"` apply per table
-with the usual auto-detected integer-PK cursor; an explicit `cursor=` applies to
-*every* table in the run, so leave it auto unless all tables share the column.
+**Incremental across many tables.** `mode="append"`/`"merge"` apply per table —
+each table keeps its own watermark, so a delta run moves exactly each table's
+delta (verified: +50k on one table and +1k on another moved 51,000 rows, not a
+reload). An explicit `cursor=` applies to *every* table in the run, so leave it
+auto unless all tables share the column (e.g. `cursor="updated_at"` across a
+uniformly-designed schema). Two semantics worth repeating from the incremental
+section:
+
+- **Merge needs the destination PRIMARY KEY.** Start the tables you intend to
+  merge with `mode="merge"` from their FIRST run — the merge bootstrap creates
+  the PK on the destination. A destination first created by `replace`/`append`
+  has no PK and a later merge refuses it loudly.
+- **A PK cursor doesn't see UPDATEs** to rows below the watermark. For
+  update-prone tables use an `updated_at`-style cursor — verified in the
+  multi-table path: 100 updates + 10 inserts moved exactly 110 rows, upserted
+  with zero duplicates.
 
 ## Incremental sync (append & merge)
 
