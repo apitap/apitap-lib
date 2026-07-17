@@ -162,6 +162,10 @@ use it for rebuildable destinations.
       multi-source copy; DML-free incremental state, sandbox-safe —
       **10M in 28.4 s (40.3 s at 2 vCPU) vs ingestr 860 s / dlt 2,160 s**,
       checksum-validated; see [benchmarks](benchmarks/README.md))
+- [x] Multi-table transfers — `tables=[…]` or a whole `schema=`, through ONE pipe
+      budget: largest-first scheduling, per-table grants re-fitted to real span
+      counts, shared pools/auth, per-table failure isolation; peak memory stays at
+      the single-table ceiling no matter the table count
 - [x] MySQL → MySQL (wire decode → `LOAD DATA LOCAL INFILE`, the only bulk path
       MySQL exposes; charset/collation preserved into the destination DDL, exact
       types, binary columns via `UNHEX`, UTC-normalized timestamps)

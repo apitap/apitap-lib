@@ -525,12 +525,19 @@ pub(crate) struct ChSink {
 
 impl ChSink {
     pub(crate) fn connect(url: &str, dest_table: &str, ddl: ChDdl) -> Result<Self> {
+        Self::bind(ChConn::parse(url)?, dest_table, ddl)
+    }
+
+    /// Bind one destination table onto an existing connection (a multi-table run
+    /// parses the URL — and builds the one HTTP client — once, then binds per
+    /// table; `ChConn` is `Clone` and the client inside is reference-counted).
+    pub(crate) fn bind(ch: ChConn, dest_table: &str, ddl: ChDdl) -> Result<Self> {
         ddl.validate()?;
         // ClickHouse table names aren't schema-qualified the Postgres way — take the
         // bare name (the URL's /database picks the namespace).
         let dest_bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
         Ok(Self {
-            ch: ChConn::parse(url)?,
+            ch,
             final_t: ch_ident(dest_bare),
             staging_t: ch_ident(&format!("{dest_bare}__apitap_staging")),
             final_bare: dest_bare.to_string(),

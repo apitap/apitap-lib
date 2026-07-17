@@ -11,7 +11,7 @@
 
 use crate::error::{Error, Result};
 use crate::plan::{Delta, DestState, Lane, TablePlan, WireFormat};
-use crate::{Mode, TransferOptions, TransferReport};
+use crate::{Mode, TableResult, TransferOptions, TransferReport};
 use std::future::Future;
 
 /// Work-stealing statement queue: many small spans, N workers pull until it drains.
@@ -67,6 +67,18 @@ pub(crate) trait Loader: Send + 'static {
 pub(crate) trait Source: Sized + Send + Sync {
     /// Probe the table: columns, native types, PK facts. Must work on empty tables.
     fn probe(&self, table: &str) -> impl Future<Output = Result<TablePlan>> + Send;
+    /// One catalog query for a multi-table run: `(name, estimated rows)` for either
+    /// an explicit `tables` list (names echoed back exactly as given, every name
+    /// verified to exist — loud-fail, never a silent skip) or a whole `schema`
+    /// (apitap's own `__apitap_staging`/`_apitap_state` artifacts excluded).
+    /// Estimates come from the planner's statistics (`reltuples`, `TABLE_ROWS`) —
+    /// they only order/size the work, never gate correctness; `-1` = unknown
+    /// (treated as large).
+    fn catalog(
+        &self,
+        schema: Option<&str>,
+        tables: Option<&[String]>,
+    ) -> impl Future<Output = Result<Vec<(String, i64)>>> + Send;
     /// Can this source produce `format` for this plan? (e.g. Postgres → RowBinary only
     /// when every column has a binary transcoding.)
     fn can_produce(&self, plan: &TablePlan, format: WireFormat) -> bool;
@@ -234,16 +246,22 @@ pub(crate) fn knobs(opts: &TransferOptions, profile: &Profile) -> Result<(usize,
 
 /// The whole transfer, once: probe → negotiate → stage → fan out → count → swap.
 /// `started` is taken by the caller BEFORE connecting, so `elapsed_ms` includes
-/// connection time (as the report always has).
+/// connection time (as the report always has). Borrows the source so a multi-table
+/// run can drive many tables through one source (and its one pool).
+///
+/// `resolve` picks the FINAL pipe count once the real span count is known:
+/// a single-table run passes `|n| parallel.min(n).max(1)` (the old behavior);
+/// a multi-table run re-fits its budget grant there (see [`Grant::resize`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run<S: Source, K: Sink>(
-    src: S,
+pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
+    src: &S,
     mut sink: K,
     table: &str,
     opts: &TransferOptions,
     profile: &Profile,
     chunk: usize,
     parallel: usize,
+    resolve: R,
     started: std::time::Instant,
     source_id: &str,
 ) -> Result<TransferReport> {
@@ -316,7 +334,7 @@ pub(crate) async fn run<S: Source, K: Sink>(
     let stmts = src
         .span_stmts(table, &plan, &lane, want, delta.as_ref())
         .await?;
-    let used = parallel.min(stmts.len()).max(1);
+    let used = resolve(stmts.len()).min(stmts.len()).max(1);
     let mut loaders = Vec::with_capacity(used);
     for _ in 0..used {
         loaders.push(sink.loader().await?);
@@ -331,6 +349,181 @@ pub(crate) async fn run<S: Source, K: Sink>(
         elapsed_ms: started.elapsed().as_millis() as u64,
         parallel: if rows == 0 { 0 } else { used },
     })
+}
+
+/// One table of a multi-table run: source name (as the user gave it / the catalog
+/// listed it) and the planner's row estimate (`-1` = unknown).
+pub(crate) struct TableJob {
+    pub table: String,
+    pub est_rows: i64,
+}
+
+/// A pipe is only worth having above roughly this many rows — below it, span setup
+/// and the extra connection cost more than the parallel read wins (the 1M-row
+/// benchmarks ran best at ~32–64k rows/pipe).
+const ROWS_PER_PIPE: i64 = 32 * 1024;
+
+/// How many pipes a table WANTS from the shared budget. Unknown sizes ask for
+/// everything (a never-analyzed big table throttled to one pipe is the worse
+/// failure mode); tiny tables ask for one and leave the rest to their siblings.
+fn desired_pipes(est_rows: i64, budget: usize) -> usize {
+    if est_rows < 0 {
+        budget
+    } else {
+        usize::try_from(est_rows / ROWS_PER_PIPE)
+            .unwrap_or(budget)
+            .clamp(1, budget)
+    }
+}
+
+/// The pipes one table holds from the shared budget, acquired ATOMICALLY
+/// (`acquire_many`): tokio's fair semaphore hands released permits to the front
+/// waiter first, so a queued table wakes holding its WHOLE ask — never 1 permit
+/// with a dead top-up (released permits go to queued waiters, so a
+/// wake-then-`try_acquire` loop would find nothing free and pin a 10M-row table
+/// to a single pipe while the budget idles).
+struct Grant<'a> {
+    sem: &'a tokio::sync::Semaphore,
+    held: Vec<tokio::sync::SemaphorePermit<'a>>,
+    count: usize,
+}
+
+impl<'a> Grant<'a> {
+    async fn acquire(sem: &'a tokio::sync::Semaphore, want: usize) -> Self {
+        let permit = sem
+            .acquire_many(want as u32)
+            .await
+            .expect("budget semaphore is never closed");
+        Self {
+            sem,
+            held: vec![permit],
+            count: want,
+        }
+    }
+
+    /// Re-fit the grant once the REAL span count is known: excess goes back to the
+    /// siblings immediately (a 1-span table — PK-less MySQL, say — must not sit on
+    /// 32 permits for its whole stream), a shortfall tops up best-effort (planner
+    /// stats under-asked; whatever is free now beats streaming under-parallel).
+    /// Returns what is now held (≥ 1).
+    fn resize(&mut self, target: usize) -> usize {
+        let target = target.max(1);
+        while self.count > target {
+            let take = self.count - target;
+            let last = self.held.last_mut().expect("grant holds at least one permit");
+            let n = last.num_permits();
+            if n <= take {
+                self.held.pop();
+                self.count -= n;
+            } else {
+                drop(last.split(take));
+                self.count -= take;
+            }
+        }
+        if self.count < target {
+            if let Ok(extra) = self.sem.try_acquire_many((target - self.count) as u32) {
+                self.count += extra.num_permits();
+                self.held.push(extra);
+            }
+        }
+        self.count
+    }
+}
+
+/// Many tables through ONE pipe budget. The budget is the same number a
+/// single-table run gets (CPU heuristic capped by the cgroup memory model), so
+/// peak memory is the single-table ceiling — `budget × ~8×chunk + reserve` —
+/// no matter how many tables are in flight.
+///
+/// Scheduling: largest-first (LPT). Each table atomically acquires its desired
+/// pipe count (see [`Grant`]), then RESIZES to the real span count the moment the
+/// spans are known — so a table that can't split frees its pipes for the
+/// siblings, and one whose stats under-estimated tops back up from whatever is
+/// free. Every table holds ≥ 1 permit while it runs, which alone bounds
+/// tables-in-flight at `budget`.
+///
+/// Failure isolation: one table's error lands in ITS result and releases its
+/// permits; the siblings keep running. Every table keeps the single-table
+/// guarantees (atomic swap, 0-row guard) because each runs the unchanged [`run`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_many<S, K, F, Fut>(
+    src: &S,
+    mut jobs: Vec<TableJob>,
+    opts: &TransferOptions,
+    profile: &Profile,
+    chunk: usize,
+    budget: usize,
+    src_url: &str,
+    make_sink: F,
+) -> Result<Vec<TableResult>>
+where
+    S: Source,
+    K: Sink,
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<K>>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    // Largest first; unknown (-1) sorts largest of all.
+    jobs.sort_by_key(|j| std::cmp::Reverse(if j.est_rows < 0 { i64::MAX } else { j.est_rows }));
+
+    let sem = tokio::sync::Semaphore::new(budget);
+    let mut futs = FuturesUnordered::new();
+    for job in jobs {
+        let sem = &sem;
+        let make_sink = &make_sink;
+        futs.push(async move {
+            // Atomic ask (FIFO fair — a queued table wakes with ALL of it), refit
+            // to the real span count inside run(). Permits release when the grant
+            // drops — success, error, either way.
+            let desired = desired_pipes(job.est_rows, budget);
+            let mut grant = Grant::acquire(sem, desired).await;
+            let granted = grant.count;
+
+            let started = std::time::Instant::now();
+            let source_id = source_identity(src_url, &job.table);
+            let out = async {
+                let sink = make_sink(job.table.clone()).await?;
+                run(
+                    src,
+                    sink,
+                    &job.table,
+                    opts,
+                    profile,
+                    chunk,
+                    granted,
+                    |spans| grant.resize(spans.min(budget)),
+                    started,
+                    &source_id,
+                )
+                .await
+            }
+            .await;
+
+            match out {
+                Ok(r) => TableResult {
+                    table: job.table,
+                    rows: r.rows,
+                    elapsed_ms: r.elapsed_ms,
+                    parallel: r.parallel,
+                    error: None,
+                },
+                Err(e) => TableResult {
+                    table: job.table,
+                    rows: 0,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    parallel: granted,
+                    error: Some(e.to_string()),
+                },
+            }
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(r) = futs.next().await {
+        results.push(r);
+    }
+    Ok(results)
 }
 
 #[cfg(test)]

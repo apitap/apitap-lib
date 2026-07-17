@@ -73,6 +73,82 @@ impl PgSource {
 }
 
 impl Source for PgSource {
+    async fn catalog(
+        &self,
+        schema: Option<&str>,
+        tables: Option<&[String]>,
+    ) -> Result<Vec<(String, i64)>> {
+        if let Some(ts) = tables {
+            // Resolve through quote_ident_path + ::regclass — the SAME spelling
+            // probe and COPY will use, so a mixed-case "public.MyTable" resolves
+            // here exactly as it will read (raw regclass input would case-fold it
+            // to a different relation). A missing table fails the whole query with
+            // its name in the error — loud, and before any table has moved.
+            // reltuples: -1 = never analyzed (unknown). Names echo back by
+            // ordinality so the caller keeps its own spelling.
+            let quoted: Vec<String> = ts.iter().map(|t| quote_ident_path(t)).collect();
+            let rows = sqlx::query(
+                "SELECT g.ord AS ord, \
+                        (SELECT CASE WHEN c.reltuples < 0 THEN -1 \
+                                     ELSE c.reltuples::bigint END \
+                         FROM pg_class c WHERE c.oid = g.t::regclass) AS est \
+                 FROM unnest($1::text[]) WITH ORDINALITY AS g(t, ord) \
+                 ORDER BY g.ord",
+            )
+            .bind(&quoted)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::InvalidInput(format!("resolving tables: {e}")))?;
+            return Ok(rows
+                .iter()
+                .map(|r| {
+                    let ord = r.get::<i64, _>("ord") as usize;
+                    (
+                        ts[ord - 1].clone(),
+                        r.get::<Option<i64>, _>("est").unwrap_or(-1),
+                    )
+                })
+                .collect());
+        }
+        let schema = schema.ok_or_else(|| {
+            Error::InvalidInput(
+                "postgres sources need schema='…' (there is no default schema for a \
+                 whole-schema transfer)"
+                    .into(),
+            )
+        })?;
+        // Base tables, partitioned parents and matviews. CHILDREN — declarative
+        // partitions AND old-style INHERITS tables — are skipped when their direct
+        // parent lives in this same schema: the parent's scan reads them, so
+        // listing both would move every row twice. A child whose parent lives in
+        // ANOTHER schema stays listed (its parent isn't in this run — dropping it
+        // would silently omit its rows). apitap's own artifacts never travel.
+        let rows = sqlx::query(
+            "SELECT n.nspname || '.' || c.relname AS name, \
+                    CASE WHEN c.reltuples < 0 THEN -1 ELSE c.reltuples::bigint END AS est \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 \
+               AND c.relkind IN ('r', 'p', 'm') \
+               AND NOT EXISTS (SELECT 1 FROM pg_inherits i \
+                               JOIN pg_class p ON p.oid = i.inhparent \
+                               JOIN pg_namespace pn ON pn.oid = p.relnamespace \
+                               WHERE i.inhrelid = c.oid AND pn.nspname = $1) \
+               AND c.relname NOT LIKE '%\\_\\_apitap\\_staging' \
+               AND c.relname NOT LIKE '%\\_\\_apitap\\_old' \
+               AND c.relname <> '_apitap_state' \
+             ORDER BY c.reltuples DESC",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::InvalidInput(format!("listing schema {schema}: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<String, _>("name"), r.get::<i64, _>("est")))
+            .collect())
+    }
+
     async fn probe(&self, table: &str) -> Result<TablePlan> {
         // One catalog probe keyed on `$1::regclass`, so name resolution (search_path,
         // quoting) matches the COPY statements exactly — information_schema would
@@ -605,6 +681,26 @@ impl PgSink {
         max_conns: usize,
         overlap_send: bool,
     ) -> Result<Self> {
+        Ok(Self::bind(
+            Self::shared_pool(url, max_conns).await?,
+            dest_table,
+            overlap_send,
+        ))
+    }
+
+    /// The sink-side pool alone — a multi-table run builds it once and binds one
+    /// sink per table onto it.
+    pub(crate) async fn shared_pool(url: &str, max_conns: usize) -> Result<PgPool> {
+        PgPoolOptions::new()
+            .max_connections(max_conns as u32)
+            .connect(url)
+            .await
+            .map_err(|e| Error::Connect(e.to_string()))
+    }
+
+    /// Bind one destination table onto an existing pool. All per-table state
+    /// (staging name, swap keys) lives in the sink; the pool carries none.
+    pub(crate) fn bind(pool: PgPool, dest_table: &str, overlap_send: bool) -> Self {
         let qualified = dest_table.contains('.');
         let (schema_pfx, bare) = match dest_table.rsplit_once('.') {
             Some((s, t)) => (format!("{s}."), t.to_string()),
@@ -617,12 +713,8 @@ impl PgSink {
         } else {
             schema
         };
-        Ok(Self {
-            pool: PgPoolOptions::new()
-                .max_connections(max_conns as u32)
-                .connect(url)
-                .await
-                .map_err(|e| Error::Connect(e.to_string()))?,
+        Self {
+            pool,
             final_t: quote_ident_path(dest_table),
             copy_in_sql: format!("COPY {staging_t} FROM STDIN (FORMAT binary)"),
             staging_t,
@@ -638,7 +730,7 @@ impl PgSink {
             wm_udt: None,
             col_names: Vec::new(),
             overlap_send,
-        })
+        }
     }
 }
 

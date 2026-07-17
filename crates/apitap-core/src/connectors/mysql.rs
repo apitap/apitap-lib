@@ -686,6 +686,111 @@ impl MySqlSource {
 }
 
 impl Source for MySqlSource {
+    async fn catalog(
+        &self,
+        schema: Option<&str>,
+        tables: Option<&[String]>,
+    ) -> Result<Vec<(String, i64)>> {
+        // TABLE_ROWS is InnoDB's estimate (may be stale) — it only orders and
+        // sizes the work; NULL = unknown = -1 (treated as large).
+        if let Some(ts) = tables {
+            // Resolve the current database once so qualified and bare names get
+            // EXACT (schema, table) matching — probe stays the final authority,
+            // but a typo should fail here, before any table has moved.
+            let curdb: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Connect(e.to_string()))?;
+            let mut pairs = Vec::with_capacity(ts.len());
+            for t in ts {
+                let (s, bare) = match t.rsplit_once('.') {
+                    Some((s, b)) => (s.to_string(), b.to_string()),
+                    None => (
+                        curdb.clone().ok_or_else(|| {
+                            Error::InvalidInput(format!(
+                                "table '{t}' is unqualified and the mysql url has no \
+                                 database — use 'db.{t}'"
+                            ))
+                        })?,
+                        t.to_string(),
+                    ),
+                };
+                pairs.push((s, bare));
+            }
+            let mut sql = String::from(
+                "SELECT CAST(TABLE_SCHEMA AS CHAR) AS s, CAST(TABLE_NAME AS CHAR) AS t, \
+                        CAST(COALESCE(TABLE_ROWS, -1) AS SIGNED) AS est \
+                 FROM information_schema.tables WHERE ",
+            );
+            sql.push_str(
+                &std::iter::repeat_n("(TABLE_SCHEMA = ? AND TABLE_NAME = ?)", pairs.len())
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+            );
+            let mut q = sqlx::query(&sql);
+            for (s, b) in &pairs {
+                q = q.bind(s).bind(b);
+            }
+            let rows = q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| Error::InvalidInput(format!("resolving tables: {e}")))?;
+            let found: std::collections::HashMap<(String, String), i64> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        (r.get::<String, _>("s"), r.get::<String, _>("t")),
+                        r.get::<i64, _>("est"),
+                    )
+                })
+                .collect();
+            let mut out = Vec::with_capacity(ts.len());
+            for (given, (s, b)) in ts.iter().zip(&pairs) {
+                // Second chance lowercased: lower_case_table_names=1/2 servers
+                // store (and return) lowercase while accepting any-case input —
+                // probe and the read path take the given spelling fine.
+                let est = found
+                    .get(&(s.clone(), b.clone()))
+                    .or_else(|| found.get(&(s.to_lowercase(), b.to_lowercase())));
+                match est {
+                    Some(est) => out.push((given.clone(), *est)),
+                    None => {
+                        return Err(Error::InvalidInput(format!(
+                            "source table {given} not found"
+                        )))
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // Whole schema (None = the URL's database). BASE TABLE only — views are
+        // derived data; apitap's own staging/state artifacts never travel.
+        let rows = sqlx::query(
+            "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(COALESCE(TABLE_ROWS, -1) AS SIGNED) AS est \
+             FROM information_schema.tables \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_TYPE = 'BASE TABLE' \
+               AND TABLE_NAME NOT LIKE '%|_|_apitap|_staging' ESCAPE '|' \
+               AND TABLE_NAME NOT LIKE '%|_|_apitap|_old' ESCAPE '|' \
+               AND TABLE_NAME <> '_apitap_state' \
+             ORDER BY TABLE_ROWS DESC",
+        )
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::InvalidInput(format!("listing tables: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let t: String = r.get("t");
+                let name = match schema {
+                    Some(s) => format!("{s}.{t}"),
+                    None => t,
+                };
+                (name, r.get::<i64, _>("est"))
+            })
+            .collect())
+    }
+
     async fn probe(&self, table: &str) -> Result<TablePlan> {
         let (schema, bare) = match table.rsplit_once('.') {
             Some((s, t)) => (Some(s.to_string()), t.to_string()),

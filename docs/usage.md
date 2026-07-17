@@ -127,6 +127,57 @@ Pass `cursor="some_int_column"` to split on any other numeric column (works for
 non-PK columns; rows where the cursor is NULL are not covered by range predicates —
 prefer NOT NULL columns).
 
+## Multi-table transfers
+
+One call moves a list of tables — or a whole schema — through **one resource
+budget**:
+
+```python
+apitap.transfer(src, dst, tables=["public.orders", "public.users"])
+apitap.transfer(src, dst, schema="public")      # every base table in the schema
+apitap.transfer(src, dst, schema="mydb")        # MySQL: the database
+```
+
+Exactly one of `table`, `tables`, `schema` picks the scope; destination tables
+keep their source names (`dest_table` is single-table only).
+
+**The budget.** A multi-table run gets exactly the pipe budget a single-table run
+would (route CPU heuristic, capped by the cgroup memory model — or your explicit
+`parallel`). Tables draw pipes from that one pool: they start **largest first**,
+each atomically acquires its ask (sized from the planner's row estimates), and
+the grant is **re-fitted the moment the real span count is known** — a table
+that can't split (say, no integer PK on a MySQL source) hands its pipes straight
+back to the siblings, one whose stats under-estimated tops back up from whatever
+is free. Peak memory stays at the single-table ceiling — `budget × ~8×chunk +
+reserve` — whether you move 1 table or 500. Small tables take one pipe each and
+overlap the big ones, so N small tables cost far less than N separate calls
+(shared connection pools, shared auth, one catalog probe).
+
+**Per-table isolation.** Every table keeps the single-table guarantees — own
+staging, atomic swap, 0-row guard. If some tables fail, the rest keep going;
+at the end a `MultiTransferError` is raised whose `.report.tables` lists every
+outcome, and the tables that succeeded ARE committed. The report's `parallel`
+is the shared budget; each `TableResult.parallel` is the pipe count that table
+actually ran with.
+
+**Schema scope details.**
+
+- Postgres: base tables, partitioned parents and materialized views travel;
+  partition/`INHERITS` children whose parent sits in the same schema are skipped
+  (the parent's scan covers their rows — listing both would double them). A
+  child whose parent lives in *another* schema is copied standalone.
+- MySQL: base tables of the named database (views are derived data and stay).
+- apitap's own artifacts (`*__apitap_staging`, `*__apitap_old`, `_apitap_state`)
+  never travel.
+- Colliding destination names fail **up front**, before any table moves —
+  including `a.events` + `b.events` into ClickHouse/MySQL/BigQuery (both would
+  land on bare `events`) and `events` + `public.events` on Postgres (one
+  relation under two spellings).
+
+**Incremental across many tables.** `mode="append"`/`"merge"` apply per table
+with the usual auto-detected integer-PK cursor; an explicit `cursor=` applies to
+*every* table in the run, so leave it auto unless all tables share the column.
+
 ## Incremental sync (append & merge)
 
 ```python

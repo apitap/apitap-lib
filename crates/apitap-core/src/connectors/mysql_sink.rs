@@ -46,7 +46,10 @@ fn sql_lit(s: &str) -> String {
 pub(crate) struct MySqlSink {
     pool: Pool,
     registry: Registry,
-    next_id: AtomicU64,
+    /// Shared with every sink on this pool: LOAD DATA stream ids must be unique
+    /// POOL-wide — two sinks with their own counters would both hand out id 0 and
+    /// collide in the registry.
+    next_id: Arc<AtomicU64>,
     db: String,
     bare: String,
     staging: String,
@@ -58,8 +61,24 @@ pub(crate) struct MySqlSink {
     mode_str: &'static str,
 }
 
+/// The per-destination resources a multi-table run builds ONCE: the pool (whose
+/// global INFILE handler owns the registry), the registry itself, the pool-wide
+/// stream-id counter, and the URL's database.
+#[derive(Clone)]
+pub(crate) struct MySqlShared {
+    pool: Pool,
+    registry: Registry,
+    next_id: Arc<AtomicU64>,
+    db: String,
+}
+
 impl MySqlSink {
     pub(crate) async fn connect(url: &str, dest_table: &str) -> Result<Self> {
+        Ok(Self::bind(Self::shared_pool(url)?, dest_table))
+    }
+
+    /// Pool + INFILE registry + id counter, built once per destination.
+    pub(crate) fn shared_pool(url: &str) -> Result<MySqlShared> {
         let opts =
             Opts::from_url(url).map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?;
         let db = opts
@@ -67,7 +86,6 @@ impl MySqlSink {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::InvalidInput("mysql url needs a database".into()))?
             .to_string();
-        let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
 
         // One global LOCAL INFILE handler for the pool: each loader registers its
         // receiver under a unique id and names it in the LOAD DATA filename, so the
@@ -101,19 +119,29 @@ impl MySqlSink {
                     })
                 },
             ));
-        let pool = Pool::new(builder);
-        Ok(Self {
-            pool,
+        Ok(MySqlShared {
+            pool: Pool::new(builder),
             registry,
-            next_id: AtomicU64::new(0),
+            next_id: Arc::new(AtomicU64::new(0)),
             db,
+        })
+    }
+
+    /// Bind one destination table onto the shared resources.
+    pub(crate) fn bind(shared: MySqlShared, dest_table: &str) -> Self {
+        let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
+        Self {
+            pool: shared.pool,
+            registry: shared.registry,
+            next_id: shared.next_id,
+            db: shared.db,
             staging: format!("{bare}__apitap_staging"),
             bare: bare.to_string(),
             cols: Vec::new(),
             source_id: None,
             cursor_col: None,
             mode_str: "replace",
-        })
+        }
     }
 
     fn fq(&self, table: &str) -> String {

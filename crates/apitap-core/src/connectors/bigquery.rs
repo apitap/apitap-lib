@@ -1250,7 +1250,13 @@ pub(crate) struct BqSink {
 
 impl BqSink {
     pub(crate) async fn connect(url: &str, dest_table: &str, parallel: usize) -> Result<Self> {
-        let conn = BqConn::parse(url).await?;
+        Self::bind(BqConn::parse(url).await?, dest_table, parallel)
+    }
+
+    /// Bind one destination table onto an existing connection — a multi-table run
+    /// authenticates ONCE (`BqConn::parse` signs a JWT and fetches an OAuth token;
+    /// per-table auth would burst the token endpoint) and binds per table.
+    pub(crate) fn bind(conn: BqConn, dest_table: &str, parallel: usize) -> Result<Self> {
         let lane_order = if parallel >= 4 {
             [WireFormat::PgCopyBinary, WireFormat::TabSeparated]
         } else {
