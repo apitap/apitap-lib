@@ -7,50 +7,13 @@
 
 use super::Profile;
 use crate::error::{Error, Result};
-use crate::sink::clickhouse::ChSink;
+use crate::sink::clickhouse::{ChDdl, ChSink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
 use crate::source::mysql::MySqlSource;
 use crate::source::postgres::PgSource;
 use crate::{MultiReport, TransferOptions, TransferReport};
 
-/// The container/cgroup memory limit, if one is set (v2 `memory.max`, v1 fallback).
-pub(crate) fn mem_limit_bytes() -> Option<u64> {
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        let s = s.trim();
-        if s != "max" {
-            if let Ok(n) = s.parse::<u64>() {
-                return Some(n);
-            }
-        }
-    }
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        if let Ok(n) = s.trim().parse::<u64>() {
-            if n < (1 << 60) {
-                return Some(n);
-            }
-        }
-    }
-    None
-}
-
-/// Cap an AUTO-derived pipe count by the memory budget: each pipe holds a few
-/// `chunk`-sized buffers in flight (encode buffer, channel slots, HTTP/COPY write
-/// buffers — ~8× chunk measured worst-case), plus ~96 MiB of process overhead.
-/// A 256 MB container at the CPU-derived 8 pipes was OOM-killed on the transcoding
-/// route; this brings the default back inside the box. An EXPLICIT `parallel` from the
-/// caller is never overridden.
-pub(crate) fn mem_capped_parallel(requested: usize, chunk: usize) -> usize {
-    match mem_limit_bytes() {
-        Some(mem) => {
-            let reserve: u64 = 96 * 1024 * 1024;
-            let per_pipe = (chunk as u64) * 8;
-            let allowed = mem.saturating_sub(reserve) / per_pipe.max(1);
-            requested.min((allowed.max(1)) as usize)
-        }
-        None => requested,
-    }
-}
 
 // Per-route pipe heuristics (all measured — see benchmarks/README.md):
 // byte-relay pipes into a Postgres COPY are writer-bound (more pipes contend on the
@@ -89,18 +52,10 @@ pub(crate) async fn single(
     let dst_scheme = dst_url.split("://").next().unwrap_or("");
     let dest_table = opts.dest_table.as_deref().unwrap_or(table);
     let source_id = super::source_identity(src_url, table);
-    if !matches!(dst_scheme, "clickhouse" | "clickhouse+https")
-        && (opts.engine.is_some() || opts.order_by.is_some() || opts.on_cluster.is_some())
-    {
-        return Err(Error::InvalidInput(
-            "engine/order_by/on_cluster only apply to ClickHouse destinations".into(),
-        ));
-    }
-    let ch_ddl = crate::sink::clickhouse::ChDdl {
-        engine: opts.engine.clone(),
-        order_by: opts.order_by.clone(),
-        on_cluster: opts.on_cluster.clone(),
-    };
+    let ch_ddl = ChDdl::from_opts(
+        opts,
+        matches!(dst_scheme, "clickhouse" | "clickhouse+https"),
+    )?;
 
     match (src_scheme, dst_scheme) {
         ("postgres" | "postgresql", "postgres" | "postgresql") => {
@@ -232,10 +187,9 @@ async fn jobs_for<S: crate::source::Source>(
             name.rsplit_once('.')
                 .map_or(name.as_str(), |(_, t)| t)
                 .to_string()
-        } else if name.contains('.') {
-            name.clone()
         } else {
-            format!("public.{name}")
+            // Same rule as source_identity — ONE copy, in the dialect.
+            crate::dialect::postgres::canonical_table(name)
         };
         if !seen.insert(key.clone()) {
             return Err(Error::InvalidInput(format!(
@@ -281,18 +235,10 @@ pub(crate) async fn multi(
                 .into(),
         ));
     }
-    if !matches!(dst_scheme, "clickhouse" | "clickhouse+https")
-        && (opts.engine.is_some() || opts.order_by.is_some() || opts.on_cluster.is_some())
-    {
-        return Err(Error::InvalidInput(
-            "engine/order_by/on_cluster only apply to ClickHouse destinations".into(),
-        ));
-    }
-    let ch_ddl = crate::sink::clickhouse::ChDdl {
-        engine: opts.engine.clone(),
-        order_by: opts.order_by.clone(),
-        on_cluster: opts.on_cluster.clone(),
-    };
+    let ch_ddl = ChDdl::from_opts(
+        opts,
+        matches!(dst_scheme, "clickhouse" | "clickhouse+https"),
+    )?;
 
     // Each arm: budget once, source pool once, sink resources once — then every
     // table runs the unchanged single-table lifecycle inside the shared budget.
@@ -440,6 +386,9 @@ mod tests {
     /// A Source that only answers catalog() — jobs_for touches nothing else.
     struct FakeCatalog(Vec<(&'static str, i64)>);
     impl crate::source::Source for FakeCatalog {
+        fn cursor_quoted(&self, _udt: &str) -> Result<bool> {
+            unimplemented!()
+        }
         async fn probe(&self, _t: &str) -> Result<TablePlan> {
             unimplemented!()
         }

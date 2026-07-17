@@ -26,3 +26,18 @@ pub(crate) fn my_ident(name: &str) -> String {
 pub(crate) fn my_ident_path(path: &str) -> String {
     path.split('.').map(my_ident).collect::<Vec<_>>().join(".")
 }
+
+pub(crate) const DEFAULT_PORT: u16 = 3306;
+
+/// Is this MySQL DATA_TYPE usable as an incremental cursor, and does its SQL
+/// literal need quoting? (Same contract as the Postgres twin.)
+pub(crate) fn cursor_quoted(udt: &str) -> crate::error::Result<bool> {
+    match udt {
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint" => Ok(false),
+        "date" | "timestamp" | "datetime" => Ok(true),
+        other => Err(crate::error::Error::InvalidInput(format!(
+            "cursor type '{other}' is not usable for append/merge — use an integer or \
+             timestamp column"
+        ))),
+    }
+}

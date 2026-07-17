@@ -32,15 +32,15 @@ pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
             };
             let host = u.host_str().unwrap_or("unknown");
             let port = u.port().unwrap_or(match scheme {
-                "postgres" => 5432,
-                "mysql" => 3306,
+                "postgres" => crate::dialect::postgres::DEFAULT_PORT,
+                "mysql" => crate::dialect::mysql::DEFAULT_PORT,
                 _ => 0,
             });
             let db = u.path().trim_matches('/');
             // Qualify the table half so 'events' and 'public.events' (the same
             // Postgres table) share one identity.
-            let table = if scheme == "postgres" && !table.contains('.') {
-                format!("public.{table}")
+            let table = if scheme == "postgres" {
+                crate::dialect::postgres::canonical_table(table)
             } else {
                 table.to_string()
             };
@@ -54,22 +54,42 @@ pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
     }
 }
 
-/// Is this source type usable as an incremental cursor, and does its SQL literal
-/// need quoting? Integers embed raw; date/time types embed as quoted text (both
-/// Postgres `::text` and ClickHouse `toString` round-trip them losslessly at
-/// microsecond precision). Anything else is rejected up front.
-pub(crate) fn cursor_literal_quoted(udt: &str) -> Result<bool> {
-    match udt {
-        // integers (postgres udt names + mysql DATA_TYPE names)
-        "int2" | "int4" | "int8" | "tinyint" | "smallint" | "mediumint" | "int" | "bigint" => {
-            Ok(false)
+
+/// The container/cgroup memory limit, if one is set (v2 `memory.max`, v1 fallback).
+pub(crate) fn mem_limit_bytes() -> Option<u64> {
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let s = s.trim();
+        if s != "max" {
+            if let Ok(n) = s.parse::<u64>() {
+                return Some(n);
+            }
         }
-        // date/time
-        "date" | "timestamp" | "timestamptz" | "datetime" => Ok(true),
-        other => Err(Error::InvalidInput(format!(
-            "cursor type '{other}' is not usable for append/merge — use an integer or \
-             timestamp column"
-        ))),
+    }
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(n) = s.trim().parse::<u64>() {
+            if n < (1 << 60) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Cap an AUTO-derived pipe count by the memory budget: each pipe holds a few
+/// `chunk`-sized buffers in flight (encode buffer, channel slots, HTTP/COPY write
+/// buffers — ~8× chunk measured worst-case), plus ~96 MiB of process overhead.
+/// A 256 MB container at the CPU-derived 8 pipes was OOM-killed on the transcoding
+/// route; this brings the default back inside the box. An EXPLICIT `parallel` from the
+/// caller is never overridden.
+pub(crate) fn mem_capped_parallel(requested: usize, chunk: usize) -> usize {
+    match mem_limit_bytes() {
+        Some(mem) => {
+            let reserve: u64 = 96 * 1024 * 1024;
+            let per_pipe = (chunk as u64) * 8;
+            let allowed = mem.saturating_sub(reserve) / per_pipe.max(1);
+            requested.min((allowed.max(1)) as usize)
+        }
+        None => requested,
     }
 }
 
@@ -91,7 +111,7 @@ pub(crate) fn knobs(opts: &TransferOptions, profile: &Profile) -> Result<(usize,
     }
     let chunk = opts.chunk_bytes.max(64 * 1024);
     let parallel = opts.parallel.unwrap_or_else(|| {
-        dispatch::mem_capped_parallel((profile.auto_parallel)(num_cpus::get()), chunk)
+        mem_capped_parallel((profile.auto_parallel)(num_cpus::get()), chunk)
     });
     Ok((chunk, parallel))
 }
@@ -137,7 +157,7 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         let col = plan.cols.iter().find(|c| c.name == cursor).ok_or_else(|| {
             Error::InvalidInput(format!("cursor column '{cursor}' not in source table"))
         })?;
-        let quoted = cursor_literal_quoted(&col.udt)?;
+        let quoted = src.cursor_quoted(&col.udt)?;
         let st = sink.dest_state(&mut plan, mode, &cursor, source_id).await?;
         if !st.exists {
             mode = Mode::Replace; // first run: bootstrap the table with a full load

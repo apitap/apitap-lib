@@ -192,21 +192,6 @@ fn ch_base_type(t: &str) -> String {
     t.to_string()
 }
 
-/// Pick the higher of two watermarks. For numeric cursors the compare is numeric;
-/// `None < Some` in Option's ordering means an UNPARSEABLE state watermark loses to
-/// the data — the safe direction (worst case is a bounded re-read, never a skip).
-fn wm_pick(numeric: bool, state: String, data: String) -> String {
-    let state_wins = if numeric {
-        state.parse::<i128>().ok() >= data.parse::<i128>().ok() && state.parse::<i128>().is_ok()
-    } else {
-        state >= data // ISO datetime text compares correctly lexicographically
-    };
-    if state_wins {
-        state
-    } else {
-        data
-    }
-}
 
 /// Escape a string for a single-quoted ClickHouse literal.
 fn ch_str(s: &str) -> String {
@@ -304,6 +289,27 @@ const MERGETREE_FAMILY: [&str; 14] = [
 ];
 
 impl ChDdl {
+    /// Extract + gate the ClickHouse-only options in ONE place for every
+    /// dispatch entry point: a non-ClickHouse destination with any of them set
+    /// is refused loudly here.
+    pub(crate) fn from_opts(
+        opts: &crate::TransferOptions,
+        dest_is_clickhouse: bool,
+    ) -> Result<Self> {
+        if !dest_is_clickhouse
+            && (opts.engine.is_some() || opts.order_by.is_some() || opts.on_cluster.is_some())
+        {
+            return Err(Error::InvalidInput(
+                "engine/order_by/on_cluster only apply to ClickHouse destinations".into(),
+            ));
+        }
+        Ok(Self {
+            engine: opts.engine.clone(),
+            order_by: opts.order_by.clone(),
+            on_cluster: opts.on_cluster.clone(),
+        })
+    }
+
     fn validate(&self) -> Result<()> {
         if let Some(engine) = &self.engine {
             let family = engine.split('(').next().unwrap_or("").trim();
@@ -1018,33 +1024,29 @@ impl crate::sink::Sink for ChSink {
             let t = out.trim();
             (!t.is_empty()).then(|| t.to_string())
         };
-        let watermark = match (state_wm, data_wm) {
-            (Some(a), Some(b)) => Some(wm_pick(numeric_cursor, a, b)),
-            (None, data) => {
-                // Fan-in guard: other sources' state rows mean the global data-max
-                // is not ours — a fallback would skip this source's backlog.
-                let siblings: u64 = self
-                    .ch
-                    .exec(&format!(
-                        "SELECT count() FROM `_apitap_state` FINAL WHERE dest_table = '{}'",
-                        ch_str(&self.final_bare)
-                    ))
-                    .await?
-                    .trim()
-                    .parse()
-                    .map_err(|e| Error::Transfer(format!("state count parse: {e}")))?;
-                if siblings > 0 {
-                    return Err(Error::InvalidInput(format!(
-                        "destination {} has state rows from other sources but none for \
-                         '{source_id}' — run mode='replace' to rebuild, or seed a state \
-                         row manually",
-                        self.final_bare
-                    )));
-                }
-                data
-            }
-            (state, None) => state,
+        let siblings = if state_wm.is_none() {
+            let n: u64 = self
+                .ch
+                .exec(&format!(
+                    "SELECT count() FROM `_apitap_state` FINAL WHERE dest_table = '{}'",
+                    ch_str(&self.final_bare)
+                ))
+                .await?
+                .trim()
+                .parse()
+                .map_err(|e| Error::Transfer(format!("state count parse: {e}")))?;
+            n > 0
+        } else {
+            false
         };
+        let watermark = crate::plan::resolve_watermark(
+            state_wm,
+            data_wm,
+            siblings,
+            crate::plan::WmArbitration::Greatest { numeric: numeric_cursor },
+            &self.final_bare,
+            source_id,
+        )?;
         Ok(DestState {
             exists: true,
             watermark,
@@ -1460,25 +1462,6 @@ mod tests {
         assert_eq!(ch_explicit_tz("Int64"), None);
     }
 
-    #[test]
-    fn wm_pick_prefers_data_when_state_is_garbage() {
-        // numeric: plain compares
-        assert_eq!(wm_pick(true, "1000".into(), "500".into()), "1000");
-        assert_eq!(wm_pick(true, "500".into(), "1000".into()), "1000");
-        // unparseable STATE must lose to data (bounded re-read, never a skip)
-        assert_eq!(wm_pick(true, "garbage".into(), "500".into()), "500");
-        // unparseable DATA: state wins (numeric state parses, data doesn't)
-        assert_eq!(wm_pick(true, "500".into(), "garbage".into()), "500");
-        // temporal: ISO text compare
-        assert_eq!(
-            wm_pick(
-                false,
-                "2026-02-01 00:00:00".into(),
-                "2026-01-01 00:00:00".into()
-            ),
-            "2026-02-01 00:00:00"
-        );
-    }
 
     #[test]
     fn ch_types_for_deliveries_match_the_old_maps() {

@@ -138,6 +138,10 @@ impl Source for PgSource {
             .collect())
     }
 
+    fn cursor_quoted(&self, udt: &str) -> Result<bool> {
+        crate::dialect::postgres::cursor_quoted(udt)
+    }
+
     async fn probe(&self, table: &str) -> Result<TablePlan> {
         // One catalog probe keyed on `$1::regclass`, so name resolution (search_path,
         // quoting) matches the COPY statements exactly — information_schema would

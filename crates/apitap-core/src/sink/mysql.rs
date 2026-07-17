@@ -459,39 +459,39 @@ impl crate::sink::Sink for MySqlSink {
         } else {
             None
         };
-        // Fresher of state and data — a crash between the swap and the state write
-        // costs a bounded re-read, never a skip.
-        let watermark = match (state_wm, data_wm) {
-            (Some(s), Some(d)) => Some(wm_max(s, d)),
-            (Some(s), None) => Some(s),
-            (None, d) => {
-                // Fan-in guard (same contract as the other sinks): if OTHER sources
-                // hold state rows for this table, the global data-max belongs to the
-                // most advanced of them — falling back would silently skip THIS
-                // source's backlog. Fail loudly instead.
-                if has_state_table {
-                    let siblings = self
-                        .scalar(&format!(
-                            "SELECT COUNT(*) FROM {} WHERE dest_table='{}'",
-                            self.fq("_apitap_state"),
-                            sql_lit(&self.bare)
-                        ))
-                        .await?
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    if siblings > 0 {
-                        return Err(Error::InvalidInput(format!(
-                            "destination {} has state rows from other sources but none \
-                             for '{source_id}' — a data-derived watermark would be \
-                             wrong here. Run mode='replace' to rebuild, or seed a \
-                             state row manually",
-                            self.bare
-                        )));
-                    }
-                }
-                d
-            }
+        let siblings = if state_wm.is_none() && has_state_table {
+            self.scalar(&format!(
+                "SELECT COUNT(*) FROM {} WHERE dest_table='{}'",
+                self.fq("_apitap_state"),
+                sql_lit(&self.bare)
+            ))
+            .await?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+                > 0
+        } else {
+            false
         };
+        // The state write lands after the RENAME swap — arbitration is Greatest
+        // (see plan::WmArbitration): a crash between them costs a bounded
+        // re-read, never a skip.
+        let numeric = !crate::dialect::mysql::cursor_quoted(
+            &plan
+                .cols
+                .iter()
+                .find(|c| c.name == cursor)
+                .map(|c| c.udt.clone())
+                .unwrap_or_default(),
+        )
+        .unwrap_or(true);
+        let watermark = crate::plan::resolve_watermark(
+            state_wm,
+            data_wm,
+            siblings,
+            crate::plan::WmArbitration::Greatest { numeric },
+            &self.bare,
+            source_id,
+        )?;
         Ok(DestState {
             exists: true,
             watermark,
@@ -581,28 +581,6 @@ impl crate::sink::Sink for MySqlSink {
     }
 }
 
-/// Numeric cursors compare numerically, text (timestamps render sortably)
-/// lexicographically; unparseable state loses to data (bounded re-read).
-fn wm_max(a: String, b: String) -> String {
-    match (a.parse::<i128>(), b.parse::<i128>()) {
-        (Ok(x), Ok(y)) => {
-            if x >= y {
-                a
-            } else {
-                b
-            }
-        }
-        (Ok(_), Err(_)) => a,
-        (Err(_), Ok(_)) => b,
-        (Err(_), Err(_)) => {
-            if a >= b {
-                a
-            } else {
-                b
-            }
-        }
-    }
-}
 
 pub(crate) struct MySqlLoader {
     tx: mpsc::Sender<std::io::Result<Bytes>>,

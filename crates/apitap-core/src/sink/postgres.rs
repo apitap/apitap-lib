@@ -504,13 +504,10 @@ impl crate::sink::Sink for PgSink {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| Error::Transfer(format!("state read: {e}")))?;
-        let watermark = match from_state {
-            Some(wm) => Some(wm),
+        let (siblings, data_max) = match &from_state {
+            Some(_) => (false, None), // authoritative: the data max is never consulted
             None => {
-                // Fan-in guard: if OTHER sources hold state rows here, the global
-                // data-max belongs to the most advanced of them — falling back would
-                // silently skip THIS source's backlog. Fail loudly instead.
-                let siblings: i64 = sqlx::query_scalar(&format!(
+                let sib: i64 = sqlx::query_scalar(&format!(
                     "SELECT count(*) FROM {} WHERE dest_table = $1",
                     self.state_table()
                 ))
@@ -518,17 +515,22 @@ impl crate::sink::Sink for PgSink {
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| Error::Transfer(format!("state read: {e}")))?;
-                if siblings > 0 {
-                    return Err(Error::InvalidInput(format!(
-                        "destination {} has state rows from other sources but none for \
-                         '{source_id}' — a data-derived watermark would be wrong here. \
-                         Run mode='replace' to rebuild, or seed a state row manually",
-                        self.dest_key
-                    )));
-                }
-                self.table_watermark(&self.final_t).await?
+                let data = if sib == 0 {
+                    self.table_watermark(&self.final_t).await?
+                } else {
+                    None
+                };
+                (sib > 0, data)
             }
         };
+        let watermark = crate::plan::resolve_watermark(
+            from_state,
+            data_max,
+            siblings,
+            crate::plan::WmArbitration::StateAuthoritative,
+            &self.dest_key,
+            source_id,
+        )?;
         Ok(DestState {
             exists: true,
             watermark,

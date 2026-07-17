@@ -163,3 +163,101 @@ pub(crate) fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Opt
         (None, b) => b,
     }
 }
+
+/// Pick the fresher of a STATE watermark and a DATA watermark. Numeric cursors
+/// compare numerically; text (timestamps render sortably) lexicographically.
+/// An unparseable state value loses to the data max — the safe direction: worst
+/// case is a bounded re-read, never a skip. (One copy — the 0.3.0-reviewed
+/// semantics; per-sink clones of this drifted once already.)
+pub(crate) fn wm_pick(numeric: bool, state: String, data: String) -> String {
+    if numeric {
+        match (state.parse::<i128>(), data.parse::<i128>()) {
+            (Ok(s), Ok(d)) => {
+                if s >= d {
+                    state
+                } else {
+                    data
+                }
+            }
+            (Ok(_), Err(_)) => state,
+            _ => data,
+        }
+    } else if state >= data {
+        state
+    } else {
+        data
+    }
+}
+
+/// How a sink arbitrates when BOTH a state row and a data max exist — this
+/// differs BY DESIGN with the sink's atomicity, it is not drift:
+pub(crate) enum WmArbitration {
+    /// The state row is written in the SAME transaction as the land (Postgres):
+    /// it is authoritative alone, and the data max is deliberately distrusted —
+    /// foreign writes to the destination would poison it.
+    StateAuthoritative,
+    /// The state write lands AFTER the swap (ClickHouse ATTACH, MySQL RENAME):
+    /// a crash between them leaves state one run behind, so the effective
+    /// watermark is the fresher of the two — a bounded re-read, never a skip.
+    Greatest { numeric: bool },
+}
+
+/// The incremental-watermark DECISION shared by every sink (the fetches stay
+/// per-sink — each database reads its own state its own way, as lazily as it
+/// likes). Invariants, from the 0.3.0 review, in one place instead of four:
+///
+/// - a missing own-state row with SIBLING rows present fails loudly (fan-in:
+///   the shared data max belongs to the most advanced source — falling back
+///   would silently skip THIS source's backlog),
+/// - no state anywhere → the data max is the only truth,
+/// - both present → per-sink [`WmArbitration`].
+pub(crate) fn resolve_watermark(
+    own_state: Option<String>,
+    data_max: Option<String>,
+    sibling_state_rows: bool,
+    arb: WmArbitration,
+    dest: &str,
+    source_id: &str,
+) -> crate::error::Result<Option<String>> {
+    match own_state {
+        Some(s) => Ok(Some(match arb {
+            WmArbitration::StateAuthoritative => s,
+            WmArbitration::Greatest { numeric } => match data_max {
+                Some(d) => wm_pick(numeric, s, d),
+                None => s,
+            },
+        })),
+        None if sibling_state_rows => Err(crate::error::Error::InvalidInput(format!(
+            "destination {dest} has state rows from other sources but none for \
+             '{source_id}' — a data-derived watermark would be wrong here. \
+             Run mode='replace' to rebuild, or seed a state row manually"
+        ))),
+        None => Ok(data_max),
+    }
+}
+
+#[cfg(test)]
+mod wm_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_watermark_holds_the_three_invariants() {
+        use WmArbitration::*;
+        let r = |o: Option<&str>, d: Option<&str>, sib, arb| {
+            resolve_watermark(
+                o.map(String::from), d.map(String::from), sib, arb, "t", "src",
+            )
+        };
+        // state-authoritative: data max is ignored when a state row exists
+        assert_eq!(r(Some("5"), Some("9"), false, StateAuthoritative).unwrap(), Some("5".into()));
+        // greatest: fresher of the two, garbage state loses
+        assert_eq!(r(Some("5"), Some("9"), false, Greatest { numeric: true }).unwrap(), Some("9".into()));
+        assert_eq!(r(Some("garbage"), Some("9"), false, Greatest { numeric: true }).unwrap(), Some("9".into()));
+        // fan-in: no own row + siblings = loud error
+        assert!(r(None, Some("9"), true, Greatest { numeric: true }).is_err());
+        assert!(r(None, None, true, StateAuthoritative).is_err());
+        // no state anywhere: data is the only truth
+        assert_eq!(r(None, Some("9"), false, StateAuthoritative).unwrap(), Some("9".into()));
+        assert_eq!(r(None, None, false, Greatest { numeric: false }).unwrap(), None);
+    }
+}

@@ -68,7 +68,15 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// Rows now in staging. `loaded` is the loaders' own count — sinks whose protocol
     /// reports rows return it as-is; others count server-side.
     fn rows_staged(&self, loaded: u64) -> impl Future<Output = Result<u64>> + Send;
-    /// Incremental modes only: inspect the destination BEFORE staging. Returns whether
+    /// Incremental modes only: inspect the destination BEFORE staging.
+    ///
+    /// The watermark DECISION is shared — fetch your inputs (own state row,
+    /// data max, sibling-row presence) however your database wants, then call
+    /// [`crate::plan::resolve_watermark`] with your [`crate::plan::WmArbitration`].
+    /// Its invariants (fan-in guard, empty-dest, no-state fallback) are the
+    /// contract; hand-rolling them is how the MySQL sink drifted once.
+    ///
+    /// Returns whether
     /// the final table exists and its current `max(cursor)` as text. Implementations
     /// must also (a) verify the destination's columns match the plan (schema drift →
     /// a clear error, never a silent mis-append), (b) reject unsupported modes early

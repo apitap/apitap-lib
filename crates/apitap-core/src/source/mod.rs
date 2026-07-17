@@ -28,6 +28,10 @@ pub(crate) trait Source: Sized + Send + Sync {
         schema: Option<&str>,
         tables: Option<&[String]>,
     ) -> impl Future<Output = Result<Vec<(String, i64)>>> + Send;
+    /// Cursor-type vocabulary of THIS source's database: is `udt` usable as an
+    /// incremental cursor, and does its literal need quoting? (Delegates to the
+    /// dialect — the per-DB lists live in `crate::dialect`.)
+    fn cursor_quoted(&self, udt: &str) -> Result<bool>;
     /// Can this source produce `format` for this plan? (e.g. Postgres → RowBinary only
     /// when every column has a binary transcoding.)
     fn can_produce(&self, plan: &TablePlan, format: WireFormat) -> bool;

@@ -28,3 +28,30 @@ mod tests {
     }
 
 }
+
+pub(crate) const DEFAULT_PORT: u16 = 5432;
+
+/// Unqualified table names live in `public` under the default search_path —
+/// `events` and `public.events` are ONE relation, and every identity/collision
+/// check must agree on that (this is the single copy of the rule).
+pub(crate) fn canonical_table(t: &str) -> String {
+    if t.contains('.') {
+        t.to_string()
+    } else {
+        format!("public.{t}")
+    }
+}
+
+/// Is this Postgres udt usable as an incremental cursor, and does its SQL
+/// literal need quoting? Integers embed raw; date/time embed as quoted text
+/// (`::text` round-trips them losslessly at microsecond precision).
+pub(crate) fn cursor_quoted(udt: &str) -> crate::error::Result<bool> {
+    match udt {
+        "int2" | "int4" | "int8" => Ok(false),
+        "date" | "timestamp" | "timestamptz" => Ok(true),
+        other => Err(crate::error::Error::InvalidInput(format!(
+            "cursor type '{other}' is not usable for append/merge — use an integer or \
+             timestamp column"
+        ))),
+    }
+}

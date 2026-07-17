@@ -28,7 +28,7 @@ use crate::sink::Loader;
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
-use crate::plan::wm_max;
+use crate::plan::{wm_max, wm_pick};
 use crate::wire::pgtext::unescape_into;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -1691,29 +1691,6 @@ impl crate::sink::Sink for BqSink {
     }
 }
 
-/// Effective watermark: the freshest of the state row and the data max.
-/// Numeric cursors compare numerically; text (timestamps render sortably)
-/// lexicographically. An unparseable state value loses to the data max —
-/// a bounded re-read, never a skip.
-fn wm_pick(numeric: bool, state: String, data: String) -> String {
-    if numeric {
-        match (state.parse::<i128>(), data.parse::<i128>()) {
-            (Ok(s), Ok(d)) => {
-                if s >= d {
-                    state
-                } else {
-                    data
-                }
-            }
-            (Ok(_), Err(_)) => state,
-            _ => data,
-        }
-    } else if state >= data {
-        state
-    } else {
-        data
-    }
-}
 
 #[cfg(test)]
 mod tests {

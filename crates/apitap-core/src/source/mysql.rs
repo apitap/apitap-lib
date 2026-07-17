@@ -770,6 +770,10 @@ impl Source for MySqlSource {
             .collect())
     }
 
+    fn cursor_quoted(&self, udt: &str) -> Result<bool> {
+        crate::dialect::mysql::cursor_quoted(udt)
+    }
+
     async fn probe(&self, table: &str) -> Result<TablePlan> {
         let (schema, bare) = match table.rsplit_once('.') {
             Some((s, t)) => (Some(s.to_string()), t.to_string()),
