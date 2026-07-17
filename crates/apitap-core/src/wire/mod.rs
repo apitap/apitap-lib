@@ -3,4 +3,5 @@
 
 pub(crate) mod bqparquet;
 pub(crate) mod pgcopy;
+pub(crate) mod pgtext;
 pub(crate) mod rowbinary;

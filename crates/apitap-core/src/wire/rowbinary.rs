@@ -14,10 +14,7 @@
 //! value.
 
 use crate::error::{Error, Result};
-
-/// PG epoch (2000-01-01) → Unix epoch, in days / microseconds.
-pub(crate) const PG_EPOCH_DAYS: i32 = 10_957;
-pub(crate) const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
+use crate::wire::pgcopy::{numeric_to_scaled_i128, numeric_to_scaled_i128_raw, PG_EPOCH_DAYS, PG_EPOCH_MICROS};
 
 /// How to transcode one column. Field order mirrors the SELECT / DDL order.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -224,12 +221,6 @@ fn try_tuple_at(
     Ok(Some((off, false)))
 }
 
-/// Test hook: lets the pgcopy ENCODER prove itself against this decoder (roundtrip).
-#[cfg(test)]
-pub(crate) fn numeric_to_scaled_i128_for_tests(f: &[u8], scale: u32) -> Result<i128> {
-    numeric_to_scaled_i128(f, scale)
-}
-
 pub(crate) fn varint(mut v: u64, out: &mut Vec<u8>) {
     loop {
         let byte = (v & 0x7f) as u8;
@@ -301,72 +292,6 @@ fn transcode_field(ty: RbType, f: &[u8], out: &mut Vec<u8>) -> Result<()> {
 
 fn bad(what: &str) -> Error {
     Error::Transfer(format!("pg binary COPY: malformed {what} field"))
-}
-
-/// PG binary NUMERIC (ndigits, weight, sign, dscale + base-10000 digit groups) → an
-/// integer scaled to exactly `scale` decimal places.
-pub(crate) fn numeric_to_scaled_i128(f: &[u8], scale: u32) -> Result<i128> {
-    let (acc_scaled_dscale, dscale) = numeric_to_scaled_i128_raw(f)?;
-    // acc is scaled to dscale places; rescale to the declared scale.
-    let diff = scale as i32 - dscale;
-    Ok(match diff.cmp(&0) {
-        std::cmp::Ordering::Equal => acc_scaled_dscale,
-        std::cmp::Ordering::Greater => acc_scaled_dscale
-            .checked_mul(10i128.pow(diff as u32))
-            .ok_or_else(|| bad("numeric overflow"))?,
-        std::cmp::Ordering::Less => acc_scaled_dscale / 10i128.pow((-diff) as u32),
-    })
-}
-
-/// → (value scaled to `dscale` decimal places, dscale).
-fn numeric_to_scaled_i128_raw(f: &[u8]) -> Result<(i128, i32)> {
-    if f.len() < 8 {
-        return Err(bad("numeric"));
-    }
-    let ndigits = i16::from_be_bytes(f[0..2].try_into().unwrap()) as i32;
-    let weight = i16::from_be_bytes(f[2..4].try_into().unwrap()) as i32;
-    let sign = u16::from_be_bytes(f[4..6].try_into().unwrap());
-    let dscale = u16::from_be_bytes(f[6..8].try_into().unwrap()) as i32;
-    match sign {
-        0x0000 | 0x4000 => {}
-        0xC000 => return Err(bad("numeric NaN")),
-        // pinf/ninf sentinels — decoding them as 0 would be silent corruption.
-        0xD000 | 0xF000 => return Err(bad("numeric Infinity")),
-        _ => return Err(bad("numeric sign")),
-    }
-    if f.len() < 8 + (ndigits as usize) * 2 {
-        return Err(bad("numeric digits"));
-    }
-    // Accumulate all digit groups, tracking the decimal exponent of the LAST group:
-    // value = acc × 10000^(weight − ndigits + 1).
-    let mut acc: i128 = 0;
-    for i in 0..ndigits {
-        let d = u16::from_be_bytes(
-            f[8 + i as usize * 2..10 + i as usize * 2]
-                .try_into()
-                .unwrap(),
-        );
-        acc = acc
-            .checked_mul(10_000)
-            .and_then(|a| a.checked_add(d as i128))
-            .ok_or_else(|| bad("numeric overflow"))?;
-    }
-    let exp4 = weight - ndigits + 1; // exponent in base-10000 groups
-    let mut exp10 = exp4 * 4 + dscale; // shift needed so acc is scaled to dscale places
-                                       // acc currently = value × 10000^(ndigits-1-weight) = value × 10^(-exp4·4)
-                                       // we want value × 10^dscale = acc × 10^(exp4·4 + dscale)
-    while exp10 > 0 {
-        acc = acc.checked_mul(10).ok_or_else(|| bad("numeric overflow"))?;
-        exp10 -= 1;
-    }
-    while exp10 < 0 {
-        acc /= 10;
-        exp10 += 1;
-    }
-    if sign == 0x4000 {
-        acc = -acc;
-    }
-    Ok((acc, dscale))
 }
 
 #[cfg(test)]

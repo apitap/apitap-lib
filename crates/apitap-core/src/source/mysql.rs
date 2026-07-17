@@ -5,7 +5,7 @@
 //! wire format directly — ClickHouse RowBinary or Postgres binary COPY, no
 //! intermediate text, no Arrow.
 
-use crate::pipeline::{pop, spans, WorkQueue};
+use super::{pop, spans, WorkQueue};
 use crate::sink::Loader;
 use crate::source::Source;
 use crate::error::{Error, Result};
@@ -995,7 +995,7 @@ impl Source for MySqlSource {
             ),
             WireFormat::TabSeparated => MyEnc::Tsv(plan.cols.iter().map(my_tsv).collect()),
         };
-        let queue = crate::pipeline::work_queue(stmts);
+        let queue = super::work_queue(stmts);
         let mut tasks = Vec::with_capacity(loaders.len());
         for loader in loaders {
             tasks.push(tokio::spawn(row_worker(

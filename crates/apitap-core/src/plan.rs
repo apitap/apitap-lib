@@ -141,3 +141,25 @@ pub(crate) struct DestState {
     /// `max(cursor)` in the destination as text; `None` when the table is empty.
     pub watermark: Option<String>,
 }
+
+/// The larger of two watermark texts — numeric cursors compare numerically,
+/// text cursors (timestamps in the source's own rendering) lexicographically.
+pub(crate) fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String> {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let x_wins = if numeric {
+                match (x.parse::<i128>(), y.parse::<i128>()) {
+                    (Ok(xi), Ok(yi)) => xi >= yi,
+                    (Ok(_), Err(_)) => true,
+                    (Err(_), Ok(_)) => false,
+                    _ => x >= y,
+                }
+            } else {
+                x >= y
+            };
+            Some(if x_wins { x } else { y })
+        }
+        (a, None) => a,
+        (None, b) => b,
+    }
+}

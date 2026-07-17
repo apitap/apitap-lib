@@ -434,21 +434,63 @@ impl crate::sink::Sink for MySqlSink {
                 self.fq(&self.bare)
             ))
             .await?;
-        let state_wm = self
+        // The state table legitimately doesn't exist on the first incremental run —
+        // and then no sibling can hold a row either. Every OTHER error must surface:
+        // swallowing a query failure here silently degrades to the data max, which
+        // is exactly the fan-in skip the guard below refuses.
+        let has_state_table = self
             .scalar(&format!(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = '{}' AND table_name = '_apitap_state'",
+                sql_lit(&self.db)
+            ))
+            .await?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            > 0;
+        let state_wm = if has_state_table {
+            self.scalar(&format!(
                 "SELECT watermark FROM {} WHERE dest_table='{}' AND source_id='{}'",
                 self.fq("_apitap_state"),
                 sql_lit(&self.bare),
                 sql_lit(source_id)
             ))
-            .await
-            .unwrap_or(None);
+            .await?
+        } else {
+            None
+        };
         // Fresher of state and data — a crash between the swap and the state write
         // costs a bounded re-read, never a skip.
         let watermark = match (state_wm, data_wm) {
             (Some(s), Some(d)) => Some(wm_max(s, d)),
             (Some(s), None) => Some(s),
-            (None, d) => d,
+            (None, d) => {
+                // Fan-in guard (same contract as the other sinks): if OTHER sources
+                // hold state rows for this table, the global data-max belongs to the
+                // most advanced of them — falling back would silently skip THIS
+                // source's backlog. Fail loudly instead.
+                if has_state_table {
+                    let siblings = self
+                        .scalar(&format!(
+                            "SELECT COUNT(*) FROM {} WHERE dest_table='{}'",
+                            self.fq("_apitap_state"),
+                            sql_lit(&self.bare)
+                        ))
+                        .await?
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if siblings > 0 {
+                        return Err(Error::InvalidInput(format!(
+                            "destination {} has state rows from other sources but none \
+                             for '{source_id}' — a data-derived watermark would be \
+                             wrong here. Run mode='replace' to rebuild, or seed a \
+                             state row manually",
+                            self.bare
+                        )));
+                    }
+                }
+                d
+            }
         };
         Ok(DestState {
             exists: true,

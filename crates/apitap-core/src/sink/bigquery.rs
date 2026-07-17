@@ -28,6 +28,8 @@ use crate::sink::Loader;
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
+use crate::plan::wm_max;
+use crate::wire::pgtext::unescape_into;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -571,38 +573,6 @@ fn check_col_name(name: &str) -> Result<()> {
 // TSV → NDJSON transcode (buffers arrive record-aligned per the Loader contract)
 // ============================================================================
 
-/// Un-escape one PostgreSQL text-COPY field into `out`. Only called when a
-/// backslash was seen — the common case borrows the raw bytes.
-fn unescape_into(field: &[u8], out: &mut Vec<u8>) {
-    let mut i = 0;
-    while i < field.len() {
-        // Bulk-copy up to the next backslash (rare in real data).
-        let mut j = i;
-        while j < field.len() && field[j] != b'\\' {
-            j += 1;
-        }
-        out.extend_from_slice(&field[i..j]);
-        if j >= field.len() {
-            break;
-        }
-        if j + 1 < field.len() {
-            out.push(match field[j + 1] {
-                b'b' => 0x08,
-                b'f' => 0x0c,
-                b'n' => b'\n',
-                b'r' => b'\r',
-                b't' => b'\t',
-                b'v' => 0x0b,
-                other => other, // covers \\ and any literal escape
-            });
-            i = j + 2;
-        } else {
-            out.push(b'\\');
-            i = j + 1;
-        }
-    }
-}
-
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_into(data: &[u8], out: &mut Vec<u8>) {
@@ -721,32 +691,6 @@ fn append_csv_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scratch: &mut 
     }
 }
 
-/// Re-export for the parquet encoder (bqparquet.rs tracks its own cursor max).
-pub(crate) fn wm_max_pub(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String> {
-    wm_max(a, b, numeric)
-}
-
-/// The larger of two watermark texts — numeric cursors compare numerically,
-/// text cursors (timestamps in the source's own rendering) lexicographically.
-fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String> {
-    match (a, b) {
-        (Some(x), Some(y)) => {
-            let x_wins = if numeric {
-                match (x.parse::<i128>(), y.parse::<i128>()) {
-                    (Ok(xi), Ok(yi)) => xi >= yi,
-                    (Ok(_), Err(_)) => true,
-                    (Err(_), Ok(_)) => false,
-                    _ => x >= y,
-                }
-            } else {
-                x >= y
-            };
-            Some(if x_wins { x } else { y })
-        }
-        (a, None) => a,
-        (None, b) => b,
-    }
-}
 
 /// Transcode record-aligned TSV bytes into CSV. Returns rows converted.
 /// NULL fields become unquoted-empty (= NULL to BigQuery; probed live), and

@@ -18,36 +18,6 @@ use crate::sink::Sink;
 use crate::source::Source;
 use std::future::Future;
 
-/// Work-stealing statement queue: many small spans, N workers pull until it drains.
-/// Static one-span-per-worker left a straggler tail (a probe caught only 7 of 12 pipes
-/// still alive at ~80% wall time).
-pub(crate) type WorkQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
-
-pub(crate) fn work_queue(stmts: Vec<String>) -> WorkQueue {
-    std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
-        stmts,
-    )))
-}
-
-pub(crate) fn pop(queue: &WorkQueue) -> Option<String> {
-    queue.lock().unwrap().pop_front()
-}
-
-/// Split `[lo, hi]` into at most `n` contiguous, non-overlapping, covering spans.
-pub(crate) fn spans(lo: i64, hi: i64, n: usize) -> Vec<(i64, i64)> {
-    let n = n.max(1) as i64;
-    let step = (hi - lo + 1 + n - 1) / n; // ceil
-    let mut out = Vec::new();
-    for k in 0..n {
-        let rlo = lo + k * step;
-        if rlo > hi {
-            break;
-        }
-        out.push((rlo, std::cmp::min(lo + (k + 1) * step - 1, hi)));
-    }
-    out
-}
-
 
 /// Credential-free source identity for the destination's state table:
 /// `scheme://host:port/db::table`. NEVER includes userinfo.
@@ -490,22 +460,4 @@ mod tests {
         assert_eq!(waiter.await.unwrap(), 3); // woke with 3, not 1
     }
 
-    #[test]
-    fn spans_cover_the_range_without_overlap() {
-        let s = spans(1, 10, 4);
-        assert_eq!(s, vec![(1, 3), (4, 6), (7, 9), (10, 10)]);
-        // Full coverage, no gaps/overlap.
-        assert_eq!(s.first().unwrap().0, 1);
-        assert_eq!(s.last().unwrap().1, 10);
-        for w in s.windows(2) {
-            assert_eq!(w[0].1 + 1, w[1].0);
-        }
-        // More splits than values: never produces an empty/inverted span.
-        let s = spans(5, 6, 8);
-        assert_eq!(s, vec![(5, 5), (6, 6)]);
-        // Single value.
-        assert_eq!(spans(7, 7, 4), vec![(7, 7)]);
-        // n=0 clamps to 1.
-        assert_eq!(spans(1, 3, 0), vec![(1, 3)]);
-    }
 }

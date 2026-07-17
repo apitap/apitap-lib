@@ -142,7 +142,7 @@ mod tests {
         let mut out = Vec::new();
         numeric_field_from_str(s, &mut out).unwrap();
         // Strip the 4-byte length header; the rest is the numeric payload.
-        crate::wire::rowbinary::numeric_to_scaled_i128_for_tests(&out[4..], scale).unwrap()
+        numeric_to_scaled_i128(&out[4..], scale).unwrap()
     }
 
     #[test]
@@ -205,5 +205,149 @@ mod tests {
         ]
         .concat();
         assert_eq!(out, expected);
+    }
+}
+
+
+
+fn bad(what: &str) -> Error {
+    Error::Transfer(format!("pg binary COPY: malformed {what} field"))
+}
+
+/// PG binary NUMERIC (ndigits, weight, sign, dscale + base-10000 digit groups) → an
+/// integer scaled to exactly `scale` decimal places.
+pub(crate) fn numeric_to_scaled_i128(f: &[u8], scale: u32) -> Result<i128> {
+    let (acc_scaled_dscale, dscale) = numeric_to_scaled_i128_raw(f)?;
+    // acc is scaled to dscale places; rescale to the declared scale.
+    let diff = scale as i32 - dscale;
+    Ok(match diff.cmp(&0) {
+        std::cmp::Ordering::Equal => acc_scaled_dscale,
+        std::cmp::Ordering::Greater => acc_scaled_dscale
+            .checked_mul(10i128.pow(diff as u32))
+            .ok_or_else(|| bad("numeric overflow"))?,
+        std::cmp::Ordering::Less => acc_scaled_dscale / 10i128.pow((-diff) as u32),
+    })
+}
+
+/// → (value scaled to `dscale` decimal places, dscale).
+pub(crate) fn numeric_to_scaled_i128_raw(f: &[u8]) -> Result<(i128, i32)> {
+    if f.len() < 8 {
+        return Err(bad("numeric"));
+    }
+    let ndigits = i16::from_be_bytes(f[0..2].try_into().unwrap()) as i32;
+    let weight = i16::from_be_bytes(f[2..4].try_into().unwrap()) as i32;
+    let sign = u16::from_be_bytes(f[4..6].try_into().unwrap());
+    let dscale = u16::from_be_bytes(f[6..8].try_into().unwrap()) as i32;
+    match sign {
+        0x0000 | 0x4000 => {}
+        0xC000 => return Err(bad("numeric NaN")),
+        // pinf/ninf sentinels — decoding them as 0 would be silent corruption.
+        0xD000 | 0xF000 => return Err(bad("numeric Infinity")),
+        _ => return Err(bad("numeric sign")),
+    }
+    if f.len() < 8 + (ndigits as usize) * 2 {
+        return Err(bad("numeric digits"));
+    }
+    // Accumulate all digit groups, tracking the decimal exponent of the LAST group:
+    // value = acc × 10000^(weight − ndigits + 1).
+    let mut acc: i128 = 0;
+    for i in 0..ndigits {
+        let d = u16::from_be_bytes(
+            f[8 + i as usize * 2..10 + i as usize * 2]
+                .try_into()
+                .unwrap(),
+        );
+        acc = acc
+            .checked_mul(10_000)
+            .and_then(|a| a.checked_add(d as i128))
+            .ok_or_else(|| bad("numeric overflow"))?;
+    }
+    let exp4 = weight - ndigits + 1; // exponent in base-10000 groups
+    let mut exp10 = exp4 * 4 + dscale; // shift needed so acc is scaled to dscale places
+                                       // acc currently = value × 10000^(ndigits-1-weight) = value × 10^(-exp4·4)
+                                       // we want value × 10^dscale = acc × 10^(exp4·4 + dscale)
+    while exp10 > 0 {
+        acc = acc.checked_mul(10).ok_or_else(|| bad("numeric overflow"))?;
+        exp10 -= 1;
+    }
+    while exp10 < 0 {
+        acc /= 10;
+        exp10 += 1;
+    }
+    if sign == 0x4000 {
+        acc = -acc;
+    }
+    Ok((acc, dscale))
+}
+
+/// Per-span framing stripper for the raw binary passthrough: skips the 19-byte header
+/// (+ extension area) at stream start and withholds the last 2 bytes so the trailer
+/// never reaches the destination mid-stream (the worker emits one synthetic header up
+/// front and one trailer at the very end). The withheld tail doubles as the "did the
+/// stream end cleanly" check.
+pub(crate) struct SpanStrip {
+    hdr: [u8; 19],
+    hdr_len: usize,
+    skip: usize,
+    pending: [u8; 2],
+    npending: usize,
+}
+
+impl SpanStrip {
+    pub(crate) fn new() -> Self {
+        Self {
+            hdr: [0; 19],
+            hdr_len: 0,
+            skip: 0,
+            pending: [0; 2],
+            npending: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, mut b: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        if self.hdr_len < 19 {
+            let take = (19 - self.hdr_len).min(b.len());
+            self.hdr[self.hdr_len..self.hdr_len + take].copy_from_slice(&b[..take]);
+            self.hdr_len += take;
+            b = &b[take..];
+            if self.hdr_len < 19 {
+                return Ok(());
+            }
+            if &self.hdr[..11] != b"PGCOPY\n\xff\r\n\0" {
+                return Err(Error::Transfer("pg binary COPY: bad header".into()));
+            }
+            self.skip = u32::from_be_bytes(self.hdr[15..19].try_into().unwrap()) as usize;
+        }
+        if self.skip > 0 {
+            let take = self.skip.min(b.len());
+            self.skip -= take;
+            b = &b[take..];
+        }
+        // Body relay with a 2-byte holdback (the eventual trailer).
+        match b.len() {
+            0 => {}
+            1 => {
+                if self.npending == 2 {
+                    out.push(self.pending[0]);
+                    self.pending[0] = self.pending[1];
+                    self.pending[1] = b[0];
+                } else {
+                    self.pending[self.npending] = b[0];
+                    self.npending += 1;
+                }
+            }
+            n => {
+                out.extend_from_slice(&self.pending[..self.npending]);
+                out.extend_from_slice(&b[..n - 2]);
+                self.pending.copy_from_slice(&b[n - 2..]);
+                self.npending = 2;
+            }
+        }
+        Ok(())
+    }
+
+    /// Did the span end exactly on the 2-byte trailer?
+    pub(crate) fn finished(&self) -> bool {
+        self.hdr_len == 19 && self.skip == 0 && self.npending == 2 && self.pending == [0xFF, 0xFF]
     }
 }

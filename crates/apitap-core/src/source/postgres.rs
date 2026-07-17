@@ -16,19 +16,38 @@
 //!   doesn't unescape — checksum validation would catch it). This is the fallback for
 //!   tables with a column the binary transcoder doesn't cover.
 
-use crate::pipeline::{pop, spans, WorkQueue};
+use super::{pop, spans, WorkQueue};
 use crate::sink::Loader;
 use crate::source::Source;
 use crate::error::{Error, Result};
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::wire::rowbinary::{rb_type, RbType, Transcoder};
 use futures::TryStreamExt;
-use sqlx::postgres::PgPoolCopyExt;
+use sqlx::postgres::{PgPoolCopyExt, PgPoolOptions};
 use sqlx::{PgPool, Row};
-use crate::dialect::postgres::{connect_pool, quote_ident, quote_ident_path};
+use crate::wire::pgcopy::SpanStrip;
+use crate::dialect::postgres::{quote_ident, quote_ident_path};
 // ---------------------------------------------------------------------------------
 // Source
 // ---------------------------------------------------------------------------------
+
+async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
+    PgPoolOptions::new()
+        .max_connections(max)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // timestamptz then serializes with a "+00" offset in text mode, which
+                // ClickHouse's best_effort parser reads — saves an AT TIME ZONE cast on
+                // every row. Binary streams are timezone-independent, so this is safe
+                // for every lane.
+                sqlx::Executor::execute(conn, "SET timezone = 'UTC'").await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await
+        .map_err(|e| Error::Connect(e.to_string()))
+}
 
 pub(crate) struct PgSource {
     pool: PgPool,
@@ -366,7 +385,7 @@ impl Source for PgSource {
         loaders: Vec<L>,
         chunk: usize,
     ) -> Result<u64> {
-        let queue = crate::pipeline::work_queue(stmts);
+        let queue = super::work_queue(stmts);
         let mut tasks = Vec::with_capacity(loaders.len());
         for loader in loaders {
             let mode = match lane.format {
@@ -531,77 +550,6 @@ async fn copy_out_worker<L: Loader>(
     loader.finish().await
 }
 
-/// Per-span framing stripper for the raw binary passthrough: skips the 19-byte header
-/// (+ extension area) at stream start and withholds the last 2 bytes so the trailer
-/// never reaches the destination mid-stream (the worker emits one synthetic header up
-/// front and one trailer at the very end). The withheld tail doubles as the "did the
-/// stream end cleanly" check.
-struct SpanStrip {
-    hdr: [u8; 19],
-    hdr_len: usize,
-    skip: usize,
-    pending: [u8; 2],
-    npending: usize,
-}
-
-impl SpanStrip {
-    fn new() -> Self {
-        Self {
-            hdr: [0; 19],
-            hdr_len: 0,
-            skip: 0,
-            pending: [0; 2],
-            npending: 0,
-        }
-    }
-
-    fn push(&mut self, mut b: &[u8], out: &mut Vec<u8>) -> Result<()> {
-        if self.hdr_len < 19 {
-            let take = (19 - self.hdr_len).min(b.len());
-            self.hdr[self.hdr_len..self.hdr_len + take].copy_from_slice(&b[..take]);
-            self.hdr_len += take;
-            b = &b[take..];
-            if self.hdr_len < 19 {
-                return Ok(());
-            }
-            if &self.hdr[..11] != b"PGCOPY\n\xff\r\n\0" {
-                return Err(Error::Transfer("pg binary COPY: bad header".into()));
-            }
-            self.skip = u32::from_be_bytes(self.hdr[15..19].try_into().unwrap()) as usize;
-        }
-        if self.skip > 0 {
-            let take = self.skip.min(b.len());
-            self.skip -= take;
-            b = &b[take..];
-        }
-        // Body relay with a 2-byte holdback (the eventual trailer).
-        match b.len() {
-            0 => {}
-            1 => {
-                if self.npending == 2 {
-                    out.push(self.pending[0]);
-                    self.pending[0] = self.pending[1];
-                    self.pending[1] = b[0];
-                } else {
-                    self.pending[self.npending] = b[0];
-                    self.npending += 1;
-                }
-            }
-            n => {
-                out.extend_from_slice(&self.pending[..self.npending]);
-                out.extend_from_slice(&b[..n - 2]);
-                self.pending.copy_from_slice(&b[n - 2..]);
-                self.npending = 2;
-            }
-        }
-        Ok(())
-    }
-
-    /// Did the span end exactly on the 2-byte trailer?
-    fn finished(&self) -> bool {
-        self.hdr_len == 19 && self.skip == 0 && self.npending == 2 && self.pending == [0xFF, 0xFF]
-    }
-}
 
 
 #[cfg(test)]
