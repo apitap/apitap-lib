@@ -40,6 +40,19 @@ fn to_bq_parallel(cores: usize) -> usize {
     (cores * 2).clamp(2, 8)
 }
 
+// Named per-route profiles — an arm references ONE of these instead of
+// restating the literal; a new route adds a line here.
+const PG_PG: Profile = Profile { auto_parallel: pg_pg_parallel, span_mult: 6 };
+const TO_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6 };
+const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6 };
+const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6 };
+const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6 };
+
+/// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
+fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
+    move |n| parallel.min(n).max(1)
+}
+
 pub(crate) async fn single(
     src_url: &str,
     dst_url: &str,
@@ -59,82 +72,64 @@ pub(crate) async fn single(
 
     match (src_scheme, dst_scheme) {
         ("postgres" | "postgresql", "postgres" | "postgresql") => {
-            let profile = Profile {
-                auto_parallel: pg_pg_parallel,
-                span_mult: 6,
-            };
+            let profile = PG_PG;
             let (chunk, parallel) = super::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
             let sink = PgSink::connect(dst_url, dest_table, parallel + 1, true).await?;
             super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, |n| parallel.min(n).max(1), started, &source_id,
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
             )
             .await
         }
         ("postgres" | "postgresql", "clickhouse" | "clickhouse+https") => {
-            let profile = Profile {
-                auto_parallel: to_ch_parallel,
-                span_mult: 6,
-            };
+            let profile = TO_CH;
             let (chunk, parallel) = super::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
             let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
             super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, |n| parallel.min(n).max(1), started, &source_id,
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
             )
             .await
         }
         ("postgres" | "postgresql", "bigquery") => {
-            let profile = Profile {
-                auto_parallel: to_bq_parallel,
-                span_mult: 6,
-            };
+            let profile = TO_BQ;
             let (chunk, parallel) = super::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, parallel + 1).await?;
             let sink = crate::sink::bigquery::BqSink::connect(dst_url, dest_table, parallel).await?;
             super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, |n| parallel.min(n).max(1), started, &source_id,
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
             )
             .await
         }
         ("mysql", "clickhouse" | "clickhouse+https") => {
-            let profile = Profile {
-                auto_parallel: to_ch_parallel,
-                span_mult: 6,
-            };
+            let profile = TO_CH;
             let (chunk, parallel) = super::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, parallel + 1).await?;
             let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
             super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, |n| parallel.min(n).max(1), started, &source_id,
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
             )
             .await
         }
         ("mysql", "mysql") => {
-            let profile = Profile {
-                auto_parallel: my_my_parallel,
-                span_mult: 6,
-            };
+            let profile = MY_MY;
             let (chunk, parallel) = super::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, parallel + 1).await?;
             let sink = crate::sink::mysql::MySqlSink::connect(dst_url, dest_table).await?;
             super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, |n| parallel.min(n).max(1), started, &source_id,
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
             )
             .await
         }
         ("mysql", "postgres" | "postgresql") => {
-            let profile = Profile {
-                auto_parallel: my_pg_parallel,
-                span_mult: 6,
-            };
+            let profile = MY_PG;
             let (chunk, parallel) = super::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, parallel + 1).await?;
             // Serial sends: this feeder's per-row encode is CPU-heavy and overlapping
             // it with the send was measured slower (see PgSink::overlap_send).
             let sink = PgSink::connect(dst_url, dest_table, parallel + 1, false).await?;
             super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, |n| parallel.min(n).max(1), started, &source_id,
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
             )
             .await
         }
@@ -247,10 +242,7 @@ pub(crate) async fn multi(
     // waiting in flight.
     let (budget, results) = match (src_scheme, dst_scheme) {
         ("postgres" | "postgresql", "postgres" | "postgresql") => {
-            let profile = Profile {
-                auto_parallel: pg_pg_parallel,
-                span_mult: 6,
-            };
+            let profile = PG_PG;
             let (chunk, budget) = super::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, budget + 8).await?;
             let jobs = jobs_for(&src, &sel, false).await?;
@@ -264,10 +256,7 @@ pub(crate) async fn multi(
             (budget, r)
         }
         ("postgres" | "postgresql", "clickhouse" | "clickhouse+https") => {
-            let profile = Profile {
-                auto_parallel: to_ch_parallel,
-                span_mult: 6,
-            };
+            let profile = TO_CH;
             let (chunk, budget) = super::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, budget + 8).await?;
             let jobs = jobs_for(&src, &sel, true).await?;
@@ -282,10 +271,7 @@ pub(crate) async fn multi(
             (budget, r)
         }
         ("postgres" | "postgresql", "bigquery") => {
-            let profile = Profile {
-                auto_parallel: to_bq_parallel,
-                span_mult: 6,
-            };
+            let profile = TO_BQ;
             let (chunk, budget) = super::knobs(opts, &profile)?;
             let src = PgSource::connect(src_url, budget + 8).await?;
             let jobs = jobs_for(&src, &sel, true).await?;
@@ -305,10 +291,7 @@ pub(crate) async fn multi(
             (budget, r)
         }
         ("mysql", "clickhouse" | "clickhouse+https") => {
-            let profile = Profile {
-                auto_parallel: to_ch_parallel,
-                span_mult: 6,
-            };
+            let profile = TO_CH;
             let (chunk, budget) = super::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, budget + 8).await?;
             let jobs = jobs_for(&src, &sel, true).await?;
@@ -323,10 +306,7 @@ pub(crate) async fn multi(
             (budget, r)
         }
         ("mysql", "mysql") => {
-            let profile = Profile {
-                auto_parallel: my_my_parallel,
-                span_mult: 6,
-            };
+            let profile = MY_MY;
             let (chunk, budget) = super::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, budget + 8).await?;
             let jobs = jobs_for(&src, &sel, true).await?;
@@ -340,10 +320,7 @@ pub(crate) async fn multi(
             (budget, r)
         }
         ("mysql", "postgres" | "postgresql") => {
-            let profile = Profile {
-                auto_parallel: my_pg_parallel,
-                span_mult: 6,
-            };
+            let profile = MY_PG;
             let (chunk, budget) = super::knobs(opts, &profile)?;
             let src = MySqlSource::connect(src_url, budget + 8).await?;
             let jobs = jobs_for(&src, &sel, false).await?;

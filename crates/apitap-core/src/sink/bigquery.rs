@@ -1418,8 +1418,6 @@ impl crate::sink::Sink for BqSink {
         &self.lane_order
     }
 
-    fn adjust_plan(&self, _plan: &mut TablePlan) {}
-
     fn lane_ok(&self, plan: &TablePlan, format: WireFormat) -> bool {
         match format {
             // Every column must decode exactly from PG binary — otherwise the

@@ -271,8 +271,6 @@ impl crate::sink::Sink for PgSink {
         &[WireFormat::PgCopyBinary]
     }
 
-    fn adjust_plan(&self, _plan: &mut TablePlan) {}
-
     async fn prepare(
         &mut self,
         plan: &TablePlan,

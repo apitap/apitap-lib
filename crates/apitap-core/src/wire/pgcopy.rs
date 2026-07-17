@@ -1,4 +1,5 @@
-//! Postgres binary-COPY ENCODER — the inverse of the parser in [`crate::wire::rowbinary`],
+//! Postgres binary-COPY format: the ENCODER (for routes writing INTO Postgres),
+//! the shared epoch/NUMERIC parsing vocabulary, and the SpanStrip framing stripper.
 //! used by routes that write INTO Postgres from a non-Postgres source. Binary beats
 //! text here for the same reason twice over: the destination skips text parsing, and
 //! the encoder has no escaping rules to get wrong.

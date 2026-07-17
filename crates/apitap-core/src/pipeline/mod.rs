@@ -6,8 +6,9 @@
 //! monomorphized: the hot loops (the sources' workers and the sinks' loaders) compile
 //! to the same code as the hand-written routes they replaced, no dynamic dispatch.
 //!
-//! Adding a connector = implement `Source` and/or `Sink` in `connectors/<name>.rs` and
-//! register the scheme in [`crate::transfer`]'s dispatch — nothing here changes.
+//! Adding a database = implement [`crate::source::Source`] in `source/<name>.rs`
+//! and/or [`crate::sink::Sink`] in `sink/<name>.rs`, then add the scheme arms in
+//! [`dispatch`] — nothing here changes.
 
 pub(crate) mod dispatch;
 

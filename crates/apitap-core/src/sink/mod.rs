@@ -51,7 +51,8 @@ pub(crate) trait Sink: Sized + Send + Sync {
     }
     /// Sink-specific plan constraints, applied before lane planning so the DDL and the
     /// encoders agree (e.g. ClickHouse: the ORDER BY column must be non-nullable).
-    fn adjust_plan(&self, plan: &mut TablePlan);
+    /// Default: none — a first-cut sink doesn't have to think about this.
+    fn adjust_plan(&self, _plan: &mut TablePlan) {}
     /// Create the staging table for this lane. `mode` is the effective mode: replace
     /// honors `durable`; incremental modes always stage UNLOGGED (staging never
     /// becomes the final table). Replace implementations should also capture whatever
@@ -92,7 +93,19 @@ pub(crate) trait Sink: Sized + Send + Sync {
         mode: Mode,
         cursor: &str,
         source_id: &str,
-    ) -> impl Future<Output = Result<DestState>> + Send;
+    ) -> impl Future<Output = Result<DestState>> + Send {
+        // Default for replace-only first-cut sinks: incremental modes refuse
+        // loudly instead of forcing every new sink to implement state handling
+        // before it can ship a full-refresh path.
+        let _ = (plan, mode, cursor, source_id);
+        async move {
+            Err(Error::InvalidInput(
+                "append/merge are not supported by this destination yet — use \
+                 mode='replace'"
+                    .into(),
+            ))
+        }
+    }
     /// Land the staged rows: `Replace` = atomic swap; `Append` = move staged rows into
     /// the existing table; `Merge` = upsert them by primary key. When `rows == 0`,
     /// drop staging and leave the destination untouched (the 0-row guard) in every

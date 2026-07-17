@@ -217,8 +217,6 @@ impl crate::sink::Sink for MySqlSink {
         &[WireFormat::TabSeparated]
     }
 
-    fn adjust_plan(&self, _plan: &mut TablePlan) {}
-
     async fn prepare(
         &mut self,
         plan: &TablePlan,
