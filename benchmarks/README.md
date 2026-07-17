@@ -415,3 +415,35 @@ docker rm -f apitap-bench-pg-src apitap-bench-pg-dst
 
 Run everything twice and report the second (warm) number. If your numbers disagree
 with the table above, please open an issue with the full output.
+
+## Multi-table on the tiny box — TPC-H, 10 × 1M rows, 256 MB / 0.5 CPU
+
+The multi-table release (`tables=[…]` / `schema=`) was benchmarked on REAL TPC-H
+data: 10 tables × 1,000,000 rows each (lineitem ×3 — 16 columns, composite key,
+TID path; orders ×3 — integer PK, range path; customer ×2; supplier ×2), sliced
+from a scale-factor-15 TPC-H Postgres. Route PG→PG. The TOOL runs in a docker
+container capped at `--cpus=0.5 --memory=256m`; both databases are stock,
+uncapped. Latest released versions; per-tool cap 40 min; per-table checksums
+(count + key sum + amount sum) gate every result.
+
+| Tool | Multi-table mode | Wall | Peak RSS | Checksums |
+|---|---|---:|---:|---|
+| **apitap 0.6.0** | one call, `schema="public"` | **33 s** | **52 MB** | **10/10** |
+| dlt 1.29.0 (pyarrow) | native `table_names=[…]` | OOM-killed at 7 s (rc 137) | >256 MB | 0/10 — nothing landed |
+| dlt 1.29.0 (default) | native `table_names=[…]` | OOM-killed at 13 s (rc 137) | >256 MB | 0/10 — nothing landed |
+| ingestr 1.1.0 | none for SQL copies — looped 10 invocations | 327 s | 194 MB | 10/10 |
+
+Can the others run tables in parallel? **dlt: yes, natively** —
+`sql_database(table_names=[…])` extracts tables through worker pools; on this
+box that same fan-out is what pushes it past 256 MB before a single row lands
+(both backends, within seconds). **ingestr: no** — `--source-table` takes one
+table per invocation (multi-table exists only in its CDC mode), so its
+multi-table story is a sequential loop, which does finish, 10× slower than
+apitap's single call.
+
+Honest note on apitap's own number: at 0.5 CPU the budget heuristic resolves to
+ONE pipe, so the tables effectively stream one after another — the win here is
+the engine's per-byte cost and bounded memory (52 MB used of 256 MB), not
+cross-table concurrency. The concurrency shows on bigger boxes: on 16 cores the
+same one-call multi-table run is ~2.1× faster than looping `transfer()`
+per table, at identical peak RSS. Raw log: [`tinybox-tpch-raw.log`](tinybox-tpch-raw.log).

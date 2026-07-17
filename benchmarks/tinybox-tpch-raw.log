@@ -1,0 +1,57 @@
+########## apitap 0.6.0 — ONE call, schema='public' ##########
+RESULT|apitap|wall=33s|peak_rss=52MB|rc=0
+rows 10000000 wall_ms 31613 budget 1
+  public.customer_a 1000000 pipes 1 2865 ms 
+  public.customer_b 1000000 pipes 1 3106 ms 
+  public.lineitem_a 1000000 pipes 1 3854 ms 
+  public.lineitem_b 1000000 pipes 1 4255 ms 
+  public.lineitem_c 1000000 pipes 1 3937 ms 
+  public.orders_a 1000000 pipes 1 2631 ms 
+  public.orders_b 1000000 pipes 1 2760 ms 
+  public.orders_c 1000000 pipes 1 2662 ms 
+  public.supplier_a 1000000 pipes 1 2843 ms 
+  public.supplier_b 1000000 pipes 1 2640 ms 
+  checksums: 10/10 MATCH, 0 mismatched-or-missing
+
+########## dlt 1.29.0 (pyarrow backend) — native table_names multi ##########
+RESULT|dlt-arrow|wall=7s|peak_rss=307MB|rc=137
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+    MISMATCH lineitem_a src=1000000|499706269684|38282634448.85 dst=
+    MISMATCH lineitem_b src=1000000|2499743232741|38235717883.71 dst=
+    MISMATCH lineitem_c src=1000000|5498651618491|38290701857.29 dst=
+    MISMATCH orders_a src=1000000|2000297298400|151182885515.85 dst=
+    MISMATCH orders_b src=1000000|9997772094888|151024302584.03 dst=
+    MISMATCH orders_c src=1000000|21994986062164|151170181798.73 dst=
+    MISMATCH customer_a src=1000000|500005830226|4497698845.21 dst=
+    MISMATCH customer_b src=1000000|813307886001|4501808139.71 dst=
+    MISMATCH supplier_a src=1000000|62501392664|4510107554.16 dst=
+    MISMATCH supplier_b src=1000000|62501392664|4510107554.16 dst=
+  checksums: 0/10 MATCH, 10 mismatched-or-missing
+
+########## dlt 1.29.0 (default backend) ##########
+RESULT|dlt-default|wall=13s|peak_rss=274MB|rc=137
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+    MISMATCH lineitem_a src=1000000|499706269684|38282634448.85 dst=
+    MISMATCH lineitem_b src=1000000|2499743232741|38235717883.71 dst=
+    MISMATCH lineitem_c src=1000000|5498651618491|38290701857.29 dst=
+    MISMATCH orders_a src=1000000|2000297298400|151182885515.85 dst=
+    MISMATCH orders_b src=1000000|9997772094888|151024302584.03 dst=
+    MISMATCH orders_c src=1000000|21994986062164|151170181798.73 dst=
+    MISMATCH customer_a src=1000000|500005830226|4497698845.21 dst=
+    MISMATCH customer_b src=1000000|813307886001|4501808139.71 dst=
+    MISMATCH supplier_a src=1000000|62501392664|4510107554.16 dst=
+    MISMATCH supplier_b src=1000000|62501392664|4510107554.16 dst=
+  checksums: 0/10 MATCH, 10 mismatched-or-missing
+
+########## ingestr 1.1.0 — one table per invocation (its only SQL mode), looped ##########
+RESULT|ingestr|wall=327s|peak_rss=194MB|rc=0
+  tables completed: 11/10
+  checksums: 10/10 MATCH, 0 mismatched-or-missing
+
+===== DONE TINYBOX TPCH =====
