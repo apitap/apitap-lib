@@ -447,3 +447,31 @@ the engine's per-byte cost and bounded memory (52 MB used of 256 MB), not
 cross-table concurrency. The concurrency shows on bigger boxes: on 16 cores the
 same one-call multi-table run is ~2.1× faster than looping `transfer()`
 per table, at identical peak RSS. Raw log: [`tinybox-tpch-raw.log`](tinybox-tpch-raw.log).
+
+### Scaled up: 10 × 5M rows (50M, ~8 GB) — same 256 MB / 0.5 CPU box
+
+Same setup, five times the data (lineitem and orders are pure 5M slices of the
+SF-15 TPC-H; customer/supplier cycled). This run also answers "can the others
+parallelize?" empirically, giving each tool its best available mode:
+
+| Tool / mode | Wall | Peak RSS | Tables intact |
+|---|---:|---:|---|
+| **apitap** — one call, `schema=` | **168 s (2.8 min)** | **53 MB** | **10/10** |
+| ingestr — sequential loop (its default) | 1,238 s (20.6 min) | 193 MB | 10/10 |
+| ingestr — `--extract-partition-by` (intra-table parallel) | **refused**: `incremental-strategy "replace" cannot be combined with extract partitioning` — its parallelism is for bounded/incremental reads only, not full copies | — | 0/10 |
+| ingestr — 10 invocations in parallel (shell) | 433 s | 188 MB | **3/10** — 7 processes OOM-killed inside the shared 256 MB |
+| dlt (pyarrow, native `table_names` multi) | OOM-killed at 7 s | >256 MB | 0/10 |
+| dlt (default) | OOM-killed at 14 s | >256 MB | 0/10 |
+
+So on a full-table copy at this box size, neither competitor has a *usable*
+parallel mode: dlt's native multi-table fan-out is what OOMs it, ingestr's
+intra-table partitioning rejects `replace` loads outright, and OS-level
+parallel ingestr silently loses 7 tables of 10. apitap's shared-budget
+concurrency is the same code path that runs 10/10 checksum-clean in 53 MB —
+and note the memory: 1M/table → 52-53 MB, 5M/table → 53 MB. The ceiling does
+not move with data size, by construction.
+
+An explicit `parallel=4` on this box (mixed-size workload) is ~1.4× faster
+than the auto budget (the CPU heuristic resolves to 1 pipe on a 0.5-CPU
+cgroup; memory would allow more) — the knob is there when you want it. Raw
+log: [`tinybox-tpch5m-raw.log`](tinybox-tpch5m-raw.log).

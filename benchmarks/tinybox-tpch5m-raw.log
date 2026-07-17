@@ -1,0 +1,64 @@
+########## apitap 0.6.0 — ONE call, schema='public' ##########
+RESULT|apitap|wall=168s|peak_rss=53MB|rc=0
+rows 50000000 wall_ms 166101 budget 1
+  public.customer_a 5000000 pipes 1 15465 ms 
+  public.customer_b 5000000 pipes 1 19297 ms 
+  public.lineitem_a 5000000 pipes 1 22047 ms 
+  public.lineitem_b 5000000 pipes 1 21086 ms 
+  public.lineitem_c 5000000 pipes 1 18953 ms 
+  public.orders_a 5000000 pipes 1 13372 ms 
+  public.orders_b 5000000 pipes 1 14719 ms 
+  public.orders_c 5000000 pipes 1 15204 ms 
+  public.supplier_a 5000000 pipes 1 13510 ms 
+  public.supplier_b 5000000 pipes 1 12354 ms 
+  checksums: 10/10 MATCH, 0 mismatched-or-missing
+
+########## dlt 1.29.0 (pyarrow backend) — native table_names multi ##########
+RESULT|dlt-arrow|wall=7s|peak_rss=308MB|rc=137
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+    MISMATCH lineitem_a src=5000000|42496251180020|191151631634.53 dst=
+    MISMATCH lineitem_b src=5000000|92512541123422|191276374704.50 dst=
+    MISMATCH lineitem_c src=5000000|167495187778304|191243844018.86 dst=
+    MISMATCH orders_a src=5000000|169969628991973|755372463354.38 dst=
+    MISMATCH orders_b src=5000000|369965742372342|755710612301.35 dst=
+    MISMATCH orders_c src=5000000|219959172994926|754994859181.65 dst=
+    MISMATCH customer_a src=5000000|6793510483066|22494073470.66 dst=
+    MISMATCH customer_b src=5000000|4991447700716|22496829242.63 dst=
+    MISMATCH supplier_a src=5000000|367649596776|22549159377.70 dst=
+    MISMATCH supplier_b src=5000000|367649596776|22549159377.70 dst=
+  checksums: 0/10 MATCH, 10 mismatched-or-missing
+
+########## dlt 1.29.0 (default backend) ##########
+RESULT|dlt-default|wall=14s|peak_rss=276MB|rc=137
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+    MISMATCH lineitem_a src=5000000|42496251180020|191151631634.53 dst=
+    MISMATCH lineitem_b src=5000000|92512541123422|191276374704.50 dst=
+    MISMATCH lineitem_c src=5000000|167495187778304|191243844018.86 dst=
+    MISMATCH orders_a src=5000000|169969628991973|755372463354.38 dst=
+    MISMATCH orders_b src=5000000|369965742372342|755710612301.35 dst=
+    MISMATCH orders_c src=5000000|219959172994926|754994859181.65 dst=
+    MISMATCH customer_a src=5000000|6793510483066|22494073470.66 dst=
+    MISMATCH customer_b src=5000000|4991447700716|22496829242.63 dst=
+    MISMATCH supplier_a src=5000000|367649596776|22549159377.70 dst=
+    MISMATCH supplier_b src=5000000|367649596776|22549159377.70 dst=
+  checksums: 0/10 MATCH, 10 mismatched-or-missing
+
+########## ingestr 1.1.0 — one table per invocation (its only SQL mode), looped ##########
+RESULT|ingestr|wall=1238s|peak_rss=193MB|rc=0
+  tables completed: 11/10
+  checksums: 10/10 MATCH, 0 mismatched-or-missing
+
+===== DONE TINYBOX TPCH5M =====
+### (a) ingestr PARTITION mode: --extract-partition-by <pk> (its intra-table parallel, default 5 jobs) ###
+RESULT|ingestr-partition|wall=11s|peak_rss=153MB|rc=0|ok=0/10|tables_5M=0/10
+### (b) ingestr SHELL-PARALLEL: 10 invocations at once (only cross-table option it has) ###
+RESULT|ingestr-10-parallel|wall=433s|peak_rss=188MB|rc=0|ok=3/10|tables_5M=3/10
+### cleanup dest ###
+dest tpch5m dropped
+DONE_INGESTR_VARIANTS
