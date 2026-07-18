@@ -177,13 +177,13 @@ pub(crate) fn text_plan(engine: &'static str, label: &str, headers: &[String]) -
 }
 
 /// (stem, key, est_rows) for every `.csv` under `prefix`. The stem — the file
-/// name minus `.csv` — is the table name; two keys sharing one stem fail
-/// loudly. est is size-derived (≥32 bytes/row assumed): it only drives
-/// largest-first scheduling and the initial pipe ask, both self-correcting.
-pub(crate) fn csv_tables(
-    keys: &[(String, i64)],
-    prefix: &str,
-) -> Result<Vec<(String, String, i64)>> {
+/// name minus `.csv` — is the table name. Duplicate stems are ALLOWED here:
+/// they only matter when actually used (resolving that stem, or a whole-schema
+/// run) — an unrelated collision elsewhere in the tree must not block a
+/// single-table transfer. est is size-derived (≥32 bytes/row assumed): it only
+/// drives largest-first scheduling and the initial pipe ask, both
+/// self-correcting.
+pub(crate) fn csv_tables(keys: &[(String, i64)], prefix: &str) -> Vec<(String, String, i64)> {
     let mut out: Vec<(String, String, i64)> = Vec::new();
     for (key, size) in keys {
         let Some(rel) = key.strip_prefix(prefix) else {
@@ -196,15 +196,58 @@ pub(crate) fn csv_tables(
         if stem.is_empty() {
             continue;
         }
-        if let Some((_, other, _)) = out.iter().find(|(s, _, _)| s == stem) {
-            return Err(Error::InvalidInput(format!(
-                "two objects share the table name '{stem}': '{other}' and '{key}' — \
-                 narrow the path so each stem is unique"
-            )));
-        }
         out.push((stem.to_string(), key.clone(), (size / 32).max(1)));
     }
-    Ok(out)
+    out
+}
+
+/// Whole-schema runs land every stem on a destination table — a duplicate stem
+/// would silently overwrite, so it fails loudly here.
+pub(crate) fn ensure_unique_stems(tables: &[(String, String, i64)]) -> Result<()> {
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (stem, key, _) in tables {
+        if let Some(other) = seen.insert(stem, key) {
+            return Err(Error::InvalidInput(format!(
+                "two objects share the table name '{stem}': '{other}' and '{key}' — \
+                 narrow the path so each stem is unique, or pick tables explicitly"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Match one requested table against the listing: a stem when unique, or the
+/// prefix-relative path (which is always unambiguous). Loud on both misses and
+/// ambiguity.
+pub(crate) fn match_table<'a>(
+    tables: &'a [(String, String, i64)],
+    prefix: &str,
+    want: &str,
+    origin: &str,
+) -> Result<&'a (String, String, i64)> {
+    let hits: Vec<_> = tables
+        .iter()
+        .filter(|(stem, key, _)| stem == want || key[prefix.len()..] == *want)
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => Err(Error::InvalidInput(format!(
+            "table '{want}' not found under {origin} (tables: {})",
+            tables
+                .iter()
+                .map(|(s, _, _)| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        _ => Err(Error::InvalidInput(format!(
+            "table name '{want}' is ambiguous under {origin}: {} — use the path \
+             relative to the url directory instead",
+            hits.iter()
+                .map(|(_, k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 /// The whole worker body for a CSV object: pump the byte stream through the
@@ -375,15 +418,34 @@ mod tests {
             ("data/2026/orders.csv".to_string(), 64),
             ("data/readme.md".to_string(), 10),
         ];
-        let t = csv_tables(&keys, "data/").unwrap();
+        let t = csv_tables(&keys, "data/");
         assert_eq!(t[0], ("users".into(), "data/users.csv".into(), 100));
         assert_eq!(t[1], ("orders".into(), "data/2026/orders.csv".into(), 2));
         assert_eq!(t.len(), 2);
-        let dup = vec![
-            ("a/users.csv".to_string(), 1),
-            ("b/users.csv".to_string(), 1),
-        ];
-        assert!(csv_tables(&dup, "").unwrap_err().to_string().contains("users"));
+
+        // Duplicate stems: listed fine, refused for whole-schema runs, and
+        // resolvable one at a time via the relative path.
+        let dup = csv_tables(
+            &[
+                ("a/users.csv".to_string(), 32),
+                ("b/users.csv".to_string(), 32),
+                ("main.csv".to_string(), 32),
+            ],
+            "",
+        );
+        assert_eq!(dup.len(), 3);
+        assert!(ensure_unique_stems(&dup).unwrap_err().to_string().contains("users"));
+        assert_eq!(match_table(&dup, "", "main", "x://").unwrap().1, "main.csv");
+        let amb = match_table(&dup, "", "users", "x://").unwrap_err().to_string();
+        assert!(amb.contains("ambiguous") && amb.contains("a/users.csv"));
+        assert_eq!(
+            match_table(&dup, "", "b/users.csv", "x://").unwrap().1,
+            "b/users.csv"
+        );
+        assert!(match_table(&dup, "", "nope", "x://")
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
     }
 
     #[test]

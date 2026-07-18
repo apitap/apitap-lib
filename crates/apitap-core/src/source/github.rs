@@ -227,29 +227,19 @@ impl GithubSource {
     }
 
     async fn tables(&self) -> Result<Vec<(String, String, i64)>> {
-        csvfile::csv_tables(self.listing().await?, &self.prefix)
+        Ok(csvfile::csv_tables(self.listing().await?, &self.prefix))
     }
 
-    /// stem (or prefix-relative path) → repo path, loudly listing what exists.
+    fn origin(&self) -> String {
+        format!("github://{}/{}/{}", self.owner, self.repo, self.prefix)
+    }
+
+    /// stem (or prefix-relative path) → repo path; loud on misses & ambiguity.
     async fn resolve(&self, table: &str) -> Result<String> {
         let tables = self.tables().await?;
-        if let Some((_, key, _)) = tables
-            .iter()
-            .find(|(stem, key, _)| stem == table || key[self.prefix.len()..] == *table)
-        {
-            return Ok(key.clone());
-        }
-        Err(Error::InvalidInput(format!(
-            "table '{table}' not found under github://{}/{}/{} (tables: {})",
-            self.owner,
-            self.repo,
-            self.prefix,
-            tables
-                .iter()
-                .map(|(s, _, _)| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+        Ok(csvfile::match_table(&tables, &self.prefix, table, &self.origin())?
+            .1
+            .clone())
     }
 
     async fn raw(&self, key: &str) -> Result<reqwest::Response> {
@@ -310,38 +300,26 @@ impl Source for GithubSource {
             Some(ts) => {
                 let mut out = Vec::with_capacity(ts.len());
                 for t in ts {
-                    match all
-                        .iter()
-                        .find(|(stem, key, _)| stem == t || key[self.prefix.len()..] == *t)
-                    {
-                        Some((stem, _, est)) => out.push((stem.clone(), *est)),
-                        None => {
-                            return Err(Error::InvalidInput(format!(
-                                "table '{t}' not found under github://{}/{}/{} (tables: {})",
-                                self.owner,
-                                self.repo,
-                                self.prefix,
-                                all.iter()
-                                    .map(|(s, _, _)| s.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )))
-                        }
-                    }
+                    let (stem, _, est) =
+                        csvfile::match_table(&all, &self.prefix, t, &self.origin())?;
+                    out.push((stem.clone(), *est));
                 }
                 Ok(out)
             }
             None => {
                 // schema, for a repo, is an extra path filter under the URL's
-                // directory; "*" (or nothing) means every table.
+                // directory; "*" (or nothing) means every table. Every stem
+                // lands on a destination table, so duplicates fail loudly HERE
+                // — an unused collision never blocks a targeted transfer.
                 let sub = schema.filter(|s| !s.is_empty() && *s != "*");
-                Ok(all
+                let picked: Vec<_> = all
                     .into_iter()
                     .filter(|(_, key, _)| {
                         sub.is_none_or(|s| key[self.prefix.len()..].starts_with(s))
                     })
-                    .map(|(stem, _, est)| (stem, est))
-                    .collect())
+                    .collect();
+                csvfile::ensure_unique_stems(&picked)?;
+                Ok(picked.into_iter().map(|(stem, _, est)| (stem, est)).collect())
             }
         }
     }
