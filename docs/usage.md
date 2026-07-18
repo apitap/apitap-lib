@@ -56,6 +56,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. |
 | Google Sheets (source) | `gsheets://` | `gsheets://<spreadsheet_id>?credentials=/path/key.json` — the id from the sheet's URL. See [Google Sheets source](#google-sheets-source). |
 | GitHub (source) | `github://` | `github://<owner>/<repo>[/dir]?ref=main` — CSV files as tables. See [GitHub source](#github-source-csv-files-as-tables). |
+| Google Cloud Storage (destination) | `gcs://` | `gcs://<bucket>[/prefix]?format=csv\|parquet&credentials=/path/key.json`. See [GCS destination](#gcs-destination-csv--parquet-files). |
 
 Table names may be schema-qualified (`public.events`, `mydb.events`); unqualified
 Postgres names resolve through the connection's `search_path`. Materialized views
@@ -485,6 +486,37 @@ apitap.transfer("github://owner/repo", dst, tables=["users", "2026/orders"])
 - **Destinations**: Postgres, ClickHouse, and MySQL. Files stream — size never
   bounds memory.
 - **Modes**: `mode="replace"` only (files carry no usable cursor).
+
+## GCS destination (CSV & Parquet files)
+
+```python
+apitap.transfer(
+    "postgres://user:pass@host:5432/db",
+    "gcs://my-bucket/exports?format=parquet&credentials=/path/service-account.json",
+    table="public.events",
+)
+```
+
+- **Layout**: `format=csv` (default) writes ONE gzipped object per table —
+  `<prefix>/<table>.csv.gz`, header row included. Workers stream their own
+  staging parts and finalize COMPOSES them server-side, so the final object
+  appears atomically (readers never see a partial file). `format=parquet`
+  writes the columnar convention instead: `<prefix>/<table>/part-NNNNN.parquet`
+  (ZSTD), one part per pipe — parts can't be concatenated, so the directory
+  swap is per-object (each file lands atomically; the set is not a
+  transaction).
+- **Auth**: the same service-account flow as BigQuery (`?credentials=` or
+  `GOOGLE_APPLICATION_CREDENTIALS`); the key needs `storage.objectAdmin` on
+  the bucket.
+- **CSV semantics**: unquoted-empty = NULL, quoted `""` = empty string;
+  values holding a delimiter, quote, or newline are quoted with `""` doubling
+  — the same dialect the BigQuery lane ships, readable by every CSV parser.
+- **Types** (Parquet): the BigQuery Parquet lane's mappings — exact decimals,
+  microsecond timestamps, real int/float/bool/date types; exotic columns
+  (arrays, ranges, `inet`, …) are refused loudly — cast in a source view or
+  use `format=csv`.
+- **Modes**: `mode="replace"` only; the 0-row guard leaves the destination
+  untouched when the source is empty. Works with `tables=`/`schema=` multi.
 
 ## Durability
 

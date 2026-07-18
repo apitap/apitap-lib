@@ -177,6 +177,10 @@ use it for rebuildable destinations.
       CSV files are the tables, streamed RFC-4180 with strict ragged-row rules;
       `GITHUB_TOKEN` for private repos; `?ref=` pins a branch/tag/SHA for
       reproducible loads)
+- [x] Postgres → GCS (`gcs://bucket/prefix?format=csv|parquet` — one composed
+      `.csv.gz` per table (atomic visibility) or a directory of ZSTD Parquet
+      parts; streams through resumable uploads, so file size never bounds
+      memory; reuses the BigQuery lane's proven transcoders)
 - [ ] Postgres → Snowflake
 
 ## Development

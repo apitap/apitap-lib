@@ -107,7 +107,10 @@ def transfer(
     tables, all-text, replace only), ``github://owner/repo[/dir]?ref=main``
     (CSV files are the tables, all-text, replace only) sources; ``postgres://``,
     ``clickhouse://`` (``clickhouse+https://`` for TLS),
-    ``bigquery://<project>/<dataset>?credentials=/path/key.json`` destinations — and
+    ``bigquery://<project>/<dataset>?credentials=/path/key.json``,
+    ``gcs://<bucket>[/prefix]?format=csv|parquet&credentials=/path/key.json``
+    (files: one composed .csv.gz per table, or a directory of Parquet parts)
+    destinations — and
     each pair negotiates its fastest wire format (raw binary COPY passthrough,
     in-flight RowBinary transcode, raw wire decode, or gzipped parallel load jobs).
     N concurrent range pipes feed a staging table that is swapped in atomically.

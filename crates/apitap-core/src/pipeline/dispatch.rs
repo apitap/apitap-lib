@@ -12,6 +12,7 @@ use super::{norm, Profile};
 use crate::error::{Error, Result};
 use crate::sink::bigquery::{BqConn, BqSink};
 use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
+use crate::sink::gcs::{GcsConn, GcsSink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
 use crate::source::github::GithubSource;
@@ -61,6 +62,9 @@ const TO_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6, ta
 const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
 const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
 const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+// GCS shares BigQuery's upload character: read + gzip/parquet-encode + upload,
+// bandwidth saturates past ~8 pipes.
+const TO_GCS: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
 const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1, table_pipe_cap: 1 };
 const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
 
@@ -181,6 +185,22 @@ impl DstScheme for MyTo {
     }
     fn bind(shared: Self::Shared, table: &str, _cfg: &SinkCfg) -> Result<MySqlSink> {
         Ok(MySqlSink::bind(shared, table))
+    }
+}
+struct GcsTo;
+impl DstScheme for GcsTo {
+    type Sink = GcsSink;
+    type Shared = GcsConn;
+    const BARE_DEST: bool = true;
+    async fn connect(url: &str, dest_table: &str, _parallel: usize, _cfg: &SinkCfg) -> Result<GcsSink> {
+        Ok(GcsSink::bind(GcsConn::parse(url).await?, dest_table))
+    }
+    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<GcsConn> {
+        // Authenticate once — the token and client are shared by every table.
+        GcsConn::parse(url).await
+    }
+    fn bind(shared: GcsConn, table: &str, _cfg: &SinkCfg) -> Result<GcsSink> {
+        Ok(GcsSink::bind(shared, table))
     }
 }
 struct BqTo;
@@ -313,6 +333,7 @@ routes! {
     "github"   -> "postgres"   : GhFrom => PgTo, GITHUB,  pg_overlap = false;
     "github"   -> "clickhouse" : GhFrom => ChTo, GITHUB,  pg_overlap = false;
     "github"   -> "mysql"      : GhFrom => MyTo, GITHUB,  pg_overlap = false;
+    "postgres" -> "gcs"        : PgFrom => GcsTo, TO_GCS,  pg_overlap = false;
 }
 
 pub(crate) async fn single(
