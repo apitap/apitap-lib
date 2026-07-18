@@ -475,3 +475,40 @@ An explicit `parallel=4` on this box (mixed-size workload) is ~1.4× faster
 than the auto budget (the CPU heuristic resolves to 1 pipe on a 0.5-CPU
 cgroup; memory would allow more) — the knob is there when you want it. Raw
 log: [`tinybox-tpch5m-raw.log`](tinybox-tpch5m-raw.log).
+
+## Postgres → GCS (files): apitap vs ingestr vs dlt
+
+Same methodology as every other table here: same box, one tool at a time in a
+`--cpus=16 --memory=4g` container, stock Postgres, the ingestr benchmark
+schema, and **every output downloaded back from the bucket and
+checksum-validated** (count | sum(id) | md5(small_str ordered)) before a time
+counts. All five 1M outputs matched the source exactly — including ingestr's
+and dlt's. Reproduce with [`run-gcs.sh`](run-gcs.sh); raw log in
+[`gcs-showdown-raw.log`](gcs-showdown-raw.log).
+
+**1M rows, PG → GCS:**
+
+| tool | output | time | vs apitap |
+|---|---|---|---|
+| **apitap** `format=csv` | one composed `.csv.gz` | **4.7 s** | — |
+| **apitap** `format=parquet` | 8 ZSTD part files | **5.3 s** | — |
+| ingestr 1.0.75 (`gs://` dest) | 1 parquet file | 14.2 s | 3.0× |
+| dlt `filesystem` + pyarrow backend | 4 parquet files | 42.6 s | 9.1× |
+| dlt `filesystem` default backend | 4 parquet files | 173.8 s | **37×** |
+
+**10M rows** (tools that finished 1M fast enough to attempt; dlt extrapolates
+to ~7 min (pyarrow) / ~29 min (default) and was not run):
+
+| tool | time | vs apitap |
+|---|---|---|
+| **apitap** `format=csv` | **15.5 s** | — |
+| **apitap** `format=parquet` | **18.2 s** | — |
+| ingestr 1.0.75 | 124.3 s | 8.0× |
+
+Notes for fairness: ingestr's `gs://` destination also writes parquet, so the
+parquet rows are apples-to-apples; dlt numbers use its documented `filesystem`
+destination with `loader_file_format="parquet"`, fresh `pipelines_dir` per run,
+and its faster pyarrow backend shown separately (its best case). apitap was
+the gcs-feature build later released as-is (the dist wheel's sha256 is the
+release). The bucket lived in `us-east1`; all tools shared the same network
+path.

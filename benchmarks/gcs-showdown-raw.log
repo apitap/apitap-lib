@@ -1,0 +1,38 @@
+SRC: 1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb
+=== images ===
+sha256:bc80f079abdcb5fb0731f21632811b02f1274b993f21b9461d9586c67b1abfe6
+sha256:13a09d8cb1f3d3cbe63e645c2ccd13b9397bdf28f18dfb56922c8fbbacd4efaf
+sha256:3160732fad92fdd67cf92350be61022480e343941ec739c818fd4503c10db623
+  images ok
+=== 1. apitap format=csv ===
+--- apitap-csv ---
+1,000,000 rows
+ELAPSED 4.7
+  apitap-csv: 5.6s (rc=0)
+=== 2. apitap format=parquet ===
+--- apitap-pq ---
+1,000,000 rows
+ELAPSED 5.3
+  apitap-pq: 5.7s (rc=0)
+=== 3. ingestr 1.0.75 -> gs ===
+--- ingestr ---
+ELAPSED 14.2
+  ingestr: 14.6s (rc=0)
+=== 4. dlt default -> gs (parquet) ===
+--- dlt-default ---
+ELAPSED 173.8
+  dlt-default: 178.5s (rc=0)
+=== 5. dlt pyarrow -> gs (parquet) ===
+--- dlt-pyarrow ---
+2026-07-18 10:51:41,582|[WARNING]|1|131726860878656|dlt|pyarrow.py|convert_array_to_arrow:1136|Default conversion to `string` for `data_type=json` failed. Using fallback strategies.
+2026-07-18 10:51:41,612|[WARNING]|1|131726860878656|dlt|pyarrow.py|cast_arrow_array_as_column_schema:1365|Received `data_type='json'`, Arrow nested values require serialization to STRING. They will be JSON-encoded, which may slow extraction. If your destination supports nested types, enable them (`supports_nested_types=True`) and provide a 'json' column with 'x-nested-type' hint to load nested values natively. Otherwise, consider casting to STRING upstream (e.g., in a VIEW).
+2026-07-18 10:51:42,081|[WARNING]|1|131726860878656|dlt|extractors.py|_compute_tables:552|In resource: bench_data_1m, when merging arrow schema with dlt schema, several column hints were different. dlt schema hints were kept and arrow schema and data were unmodified. It is up to destination to coerce the differences when loading. Change log level to INFO for more details.
+ELAPSED 42.6
+  dlt-pyarrow: 47.5s (rc=0)
+=== 6. VALIDASI dari bucket (semua prefix) ===
+  ap-csv/   1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb (1 data files)
+  ap-pq/    1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb (8 data files)
+  ing/      1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb (1 data files)
+  dlt-def/  1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb (4 data files)
+  dlt-pa/   1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb (4 data files)
+DONE_SHOWDOWN
