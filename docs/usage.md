@@ -517,6 +517,14 @@ apitap.transfer(
   use `format=csv`.
 - **Modes**: `mode="replace"` only; the 0-row guard leaves the destination
   untouched when the source is empty. Works with `tables=`/`schema=` multi.
+  Switching `format=` re-points the table: the other format's previous output
+  is swept on the next successful run.
+- **Limits**: `format=csv` takes at most 31 pipes (GCS composes header + one
+  part per pipe, 32-object cap — auto-parallel never exceeds 8); a
+  single-NULLABLE-column table is refused on the CSV lane (a NULL row would be
+  a blank line, which CSV readers silently drop — use Parquet). A Parquet
+  finalize interrupted mid-rename can leave old and new parts mixed until the
+  next successful run.
 
 ## Durability
 

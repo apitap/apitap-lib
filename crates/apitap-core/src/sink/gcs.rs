@@ -45,11 +45,14 @@ pub(crate) enum GcsFormat {
     Parquet,
 }
 
-/// The once-per-destination resources: HTTP client + bearer token + layout.
+/// The once-per-destination resources: HTTP client + auth + layout.
 #[derive(Clone)]
 pub(crate) struct GcsConn {
     client: reqwest::Client,
-    token: String,
+    /// Kept to RE-MINT the ~1h token mid-transfer — a long upload (or a big
+    /// multi-table run sharing one conn) must not die 401 at the finish line.
+    credentials: Arc<String>,
+    token: Arc<std::sync::Mutex<(String, std::time::Instant)>>,
     bucket: String,
     /// Normalized to end with '/' when non-empty.
     prefix: String,
@@ -123,11 +126,15 @@ impl GcsConn {
         }
         let mut credentials_path = None;
         let mut format = GcsFormat::Csv;
-        for (k, v) in u.query_pairs() {
-            match k.as_ref() {
-                "credentials" => credentials_path = Some(v.to_string()),
+        // Raw pairs, percent-decoded WITHOUT '+'-as-space (query_pairs is form
+        // decoding — it would mangle a key path containing a literal '+').
+        for pair in u.query().unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let (k, v) = (decode_component(k)?, decode_component(v)?);
+            match k.as_str() {
+                "credentials" => credentials_path = Some(v),
                 "format" => {
-                    format = match v.as_ref() {
+                    format = match v.as_str() {
                         "csv" => GcsFormat::Csv,
                         "parquet" => GcsFormat::Parquet,
                         other => {
@@ -149,11 +156,53 @@ impl GcsConn {
         let token = crate::gcp::fetch_access_token(&client, &credentials, SCOPE).await?;
         Ok(Self {
             client,
-            token,
+            credentials: Arc::new(credentials),
+            token: Arc::new(std::sync::Mutex::new((token, std::time::Instant::now()))),
             bucket,
             prefix,
             format,
         })
+    }
+
+    /// The current bearer token, re-minted past 55 minutes (tokens live ~1h).
+    /// Two racing refreshes just mint twice — harmless.
+    async fn bearer(&self) -> Result<String> {
+        {
+            let t = self.token.lock().expect("gcs token");
+            if t.1.elapsed() < std::time::Duration::from_secs(55 * 60) {
+                return Ok(t.0.clone());
+            }
+        }
+        let fresh = crate::gcp::fetch_access_token(&self.client, &self.credentials, SCOPE).await?;
+        let mut t = self.token.lock().expect("gcs token");
+        *t = (fresh.clone(), std::time::Instant::now());
+        Ok(fresh)
+    }
+
+    /// Send with up to 3 attempts: transport errors and 5xx retry with backoff
+    /// (every call here is idempotent — range re-PUTs included, per the
+    /// resumable protocol). 4xx and success return immediately.
+    async fn send_retry(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match build().send().await {
+                Ok(resp) if resp.status().is_server_error() && attempt < 3 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
+                }
+                Ok(resp) => return Ok(resp),
+                Err(_) if attempt < 3 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
+                }
+                Err(e) => return Err(Error::Transfer(format!("gcs {what}: {e}"))),
+            }
+        }
     }
 
     async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
@@ -174,15 +223,19 @@ impl GcsConn {
             self.bucket,
             enc(object)
         );
+        let tok = self.bearer().await?;
         let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("content-type", "application/octet-stream")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("gcs upload: {e}")))?;
+            .send_retry(
+                || {
+                    self.client
+                        .post(&url)
+                        .bearer_auth(&tok)
+                        .header("content-type", "application/octet-stream")
+                        .body(bytes.clone())
+                },
+                "upload",
+            )
+            .await?;
         Self::check(resp, "upload").await.map(|_| ())
     }
 
@@ -192,14 +245,18 @@ impl GcsConn {
             self.bucket,
             enc(object)
         );
+        let tok = self.bearer().await?;
         let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("content-length", "0")
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("gcs resumable begin: {e}")))?;
+            .send_retry(
+                || {
+                    self.client
+                        .post(&url)
+                        .bearer_auth(&tok)
+                        .header("content-length", "0")
+                },
+                "resumable begin",
+            )
+            .await?;
         let resp = Self::check(resp, "resumable begin").await?;
         resp.headers()
             .get("location")
@@ -225,22 +282,50 @@ impl GcsConn {
             (true, None) => return Ok(()),
         };
         let resp = self
-            .client
-            .put(session)
-            .header("content-range", range)
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("gcs chunk upload: {e}")))?;
+            .send_retry(
+                || {
+                    self.client
+                        .put(session)
+                        .header("content-range", range.clone())
+                        .body(bytes.clone())
+                },
+                "chunk upload",
+            )
+            .await?;
         let status = resp.status();
-        if status.as_u16() == 308 || status.is_success() {
-            return Ok(());
+        // The status CONTRACT, not just "no error": a non-final chunk must get
+        // 308 with the full range confirmed (GCS may accept FEWER bytes and
+        // still answer 308); the FINAL chunk must get 2xx — a final 308 means
+        // the object was never finalized, and treating it as success silently
+        // drops this worker's whole part from the composed result.
+        match (status.as_u16(), total) {
+            (308, None) => {
+                let confirmed = resp
+                    .headers()
+                    .get("range")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|r| r.rsplit('-').next())
+                    .and_then(|n| n.parse::<u64>().ok());
+                if confirmed == Some(end - 1) {
+                    Ok(())
+                } else {
+                    Err(Error::Transfer(format!(
+                        "gcs chunk upload: 308 confirmed bytes up to {confirmed:?}, \
+                         expected {} — resumable session out of sync",
+                        end - 1
+                    )))
+                }
+            }
+            (_, Some(_)) if status.is_success() => Ok(()),
+            _ => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(Error::Transfer(format!(
+                    "gcs chunk upload ({status}, final={}): {}",
+                    total.is_some(),
+                    body.chars().take(400).collect::<String>().trim()
+                )))
+            }
         }
-        let body = resp.text().await.unwrap_or_default();
-        Err(Error::Transfer(format!(
-            "gcs chunk upload ({status}): {}",
-            body.chars().take(400).collect::<String>().trim()
-        )))
     }
 
     /// Cancel a resumable session so GCS discards the partial object.
@@ -260,13 +345,10 @@ impl GcsConn {
             if let Some(t) = &token {
                 url.push_str(&format!("&pageToken={}", enc(t)));
             }
+            let tok = self.bearer().await?;
             let resp = self
-                .client
-                .get(&url)
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .map_err(|e| Error::Transfer(format!("gcs list: {e}")))?;
+                .send_retry(|| self.client.get(&url).bearer_auth(&tok), "list")
+                .await?;
             let v: serde_json::Value = Self::check(resp, "list")
                 .await?
                 .json()
@@ -286,13 +368,10 @@ impl GcsConn {
 
     async fn delete(&self, object: &str) -> Result<()> {
         let url = format!("{API}/b/{}/o/{}", self.bucket, enc(object));
+        let tok = self.bearer().await?;
         let resp = self
-            .client
-            .delete(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("gcs delete: {e}")))?;
+            .send_retry(|| self.client.delete(&url).bearer_auth(&tok), "delete")
+            .await?;
         // 404 tolerated: sweeps race their own prior runs.
         if resp.status().is_success() || resp.status().as_u16() == 404 {
             return Ok(());
@@ -315,14 +394,13 @@ impl GcsConn {
             "sourceObjects": sources.iter().map(|s| serde_json::json!({"name": s})).collect::<Vec<_>>(),
             "destination": {"contentType": "application/gzip"},
         });
+        let tok = self.bearer().await?;
         let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("gcs compose: {e}")))?;
+            .send_retry(
+                || self.client.post(&url).bearer_auth(&tok).json(&body),
+                "compose",
+            )
+            .await?;
         Self::check(resp, "compose").await.map(|_| ())
     }
 
@@ -340,14 +418,18 @@ impl GcsConn {
             if let Some(t) = &token {
                 url.push_str(&format!("?rewriteToken={}", enc(t)));
             }
+            let tok = self.bearer().await?;
             let resp = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.token)
-                .header("content-length", "0")
-                .send()
-                .await
-                .map_err(|e| Error::Transfer(format!("gcs rewrite: {e}")))?;
+                .send_retry(
+                    || {
+                        self.client
+                            .post(&url)
+                            .bearer_auth(&tok)
+                            .header("content-length", "0")
+                    },
+                    "rewrite",
+                )
+                .await?;
             let v: serde_json::Value = Self::check(resp, "rewrite")
                 .await?
                 .json()
@@ -377,17 +459,27 @@ pub(crate) struct GcsSink {
 }
 
 impl GcsSink {
-    pub(crate) fn bind(conn: GcsConn, dest_table: &str) -> Self {
+    pub(crate) fn bind(conn: GcsConn, dest_table: &str, parallel: usize) -> Result<Self> {
+        // The CSV lane composes header + one part per pipe; GCS compose caps at
+        // 32 sources. Refuse BEFORE uploading anything, not after.
+        if conn.format == GcsFormat::Csv && parallel + 1 > COMPOSE_MAX {
+            return Err(Error::InvalidInput(format!(
+                "format=csv supports at most {} pipes (GCS composes header + one \
+                 part per pipe, 32-object limit) — lower parallel or use \
+                 format=parquet",
+                COMPOSE_MAX - 1
+            )));
+        }
         let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
         let staging = format!("{}{bare}__apitap_staging/", conn.prefix);
-        Self {
+        Ok(Self {
             conn,
             bare: bare.to_string(),
             staging,
             names: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
             next_part: Arc::new(AtomicU64::new(0)),
-        }
+        })
     }
 
     fn ext(&self) -> &'static str {
@@ -417,6 +509,20 @@ impl crate::sink::Sink for GcsSink {
         _durable: bool,
         _mode: Mode,
     ) -> Result<()> {
+        // A single-column table's NULL row would be a BLANK CSV line — which
+        // every standard reader silently drops. No honest spelling exists
+        // (quoted "" means empty string), so refuse instead of losing rows.
+        if self.conn.format == GcsFormat::Csv
+            && plan.cols.len() == 1
+            && plan.cols[0].nullable
+        {
+            return Err(Error::InvalidInput(format!(
+                "single nullable column '{}' can't round-trip through CSV (a NULL \
+                 row is a blank line, dropped by CSV readers) — use format=parquet, \
+                 or a NOT NULL source column",
+                plan.cols[0].name
+            )));
+        }
         let mut delivered = Vec::new();
         let mut names = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
@@ -506,12 +612,27 @@ impl crate::sink::Sink for GcsSink {
             }
             return Ok(());
         }
+        // Once the data has LANDED, cleanup failures must not fail the run —
+        // a reported failure with a fully-landed destination is a lie, and the
+        // next prepare sweeps staging anyway. Hence best-effort deletes below.
         match self.conn.format {
             GcsFormat::Csv => {
                 let dest = format!("{}{}.csv.gz", self.conn.prefix, self.bare);
                 self.conn.compose(&parts, &dest).await?;
                 for p in &parts {
-                    self.conn.delete(p).await?;
+                    let _ = self.conn.delete(p).await;
+                }
+                // A previous format=parquet run of this table would otherwise
+                // stay live next to the new CSV forever.
+                for old in self
+                    .conn
+                    .list(&format!("{}{}/", self.conn.prefix, self.bare))
+                    .await
+                    .unwrap_or_default()
+                {
+                    if is_part_object(&old) {
+                        let _ = self.conn.delete(&old).await;
+                    }
                 }
             }
             GcsFormat::Parquet => {
@@ -524,20 +645,37 @@ impl crate::sink::Sink for GcsSink {
                     fresh.push(dst);
                 }
                 // Per-object renames aren't a transaction: readers can see a
-                // mixed directory for a moment. Old extras go LAST so a
-                // successful run never leaves stale parts behind.
+                // mixed directory until this finishes (a failure here leaves
+                // the mix until the next successful run — documented). Only
+                // apitap's OWN part files are swept; anything else a user put
+                // in the directory is not ours to delete.
                 for s in stale {
-                    if !fresh.contains(&s) {
-                        self.conn.delete(&s).await?;
+                    if !fresh.contains(&s) && is_part_object(&s) {
+                        let _ = self.conn.delete(&s).await;
                     }
                 }
                 for p in &parts {
-                    self.conn.delete(p).await?;
+                    let _ = self.conn.delete(p).await;
                 }
+                // A previous format=csv run of this table would otherwise stay
+                // live next to the new parts forever.
+                let _ = self
+                    .conn
+                    .delete(&format!("{}{}.csv.gz", self.conn.prefix, self.bare))
+                    .await;
             }
         }
         Ok(())
     }
+}
+
+/// apitap's own part-file names (`part-NNNNN.parquet` under a table dir) —
+/// the ONLY things a stale-sweep may delete.
+fn is_part_object(name: &str) -> bool {
+    let base = name.rsplit_once('/').map_or(name, |(_, b)| b);
+    base.strip_prefix("part-")
+        .and_then(|r| r.strip_suffix(".parquet"))
+        .is_some_and(|digits| digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub(crate) struct GcsLoader {
@@ -645,5 +783,28 @@ impl crate::sink::Loader for GcsLoader {
         // Cancel the session so GCS discards the partial part object.
         self.conn.cancel(&self.session).await;
         cause
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enc_and_decode_component_roundtrip() {
+        assert_eq!(enc("e2e/año 1.csv.gz"), "e2e%2Fa%C3%B1o%201.csv.gz");
+        assert_eq!(decode_component("a%C3%B1o%201").unwrap(), "año 1");
+        // '+' is a literal plus in a path, never a space.
+        assert_eq!(decode_component("k+ey.json").unwrap(), "k+ey.json");
+        assert!(decode_component("bad%zz").is_err());
+    }
+
+    #[test]
+    fn stale_sweep_only_touches_our_part_files() {
+        assert!(is_part_object("e2e/events/part-00003.parquet"));
+        assert!(!is_part_object("e2e/events/part-3.parquet"));
+        assert!(!is_part_object("e2e/events/users-notes.parquet"));
+        assert!(!is_part_object("e2e/events/part-00003.csv"));
+        assert!(!is_part_object("e2e/events/README.md"));
     }
 }

@@ -192,15 +192,15 @@ impl DstScheme for GcsTo {
     type Sink = GcsSink;
     type Shared = GcsConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, _parallel: usize, _cfg: &SinkCfg) -> Result<GcsSink> {
-        Ok(GcsSink::bind(GcsConn::parse(url).await?, dest_table))
+    async fn connect(url: &str, dest_table: &str, parallel: usize, _cfg: &SinkCfg) -> Result<GcsSink> {
+        GcsSink::bind(GcsConn::parse(url).await?, dest_table, parallel)
     }
     async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<GcsConn> {
         // Authenticate once — the token and client are shared by every table.
         GcsConn::parse(url).await
     }
-    fn bind(shared: GcsConn, table: &str, _cfg: &SinkCfg) -> Result<GcsSink> {
-        Ok(GcsSink::bind(shared, table))
+    fn bind(shared: GcsConn, table: &str, cfg: &SinkCfg) -> Result<GcsSink> {
+        GcsSink::bind(shared, table, cfg.budget)
     }
 }
 struct BqTo;
