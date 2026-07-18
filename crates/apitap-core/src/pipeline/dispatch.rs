@@ -8,7 +8,7 @@
 //! `one::<S, D>` / `many::<S, D>` at compile time — no dynamic dispatch anywhere
 //! on the hot path, and per-route perf character lives in the [`Profile`] column.
 
-use super::Profile;
+use super::{norm, Profile};
 use crate::error::{Error, Result};
 use crate::sink::bigquery::{BqConn, BqSink};
 use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
@@ -56,17 +56,6 @@ const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6 };
 const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6 };
 const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6 };
 const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1 };
-
-/// Collapse URL-scheme aliases so the route table matches one spelling per
-/// engine. Only the ROUTING string is normalized — the sink still parses the
-/// original URL (`clickhouse+https` keeps its TLS meaning there).
-fn norm(scheme: &str) -> &str {
-    match scheme {
-        "postgresql" => "postgres",
-        "clickhouse+https" => "clickhouse",
-        other => other,
-    }
-}
 
 /// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
 fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
@@ -251,11 +240,11 @@ async fn many<S: SrcScheme, D: DstScheme>(
 }
 
 /// THE route table. One line per supported pair: source adapter, destination
-/// adapter, profile, and the pg-overlap flag. The macro expands it into the
+/// adapter, profile, and the pg_overlap flag (dead on non-Postgres dests\n/// by construction — only PgTo reads it). The macro expands it into the
 /// single-table match, the multi-table match, and the "supported:" list in the
 /// unsupported-route error — the three can never drift apart.
 macro_rules! routes {
-    ($( $sname:literal -> $dname:literal : $S:ty => $D:ty, $prof:expr, overlap = $ov:expr );+ $(;)?) => {
+    ($( $sname:literal -> $dname:literal : $S:ty => $D:ty, $prof:expr, pg_overlap = $ov:expr );+ $(;)?) => {
         #[allow(clippy::too_many_arguments)]
         async fn route_single(
             s: &str, d: &str,
@@ -279,6 +268,11 @@ macro_rules! routes {
                 (s, d) => Err(unsupported(s, d)),
             }
         }
+        /// Every table pair, for guard tests: entries must be norm() fixed
+        /// points (an alias spelling would be silently unreachable) and unique
+        /// (a duplicate would silently lose to the first line).
+        #[cfg(test)]
+        const ROUTES: &[(&str, &str)] = &[ $( ($sname, $dname) ),+ ];
         fn unsupported(s: &str, d: &str) -> Error {
             Error::InvalidInput(format!(
                 "unsupported route {s}:// → {d}:// (supported: {})",
@@ -289,15 +283,15 @@ macro_rules! routes {
 }
 
 routes! {
-    "postgres" -> "postgres"   : PgFrom => PgTo, PG_PG,   overlap = true;
-    "postgres" -> "clickhouse" : PgFrom => ChTo, TO_CH,   overlap = false;
-    "postgres" -> "bigquery"   : PgFrom => BqTo, TO_BQ,   overlap = false;
-    "mysql"    -> "clickhouse" : MyFrom => ChTo, TO_CH,   overlap = false;
-    "mysql"    -> "postgres"   : MyFrom => PgTo, MY_PG,   overlap = false;
-    "mysql"    -> "mysql"      : MyFrom => MyTo, MY_MY,   overlap = false;
-    "gsheets"  -> "postgres"   : GsFrom => PgTo, GSHEETS, overlap = false;
-    "gsheets"  -> "clickhouse" : GsFrom => ChTo, GSHEETS, overlap = false;
-    "gsheets"  -> "mysql"      : GsFrom => MyTo, GSHEETS, overlap = false;
+    "postgres" -> "postgres"   : PgFrom => PgTo, PG_PG,   pg_overlap = true;
+    "postgres" -> "clickhouse" : PgFrom => ChTo, TO_CH,   pg_overlap = false;
+    "postgres" -> "bigquery"   : PgFrom => BqTo, TO_BQ,   pg_overlap = false;
+    "mysql"    -> "clickhouse" : MyFrom => ChTo, TO_CH,   pg_overlap = false;
+    "mysql"    -> "postgres"   : MyFrom => PgTo, MY_PG,   pg_overlap = false;
+    "mysql"    -> "mysql"      : MyFrom => MyTo, MY_MY,   pg_overlap = false;
+    "gsheets"  -> "postgres"   : GsFrom => PgTo, GSHEETS, pg_overlap = false;
+    "gsheets"  -> "clickhouse" : GsFrom => ChTo, GSHEETS, pg_overlap = false;
+    "gsheets"  -> "mysql"      : GsFrom => MyTo, GSHEETS, pg_overlap = false;
 }
 
 pub(crate) async fn single(
@@ -480,6 +474,19 @@ mod tests {
         assert_eq!(norm("clickhouse+https"), "clickhouse");
         assert_eq!(norm("gsheets"), "gsheets");
         assert_eq!(norm("sqlite"), "sqlite");
+    }
+
+    #[test]
+    fn route_table_entries_are_norm_fixed_points_and_unique() {
+        // An alias spelling ("postgresql") would compile fine yet be silently
+        // unreachable (norm() runs before the match); a duplicate pair would
+        // silently lose to the first line. Both are caught here.
+        let mut seen = std::collections::HashSet::new();
+        for (s, d) in ROUTES {
+            assert_eq!(norm(s), *s, "route source '{s}' is not the canonical spelling");
+            assert_eq!(norm(d), *d, "route dest '{d}' is not the canonical spelling");
+            assert!(seen.insert((s, d)), "duplicate route line {s}→{d}");
+        }
     }
 
     #[test]

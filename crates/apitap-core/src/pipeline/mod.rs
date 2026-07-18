@@ -22,15 +22,25 @@ use std::future::Future;
 
 /// Credential-free source identity for the destination's state table:
 /// `scheme://host:port/db::table`. NEVER includes userinfo.
+/// Collapse URL-scheme aliases to one canonical spelling per engine. THE single
+/// alias authority: route dispatch and `source_identity` both call it, so an
+/// alias spelling can never route one way while forking the watermark identity
+/// the other way. Only the routing/identity string is normalized — sinks still
+/// parse the original URL (`clickhouse+https` keeps its TLS meaning there).
+pub(crate) fn norm(scheme: &str) -> &str {
+    match scheme {
+        "postgresql" => "postgres",
+        "clickhouse+https" => "clickhouse",
+        other => other,
+    }
+}
+
 pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
     match reqwest::Url::parse(src_url) {
         Ok(u) => {
             // Normalize so equivalent URLs yield ONE identity — a scheme alias or an
             // elided default port must not silently fork the watermark.
-            let scheme = match u.scheme() {
-                "postgresql" => "postgres",
-                other => other,
-            };
+            let scheme = norm(u.scheme());
             let host = u.host_str().unwrap_or("unknown");
             let port = u.port().unwrap_or(match scheme {
                 "postgres" => crate::dialect::postgres::DEFAULT_PORT,

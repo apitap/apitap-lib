@@ -216,7 +216,11 @@ impl MySqlSink {
 /// than guessing a lossy type.
 fn my_type_of(d: &Delivered, col: &str) -> Result<String> {
     match d {
-        Delivered::Text => Ok("TEXT".to_string()),
+        // MEDIUMTEXT, not TEXT: TEXT caps at 65,535 BYTES and the loader session
+        // runs with sql_mode='' where an over-long cell TRUNCATES with only a
+        // warning — a Google Sheets cell (up to 50k chars, ~200KB as UTF-8) would
+        // silently lose its tail. MEDIUMTEXT (16MB) costs the same storage.
+        Delivered::Text => Ok("MEDIUMTEXT".to_string()),
         other => Err(Error::Transfer(format!(
             "mysql sink: no type mapping for column {col} delivered as {other:?} \
              from a non-mysql source — open an issue"
