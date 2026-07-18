@@ -12,6 +12,7 @@ use std::future::Future;
 
 pub(crate) mod csvfile;
 pub(crate) mod github;
+pub(crate) mod github_api;
 pub(crate) mod gsheets;
 pub(crate) mod mysql;
 pub(crate) mod postgres;

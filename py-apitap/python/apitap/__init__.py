@@ -105,7 +105,9 @@ def transfer(
     schemes pick the route — ``postgres://``/``postgresql://``, ``mysql://``,
     ``gsheets://<spreadsheet_id>?credentials=/path/key.json`` (tabs are the
     tables, all-text, replace only), ``github://owner/repo[/dir]?ref=main``
-    (CSV files are the tables, all-text, replace only) sources; ``postgres://``,
+    (CSV files are the tables, all-text, replace only),
+    ``github+api://owner/repo`` (issues/PRs/commits/stars… as typed tables,
+    incremental where the API allows) sources; ``postgres://``,
     ``clickhouse://`` (``clickhouse+https://`` for TLS),
     ``bigquery://<project>/<dataset>?credentials=/path/key.json``,
     ``gcs://<bucket>[/prefix]?format=csv|parquet&credentials=/path/key.json``

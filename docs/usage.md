@@ -56,6 +56,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. |
 | Google Sheets (source) | `gsheets://` | `gsheets://<spreadsheet_id>?credentials=/path/key.json` — the id from the sheet's URL. See [Google Sheets source](#google-sheets-source). |
 | GitHub (source) | `github://` | `github://<owner>/<repo>[/dir]?ref=main` — CSV files as tables. See [GitHub source](#github-source-csv-files-as-tables). |
+| GitHub API (source) | `github+api://` | `github+api://<owner>/<repo>` — issues, PRs, commits, stars … as typed tables. See [GitHub API source](#github-api-source-the-project-as-tables). |
 | Google Cloud Storage (destination) | `gcs://` | `gcs://<bucket>[/prefix]?format=csv\|parquet&credentials=/path/key.json`. See [GCS destination](#gcs-destination-csv--parquet-files). |
 
 Table names may be schema-qualified (`public.events`, `mydb.events`); unqualified
@@ -486,6 +487,33 @@ apitap.transfer("github://owner/repo", dst, tables=["users", "2026/orders"])
 - **Destinations**: Postgres, ClickHouse, and MySQL. Files stream — size never
   bounds memory.
 - **Modes**: `mode="replace"` only (files carry no usable cursor).
+
+## GitHub API source (the project as tables)
+
+```python
+apitap.transfer("github+api://apitap/apitap-lib", pg_url, table="issues")
+apitap.transfer("github+api://owner/repo", ch_url, schema="*")   # every entity
+# incremental — only issues updated since the watermark travel:
+apitap.transfer("github+api://owner/repo", pg_url, table="issues",
+                mode="merge", cursor="updated_at")
+```
+
+- **Tables**: `issues` · `pull_requests` · `commits` · `stargazers` ·
+  `releases` · `issue_comments` · `workflow_runs` · `branches` · `tags` ·
+  `labels`. Each ships a curated TYPED column set (ids/counts as int8, flags
+  as bool, times as timestamptz, labels as jsonb) **plus a `raw` jsonb column
+  with the whole API object** — nothing the API returned is lost, and the
+  schema is declared, not inferred. The issues endpoint's interleaved PRs are
+  filtered out (they live in `pull_requests`).
+- **Incremental**: `issues` and `issue_comments` (`cursor="updated_at"`) and
+  `commits` (`cursor="committed_at"`) sync incrementally — their APIs filter
+  server-side with `since=`. `mode="merge"` (Postgres dests) also carries
+  edits; entities without a server-side filter refuse incremental loudly.
+- **Auth**: `GITHUB_TOKEN`/`GH_TOKEN` — required for private repos **and for
+  `stargazers`** (its `starred_at` media type is auth-only), and lifts
+  the API rate limit from 60 requests/hour to 5,000 (a page is 100 rows, so
+  that's ~500k rows/hour of headroom).
+- **Destinations**: Postgres and ClickHouse.
 
 ## GCS destination (CSV & Parquet files)
 

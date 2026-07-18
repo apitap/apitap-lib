@@ -181,6 +181,9 @@ use it for rebuildable destinations.
       `.csv.gz` per table (atomic visibility) or a directory of ZSTD Parquet
       parts; streams through resumable uploads, so file size never bounds
       memory; reuses the BigQuery lane's proven transcoders)
+- [x] GitHub API → Postgres / ClickHouse (`github+api://owner/repo` — issues,
+      PRs, commits, stars, releases … as TYPED tables + a raw jsonb column;
+      incremental on the entities whose API filters server-side)
 - [ ] Postgres → Snowflake
 
 ## Development

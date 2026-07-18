@@ -16,6 +16,7 @@ use crate::sink::gcs::{GcsConn, GcsSink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
 use crate::source::github::GithubSource;
+use crate::source::github_api::GithubApiSource;
 use crate::source::gsheets::GsheetsSource;
 use crate::source::mysql::MySqlSource;
 use crate::source::postgres::PgSource;
@@ -67,6 +68,9 @@ const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, ta
 const TO_GCS: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
 const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1, table_pipe_cap: 1 };
 const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
+// Same single-stream shape for the API entities (pagination is serial; the
+// multi-table budget parallelizes ACROSS entities).
+const GH_API: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
 
 /// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
 fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
@@ -112,6 +116,13 @@ impl SrcScheme for GsFrom {
     type Src = GsheetsSource;
     async fn connect(url: &str, _pool: usize) -> Result<GsheetsSource> {
         GsheetsSource::connect(url).await
+    }
+}
+struct GhApiFrom;
+impl SrcScheme for GhApiFrom {
+    type Src = GithubApiSource;
+    async fn connect(url: &str, _pool: usize) -> Result<GithubApiSource> {
+        GithubApiSource::connect(url).await
     }
 }
 struct GhFrom;
@@ -334,6 +345,8 @@ routes! {
     "github"   -> "clickhouse" : GhFrom => ChTo, GITHUB,  pg_overlap = false;
     "github"   -> "mysql"      : GhFrom => MyTo, GITHUB,  pg_overlap = false;
     "postgres" -> "gcs"        : PgFrom => GcsTo, TO_GCS,  pg_overlap = false;
+    "github+api" -> "postgres"  : GhApiFrom => PgTo, GH_API, pg_overlap = false;
+    "github+api" -> "clickhouse": GhApiFrom => ChTo, GH_API, pg_overlap = false;
 }
 
 pub(crate) async fn single(
