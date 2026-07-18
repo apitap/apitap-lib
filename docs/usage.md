@@ -437,7 +437,8 @@ apitap.transfer("gsheets://<id>?credentials=…", dst, tables=["Sheet1", "Q3 dat
   belongs in the destination, where it can fail loudly per value. Blank cells
   land as `NULL`.
 - **Destinations**: Postgres and ClickHouse (all-text delivery over the binary
-  lanes). BigQuery is not wired for this source yet.
+  lanes) and MySQL (`LOAD DATA` text lane, `TEXT` columns). BigQuery is not
+  wired for this source yet.
 - **Modes**: `mode="replace"` only. Sheets carry no usable incremental cursor,
   so append/merge are refused loudly.
 - **Paging**: rows stream in 10k-row pages (override with

@@ -2,6 +2,7 @@
 //! COPY framing, ClickHouse RowBinary, Parquet for BigQuery load jobs.
 
 pub(crate) mod bqparquet;
+pub(crate) mod mytsv;
 pub(crate) mod pgcopy;
 pub(crate) mod pgtext;
 pub(crate) mod rowbinary;

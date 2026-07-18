@@ -297,6 +297,7 @@ routes! {
     "mysql"    -> "mysql"      : MyFrom => MyTo, MY_MY,   overlap = false;
     "gsheets"  -> "postgres"   : GsFrom => PgTo, GSHEETS, overlap = false;
     "gsheets"  -> "clickhouse" : GsFrom => ChTo, GSHEETS, overlap = false;
+    "gsheets"  -> "mysql"      : GsFrom => MyTo, GSHEETS, overlap = false;
 }
 
 pub(crate) async fn single(

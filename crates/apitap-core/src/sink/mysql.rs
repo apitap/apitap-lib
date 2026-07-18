@@ -20,7 +20,7 @@
 use crate::sink::Loader;
 use crate::dialect::mysql::{is_binary_udt, my_ident};
 use crate::error::{Error, Result};
-use crate::plan::{DestState, Lane, TablePlan, WireFormat};
+use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
 use bytes::Bytes;
 use futures::channel::mpsc;
@@ -210,6 +210,20 @@ impl MySqlSink {
     }
 }
 
+/// MySQL column type for a lane delivery when the source has no MySQL DDL to
+/// mirror (a non-MySQL source feeding this sink). Only the deliveries a wired
+/// route actually produces are mapped; anything new fails loudly here rather
+/// than guessing a lossy type.
+fn my_type_of(d: &Delivered, col: &str) -> Result<String> {
+    match d {
+        Delivered::Text => Ok("TEXT".to_string()),
+        other => Err(Error::Transfer(format!(
+            "mysql sink: no type mapping for column {col} delivered as {other:?} \
+             from a non-mysql source — open an issue"
+        ))),
+    }
+}
+
 impl crate::sink::Sink for MySqlSink {
     type Loader = MySqlLoader;
 
@@ -220,17 +234,20 @@ impl crate::sink::Sink for MySqlSink {
     async fn prepare(
         &mut self,
         plan: &TablePlan,
-        _lane: &Lane,
+        lane: &Lane,
         _durable: bool,
         _mode: Mode,
     ) -> Result<()> {
-        // Staging mirrors the source column types verbatim (same engine) so a swap
-        // yields a table identical to the source's, plus its primary key.
+        // Same-engine transfers mirror the source column types verbatim
+        // (`native_ddl`) so a swap yields a table identical to the source's;
+        // anything else maps the lane's deliveries — same rule as the Postgres
+        // sink.
         let mut ddl = Vec::new();
-        for c in &plan.cols {
-            let ty = c.native_ddl.as_deref().ok_or_else(|| {
-                Error::Transfer(format!("mysql sink: column {} has no source type", c.name))
-            })?;
+        for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
+            let ty = match (&c.native_ddl, plan.engine) {
+                (Some(native), "mysql") => native.clone(),
+                _ => my_type_of(&lc.delivered, &c.name)?,
+            };
             let null = if c.nullable { "NULL" } else { "NOT NULL" };
             ddl.push(format!("{} {ty} {null}", my_ident(&c.name)));
         }

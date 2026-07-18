@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::Source;
+use crate::wire::mytsv::tsv_escape;
 use crate::wire::pgcopy as pgc;
 use crate::wire::rowbinary::varint;
 use serde_json::Value;
@@ -245,10 +246,14 @@ impl Source for GsheetsSource {
     }
 
     fn can_produce(&self, _plan: &TablePlan, format: WireFormat) -> bool {
-        // All-text delivery: Postgres binary COPY and ClickHouse RowBinary both
-        // carry it exactly. (The TabSeparated lanes are per-database escape
-        // dialects — not produced here.)
-        matches!(format, WireFormat::PgCopyBinary | WireFormat::RowBinary)
+        // All-text delivery: Postgres binary COPY and ClickHouse RowBinary carry
+        // it exactly; TabSeparated is emitted in the MySQL `LOAD DATA` escape
+        // dialect ([`crate::wire::mytsv`]) for the MySQL sink — the binary-first
+        // sinks never negotiate down to it (their accepts() lists binary first).
+        matches!(
+            format,
+            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::TabSeparated
+        )
     }
 
     fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane {
@@ -291,10 +296,20 @@ impl Source for GsheetsSource {
             .expect("one span always yields one loader");
         let tab = stmts.into_iter().next().expect("one span statement");
         let ncols = plan.cols.len();
-        let pg = matches!(lane.format, WireFormat::PgCopyBinary);
+        #[derive(Clone, Copy, PartialEq)]
+        enum Enc {
+            Pg,
+            RowBin,
+            Tsv,
+        }
+        let enc = match lane.format {
+            WireFormat::PgCopyBinary => Enc::Pg,
+            WireFormat::RowBinary => Enc::RowBin,
+            WireFormat::TabSeparated => Enc::Tsv,
+        };
 
         let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
-        if pg {
+        if enc == Enc::Pg {
             pgc::header(&mut out);
         }
         let page_rows = fetch_rows();
@@ -311,27 +326,44 @@ impl Source for GsheetsSource {
             }
             let got = page.len();
             for row in &page {
-                if pg {
+                if enc == Enc::Pg {
                     pgc::tuple_start(ncols, &mut out);
                 }
                 for i in 0..ncols {
                     let cell = row.get(i).map(String::as_str).unwrap_or("");
-                    if pg {
-                        if cell.is_empty() {
-                            pgc::null_field(&mut out);
-                        } else {
-                            pgc::field(cell.as_bytes(), &mut out);
+                    match enc {
+                        Enc::Pg => {
+                            if cell.is_empty() {
+                                pgc::null_field(&mut out);
+                            } else {
+                                pgc::field(cell.as_bytes(), &mut out);
+                            }
                         }
-                    } else {
                         // RowBinary Nullable(String): null flag, then varint+bytes.
-                        if cell.is_empty() {
-                            out.push(1);
-                        } else {
-                            out.push(0);
-                            varint(cell.len() as u64, &mut out);
-                            out.extend_from_slice(cell.as_bytes());
+                        Enc::RowBin => {
+                            if cell.is_empty() {
+                                out.push(1);
+                            } else {
+                                out.push(0);
+                                varint(cell.len() as u64, &mut out);
+                                out.extend_from_slice(cell.as_bytes());
+                            }
+                        }
+                        // MySQL LOAD DATA line: \t between fields, \n after, \N NULLs.
+                        Enc::Tsv => {
+                            if i > 0 {
+                                out.push(b'\t');
+                            }
+                            if cell.is_empty() {
+                                out.extend_from_slice(b"\\N");
+                            } else {
+                                tsv_escape(cell.as_bytes(), &mut out);
+                            }
                         }
                     }
+                }
+                if enc == Enc::Tsv {
+                    out.push(b'\n');
                 }
                 rows_sent += 1;
                 if out.len() >= chunk {
@@ -344,7 +376,7 @@ impl Source for GsheetsSource {
             }
             start += got;
         }
-        if pg {
+        if enc == Enc::Pg {
             pgc::trailer(&mut out);
         }
         if !out.is_empty() {
