@@ -94,13 +94,11 @@ impl CsvPump {
             self.consumed += nin;
             match res {
                 csv_core::ReadRecordResult::Record => {
-                    // A fully-empty record (blank line) is separator noise, not
-                    // a row of NULLs — skip it, like every CSV reader does.
-                    if self.ends.len() == 1 && self.outlen == 0 {
-                        self.outlen = 0;
-                        self.ends.clear();
-                        continue;
-                    }
+                    // True blank lines never reach here — csv-core discards
+                    // them in its DFA. A `""` line DOES arrive as one empty
+                    // field and is delivered: it's the RFC-4180 spelling of a
+                    // single empty (= NULL) cell, and every other CSV reader
+                    // returns it too.
                     self.row_ready = true;
                     return Some(CsvRow {
                         out: &self.out[..self.outlen],
@@ -126,13 +124,8 @@ impl CsvPump {
     }
 }
 
-/// Header row out of a probe read (the first bytes of the object).
-pub(crate) fn header_fields(bytes: &[u8]) -> Result<Vec<String>> {
-    let mut pump = CsvPump::new();
-    pump.feed(bytes);
-    let row = pump.next_record(true).ok_or_else(|| {
-        Error::InvalidInput("csv object is empty — row 1 must hold the column names".into())
-    })?;
+/// A record's fields as UTF-8 strings (header parsing).
+pub(crate) fn row_strings(row: &CsvRow<'_>) -> Result<Vec<String>> {
     (0..row.len())
         .map(|i| {
             String::from_utf8(row.field(i).to_vec())
@@ -201,33 +194,25 @@ pub(crate) fn csv_tables(keys: &[(String, i64)], prefix: &str) -> Vec<(String, S
     out
 }
 
-/// Whole-schema runs land every stem on a destination table — a duplicate stem
-/// would silently overwrite, so it fails loudly here.
-pub(crate) fn ensure_unique_stems(tables: &[(String, String, i64)]) -> Result<()> {
-    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for (stem, key, _) in tables {
-        if let Some(other) = seen.insert(stem, key) {
-            return Err(Error::InvalidInput(format!(
-                "two objects share the table name '{stem}': '{other}' and '{key}' — \
-                 narrow the path so each stem is unique, or pick tables explicitly"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Match one requested table against the listing: a stem when unique, or the
-/// prefix-relative path (which is always unambiguous). Loud on both misses and
-/// ambiguity.
+/// prefix-relative path WITHOUT the `.csv` extension (always unambiguous).
+/// Loud on misses, on ambiguity, and on a `.csv`-suffixed request — the
+/// extension would leak into destination naming, where `.` means a schema
+/// qualifier.
 pub(crate) fn match_table<'a>(
     tables: &'a [(String, String, i64)],
     prefix: &str,
     want: &str,
     origin: &str,
 ) -> Result<&'a (String, String, i64)> {
+    if let Some(bare) = want.strip_suffix(".csv") {
+        return Err(Error::InvalidInput(format!(
+            "address tables without the .csv extension: use '{bare}'"
+        )));
+    }
     let hits: Vec<_> = tables
         .iter()
-        .filter(|(stem, key, _)| stem == want || key[prefix.len()..] == *want)
+        .filter(|(stem, key, _)| stem == want || rel_no_ext(key, prefix) == want)
         .collect();
     match hits.len() {
         1 => Ok(hits[0]),
@@ -241,13 +226,47 @@ pub(crate) fn match_table<'a>(
         ))),
         _ => Err(Error::InvalidInput(format!(
             "table name '{want}' is ambiguous under {origin}: {} — use the path \
-             relative to the url directory instead",
+             relative to the url directory instead (without .csv)",
             hits.iter()
                 .map(|(_, k, _)| k.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
     }
+}
+
+/// The prefix-relative path minus the `.csv` extension — the always-unique
+/// table address.
+pub(crate) fn rel_no_ext<'a>(key: &'a str, prefix: &str) -> &'a str {
+    let rel = key.strip_prefix(prefix).unwrap_or(key);
+    rel.strip_suffix(".csv").unwrap_or(rel)
+}
+
+/// The CANONICAL table name for one listing entry: the stem when it is unique
+/// in the listing, else the relative path without `.csv` (so two `full_data`
+/// files in different directories get distinct destination tables instead of
+/// blocking each other). A name containing '.' fails loudly — every database
+/// sink reads '.' as a schema qualifier, which would silently land
+/// `2026.01.csv` in a table named `01`.
+pub(crate) fn canonical_name(
+    tables: &[(String, String, i64)],
+    entry: &(String, String, i64),
+    prefix: &str,
+) -> Result<String> {
+    let (stem, key, _) = entry;
+    let unique = tables.iter().filter(|(s, _, _)| s == stem).count() == 1;
+    let name = if unique {
+        stem.clone()
+    } else {
+        rel_no_ext(key, prefix).to_string()
+    };
+    if name.contains('.') {
+        return Err(Error::InvalidInput(format!(
+            "table name '{name}' (from '{key}') contains '.', which database \
+             destinations read as a schema qualifier — rename the file"
+        )));
+    }
+    Ok(name)
 }
 
 /// The whole worker body for a CSV object: pump the byte stream through the
@@ -293,9 +312,10 @@ where
                 let n = row.len();
                 return Err(loader
                     .abort(Error::InvalidInput(format!(
-                        "'{label}' row {} has {n} fields but the header has {ncols} — \
-                         fix the file (short rows pad with NULLs; a long row is refused, \
-                         it would drop data)",
+                        "'{label}' record {} (header counted, blank lines not) has \
+                         {n} fields but the header has {ncols} — fix the file (short \
+                         rows pad with NULLs; a long row is refused, it would drop \
+                         data)",
                         rows_sent + 2,
                     )))
                     .await);
@@ -403,16 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn header_fields_reads_row_one() {
-        assert_eq!(
-            header_fields(b"id,\"the name\",note\n1,2,3\n").unwrap(),
-            vec!["id", "the name", "note"]
-        );
-        assert!(header_fields(b"").is_err());
+    fn quoted_empty_row_is_delivered_not_dropped() {
+        // "" is the RFC-4180 spelling of one empty (= NULL) cell; every other
+        // reader returns it — dropping it silently diverges row counts.
+        let r = rows(b"name\nalice\n\"\"\nbob\n");
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[2], vec![""]);
+        // A true blank line IS discarded (by csv-core itself).
+        assert_eq!(rows(b"name\nalice\n\nbob\n").len(), 3);
     }
 
     #[test]
-    fn csv_tables_stems_and_collisions() {
+    fn csv_tables_naming_and_addressing() {
         let keys = vec![
             ("data/users.csv".to_string(), 3200),
             ("data/2026/orders.csv".to_string(), 64),
@@ -422,9 +444,16 @@ mod tests {
         assert_eq!(t[0], ("users".into(), "data/users.csv".into(), 100));
         assert_eq!(t[1], ("orders".into(), "data/2026/orders.csv".into(), 2));
         assert_eq!(t.len(), 2);
+        // Unique stems keep the short name; the rel path also addresses them.
+        assert_eq!(canonical_name(&t, &t[1], "data/").unwrap(), "orders");
+        assert_eq!(
+            match_table(&t, "data/", "2026/orders", "x://").unwrap().1,
+            "data/2026/orders.csv"
+        );
 
-        // Duplicate stems: listed fine, refused for whole-schema runs, and
-        // resolvable one at a time via the relative path.
+        // Duplicate stems: each gets its rel path as the canonical name, both
+        // stay addressable, the bare stem is loudly ambiguous, and .csv-form
+        // addressing is redirected (the extension would poison dest naming).
         let dup = csv_tables(
             &[
                 ("a/users.csv".to_string(), 32),
@@ -433,19 +462,22 @@ mod tests {
             ],
             "",
         );
-        assert_eq!(dup.len(), 3);
-        assert!(ensure_unique_stems(&dup).unwrap_err().to_string().contains("users"));
-        assert_eq!(match_table(&dup, "", "main", "x://").unwrap().1, "main.csv");
+        assert_eq!(canonical_name(&dup, &dup[0], "").unwrap(), "a/users");
+        assert_eq!(canonical_name(&dup, &dup[2], "").unwrap(), "main");
+        assert_eq!(match_table(&dup, "", "b/users", "x://").unwrap().1, "b/users.csv");
         let amb = match_table(&dup, "", "users", "x://").unwrap_err().to_string();
         assert!(amb.contains("ambiguous") && amb.contains("a/users.csv"));
-        assert_eq!(
-            match_table(&dup, "", "b/users.csv", "x://").unwrap().1,
-            "b/users.csv"
-        );
+        let ext = match_table(&dup, "", "b/users.csv", "x://").unwrap_err().to_string();
+        assert!(ext.contains("without the .csv"));
         assert!(match_table(&dup, "", "nope", "x://")
             .unwrap_err()
             .to_string()
             .contains("not found"));
+
+        // Dotted stems would schema-split in the destinations — loud.
+        let dotted = csv_tables(&[("2026.01.csv".to_string(), 32)], "");
+        let err = canonical_name(&dotted, &dotted[0], "").unwrap_err().to_string();
+        assert!(err.contains("schema qualifier"));
     }
 
     #[test]

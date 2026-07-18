@@ -14,10 +14,10 @@ use crate::sink::bigquery::{BqConn, BqSink};
 use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
+use crate::source::github::GithubSource;
 use crate::source::gsheets::GsheetsSource;
 use crate::source::mysql::MySqlSource;
 use crate::source::postgres::PgSource;
-use crate::source::github::GithubSource;
 use crate::{MultiReport, TransferOptions, TransferReport};
 
 // Per-route pipe heuristics (all measured — see benchmarks/README.md):
@@ -56,13 +56,13 @@ fn github_parallel(cores: usize) -> usize {
 
 // Named per-route profiles — a route line references ONE of these instead of
 // restating the literal; a new route adds a line here.
-const PG_PG: Profile = Profile { auto_parallel: pg_pg_parallel, span_mult: 6 };
-const TO_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6 };
-const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6 };
-const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6 };
-const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6 };
-const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1 };
-const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1 };
+const PG_PG: Profile = Profile { auto_parallel: pg_pg_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+const TO_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1, table_pipe_cap: 1 };
+const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
 
 /// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
 fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
@@ -219,6 +219,10 @@ async fn one<S: SrcScheme, D: DstScheme>(
     let dest_table = opts.dest_table.as_deref().unwrap_or(table);
     let source_id = super::source_identity(src_url, table);
     let (chunk, parallel) = super::knobs(opts, &profile)?;
+    // One table can never use more pipes than the profile's per-table cap —
+    // clamping HERE also sizes the connection pools honestly for single-stream
+    // sources (a 1-pipe github read must not open a 33-connection pool).
+    let parallel = parallel.min(profile.table_pipe_cap).max(1);
     let cfg = SinkCfg { pg_overlap, ch_ddl, budget: parallel };
     let src = S::connect(src_url, parallel + 1).await?;
     let sink = D::connect(dst_url, dest_table, parallel, &cfg).await?;

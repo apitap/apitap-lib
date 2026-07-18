@@ -59,6 +59,37 @@ fn encode_segment(s: &str) -> String {
     out
 }
 
+/// Decode one percent-encoded path segment from the user's URL. A decoded '/'
+/// or NUL is refused — it would silently change which object is addressed.
+fn decode_component(s: &str) -> Result<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = b
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!("github url: invalid percent-escape in '{s}'"))
+                })?;
+            if hex == b'/' || hex == 0 {
+                return Err(Error::InvalidInput(format!(
+                    "github url: refusing encoded '/' or NUL in path segment '{s}'"
+                )));
+            }
+            out.push(hex);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|e| Error::InvalidInput(format!("github url path is not UTF-8: {e}")))
+}
+
 /// Encode a repo-relative path, keeping '/' between segments.
 fn encode_path(p: &str) -> String {
     p.split('/').map(encode_segment).collect::<Vec<_>>().join("/")
@@ -78,24 +109,40 @@ impl GithubSource {
                 )
             })?
             .to_string();
+        // Url::path() is percent-ENCODED — decode each segment once, or a
+        // directory with a space/unicode would be re-encoded into a literal
+        // '%20' lookup (and 404 with a misleading hint).
         let mut segs = u.path().trim_matches('/').splitn(2, '/');
-        let repo = segs
+        let repo = decode_component(segs.next().unwrap_or(""))?;
+        if repo.is_empty() {
+            return Err(Error::InvalidInput(
+                "github url needs a repo: github://<owner>/<repo>[/dir]?ref=main".into(),
+            ));
+        }
+        let mut prefix = segs
             .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::InvalidInput(
-                    "github url needs a repo: github://<owner>/<repo>[/dir]?ref=main".into(),
-                )
-            })?
-            .to_string();
-        let mut prefix = segs.next().unwrap_or("").to_string();
+            .unwrap_or("")
+            .split('/')
+            .map(decode_component)
+            .collect::<Result<Vec<_>>>()?
+            .join("/");
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
         let mut want_ref = None;
         for (k, v) in u.query_pairs() {
             match k.as_ref() {
-                "ref" => want_ref = Some(v.to_string()),
+                "ref" => {
+                    if v.is_empty() {
+                        return Err(Error::InvalidInput(
+                            "github url: ?ref= is empty — pass a branch, tag, or \
+                             commit SHA (or drop the parameter for the default \
+                             branch)"
+                                .into(),
+                        ));
+                    }
+                    want_ref = Some(v.to_string());
+                }
                 other => {
                     return Err(Error::InvalidInput(format!(
                         "unknown github url parameter '{other}' (supported: ref — auth \
@@ -133,12 +180,11 @@ impl GithubSource {
             .map_err(|e| Error::Transfer(format!("github {what}: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
-            let hint = if status.as_u16() == 404 && self.token.is_none() {
-                " (a private repo needs GITHUB_TOKEN)"
-            } else if status.as_u16() == 403 {
-                " (rate limited? set GITHUB_TOKEN to lift 60/h → 5,000/h)"
-            } else {
-                ""
+            let hint = match (status.as_u16(), self.token.is_some()) {
+                (404, false) => " (a private repo needs GITHUB_TOKEN)",
+                (403 | 429, false) => " (rate limited? set GITHUB_TOKEN to lift 60/h → 5,000/h)",
+                (403 | 429, true) => " (rate limited — authenticated limits reset hourly)",
+                _ => "",
             };
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Transfer(format!(
@@ -213,7 +259,12 @@ impl GithubSource {
                     .cloned()
                     .unwrap_or_default()
                     .iter()
-                    .filter(|e| e["type"].as_str() == Some("blob"))
+                    // mode 100644/100755 = regular files; 120000 symlinks would
+                    // otherwise list as tables and 404 on raw fetch.
+                    .filter(|e| {
+                        e["type"].as_str() == Some("blob")
+                            && e["mode"].as_str().is_some_and(|m| m.starts_with("100"))
+                    })
                     .filter_map(|e| {
                         let path = e["path"].as_str()?;
                         Some((
@@ -269,24 +320,40 @@ impl Source for GithubSource {
 
     async fn probe(&self, table: &str) -> Result<TablePlan> {
         let key = self.resolve(table).await?;
-        // Stream just enough for the header, then hang up — raw files can be
-        // huge and Range support is the CDN's business, not a contract.
+        // Stream until ONE COMPLETE header record parses, then hang up. EOF is
+        // only signalled at true end-of-stream — a fabricated EOF would let
+        // csv-core flush a truncated header as if it were real.
         let mut stream = self.raw(&key).await?.bytes_stream();
-        let mut head: Vec<u8> = Vec::with_capacity(PROBE_BYTES);
-        while head.len() < PROBE_BYTES {
-            match stream.next().await {
-                Some(Ok(b)) => head.extend_from_slice(&b),
-                Some(Err(e)) => return Err(Error::Transfer(format!("github probe '{key}': {e}"))),
-                None => break,
+        let mut pump = csvfile::CsvPump::new();
+        let mut fed = 0usize;
+        let headers: Vec<String> = loop {
+            if let Some(row) = pump.next_record(false) {
+                break csvfile::row_strings(&row)?;
             }
-        }
+            if fed > PROBE_BYTES {
+                return Err(Error::InvalidInput(format!(
+                    "'{key}': header row exceeds {PROBE_BYTES} bytes"
+                )));
+            }
+            match stream.next().await {
+                Some(Ok(b)) => {
+                    fed += b.len();
+                    pump.feed(&b);
+                }
+                Some(Err(e)) => {
+                    return Err(Error::Transfer(format!("github probe '{key}': {e}")))
+                }
+                None => match pump.next_record(true) {
+                    Some(row) => break csvfile::row_strings(&row)?,
+                    None => {
+                        return Err(Error::InvalidInput(format!(
+                            "'{key}' is empty — row 1 must hold the column names"
+                        )))
+                    }
+                },
+            }
+        };
         drop(stream);
-        if head.len() >= PROBE_BYTES && !head.contains(&b'\n') {
-            return Err(Error::InvalidInput(format!(
-                "'{key}': header row exceeds {PROBE_BYTES} bytes"
-            )));
-        }
-        let headers = csvfile::header_fields(&head[..head.len().min(PROBE_BYTES)])?;
         csvfile::text_plan("github", &key, &headers)
     }
 
@@ -300,26 +367,42 @@ impl Source for GithubSource {
             Some(ts) => {
                 let mut out = Vec::with_capacity(ts.len());
                 for t in ts {
-                    let (stem, _, est) =
-                        csvfile::match_table(&all, &self.prefix, t, &self.origin())?;
-                    out.push((stem.clone(), *est));
+                    let entry = csvfile::match_table(&all, &self.prefix, t, &self.origin())?;
+                    out.push((
+                        csvfile::canonical_name(&all, entry, &self.prefix)?,
+                        entry.2,
+                    ));
                 }
                 Ok(out)
             }
             None => {
-                // schema, for a repo, is an extra path filter under the URL's
-                // directory; "*" (or nothing) means every table. Every stem
-                // lands on a destination table, so duplicates fail loudly HERE
-                // — an unused collision never blocks a targeted transfer.
-                let sub = schema.filter(|s| !s.is_empty() && *s != "*");
-                let picked: Vec<_> = all
-                    .into_iter()
-                    .filter(|(_, key, _)| {
-                        sub.is_none_or(|s| key[self.prefix.len()..].starts_with(s))
-                    })
-                    .collect();
-                csvfile::ensure_unique_stems(&picked)?;
-                Ok(picked.into_iter().map(|(stem, _, est)| (stem, est)).collect())
+                // schema, for a repo, is an extra DIRECTORY filter under the
+                // URL's directory ("*" or nothing = every table), matched on a
+                // path-segment boundary: "2026" picks 2026/…, never
+                // 2026-backup/… . Duplicate stems don't collide — they get
+                // their relative path as the table name (canonical_name).
+                let sub = schema
+                    .filter(|s| !s.is_empty() && *s != "*")
+                    .map(|s| s.trim_end_matches('/'));
+                let mut out = Vec::new();
+                for entry in &all {
+                    let rel = &entry.1[self.prefix.len()..];
+                    let keep = match sub {
+                        None => true,
+                        Some(d) => {
+                            rel.len() > d.len()
+                                && rel.starts_with(d)
+                                && rel.as_bytes()[d.len()] == b'/'
+                        }
+                    };
+                    if keep {
+                        out.push((
+                            csvfile::canonical_name(&all, entry, &self.prefix)?,
+                            entry.2,
+                        ));
+                    }
+                }
+                Ok(out)
             }
         }
     }

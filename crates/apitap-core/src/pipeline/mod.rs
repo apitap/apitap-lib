@@ -111,6 +111,11 @@ pub(crate) struct Profile {
     pub auto_parallel: fn(usize) -> usize,
     /// Spans per pipe in the work queue. >1 = tail balancing; 1 = one span per pipe.
     pub span_mult: usize,
+    /// Most pipes ONE TABLE can use. Single-stream sources (a CSV file, a sheet
+    /// tab) set 1: a multi-table budget then bounds tables-in-flight instead of
+    /// letting one big file ask for the whole budget, convoy the fair semaphore
+    /// behind its dead ask, and stream alone anyway. `usize::MAX` = no cap.
+    pub table_pipe_cap: usize,
 }
 
 /// Resolve the knobs every route shares. An explicit `parallel` is never overridden;
@@ -250,13 +255,14 @@ const ROWS_PER_PIPE: i64 = 32 * 1024;
 /// How many pipes a table WANTS from the shared budget. Unknown sizes ask for
 /// everything (a never-analyzed big table throttled to one pipe is the worse
 /// failure mode); tiny tables ask for one and leave the rest to their siblings.
-fn desired_pipes(est_rows: i64, budget: usize) -> usize {
+fn desired_pipes(est_rows: i64, budget: usize, table_pipe_cap: usize) -> usize {
+    let cap = budget.min(table_pipe_cap).max(1);
     if est_rows < 0 {
-        budget
+        cap
     } else {
         usize::try_from(est_rows / ROWS_PER_PIPE)
-            .unwrap_or(budget)
-            .clamp(1, budget)
+            .unwrap_or(cap)
+            .clamp(1, cap)
     }
 }
 
@@ -365,7 +371,7 @@ where
             // Atomic ask (FIFO fair — a queued table wakes with ALL of it), refit
             // to the real span count inside run(). Permits release when the grant
             // drops — success, error, either way.
-            let desired = desired_pipes(job.est_rows, budget);
+            let desired = desired_pipes(job.est_rows, budget, profile.table_pipe_cap);
             let mut grant = Grant::acquire(sem, desired).await;
             let granted = grant.count;
 
@@ -439,14 +445,17 @@ mod tests {
     fn desired_pipes_sizes_the_ask() {
         // Unknown (-1) asks for the whole budget: a never-analyzed big table
         // throttled to one pipe is the worse failure mode.
-        assert_eq!(desired_pipes(-1, 8), 8);
+        assert_eq!(desired_pipes(-1, 8, usize::MAX), 8);
+        // single-stream cap: unknown/big sizes ask 1, never the whole budget
+        assert_eq!(desired_pipes(-1, 8, 1), 1);
+        assert_eq!(desired_pipes(i64::MAX, 8, 1), 1);
         // Tiny and empty tables ask for exactly one.
-        assert_eq!(desired_pipes(0, 8), 1);
-        assert_eq!(desired_pipes(100, 8), 1);
-        assert_eq!(desired_pipes(ROWS_PER_PIPE - 1, 8), 1);
+        assert_eq!(desired_pipes(0, 8, usize::MAX), 1);
+        assert_eq!(desired_pipes(100, 8, usize::MAX), 1);
+        assert_eq!(desired_pipes(ROWS_PER_PIPE - 1, 8, usize::MAX), 1);
         // Scales by ROWS_PER_PIPE, clamped to the budget.
-        assert_eq!(desired_pipes(ROWS_PER_PIPE * 3, 8), 3);
-        assert_eq!(desired_pipes(i64::MAX, 8), 8);
+        assert_eq!(desired_pipes(ROWS_PER_PIPE * 3, 8, usize::MAX), 3);
+        assert_eq!(desired_pipes(i64::MAX, 8, usize::MAX), 8);
     }
 
     #[tokio::test]

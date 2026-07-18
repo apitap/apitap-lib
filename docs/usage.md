@@ -461,9 +461,17 @@ apitap.transfer("github://owner/repo", dst, tables=["users", "2026/orders"])
 ```
 
 - **Model**: the repo (or one directory) is the database; every `.csv` under it
-  is a table, named by its file stem (`exports/2026/users.csv` → `users`; two
-  files sharing a stem fail loudly — narrow the directory). Row 1 is the header
-  row (blank headers become `col_N`, duplicates fail loudly).
+  is a table, named by its file stem (`exports/2026/users.csv` → `users`). Two
+  files sharing a stem each get their directory-relative path as the table name
+  instead (`archived/ecdc/full_data`, `archived/who/full_data`) — nothing
+  collides, nothing blocks. Address a table by stem or by that relative path,
+  always **without** `.csv` (the extension is refused — a `.` in a table name
+  reads as a schema qualifier downstream, which is also why a file stem
+  containing `.` fails loudly: rename the file). Row 1 is the header row
+  (blank headers become `col_N`, duplicates fail loudly).
+- **`schema=`** filters to one sub-directory (on a whole path segment:
+  `schema="2026"` picks `2026/…`, never `2026-backup/…`); `"*"` means every
+  table.
 - **Ref**: `?ref=` pins a branch, tag, or commit SHA; default is the repo's
   default branch. Pinning a SHA gives perfectly reproducible loads.
 - **Auth**: set `GITHUB_TOKEN` (or `GH_TOKEN`) for private repos; it also lifts
