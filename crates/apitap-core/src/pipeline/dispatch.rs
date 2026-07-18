@@ -1,12 +1,16 @@
-//! Route dispatch: the (source scheme, destination scheme) match that binds one
+//! Route dispatch: the (source scheme, destination scheme) table that binds one
 //! [`crate::source`] and one [`crate::sink`] onto the generic pipeline, plus the
 //! budget derivation (per-route CPU heuristics × the cgroup memory model).
 //!
-//! ADDING A ROUTE = implement the trait in `source/` or `sink/`, then add ONE
-//! arm to [`single`] and (if multi-table applies) [`multi`]. Nothing else moves.
+//! ADDING A ROUTE = one line in [`routes!`]. ADDING AN ENGINE = implement the
+//! trait in `source/` or `sink/`, add a ~5-line scheme adapter here, then add
+//! its route lines. Everything stays monomorphized: each table line instantiates
+//! `one::<S, D>` / `many::<S, D>` at compile time — no dynamic dispatch anywhere
+//! on the hot path, and per-route perf character lives in the [`Profile`] column.
 
 use super::Profile;
 use crate::error::{Error, Result};
+use crate::sink::bigquery::{BqConn, BqSink};
 use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
@@ -14,7 +18,6 @@ use crate::source::gsheets::GsheetsSource;
 use crate::source::mysql::MySqlSource;
 use crate::source::postgres::PgSource;
 use crate::{MultiReport, TransferOptions, TransferReport};
-
 
 // Per-route pipe heuristics (all measured — see benchmarks/README.md):
 // byte-relay pipes into a Postgres COPY are writer-bound (more pipes contend on the
@@ -40,24 +43,260 @@ fn my_my_parallel(cores: usize) -> usize {
 fn to_bq_parallel(cores: usize) -> usize {
     (cores * 2).clamp(2, 8)
 }
+// Google Sheets reads are one API stream; parallelism buys nothing.
+fn gsheets_parallel(_cores: usize) -> usize {
+    1
+}
 
-// Named per-route profiles — an arm references ONE of these instead of
+// Named per-route profiles — a route line references ONE of these instead of
 // restating the literal; a new route adds a line here.
 const PG_PG: Profile = Profile { auto_parallel: pg_pg_parallel, span_mult: 6 };
 const TO_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6 };
 const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6 };
 const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6 };
 const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6 };
-
-// Google Sheets reads are one API stream; parallelism buys nothing.
-fn gsheets_parallel(_cores: usize) -> usize {
-    1
-}
 const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1 };
+
+/// Collapse URL-scheme aliases so the route table matches one spelling per
+/// engine. Only the ROUTING string is normalized — the sink still parses the
+/// original URL (`clickhouse+https` keeps its TLS meaning there).
+fn norm(scheme: &str) -> &str {
+    match scheme {
+        "postgresql" => "postgres",
+        "clickhouse+https" => "clickhouse",
+        other => other,
+    }
+}
 
 /// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
 fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
     move |n| parallel.min(n).max(1)
+}
+
+/// Per-route sink configuration, one struct for every sink kind — each impl
+/// reads the fields it cares about and ignores the rest.
+#[derive(Clone)]
+struct SinkCfg {
+    /// Postgres only: overlap the encode with the COPY send. True for the raw
+    /// pg→pg relay; false where the feeder's per-row encode is CPU-heavy and
+    /// overlapping was measured slower (see `PgSink::overlap_send`).
+    pg_overlap: bool,
+    /// ClickHouse only: engine/order_by/on_cluster DDL options.
+    ch_ddl: ChDdl,
+    /// BigQuery only: the run's pipe budget (staging-table load fan-out).
+    budget: usize,
+}
+
+/// A source engine, keyed by URL scheme: how to open it with a given pool size.
+trait SrcScheme {
+    type Src: crate::source::Source;
+    async fn connect(url: &str, pool: usize) -> Result<Self::Src>;
+}
+
+struct PgFrom;
+impl SrcScheme for PgFrom {
+    type Src = PgSource;
+    async fn connect(url: &str, pool: usize) -> Result<PgSource> {
+        PgSource::connect(url, pool).await
+    }
+}
+struct MyFrom;
+impl SrcScheme for MyFrom {
+    type Src = MySqlSource;
+    async fn connect(url: &str, pool: usize) -> Result<MySqlSource> {
+        MySqlSource::connect(url, pool).await
+    }
+}
+struct GsFrom;
+impl SrcScheme for GsFrom {
+    type Src = GsheetsSource;
+    async fn connect(url: &str, _pool: usize) -> Result<GsheetsSource> {
+        GsheetsSource::connect(url).await
+    }
+}
+
+/// A destination engine, keyed by URL scheme. `connect` serves single-table
+/// runs; `shared` + `bind` serve multi-table runs (auth/pool once, then one
+/// cheap bind per table — a 200-table schema must not open 200 pools).
+trait DstScheme {
+    type Sink: crate::sink::Sink;
+    /// The once-per-run resource `bind` clones from (pool / HTTP client / token).
+    type Shared: Clone;
+    /// True where the sink drops schema qualifiers (`a.events` → `events`), so
+    /// multi-table pre-flight can refuse silent overwrites up front.
+    const BARE_DEST: bool;
+    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg)
+        -> Result<Self::Sink>;
+    async fn shared(url: &str, budget: usize, cfg: &SinkCfg) -> Result<Self::Shared>;
+    fn bind(shared: Self::Shared, table: &str, cfg: &SinkCfg) -> Result<Self::Sink>;
+}
+
+struct PgTo;
+impl DstScheme for PgTo {
+    type Sink = PgSink;
+    type Shared = sqlx::PgPool;
+    const BARE_DEST: bool = false;
+    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<PgSink> {
+        PgSink::connect(url, dest_table, parallel + 1, cfg.pg_overlap).await
+    }
+    async fn shared(url: &str, budget: usize, _cfg: &SinkCfg) -> Result<sqlx::PgPool> {
+        // +8 headroom over the budget: pipes take most connections, the extra
+        // covers the short-lived control work (probe/DDL/finalize) of tables
+        // waiting in flight.
+        PgSink::shared_pool(url, budget + 8).await
+    }
+    fn bind(shared: sqlx::PgPool, table: &str, cfg: &SinkCfg) -> Result<PgSink> {
+        Ok(PgSink::bind(shared, table, cfg.pg_overlap))
+    }
+}
+struct ChTo;
+impl DstScheme for ChTo {
+    type Sink = ChSink;
+    type Shared = ChConn;
+    const BARE_DEST: bool = true;
+    async fn connect(url: &str, dest_table: &str, _parallel: usize, cfg: &SinkCfg) -> Result<ChSink> {
+        ChSink::connect(url, dest_table, cfg.ch_ddl.clone())
+    }
+    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<ChConn> {
+        // Parse once: the reqwest client inside ChConn is shared by every table.
+        ChConn::parse(url)
+    }
+    fn bind(shared: ChConn, table: &str, cfg: &SinkCfg) -> Result<ChSink> {
+        ChSink::bind(shared, table, cfg.ch_ddl.clone())
+    }
+}
+struct MyTo;
+impl DstScheme for MyTo {
+    type Sink = MySqlSink;
+    type Shared = crate::sink::mysql::MySqlShared;
+    const BARE_DEST: bool = true;
+    async fn connect(url: &str, dest_table: &str, _parallel: usize, _cfg: &SinkCfg) -> Result<MySqlSink> {
+        MySqlSink::connect(url, dest_table).await
+    }
+    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<Self::Shared> {
+        MySqlSink::shared_pool(url)
+    }
+    fn bind(shared: Self::Shared, table: &str, _cfg: &SinkCfg) -> Result<MySqlSink> {
+        Ok(MySqlSink::bind(shared, table))
+    }
+}
+struct BqTo;
+impl DstScheme for BqTo {
+    type Sink = BqSink;
+    type Shared = BqConn;
+    const BARE_DEST: bool = true;
+    async fn connect(url: &str, dest_table: &str, parallel: usize, _cfg: &SinkCfg) -> Result<BqSink> {
+        BqSink::connect(url, dest_table, parallel).await
+    }
+    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<BqConn> {
+        // Authenticate once (JWT sign + OAuth round-trip live in parse) — a
+        // 200-table schema must not hit the token endpoint 200 times.
+        BqConn::parse(url).await
+    }
+    fn bind(shared: BqConn, table: &str, cfg: &SinkCfg) -> Result<BqSink> {
+        // BigQuery has no schema qualifiers — land `public.events` as `events`.
+        let bare = table.rsplit_once('.').map_or(table, |(_, b)| b);
+        BqSink::bind(shared, bare, cfg.budget)
+    }
+}
+
+/// One single-table transfer over a (source, destination) pair: resolve knobs,
+/// open both ends, hand off to the shared pipeline.
+#[allow(clippy::too_many_arguments)]
+async fn one<S: SrcScheme, D: DstScheme>(
+    profile: Profile,
+    pg_overlap: bool,
+    src_url: &str,
+    dst_url: &str,
+    table: &str,
+    opts: &TransferOptions,
+    ch_ddl: ChDdl,
+    started: std::time::Instant,
+) -> Result<TransferReport> {
+    let dest_table = opts.dest_table.as_deref().unwrap_or(table);
+    let source_id = super::source_identity(src_url, table);
+    let (chunk, parallel) = super::knobs(opts, &profile)?;
+    let cfg = SinkCfg { pg_overlap, ch_ddl, budget: parallel };
+    let src = S::connect(src_url, parallel + 1).await?;
+    let sink = D::connect(dst_url, dest_table, parallel, &cfg).await?;
+    super::run(
+        &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
+    )
+    .await
+}
+
+/// One multi-table run: budget once, source pool once, sink resources once —
+/// then every table runs the unchanged single-table lifecycle inside the
+/// shared budget.
+async fn many<S: SrcScheme, D: DstScheme>(
+    profile: Profile,
+    pg_overlap: bool,
+    src_url: &str,
+    dst_url: &str,
+    sel: TableSel<'_>,
+    opts: &TransferOptions,
+    ch_ddl: ChDdl,
+) -> Result<(usize, Vec<crate::TableResult>)> {
+    let (chunk, budget) = super::knobs(opts, &profile)?;
+    let cfg = SinkCfg { pg_overlap, ch_ddl, budget };
+    let src = S::connect(src_url, budget + 8).await?;
+    let jobs = jobs_for(&src, &sel, D::BARE_DEST).await?;
+    let shared = D::shared(dst_url, budget, &cfg).await?;
+    let mk = |t: String| {
+        let (shared, cfg) = (shared.clone(), cfg.clone());
+        async move { D::bind(shared, &t, &cfg) }
+    };
+    let r = super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
+    Ok((budget, r))
+}
+
+/// THE route table. One line per supported pair: source adapter, destination
+/// adapter, profile, and the pg-overlap flag. The macro expands it into the
+/// single-table match, the multi-table match, and the "supported:" list in the
+/// unsupported-route error — the three can never drift apart.
+macro_rules! routes {
+    ($( $sname:literal -> $dname:literal : $S:ty => $D:ty, $prof:expr, overlap = $ov:expr );+ $(;)?) => {
+        #[allow(clippy::too_many_arguments)]
+        async fn route_single(
+            s: &str, d: &str,
+            src_url: &str, dst_url: &str, table: &str,
+            opts: &TransferOptions, ch_ddl: ChDdl, started: std::time::Instant,
+        ) -> Result<TransferReport> {
+            match (s, d) {
+                $( ($sname, $dname) =>
+                    one::<$S, $D>($prof, $ov, src_url, dst_url, table, opts, ch_ddl, started).await, )+
+                (s, d) => Err(unsupported(s, d)),
+            }
+        }
+        async fn route_multi(
+            s: &str, d: &str,
+            src_url: &str, dst_url: &str, sel: TableSel<'_>,
+            opts: &TransferOptions, ch_ddl: ChDdl,
+        ) -> Result<(usize, Vec<crate::TableResult>)> {
+            match (s, d) {
+                $( ($sname, $dname) =>
+                    many::<$S, $D>($prof, $ov, src_url, dst_url, sel, opts, ch_ddl).await, )+
+                (s, d) => Err(unsupported(s, d)),
+            }
+        }
+        fn unsupported(s: &str, d: &str) -> Error {
+            Error::InvalidInput(format!(
+                "unsupported route {s}:// → {d}:// (supported: {})",
+                [ $( concat!($sname, "→", $dname) ),+ ].join(", "),
+            ))
+        }
+    };
+}
+
+routes! {
+    "postgres" -> "postgres"   : PgFrom => PgTo, PG_PG,   overlap = true;
+    "postgres" -> "clickhouse" : PgFrom => ChTo, TO_CH,   overlap = false;
+    "postgres" -> "bigquery"   : PgFrom => BqTo, TO_BQ,   overlap = false;
+    "mysql"    -> "clickhouse" : MyFrom => ChTo, TO_CH,   overlap = false;
+    "mysql"    -> "postgres"   : MyFrom => PgTo, MY_PG,   overlap = false;
+    "mysql"    -> "mysql"      : MyFrom => MyTo, MY_MY,   overlap = false;
+    "gsheets"  -> "postgres"   : GsFrom => PgTo, GSHEETS, overlap = false;
+    "gsheets"  -> "clickhouse" : GsFrom => ChTo, GSHEETS, overlap = false;
 }
 
 pub(crate) async fn single(
@@ -66,108 +305,14 @@ pub(crate) async fn single(
     table: &str,
     opts: &TransferOptions,
 ) -> Result<TransferReport> {
-
     let started = std::time::Instant::now();
-    let src_scheme = src_url.split("://").next().unwrap_or("");
-    let dst_scheme = dst_url.split("://").next().unwrap_or("");
-    let dest_table = opts.dest_table.as_deref().unwrap_or(table);
-    let source_id = super::source_identity(src_url, table);
-    let ch_ddl = ChDdl::from_opts(
-        opts,
-        matches!(dst_scheme, "clickhouse" | "clickhouse+https"),
-    )?;
-
-    match (src_scheme, dst_scheme) {
-        ("postgres" | "postgresql", "postgres" | "postgresql") => {
-            let profile = PG_PG;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = PgSource::connect(src_url, parallel + 1).await?;
-            let sink = PgSink::connect(dst_url, dest_table, parallel + 1, true).await?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
-            )
-            .await
-        }
-        ("postgres" | "postgresql", "clickhouse" | "clickhouse+https") => {
-            let profile = TO_CH;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = PgSource::connect(src_url, parallel + 1).await?;
-            let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
-            )
-            .await
-        }
-        ("postgres" | "postgresql", "bigquery") => {
-            let profile = TO_BQ;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = PgSource::connect(src_url, parallel + 1).await?;
-            let sink = crate::sink::bigquery::BqSink::connect(dst_url, dest_table, parallel).await?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
-            )
-            .await
-        }
-        ("mysql", "clickhouse" | "clickhouse+https") => {
-            let profile = TO_CH;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = MySqlSource::connect(src_url, parallel + 1).await?;
-            let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
-            )
-            .await
-        }
-        ("mysql", "mysql") => {
-            let profile = MY_MY;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = MySqlSource::connect(src_url, parallel + 1).await?;
-            let sink = crate::sink::mysql::MySqlSink::connect(dst_url, dest_table).await?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
-            )
-            .await
-        }
-        ("mysql", "postgres" | "postgresql") => {
-            let profile = MY_PG;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = MySqlSource::connect(src_url, parallel + 1).await?;
-            // Serial sends: this feeder's per-row encode is CPU-heavy and overlapping
-            // it with the send was measured slower (see PgSink::overlap_send).
-            let sink = PgSink::connect(dst_url, dest_table, parallel + 1, false).await?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
-            )
-            .await
-        }
-        ("gsheets", "postgres" | "postgresql") => {
-            let profile = GSHEETS;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = GsheetsSource::connect(src_url).await?;
-            let sink = PgSink::connect(dst_url, dest_table, parallel + 1, false).await?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started,
-                &source_id,
-            )
-            .await
-        }
-        ("gsheets", "clickhouse" | "clickhouse+https") => {
-            let profile = GSHEETS;
-            let (chunk, parallel) = super::knobs(opts, &profile)?;
-            let src = GsheetsSource::connect(src_url).await?;
-            let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
-            super::run(
-                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started,
-                &source_id,
-            )
-            .await
-        }
-        (s, d) => Err(Error::InvalidInput(format!(
-            "unsupported route {s}:// → {d}:// (supported: postgres→postgres, \
-             postgres→clickhouse, postgres→bigquery, mysql→clickhouse, \
-             mysql→postgres, mysql→mysql, gsheets→postgres, gsheets→clickhouse)"
-        ))),
-    }
+    let src_scheme = norm(src_url.split("://").next().unwrap_or(""));
+    let dst_scheme = norm(dst_url.split("://").next().unwrap_or(""));
+    let ch_ddl = ChDdl::from_opts(opts, dst_scheme == "clickhouse")?;
+    route_single(
+        src_scheme, dst_scheme, src_url, dst_url, table, opts, ch_ddl, started,
+    )
+    .await
 }
 
 /// Which tables a multi-table run moves.
@@ -178,7 +323,6 @@ pub(crate) enum TableSel<'a> {
     /// URL's database; Postgres has no such default and requires the name.
     Schema(Option<&'a str>),
 }
-
 
 async fn jobs_for<S: crate::source::Source>(
     src: &S,
@@ -248,10 +392,9 @@ pub(crate) async fn multi(
     sel: TableSel<'_>,
     opts: &TransferOptions,
 ) -> Result<MultiReport> {
-
     let started = std::time::Instant::now();
-    let src_scheme = src_url.split("://").next().unwrap_or("");
-    let dst_scheme = dst_url.split("://").next().unwrap_or("");
+    let src_scheme = norm(src_url.split("://").next().unwrap_or(""));
+    let dst_scheme = norm(dst_url.split("://").next().unwrap_or(""));
     if opts.dest_table.is_some() {
         return Err(Error::InvalidInput(
             "dest_table applies to single-table transfers — multi-table runs keep \
@@ -259,146 +402,11 @@ pub(crate) async fn multi(
                 .into(),
         ));
     }
-    let ch_ddl = ChDdl::from_opts(
-        opts,
-        matches!(dst_scheme, "clickhouse" | "clickhouse+https"),
-    )?;
-
-    // Each arm: budget once, source pool once, sink resources once — then every
-    // table runs the unchanged single-table lifecycle inside the shared budget.
-    // Pools get a little headroom over the budget: pipes take most connections,
-    // the +8 covers the short-lived control work (probe/DDL/finalize) of tables
-    // waiting in flight.
-    let (budget, results) = match (src_scheme, dst_scheme) {
-        ("postgres" | "postgresql", "postgres" | "postgresql") => {
-            let profile = PG_PG;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = PgSource::connect(src_url, budget + 8).await?;
-            let jobs = jobs_for(&src, &sel, false).await?;
-            let pool = PgSink::shared_pool(dst_url, budget + 8).await?;
-            let mk = |t: String| {
-                let pool = pool.clone();
-                async move { Ok(PgSink::bind(pool, &t, true)) }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        ("postgres" | "postgresql", "clickhouse" | "clickhouse+https") => {
-            let profile = TO_CH;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = PgSource::connect(src_url, budget + 8).await?;
-            let jobs = jobs_for(&src, &sel, true).await?;
-            // Parse once: the reqwest client inside ChConn is shared by every table.
-            let ch = crate::sink::clickhouse::ChConn::parse(dst_url)?;
-            let mk = |t: String| {
-                let (ch, ddl) = (ch.clone(), ch_ddl.clone());
-                async move { ChSink::bind(ch, &t, ddl) }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        ("postgres" | "postgresql", "bigquery") => {
-            let profile = TO_BQ;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = PgSource::connect(src_url, budget + 8).await?;
-            let jobs = jobs_for(&src, &sel, true).await?;
-            // Authenticate once (JWT sign + OAuth round-trip live in parse) — a
-            // 200-table schema must not hit the token endpoint 200 times.
-            let bq = crate::sink::bigquery::BqConn::parse(dst_url).await?;
-            let mk = |t: String| {
-                let bq = bq.clone();
-                async move {
-                    // BigQuery has no schema qualifiers — land `public.events` as `events`.
-                    let bare = t.rsplit_once('.').map_or(t.as_str(), |(_, b)| b);
-                    crate::sink::bigquery::BqSink::bind(bq, bare, budget)
-                }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        ("mysql", "clickhouse" | "clickhouse+https") => {
-            let profile = TO_CH;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = MySqlSource::connect(src_url, budget + 8).await?;
-            let jobs = jobs_for(&src, &sel, true).await?;
-            // Parse once: the reqwest client inside ChConn is shared by every table.
-            let ch = crate::sink::clickhouse::ChConn::parse(dst_url)?;
-            let mk = |t: String| {
-                let (ch, ddl) = (ch.clone(), ch_ddl.clone());
-                async move { ChSink::bind(ch, &t, ddl) }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        ("mysql", "mysql") => {
-            let profile = MY_MY;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = MySqlSource::connect(src_url, budget + 8).await?;
-            let jobs = jobs_for(&src, &sel, true).await?;
-            let shared = MySqlSink::shared_pool(dst_url)?;
-            let mk = |t: String| {
-                let shared = shared.clone();
-                async move { Ok(MySqlSink::bind(shared, &t)) }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        ("mysql", "postgres" | "postgresql") => {
-            let profile = MY_PG;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = MySqlSource::connect(src_url, budget + 8).await?;
-            let jobs = jobs_for(&src, &sel, false).await?;
-            let pool = PgSink::shared_pool(dst_url, budget + 8).await?;
-            // overlap_send=false: same reasoning as the single-table arm.
-            let mk = |t: String| {
-                let pool = pool.clone();
-                async move { Ok(PgSink::bind(pool, &t, false)) }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        ("gsheets", "postgres" | "postgresql") => {
-            let profile = GSHEETS;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = GsheetsSource::connect(src_url).await?;
-            let jobs = jobs_for(&src, &sel, false).await?;
-            let pool = PgSink::shared_pool(dst_url, budget + 8).await?;
-            let mk = |t: String| {
-                let pool = pool.clone();
-                async move { Ok(PgSink::bind(pool, &t, false)) }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        ("gsheets", "clickhouse" | "clickhouse+https") => {
-            let profile = GSHEETS;
-            let (chunk, budget) = super::knobs(opts, &profile)?;
-            let src = GsheetsSource::connect(src_url).await?;
-            let jobs = jobs_for(&src, &sel, true).await?;
-            let ch = ChConn::parse(dst_url)?;
-            let mk = |t: String| {
-                let (ch, ddl) = (ch.clone(), ch_ddl.clone());
-                async move { ChSink::bind(ch, &t, ddl) }
-            };
-            let r =
-                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
-            (budget, r)
-        }
-        (s, d) => {
-            return Err(Error::InvalidInput(format!(
-                "unsupported route {s}:// → {d}:// (supported: postgres→postgres, \
-                 postgres→clickhouse, postgres→bigquery, mysql→clickhouse, \
-                 mysql→postgres, mysql→mysql, gsheets→postgres, gsheets→clickhouse)"
-            )))
-        }
-    };
+    let ch_ddl = ChDdl::from_opts(opts, dst_scheme == "clickhouse")?;
+    let (budget, results) = route_multi(
+        src_scheme, dst_scheme, src_url, dst_url, sel, opts, ch_ddl,
+    )
+    .await?;
 
     Ok(MultiReport {
         rows: results
@@ -463,6 +471,23 @@ mod tests {
 
     fn names(src: Vec<(&'static str, i64)>) -> FakeCatalog {
         FakeCatalog(src)
+    }
+
+    #[test]
+    fn scheme_aliases_normalize_and_unknowns_pass_through() {
+        assert_eq!(norm("postgresql"), "postgres");
+        assert_eq!(norm("clickhouse+https"), "clickhouse");
+        assert_eq!(norm("gsheets"), "gsheets");
+        assert_eq!(norm("sqlite"), "sqlite");
+    }
+
+    #[test]
+    fn unsupported_error_lists_the_route_table() {
+        let msg = unsupported("sqlite", "postgres").to_string();
+        assert!(msg.contains("sqlite:// → postgres://"));
+        // Generated from the SAME table as the match — spot-check both ends.
+        assert!(msg.contains("postgres→postgres"));
+        assert!(msg.contains("gsheets→clickhouse"));
     }
 
     #[tokio::test]

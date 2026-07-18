@@ -272,7 +272,6 @@ impl Write for SharedBuf {
 // ============================================================================
 
 pub(crate) struct ParquetEncoder {
-    names: Vec<String>,
     delivered: Vec<Delivered>,
     schema: Arc<Type>,
     props: Arc<WriterProperties>,
@@ -319,7 +318,6 @@ impl ParquetEncoder {
         let cols = delivered.iter().map(ColBuf::new).collect();
         let defs = vec![Vec::new(); delivered.len()];
         let mut enc = Self {
-            names,
             delivered,
             schema,
             props,
