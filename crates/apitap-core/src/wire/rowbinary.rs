@@ -207,6 +207,12 @@ fn try_tuple_at(
             out.push(1); // Nullable(T): null flag, no value
             continue;
         }
+        if len < 0 {
+            out.truncate(out_start);
+            return Err(Error::Transfer(format!(
+                "pg binary COPY: negative field length {len}"
+            )));
+        }
         let len = len as usize;
         if b.len() < off + len {
             out.truncate(out_start);
@@ -427,6 +433,17 @@ mod tests {
         t.push(&push2, &mut out).unwrap();
         assert!(t.finished());
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn corrupt_negative_field_length_errors_not_panics() {
+        let mut input = b"PGCOPY\n\xff\r\n\0".to_vec();
+        input.extend(0u32.to_be_bytes());
+        input.extend(0u32.to_be_bytes());
+        input.extend(1i16.to_be_bytes());
+        input.extend((-2i32).to_be_bytes()); // hostile length
+        let mut t = Transcoder::new(vec![(RbType::Swap(4), false)]);
+        assert!(t.push(&input, &mut Vec::new()).is_err());
     }
 
     #[test]

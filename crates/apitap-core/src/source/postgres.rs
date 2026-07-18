@@ -1,7 +1,7 @@
 //! Postgres connector: [`PgSource`] (raw `COPY … TO STDOUT` byte streams) and
 //! [`PgSink`] (`COPY … FROM STDIN (FORMAT binary)` with staging + atomic swap).
 //!
-//! The source never decodes rows. It produces three wire formats:
+//! The source never decodes rows. It produces four wire formats:
 //!
 //! - **PgCopyBinary** — the raw binary COPY stream relayed byte-for-byte (exactly what
 //!   `psql src | psql dst` would move, minus the shell). Per-span framing (header /
@@ -15,12 +15,17 @@
 //!   escapes; corner case: a literal vertical tab escapes as `\v`, which ClickHouse
 //!   doesn't unescape — checksum validation would catch it). This is the fallback for
 //!   tables with a column the binary transcoder doesn't cover.
+//! - **MyTsv** — the binary COPY stream rendered in-flight into MySQL's
+//!   `LOAD DATA` text dialect by [`crate::wire::pgmytsv::PgToMyTsv`] (offset-free
+//!   UTC datetimes, `1`/`0` booleans, HEX bytea) — relaying Postgres TEXT COPY
+//!   would be wrong here, the escape dialects differ (`\v`, `\b`, `\f`).
 
 use super::{pop, spans, WorkQueue};
 use crate::sink::Loader;
 use crate::source::Source;
 use crate::error::{Error, Result};
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
+use crate::wire::pgmytsv::{my_tsv_type, MyType, PgToMyTsv};
 use crate::wire::rowbinary::{rb_type, RbType, Transcoder};
 use futures::TryStreamExt;
 use sqlx::postgres::{PgPoolCopyExt, PgPoolOptions};
@@ -158,7 +163,7 @@ impl Source for PgSource {
                     CASE WHEN t.typname = 'numeric' AND a.atttypmod >= 4 \
                          THEN (((a.atttypmod - 4) >> 16) & 65535) END AS p, \
                     CASE WHEN t.typname = 'numeric' AND a.atttypmod >= 4 \
-                         THEN ((a.atttypmod - 4) & 65535) END AS s \
+                         THEN ((((a.atttypmod - 4) & 2047) # 1024) - 1024) END AS s \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
              WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
@@ -223,9 +228,12 @@ impl Source for PgSource {
         match format {
             // Raw passthrough and text relay carry ANY column type.
             WireFormat::PgCopyBinary | WireFormat::TabSeparated => true,
-            // The MySQL LOAD DATA dialect is not rendered here (yet) — see the
-            // NOT_YET entry for postgres → mysql in dispatch.
-            WireFormat::MyTsv => false,
+            // Rendered from the binary stream; needs every column covered
+            // (arrays, interval, NUMERIC past MySQL's DECIMAL(65) can't ride).
+            WireFormat::MyTsv => plan
+                .cols
+                .iter()
+                .all(|c| my_tsv_type(&c.udt, c.precision, c.scale).is_some()),
             // Binary transcoding needs every column covered (e.g. NUMERIC p>38 would
             // be Decimal256, which the transcoder doesn't emit → text fallback).
             WireFormat::RowBinary => plan
@@ -233,6 +241,24 @@ impl Source for PgSource {
                 .iter()
                 .all(|c| rb_type(&c.udt, c.precision, c.scale).is_some()),
         }
+    }
+
+    fn uncovered_cols(&self, plan: &TablePlan, format: WireFormat) -> Vec<(String, String)> {
+        let miss = |covered: bool, c: &ColumnPlan| {
+            (!covered).then(|| (c.name.clone(), c.udt.clone()))
+        };
+        plan.cols
+            .iter()
+            .filter_map(|c| match format {
+                WireFormat::MyTsv => {
+                    miss(my_tsv_type(&c.udt, c.precision, c.scale).is_some(), c)
+                }
+                WireFormat::RowBinary => {
+                    miss(rb_type(&c.udt, c.precision, c.scale).is_some(), c)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane {
@@ -252,10 +278,15 @@ impl Source for PgSource {
                         delivered: delivered_of_udt(c),
                         select: pq,
                     },
+                    // Rendered from the binary stream — raw columns, no casts; the
+                    // delivery drives the MySQL sink's DDL (my_type_of).
+                    WireFormat::MyTsv => LaneCol {
+                        delivered: delivered_of_udt(c),
+                        select: pq,
+                    },
                     // Text casts anything whose CSV/TSV form the destination wouldn't
                     // parse natively; the rule is "let each database do what it's good
                     // at" — Postgres casts, this process never touches a row.
-                    WireFormat::MyTsv => unreachable!("can_produce refuses MyTsv for the Postgres source"),
                     WireFormat::TabSeparated => match c.udt.as_str() {
                         // Postgres text booleans are t/f — cast to 0/1.
                         "bool" => LaneCol {
@@ -304,8 +335,9 @@ impl Source for PgSource {
             .join(", ");
         let copy_opts = match lane.format {
             WireFormat::TabSeparated => "FORMAT text",
-            WireFormat::PgCopyBinary | WireFormat::RowBinary => "FORMAT binary",
-            WireFormat::MyTsv => unreachable!("can_produce refuses MyTsv for the Postgres source"),
+            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::MyTsv => {
+                "FORMAT binary"
+            }
         };
         // Incremental predicate — appended to EVERY statement in this fn, including
         // the min/max probe and the ctid fallback.
@@ -409,7 +441,18 @@ impl Source for PgSource {
                         .collect(),
                 ),
                 WireFormat::TabSeparated => PgReadMode::Text,
-                WireFormat::MyTsv => unreachable!("can_produce refuses MyTsv for the Postgres source"),
+                WireFormat::MyTsv => PgReadMode::MyTsv(
+                    plan.cols
+                        .iter()
+                        .map(|c| {
+                            // can_produce(MyTsv) already proved coverage.
+                            (
+                                my_tsv_type(&c.udt, c.precision, c.scale).unwrap(),
+                                c.name.clone(),
+                            )
+                        })
+                        .collect(),
+                ),
             };
             tasks.push(tokio::spawn(copy_out_worker(
                 self.pool.clone(),
@@ -463,6 +506,7 @@ fn delivered_of_udt(c: &ColumnPlan) -> Delivered {
         "timestamp" => Delivered::DateTime { utc: false },
         "timestamptz" => Delivered::DateTime { utc: true },
         "uuid" => Delivered::Uuid,
+        "bytea" => Delivered::Bytes,
         "json" | "jsonb" => Delivered::Json,
         "varchar" | "bpchar" | "text" | "name" => Delivered::Text,
         _ => Delivered::Text,
@@ -478,8 +522,40 @@ enum PgReadMode {
     FrameStrip,
     /// Binary → RowBinary, fresh [`Transcoder`] per span (it consumes the framing).
     Transcode(Vec<(RbType, bool)>),
+    /// Binary → MySQL `LOAD DATA` TSV, fresh [`PgToMyTsv`] per span.
+    MyTsv(Vec<(MyType, String)>),
     /// Text relay — rows of one text format concatenate cleanly.
     Text,
+}
+
+/// Per-span stream state for one COPY statement.
+enum SpanState {
+    Strip(SpanStrip),
+    Rb(Transcoder),
+    My(PgToMyTsv),
+    Raw,
+}
+
+impl SpanState {
+    fn push(&mut self, piece: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            SpanState::Strip(s) => s.push(piece, out),
+            SpanState::Rb(t) => t.push(piece, out),
+            SpanState::My(t) => t.push(piece, out),
+            SpanState::Raw => {
+                out.extend_from_slice(piece);
+                Ok(())
+            }
+        }
+    }
+    fn finished(&self) -> bool {
+        match self {
+            SpanState::Strip(s) => s.finished(),
+            SpanState::Rb(t) => t.finished(),
+            SpanState::My(t) => t.finished(),
+            SpanState::Raw => true,
+        }
+    }
 }
 
 /// One worker: keeps ONE sink stream open and feeds it the byte streams of successive
@@ -508,13 +584,11 @@ async fn copy_out_worker<L: Loader>(
                     .await)
             }
         };
-        let mut transcoder = match &mode {
-            PgReadMode::Transcode(cols) => Some(Transcoder::new(cols.clone())),
-            _ => None,
-        };
-        let mut strip = match &mode {
-            PgReadMode::FrameStrip => Some(SpanStrip::new()),
-            _ => None,
+        let mut state = match &mode {
+            PgReadMode::Transcode(cols) => SpanState::Rb(Transcoder::new(cols.clone())),
+            PgReadMode::MyTsv(cols) => SpanState::My(PgToMyTsv::new(cols.clone())),
+            PgReadMode::FrameStrip => SpanState::Strip(SpanStrip::new()),
+            PgReadMode::Text => SpanState::Raw,
         };
         loop {
             let piece = match stream.try_next().await {
@@ -522,15 +596,7 @@ async fn copy_out_worker<L: Loader>(
                 Ok(None) => break,
                 Err(e) => return Err(loader.abort(Error::Transfer(format!("pg read: {e}"))).await),
             };
-            let step = match (&mut transcoder, &mut strip) {
-                (Some(t), _) => t.push(&piece, &mut out),
-                (_, Some(s)) => s.push(&piece, &mut out),
-                _ => {
-                    out.extend_from_slice(&piece);
-                    Ok(())
-                }
-            };
-            if let Err(e) = step {
+            if let Err(e) = state.push(&piece, &mut out) {
                 return Err(loader.abort(e).await);
             }
             // mem::replace (not take): take leaves capacity 0 and the next chunk pays
@@ -540,12 +606,7 @@ async fn copy_out_worker<L: Loader>(
                 loader.send(full).await?;
             }
         }
-        let complete = match (&transcoder, &strip) {
-            (Some(t), _) => t.finished(),
-            (_, Some(s)) => s.finished(),
-            _ => true,
-        };
-        if !complete {
+        if !state.finished() {
             return Err(loader
                 .abort(Error::Transfer("pg binary COPY ended mid-stream".into()))
                 .await);

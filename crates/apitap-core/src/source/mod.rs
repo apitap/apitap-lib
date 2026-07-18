@@ -39,6 +39,12 @@ pub(crate) trait Source: Sized + Send + Sync {
     /// Can this source produce `format` for this plan? (e.g. Postgres → RowBinary only
     /// when every column has a binary transcoding.)
     fn can_produce(&self, plan: &TablePlan, format: WireFormat) -> bool;
+    /// The columns that keep `can_produce(format)` false, as `(name, udt)` — the
+    /// negotiation error names them so the user knows exactly what to cast.
+    /// Default empty (sources whose refusals aren't per-column).
+    fn uncovered_cols(&self, _plan: &TablePlan, _format: WireFormat) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// Per-column delivery + SELECT expressions for a producible format.
     fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane;
     /// Read statements covering the table: cursor ranges, then any source-specific

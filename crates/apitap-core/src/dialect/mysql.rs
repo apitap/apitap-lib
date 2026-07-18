@@ -16,6 +16,9 @@ pub(crate) fn is_binary_udt(udt: &str) -> bool {
             | "varbinary"
             | "bit"
             | "geometry"
+            // Postgres vocabulary — a postgres → mysql plan flows through the
+            // same LOAD DATA column list and arrives HEX-encoded too.
+            | "bytea"
     )
 }
 

@@ -334,6 +334,7 @@ macro_rules! routes {
 routes! {
     "postgres" -> "postgres"   : PgFrom => PgTo, PG_PG,   pg_overlap = true;
     "postgres" -> "clickhouse" : PgFrom => ChTo, TO_CH,   pg_overlap = false;
+    "postgres" -> "mysql"      : PgFrom => MyTo, MY_MY,   pg_overlap = false;
     "postgres" -> "bigquery"   : PgFrom => BqTo, TO_BQ,   pg_overlap = false;
     "mysql"    -> "clickhouse" : MyFrom => ChTo, TO_CH,   pg_overlap = false;
     "mysql"    -> "postgres"   : MyFrom => PgTo, MY_PG,   pg_overlap = false;
@@ -362,13 +363,9 @@ routes! {
 /// test forces every (source, destination) combination to be either WIRED or
 /// listed HERE. Adding a source without covering every destination fails the
 /// build, on purpose: "new source reaches every destination" is a contract now.
+/// Currently empty: all 25 pairs are wired.
 #[cfg(test)]
-const NOT_YET: &[(&str, &str, &str)] = &[(
-    "postgres",
-    "mysql",
-    "the Postgres reader renders the PG text dialect, not MySQL's LOAD DATA \
-     dialect — needs a MyTsv lane on the Postgres source",
-)];
+const NOT_YET: &[(&str, &str, &str)] = &[];
 
 pub(crate) async fn single(
     src_url: &str,

@@ -133,11 +133,29 @@ prefer NOT NULL columns).
 
 ## The route matrix
 
-Every source reaches every destination — enforced by a completeness test
-(`cargo test` fails on any pair that is neither wired nor consciously
-deferred), so a new source can't ship half-wired. The one deferred pair:
-Postgres → MySQL (the Postgres reader doesn't render MySQL's `LOAD DATA`
-text dialect yet). Format notes: `gcs://…&format=csv` needs the Postgres
+Every source reaches every destination — all 25 pairs, enforced by a
+completeness test (`cargo test` fails on any pair that is neither wired nor
+consciously deferred), so a new source can't ship half-wired.
+
+Type notes for Postgres → MySQL — the lane covers integers, floats, `bool`,
+`date`, `timestamp`/`timestamptz`, `NUMERIC` within MySQL's `DECIMAL` bounds
+(precision ≤ 65, scale 0–30, scale ≤ precision), `varchar`/`char`/`text`,
+`json`/`jsonb`, `uuid` and `bytea`; anything else (`time`, `interval`,
+arrays, `inet`, enums, ranges, …) is refused at negotiation and the error
+names the offending columns — cast them in a source view. Values MySQL
+cannot hold fail loudly in-flight instead of being zero-coerced by
+`LOAD DATA`: NaN/±Infinity, dates outside MySQL's year 1000–9999 range, and
+unconstrained-`NUMERIC` values beyond `DOUBLE` range (in-range unconstrained
+`NUMERIC` lands in a `DOUBLE` column — 17 significant digits, documented
+lossy; declare a precision for exact `DECIMAL`). Bounded `varchar(n)`
+becomes `VARCHAR(n)` (so string PKs work up to 768 chars); an unbounded-text
+PK is refused with a cast hint. One normalization caveat: MySQL's `JSON`
+type rewrites documents on load (duplicate keys collapse, key order and
+whitespace are not preserved, numbers beyond 64-bit/double precision are
+rounded) — cast `json` to `text` in a source view if byte fidelity matters.
+
+Format notes:
+`gcs://…&format=csv` needs the Postgres
 text lane — every other source uses `format=parquet` there; BigQuery takes
 the other sources via its Parquet lane, which means a MySQL column with no
 Parquet mapping (`bit`, `binary`/`blob`, `DECIMAL` beyond 38 digits) can't

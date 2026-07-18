@@ -210,6 +210,17 @@ impl MySqlSink {
     }
 }
 
+/// Declared length of a BOUNDED character type from the source's own DDL
+/// spelling (Postgres `format_type`): `character varying(20)` / `character(20)`.
+/// Unbounded spellings (`text`, `character varying` with no modifier) → None.
+fn bounded_char_len(native: Option<&str>) -> Option<u32> {
+    let native = native?;
+    let rest = native
+        .strip_prefix("character varying(")
+        .or_else(|| native.strip_prefix("character("))?;
+    rest.strip_suffix(')')?.parse().ok()
+}
+
 /// MySQL column type for a lane delivery when the source has no MySQL DDL to
 /// mirror (a non-MySQL source feeding this sink). Only the deliveries a wired
 /// route actually produces are mapped; anything new fails loudly here rather
@@ -232,16 +243,31 @@ fn my_type_of(d: &Delivered, col: &str) -> Result<String> {
         Delivered::Bool => "TINYINT(1)".into(),
         Delivered::Float32 => "FLOAT".into(),
         Delivered::Float64 => "DOUBLE".into(),
-        Delivered::Decimal { p, s } if *p > 0 => format!("DECIMAL({p},{s})"),
+        Delivered::Decimal { p, s } if *p > 0 => {
+            // MySQL DECIMAL bounds; source-side gates should refuse earlier —
+            // this is the belt for any future lane that forgets.
+            if *p > 65 || *s > 30 || s > p {
+                return Err(Error::Transfer(format!(
+                    "mysql sink: DECIMAL({p},{s}) for column {col} exceeds MySQL's \
+                     limits (precision ≤ 65, scale ≤ 30, scale ≤ precision) — cast \
+                     the column in a source view"
+                )));
+            }
+            format!("DECIMAL({p},{s})")
+        }
         Delivered::Date => "DATE".into(),
         // Sessions run UTC (pool setup) — wall-as-UTC round-trips exactly.
         Delivered::DateTime { .. } => "DATETIME(6)".into(),
         Delivered::Json => "JSON".into(),
         Delivered::Uuid => "CHAR(36)".into(),
-        // MEDIUMTEXT, not TEXT: TEXT caps at 65,535 BYTES and the loader session
-        // runs with sql_mode='' where an over-long value TRUNCATES with only a
-        // warning. MEDIUMTEXT (16MB) costs the same storage.
-        Delivered::Text => "MEDIUMTEXT".into(),
+        // Arrives HEX-encoded; the LOAD DATA column list UNHEXes it back.
+        Delivered::Bytes => "LONGBLOB".into(),
+        // LONGTEXT (4 GB): the loader session runs sql_mode='' where an
+        // over-long value TRUNCATES with only a warning, so the column must be
+        // wide enough for anything a source can legally hold — Postgres text
+        // reaches 1 GB, past MEDIUMTEXT's 16 MB cliff. Storage cost is a
+        // 4-byte vs 3-byte length prefix per value.
+        Delivered::Text => "LONGTEXT".into(),
         other => {
             return Err(Error::Transfer(format!(
                 "mysql sink: no type mapping for column {col} delivered as {other:?} \
@@ -263,18 +289,53 @@ impl crate::sink::Sink for MySqlSink {
         plan: &TablePlan,
         lane: &Lane,
         _durable: bool,
-        _mode: Mode,
+        mode: Mode,
     ) -> Result<()> {
         // Same-engine transfers mirror the source column types verbatim
         // (`native_ddl`) so a swap yields a table identical to the source's;
         // anything else maps the lane's deliveries — same rule as the Postgres
         // sink.
         let mut ddl = Vec::new();
+        let mut types = Vec::with_capacity(plan.cols.len());
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             let ty = match (&c.native_ddl, plan.engine) {
                 (Some(native), "mysql") => native.clone(),
-                _ => my_type_of(&lc.delivered, &c.name)?,
+                _ => {
+                    let mut t = my_type_of(&lc.delivered, &c.name)?;
+                    // A BOUNDED source string keeps its declared length:
+                    // VARCHAR(n) holds exactly what the source enforced and —
+                    // unlike LONGTEXT — can be a key part.
+                    if t == "LONGTEXT" {
+                        if let Some(n) = bounded_char_len(c.native_ddl.as_deref()) {
+                            if n <= 16383 {
+                                t = format!("VARCHAR({n})");
+                            }
+                        }
+                    }
+                    t
+                }
             };
+            // A LONGTEXT/JSON/LONGBLOB key part is unindexable (MySQL error
+            // 1170/3152), and a VARCHAR key part past 768 chars overflows the
+            // utf8mb4 3072-byte index cap — refuse with the remedy instead of
+            // surfacing the raw DDL error.
+            if plan.pk_cols.contains(&c.name) {
+                let varchar_w: Option<u32> = ty
+                    .strip_prefix("VARCHAR(")
+                    .and_then(|r| r.strip_suffix(')'))
+                    .and_then(|n| n.parse().ok());
+                if matches!(ty.as_str(), "LONGTEXT" | "MEDIUMTEXT" | "JSON" | "LONGBLOB")
+                    || varchar_w.is_some_and(|n| n > 768)
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "primary-key column {} maps to {ty}, which MySQL cannot \
+                         index — cast it to a bounded type in a source view \
+                         (e.g. ::varchar(255))",
+                        c.name
+                    )));
+                }
+            }
+            types.push(ty.clone());
             // A PK column must be NOT NULL — MySQL refuses a nullable key
             // part outright (Postgres implies NOT NULL; here it's explicit).
             let null = if c.nullable && !plan.pk_cols.contains(&c.name) {
@@ -283,6 +344,49 @@ impl crate::sink::Sink for MySqlSink {
                 "NOT NULL"
             };
             ddl.push(format!("{} {ty} {null}", my_ident(&c.name)));
+        }
+        // Cross-vocabulary drift check for append: dest_state can only compare
+        // COLUMN_TYPE same-engine, so for a non-mysql plan compare the dest
+        // against the exact types THIS run would stage. (mediumtext ≡ longtext:
+        // pre-0.13 tables were created MEDIUMTEXT — widening is safe.)
+        if mode == Mode::Append && plan.engine != "mysql" {
+            let dest: Vec<(String, String)> = {
+                let mut conn = self
+                    .pool
+                    .get_conn()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("mysql conn: {e}")))?;
+                conn.query_map(
+                    format!(
+                        "SELECT column_name, column_type FROM information_schema.columns \
+                         WHERE table_schema='{}' AND table_name='{}' ORDER BY ordinal_position",
+                        sql_lit(&self.db),
+                        sql_lit(&self.bare)
+                    ),
+                    |(n, t): (String, String)| (n, t),
+                )
+                .await
+                .map_err(|e| Error::Transfer(format!("mysql columns: {e}")))?
+            };
+            if !dest.is_empty() && dest.len() == types.len() {
+                let norm = |t: &str| {
+                    let t = t.to_ascii_lowercase();
+                    if t == "mediumtext" {
+                        "longtext".to_string()
+                    } else {
+                        t
+                    }
+                };
+                for ((dn, dt), st) in dest.iter().zip(types.iter()) {
+                    if norm(dt) != norm(st) {
+                        return Err(Error::InvalidInput(format!(
+                            "destination column {dn} is {dt} but this run would \
+                             stage {st} — the source type changed since bootstrap; \
+                             run once with mode='replace' to realign the schema"
+                        )));
+                    }
+                }
+            }
         }
         if !plan.pk_cols.is_empty() {
             let pk: Vec<String> = plan.pk_cols.iter().map(|c| my_ident(c)).collect();
@@ -322,11 +426,13 @@ impl crate::sink::Sink for MySqlSink {
             .insert(id, rx);
 
         // Column list: binary columns arrive HEX-encoded and are UNHEXed back.
+        // User variables are SYNTHETIC (positional): a column name with a char
+        // outside [0-9a-zA-Z$_.] would break an @{name} spelling mid-statement.
         let mut names = Vec::new();
         let mut sets = Vec::new();
-        for (name, is_bin) in &self.cols {
+        for (i, (name, is_bin)) in self.cols.iter().enumerate() {
             if *is_bin {
-                let var = format!("@{name}");
+                let var = format!("@apitap_{i}");
                 names.push(var.clone());
                 sets.push(format!("{} = UNHEX({var})", my_ident(name)));
             } else {
@@ -529,15 +635,19 @@ impl crate::sink::Sink for MySqlSink {
         // The state write lands after the RENAME swap — arbitration is Greatest
         // (see plan::WmArbitration): a crash between them costs a bounded
         // re-read, never a skip.
-        let numeric = !crate::dialect::mysql::cursor_quoted(
-            &plan
-                .cols
-                .iter()
-                .find(|c| c.name == cursor)
-                .map(|c| c.udt.clone())
-                .unwrap_or_default(),
-        )
-        .unwrap_or(true);
+        // Vocabulary-neutral (the plan may carry Postgres udts): numeric unless
+        // the cursor is a temporal spelling — same rule as the ClickHouse sink.
+        let numeric = plan
+            .cols
+            .iter()
+            .find(|c| c.name == cursor)
+            .map(|c| {
+                !matches!(
+                    c.udt.as_str(),
+                    "date" | "timestamp" | "timestamptz" | "datetime"
+                )
+            })
+            .unwrap_or(false);
         let watermark = crate::plan::resolve_watermark(
             state_wm,
             data_wm,
