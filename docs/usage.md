@@ -133,12 +133,15 @@ prefer NOT NULL columns).
 
 ## The route matrix
 
-Every source reaches every destination — enforced by a build-failing
-completeness test, so a new source can't ship half-wired. The one conscious
-exception: Postgres → MySQL (the Postgres reader doesn't render MySQL's
-`LOAD DATA` text dialect yet — the table says so, loudly). Format notes:
-`gcs://…&format=csv` needs the Postgres text lane, so file/API sources use
-`format=parquet` there; BigQuery takes every source via its Parquet lane.
+Every source reaches every destination — enforced by a completeness test
+(`cargo test` fails on any pair that is neither wired nor consciously
+deferred), so a new source can't ship half-wired. The one deferred pair:
+Postgres → MySQL (the Postgres reader doesn't render MySQL's `LOAD DATA`
+text dialect yet). Format notes: `gcs://…&format=csv` needs the Postgres
+text lane — every other source uses `format=parquet` there; BigQuery takes
+the other sources via its Parquet lane, which means a MySQL column with no
+Parquet mapping (`bit`, `binary`/`blob`, `DECIMAL` beyond 38 digits) can't
+reach BigQuery/GCS until cast in a source view — the error says so.
 
 ## Multi-table transfers
 

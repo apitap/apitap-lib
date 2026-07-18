@@ -82,6 +82,10 @@ pub(crate) fn parquet_decodable(udt: &str) -> bool {
             | "tinytext"
             | "mediumtext"
             | "longtext"
+            | "enum"
+            | "set"
+            | "year"
+            | "time"
     )
 }
 
@@ -604,6 +608,25 @@ fn render_cursor(d: &Delivered, f: &[u8]) -> Result<String> {
                 .ok_or_else(|| bad("cursor date range"))?
                 .format("%Y-%m-%d")
                 .to_string()
+        }
+        Delivered::Decimal { s, .. } => {
+            // BIGINT UNSIGNED rides as Decimal{20,0} on MySQL sources — an
+            // unsigned auto-increment PK is the default cursor idiom there.
+            let scale = *s as u32;
+            let scaled = crate::wire::pgcopy::numeric_to_scaled_i128(f, scale)?;
+            if scale == 0 {
+                scaled.to_string()
+            } else {
+                let neg = scaled < 0;
+                let abs = scaled.unsigned_abs().to_string();
+                let abs = if abs.len() <= scale as usize {
+                    format!("{}{}", "0".repeat(scale as usize + 1 - abs.len()), abs)
+                } else {
+                    abs
+                };
+                let (int, frac) = abs.split_at(abs.len() - scale as usize);
+                format!("{}{int}.{frac}", if neg { "-" } else { "" })
+            }
         }
         other => {
             return Err(Error::InvalidInput(format!(

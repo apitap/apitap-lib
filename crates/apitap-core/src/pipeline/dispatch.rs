@@ -556,6 +556,31 @@ mod tests {
     fn every_source_reaches_every_destination_or_says_why_not() {
         const SOURCES: &[&str] = &["postgres", "mysql", "gsheets", "github", "github+api"];
         const DESTS: &[&str] = &["postgres", "clickhouse", "mysql", "bigquery", "gcs"];
+        // The declared sets must EQUAL what the table mentions — a new adapter
+        // wired with a single route line would otherwise silently escape the
+        // matrix walk below.
+        let seen_src: std::collections::BTreeSet<&str> = ROUTES
+            .iter()
+            .map(|(s, _)| *s)
+            .chain(NOT_YET.iter().map(|(s, _, _)| *s))
+            .collect();
+        let seen_dst: std::collections::BTreeSet<&str> = ROUTES
+            .iter()
+            .map(|(_, d)| *d)
+            .chain(NOT_YET.iter().map(|(_, d, _)| *d))
+            .collect();
+        assert_eq!(
+            seen_src,
+            SOURCES.iter().copied().collect(),
+            "a scheme appears in the route table that the matrix test doesn't \
+             cover (or vice versa) — update SOURCES here"
+        );
+        assert_eq!(
+            seen_dst,
+            DESTS.iter().copied().collect(),
+            "a scheme appears in the route table that the matrix test doesn't \
+             cover (or vice versa) — update DESTS here"
+        );
         for s in SOURCES {
             for d in DESTS {
                 let wired = ROUTES.contains(&(*s, *d));

@@ -13,7 +13,7 @@
 pub(crate) mod dispatch;
 
 use crate::error::{Error, Result};
-use crate::plan::Delta;
+use crate::plan::{Delta, WireFormat};
 use crate::{Mode, TableResult, TransferOptions, TransferReport};
 use crate::sink::Sink;
 use crate::source::Source;
@@ -205,9 +205,23 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         .copied()
         .find(|f| sink.lane_ok(&plan, *f) && src.can_produce(&plan, *f))
         .ok_or_else(|| {
+            let offered: Vec<&str> = sink
+                .accepts()
+                .iter()
+                .map(|f| match f {
+                    WireFormat::PgCopyBinary => "binary COPY",
+                    WireFormat::RowBinary => "RowBinary",
+                    WireFormat::TabSeparated => "PG text",
+                    WireFormat::MyTsv => "MySQL text",
+                })
+                .collect();
             Error::InvalidInput(format!(
-                "no common wire format for {} → this destination",
-                plan.engine
+                "no common wire format for {} → this destination (it accepts: {}). \
+                 Usual causes: a column type excluded from the destination's binary \
+                 lane (cast it in a source view), or gcs:// without format=parquet — \
+                 see the route matrix in docs/usage.md",
+                plan.engine,
+                offered.join(", ")
             ))
         })?;
     let lane = src.plan_lane(&plan, format);

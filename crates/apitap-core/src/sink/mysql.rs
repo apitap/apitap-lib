@@ -455,8 +455,14 @@ impl crate::sink::Sink for MySqlSink {
                  {src_names:?} — run once with mode='replace' to realign"
             )));
         }
+        // The TYPE comparison only makes sense same-engine: a non-MySQL plan
+        // carries its own udt vocabulary ("int8", "timestamptz") while the
+        // destination reports COLUMN_TYPE from my_type_of — comparing them
+        // failed EVERY github+api incremental run after the first. The name/
+        // order check above still catches drift; the types were created from
+        // this very plan.
         for ((dn, dt), (_, st)) in dest_cols.iter().zip(src_cols.iter()) {
-            if !dt.eq_ignore_ascii_case(st) {
+            if plan.engine == "mysql" && !dt.eq_ignore_ascii_case(st) {
                 return Err(Error::InvalidInput(format!(
                     "destination column {dn} is {dt} but the source delivers {st} — \
                      run once with mode='replace' to realign the schema"

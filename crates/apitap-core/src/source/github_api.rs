@@ -523,6 +523,24 @@ fn strip_json_nul(s: String) -> String {
     }
 }
 
+
+/// True when this column's extraction would come up NULL for the object.
+fn extract_is_null(item: &Value, col: &Col) -> bool {
+    match col.ex {
+        Ex::Raw => false,
+        Ex::I64(p) => walk(item, p).as_i64().is_none(),
+        Ex::Txt(p) => walk(item, p).as_str().is_none(),
+        Ex::Bool(p) => walk(item, p).as_bool().is_none(),
+        Ex::Ts(p) => walk(item, p).as_str().is_none(),
+        Ex::Json(p) => walk(item, p).is_null(),
+        Ex::TailNum(p) => walk(item, p)
+            .as_str()
+            .and_then(|u| u.rsplit('/').next())
+            .and_then(|t| t.parse::<i64>().ok())
+            .is_none(),
+    }
+}
+
 /// Render micros-since-Unix-epoch as MySQL DATETIME(6) text (sessions run UTC).
 fn mysql_datetime(micros: i64) -> Result<String> {
     chrono::DateTime::from_timestamp_micros(micros)
@@ -538,6 +556,16 @@ fn encode_row_tsv(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
     for (i, col) in e.cols.iter().enumerate() {
         if i > 0 {
             out.push(b'\t');
+        }
+        // A missing KEY value must never reach the sink: the MySQL loader runs
+        // non-strict, where \N into the NOT NULL pk coerces to 0/'' with only
+        // a warning — a silently wrong key row.
+        if col.pk && extract_is_null(item, col) {
+            return Err(Error::Transfer(format!(
+                "github+api {}: object missing its key field '{}' — refusing to \
+                 load a coerced key",
+                e.name, col.name
+            )));
         }
         match col.ex {
             Ex::Raw => tsv_escape(strip_json_nul(item.to_string()).as_bytes(), out),

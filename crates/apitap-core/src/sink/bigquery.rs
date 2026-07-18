@@ -492,7 +492,8 @@ fn check_col_name(name: &str) -> Result<()> {
     } else {
         Err(Error::InvalidInput(format!(
             "column name '{name}' is not a valid BigQuery column name \
-             ([A-Za-z_][A-Za-z0-9_]*) — alias it in a source view"
+             ([A-Za-z_][A-Za-z0-9_]*) — rename it at the source (sheet header \
+             / CSV header), or alias it in a source view (database sources)"
         )))
     }
 }
@@ -1104,13 +1105,18 @@ impl BqSink {
     /// source's rendering, and mixed formats would misorder lexicographic
     /// watermark comparisons (a re-read means DUPLICATES here; BigQuery
     /// tables don't dedup).
-    fn cursor_max_expr(udt: &str, cursor: &str) -> String {
+    fn cursor_max_expr(engine: &str, udt: &str, cursor: &str) -> String {
         let q = format!("`{cursor}`");
-        match udt {
-            "timestamptz" => {
+        match (engine, udt) {
+            // tz-carrying types → BQ TIMESTAMP. NOTE the vocabularies invert:
+            // PG "timestamp" is tz-LESS, MySQL "timestamp" is UTC-normalized.
+            ("mysql", "timestamp") | (_, "timestamptz") => {
                 format!("FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E*S+00', MAX({q}), 'UTC')")
             }
-            "timestamp" => format!("FORMAT_DATETIME('%Y-%m-%d %H:%M:%E*S', MAX({q}))"),
+            // tz-less types → BQ DATETIME.
+            ("mysql", "datetime") | ("postgres", "timestamp") => {
+                format!("FORMAT_DATETIME('%Y-%m-%d %H:%M:%E*S', MAX({q}))")
+            }
             _ => format!("CAST(MAX({q}) AS STRING)"),
         }
     }
@@ -1308,6 +1314,7 @@ impl crate::sink::Sink for BqSink {
         // MAX(cursor) directly (table metadata like numRows can lag behind jobs);
         // NULL means empty (or an all-NULL cursor, same conclusion).
         let max_expr = Self::cursor_max_expr(
+            plan.engine,
             plan.cols
                 .iter()
                 .find(|c| c.name == cursor)
@@ -1660,9 +1667,13 @@ mod tests {
 
     #[test]
     fn cursor_max_renders_in_source_style() {
-        assert!(BqSink::cursor_max_expr("timestamptz", "ts").contains("FORMAT_TIMESTAMP"));
-        assert!(BqSink::cursor_max_expr("timestamp", "ts").contains("FORMAT_DATETIME"));
-        assert!(BqSink::cursor_max_expr("int8", "id").starts_with("CAST(MAX"));
+        assert!(BqSink::cursor_max_expr("postgres", "timestamptz", "ts").contains("FORMAT_TIMESTAMP"));
+        // MySQL inverts the spellings: "timestamp"=UTC → TIMESTAMP,
+        // "datetime"=tz-less → DATETIME.
+        assert!(BqSink::cursor_max_expr("mysql", "timestamp", "ts").contains("FORMAT_TIMESTAMP"));
+        assert!(BqSink::cursor_max_expr("mysql", "datetime", "ts").contains("FORMAT_DATETIME"));
+        assert!(BqSink::cursor_max_expr("postgres", "timestamp", "ts").contains("FORMAT_DATETIME"));
+        assert!(BqSink::cursor_max_expr("postgres", "int8", "id").starts_with("CAST(MAX"));
     }
 
     #[test]
