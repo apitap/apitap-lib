@@ -514,6 +514,13 @@ apitap.transfer("github+api://owner/repo", pg_url, table="issues",
   the API rate limit from 60 requests/hour to 5,000 (a page is 100 rows, so
   that's ~500k rows/hour of headroom).
 - **Destinations**: Postgres and ClickHouse.
+- **Semantics you must know**: `commits` walks the DEFAULT branch's history,
+  and `since=` filters on the COMMITTER date — merging an old branch or
+  cherry-picking introduces commits whose committer dates predate the
+  watermark; incremental will not see them (a `replace` run repairs). GitHub
+  caps `workflow_runs` and `stargazers` listings at their newest 40,000 rows
+  — server-side, for every client. Update-prone entities are safest as
+  `mode="merge"` from the first run.
 
 ## GCS destination (CSV & Parquet files)
 

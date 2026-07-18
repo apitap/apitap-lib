@@ -44,6 +44,8 @@ enum Ex {
     Json(&'static [&'static str]),
     /// The whole API object, verbatim.
     Raw,
+    /// Trailing integer of a URL string (issue_comments → issue number).
+    TailNum(&'static [&'static str]),
 }
 
 struct Col {
@@ -196,6 +198,7 @@ const ENTITIES: &[Entity] = &[
         drop_if_key: None,
         cols: &[
             pk("id", "int8", Ex::I64(&["id"])),
+            c("issue_number", "int8", Ex::TailNum(&["issue_url"])),
             c("issue_url", "text", Ex::Txt(&["issue_url"])),
             c("author", "text", Ex::Txt(&["user", "login"])),
             c("created_at", "timestamptz", Ex::Ts(&["created_at"])),
@@ -316,7 +319,13 @@ fn watermark_parts(literal: &str) -> Result<(String, i64)> {
         iso.push('Z');
     }
     let micros = ts_micros(&iso)?;
-    Ok((iso, micros))
+    // Re-render CANONICAL UTC for the query string: an offset like +07:00
+    // would leak a literal '+' into the URL (decoded as a space server-side).
+    let canonical = chrono::DateTime::from_timestamp_micros(micros)
+        .ok_or_else(|| Error::Transfer(format!("watermark out of range: {literal}")))?
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    Ok((canonical, micros))
 }
 
 /* ------------------------------------------------------------------ source */
@@ -390,6 +399,37 @@ impl GithubApiSource {
                     if status.is_success() {
                         return Ok(resp);
                     }
+                    // Secondary rate limits clear in well under a minute and
+                    // GitHub says clients MUST honor Retry-After — wait when the
+                    // wait is short instead of aborting a half-streamed table.
+                    if matches!(status.as_u16(), 403 | 429) && attempt < 3 {
+                        let wait = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .or_else(|| {
+                                resp.headers()
+                                    .get("x-ratelimit-reset")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .map(|reset| {
+                                        reset.saturating_sub(
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0),
+                                        )
+                                    })
+                            });
+                        if let Some(w) = wait {
+                            if w <= 120 {
+                                tokio::time::sleep(std::time::Duration::from_secs(w.max(1)))
+                                    .await;
+                                continue;
+                            }
+                        }
+                    }
                     let hint = match (status.as_u16(), self.token.is_some()) {
                         (401, false) => {
                             " (this endpoint requires auth — set GITHUB_TOKEN; \
@@ -433,9 +473,9 @@ impl GithubApiSource {
             .await
     }
 
-    fn page_url(&self, e: &Entity, page: u32, since: Option<&str>) -> String {
+    fn first_page_url(&self, e: &Entity, since: Option<&str>) -> String {
         let mut url = format!(
-            "{API}/repos/{}/{}/{}?per_page={PER_PAGE}&page={page}",
+            "{API}/repos/{}/{}/{}?per_page={PER_PAGE}",
             self.owner, self.repo, e.path
         );
         for (k, v) in e.query {
@@ -448,18 +488,52 @@ impl GithubApiSource {
     }
 }
 
+/// The `rel="next"` URL out of a Link header. GitHub's large datasets REQUIRE
+/// this (the URL carries an `after=` cursor; a manufactured `page=11` answers
+/// HTTP 422) — and cursor pagination also anchors the crawl position, so items
+/// updated mid-crawl can't shift rows across page boundaries.
+fn link_next(link: &str) -> Option<String> {
+    link.split(',').find_map(|part| {
+        let (url, rest) = part.split_once(';')?;
+        if !rest.contains("rel=\"next\"") {
+            return None;
+        }
+        Some(url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+    })
+}
+
+/// Postgres can't store U+0000 in text/jsonb (binary COPY aborts the whole
+/// load) — strip it; GitHub bodies are user-controlled bytes.
+fn strip_nul(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\u{0}') {
+        std::borrow::Cow::Owned(s.replace('\u{0}', ""))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+fn strip_json_nul(s: String) -> String {
+    // serde_json renders U+0000 as the escape \u0000 — remove it before the
+    // jsonb field for the same Postgres reason.
+    if s.contains("\\u0000") {
+        s.replace("\\u0000", "")
+    } else {
+        s
+    }
+}
+
 /// Encode one API object as a PgCopyBinary tuple.
 fn encode_row(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
     pgc::tuple_start(e.cols.len(), out);
     for col in e.cols {
         match col.ex {
-            Ex::Raw => pgc::jsonb_field(item.to_string().as_bytes(), out),
+            Ex::Raw => pgc::jsonb_field(strip_json_nul(item.to_string()).as_bytes(), out),
             Ex::I64(p) => match walk(item, p).as_i64() {
                 Some(v) => pgc::field(&v.to_be_bytes(), out),
                 None => pgc::null_field(out),
             },
             Ex::Txt(p) => match walk(item, p).as_str() {
-                Some(v) => pgc::field(v.as_bytes(), out),
+                Some(v) => pgc::field(strip_nul(v).as_bytes(), out),
                 None => pgc::null_field(out),
             },
             Ex::Bool(p) => match walk(item, p).as_bool() {
@@ -470,12 +544,22 @@ fn encode_row(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
                 Some(v) => pgc::field(&(ts_micros(v)? - pgc::PG_EPOCH_MICROS).to_be_bytes(), out),
                 None => pgc::null_field(out),
             },
+            Ex::TailNum(p) => {
+                let n = walk(item, p)
+                    .as_str()
+                    .and_then(|u| u.rsplit('/').next())
+                    .and_then(|t| t.parse::<i64>().ok());
+                match n {
+                    Some(v) => pgc::field(&v.to_be_bytes(), out),
+                    None => pgc::null_field(out),
+                }
+            }
             Ex::Json(p) => {
                 let v = walk(item, p);
                 if v.is_null() {
                     pgc::null_field(out);
                 } else {
-                    pgc::jsonb_field(v.to_string().as_bytes(), out);
+                    pgc::jsonb_field(strip_json_nul(v.to_string()).as_bytes(), out);
                 }
             }
         }
@@ -620,7 +704,7 @@ impl Source for GithubApiSource {
 
     async fn run_workers<L: Loader>(
         &self,
-        _plan: &TablePlan,
+        plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
         loaders: Vec<L>,
@@ -649,14 +733,23 @@ impl Source for GithubApiSource {
         let mut xcode = match lane.format {
             WireFormat::PgCopyBinary => None,
             WireFormat::RowBinary => {
-                let cols = lane
+                // Nullability comes from the ADJUSTED plan — the ClickHouse
+                // sink flips the cursor/order-by column non-Nullable and its
+                // DDL and this wire framing must agree (the flag byte would
+                // frame-shift a non-Nullable column). Same contract as the
+                // Postgres source.
+                let cols = plan
                     .cols
                     .iter()
-                    .zip(e.cols.iter())
-                    .map(|(_, c)| {
-                        rb_type(c.udt, None, None).map(|t| (t, true)).ok_or_else(|| {
-                            Error::Transfer(format!("github+api: no RowBinary type for {}", c.udt))
-                        })
+                    .map(|c| {
+                        rb_type(&c.udt, None, None)
+                            .map(|t| (t, c.nullable))
+                            .ok_or_else(|| {
+                                Error::Transfer(format!(
+                                    "github+api: no RowBinary type for {}",
+                                    c.udt
+                                ))
+                            })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Some(Transcoder::new(cols))
@@ -674,18 +767,17 @@ impl Source for GithubApiSource {
         pgc::header(&mut pg);
         let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
         let mut rows: u64 = 0;
-        let mut page = 1u32;
+        let mut url = self.first_page_url(e, since.as_deref());
         loop {
-            let url = self.page_url(e, page, since.as_deref());
-            let resp = match self.send(url, e.accept, e.name).await {
+            let resp = match self.send(url.clone(), e.accept, e.name).await {
                 Ok(r) => r,
                 Err(err) => return Err(loader.abort(err).await),
             };
-            let link_next = resp
+            let next = resp
                 .headers()
                 .get("link")
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|l| l.contains("rel=\"next\""));
+                .and_then(link_next);
             let body: Value = match resp.json().await {
                 Ok(v) => v,
                 Err(err) => {
@@ -738,10 +830,10 @@ impl Source for GithubApiSource {
                     }
                 }
             }
-            if !link_next || items.is_empty() {
-                break;
+            match next {
+                Some(n) if !items.is_empty() => url = n,
+                _ => break,
             }
-            page += 1;
         }
         pgc::trailer(&mut pg);
         match &mut xcode {
@@ -796,6 +888,31 @@ mod tests {
         assert_eq!(&out[..2], &(12i16).to_be_bytes());
         // A PR-flavored object carries "pull_request" — the caller drops it.
         assert_eq!(e.drop_if_key, Some("pull_request"));
+    }
+
+    #[test]
+    fn link_header_next_is_followed_verbatim() {
+        let l = "<https://api.github.com/repositories/1/issues?after=Y3Vyc29y&per_page=100>; rel=\"next\", <https://x>; rel=\"last\"";
+        assert_eq!(
+            link_next(l).as_deref(),
+            Some("https://api.github.com/repositories/1/issues?after=Y3Vyc29y&per_page=100")
+        );
+        assert_eq!(link_next("<https://x>; rel=\"prev\""), None);
+    }
+
+    #[test]
+    fn nul_bytes_never_reach_postgres() {
+        assert_eq!(strip_nul("a\u{0}b"), "ab");
+        assert_eq!(strip_nul("clean"), "clean");
+        let v: Value = serde_json::json!({"t": "a\u{0}b"});
+        assert!(!strip_json_nul(v.to_string()).contains("\\u0000"));
+    }
+
+    #[test]
+    fn watermark_since_is_always_utc_z() {
+        // A +07:00 literal must not leak '+' into the query string.
+        let (iso, _) = watermark_parts("'2026-07-18 10:00:00+07:00'").unwrap();
+        assert_eq!(iso, "2026-07-18T03:00:00Z");
     }
 
     #[test]
