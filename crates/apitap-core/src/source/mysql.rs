@@ -833,7 +833,7 @@ impl Source for MySqlSource {
         // renders server-side (CAST/HEX) so it handles every column too.
         matches!(
             format,
-            WireFormat::RowBinary | WireFormat::PgCopyBinary | WireFormat::TabSeparated
+            WireFormat::RowBinary | WireFormat::PgCopyBinary | WireFormat::MyTsv
         )
     }
 
@@ -868,7 +868,8 @@ impl Source for MySqlSource {
                     // connection-charset text (round-trips exactly on reload),
                     // HEX for binary so bytes survive the charset. delivered is a
                     // marker — the sink mirrors native_ddl for its DDL, not this.
-                    WireFormat::TabSeparated => {
+                    WireFormat::TabSeparated => unreachable!("can_produce refuses the PG text dialect for the MySQL source"),
+                    WireFormat::MyTsv => {
                         // Read BINARY and format client-side (measured ~3x cheaper
                         // than CAST-to-text on the wire). Only TIME is CAST — its
                         // binary layout isn't covered by the decoders.
@@ -970,7 +971,8 @@ impl Source for MySqlSource {
                     .map(|c| (my_rb(c).expect("validated at probe").0, c.nullable))
                     .collect(),
             ),
-            WireFormat::TabSeparated => MyEnc::Tsv(plan.cols.iter().map(my_tsv).collect()),
+            WireFormat::MyTsv => MyEnc::Tsv(plan.cols.iter().map(my_tsv).collect()),
+            WireFormat::TabSeparated => unreachable!("can_produce refuses the PG text dialect for the MySQL source"),
         };
         let queue = super::work_queue(stmts);
         let mut tasks = Vec::with_capacity(loaders.len());

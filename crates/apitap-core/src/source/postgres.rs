@@ -223,6 +223,9 @@ impl Source for PgSource {
         match format {
             // Raw passthrough and text relay carry ANY column type.
             WireFormat::PgCopyBinary | WireFormat::TabSeparated => true,
+            // The MySQL LOAD DATA dialect is not rendered here (yet) — see the
+            // NOT_YET entry for postgres → mysql in dispatch.
+            WireFormat::MyTsv => false,
             // Binary transcoding needs every column covered (e.g. NUMERIC p>38 would
             // be Decimal256, which the transcoder doesn't emit → text fallback).
             WireFormat::RowBinary => plan
@@ -252,6 +255,7 @@ impl Source for PgSource {
                     // Text casts anything whose CSV/TSV form the destination wouldn't
                     // parse natively; the rule is "let each database do what it's good
                     // at" — Postgres casts, this process never touches a row.
+                    WireFormat::MyTsv => unreachable!("can_produce refuses MyTsv for the Postgres source"),
                     WireFormat::TabSeparated => match c.udt.as_str() {
                         // Postgres text booleans are t/f — cast to 0/1.
                         "bool" => LaneCol {
@@ -301,6 +305,7 @@ impl Source for PgSource {
         let copy_opts = match lane.format {
             WireFormat::TabSeparated => "FORMAT text",
             WireFormat::PgCopyBinary | WireFormat::RowBinary => "FORMAT binary",
+            WireFormat::MyTsv => unreachable!("can_produce refuses MyTsv for the Postgres source"),
         };
         // Incremental predicate — appended to EVERY statement in this fn, including
         // the min/max probe and the ctid fallback.
@@ -404,6 +409,7 @@ impl Source for PgSource {
                         .collect(),
                 ),
                 WireFormat::TabSeparated => PgReadMode::Text,
+                WireFormat::MyTsv => unreachable!("can_produce refuses MyTsv for the Postgres source"),
             };
             tasks.push(tokio::spawn(copy_out_worker(
                 self.pool.clone(),

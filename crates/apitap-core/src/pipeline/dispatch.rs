@@ -347,7 +347,28 @@ routes! {
     "postgres" -> "gcs"        : PgFrom => GcsTo, TO_GCS,  pg_overlap = false;
     "github+api" -> "postgres"  : GhApiFrom => PgTo, GH_API, pg_overlap = false;
     "github+api" -> "clickhouse": GhApiFrom => ChTo, GH_API, pg_overlap = false;
+    "github+api" -> "mysql"     : GhApiFrom => MyTo, GH_API, pg_overlap = false;
+    "github+api" -> "bigquery"  : GhApiFrom => BqTo, GH_API, pg_overlap = false;
+    "github+api" -> "gcs"       : GhApiFrom => GcsTo, GH_API, pg_overlap = false;
+    "mysql"    -> "bigquery"   : MyFrom => BqTo, TO_BQ,   pg_overlap = false;
+    "mysql"    -> "gcs"        : MyFrom => GcsTo, TO_GCS, pg_overlap = false;
+    "gsheets"  -> "bigquery"   : GsFrom => BqTo, GSHEETS, pg_overlap = false;
+    "gsheets"  -> "gcs"        : GsFrom => GcsTo, GSHEETS, pg_overlap = false;
+    "github"   -> "bigquery"   : GhFrom => BqTo, GITHUB,  pg_overlap = false;
+    "github"   -> "gcs"        : GhFrom => GcsTo, GITHUB, pg_overlap = false;
 }
+
+/// Pairs consciously NOT in the table, each with its reason — the completeness
+/// test forces every (source, destination) combination to be either WIRED or
+/// listed HERE. Adding a source without covering every destination fails the
+/// build, on purpose: "new source reaches every destination" is a contract now.
+#[cfg(test)]
+const NOT_YET: &[(&str, &str, &str)] = &[(
+    "postgres",
+    "mysql",
+    "the Postgres reader renders the PG text dialect, not MySQL's LOAD DATA \
+     dialect — needs a MyTsv lane on the Postgres source",
+)];
 
 pub(crate) async fn single(
     src_url: &str,
@@ -529,6 +550,27 @@ mod tests {
         assert_eq!(norm("clickhouse+https"), "clickhouse");
         assert_eq!(norm("gsheets"), "gsheets");
         assert_eq!(norm("sqlite"), "sqlite");
+    }
+
+    #[test]
+    fn every_source_reaches_every_destination_or_says_why_not() {
+        const SOURCES: &[&str] = &["postgres", "mysql", "gsheets", "github", "github+api"];
+        const DESTS: &[&str] = &["postgres", "clickhouse", "mysql", "bigquery", "gcs"];
+        for s in SOURCES {
+            for d in DESTS {
+                let wired = ROUTES.contains(&(*s, *d));
+                let deferred = NOT_YET.iter().any(|(ns, nd, _)| ns == s && nd == d);
+                assert!(
+                    wired || deferred,
+                    "route {s} → {d} is neither wired nor consciously deferred \
+                     (add the table line, or a NOT_YET entry with a reason)"
+                );
+                assert!(
+                    !(wired && deferred),
+                    "route {s} → {d} is both wired and in NOT_YET — remove the exemption"
+                );
+            }
+        }
     }
 
     #[test]

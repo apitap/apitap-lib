@@ -412,7 +412,7 @@ impl Source for GithubSource {
         // Google Sheets source).
         matches!(
             format,
-            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::TabSeparated
+            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::MyTsv
         )
     }
 

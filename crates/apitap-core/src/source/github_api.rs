@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::Source;
+use crate::wire::mytsv::tsv_escape;
 use crate::wire::pgcopy as pgc;
 use crate::wire::rowbinary::{rb_type, Transcoder};
 use serde_json::Value;
@@ -522,6 +523,64 @@ fn strip_json_nul(s: String) -> String {
     }
 }
 
+/// Render micros-since-Unix-epoch as MySQL DATETIME(6) text (sessions run UTC).
+fn mysql_datetime(micros: i64) -> Result<String> {
+    chrono::DateTime::from_timestamp_micros(micros)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+        .ok_or_else(|| Error::Transfer(format!("timestamp out of range: {micros}")))
+}
+
+/// Encode one API object as a MySQL LOAD DATA text row (\t fields, \N NULLs,
+/// [`crate::wire::mytsv`] escapes). An empty string stays '' — distinct from
+/// NULL, unlike the all-text sources.
+fn encode_row_tsv(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
+    let mut itoa = itoa::Buffer::new();
+    for (i, col) in e.cols.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
+        match col.ex {
+            Ex::Raw => tsv_escape(strip_json_nul(item.to_string()).as_bytes(), out),
+            Ex::I64(p) => match walk(item, p).as_i64() {
+                Some(v) => out.extend_from_slice(itoa.format(v).as_bytes()),
+                None => out.extend_from_slice(b"\\N"),
+            },
+            Ex::Txt(p) => match walk(item, p).as_str() {
+                Some(v) => tsv_escape(v.as_bytes(), out),
+                None => out.extend_from_slice(b"\\N"),
+            },
+            Ex::Bool(p) => match walk(item, p).as_bool() {
+                Some(v) => out.push(if v { b'1' } else { b'0' }),
+                None => out.extend_from_slice(b"\\N"),
+            },
+            Ex::Ts(p) => match walk(item, p).as_str() {
+                Some(v) => out.extend_from_slice(mysql_datetime(ts_micros(v)?)?.as_bytes()),
+                None => out.extend_from_slice(b"\\N"),
+            },
+            Ex::Json(p) => {
+                let v = walk(item, p);
+                if v.is_null() {
+                    out.extend_from_slice(b"\\N");
+                } else {
+                    tsv_escape(strip_json_nul(v.to_string()).as_bytes(), out);
+                }
+            }
+            Ex::TailNum(p) => {
+                match walk(item, p)
+                    .as_str()
+                    .and_then(|u| u.rsplit('/').next())
+                    .and_then(|t| t.parse::<i64>().ok())
+                {
+                    Some(v) => out.extend_from_slice(itoa.format(v).as_bytes()),
+                    None => out.extend_from_slice(b"\\N"),
+                }
+            }
+        }
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
 /// Encode one API object as a PgCopyBinary tuple.
 fn encode_row(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
     pgc::tuple_start(e.cols.len(), out);
@@ -634,8 +693,13 @@ impl Source for GithubApiSource {
 
     fn can_produce(&self, _plan: &TablePlan, format: WireFormat) -> bool {
         // Typed delivery: native PgCopyBinary, RowBinary via the same
-        // transcoder the Postgres source uses. TabSeparated is not produced.
-        matches!(format, WireFormat::PgCopyBinary | WireFormat::RowBinary)
+        // transcoder the Postgres source uses, and the MySQL text dialect for
+        // LOAD DATA (values rendered as text; the Postgres text dialect is
+        // never produced).
+        matches!(
+            format,
+            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::MyTsv
+        )
     }
 
     fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane {
@@ -730,8 +794,9 @@ impl Source for GithubApiSource {
 
         // RowBinary lane: run the pgcopy stream through the same transcoder the
         // Postgres source uses — one encoder, every destination.
+        let tsv_lane = lane.format == WireFormat::MyTsv;
         let mut xcode = match lane.format {
-            WireFormat::PgCopyBinary => None,
+            WireFormat::PgCopyBinary | WireFormat::MyTsv => None,
             WireFormat::RowBinary => {
                 // Nullability comes from the ADJUSTED plan — the ClickHouse
                 // sink flips the cursor/order-by column non-Nullable and its
@@ -757,14 +822,16 @@ impl Source for GithubApiSource {
             WireFormat::TabSeparated => {
                 return Err(loader
                     .abort(Error::Transfer(
-                        "github+api does not produce TabSeparated".into(),
+                        "github+api never negotiates the PG text dialect".into(),
                     ))
                     .await)
             }
         };
 
         let mut pg: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
-        pgc::header(&mut pg);
+        if !tsv_lane {
+            pgc::header(&mut pg);
+        }
         let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
         let mut rows: u64 = 0;
         let mut url = self.first_page_url(e, since.as_deref());
@@ -809,7 +876,12 @@ impl Source for GithubApiSource {
                         }
                     }
                 }
-                if let Err(err) = encode_row(e, item, &mut pg) {
+                let enc_res = if tsv_lane {
+                    encode_row_tsv(e, item, &mut pg)
+                } else {
+                    encode_row(e, item, &mut pg)
+                };
+                if let Err(err) = enc_res {
                     return Err(loader.abort(err).await);
                 }
                 rows += 1;
@@ -835,7 +907,9 @@ impl Source for GithubApiSource {
                 _ => break,
             }
         }
-        pgc::trailer(&mut pg);
+        if !tsv_lane {
+            pgc::trailer(&mut pg);
+        }
         match &mut xcode {
             None => {
                 if !pg.is_empty() {

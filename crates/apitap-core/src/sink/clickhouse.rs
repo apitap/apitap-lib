@@ -737,6 +737,7 @@ impl crate::sink::Sink for ChSink {
             .await?;
         let fmt = match lane.format {
             WireFormat::TabSeparated => "TabSeparated",
+            WireFormat::MyTsv => unreachable!("accepts() never offers MyTsv to ClickHouse"),
             WireFormat::RowBinary => "RowBinary",
             // accepts() never offers it — negotiation can't get here.
             WireFormat::PgCopyBinary => unreachable!("guarded by accepts()"),

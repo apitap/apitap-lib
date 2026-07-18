@@ -250,7 +250,7 @@ impl Source for GsheetsSource {
         // sinks never negotiate down to it (their accepts() lists binary first).
         matches!(
             format,
-            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::TabSeparated
+            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::MyTsv
         )
     }
 

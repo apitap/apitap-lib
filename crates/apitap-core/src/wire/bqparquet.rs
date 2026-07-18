@@ -42,7 +42,8 @@ pub(crate) fn parquet_col_ok(udt: &str, precision: Option<i32>) -> bool {
     if !parquet_decodable(udt) {
         return false;
     }
-    udt != "numeric" || matches!(precision, Some(p) if (1..=38).contains(&p))
+    !matches!(udt, "numeric" | "decimal")
+        || matches!(precision, Some(p) if (1..=38).contains(&p))
 }
 
 pub(crate) fn parquet_decodable(udt: &str) -> bool {
@@ -65,6 +66,22 @@ pub(crate) fn parquet_decodable(udt: &str) -> bool {
             | "varchar"
             | "bpchar"
             | "name"
+            // MySQL DATA_TYPE vocabulary — the delivered types are the same
+            // standard set (the MySQL reader encodes typed PgCopyBinary);
+            // only the udt SPELLINGS differ. binary/blob stay excluded.
+            | "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "bigint"
+            | "float"
+            | "double"
+            | "decimal"
+            | "datetime"
+            | "char"
+            | "tinytext"
+            | "mediumtext"
+            | "longtext"
     )
 }
 

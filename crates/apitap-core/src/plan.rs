@@ -103,6 +103,13 @@ pub(crate) enum WireFormat {
     /// be configured to (e.g. FIELD_DELIMITER='\t', NULL_IF=('\\N')). Row-oriented:
     /// buffers end on a record boundary.
     TabSeparated,
+    /// MySQL `LOAD DATA ... FIELDS ESCAPED BY '\\'` dialect: tab delimiter, `\N`
+    /// NULLs, `\t\n\r\\\0\Z` escapes ([`crate::wire::mytsv`]). SPLIT from
+    /// [`WireFormat::TabSeparated`] on purpose: the two vocabularies differ in
+    /// corner bytes, and one enum value for both let negotiation pair a MySQL
+    /// producer with a Postgres-dialect consumer — silent corruption. Now the
+    /// type system forbids it. Row-oriented: buffers end on a record boundary.
+    MyTsv,
 }
 
 /// One column as the lane's encoder will deliver it.

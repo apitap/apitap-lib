@@ -131,6 +131,15 @@ Pass `cursor="some_int_column"` to split on any other numeric column (works for
 non-PK columns; rows where the cursor is NULL are not covered by range predicates —
 prefer NOT NULL columns).
 
+## The route matrix
+
+Every source reaches every destination — enforced by a build-failing
+completeness test, so a new source can't ship half-wired. The one conscious
+exception: Postgres → MySQL (the Postgres reader doesn't render MySQL's
+`LOAD DATA` text dialect yet — the table says so, loudly). Format notes:
+`gcs://…&format=csv` needs the Postgres text lane, so file/API sources use
+`format=parquet` there; BigQuery takes every source via its Parquet lane.
+
 ## Multi-table transfers
 
 One call moves a list of tables — or a whole schema — through **one resource
@@ -439,9 +448,9 @@ apitap.transfer("gsheets://<id>?credentials=…", dst, tables=["Sheet1", "Q3 dat
   sheet displays it (`FORMATTED_VALUE`). Sheets are untyped — a typed cast
   belongs in the destination, where it can fail loudly per value. Blank cells
   land as `NULL`.
-- **Destinations**: Postgres and ClickHouse (all-text delivery over the binary
-  lanes) and MySQL (`LOAD DATA` text lane, `TEXT` columns). BigQuery is not
-  wired for this source yet.
+- **Destinations**: all five — Postgres, ClickHouse, MySQL (`LOAD DATA` text
+  lane), BigQuery, and GCS `format=parquet` (all-text columns land as
+  STRING).
 - **Modes**: `mode="replace"` only. Sheets carry no usable incremental cursor,
   so append/merge are refused loudly.
 - **Paging**: rows stream in 10k-row pages (override with
@@ -484,8 +493,8 @@ apitap.transfer("github://owner/repo", dst, tables=["users", "2026/orders"])
   a short row NULL-pads its missing trailing fields; a row with MORE fields
   than the header is refused loudly (silently dropping fields is data loss).
   Parsing is RFC-4180: quoted fields, embedded commas/newlines, `""` escapes.
-- **Destinations**: Postgres, ClickHouse, and MySQL. Files stream — size never
-  bounds memory.
+- **Destinations**: all five — Postgres, ClickHouse, MySQL, BigQuery, and GCS
+  `format=parquet`. Files stream — size never bounds memory.
 - **Modes**: `mode="replace"` only (files carry no usable cursor).
 
 ## GitHub API source (the project as tables)
@@ -513,7 +522,8 @@ apitap.transfer("github+api://owner/repo", pg_url, table="issues",
   `stargazers`** (its `starred_at` media type is auth-only), and lifts
   the API rate limit from 60 requests/hour to 5,000 (a page is 100 rows, so
   that's ~500k rows/hour of headroom).
-- **Destinations**: Postgres and ClickHouse.
+- **Destinations**: all five — Postgres, ClickHouse, MySQL (typed: BIGINT /
+  TINYINT(1) / DATETIME(6) / JSON), BigQuery, and GCS `format=parquet`.
 - **Semantics you must know**: `commits` walks the DEFAULT branch's history,
   and `since=` filters on the COMMITTER date — merging an old branch or
   cherry-picking introduces commits whose committer dates predate the

@@ -215,24 +215,47 @@ impl MySqlSink {
 /// route actually produces are mapped; anything new fails loudly here rather
 /// than guessing a lossy type.
 fn my_type_of(d: &Delivered, col: &str) -> Result<String> {
-    match d {
+    Ok(match d {
+        Delivered::Int { bytes, unsigned } => {
+            let base = match bytes {
+                1 => "TINYINT",
+                2 => "SMALLINT",
+                4 => "INT",
+                _ => "BIGINT",
+            };
+            if *unsigned {
+                format!("{base} UNSIGNED")
+            } else {
+                base.to_string()
+            }
+        }
+        Delivered::Bool => "TINYINT(1)".into(),
+        Delivered::Float32 => "FLOAT".into(),
+        Delivered::Float64 => "DOUBLE".into(),
+        Delivered::Decimal { p, s } if *p > 0 => format!("DECIMAL({p},{s})"),
+        Delivered::Date => "DATE".into(),
+        // Sessions run UTC (pool setup) — wall-as-UTC round-trips exactly.
+        Delivered::DateTime { .. } => "DATETIME(6)".into(),
+        Delivered::Json => "JSON".into(),
+        Delivered::Uuid => "CHAR(36)".into(),
         // MEDIUMTEXT, not TEXT: TEXT caps at 65,535 BYTES and the loader session
-        // runs with sql_mode='' where an over-long cell TRUNCATES with only a
-        // warning — a Google Sheets cell (up to 50k chars, ~200KB as UTF-8) would
-        // silently lose its tail. MEDIUMTEXT (16MB) costs the same storage.
-        Delivered::Text => Ok("MEDIUMTEXT".to_string()),
-        other => Err(Error::Transfer(format!(
-            "mysql sink: no type mapping for column {col} delivered as {other:?} \
-             from a non-mysql source — open an issue"
-        ))),
-    }
+        // runs with sql_mode='' where an over-long value TRUNCATES with only a
+        // warning. MEDIUMTEXT (16MB) costs the same storage.
+        Delivered::Text => "MEDIUMTEXT".into(),
+        other => {
+            return Err(Error::Transfer(format!(
+                "mysql sink: no type mapping for column {col} delivered as {other:?} \
+                 from a non-mysql source — open an issue"
+            )))
+        }
+    })
 }
 
 impl crate::sink::Sink for MySqlSink {
     type Loader = MySqlLoader;
 
     fn accepts(&self) -> &[WireFormat] {
-        &[WireFormat::TabSeparated]
+        &[WireFormat::MyTsv]
     }
 
     async fn prepare(
@@ -252,7 +275,13 @@ impl crate::sink::Sink for MySqlSink {
                 (Some(native), "mysql") => native.clone(),
                 _ => my_type_of(&lc.delivered, &c.name)?,
             };
-            let null = if c.nullable { "NULL" } else { "NOT NULL" };
+            // A PK column must be NOT NULL — MySQL refuses a nullable key
+            // part outright (Postgres implies NOT NULL; here it's explicit).
+            let null = if c.nullable && !plan.pk_cols.contains(&c.name) {
+                "NULL"
+            } else {
+                "NOT NULL"
+            };
             ddl.push(format!("{} {ty} {null}", my_ident(&c.name)));
         }
         if !plan.pk_cols.is_empty() {

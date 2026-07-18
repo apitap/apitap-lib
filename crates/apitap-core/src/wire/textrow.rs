@@ -25,7 +25,12 @@ impl TextEnc {
         match format {
             WireFormat::PgCopyBinary => Self::PgBinary,
             WireFormat::RowBinary => Self::RowBinary,
-            WireFormat::TabSeparated => Self::MyTsv,
+            WireFormat::MyTsv => Self::MyTsv,
+            // Text sources declare MyTsv, never the Postgres text dialect —
+            // can_produce() upstream keeps this arm unreachable.
+            WireFormat::TabSeparated => {
+                unreachable!("text sources never negotiate the PG text dialect")
+            }
         }
     }
 
