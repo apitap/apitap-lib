@@ -6,3 +6,4 @@ pub(crate) mod mytsv;
 pub(crate) mod pgcopy;
 pub(crate) mod pgtext;
 pub(crate) mod rowbinary;
+pub(crate) mod textrow;

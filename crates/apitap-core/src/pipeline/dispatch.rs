@@ -17,6 +17,7 @@ use crate::sink::postgres::PgSink;
 use crate::source::gsheets::GsheetsSource;
 use crate::source::mysql::MySqlSource;
 use crate::source::postgres::PgSource;
+use crate::source::github::GithubSource;
 use crate::{MultiReport, TransferOptions, TransferReport};
 
 // Per-route pipe heuristics (all measured — see benchmarks/README.md):
@@ -47,6 +48,11 @@ fn to_bq_parallel(cores: usize) -> usize {
 fn gsheets_parallel(_cores: usize) -> usize {
     1
 }
+// GitHub: one stream per file (RFC-4180 can't byte-range split), so parallelism
+// is ACROSS files — download + parse + encode is light-moderate CPU per pipe.
+fn github_parallel(cores: usize) -> usize {
+    (cores * 2).clamp(1, 16)
+}
 
 // Named per-route profiles — a route line references ONE of these instead of
 // restating the literal; a new route adds a line here.
@@ -56,6 +62,7 @@ const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6 };
 const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6 };
 const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6 };
 const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1 };
+const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1 };
 
 /// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
 fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
@@ -101,6 +108,13 @@ impl SrcScheme for GsFrom {
     type Src = GsheetsSource;
     async fn connect(url: &str, _pool: usize) -> Result<GsheetsSource> {
         GsheetsSource::connect(url).await
+    }
+}
+struct GhFrom;
+impl SrcScheme for GhFrom {
+    type Src = GithubSource;
+    async fn connect(url: &str, _pool: usize) -> Result<GithubSource> {
+        GithubSource::connect(url).await
     }
 }
 
@@ -292,6 +306,9 @@ routes! {
     "gsheets"  -> "postgres"   : GsFrom => PgTo, GSHEETS, pg_overlap = false;
     "gsheets"  -> "clickhouse" : GsFrom => ChTo, GSHEETS, pg_overlap = false;
     "gsheets"  -> "mysql"      : GsFrom => MyTo, GSHEETS, pg_overlap = false;
+    "github"   -> "postgres"   : GhFrom => PgTo, GITHUB,  pg_overlap = false;
+    "github"   -> "clickhouse" : GhFrom => ChTo, GITHUB,  pg_overlap = false;
+    "github"   -> "mysql"      : GhFrom => MyTo, GITHUB,  pg_overlap = false;
 }
 
 pub(crate) async fn single(

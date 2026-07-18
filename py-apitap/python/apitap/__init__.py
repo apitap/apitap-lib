@@ -104,8 +104,9 @@ def transfer(
     Exactly one of ``table``, ``tables``, ``schema`` picks the scope. The URL
     schemes pick the route — ``postgres://``/``postgresql://``, ``mysql://``,
     ``gsheets://<spreadsheet_id>?credentials=/path/key.json`` (tabs are the
-    tables, all-text, replace only) sources; ``postgres://``, ``clickhouse://``
-    (``clickhouse+https://`` for TLS),
+    tables, all-text, replace only), ``github://owner/repo[/dir]?ref=main``
+    (CSV files are the tables, all-text, replace only) sources; ``postgres://``,
+    ``clickhouse://`` (``clickhouse+https://`` for TLS),
     ``bigquery://<project>/<dataset>?credentials=/path/key.json`` destinations — and
     each pair negotiates its fastest wire format (raw binary COPY passthrough,
     in-flight RowBinary transcode, raw wire decode, or gzipped parallel load jobs).

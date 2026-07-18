@@ -55,6 +55,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | MySQL | `mysql://` | `mysql://user:pass@host:3306/db` |
 | ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. |
 | Google Sheets (source) | `gsheets://` | `gsheets://<spreadsheet_id>?credentials=/path/key.json` — the id from the sheet's URL. See [Google Sheets source](#google-sheets-source). |
+| GitHub (source) | `github://` | `github://<owner>/<repo>[/dir]?ref=main` — CSV files as tables. See [GitHub source](#github-source-csv-files-as-tables). |
 
 Table names may be schema-qualified (`public.events`, `mydb.events`); unqualified
 Postgres names resolve through the connection's `search_path`. Materialized views
@@ -445,6 +446,37 @@ apitap.transfer("gsheets://<id>?credentials=…", dst, tables=["Sheet1", "Q3 dat
   `APITAP_GSHEETS_PAGE_ROWS` if you hit per-request API limits). The Sheets API
   caps a spreadsheet at 10M cells, so a tab is always small by database
   standards — one pipe moves it.
+
+## GitHub source (CSV files as tables)
+
+```python
+apitap.transfer(
+    "github://apitap/apitap-lib/tests/data",   # repo directory
+    "postgresql://user:pass@host:5432/db",
+    table="people",                            # tests/data/people.csv
+)
+# every .csv under the directory at once, or an explicit list:
+apitap.transfer("github://owner/repo/exports?ref=v2.1", dst, schema="*")
+apitap.transfer("github://owner/repo", dst, tables=["users", "2026/orders"])
+```
+
+- **Model**: the repo (or one directory) is the database; every `.csv` under it
+  is a table, named by its file stem (`exports/2026/users.csv` → `users`; two
+  files sharing a stem fail loudly — narrow the directory). Row 1 is the header
+  row (blank headers become `col_N`, duplicates fail loudly).
+- **Ref**: `?ref=` pins a branch, tag, or commit SHA; default is the repo's
+  default branch. Pinning a SHA gives perfectly reproducible loads.
+- **Auth**: set `GITHUB_TOKEN` (or `GH_TOKEN`) for private repos; it also lifts
+  the API rate limit (60/h anonymous → 5,000/h). The token rides only in the
+  Authorization header — never put it in the URL.
+- **Types**: every column arrives as **nullable TEXT** exactly as written in
+  the file — a typed cast belongs in the destination. An empty field is `NULL`;
+  a short row NULL-pads its missing trailing fields; a row with MORE fields
+  than the header is refused loudly (silently dropping fields is data loss).
+  Parsing is RFC-4180: quoted fields, embedded commas/newlines, `""` escapes.
+- **Destinations**: Postgres, ClickHouse, and MySQL. Files stream — size never
+  bounds memory.
+- **Modes**: `mode="replace"` only (files carry no usable cursor).
 
 ## Durability
 

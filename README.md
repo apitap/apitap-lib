@@ -173,6 +173,10 @@ use it for rebuildable destinations.
       tabs are the tables, row 1 the headers, everything nullable TEXT as the
       sheet displays it; service-account auth shared with BigQuery; works with
       `tables=`/`schema=` multi-table too)
+- [x] GitHub → Postgres / ClickHouse / MySQL (`github://owner/repo[/dir]?ref=…` —
+      CSV files are the tables, streamed RFC-4180 with strict ragged-row rules;
+      `GITHUB_TOKEN` for private repos; `?ref=` pins a branch/tag/SHA for
+      reproducible loads)
 - [ ] Postgres → Snowflake
 
 ## Development

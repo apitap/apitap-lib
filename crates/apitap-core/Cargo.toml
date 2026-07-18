@@ -32,6 +32,9 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonwebtoken = "9"
+# Incremental RFC-4180 parsing for the CSV-file sources (GitHub); zero-dep
+# push parser, records stream through a bounded buffer.
+csv-core = "0.1"
 # zlib-rs backend: ~2-4x faster than the default miniz_oxide at the same
 # ratio — the gzip leg is the CPU wall on small cores (BigQuery route).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
