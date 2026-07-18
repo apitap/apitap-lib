@@ -54,6 +54,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | Postgres | `postgres://` or `postgresql://` | standard DSN: `postgres://user:pass@host:5432/db` |
 | MySQL | `mysql://` | `mysql://user:pass@host:3306/db` |
 | ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. |
+| Google Sheets (source) | `gsheets://` | `gsheets://<spreadsheet_id>?credentials=/path/key.json` — the id from the sheet's URL. See [Google Sheets source](#google-sheets-source). |
 
 Table names may be schema-qualified (`public.events`, `mydb.events`); unqualified
 Postgres names resolve through the connection's `search_path`. Materialized views
@@ -410,6 +411,40 @@ apitap.transfer(
   so never point two pipelines at one destination table without the fan-in
   guard tripping first.
 
+## Google Sheets source
+
+```python
+apitap.transfer(
+    "gsheets://1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms?credentials=/path/service-account.json",
+    "postgresql://user:pass@host:5432/db",
+    table="Class Data",          # a TAB name — quotes/spaces are fine
+)
+# or every tab at once (the multi-table machinery, same as databases):
+apitap.transfer("gsheets://<id>?credentials=…", dst, schema="*")
+apitap.transfer("gsheets://<id>?credentials=…", dst, tables=["Sheet1", "Q3 data"])
+```
+
+- **Model**: the spreadsheet is the database, its **tabs are the tables**. Row 1
+  is the header row and becomes the column names (blank header cells become
+  `col_N`; duplicate headers fail loudly — rename them in the sheet).
+- **Auth**: the same service-account key flow as BigQuery (`?credentials=` or
+  `GOOGLE_APPLICATION_CREDENTIALS`), read-only Sheets scope. **Share the
+  spreadsheet with the service account's email** (viewer is enough) — that's
+  how Google grants a robot access; sheets that are link-visible work without
+  sharing.
+- **Types**: every column arrives as **nullable TEXT**, rendered exactly as the
+  sheet displays it (`FORMATTED_VALUE`). Sheets are untyped — a typed cast
+  belongs in the destination, where it can fail loudly per value. Blank cells
+  land as `NULL`.
+- **Destinations**: Postgres and ClickHouse (all-text delivery over the binary
+  lanes). BigQuery is not wired for this source yet.
+- **Modes**: `mode="replace"` only. Sheets carry no usable incremental cursor,
+  so append/merge are refused loudly.
+- **Paging**: rows stream in 10k-row pages (override with
+  `APITAP_GSHEETS_PAGE_ROWS` if you hit per-request API limits). The Sheets API
+  caps a spreadsheet at 10M cells, so a tab is always small by database
+  standards — one pipe moves it.
+
 ## Durability
 
 `durable=False` (Postgres destinations only) loads through an **UNLOGGED** staging
@@ -510,11 +545,10 @@ Three honest caveats:
 
 ## Current limitations
 
-- Full-table replace today — incremental sync (cursor-based append & merge) is on
-  the roadmap.
 - Wheels: Linux x86-64 today (aarch64 and macOS planned).
-- One table per call — loop for many (or run several calls in parallel: each call
-  holds `parallel`+1 connections per side).
+- BigQuery: `mode="merge"` not supported yet; not wired as a destination for the
+  Google Sheets source.
+- Google Sheets: source only, `mode="replace"` only (no usable cursor in a sheet).
 - The GIL is released for the whole transfer, so other Python threads keep running.
 
 ## Troubleshooting

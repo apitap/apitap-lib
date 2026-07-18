@@ -2,8 +2,6 @@
 //! backslash escape set — the vocabulary of `WireFormat::TabSeparated` as a
 //! Postgres source emits it.
 
-pub(crate) const NULL_MARKER: &[u8] = b"\\N";
-
 
 /// Un-escape one PostgreSQL text-COPY field into `out`. Only called when a
 /// backslash was seen — the common case borrows the raw bytes.

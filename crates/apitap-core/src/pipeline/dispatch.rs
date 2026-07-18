@@ -7,9 +7,10 @@
 
 use super::Profile;
 use crate::error::{Error, Result};
-use crate::sink::clickhouse::{ChDdl, ChSink};
+use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
+use crate::source::gsheets::GsheetsSource;
 use crate::source::mysql::MySqlSource;
 use crate::source::postgres::PgSource;
 use crate::{MultiReport, TransferOptions, TransferReport};
@@ -47,6 +48,12 @@ const TO_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6 };
 const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6 };
 const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6 };
 const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6 };
+
+// Google Sheets reads are one API stream; parallelism buys nothing.
+fn gsheets_parallel(_cores: usize) -> usize {
+    1
+}
+const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1 };
 
 /// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
 fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
@@ -133,10 +140,32 @@ pub(crate) async fn single(
             )
             .await
         }
+        ("gsheets", "postgres" | "postgresql") => {
+            let profile = GSHEETS;
+            let (chunk, parallel) = super::knobs(opts, &profile)?;
+            let src = GsheetsSource::connect(src_url).await?;
+            let sink = PgSink::connect(dst_url, dest_table, parallel + 1, false).await?;
+            super::run(
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started,
+                &source_id,
+            )
+            .await
+        }
+        ("gsheets", "clickhouse" | "clickhouse+https") => {
+            let profile = GSHEETS;
+            let (chunk, parallel) = super::knobs(opts, &profile)?;
+            let src = GsheetsSource::connect(src_url).await?;
+            let sink = ChSink::connect(dst_url, dest_table, ch_ddl.clone())?;
+            super::run(
+                &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started,
+                &source_id,
+            )
+            .await
+        }
         (s, d) => Err(Error::InvalidInput(format!(
             "unsupported route {s}:// → {d}:// (supported: postgres→postgres, \
              postgres→clickhouse, postgres→bigquery, mysql→clickhouse, \
-             mysql→postgres, mysql→mysql)"
+             mysql→postgres, mysql→mysql, gsheets→postgres, gsheets→clickhouse)"
         ))),
     }
 }
@@ -334,11 +363,39 @@ pub(crate) async fn multi(
                 super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
             (budget, r)
         }
+        ("gsheets", "postgres" | "postgresql") => {
+            let profile = GSHEETS;
+            let (chunk, budget) = super::knobs(opts, &profile)?;
+            let src = GsheetsSource::connect(src_url).await?;
+            let jobs = jobs_for(&src, &sel, false).await?;
+            let pool = PgSink::shared_pool(dst_url, budget + 8).await?;
+            let mk = |t: String| {
+                let pool = pool.clone();
+                async move { Ok(PgSink::bind(pool, &t, false)) }
+            };
+            let r =
+                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
+            (budget, r)
+        }
+        ("gsheets", "clickhouse" | "clickhouse+https") => {
+            let profile = GSHEETS;
+            let (chunk, budget) = super::knobs(opts, &profile)?;
+            let src = GsheetsSource::connect(src_url).await?;
+            let jobs = jobs_for(&src, &sel, true).await?;
+            let ch = ChConn::parse(dst_url)?;
+            let mk = |t: String| {
+                let (ch, ddl) = (ch.clone(), ch_ddl.clone());
+                async move { ChSink::bind(ch, &t, ddl) }
+            };
+            let r =
+                super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
+            (budget, r)
+        }
         (s, d) => {
             return Err(Error::InvalidInput(format!(
                 "unsupported route {s}:// → {d}:// (supported: postgres→postgres, \
                  postgres→clickhouse, postgres→bigquery, mysql→clickhouse, \
-                 mysql→postgres, mysql→mysql)"
+                 mysql→postgres, mysql→mysql, gsheets→postgres, gsheets→clickhouse)"
             )))
         }
     };

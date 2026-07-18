@@ -53,79 +53,8 @@ const ROTATE_SECS: u64 = 6;
 const ROTATE_HARD_BYTES: u64 = 96 * 1024 * 1024;
 const STATE_TABLE: &str = "_apitap_state";
 
-// ============================================================================
-// Service-account auth (JWT-bearer → OAuth2 access token)
-// ============================================================================
-
-#[derive(serde::Deserialize)]
-struct ServiceAccountKey {
-    client_email: String,
-    private_key: String,
-    #[serde(default = "default_token_uri")]
-    token_uri: String,
-}
-
-fn default_token_uri() -> String {
-    "https://oauth2.googleapis.com/token".to_string()
-}
-
-#[derive(serde::Serialize)]
-struct JwtClaims {
-    iss: String,
-    scope: &'static str,
-    aud: String,
-    iat: u64,
-    exp: u64,
-}
-
-async fn fetch_access_token(client: &reqwest::Client, credentials_json: &str) -> Result<String> {
-    let key: ServiceAccountKey = serde_json::from_str(credentials_json)
-        .map_err(|e| Error::InvalidInput(format!("invalid BigQuery service-account JSON: {e}")))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| Error::Transfer(format!("system clock: {e}")))?
-        .as_secs();
-    let claims = JwtClaims {
-        iss: key.client_email,
-        scope: BQ_SCOPE,
-        aud: key.token_uri.clone(),
-        iat: now,
-        exp: now + 3600,
-    };
-    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(key.private_key.as_bytes())
-        .map_err(|e| {
-            Error::InvalidInput(format!("invalid BigQuery service-account private_key: {e}"))
-        })?;
-    let assertion = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
-        &claims,
-        &encoding_key,
-    )
-    .map_err(|e| Error::Transfer(format!("failed to sign BigQuery JWT: {e}")))?;
-    let resp = client
-        .post(&key.token_uri)
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-            ("assertion", assertion.as_str()),
-        ])
-        .send()
-        .await
-        .map_err(|e| Error::Transfer(format!("bigquery token exchange: {e}")))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(Error::Transfer(format!(
-            "bigquery token exchange failed ({status}): {}",
-            body.trim()
-        )));
-    }
-    let v: Value = serde_json::from_str(&body)
-        .map_err(|e| Error::Transfer(format!("bigquery token response: {e}")))?;
-    v["access_token"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| Error::Transfer("bigquery token response missing access_token".into()))
-}
+// Service-account auth lives in crate::gcp (shared with the Sheets source).
+use crate::gcp::fetch_access_token;
 
 // ============================================================================
 // Connection: project/dataset + bearer-authenticated REST helpers
@@ -203,7 +132,7 @@ impl BqConn {
             ))
         })?;
         let client = reqwest::Client::new();
-        let token = fetch_access_token(&client, &credentials).await?;
+        let token = fetch_access_token(&client, &credentials, BQ_SCOPE).await?;
         Ok(Self {
             client,
             credentials: Arc::new(credentials),
@@ -219,7 +148,7 @@ impl BqConn {
     async fn bearer(&self) -> Result<String> {
         let mut auth = self.auth.lock().await;
         if auth.1.elapsed() >= std::time::Duration::from_secs(55 * 60) {
-            auth.0 = fetch_access_token(&self.client, &self.credentials).await?;
+            auth.0 = fetch_access_token(&self.client, &self.credentials, BQ_SCOPE).await?;
             auth.1 = std::time::Instant::now();
         }
         Ok(auth.0.clone())

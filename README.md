@@ -169,6 +169,10 @@ use it for rebuildable destinations.
 - [x] MySQL → MySQL (wire decode → `LOAD DATA LOCAL INFILE`, the only bulk path
       MySQL exposes; charset/collation preserved into the destination DDL, exact
       types, binary columns via `UNHEX`, UTC-normalized timestamps)
+- [x] Google Sheets → Postgres / ClickHouse (`gsheets://<id>?credentials=…` —
+      tabs are the tables, row 1 the headers, everything nullable TEXT as the
+      sheet displays it; service-account auth shared with BigQuery; works with
+      `tables=`/`schema=` multi-table too)
 - [ ] Postgres → Snowflake
 
 ## Development

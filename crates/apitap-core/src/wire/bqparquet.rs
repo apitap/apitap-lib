@@ -114,18 +114,6 @@ impl ColBuf {
         }
     }
 
-    fn len(&self) -> usize {
-        match self {
-            ColBuf::I64(v) => v.len(),
-            ColBuf::F32(v) => v.len(),
-            ColBuf::F64(v) => v.len(),
-            ColBuf::Bool(v) => v.len(),
-            ColBuf::Dec { vals, .. } => vals.len(),
-            ColBuf::Date(v) | ColBuf::Ts(v) => v.len(),
-            ColBuf::Bytes(v) => v.len(),
-        }
-    }
-
     /// RESIDENT bytes, for row-group sizing — ByteArray/FLBA hold a struct
     /// (~32 B) plus a heap allocation with allocator quantum; undercounting
     /// here is how a 24 MiB gate turns into a 256 MB OOM at 4 pipes.

@@ -25,6 +25,7 @@
 
 mod dialect;
 mod error;
+mod gcp;
 mod pipeline;
 mod plan;
 mod sink;
