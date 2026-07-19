@@ -8,7 +8,22 @@ on:
     tags: ["v*"]
 
 jobs:
+  # The wheel is abi3 built once on a NEW Python — nothing else ever imports it
+  # on 3.9, so the floor claim must be proven here before anything publishes.
+  smoke-py39:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Wheel imports on the oldest supported Python
+        run: |
+          pip install dist/*.whl
+          python -c "import apitap; print('py3.9 import ok', apitap.__version__)"
+
   pypi:
+    needs: smoke-py39
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

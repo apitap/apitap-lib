@@ -16,6 +16,8 @@ The engine is Rust (see https://apitap.dev); this package is a thin binding.
     report = apitap.transfer(src, dst, schema="public")
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from apitap._apitap import (
