@@ -47,6 +47,7 @@ for _ in 1 2; do
     train "$MY" "$CH" bench_my_1m
     train "$MY" "$PD" bench_my_1m
     train "$MY" "$MYD" bench_my_1m
+    train "$PS" "$MYD" public.bench_data_1m   # pg->mysql (0.13.0): pgmytsv transcoder
 done
 # BigQuery route (both lanes — untrained branches can regress): needs a live
 # project. Set BQ_TRAIN_URL='bigquery://proj/ds?credentials=/sa/key.json' and
