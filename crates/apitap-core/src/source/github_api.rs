@@ -54,13 +54,22 @@ struct Col {
     udt: &'static str,
     ex: Ex,
     pk: bool,
+    /// Bounded DDL spelling (PG `format_type` vocabulary, e.g. `character
+    /// varying(64)`) for text columns whose values have a known cap. The MySQL
+    /// sink derives an indexable VARCHAR(n) from it — without a bound a text
+    /// PK maps to LONGTEXT, which MySQL refuses to index. Same-engine sinks
+    /// never mirror it (the plan's engine is `github+api`).
+    native: Option<&'static str>,
 }
 
 const fn c(name: &'static str, udt: &'static str, ex: Ex) -> Col {
-    Col { name, udt, ex, pk: false }
+    Col { name, udt, ex, pk: false, native: None }
 }
 const fn pk(name: &'static str, udt: &'static str, ex: Ex) -> Col {
-    Col { name, udt, ex, pk: true }
+    Col { name, udt, ex, pk: true, native: None }
+}
+const fn pk_bounded(name: &'static str, udt: &'static str, ex: Ex, native: &'static str) -> Col {
+    Col { name, udt, ex, pk: true, native: Some(native) }
 }
 
 struct Entity {
@@ -142,7 +151,8 @@ const ENTITIES: &[Entity] = &[
         cursor: Some("committed_at"),
         drop_if_key: None,
         cols: &[
-            pk("sha", "text", Ex::Txt(&["sha"])),
+            // 40 hex today; 64 covers SHA-256 object format.
+            pk_bounded("sha", "text", Ex::Txt(&["sha"]), "character varying(64)"),
             c("author_name", "text", Ex::Txt(&["commit", "author", "name"])),
             c("author_login", "text", Ex::Txt(&["author", "login"])),
             c("message", "text", Ex::Txt(&["commit", "message"])),
@@ -240,7 +250,7 @@ const ENTITIES: &[Entity] = &[
         cursor: None,
         drop_if_key: None,
         cols: &[
-            pk("name", "text", Ex::Txt(&["name"])),
+            pk_bounded("name", "text", Ex::Txt(&["name"]), "character varying(255)"),
             c("sha", "text", Ex::Txt(&["commit", "sha"])),
             c("protected", "bool", Ex::Bool(&["protected"])),
             c("raw", "jsonb", Ex::Raw),
@@ -256,7 +266,7 @@ const ENTITIES: &[Entity] = &[
         cursor: None,
         drop_if_key: None,
         cols: &[
-            pk("name", "text", Ex::Txt(&["name"])),
+            pk_bounded("name", "text", Ex::Txt(&["name"]), "character varying(255)"),
             c("sha", "text", Ex::Txt(&["commit", "sha"])),
             c("raw", "jsonb", Ex::Raw),
         ],
@@ -678,7 +688,7 @@ impl Source for GithubApiSource {
                     name: col.name.to_string(),
                     nullable: true,
                     int_pk: false,
-                    native_ddl: None,
+                    native_ddl: col.native.map(str::to_string),
                     udt: col.udt.into(),
                     precision: None,
                     scale: None,
@@ -1032,6 +1042,16 @@ mod tests {
                 "{} missing a primary key column",
                 e.name
             );
+            // A text PK without a bound maps to LONGTEXT on MySQL, which
+            // cannot be indexed — the route would refuse at prepare().
+            for col in e.cols.iter().filter(|c| c.pk && c.udt == "text") {
+                assert!(
+                    col.native.is_some_and(|n| n.starts_with("character varying(")),
+                    "{}.{} is a text PK without a bounded native type",
+                    e.name,
+                    col.name
+                );
+            }
             if e.since {
                 assert!(e.cursor.is_some(), "{} since without cursor", e.name);
             }
