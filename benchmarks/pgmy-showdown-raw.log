@@ -1,0 +1,28 @@
+=== 0. seed ===
+  bench_data_1m: 1000000
+  bench_data_10m: 10000000
+=== 1. build tool images ===
+  apitap img ok
+  ingestr img ok: ingestr version v1.1.1
+  dlt img ok: 1.29.0
+=== 2. apitap ===
+  apitap bench_data_1m: 1,000,000 rows 6.4s
+  apitap bench_data_10m: 10,000,000 rows 64.3s
+=== 3. ingestr (run-2 = warm) ===
+  ingestr bench_data_1m: rc=0 32.8s  [Ingestion completed successfully!]
+  ingestr bench_data_1m: rc=0 35.4s  [Ingestion completed successfully!]
+  ingestr bench_data_10m: rc=0 366.4s  [Ingestion completed successfully!]
+=== 4. dlt -> sqlalchemy(mysql) 1M (timeout 45m each) ===
+  dlt-default 1m: rc=0 329.7s  [Load package 1784418846.9981835 is LOADED and contains no failed jobs]
+  dlt-pyarrow 1m: rc=0 181.5s  [2026-07-19 00:00:16,569|[WARNING]|8|126326049977152|dlt|extractors.py|_compute_tables:552|In resource: bench_d]
+=== 5. validation ===
+  pg 1m : 1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb
+  pg 10m: 10000000|50000005000000
+  apitap-1m: 1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb
+  apitap-10m: 10000000|50000005000000
+  ingestr-1m: 1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb
+  ingestr-10m: 10000000|50000005000000
+  dlt tables: dltset.bench_data_1m,dltpa.bench_data_1m
+  dlt:dltset.bench_data_1m: 1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb
+  dlt:dltpa.bench_data_1m: 1000000|500000500000|1e17e89eb74ef556fa5c331d9a22eaeb
+DONE_SHOOTOUT

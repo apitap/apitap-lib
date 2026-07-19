@@ -512,3 +512,44 @@ and its faster pyarrow backend shown separately (its best case). apitap was
 the gcs-feature build later released as-is (the dist wheel's sha256 is the
 release). The bucket lived in `us-east1`; all tools shared the same network
 path.
+
+## Postgres → MySQL: apitap vs ingestr vs dlt
+
+The 25th route (apitap 0.13.0's pgcopy-binary → `LOAD DATA` transcoder),
+head-to-head on the same box. Each tool ran in an identical uncapped
+`python:3.12-slim` container on the host network, against the same stock
+Postgres source and stock MySQL 8 destination (both loopback Docker
+containers), moving the ingestr benchmark table. **Every destination table
+was checksum-validated** (count | sum(id) | md5(small_str ordered)) against
+the source before a time counted — all four 1M outputs and both 10M outputs
+matched exactly. Reproduce with [`run-mysql-dest.sh`](run-mysql-dest.sh);
+raw log in [`pgmy-showdown-raw.log`](pgmy-showdown-raw.log).
+
+dlt (1.29.0) has no native MySQL destination; its documented path is the
+generic `sqlalchemy` destination (pymysql), shown with both its default and
+its faster pyarrow source backend. ingestr was v1.1.1, warm run reported
+(cold and warm were within 8%).
+
+**1M rows, PG → MySQL:**
+
+| tool | time | vs apitap |
+|---|---|---|
+| **apitap** | **6.4 s** | — |
+| ingestr 1.1.1 | 32.8 s | 5.1× |
+| dlt 1.29.0 `sqlalchemy` + pyarrow backend | 181.5 s | 28× |
+| dlt 1.29.0 `sqlalchemy` default backend | 329.7 s | **52×** |
+
+**10M rows** (dlt extrapolates to ~30 min (pyarrow) / ~55 min (default) and
+was not run):
+
+| tool | time | vs apitap |
+|---|---|---|
+| **apitap** | **64.3 s** | — |
+| ingestr 1.1.1 | 366.4 s | 5.7× |
+
+The shape mirrors every other route here: apitap streams Postgres binary
+COPY and renders MySQL's `LOAD DATA` text dialect in-flight (one bulk-load
+statement per pipe), while the Python tools decode rows into Python/Arrow
+objects and re-insert them through SQLAlchemy. MySQL's own `LOAD DATA`
+ingest speed is the floor on this route for every tool — apitap sits close
+to it.
