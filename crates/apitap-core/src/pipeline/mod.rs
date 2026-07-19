@@ -205,21 +205,38 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         .copied()
         .find(|f| sink.lane_ok(&plan, *f) && src.can_produce(&plan, *f))
         .ok_or_else(|| {
-            let offered: Vec<&str> = sink
-                .accepts()
-                .iter()
-                .map(|f| match f {
+            let mut offered = Vec::new();
+            let mut uncovered: Vec<(String, String)> = Vec::new();
+            for f in sink.accepts() {
+                offered.push(match f {
                     WireFormat::PgCopyBinary => "binary COPY",
                     WireFormat::RowBinary => "RowBinary",
                     WireFormat::TabSeparated => "PG text",
                     WireFormat::MyTsv => "MySQL text",
-                })
-                .collect();
+                });
+                for (n, u) in src.uncovered_cols(&plan, *f) {
+                    if !uncovered.iter().any(|(en, _)| en == &n) {
+                        uncovered.push((n, u));
+                    }
+                }
+            }
+            let cols = if uncovered.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Columns its wire format can't carry: {} — cast them in a \
+                     source view.",
+                    uncovered
+                        .iter()
+                        .map(|(n, u)| format!("{n} ({u})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             Error::InvalidInput(format!(
-                "no common wire format for {} → this destination (it accepts: {}). \
-                 Usual causes: a column type excluded from the destination's binary \
-                 lane (cast it in a source view), or gcs:// without format=parquet — \
-                 see the route matrix in docs/usage.md",
+                "no common wire format for {} → this destination (it accepts: {}).{cols} \
+                 Other causes: a column type excluded from a lane, or gcs:// without \
+                 format=parquet — see the route matrix in docs/usage.md",
                 plan.engine,
                 offered.join(", ")
             ))
