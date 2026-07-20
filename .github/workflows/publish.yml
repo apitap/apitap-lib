@@ -22,6 +22,24 @@ jobs:
           pip install dist/*.whl
           python -c "import apitap; print('py3.9 import ok', apitap.__version__)"
 
+      # The PyPI project page renders py-apitap/README.md — a DIFFERENT file from
+      # the repo root README. It silently drifted ~8 releases once (the page still
+      # advertised 4 routes when 25 were wired). This gate makes that impossible:
+      # every scheme in the route table must appear on the page we publish.
+      - name: PyPI README lists every route scheme
+        run: |
+          schemes=$(grep -oE '"[a-z+]+" *-> *"[a-z+]+"' crates/apitap-core/src/pipeline/dispatch.rs \
+            | tr -d '"' | sed 's/ *-> */\n/' | sort -u)
+          missing=""
+          for s in $schemes; do
+            grep -q -- "$s://" py-apitap/README.md || missing="$missing $s"
+          done
+          if [ -n "$missing" ]; then
+            echo "py-apitap/README.md (the PyPI page) never mentions:$missing"
+            exit 1
+          fi
+          echo "PyPI README covers every route scheme:"; echo "$schemes" | tr '\n' ' '; echo
+
   pypi:
     needs: smoke-py39
     runs-on: ubuntu-latest
