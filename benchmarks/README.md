@@ -553,3 +553,51 @@ statement per pipe), while the Python tools decode rows into Python/Arrow
 objects and re-insert them through SQLAlchemy. MySQL's own `LOAD DATA`
 ingest speed is the floor on this route for every tool — apitap sits close
 to it.
+
+## Constrain the tool, not the databases — PG → ClickHouse at 256 MB
+
+The other tables here cap *everything* — tool and databases alike. This one caps
+only the **tool**: source Postgres and destination ClickHouse are ordinary
+servers, and the transfer process runs inside a container held to a fixed
+memory and CPU ceiling. That isolates the question a bounded-memory claim
+actually turns on: *how much RAM does the mover itself need?*
+
+Same protocol as everything else: one run at a time (concurrent runs distort
+each other's timings), each in a fresh container, and **the destination row
+count is read back and must match before a time counts**. Every number below is
+verified. This is the rig behind **[apitap.dev/lab](https://apitap.dev/lab)** —
+you can run these exact comparisons in a browser, no install.
+
+**1,000,000 rows:**
+
+| tool | tool box: 256 MB / 0.5 vCPU | tool box: 1 GB / 2 vCPU |
+|---|---|---|
+| **apitap 0.13.0** | **6.4 s** | **6.8 s** |
+| ingestr 1.1.1 | 46.0 s | 12.9 s |
+| dlt 1.29 + pyarrow | **OOM-killed** (exit 137) | 45 s |
+
+**5,000,000 rows:**
+
+| tool | tool box: 256 MB / 0.5 vCPU | tool box: 1 GB / 2 vCPU |
+|---|---|---|
+| **apitap 0.13.0** | **25.6 s** | **29.1 s** |
+| ingestr 1.1.1 | 201 s | 62.1 s |
+| dlt 1.29 + pyarrow | **OOM-killed** (exit 137, ~9 s in) | 208 s |
+
+Three things worth reading off this:
+
+- **dlt dies at 256 MB at either size** — it materializes the result set through
+  pyarrow, so the ceiling is hit before the data is. Giving it 1 GB fixes the
+  crash and it completes, ~7× slower than apitap.
+- **ingestr survives 256 MB** — it streams, so it fits; it just crawls (46 s vs
+  6.4 s at 1M, 201 s vs 25.6 s at 5M). Surviving a small box and being fast on
+  one are different properties.
+- **apitap barely notices the box.** 5M in 25.6 s at 256 MB vs 29.1 s at 1 GB —
+  and the *smaller* box is marginally faster, because at 0.5 vCPU apitap opens
+  fewer parallel pipes, which means less insert contention at ClickHouse. Its
+  memory is bounded by design (chunk buffers), not by how much you hand it.
+
+Caveat, stated plainly: the databases here are ordinary-sized. A 1.5 GB
+ClickHouse cannot *receive* a 5M-row insert regardless of which tool sends it —
+that is a destination limit, not a mover's, and conflating the two would make
+any tool look broken.

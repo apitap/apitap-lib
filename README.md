@@ -46,6 +46,20 @@ workload where apitap does badly — please open an issue. This project has
 been corrected by its own failed runs more than once, and it is better for
 each of them.
 
+## Try it without installing anything
+
+**[apitap.dev/lab](https://apitap.dev/lab)** runs the real PyPI wheel — plus
+ingestr and dlt, each pip-installed alongside it — against a seeded Postgres and
+ClickHouse on the site's own hardware. Pick a tool, pick the box it runs in
+(1 GB / 2 vCPU or **256 MB / 0.5 vCPU**), press run, and watch the engine's own
+output stream back. Every result is row-count-verified before a number appears,
+and the destination table is dropped afterwards.
+
+The point of the box picker: at 256 MB, apitap moves 5M rows in ~26 s, ingestr
+crawls through in ~200 s, and dlt is OOM-killed. Those exact numbers, with the
+methodology, are in
+[benchmarks/README.md](benchmarks/README.md#constrain-the-tool-not-the-databases--pg--clickhouse-at-256-mb).
+
 ## Documentation
 
 **📰 Launch post:** [*I moved 10 million rows in 9.9 seconds with pip install apitap — and learned why your ELT benchmark is probably lying to you*](https://medium.com/p/i-moved-10-million-rows-in-9-9-seconds-with-pip-install-apitap-e3c6a826b253) — the origin story, the full showdown vs ingestr and dlt, and three lessons about "rows per hour".
