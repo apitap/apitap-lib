@@ -64,6 +64,8 @@ methodology, are in
 
 **📰 Launch post:** [*I moved 10 million rows in 9.9 seconds with pip install apitap — and learned why your ELT benchmark is probably lying to you*](https://medium.com/p/i-moved-10-million-rows-in-9-9-seconds-with-pip-install-apitap-e3c6a826b253) — the origin story, the full showdown vs ingestr and dlt, and three lessons about "rows per hour".
 
+**📰 Part 2:** [*I moved 100 GB between databases in 9 minutes — on half a CPU core and less RAM than a browser tab*](https://medium.com/@abdul.haris.djafar/i-moved-100-gb-between-databases-in-9-minutes-on-half-a-cpu-core-and-less-ram-than-a-browser-tab-84f15850535d) — the profiling day behind v0.14.0: the allocator swap that measured worse, the buffer recycling that beat it, the 44 MB floor, the 100 GB ladder, and the same-box control runs. Numbers and raw logs: [benchmarks/profiling.md](benchmarks/profiling.md).
+
 The full usage guide — connection URLs, every option, per-route type mappings,
 durability semantics, troubleshooting — lives in [docs/usage.md](docs/usage.md).
 
