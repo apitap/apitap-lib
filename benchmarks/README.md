@@ -5,6 +5,19 @@ records exactly what runs, where the numbers came from, and what they do — and
 not — show. If anything here looks unfair, open an issue; the harness is small enough
 to audit in one sitting.
 
+Companion write-ups in this directory:
+
+- **[profiling.md](profiling.md)** — the hot-path profiling story (hotpath-rs,
+  feature-gated in the crate), the buffer-recycling optimization it produced
+  (alloc churn −95%, peak RSS −42%), the 44 MB floor probes, the **100 GB
+  ladder** (232M rows through 256→44 MB containers), and the same-box control
+  runs where latest ingestr and dlt+pyarrow OOM in ~21 s.
+  Raw: [100gb-ladder-raw.log](100gb-ladder-raw.log),
+  [hotpath-profile-raw.log](hotpath-profile-raw.log).
+- **[mimalloc-ab.md](mimalloc-ab.md)** — the allocator swap that measured worse
+  and was rejected; kept so it isn't re-tried without new evidence.
+  Raw: [mimalloc-ab-raw.log](mimalloc-ab-raw.log).
+
 ## What is compared
 
 PG→PG full-table transfer: **apitap** (this library) vs **[ingestr](https://github.com/bruin-data/ingestr)**,
