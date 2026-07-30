@@ -30,6 +30,8 @@ PG_DOCKER="${PG_DOCKER:-1}"
 SRC_DB="${SRC_DB:-apitap_bench_src}"; DST_DB="${DST_DB:-apitap_bench_dst}"
 ROWS="${ROWS:-1000000}"; WITH_INGESTR="${WITH_INGESTR:-1}"
 CAP_CPUS="${CAP_CPUS:-2}"; CAP_MEM="${CAP_MEM:-2g}"
+# Optional pipe-count override for apitap (empty = the engine's auto heuristic).
+PARALLEL="${PARALLEL:-}"
 # Destination engine: postgres (default) or clickhouse.
 DEST="${DEST:-postgres}"
 
@@ -128,26 +130,29 @@ fi
 # Canonical checksum — one string producible from BOTH engines (decimal trim_scale'd,
 # timestamps formatted, tstz normalized to UTC; float sums excluded — their text form
 # is not comparable across engines). 16 per-column aggregates.
+# String columns use SUM of a per-row 32-bit md5 prefix (signed, order-independent)
+# instead of md5(string_agg(...)): the concatenated buffer crosses Postgres's 1 GiB
+# varlena limit around ~110M rows ("cannot enlarge string buffer") — hit at 232M.
 VALIDATE_PG="SELECT count(*) || '|' || sum(id) || '|' || sum(tiny_int) || '|' || sum(regular_int) || '|' ||
- sum(big_int) || '|' || md5(string_agg(small_str, '' ORDER BY id)) || '|' ||
- md5(string_agg(medium_str, '' ORDER BY id)) || '|' || sum(length(large_str)) || '|' ||
+ sum(big_int) || '|' || sum((('x'||substr(md5(small_str),1,8))::bit(32)::int)::bigint) || '|' ||
+ sum((('x'||substr(md5(medium_str),1,8))::bit(32)::int)::bigint) || '|' || sum(length(large_str)) || '|' ||
  sum(length(extra_text)) || '|' || trim_scale(sum(decimal_val)) || '|' ||
  count(*) FILTER (WHERE bool_val) || '|' || min(date_val) || '|' || max(date_val) || '|' ||
  to_char(min(ts_val), 'YYYY-MM-DD HH24:MI:SS') || '|' || to_char(max(ts_val), 'YYYY-MM-DD HH24:MI:SS') || '|' ||
  to_char(max(ts_tz_val) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || '|' ||
- md5(string_agg(json_val->>'key', '' ORDER BY id)) FROM public.TBL"
+ sum((('x'||substr(md5(json_val->>'key'),1,8))::bit(32)::int)::bigint) FROM public.TBL"
 # NB: sum(big_int) at 10M rows exceeds Int64 (5.0e19 > 9.2e18) — ClickHouse's sum()
 # wraps silently while Postgres promotes to numeric, so the CH side sums in Int128.
 VALIDATE_CH="SELECT concat(toString(count()), '|', toString(sum(id)), '|', toString(sum(tiny_int)), '|',
  toString(sum(regular_int)), '|', toString(sum(toInt128(big_int))), '|',
- lower(hex(MD5(arrayStringConcat(arrayMap(x -> x.2, arraySort(groupArray((id, small_str)))))))), '|',
- lower(hex(MD5(arrayStringConcat(arrayMap(x -> x.2, arraySort(groupArray((id, medium_str)))))))), '|',
+ toString(sum(toInt64(reinterpretAsInt32(reverse(unhex(substring(lower(hex(MD5(small_str))),1,8))))))), '|',
+ toString(sum(toInt64(reinterpretAsInt32(reverse(unhex(substring(lower(hex(MD5(medium_str))),1,8))))))), '|',
  toString(sum(length(large_str))), '|', toString(sum(length(extra_text))), '|',
  toString(sum(decimal_val)), '|', toString(countIf(bool_val = 1)), '|',
  toString(min(date_val)), '|', toString(max(date_val)), '|',
  formatDateTime(min(ts_val), '%Y-%m-%d %H:%i:%S'), '|', formatDateTime(max(ts_val), '%Y-%m-%d %H:%i:%S'), '|',
  formatDateTime(max(ts_tz_val), '%Y-%m-%d %H:%i:%S'), '|',
- lower(hex(MD5(arrayStringConcat(arrayMap(x -> x.2, arraySort(groupArray((id, JSONExtractString(json_val, 'key')))))))))
+ toString(sum(toInt64(reinterpretAsInt32(reverse(unhex(substring(lower(hex(MD5(JSONExtractString(json_val, 'key')))),1,8)))))))
  ) FROM TBL"
 
 # Checksum of a destination table, per engine.
@@ -164,13 +169,25 @@ if [[ "$DEST" == "postgres" ]]; then
 fi
 
 echo "==> seeding public.${TABLE} (${ROWS} rows) in ${SRC_DB}…"
+# Source checksum cache: the sum only changes when the seed does, and computing it
+# scans the whole table (~10 min at 100 GB) — cache it per (db, table, validator
+# formula) so repeat runs against the same seed skip the scan. Re-seeding drops it.
+SRCSUM_CACHE="$HOME/.apitap-srcsum-${SRC_DB}-${TABLE}-$(printf '%s' "$VALIDATE_PG" | md5sum | cut -c1-8)"
 if [[ "$(qs "$SRC_DB" "SELECT count(*) FROM public.${TABLE}" 2>/dev/null || echo 0)" == "$ROWS" ]]; then
     echo "    already seeded"
 else
+    rm -f "$SRCSUM_CACHE"
     sed "s/BENCH_TABLE_PLACEHOLDER/${TABLE}/g; s/BENCH_ROWS_PLACEHOLDER/${ROWS}/g" seed.sql > /tmp/apitap_seed.sql
     time qsf "$SRC_DB" /tmp/apitap_seed.sql >/dev/null
 fi
-SRC_SUM="$(qs "$SRC_DB" "${VALIDATE_PG//TBL/$TABLE}")"
+if [[ -s "$SRCSUM_CACHE" ]]; then
+    SRC_SUM="$(cat "$SRCSUM_CACHE")"
+    echo "==> source checksum: cached"
+else
+    echo "==> source checksum: computing (full scan)…"
+    SRC_SUM="$(qs "$SRC_DB" "${VALIDATE_PG//TBL/$TABLE}")"
+    printf '%s' "$SRC_SUM" > "$SRCSUM_CACHE"
+fi
 
 # ---- one-time images -----------------------------------------------------------------
 if ! docker image inspect "$APITAP_IMG" >/dev/null 2>&1; then
@@ -193,10 +210,16 @@ APITAP_T="$(docker run --rm --network=host --cpus="$CAP_CPUS" --memory="$CAP_MEM
     python -c "
 import apitap, time
 t0 = time.time()
-r = apitap.transfer('$SRC_URI', '$DST_URI', table='public.${TABLE}')
+r = apitap.transfer('$SRC_URI', '$DST_URI', table='public.${TABLE}'${PARALLEL:+, parallel=$PARALLEL})
 print(f'    {r.rows:,} rows over {r.parallel} pipes', flush=True)
 print('ELAPSED', time.time() - t0)
-" | tee /dev/stderr | awk '/^ELAPSED/{print $2}')"
+# cgroup v2 then v1 — the container's own peak, so allocator changes show up here
+for p in ('/sys/fs/cgroup/memory.peak', '/sys/fs/cgroup/memory/memory.max_usage_in_bytes'):
+    try:
+        print('PEAK_MB', round(int(open(p).read()) / 1048576, 1)); break
+    except OSError:
+        pass
+" | tee -a /dev/stderr | awk '/^ELAPSED/{print $2}')"
 APITAP_OK="MISMATCH"
 APITAP_SUM="$(val_dest "$TABLE")"
 if [[ "$APITAP_SUM" == "$SRC_SUM" ]]; then APITAP_OK="match"; else
@@ -218,7 +241,7 @@ r = subprocess.run(cmd, capture_output=True, text=True)
 if r.returncode != 0:
     print(r.stdout[-2000:], r.stderr[-2000:], sep='\n', file=sys.stderr); sys.exit(1)
 print('ELAPSED', time.time() - t0)
-" | tee /dev/stderr | awk '/^ELAPSED/{print $2}')"
+" | tee -a /dev/stderr | awk '/^ELAPSED/{print $2}')"
     INGESTR_OK="MISMATCH"
     if [[ "$DEST" == "clickhouse" ]]; then
         # dlt may prefix/rename its destination table — find what it actually created.
