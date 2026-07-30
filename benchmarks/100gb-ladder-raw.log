@@ -1,0 +1,58 @@
+════════ 100 GB LADDER (bench_data_232m, pg→ch, 0.5 vCPU) ════════
+──── 256m ────
+    232,000,000 rows over 5 pipes
+ELAPSED 536.7183637619019
+PEAK_MB 170.8
+apitap         536.7s        match
+──── 128m-p3 ────
+    232,000,000 rows over 3 pipes
+ELAPSED 638.8281638622284
+PEAK_MB 113.6
+apitap         638.8s        match
+──── 80m-p2 ────
+    232,000,000 rows over 2 pipes
+ELAPSED 874.9954125881195
+PEAK_MB 72.4
+apitap         875.0s        match
+──── 64m-p2 ────
+(OOM-killed mid-transfer — no ELAPSED; container exit 137)
+──── 48m ────
+    232,000,000 rows over 1 pipes
+ELAPSED 1552.6809511184692
+PEAK_MB 48.0
+apitap        1552.7s        match
+──── 44m ────
+    232,000,000 rows over 1 pipes
+ELAPSED 1423.0930740833282
+PEAK_MB 44.1
+apitap        1423.1s        match
+
+════════ COMPETITOR SHOWDOWN (same box: 0.5 cpu / 256 MB, 30-min cap) ════════
+==> building images (latest versions)…
+#7 unpacking to docker.io/library/apitap-bench-ingestr:latest 2.3s done
+#7 DONE 21.0s
+#8 unpacking to docker.io/library/apitap-bench-dlt:latest 8.0s done
+#8 DONE 44.8s
+ingestr version v1.1.14
+dlt 1.29.1
+    dest wiped; disk: 120G free
+==> ingestr (latest), 0.5 cpu / 256 MB, 30-min cap
+RESULT ingestr status=died-exit137-oomtrue elapsed=21s peak_mb=0 rows_landed=\N
+    | Primary Key: id
+    | 
+    | 
+    | 
+    | Starting data ingestion...
+    | [STRATEGY] 18:17:23 | Using staging table: _bruin_staging.default__bench_data_232m_ingestr_staging_1785435443938331170
+    dest wiped; disk: 120G free
+==> dlt (latest, pyarrow), 0.5 cpu / 256 MB, 30-min cap
+RESULT dlt status=died-exit137-oomtrue elapsed=21s peak_mb=0 rows_landed=\N
+    dest wiped; disk: 120G free
+COMPETITORS-DONE
+
+════════ REPRODUCTION RUN ════════
+==> building images (latest versions)…
+ingestr version v1.1.14
+dlt 1.29.1
+RESULT ingestr status=died-exit137-oomtrue elapsed=20s peak_mb=0 rows_landed=\N
+RESULT dlt status=died-exit137-oomtrue elapsed=20s peak_mb=0 rows_landed=\N

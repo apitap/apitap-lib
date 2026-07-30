@@ -1,0 +1,80 @@
+════════ base-postgres-0.5cpu-256m-r1 ════════
+    10,000,000 rows over 1 pipes
+ELAPSED 63.25394582748413
+PEAK_MB 51.4
+apitap          63.3s        match
+════════ base-postgres-0.5cpu-256m-r2 ════════
+    10,000,000 rows over 1 pipes
+ELAPSED 67.05516910552979
+PEAK_MB 47.9
+apitap          67.1s        match
+════════ base-postgres-16cpu-4g-r1 ════════
+    10,000,000 rows over 8 pipes
+ELAPSED 23.077275276184082
+PEAK_MB 476.8
+apitap          23.1s        match
+════════ base-postgres-16cpu-4g-r2 ════════
+    10,000,000 rows over 8 pipes
+ELAPSED 23.289066314697266
+PEAK_MB 513.3
+apitap          23.3s        match
+════════ base-clickhouse-0.5cpu-256m-r1 ════════
+    10,000,000 rows over 5 pipes
+ELAPSED 23.873637914657593
+PEAK_MB 159.6
+apitap          23.9s        match
+════════ base-clickhouse-0.5cpu-256m-r2 ════════
+    10,000,000 rows over 5 pipes
+ELAPSED 23.478997468948364
+PEAK_MB 159.7
+apitap          23.5s        match
+════════ base-clickhouse-16cpu-4g-r1 ════════
+    10,000,000 rows over 32 pipes
+ELAPSED 10.74463152885437
+PEAK_MB 356.7
+apitap          10.7s        match
+════════ base-clickhouse-16cpu-4g-r2 ════════
+    10,000,000 rows over 32 pipes
+ELAPSED 11.043091773986816
+PEAK_MB 382.5
+apitap          11.0s        match
+════════ mim-postgres-0.5cpu-256m-r1 ════════
+    10,000,000 rows over 1 pipes
+ELAPSED 62.94635820388794
+PEAK_MB 75.1
+apitap          62.9s        match
+════════ mim-postgres-0.5cpu-256m-r2 ════════
+    10,000,000 rows over 1 pipes
+ELAPSED 65.0104079246521
+PEAK_MB 66.4
+apitap          65.0s        match
+════════ mim-postgres-16cpu-4g-r1 ════════
+    10,000,000 rows over 8 pipes
+ELAPSED 23.27121067047119
+PEAK_MB 420.9
+apitap          23.3s        match
+════════ mim-postgres-16cpu-4g-r2 ════════
+    10,000,000 rows over 8 pipes
+ELAPSED 22.23417329788208
+PEAK_MB 418.9
+apitap          22.2s        match
+════════ mim-clickhouse-0.5cpu-256m-r1 ════════
+    10,000,000 rows over 5 pipes
+ELAPSED 23.04547119140625
+PEAK_MB 195.4
+apitap          23.0s        match
+════════ mim-clickhouse-0.5cpu-256m-r2 ════════
+    10,000,000 rows over 5 pipes
+ELAPSED 23.012274503707886
+PEAK_MB 189.2
+apitap          23.0s        match
+════════ mim-clickhouse-16cpu-4g-r1 ════════
+    10,000,000 rows over 32 pipes
+ELAPSED 11.22874927520752
+PEAK_MB 442.4
+apitap          11.2s        match
+════════ mim-clickhouse-16cpu-4g-r2 ════════
+    10,000,000 rows over 32 pipes
+ELAPSED 11.765949964523315
+PEAK_MB 410.6
+apitap          11.8s        match

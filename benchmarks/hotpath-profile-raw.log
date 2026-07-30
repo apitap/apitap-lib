@@ -1,0 +1,462 @@
+█████ BUILD timing █████
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded dirs-next v2.0.0
+  Downloaded dirs-sys-next v0.1.2
+  Downloaded chunked_transfer v1.5.0
+  Downloaded tiny_http v0.12.0
+  Downloaded is-terminal v0.4.17
+  Downloaded term v0.7.0
+  Downloaded raw-cpuid v11.6.0
+  Downloaded encode_unicode v1.0.0
+  Downloaded quanta v0.12.6
+  Downloaded ascii v1.1.0
+  Downloaded arc-swap v1.9.2
+  Downloaded unicode-width v0.1.14
+  Downloaded hdrhistogram v7.6.0
+  Downloaded httpdate v1.0.3
+  Downloaded hotpath-macros v0.22.0
+  Downloaded prettytable-rs v0.10.0
+  Downloaded hotpath v0.22.0
+   Compiling crossbeam-utils v0.8.22
+   Compiling errno v0.3.14
+   Compiling dirs-sys-next v0.1.2
+   Compiling rustversion v1.0.23
+   Compiling raw-cpuid v11.6.0
+   Compiling is-terminal v0.4.17
+   Compiling chunked_transfer v1.5.0
+   Compiling httpdate v1.0.3
+   Compiling unicode-width v0.1.14
+   Compiling encode_unicode v1.0.0
+   Compiling ascii v1.1.0
+   Compiling hdrhistogram v7.6.0
+   Compiling hotpath-macros v0.22.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling dirs-next v2.0.0
+   Compiling term v0.7.0
+   Compiling tokio v1.52.3
+   Compiling tiny_http v0.12.0
+   Compiling arc-swap v1.9.2
+   Compiling prettytable-rs v0.10.0
+   Compiling crossbeam-queue v0.3.13
+   Compiling concurrent-queue v2.5.0
+   Compiling crossbeam-channel v0.5.16
+   Compiling crossbeam-epoch v0.9.20
+   Compiling event-listener v5.4.1
+   Compiling crossbeam-deque v0.8.7
+   Compiling crossbeam v0.8.4
+   Compiling quanta v0.12.6
+   Compiling hotpath v0.22.0
+   Compiling tokio-stream v0.1.18
+   Compiling hyper v1.10.1
+   Compiling tokio-rustls v0.26.4
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling sqlx-core v0.8.6 (/io/vendor/sqlx-core)
+   Compiling tower-http v0.6.11
+   Compiling mysql_async v0.34.2
+   Compiling hyper-util v0.1.20
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query.rs:502:48
+    |
+501 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+502 | ) -> Query<'q, DB, <DB as Database>::Arguments<'_>>
+    |            -- the same lifetime is named here  ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: consistently use `'q`
+    |
+502 - ) -> Query<'q, DB, <DB as Database>::Arguments<'_>>
+502 + ) -> Query<'q, DB, <DB as Database>::Arguments<'q>>
+    |
+
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query_as.rs:389:53
+    |
+388 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+389 | ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'_>>
+    |              -- the same lifetime is named here     ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'q`
+    |
+389 - ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'_>>
+389 + ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'q>>
+    |
+
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query_scalar.rs:368:57
+    |
+367 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+368 | ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'_>>
+    |                  -- the same lifetime is named here     ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'q`
+    |
+368 - ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'_>>
+368 + ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'q>>
+    |
+
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling sqlx-postgres v0.8.6
+   Compiling sqlx-mysql v0.8.6
+warning: `sqlx-core` (lib) generated 3 warnings (run `cargo fix --lib -p sqlx-core` to apply 3 suggestions)
+   Compiling sqlx v0.8.6
+   Compiling apitap-core v0.13.2 (/io/crates/apitap-core)
+    Finished `release` profile [optimized] target(s) in 2m 08s
+█████ TIMING pg→pg █████
+10000000 rows in 23481 ms over 8 pipes
+[hotpath] 23.51s | timing, threads (CPU baseline avg: 335.03 µs)
+
+timing - Execution duration of functions.
++---------------------------+----------+-----------+-----------+----------+---------+
+| Function                  | Calls    | Avg       | P95       | Total    | % Total |
++---------------------------+----------+-----------+-----------+----------+---------+
+| postgres::copy_out_worker | 8        | 22.10 s   | 22.21 s   | 176.83 s | 752.26% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| postgres::send            | 1108     | 137.46 ms | 265.03 ms | 152.30 s | 647.90% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| profile::main             | 1        | 23.51 s   | 23.52 s   | 23.51 s  | 100.00% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| pipeline::run             | 1        | 23.46 s   | 23.47 s   | 23.46 s  | 99.78%  |
++---------------------------+----------+-----------+-----------+----------+---------+
+| pgcopy::push              | 10000048 | 456 ns    | 599 ns    | 4.57 s   | 19.43%  |
++---------------------------+----------+-----------+-----------+----------+---------+
+
+threads - Thread CPU and memory statistics. (RSS: 45.3 MB, 5/26)
++-----------------+----------+------+-------+-------+
+| Thread          | Status   | CPU% | Max%  | Avg%  |
++-----------------+----------+------+-------+-------+
+| tokio-rt-worker | Sleeping | 0.0% | 71.3% | 18.8% |
++-----------------+----------+------+-------+-------+
+| tokio-rt-worker | Sleeping | 0.0% | 59.6% | 11.8% |
++-----------------+----------+------+-------+-------+
+| tokio-rt-worker | Sleeping | 0.0% | 55.8% | 7.2%  |
++-----------------+----------+------+-------+-------+
+| tokio-rt-worker | Sleeping | 0.0% | 55.8% | 13.9% |
++-----------------+----------+------+-------+-------+
+| tokio-rt-worker | Sleeping | 0.0% | 47.6% | 4.7%  |
++-----------------+----------+------+-------+-------+
+
+█████ TIMING pg→ch █████
+10000000 rows in 11777 ms over 32 pipes
+[hotpath] 11.81s | timing, threads (CPU baseline avg: 356.79 µs)
+
+timing - Execution duration of functions.
++---------------------------+----------+----------+---------+----------+----------+
+| Function                  | Calls    | Avg      | P95     | Total    | % Total  |
++---------------------------+----------+----------+---------+----------+----------+
+| clickhouse::insert_stream | 32       | 11.19 s  | 11.66 s | 357.95 s | 3030.19% |
++---------------------------+----------+----------+---------+----------+----------+
+| postgres::copy_out_worker | 32       | 11.19 s  | 11.66 s | 357.93 s | 3030.02% |
++---------------------------+----------+----------+---------+----------+----------+
+| rowbinary::push           | 10000192 | 1.60 µs  | 1.54 µs | 15.98 s  | 135.29%  |
++---------------------------+----------+----------+---------+----------+----------+
+| profile::main             | 1        | 11.81 s  | 11.82 s | 11.81 s  | 100.00%  |
++---------------------------+----------+----------+---------+----------+----------+
+| pipeline::run             | 1        | 11.76 s  | 11.77 s | 11.76 s  | 99.59%   |
++---------------------------+----------+----------+---------+----------+----------+
+| clickhouse::send          | 1014     | 10.07 µs | 9.24 µs | 10.22 ms | 0.09%    |
++---------------------------+----------+----------+---------+----------+----------+
+
+threads - Thread CPU and memory statistics. (RSS: 48.2 MB, 5/9)
++--------------+----------+------+-------+-------+
+| Thread       | Status   | CPU% | Max%  | Avg%  |
++--------------+----------+------+-------+-------+
+| hp-functions | Running  | 8.0% | 27.8% | 17.4% |
++--------------+----------+------+-------+-------+
+| profile      | Sleeping | 8.0% | 8.0%  | 0.3%  |
++--------------+----------+------+-------+-------+
+| hp-threads   | Running  | 0.0% | 4.0%  | 0.5%  |
++--------------+----------+------+-------+-------+
+| hp-server    | Sleeping | 0.0% | 0.0%  | 0.0%  |
++--------------+----------+------+-------+-------+
+| hp-server    | Sleeping | 0.0% | 0.0%  | 0.0%  |
++--------------+----------+------+-------+-------+
+
+█████ BUILD alloc █████
+ Downloading crates ...
+  Downloaded hotpath-macros-meta v0.22.0
+  Downloaded hotpath-meta v0.22.0
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query.rs:502:48
+    |
+501 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+502 | ) -> Query<'q, DB, <DB as Database>::Arguments<'_>>
+    |            -- the same lifetime is named here  ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: consistently use `'q`
+    |
+502 - ) -> Query<'q, DB, <DB as Database>::Arguments<'_>>
+502 + ) -> Query<'q, DB, <DB as Database>::Arguments<'q>>
+    |
+
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query_as.rs:389:53
+    |
+388 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+389 | ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'_>>
+    |              -- the same lifetime is named here     ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'q`
+    |
+389 - ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'_>>
+389 + ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'q>>
+    |
+
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query_scalar.rs:368:57
+    |
+367 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+368 | ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'_>>
+    |                  -- the same lifetime is named here     ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'q`
+    |
+368 - ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'_>>
+368 + ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'q>>
+    |
+
+warning: `sqlx-core` (lib) generated 3 warnings (run `cargo fix --lib -p sqlx-core` to apply 3 suggestions)
+   Compiling hotpath-macros v0.22.0
+   Compiling hotpath v0.22.0
+   Compiling apitap-core v0.13.2 (/io/crates/apitap-core)
+    Finished `release` profile [optimized] target(s) in 1m 52s
+█████ ALLOC pg→pg █████
+10000000 rows in 23501 ms over 8 pipes
+[hotpath] 23.53s | timing, alloc, threads (CPU baseline avg: 358.28 µs)
+
+timing - Function execution time metrics.
++---------------------------+----------+-----------+-----------+----------+---------+
+| Function                  | Calls    | Avg       | P95       | Total    | % Total |
++---------------------------+----------+-----------+-----------+----------+---------+
+| postgres::copy_out_worker | 8        | 21.01 s   | 21.19 s   | 168.06 s | 714.28% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| postgres::send            | 1108     | 130.06 ms | 267.26 ms | 144.11 s | 612.49% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| profile::main             | 1        | 23.53 s   | 23.54 s   | 23.53 s  | 100.00% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| pipeline::run             | 1        | 23.48 s   | 23.49 s   | 23.48 s  | 99.78%  |
++---------------------------+----------+-----------+-----------+----------+---------+
+| pgcopy::push              | 10000048 | 414 ns    | 557 ns    | 4.14 s   | 17.62%  |
++---------------------------+----------+-----------+-----------+----------+---------+
+
+alloc-bytes - Exclusive allocation bytes by each function (excluding nested calls).
+Total: 4.4 GB
++---------------------------+----------+----------+----------+---------+---------+
+| Function                  | Calls    | Avg      | P95      | Total   | % Total |
++---------------------------+----------+----------+----------+---------+---------+
+| postgres::copy_out_worker | 8        | 568.3 MB | 572.0 MB | 4.4 GB  | 99.90%  |
++---------------------------+----------+----------+----------+---------+---------+
+| pipeline::run             | 1        | 2.2 MB   | 2.2 MB   | 2.2 MB  | 0.05%   |
++---------------------------+----------+----------+----------+---------+---------+
+| profile::main             | 1        | 2.2 MB   | 2.2 MB   | 2.2 MB  | 0.05%   |
++---------------------------+----------+----------+----------+---------+---------+
+| postgres::send            | 1108     | 46 B     | 48 B     | 50.5 KB | 0.00%   |
++---------------------------+----------+----------+----------+---------+---------+
+| pgcopy::push              | 10000048 | 0 B      | 0 B      | 0 B     | 0.00%   |
++---------------------------+----------+----------+----------+---------+---------+
+
+threads - Thread CPU and memory statistics. (RSS: 69.1 MB, Alloc: 4.5 GB, Dealloc: 4.5 GB, Diff: 69.2 MB, 5/26)
++-----------------+----------+------+-------+-------+----------+----------+-----------+
+| Thread          | Status   | CPU% | Max%  | Avg%  | Alloc    | Dealloc  | Diff      |
++-----------------+----------+------+-------+-------+----------+----------+-----------+
+| tokio-rt-worker | Sleeping | 0.0% | 59.6% | 17.1% | 1.2 GB   | 1.3 GB   | -101.1 MB |
++-----------------+----------+------+-------+-------+----------+----------+-----------+
+| tokio-rt-worker | Sleeping | 0.0% | 47.4% | 12.5% | 957.8 MB | 939.3 MB | 18.5 MB   |
++-----------------+----------+------+-------+-------+----------+----------+-----------+
+| tokio-rt-worker | Sleeping | 0.0% | 43.8% | 12.4% | 921.2 MB | 921.5 MB | -279.1 KB |
++-----------------+----------+------+-------+-------+----------+----------+-----------+
+| tokio-rt-worker | Sleeping | 0.0% | 47.7% | 9.3%  | 667.0 MB | 663.0 MB | 4.1 MB    |
++-----------------+----------+------+-------+-------+----------+----------+-----------+
+| tokio-rt-worker | Sleeping | 0.0% | 47.7% | 9.3%  | 656.7 MB | 631.2 MB | 25.6 MB   |
++-----------------+----------+------+-------+-------+----------+----------+-----------+
+
+█████ ALLOC pg→ch █████
+10000000 rows in 11272 ms over 32 pipes
+[hotpath] 11.28s | timing, alloc, threads (CPU baseline avg: 339.61 µs)
+
+timing - Function execution time metrics.
++---------------------------+----------+----------+---------+----------+----------+
+| Function                  | Calls    | Avg      | P95     | Total    | % Total  |
++---------------------------+----------+----------+---------+----------+----------+
+| clickhouse::insert_stream | 32       | 10.62 s  | 11.16 s | 339.85 s | 3012.44% |
++---------------------------+----------+----------+---------+----------+----------+
+| postgres::copy_out_worker | 32       | 10.62 s  | 11.16 s | 339.83 s | 3012.29% |
++---------------------------+----------+----------+---------+----------+----------+
+| rowbinary::push           | 10000192 | 1.25 µs  | 1.23 µs | 12.48 s  | 110.62%  |
++---------------------------+----------+----------+---------+----------+----------+
+| profile::main             | 1        | 11.28 s  | 11.28 s | 11.28 s  | 100.00%  |
++---------------------------+----------+----------+---------+----------+----------+
+| pipeline::run             | 1        | 11.26 s  | 11.27 s | 11.26 s  | 99.80%   |
++---------------------------+----------+----------+---------+----------+----------+
+| clickhouse::send          | 1012     | 57.00 µs | 9.32 µs | 57.68 ms | 0.51%    |
++---------------------------+----------+----------+---------+----------+----------+
+
+alloc-bytes - Exclusive allocation bytes by each function (excluding nested calls).
+Total: 4.3 GB
++---------------------------+----------+----------+----------+---------+---------+
+| Function                  | Calls    | Avg      | P95      | Total   | % Total |
++---------------------------+----------+----------+----------+---------+---------+
+| postgres::copy_out_worker | 32       | 138.5 MB | 163.0 MB | 4.3 GB  | 99.92%  |
++---------------------------+----------+----------+----------+---------+---------+
+| pipeline::run             | 1        | 1.4 MB   | 1.4 MB   | 1.4 MB  | 0.03%   |
++---------------------------+----------+----------+----------+---------+---------+
+| profile::main             | 1        | 1.2 MB   | 1.2 MB   | 1.2 MB  | 0.03%   |
++---------------------------+----------+----------+----------+---------+---------+
+| clickhouse::insert_stream | 32       | 34.3 KB  | 36.1 KB  | 1.1 MB  | 0.02%   |
++---------------------------+----------+----------+----------+---------+---------+
+| clickhouse::send          | 1012     | 72 B     | 72 B     | 71.2 KB | 0.00%   |
++---------------------------+----------+----------+----------+---------+---------+
+| rowbinary::push           | 10000192 | 0 B      | 0 B      | 0 B     | 0.00%   |
++---------------------------+----------+----------+----------+---------+---------+
+
+threads - Thread CPU and memory statistics. (RSS: 622.7 MB, Alloc: 4.3 GB, Dealloc: 4.3 GB, Diff: 19.8 MB, 5/26)
++-----------------+----------+-------+-------+-------+----------+----------+----------+
+| Thread          | Status   | CPU%  | Max%  | Avg%  | Alloc    | Dealloc  | Diff     |
++-----------------+----------+-------+-------+-------+----------+----------+----------+
+| tokio-rt-worker | Sleeping | 15.9% | 31.5% | 14.7% | 343.2 MB | 361.5 MB | -18.3 MB |
++-----------------+----------+-------+-------+-------+----------+----------+----------+
+| tokio-rt-worker | Sleeping | 0.0%  | 27.7% | 11.9% | 336.8 MB | 348.1 MB | -11.3 MB |
++-----------------+----------+-------+-------+-------+----------+----------+----------+
+| tokio-rt-worker | Sleeping | 4.0%  | 31.5% | 14.2% | 329.3 MB | 331.5 MB | -2.2 MB  |
++-----------------+----------+-------+-------+-------+----------+----------+----------+
+| tokio-rt-worker | Sleeping | 0.0%  | 43.2% | 11.2% | 315.9 MB | 310.7 MB | 5.1 MB   |
++-----------------+----------+-------+-------+-------+----------+----------+----------+
+| tokio-rt-worker | Sleeping | 0.0%  | 34.5% | 13.4% | 314.4 MB | 335.0 MB | -20.7 MB |
++-----------------+----------+-------+-------+-------+----------+----------+----------+
+
+PROFILE-ALL-DONE
+
+════════ RE-PROFILE AFTER OPTIMIZATION (alloc, pg→pg) ════════
+=== alloc re-profile pg→pg (expect churn collapse) ===
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query.rs:502:48
+    |
+501 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+502 | ) -> Query<'q, DB, <DB as Database>::Arguments<'_>>
+    |            -- the same lifetime is named here  ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: consistently use `'q`
+    |
+502 - ) -> Query<'q, DB, <DB as Database>::Arguments<'_>>
+502 + ) -> Query<'q, DB, <DB as Database>::Arguments<'q>>
+    |
+
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query_as.rs:389:53
+    |
+388 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+389 | ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'_>>
+    |              -- the same lifetime is named here     ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'q`
+    |
+389 - ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'_>>
+389 + ) -> QueryAs<'q, DB, O, <DB as Database>::Arguments<'q>>
+    |
+
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> vendor/sqlx-core/src/query_scalar.rs:368:57
+    |
+367 |     statement: &'q DB::Statement<'q>,
+    |                 --               -- the lifetime is named here
+    |                 |
+    |                 the lifetime is named here
+368 | ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'_>>
+    |                  -- the same lifetime is named here     ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'q`
+    |
+368 - ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'_>>
+368 + ) -> QueryScalar<'q, DB, O, <DB as Database>::Arguments<'q>>
+    |
+
+warning: `sqlx-core` (lib) generated 3 warnings (run `cargo fix --lib -p sqlx-core` to apply 3 suggestions)
+   Compiling apitap-core v0.13.2 (/io/crates/apitap-core)
+    Finished `release` profile [optimized] target(s) in 1m 42s
+10000000 rows in 23032 ms over 8 pipes
+[hotpath] 23.06s | timing, alloc, threads (CPU baseline avg: 336.43 µs)
+
+timing - Function execution time metrics.
++---------------------------+----------+-----------+-----------+----------+---------+
+| Function                  | Calls    | Avg       | P95       | Total    | % Total |
++---------------------------+----------+-----------+-----------+----------+---------+
+| postgres::copy_out_worker | 8        | 21.74 s   | 21.88 s   | 173.88 s | 754.20% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| postgres::send            | 1108     | 135.11 ms | 269.22 ms | 149.71 s | 649.33% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| profile::main             | 1        | 23.06 s   | 23.07 s   | 23.06 s  | 100.00% |
++---------------------------+----------+-----------+-----------+----------+---------+
+| pipeline::run             | 1        | 23.01 s   | 23.02 s   | 23.01 s  | 99.78%  |
++---------------------------+----------+-----------+-----------+----------+---------+
+| pgcopy::push              | 10000048 | 267 ns    | 437 ns    | 2.68 s   | 11.62%  |
++---------------------------+----------+-----------+-----------+----------+---------+
+
+alloc-bytes - Exclusive allocation bytes by each function (excluding nested calls).
+Total: 209.2 MB
++---------------------------+----------+---------+---------+----------+---------+
+| Function                  | Calls    | Avg     | P95     | Total    | % Total |
++---------------------------+----------+---------+---------+----------+---------+
+| postgres::copy_out_worker | 8        | 25.6 MB | 27.2 MB | 204.8 MB | 97.91%  |
++---------------------------+----------+---------+---------+----------+---------+
+| pipeline::run             | 1        | 2.2 MB  | 2.2 MB  | 2.2 MB   | 1.04%   |
++---------------------------+----------+---------+---------+----------+---------+
+| profile::main             | 1        | 2.2 MB  | 2.2 MB  | 2.2 MB   | 1.03%   |
++---------------------------+----------+---------+---------+----------+---------+
+| postgres::send            | 1108     | 46 B    | 48 B    | 50.6 KB  | 0.02%   |
++---------------------------+----------+---------+---------+----------+---------+
+| pgcopy::push              | 10000048 | 0 B     | 0 B     | 0 B      | 0.00%   |
++---------------------------+----------+---------+---------+----------+---------+
+
+threads - Thread CPU and memory statistics. (RSS: 115.6 MB, Alloc: 311.3 MB, Dealloc: 238.0 MB, Diff: 73.3 MB, 5/26)
++-----------------+----------+------+-------+-------+---------+---------+----------+
+| Thread          | Status   | CPU% | Max%  | Avg%  | Alloc   | Dealloc | Diff     |
++-----------------+----------+------+-------+-------+---------+---------+----------+
+| tokio-rt-worker | Sleeping | 0.0% | 55.0% | 8.4%  | 51.6 MB | 46.3 MB | 5.3 MB   |
++-----------------+----------+------+-------+-------+---------+---------+----------+
+| tokio-rt-worker | Sleeping | 0.0% | 43.8% | 8.7%  | 49.6 MB | 13.2 MB | 36.5 MB  |
++-----------------+----------+------+-------+-------+---------+---------+----------+
+| tokio-rt-worker | Sleeping | 0.0% | 51.7% | 8.5%  | 45.4 MB | 10.4 MB | 35.1 MB  |
++-----------------+----------+------+-------+-------+---------+---------+----------+
+| tokio-rt-worker | Sleeping | 0.0% | 66.0% | 12.7% | 36.7 MB | 73.5 MB | -36.8 MB |
++-----------------+----------+------+-------+-------+---------+---------+----------+
+| tokio-rt-worker | Sleeping | 0.0% | 27.8% | 0.8%  | 35.3 MB | 10.0 MB | 25.3 MB  |
++-----------------+----------+------+-------+-------+---------+---------+----------+
+
+=== bench matrix (optimized wheel) ===
