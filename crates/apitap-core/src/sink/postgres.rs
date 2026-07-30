@@ -715,6 +715,8 @@ pub(crate) enum PgCopyLoader {
         /// Postgres discards the partial stream (a clean close would commit it into
         /// staging — wasted WAL for data the swap will never use).
         tx: futures::channel::mpsc::Sender<std::result::Result<Vec<u8>, ()>>,
+        /// Emptied chunk buffers coming back from the sender task for reuse.
+        back: futures::channel::mpsc::Receiver<Vec<u8>>,
         join: tokio::task::JoinHandle<Result<u64>>,
     },
 }
@@ -730,6 +732,9 @@ impl PgCopyLoader {
         }
         use futures::StreamExt;
         let (tx, mut rx) = futures::channel::mpsc::channel::<std::result::Result<Vec<u8>, ()>>(2);
+        // Sized to the buffers that can be in flight (2 channel slots + 1 in the
+        // worker + 1 here); a full channel just drops the buffer instead of blocking.
+        let (mut back_tx, back) = futures::channel::mpsc::channel::<Vec<u8>>(4);
         let join = tokio::spawn(async move {
             let mut copier = pool
                 .copy_in_raw(&copy_in_sql)
@@ -737,11 +742,18 @@ impl PgCopyLoader {
                 .map_err(|e| Error::Transfer(format!("COPY IN: {e}")))?;
             while let Some(item) = rx.next().await {
                 match item {
-                    Ok(buf) => copier
-                        .send(buf)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| Error::Transfer(format!("pg send: {e}")))?,
+                    Ok(mut buf) => {
+                        // Borrow, don't consume: sqlx memcpys into its write buffer
+                        // either way, and keeping ownership lets the emptied Vec go
+                        // back to the worker for reuse.
+                        copier
+                            .send(&buf[..])
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| Error::Transfer(format!("pg send: {e}")))?;
+                        buf.clear();
+                        let _ = back_tx.try_send(buf);
+                    }
                     Err(()) => {
                         let _ = copier.abort("apitap: source failed").await;
                         return Err(Error::Transfer("copy aborted".into()));
@@ -753,11 +765,19 @@ impl PgCopyLoader {
                 .await
                 .map_err(|e| Error::Transfer(format!("pg finish: {e}")))
         });
-        Ok(Self::Overlap { tx, join })
+        Ok(Self::Overlap { tx, back, join })
     }
 }
 
 impl Loader for PgCopyLoader {
+    fn reclaim(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Serial(_) => None,
+            Self::Overlap { back, .. } => back.try_recv().ok(),
+        }
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         match self {
             Self::Serial(copier) => copier
@@ -765,7 +785,7 @@ impl Loader for PgCopyLoader {
                 .await
                 .map(|_| ())
                 .map_err(|e| Error::Transfer(format!("pg send: {e}"))),
-            Self::Overlap { tx, join } => {
+            Self::Overlap { tx, join, .. } => {
                 use futures::SinkExt;
                 if tx.send(Ok(buf)).await.is_err() {
                     // Sender died — surface ITS error, not the closed channel.
@@ -786,7 +806,7 @@ impl Loader for PgCopyLoader {
                 .finish()
                 .await
                 .map_err(|e| Error::Transfer(format!("pg finish: {e}"))),
-            Self::Overlap { tx, join } => {
+            Self::Overlap { tx, join, .. } => {
                 drop(tx); // close the channel; the sender task then finishes the COPY
                 match join.await {
                     Ok(r) => r,
@@ -802,7 +822,7 @@ impl Loader for PgCopyLoader {
             Self::Serial(copier) => {
                 let _ = copier.abort("apitap: source failed").await;
             }
-            Self::Overlap { mut tx, join } => {
+            Self::Overlap { mut tx, join, .. } => {
                 use futures::SinkExt;
                 let _ = tx.send(Err(())).await;
                 drop(tx);

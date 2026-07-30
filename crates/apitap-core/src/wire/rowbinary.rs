@@ -91,7 +91,10 @@ impl Transcoder {
     pub(crate) fn new(cols: Vec<(RbType, bool)>) -> Self {
         Self {
             cols,
-            buf: Vec::with_capacity(1 << 20),
+            // Carry buffer only ever holds the header prefix or a partial tuple; both
+            // are rare and small, so it grows on demand (a 1 MiB preallocation here
+            // cost spans × 1 MiB of pure churn per run — measured, never used).
+            buf: Vec::new(),
             pos: 0,
             header_done: false,
             finished: false,
@@ -99,6 +102,7 @@ impl Transcoder {
     }
 
     /// Feed input; append transcoded RowBinary to `out`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn push(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<()> {
         // Compact a fully-consumed buffer so the fast path stays reachable.
         if self.pos > 0 && self.pos == self.buf.len() {

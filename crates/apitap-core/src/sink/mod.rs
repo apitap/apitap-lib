@@ -28,6 +28,14 @@ pub(crate) trait Loader: Send + 'static {
     /// (PgCopyBinary) give NO alignment guarantee; such loaders must treat the stream
     /// as opaque bytes.
     fn send(&mut self, buf: Vec<u8>) -> impl Future<Output = Result<()>> + Send;
+    /// Hand back an emptied buffer from an already-shipped send, if this sink has one
+    /// ready. Workers use it to recycle chunk buffers instead of allocating fresh —
+    /// the fresh 4 MiB chunk Vec was 99.9% of steady-state allocator traffic
+    /// (benchmarks/profiling.md). Default: none; sinks that consume the buffer
+    /// zero-copy (ClickHouse HTTP body) simply never return one.
+    fn reclaim(&mut self) -> Option<Vec<u8>> {
+        None
+    }
     /// Close the stream cleanly. Returns rows ingested if this sink reports them
     /// (Postgres COPY does; ClickHouse counts via [`Sink::rows_staged`] instead).
     fn finish(self) -> impl Future<Output = Result<u64>> + Send;

@@ -141,6 +141,7 @@ pub(crate) fn knobs(opts: &TransferOptions, profile: &Profile) -> Result<(usize,
 /// a single-table run passes `|n| parallel.min(n).max(1)` (the old behavior);
 /// a multi-table run re-fits its budget grant there (see [`Grant::resize`]).
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     src: &S,
     mut sink: K,

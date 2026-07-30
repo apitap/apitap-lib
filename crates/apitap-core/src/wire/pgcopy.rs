@@ -305,6 +305,7 @@ impl SpanStrip {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn push(&mut self, mut b: &[u8], out: &mut Vec<u8>) -> Result<()> {
         if self.hdr_len < 19 {
             let take = (19 - self.hdr_len).min(b.len());

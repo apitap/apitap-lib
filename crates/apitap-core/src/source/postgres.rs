@@ -562,6 +562,7 @@ impl SpanState {
 /// `COPY` statements pulled from the shared work queue. Output is coalesced to
 /// ~`chunk` bytes — sqlx yields one piece per COPY message (≈ one row), and per-row
 /// sends are pure protocol overhead.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn copy_out_worker<L: Loader>(
     pool: PgPool,
     queue: WorkQueue,
@@ -600,9 +601,14 @@ async fn copy_out_worker<L: Loader>(
                 return Err(loader.abort(e).await);
             }
             // mem::replace (not take): take leaves capacity 0 and the next chunk pays
-            // ~1 extra full copy in geometric regrowth.
+            // ~1 extra full copy in geometric regrowth. A loader that finishes with
+            // its buffers hands them back — at steady state this loop allocates
+            // nothing (the fresh 4 MiB Vec per chunk was 99.9% of allocator traffic).
             if out.len() >= chunk {
-                let full = std::mem::replace(&mut out, Vec::with_capacity(chunk + 64 * 1024));
+                let fresh = loader
+                    .reclaim()
+                    .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024));
+                let full = std::mem::replace(&mut out, fresh);
                 loader.send(full).await?;
             }
         }

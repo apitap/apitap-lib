@@ -91,6 +91,7 @@ impl ChConn {
     /// a chunked body. Squash settings force ~1M-row blocks so each worker writes a few
     /// big MergeTree parts instead of hundreds of small ones (the probe showed
     /// OpenFileForWrite climbing into the hundreds — parts churn).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) async fn insert_stream(&self, query: &str, body: reqwest::Body) -> Result<()> {
         let resp = self
             .client
@@ -1268,6 +1269,7 @@ impl ChLoader {
 }
 
 impl Loader for ChLoader {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         use futures::SinkExt;
         if self.tx.send(Ok(bytes::Bytes::from(buf))).await.is_err() {
