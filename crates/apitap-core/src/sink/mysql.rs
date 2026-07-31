@@ -142,27 +142,36 @@ impl MySqlSink {
         }
     }
 
+    /// `mysql_async` puts no overall deadline on its handshake: against an
+    /// incompatible server the connection can park in Sleep forever (observed
+    /// with MySQL 8.4 before the 0.37 upgrade — the engine hung silently for
+    /// 36+ minutes). 30 s is generous for any healthy network; past it, fail
+    /// loudly and name the likely cause.
+    async fn deadline_conn(&self) -> Result<mysql_async::Conn> {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), self.pool.get_conn()).await {
+            Ok(r) => r.map_err(|e| Error::Transfer(format!("mysql conn: {e}"))),
+            Err(_) => Err(Error::Transfer(
+                "mysql connection timed out after 30 s: the server accepted TCP but never \
+                 completed the protocol (seen with MySQL 8.4 + older clients; MySQL 8.0 is \
+                 known-good). Check the server version and connectivity"
+                    .into(),
+            )),
+        }
+    }
+
     fn fq(&self, table: &str) -> String {
         format!("{}.{}", my_ident(&self.db), my_ident(table))
     }
 
     async fn exec(&self, sql: &str) -> Result<()> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| Error::Transfer(format!("mysql conn: {e}")))?;
+        let mut conn = self.deadline_conn().await?;
         conn.query_drop(sql)
             .await
             .map_err(|e| Error::Transfer(format!("mysql exec [{sql}]: {e}")))
     }
 
     async fn scalar(&self, sql: &str) -> Result<Option<String>> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| Error::Transfer(format!("mysql conn: {e}")))?;
+        let mut conn = self.deadline_conn().await?;
         let v: Option<Option<String>> = conn
             .query_first(sql)
             .await
@@ -351,11 +360,7 @@ impl crate::sink::Sink for MySqlSink {
         // pre-0.13 tables were created MEDIUMTEXT — widening is safe.)
         if mode == Mode::Append && plan.engine != "mysql" {
             let dest: Vec<(String, String)> = {
-                let mut conn = self
-                    .pool
-                    .get_conn()
-                    .await
-                    .map_err(|e| Error::Transfer(format!("mysql conn: {e}")))?;
+                let mut conn = self.deadline_conn().await?;
                 conn.query_map(
                     format!(
                         "SELECT column_name, column_type FROM information_schema.columns \
@@ -453,11 +458,7 @@ impl crate::sink::Sink for MySqlSink {
             cols = names.join(", "),
         );
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| Error::Transfer(format!("mysql loader conn: {e}")))?;
+        let mut conn = self.deadline_conn().await?;
         // UTC + relaxed integrity for the bulk load (staging carries no FKs anyway).
         conn.query_drop(
             "SET time_zone='+00:00', unique_checks=0, foreign_key_checks=0, sql_mode=''",
@@ -519,11 +520,7 @@ impl crate::sink::Sink for MySqlSink {
         // Column drift: names AND types must match. A narrowed dest column
         // (e.g. VARCHAR(500)→VARCHAR(20)) would silently truncate under sql_mode=''.
         let dest_cols: Vec<(String, String)> = {
-            let mut conn = self
-                .pool
-                .get_conn()
-                .await
-                .map_err(|e| Error::Transfer(format!("mysql conn: {e}")))?;
+            let mut conn = self.deadline_conn().await?;
             conn.query_map(
                 format!(
                     "SELECT column_name, column_type FROM information_schema.columns \

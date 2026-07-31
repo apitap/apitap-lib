@@ -1,0 +1,40 @@
+════════ SESSION 2 VALIDATION (V1-V6) ════════
+=== build bench wheel (plain release) ===
+=== V1 my→my vs mysql 8.0 (sanity) ===
+V1-OK rows=1000000 12.1s
+=== V2 my→my vs mysql 8.4 (the bug) ===
+V2-WORKS rows=1000000 6.2s  (0.37 fixed 8.4!)
+=== V3 pg→ch 10M @128MB (expect AUTO 2 pipes) ===
+V3-128MB rows=10000000 pipes=2 elapsed=30.7s peak=67.6MB
+=== V4 pg→ch 10M @256MB (expect 5 pipes, unchanged) ===
+V4-256MB rows=10000000 pipes=5 elapsed=22.5s peak=149.3MB
+=== V5 pg→ch 10M @44MB (floor still safe, 1 pipe) ===
+V5-44MB rows=10000000 pipes=1 elapsed=52.8s peak=37.3MB
+=== V6 thin pipes: @128MB chunk=2MiB (expect 4 pipes) ===
+V6-128MB-thin rows=10000000 pipes=4 elapsed=24.4s peak=78.4MB
+
+════════ THIN-PIPE CELLS (T1-T4) ════════
+
+════════ AUTO-THIN VERIFY + MIMALLOC ROUND 2 ════════
+grep: unrecognized option '--- |T[0-9]-'
+Usage: grep [OPTION]... PATTERNS [FILE]...
+Try 'grep --help' for more information.
+=== rebuild s2 wheel (auto-thin) ===
+=== A1 AUTO @128MB (expect 4 thin pipes) ===
+A1-128 pipes=4 elapsed=23.4s peak=80.7MB
+=== A2 AUTO @80MB (expect 2 thin pipes) ===
+A2-80 pipes=2 elapsed=29.1s peak=49.0MB
+=== A3 AUTO @256MB (expect 5 fat pipes, unchanged) ===
+A3-256 pipes=8 elapsed=21.7s peak=119.0MB
+=== A4 AUTO @44MB (floor: 1 thin or fat pipe, must complete) ===
+A4-44 pipes=1 elapsed=58.9s peak=40.7MB
+=== mimalloc round-2 wheel ===
+=== M pg→ch matrix: stock vs mimalloc (2 reps each) ===
+M-stock-256-r1 pipes=8 elapsed=21.7s peak=99.2MB
+M-mim-256-r1 pipes=8 elapsed=21.4s peak=151.3MB
+M-stock-256-r2 pipes=8 elapsed=21.0s peak=116.7MB
+M-mim-256-r2 pipes=8 elapsed=21.3s peak=146.3MB
+M-stock-16c-r1 pipes=32 elapsed=10.7s peak=313.7MB
+M-mim-16c-r1 pipes=32 elapsed=9.7s peak=369.8MB
+M-stock-16c-r2 pipes=32 elapsed=11.0s peak=274.6MB
+M-mim-16c-r2 pipes=32 elapsed=10.3s peak=383.2MB

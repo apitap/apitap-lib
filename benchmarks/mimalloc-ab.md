@@ -55,10 +55,28 @@ adds standing overhead.
 The allocation-*reduction* half of the article (heapless / bytes / smallvec) is the
 half that applies here — `bytes` is already load-bearing in apitap-core.
 
-## Verdict
+## Round 2 (2026-07-31): after buffer recycling — rejected again, final
 
-- **Not merged.** Allocator stays the system default.
-- **Kept:** `PEAK_MB` reporting in `run-server.sh` — peak RSS is now a first-class
-  benchmark output alongside wall time.
-- Revisit only if a future workload profile shows small-alloc churn (e.g. a row-decode
-  path for a new source type), and then re-run this exact A/B.
+Round 1 predated the buffer-recycling optimization that cut allocator churn
+4.4 GB → 205 MB — the exact traffic feeding mimalloc's segment cache — so the
+question deserved a re-run on the new code (same A/B discipline, 10M pg→ch,
+auto-thin pipes, 2 reps per cell; raw: [session2-raw.log](session2-raw.log)):
+
+| box | stock (system alloc) | mimalloc default |
+|---|---|---|
+| 0.5 cpu / 256 MB (8 pipes) | 21.0-21.7 s / **99-117 MB** | 21.3-21.4 s / 146-151 MB (**+30-50% RSS**) |
+| 16 cpu / 4 GB (32 pipes) | 10.7-11.0 s / **275-314 MB** | 9.7-10.3 s / 370-383 MB (+25-35% RSS) |
+
+With the churn gone, mimalloc's standing segment overhead is all cost on the
+memory-bounded tier, and its ~6% wall-time edge appears only where the wall is
+the source database and memory is free anyway.
+
+## Verdict (two rounds, final)
+
+- **Not merged — twice.** The system allocator wins this workload's pareto
+  curve both before and after the engine stopped churning. The allocator
+  question is closed.
+- **Kept:** `PEAK_MB` reporting in `run-server.sh` — peak RSS is now a
+  first-class benchmark output alongside wall time.
+- Revisit only if the workload itself changes shape (a per-row decode path with
+  real small-alloc churn), and then re-run this exact A/B.

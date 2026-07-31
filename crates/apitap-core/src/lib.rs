@@ -79,8 +79,12 @@ pub struct TransferOptions {
     pub cursor: Option<String>,
     /// Destination table. `None` = same name as the source table.
     pub dest_table: Option<String>,
-    /// Bytes to coalesce per send (floor 64 KiB).
-    pub chunk_bytes: usize,
+    /// Bytes to coalesce per send (floor 64 KiB). `None` = auto: 4 MiB, and when
+    /// the memory budget caps the pipe count below the CPU ask, the engine may
+    /// thin the chunk to 2 MiB to buy pipes instead — measured 1.3-1.8× faster
+    /// on memory-starved boxes (see `pipeline::knobs`). An explicit value is
+    /// honored verbatim and never thinned.
+    pub chunk_bytes: Option<usize>,
     /// Postgres destinations only. `false` loads into an UNLOGGED table — skipping WAL
     /// roughly halves the destination's write cost — and the swapped-in table REMAINS
     /// unlogged: Postgres truncates it during crash recovery until you run
@@ -113,7 +117,7 @@ impl Default for TransferOptions {
             parallel: None,
             cursor: None,
             dest_table: None,
-            chunk_bytes: 4 * 1024 * 1024,
+            chunk_bytes: None,
             durable: true,
             mode: Mode::Replace,
             engine: None,

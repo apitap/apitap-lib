@@ -74,7 +74,7 @@ work as Postgres sources.
 | `dest_table` | same as `table` | destination table name |
 | `parallel` | auto | concurrent range pipes. Auto derives from the container's CPU count **and** cgroup memory limit (details below). An explicit value is never overridden. `0` is rejected. |
 | `cursor` | auto | numeric column used to split the table into ranges. Auto-detects a single-column integer primary key. |
-| `chunk_bytes` | 4 MiB | bytes coalesced per network send (floor 64 KiB) |
+| `chunk_bytes` | auto | bytes coalesced per network send (floor 64 KiB). Auto = 4 MiB, but on a memory-capped box the engine may thin to 2 MiB when that buys extra pipes (measured 1.3-1.8× faster). An explicit value is never thinned. |
 | `durable` | `True` | Postgres destinations only — see [Durability](#durability) |
 | `mode` | `"replace"` | `"append"` / `"merge"` — see [Incremental sync](#incremental-sync-append--merge) |
 | `engine` | `MergeTree` | ClickHouse destinations only — see [ClickHouse table engines](#clickhouse-table-engines) |
@@ -113,10 +113,14 @@ never touches the existing destination table.
 Auto `parallel` is route-specific (measured, not guessed): Postgres→Postgres uses up
 to 8 pipes (destination COPY is writer-bound), ClickHouse destinations up to 32,
 MySQL→Postgres up to 16. The auto value is then **capped by the cgroup memory
-limit** — each pipe budgets ~8 × `chunk_bytes` — so the same code that uses 32 pipes
-on a big host uses 5 in a 256 MB container instead of getting OOM-killed. Memory use
-is `parallel × chunk_bytes`-scale regardless of table size; bytes stream with TCP
-backpressure.
+limit** — each pipe budgets ~10 × `chunk_bytes` plus a 40 MiB reserve, numbers
+fitted to measured whole-container peaks (benchmarks/profiling.md) — so the same
+code that uses 32 pipes on a big host uses 5 in a 256 MB container instead of
+getting OOM-killed. When memory (not CPU) is what limits the pipe count and
+`chunk_bytes` wasn't set explicitly, the engine also **thins the chunk to 2 MiB
+if that buys extra pipes** — measured 1.3-1.8× faster on 80-128 MB boxes. Memory
+use is `parallel × chunk_bytes`-scale regardless of table size; bytes stream with
+TCP backpressure.
 
 ### Cursor and PK-less tables
 

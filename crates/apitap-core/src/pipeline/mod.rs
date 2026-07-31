@@ -88,20 +88,27 @@ pub(crate) fn mem_limit_bytes() -> Option<u64> {
 
 /// Cap an AUTO-derived pipe count by the memory budget: each pipe holds a few
 /// `chunk`-sized buffers in flight (encode buffer, channel slots, HTTP/COPY write
-/// buffers — ~8× chunk measured worst-case), plus ~96 MiB of process overhead.
-/// A 256 MB container at the CPU-derived 8 pipes was OOM-killed on the transcoding
-/// route; this brings the default back inside the box. An EXPLICIT `parallel` from the
-/// caller is never overridden.
+/// buffers), plus fixed process overhead. Budgets are MEASURED, not guessed —
+/// whole-container cgroup `memory.peak` on the 100 GB pg→ch ladder
+/// (benchmarks/profiling.md): 1 pipe 44.1 MB, 2 pipes 72.4 MB, 3 pipes 113.6 MB,
+/// 5 pipes 170.8 MB → ~29-32 MB marginal per pipe at the 4 MiB default chunk,
+/// ~40 MB base. 10× chunk per pipe + 40 MiB reserve covers the worst measured
+/// cell with ≥25% headroom: a 128 MB cap now auto-runs 2 pipes (measured peak
+/// 72.4 MB — the old 96 MiB reserve forced 1 pipe and doubled the wall time),
+/// 256 MB still picks the proven 5, and 44-80 MB caps stay at 1. An EXPLICIT
+/// `parallel` from the caller is never overridden.
 pub(crate) fn mem_capped_parallel(requested: usize, chunk: usize) -> usize {
     match mem_limit_bytes() {
-        Some(mem) => {
-            let reserve: u64 = 96 * 1024 * 1024;
-            let per_pipe = (chunk as u64) * 8;
-            let allowed = mem.saturating_sub(reserve) / per_pipe.max(1);
-            requested.min((allowed.max(1)) as usize)
-        }
+        Some(mem) => mem_capped(requested, chunk, mem),
         None => requested,
     }
+}
+
+fn mem_capped(requested: usize, chunk: usize, mem: u64) -> usize {
+    let reserve: u64 = 40 * 1024 * 1024;
+    let per_pipe = (chunk as u64) * 10;
+    let allowed = mem.saturating_sub(reserve) / per_pipe.max(1);
+    requested.min((allowed.max(1)) as usize)
 }
 
 /// Per-route tuning that is legitimately different between routes (measured, not
@@ -125,11 +132,27 @@ pub(crate) fn knobs(opts: &TransferOptions, profile: &Profile) -> Result<(usize,
     if opts.parallel == Some(0) {
         return Err(Error::InvalidInput("parallel must be at least 1".into()));
     }
-    let chunk = opts.chunk_bytes.max(64 * 1024);
-    let parallel = opts.parallel.unwrap_or_else(|| {
-        mem_capped_parallel((profile.auto_parallel)(num_cpus::get()), chunk)
-    });
-    Ok((chunk, parallel))
+    const DEFAULT_CHUNK: usize = 4 * 1024 * 1024;
+    let pinned = opts.chunk_bytes.map(|c| c.max(64 * 1024));
+    let chunk = pinned.unwrap_or(DEFAULT_CHUNK);
+    if let Some(p) = opts.parallel {
+        return Ok((chunk, p));
+    }
+    let ask = (profile.auto_parallel)(num_cpus::get());
+    let fat = mem_capped_parallel(ask, chunk);
+    // Memory-starved with an un-pinned chunk: thinner chunks buy pipes, and pipes
+    // are worth more than buffer depth — measured (10M pg→ch): a 128 MB cap runs
+    // 2×4 MiB in 30.7 s vs 4×2 MiB in 24.4 s; an 80 MB cap 1×4 MiB in 57.4 s vs
+    // 2×2 MiB in 31.3 s, peaks ≤61% of the cap. Routes whose CPU ask is already
+    // satisfied never take this path, so big boxes keep the deeper 4 MiB buffers.
+    if pinned.is_none() && fat < ask {
+        const THIN_CHUNK: usize = 2 * 1024 * 1024;
+        let thin = mem_capped_parallel(ask, THIN_CHUNK);
+        if thin > fat {
+            return Ok((THIN_CHUNK, thin));
+        }
+    }
+    Ok((chunk, fat))
 }
 
 /// The whole transfer, once: probe → negotiate → stage → fan out → count → swap.
@@ -456,6 +479,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Locks the memory→pipes budget to the MEASURED 100 GB ladder
+    /// (benchmarks/profiling.md): peaks were 44.1 MB @1 pipe, 72.4 @2, 113.6 @3,
+    /// 170.8 @5 — every cell this table allows ran with ≥25% headroom, and the
+    /// one cell that OOM'd (2 pipes in 64 MB) stays disallowed.
+    #[test]
+    fn mem_budget_matches_the_measured_ladder() {
+        const MB: u64 = 1024 * 1024;
+        let chunk = 4 * 1024 * 1024; // default chunk_bytes
+        let ask = 32; // CPU-derived ask far above every cap below
+        assert_eq!(mem_capped(ask, chunk, 44 * MB), 1);
+        assert_eq!(mem_capped(ask, chunk, 64 * MB), 1); // 2 pipes OOM'd here
+        assert_eq!(mem_capped(ask, chunk, 80 * MB), 1); // 2 fits but at 90% — too tight for auto
+        assert_eq!(mem_capped(ask, chunk, 128 * MB), 2); // measured 72.4 MB peak
+        assert_eq!(mem_capped(ask, chunk, 256 * MB), 5); // measured 170.8 MB peak
+        // Big boxes: memory stops being the governor, CPU ask passes through.
+        assert_eq!(mem_capped(5, chunk, 4096 * MB), 5);
+        // Smaller chunks buy more pipes in the same cap (the "thin pipes" lever).
+        assert!(mem_capped(ask, 2 * 1024 * 1024, 128 * MB) > 2);
+    }
 
     #[test]
     fn source_identity_is_normalized_and_credential_free() {

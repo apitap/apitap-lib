@@ -164,3 +164,36 @@ at this table size, in the container where apitap finishes with 85 MB to spare.
 (At 10M rows ingestr *does* complete in this box — 428 s in our earlier
 measurement; the 23× table is what pushes its working set over.) Both failures
 were reproduced on a second run before being recorded here.
+
+## Session 2 (2026-07-31): the retune the ladder paid for
+
+Three engine changes, each with the measurement that justified it
+(raw: [session2-raw.log](session2-raw.log)):
+
+1. **MySQL 8.4 hang → fixed.** `mysql_async` 0.34 silently hung forever against
+   MySQL 8.4 servers (connections parked in Sleep, no error — reproduced on
+   published 0.13.2 too). Upgrading to 0.37 fixes it outright (1M my→my in
+   6.2 s vs an infinite hang), and every sink connection now carries a 30 s
+   deadline that names the failure instead of freezing.
+2. **The memory→pipes budget now matches the measured ladder.** Old formula:
+   96 MiB reserve + 8×chunk per pipe (forced 1 pipe at every cap ≤128 MB). New:
+   40 MiB reserve + 10×chunk, fitted to the 100 GB ladder's whole-container
+   peaks and locked by a unit test (`mem_budget_matches_the_measured_ladder`).
+3. **Auto thin pipes.** When memory (not CPU) caps the pipe count and
+   `chunk_bytes` wasn't pinned, the engine now trades buffer depth for pipes
+   (2 MiB chunks). `chunk_bytes` became `Option` end-to-end so an explicit
+   value is never touched.
+
+What auto now does on the same 10M pg→ch run (was: 1 pipe / ~58 s at every cap
+below 256 MB):
+
+| cap | auto config | time | peak | vs before session 2 |
+|---|---|---|---|---|
+| 256 MB | 8 × 2 MiB | 21.7 s | 119 MB (46%) | same speed, −30 MB peak |
+| 128 MB | 4 × 2 MiB | **23.4 s** | 80.7 MB (63%) | **2.5× faster** |
+| 80 MB | 2 × 2 MiB | **29.1 s** | 49.0 MB (61%) | **2× faster** |
+| 44 MB | 1 pipe | 58.9 s | 40.7 MB | unchanged, still completes |
+
+The 128 MB container now nearly matches the 256 MB one — parallelism, not
+memory, was always the thing being bought. mimalloc was also re-tried on the
+new code and rejected a second, final time: [mimalloc-ab.md](mimalloc-ab.md).
