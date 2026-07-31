@@ -43,13 +43,18 @@ streams and survives but crawls; apitap barely notices the box — it is margina
 *faster* on the small one, because fewer vCPUs means fewer pipes and less insert
 contention at the destination.
 
-And it holds at scale (v0.14.0): **100 GB — 232M rows — through that same
-256 MB / 0.5 vCPU container in 8m57s**, peak RSS 170.8 MB, every row
-checksum-verified; on that table ingestr v1.1.14 and dlt 1.29.1 (pyarrow) are
-OOM-killed in ~21 s. Peak memory is `pipes × chunk_bytes`, never table size —
-the same 100 GB also lands inside a **44 MB** container. Ladder, methodology
-and raw logs:
-[benchmarks/profiling.md](https://github.com/apitap/apitap-lib/blob/main/benchmarks/profiling.md).
+And it holds at scale: **100 GB — 232M rows — through that same 256 MB /
+0.5 vCPU container in 8m57s**, peak RSS 170.8 MB, every row checksum-verified;
+on that table ingestr v1.1.14 and dlt 1.29.1 (pyarrow) are OOM-killed in
+~21 s. Peak memory is `pipes × chunk_bytes`, never table size — the same
+100 GB also lands inside a **44 MB** container. Give it real hardware and the
+same zero-config call does the same 100 GB in **30.3 seconds** (~3.3 GB/s,
+three dedicated GCE machines — where the alternatives had landed zero rows
+when cut). v0.15.0 additionally auto-thins chunks on memory-capped boxes
+(128 MB tier: 2.5× faster than v0.14.0) and fixes a silent hang against
+MySQL 8.4 servers. Ladder, methodology and raw logs:
+[benchmarks/profiling.md](https://github.com/apitap/apitap-lib/blob/main/benchmarks/profiling.md)
+· [gcp-benchmark.md](https://github.com/apitap/apitap-lib/blob/main/benchmarks/gcp-benchmark.md).
 
 ## Routes
 

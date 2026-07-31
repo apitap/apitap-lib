@@ -32,14 +32,19 @@ that needs gigabytes of RAM elsewhere can finish, faster, on the smallest
 container you can rent. That difference is real cost savings, every hour, on
 every pipeline.
 
-Where that belief stands today, honestly measured: about **1M rows in ~18
-seconds on 0.5 vCPU / 256 MB** (~3.3M rows/minute) — a box where, in our
-benchmarks, the tools we compared against could not finish at all. The goal
-we are quietly working toward is **10M rows per minute on that same tiny
-box**. We are roughly 3× away, and we might never fully get there — but every
-step is taken the same way: one lever at a time, measured, checksum-validated,
-and written down in [benchmarks/README.md](benchmarks/README.md) including
-the caveats and our own mistakes.
+Where that belief stands today, honestly measured: the tiny-box goal we set at
+launch — **10M rows per minute on 0.5 vCPU / 256 MB** — has been reached and
+passed: the transcode route now moves **232M rows (101 GB) in 8m57s** in that
+container (~26M rows/minute, peak RSS 170.8 MB), the same table still completes
+inside a **44 MB** cap, and on three dedicated machines the identical transfer
+takes **30.3 seconds** (~3.3 GB/s, checksum-matched). The tools we compare
+against were OOM-killed in ~21 s on the small box and had landed **zero rows**
+when cut on the big one. Every step got here the same way: one lever at a
+time, measured, checksum-validated, and written down in
+[benchmarks/README.md](benchmarks/README.md) including the caveats and our own
+mistakes — the profiling story behind the last 2-2.5× is
+[benchmarks/profiling.md](benchmarks/profiling.md), and the fast-rig run is
+[benchmarks/gcp-benchmark.md](benchmarks/gcp-benchmark.md) (Round C).
 
 If you see a number that looks wrong, an assumption that doesn't hold, or a
 workload where apitap does badly — please open an issue. This project has
