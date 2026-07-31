@@ -1,0 +1,75 @@
+════════ GCP ROUND C — 100 GB pg→ch, 3 dedicated machines, internal VPC (2026-07-31) ════════
+rig: rc-src c3-highmem-44 (352GB RAM, pgdata pd-balanced 300GB) · rc-tool c3-highcpu-88 (TIER_1) · rc-dst c3-standard-44-lssd (RAID0 8× local NVMe) · zone us-central1-a · MTU 8896 · gVNIC
+seed: 232,000,000 rows parallel-16 UNLOGGED INSERT 248 s + PK build 422 s (pd-balanced was the wall)
+
+──── provisioning + seed (round-c.log, fixed pg data-dir + reseed v2) ────
+[17:07:39] == phase 1: network ==
+[17:08:28] == phase 2: instances (parallel create) ==
+[17:08:51] src=10.10.0.2 dst=10.10.0.4
+[17:08:51] == phase 3: wait ssh + startup ==
+[17:09:46] rc-src ready
+[17:09:51] rc-tool ready
+[17:09:57] rc-dst ready
+[17:09:57] == phase 4: databases ==
+CH-UP raid0 over 8 local ssd
+[17:12:42] == phase 5: tool host software ==
+apitap 0.14.0 | ingestr ingestr version v1.1.15 | dlt 1.29.1
+[17:13:54] == phase 6: seed 232000000 rows (parallel unlogged) ==
+[17:14:07] == phase 7: source checksum (also warms cache) ==
+[17:14:17] SRC_SUM=
+[17:14:24] == phase 8: apitap x3 ==
+[17:14:24] --- apitap run 1 ---
+[17:15:05] APITAP-R1 checksum MATCH
+[17:15:11] dest dropped
+[17:15:11] --- apitap run 2 ---
+
+──── apitap runs (round-c2.log) ────
+[17:27:50] == C2 phase 1: source checksum (warms cache) ==
+[17:32:16] SRC_SUM=232000000|26912000116000000|3800744537500|26912000116000000|…
+[17:32:16] == C2 phase 2: apitap x3 ==
+[17:32:16] --- apitap run 1 ---
+APITAP-R1 rows=232000000 pipes=32 wall=30.3s engine_ms=30265
+print(f'APITAP-R1 rows={r.rows} pipes={r.parallel} wall={round(time.time()-t0,1)}s engine_ms={r.elapsed_ms}')"
+	Percent of CPU this job got: 632%
+	Maximum resident set size (kbytes): 614024
+[17:33:07] APITAP-R1 checksum MATCH
+[17:33:14] dest dropped
+[17:33:14] --- apitap run 2 ---
+APITAP-R2 rows=232000000 pipes=32 wall=33.8s engine_ms=33809
+print(f'APITAP-R2 rows={r.rows} pipes={r.parallel} wall={round(time.time()-t0,1)}s engine_ms={r.elapsed_ms}')"
+	Percent of CPU this job got: 575%
+	Maximum resident set size (kbytes): 736264
+[17:34:08] APITAP-R2 checksum MATCH
+[17:34:14] dest dropped
+[17:34:14] --- apitap run 3 ---
+APITAP-R3 rows=232000000 pipes=32 wall=30.3s engine_ms=30310
+print(f'APITAP-R3 rows={r.rows} pipes={r.parallel} wall={round(time.time()-t0,1)}s engine_ms={r.elapsed_ms}')"
+	Percent of CPU this job got: 632%
+	Maximum resident set size (kbytes): 794700
+[17:35:04] APITAP-R3 checksum MATCH
+[17:35:10] dest dropped
+[17:35:10] == C2 phase 3: ingestr (10-min cap) ==
+
+──── forced-pipe experiment (does auto's 32-pipe clamp leave speed on the table? No.) ────
+PIPES-64 rows=232000000 wall=35.2s   Percent of CPU: 567%   Max RSS: 847640 kB
+PIPES-96 rows=232000000 wall=34.4s   Percent of CPU: 587%   Max RSS: 1242668 kB
+(auto 32 pipes: 30.3 / 33.8 / 30.3 s — fastest; more pipes = slower + more RAM)
+
+──── competitors, 10-min caps (round-c3.log) ────
+[PROGRESS] 10:44:19 | Rows: 122,425,000 | Batches: 4897 | Rate: 313910 rows/s | CPU: 100.9% | Mem: 605 MB
+[PROGRESS] 10:44:22 | Rows: 123,400,000 | Batches: 4936 | Rate: 313994 rows/s | CPU: 100.9% | Mem: 612 MB
+[17:44:31] ingestr rows landed: 0
+[17:44:37] dest dropped
+[17:44:37] == C3: dlt: dlt+pyarrow (10-min cap) ==
+2026-07-31 10:49:51,712|[WARNING]|5627|133202434265536|dlt|pyarrow.py|cast_arrow_array_as_column_schema:1365|Received `data_type='json'`, Arrow nested values require serialization to STRING. They will be JSON-encoded, which may slow extraction. If your destination supports nested types, enable them (`supports_nested_types=True`) and provide a 'json' column with 'x-nested-type' hint to load nested values natively. Otherwise, consider casting to STRING upstream (e.g., in a VIEW).
+2026-07-31 10:49:52,429|[WARNING]|5627|133202434265536|dlt|pyarrow.py|convert_array_to_arrow:1136|Default conversion to `string` for `data_type=json` failed. Using fallback strategies.
+2026-07-31 10:49:52,448|[WARNING]|5627|133202434265536|dlt|pyarrow.py|cast_arrow_array_as_column_schema:1365|Received `data_type='json'`, Arrow nested values require serialization to STRING. They will be JSON-encoded, which may slow extraction. If your destination supports nested types, enable them (`supports_nested_types=True`) and provide a 'json' column with 'x-nested-type' hint to load nested values natively. Otherwise, consider casting to STRING upstream (e.g., in a VIEW).
+[17:49:58] dlt rows landed: 0
+[17:50:03] dest dropped
+[17:50:03] ROUND-C3-COMPLETE
+[17:50:03] TEARDOWN: deleting all round-c resources…
+
+──── verdicts ────
+ingestr v1.1.15: CUT at ~6.5 min (user-shortened cap). Its own progress log: 123.4M rows READ (53%) at ~314K rows/s, 100.9% CPU (1 core of 88) — extract-then-load architecture: 0 rows had reached ClickHouse.
+dlt 1.29.1 + pyarrow: CUT at 5m16s. Still in arrow extraction (schema-warning loop) — 0 rows had reached ClickHouse.
+apitap 0.14.0+s2: 30.3 / 33.8 / 30.3 s, all 232M rows checksum-MATCH, ~3.3 GB/s, 632% CPU, 614-736 MB RSS. Zero configuration.

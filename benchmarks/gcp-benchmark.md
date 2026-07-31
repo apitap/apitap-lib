@@ -216,3 +216,54 @@ Round-B notes:
   `dlt_run.py`) are the exact scripts that produced the numbers above; machine
   types, region, internal-IP topology, image tags, tool versions, and the
   measurement command (`/usr/bin/time -v`) are all listed here and there.
+
+## Round C — 100 GB, the fast-rig question (2026-07-31)
+
+Round A asked "who is faster on equal machines"; Round C asks the follow-up the
+100 GB OVH ladder raised: **when every external wall is removed, how fast is the
+engine itself — and do the alternatives benefit from better hardware at all?**
+Raw log: [gcp-round-c-raw.log](gcp-round-c-raw.log).
+
+**Rig** (same zone `us-central1-a`, internal VPC, MTU 8896, gVNIC):
+
+| Role | Machine | Storage |
+|---|---|---|
+| Source PG 16 | `c3-highmem-44` (352 GB RAM — the 101 GB table serves cache-hot) | 300 GB pd-balanced |
+| Tool host | `c3-highcpu-88`, Tier_1 networking | — |
+| Dest CH 24.8 | `c3-standard-44-lssd` | RAID0 over 8 local NVMe |
+
+**Data**: the same 232,000,000-row / 101 GB table as the OVH ladder, seeded in
+4m08s (16 parallel UNLOGGED INSERTs) + 7m02s PK build, checksummed at the
+source before any run counted.
+
+**apitap 0.14.0 (+session-2 engine), zero configuration** — three runs:
+
+| run | wall | verdict |
+|---|---|---|
+| 1 | **30.3 s** | checksum MATCH |
+| 2 | 33.8 s | checksum MATCH |
+| 3 | 30.3 s | checksum MATCH |
+
+**~3.3 GB/s sustained** (7.7M rows/s), ~6.3 cores of the 88 busy, peak RSS
+614-736 MB. Forcing more pipes than auto's 32 made it *slower* (64 pipes:
+35.2 s; 96: 34.4 s, 1.24 GB RSS) — the clamp is calibration, not timidity; at
+3.3 GB/s the wall is the databases, not the engine.
+
+**The competitors, same rig, caps shortened at the operator's request:**
+
+- **ingestr v1.1.15** — cut at ~6.5 min. Its own progress log shows why more
+  hardware doesn't help: 123.4M rows *read* at ~314K rows/s on **1 core of
+  88** (100.9% CPU), and because it extracts fully before loading, **0 rows
+  had reached ClickHouse** when cut. At that read rate the extract alone
+  needed ~12.3 more minutes before the first row would land.
+- **dlt 1.29.1 (pyarrow)** — cut at 5m16s, still in arrow extraction,
+  **0 rows landed**.
+
+The asymmetry is the finding: apitap's streaming architecture converts extra
+hardware into throughput (0.5 vCPU/256 MB → 8m57s; this rig → 30.3 s, a 17.7×
+scale-up), while a serial extract-then-load pipeline runs at the same ~1-core
+pace on a $0.05/hr VPS and a $16/hr rig alike. Renting fast machines only pays
+if the tool can spend them.
+
+Cost of the entire round, provision to teardown: ≈ **$6** of instance time.
+Everything was deleted immediately after (`gcloud compute instances list` → empty).
