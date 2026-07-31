@@ -1,0 +1,45 @@
+════════ GCP ROUND D — how small can the TOOL be? (2026-07-31) ════════
+[18:30:00] == D phase 1: network ==
+[18:30:49] == D phase 2: instances ==
+[18:31:10] src=10.11.0.3 dst=10.11.0.5
+[18:31:11] == D phase 3: wait ready ==
+[18:35:03] rd-src ready
+[18:35:09] rd-tool ready
+[18:35:14] rd-tool8 ready
+[18:35:20] rd-dst ready
+[18:35:20] == D phase 4: databases (pg data-dir fix applied) ==
+[18:36:06] == D phase 5: tools ==
+[18:36:50] == D phase 6: seed (parallel unlogged, known-good v2) ==
+INSERT-DONE 248s
+PK-DONE 662s
+[18:48:05] == D phase 7: source checksum ==
+[18:52:42] SRC_SUM ok (232000000|26912000116000000|380074453750…)
+[18:52:42] == D phase 8: REF uncapped on 88-core (sanity) ==
+RES rows=232000000 pipes=32 wall=34.8s peak_cg=0MB
+print(f'RES rows={r.rows} pipes={r.parallel} wall={el}s peak_cg={peak}MB')"
+	Percent of CPU this job got: 493%
+	Maximum resident set size (kbytes): 622876
+[18:53:37] REF MATCH
+[18:53:43] dest dropped
+[18:53:43] == D phase 9: D1 docker --cpus=8 --memory=1g on 88-core host (x2) ==
+RES rows=232000000 pipes=32 wall=30.7s peak_cg=506.1MB
+[18:54:34] D1-R1 MATCH
+[18:54:40] dest dropped
+RES rows=232000000 pipes=32 wall=34.2s peak_cg=504.2MB
+[18:55:38] D1-R2 MATCH
+[18:55:44] dest dropped
+[18:55:44] == D phase 10: D2 real c3-standard-8 VM (x2) ==
+RES rows=232000000 pipes=32 wall=38.9s peak_cg=0MB
+print(f'RES rows={r.rows} pipes={r.parallel} wall={el}s peak_cg={peak}MB')"
+	Percent of CPU this job got: 565%
+	Maximum resident set size (kbytes): 944776
+[18:56:42] D2-R1 MATCH
+[18:56:49] dest dropped
+RES rows=232000000 pipes=32 wall=38.8s peak_cg=0MB
+print(f'RES rows={r.rows} pipes={r.parallel} wall={el}s peak_cg={peak}MB')"
+	Percent of CPU this job got: 579%
+	Maximum resident set size (kbytes): 934148
+[18:57:47] D2-R2 MATCH
+[18:57:54] dest dropped
+[18:57:54] ROUND-D-COMPLETE
+[18:57:54] TEARDOWN: deleting all round-d resources…

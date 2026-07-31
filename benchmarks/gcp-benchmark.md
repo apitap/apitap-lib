@@ -267,3 +267,31 @@ if the tool can spend them.
 
 Cost of the entire round, provision to teardown: ≈ **$6** of instance time.
 Everything was deleted immediately after (`gcloud compute instances list` → empty).
+
+## Round D — how small can the mover be? (2026-07-31)
+
+Round C showed the engine using ~6 of 88 cores and ~700 MB. Round D asks the
+operator's follow-up directly: *does an 8-vCPU / 1 GB tool hit the same 30
+seconds?* Same source, destination and data as Round C; only the tool varies.
+Raw: [gcp-round-d-raw.log](gcp-round-d-raw.log).
+
+| tool configuration | wall (×2) | peak mem | verdict |
+|---|---|---|---|
+| reference: `c3-highcpu-88`, uncapped | 34.8 s | 623 MB RSS | MATCH |
+| **docker `--cpus=8 --memory=1g`** on that host | **30.7 / 34.2 s** | 506 MB (cgroup) | MATCH ×2 |
+| **real `c3-standard-8` VM** (≈$0.42/hr) | **38.9 / 38.8 s** | 945 MB RSS | MATCH ×2 |
+
+Readings:
+
+- **8 cores + 1 GB fully matches the 88-core host** — the capped container even
+  posted the session's fastest run. Inside the 1 GB cgroup the engine
+  auto-selected 32 thin pipes and peaked at 506 MB (50% headroom).
+- **The real small VM costs +4-8 s, and the delta is the network, not the
+  engine**: a c3-standard-8's ~23 Gbps egress caps the pipe at ~2.9 GB/s;
+  101 GB ÷ 2.9 GB/s ≈ 35 s + overhead lands exactly on the measured
+  38.8-38.9 s (reproduced to within 0.1 s).
+- Net: in a 100 GB / half-minute pipeline, **the data mover is the cheapest
+  machine in the rack** — the databases are what you pay for. This is the
+  inverse of the gigabyte-worker ELT norm.
+
+Round cost ≈ $9; all resources deleted immediately after.
