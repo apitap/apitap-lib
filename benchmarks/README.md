@@ -15,8 +15,47 @@ Companion write-ups in this directory:
   Raw: [100gb-ladder-raw.log](100gb-ladder-raw.log),
   [hotpath-profile-raw.log](hotpath-profile-raw.log).
 - **[mimalloc-ab.md](mimalloc-ab.md)** — the allocator swap that measured worse
-  and was rejected; kept so it isn't re-tried without new evidence.
-  Raw: [mimalloc-ab-raw.log](mimalloc-ab-raw.log).
+  and was rejected — twice: Round 2 re-ran it on the recycled engine and it
+  lost again (RSS +25-50% for a wash in time). The allocator question is
+  closed. Raw: [mimalloc-ab-raw.log](mimalloc-ab-raw.log).
+- **Session 2** (in [profiling.md](profiling.md), same page, later section) —
+  the retune the 100 GB ladder paid for: the memory→pipes budget refitted to
+  measured whole-container peaks (locked by a unit test), **auto thin pipes**
+  (2 MiB chunks when memory — not CPU — caps the pipe count: the 128 MB tier
+  went 58 s → 23.4 s on 10M rows), and the MySQL 8.4 silent-hang fix
+  (mysql_async 0.37 + a 30 s loud deadline on every sink connection).
+  Raw: [session2-raw.log](session2-raw.log).
+- **[gcp-benchmark.md](gcp-benchmark.md)** — dedicated-machine rounds on
+  Google Cloud. Round A/B: every tool uncapped on equal hardware. **Round C:
+  the same 232M-row / 101 GB table as the OVH ladder on a three-machine
+  internal-VPC rig — apitap 30.3 s (×3, checksum-matched, ~3.3 GB/s); latest
+  ingestr and dlt+pyarrow had landed 0 rows when cut.**
+  Raw: [gcp-round-c-raw.log](gcp-round-c-raw.log).
+
+## What the harness measures (and how)
+
+Features of [`run-server.sh`](run-server.sh) that the write-ups above rely on —
+each added when a benchmark outgrew the previous version of the harness:
+
+- **`PEAK_MB`** — every run prints the container cgroup's `memory.peak`; peak
+  RSS is a first-class output next to wall time (added when the mimalloc A/B
+  needed trustworthy memory numbers).
+- **Scale-safe cross-engine checksums** — string columns validate via an
+  order-independent SUM of per-row 32-bit md5 prefixes, computed independently
+  by Postgres and ClickHouse and compared as one string. The previous
+  `md5(string_agg(...))` crossed Postgres's 1 GiB buffer limit around ~110M
+  rows — at 232M the *validator* broke before the engine did. The two
+  formulations were verified byte-identical on both engines before the swap.
+- **Cached source checksums** — the source sum is a full-table scan that only
+  changes when the seed does; it is cached per (db, table, validator-formula
+  hash) and invalidated on re-seed, so a 5-rung ladder pays the ~10-minute
+  scan once.
+- **`PARALLEL=` / explicit `chunk_bytes`** — env passthrough for pipe-count
+  and chunk experiments (how the forced-pipe rows in the 100 GB ladder and the
+  thin-pipe cells were produced). Auto behavior is always reported alongside.
+- **Dest hygiene** — every run ends by dropping the destination table and
+  staging; competitor runs get identical treatment, and any capped/killed run
+  records the rows that had actually landed at cut time.
 
 ## What is compared
 
