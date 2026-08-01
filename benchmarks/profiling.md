@@ -197,3 +197,45 @@ below 256 MB):
 The 128 MB container now nearly matches the 256 MB one — parallelism, not
 memory, was always the thing being bought. mimalloc was also re-tried on the
 new code and rejected a second, final time: [mimalloc-ab.md](mimalloc-ab.md).
+
+
+## Session 3 — the MySQL source (2026-08-02)
+
+Same discipline as the first campaign, pointed at `mysql://` sources: hotpath
+for the wait-structure, `perf` on software `cpu-clock` (this VPS blocks PMU
+counters), and the worker's own fetch/encode/send split. Rig: 11.8M rows
+(the ingestr schema), MySQL 8.0 source, 16-core host.
+
+**Finding 1 — the TLS tax.** The top `perf` symbol on my→pg was
+`_aesni_ctr32_ghash_6x`: MySQL 8 negotiates TLS by default and sqlx obliges,
+so the entire wire stream pays AES-GCM. `?ssl-mode=disabled` (trusted
+networks): my→pg 34.6 s → 27.6 s (−20%), my→ch 14.8 s → 12.4 s (−16%).
+Zero code — documented in the usage guide. (Postgres benches never paid this
+because postgres:16-alpine ships without TLS; a TLS-enabled pg would.)
+
+**Finding 2 — the source was never the wall.** With TLS off, the worker
+split reads fetch ≈ 2 s, encode ≈ 1 s, send-wait ≈ 21 s of a 28 s my→pg run,
+on every one of 16 workers — and my→ch moves the same rows in 12.4 s. The
+MySQL source sustains ~950K rows/s; the pg *destination* saturates at
+~450K rows/s regardless of pipe count.
+
+**Fixes landed.** (1) The mysql row_worker now recycles chunk buffers from
+the pg sink's back-channel instead of allocating a fresh multi-MB Vec per
+chunk (`clear_page_erms` was 4.8% of samples — the same churn the pg COPY
+worker shed in session 1), and my→pg gets the overlapped COPY loader.
+(2) `my_pg_parallel` caps at the measured dest saturation: 8 pipes = 26.0 s
+where 16 = 28.4 s — same speed, half the peak memory, less lock contention.
+
+| my→pg, 11.8M rows | wall | peak | notes |
+|---|---|---|---|
+| 0.16.0, defaults (host) | 34.6 s | — | TLS on, 16 pipes |
+| 0.16.0, `ssl-mode=disabled` (host) | 27.6 s | — | knob only |
+| **this session** (host, auto 8 pipes) | **26.0 s** | — | −25% end-to-end |
+| 0.16.0 in 2 vCPU / 1 GB | 26.7 s | 246 MB | ssl off |
+| **this session** in 2 vCPU / 1 GB | **24.5 s** | 303 MB | −8% engine-only; +57 MB is the overlap pipeline's in-flight buffers, inside every tier budget |
+
+pg→pg on the same dest instance: 25.3 s — the my→pg gap is now noise. What
+remains of my→pg is the **destination's** ~450K rows/s COPY ceiling, which is
+the next session's target (with `sqlx BinaryRow::decode_with` at 6.3% +
+async-stream yielding at ~8.5%, a raw-protocol MySQL reader is the source-side
+endgame if it ever becomes the wall again).
