@@ -373,7 +373,7 @@ routes! {
     "postgres" -> "mysql"      : PgFrom => MyTo, MY_MY,   pg_overlap = false;
     "postgres" -> "bigquery"   : PgFrom => BqTo, TO_BQ,   pg_overlap = false;
     "mysql"    -> "clickhouse" : MyFrom => ChTo, TO_CH,   pg_overlap = false;
-    "mysql"    -> "postgres"   : MyFrom => PgTo, MY_PG,   pg_overlap = false;
+    "mysql"    -> "postgres"   : MyFrom => PgTo, MY_PG,   pg_overlap = true;
     "mysql"    -> "mysql"      : MyFrom => MyTo, MY_MY,   pg_overlap = false;
     "gsheets"  -> "postgres"   : GsFrom => PgTo, GSHEETS, pg_overlap = false;
     "gsheets"  -> "clickhouse" : GsFrom => ChTo, GSHEETS, pg_overlap = false;

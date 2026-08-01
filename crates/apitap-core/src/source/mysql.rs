@@ -1096,9 +1096,17 @@ async fn row_worker<L: Loader>(
                 return Err(loader.abort(e).await);
             }
             // mem::replace (not take): take leaves capacity 0 and the next chunk pays
-            // ~1 extra full copy in geometric regrowth.
+            // ~1 extra full copy in geometric regrowth. Recycled buffers from the
+            // sink's back-channel replace fresh allocations — the same churn fix
+            // the pg COPY worker got (benchmarks/profiling.md): a fresh multi-MB
+            // Vec per chunk was kernel page-zeroing on every allocation.
             if out.len() >= chunk {
-                let full = std::mem::replace(&mut out, Vec::with_capacity(chunk + 64 * 1024));
+                let full = std::mem::replace(
+                    &mut out,
+                    loader
+                        .reclaim()
+                        .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024)),
+                );
                 let ts = std::time::Instant::now();
                 loader.send(full).await?;
                 if dbg {
