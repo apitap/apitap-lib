@@ -510,6 +510,16 @@ impl IcebergSink {
         )
     }
 
+    /// Companion property recording WHICH column the watermark tracks — the
+    /// Postgres sink's state table has a cursor_col column for the same
+    /// reason: a run that switches cursors must not reuse the old value.
+    fn cur_prop(&self) -> String {
+        format!(
+            "apitap.watermark-cursor.{}",
+            self.source_id.as_deref().unwrap_or("default")
+        )
+    }
+
     /// Bind the S3 side from the catalog-assigned table location.
     fn bind_storage(&mut self, meta: &TableMetadata) -> Result<()> {
         if meta.format_version() == FormatVersion::V1 {
@@ -734,7 +744,13 @@ impl crate::sink::Sink for IcebergSink {
             )));
         }
         let props = meta.properties();
-        let own = props.get(&self.wm_prop()).cloned();
+        // A state row only counts if it tracked THIS cursor column — a
+        // cursor switch quietly re-bootstraps from data instead of feeding a
+        // value from one column into a filter on another.
+        let own = props
+            .get(&self.wm_prop())
+            .filter(|_| props.get(&self.cur_prop()).map(String::as_str) == Some(cursor))
+            .cloned();
         let sibling = props
             .keys()
             .any(|k| k.starts_with("apitap.watermark.") && *k != self.wm_prop());
@@ -1079,15 +1095,25 @@ impl IcebergSink {
                 let stale: Vec<String> = meta
                     .properties()
                     .keys()
-                    .filter(|k| k.starts_with("apitap.watermark."))
+                    .filter(|k| {
+                        k.starts_with("apitap.watermark.")
+                            || k.starts_with("apitap.watermark-cursor.")
+                    })
                     .cloned()
                     .collect();
                 if !stale.is_empty() {
                     updates.push(TableUpdate::RemoveProperties { removals: stale });
                 }
             } else if let Some(wm) = &new_wm {
+                let cursor_name = self
+                    .cursor
+                    .map(|(i, _)| self.names[i].clone())
+                    .unwrap_or_default();
                 updates.push(TableUpdate::SetProperties {
-                    updates: HashMap::from([(self.wm_prop(), wm.clone())]),
+                    updates: HashMap::from([
+                        (self.wm_prop(), wm.clone()),
+                        (self.cur_prop(), cursor_name),
+                    ]),
                 });
             }
             let requirements = vec![
