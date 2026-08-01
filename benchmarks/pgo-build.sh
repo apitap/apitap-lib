@@ -41,6 +41,10 @@ train() {
 import apitap
 apitap.transfer('$1', '$2', table='$3')"
 }
+# Object-store lanes (0.16.0): the parquet encoder + SigV4 client + Iceberg
+# commit path are distinct hot branches — untrained they can regress.
+S3T="s3://apitap-bench/pgotrain?format=parquet&endpoint=http://127.0.0.1:9100&access_key_id=bench&secret_access_key=benchbench"
+ICET="iceberg://127.0.0.1:8181/pgotrain?endpoint=http://127.0.0.1:9100&access_key_id=bench&secret_access_key=benchbench"
 for _ in 1 2; do
     train "$PS" "$PD" public.bench_data_1m
     train "$PS" "$CH" public.bench_data_1m
@@ -48,7 +52,24 @@ for _ in 1 2; do
     train "$MY" "$PD" bench_my_1m
     train "$MY" "$MYD" bench_my_1m
     train "$PS" "$MYD" public.bench_data_1m   # pg->mysql (0.13.0): pgmytsv transcoder
+    train "$PS" "$S3T" public.bench_data_1m   # s3 multipart + parquet encode
+    train "$PS" "$ICET" public.bench_data_1m  # iceberg: same lane + REST commit
 done
+# GCS (both formats) needs live GCP creds: set GCS_TRAIN_URL to the parquet
+# URL (gcs://bucket/prefix?format=parquet&credentials=/abs/key.json) and
+# GCS_TRAIN_SA to the key path; skipped otherwise.
+if [ -n "${GCS_TRAIN_URL:-}" ] && [ -n "${GCS_TRAIN_SA:-}" ]; then
+    train_gcs() {
+        docker run --rm --network=host \
+            -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+            -v "$GCS_TRAIN_SA":/sa/key.json:ro \
+            apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$PS', '$1', table='public.bench_data_1m', dest_table='pgo_train_gcs')"
+    }
+    train_gcs "$GCS_TRAIN_URL"
+    train_gcs "${GCS_TRAIN_URL/format=parquet/format=csv}"
+fi
 # BigQuery route (both lanes — untrained branches can regress): needs a live
 # project. Set BQ_TRAIN_URL='bigquery://proj/ds?credentials=/sa/key.json' and
 # BQ_TRAIN_SA=/abs/path/key.json to enable; skipped otherwise.

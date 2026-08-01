@@ -671,6 +671,62 @@ apitap.transfer(
 - **Scope**: format-version 2 tables; single-level namespaces; concurrent
   writers are handled by requirement-checked commits with 3 retries.
 
+### Try it locally in five minutes
+
+A full Iceberg lakehouse on one machine — MinIO for storage, Apache's REST
+catalog fixture in front of it:
+
+```bash
+docker network create lake
+docker run -d --name minio --network lake -p 9000:9000 \
+  -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=adminadmin \
+  minio/minio server /data
+docker exec minio mc alias set m http://127.0.0.1:9000 admin adminadmin
+docker exec minio mc mb m/lake
+docker run -d --name icecat --network lake -p 8181:8181 \
+  -e CATALOG_WAREHOUSE=s3://lake/wh \
+  -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+  -e CATALOG_S3_ENDPOINT=http://minio:9000 \
+  -e CATALOG_S3_PATH__STYLE__ACCESS=true \
+  -e AWS_ACCESS_KEY_ID=admin -e AWS_SECRET_ACCESS_KEY=adminadmin \
+  -e AWS_REGION=us-east-1 \
+  apache/iceberg-rest-fixture:latest
+```
+
+Then every mode is one call:
+
+```python
+import apitap
+
+ICE = ("iceberg://127.0.0.1:8181/analytics?endpoint=http://127.0.0.1:9000"
+       "&access_key_id=admin&secret_access_key=adminadmin")
+
+# 1) full load — creates namespace + table, commits an overwrite snapshot
+apitap.transfer("postgres://user:pass@host/db", ICE, table="public.events")
+
+# 2) nightly increment — only rows past the last watermark move
+apitap.transfer("postgres://user:pass@host/db", ICE, table="public.events",
+                mode="append")
+
+# 3) upsert a delta by primary key (rows whose updated_at advanced)
+apitap.transfer("postgres://user:pass@host/db", ICE, table="public.events",
+                mode="merge", cursor="updated_at")
+```
+
+Read it back from anything that speaks Iceberg — DuckDB for instance:
+
+```sql
+INSTALL iceberg; LOAD iceberg;
+SET s3_endpoint='127.0.0.1:9000'; SET s3_access_key_id='admin';
+SET s3_secret_access_key='adminadmin'; SET s3_use_ssl=false; SET s3_url_style='path';
+SELECT count(*) FROM iceberg_scan('s3://lake/wh/analytics/events/metadata/<latest>.metadata.json');
+```
+
+(The `<latest>` metadata path comes from
+`GET http://127.0.0.1:8181/v1/namespaces/analytics/tables/events` →
+`metadata-location`.) For production, point the same URL at Lakekeeper,
+Polaris, Nessie, Glue or R2 — only `warehouse=`/`base=`/`token=` change.
+
 ## Durability
 
 `durable=False` (Postgres destinations only) loads through an **UNLOGGED** staging
