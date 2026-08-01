@@ -563,9 +563,12 @@ impl IcebergSink {
                     continue;
                 }
                 saw_file = true;
-                let (v, num) = self
+                let Some((v, num)) = self
                     .footer_cursor_max(&s3, df.file_path(), df.file_size_in_bytes(), cursor)
-                    .await?;
+                    .await?
+                else {
+                    continue; // 0-row file (some writers land them) — nothing to learn
+                };
                 numeric = num;
                 acc = wm_max(acc, Some(v), num);
             }
@@ -584,7 +587,7 @@ impl IcebergSink {
         path: &str,
         size: u64,
         cursor: &str,
-    ) -> Result<(String, bool)> {
+    ) -> Result<Option<(String, bool)>> {
         use parquet::basic::{LogicalType, TimeUnit, Type as PhysicalType};
         use parquet::file::metadata::ParquetMetaDataReader;
         use parquet::file::statistics::Statistics;
@@ -619,6 +622,9 @@ impl IcebergSink {
                  mode='replace', or use an integer/timestamp cursor"
             ))
         };
+        if md.file_metadata().num_rows() == 0 {
+            return Ok(None);
+        }
         let mut max_i: Option<i64> = None;
         let mut max_s: Option<String> = None;
         for rg in md.row_groups() {
@@ -653,18 +659,18 @@ impl IcebergSink {
                          timestamp unit — not supported"
                     )));
                 }
-                Ok((
+                Ok(Some((
                     crate::wire::bqparquet::render_ts_micros(m, is_adjusted_to_u_t_c)?,
                     false,
-                ))
+                )))
             }
             (PhysicalType::INT32, Some(LogicalType::Date), Some(m), _) => {
-                Ok((crate::wire::bqparquet::render_date_days(m)?, false))
+                Ok(Some((crate::wire::bqparquet::render_date_days(m)?, false)))
             }
             (PhysicalType::INT64 | PhysicalType::INT32, None | Some(LogicalType::Integer { .. }), Some(m), _) => {
-                Ok((m.to_string(), true))
+                Ok(Some((m.to_string(), true)))
             }
-            (PhysicalType::BYTE_ARRAY, _, _, Some(m)) => Ok((m, false)),
+            (PhysicalType::BYTE_ARRAY, _, _, Some(m)) => Ok(Some((m, false))),
             _ => Err(no_stats()),
         }
     }
@@ -1292,7 +1298,9 @@ impl crate::sink::Loader for IcebergLoader {
             let mut b = self.pq.out.0.lock().expect("parquet buf");
             std::mem::take(&mut *b)
         };
-        if self.etags.is_empty() && pending.is_empty() {
+        // A 0-row worker still produced parquet header+footer bytes — don't
+        // land an empty data file in the manifest; abort the upload instead.
+        if self.rows == 0 {
             self.s3.abort_multipart(&self.key, &self.upload_id).await;
             return Ok(0);
         }
