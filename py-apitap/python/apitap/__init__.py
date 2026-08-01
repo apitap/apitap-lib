@@ -113,9 +113,11 @@ def transfer(
     ``clickhouse://`` (``clickhouse+https://`` for TLS),
     ``bigquery://<project>/<dataset>?credentials=/path/key.json``,
     ``gcs://<bucket>[/prefix]?format=csv|parquet&credentials=/path/key.json``
-      s3://bucket[/prefix]?format=parquet&endpoint=…       (S3/MinIO/R2, Parquet files)
-    (files: one composed .csv.gz per table, or a directory of Parquet parts)
-    destinations — and
+    (files: one composed .csv.gz per table, or a directory of Parquet parts),
+    ``s3://<bucket>[/prefix]?format=parquet&endpoint=…`` (S3/MinIO/R2, Parquet
+    files), ``iceberg://<catalog-host:port>/<namespace>?warehouse=…&endpoint=…``
+    (Apache Iceberg via any REST catalog; replace/append/merge are real
+    snapshot commits) destinations — and
     each pair negotiates its fastest wire format (raw binary COPY passthrough,
     in-flight RowBinary transcode, raw wire decode, or gzipped parallel load jobs).
     N concurrent range pipes feed a staging table that is swapped in atomically.

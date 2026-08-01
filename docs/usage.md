@@ -59,6 +59,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | GitHub API (source) | `github+api://` | `github+api://<owner>/<repo>` — issues, PRs, commits, stars … as typed tables. See [GitHub API source](#github-api-source-the-project-as-tables). |
 | Google Cloud Storage (destination) | `gcs://` | `gcs://<bucket>[/prefix]?format=csv\|parquet&credentials=/path/key.json`. See [GCS destination](#gcs-destination-csv--parquet-files). |
 | S3-compatible (destination) | `s3://` | `s3://<bucket>[/prefix]?format=parquet[&endpoint=…]` — AWS, MinIO, R2, OVH/Scaleway/Hetzner. See [S3-compatible destination](#s3-compatible-destination-parquet-files). |
+| Apache Iceberg (destination) | `iceberg://` | `iceberg://<catalog-host:port>/<namespace>?warehouse=…[&endpoint=…]` — any REST catalog (Lakekeeper, Polaris, Nessie, Glue, R2, S3 Tables) on S3-compatible storage. Full replace, append AND merge. See [Apache Iceberg destination](#apache-iceberg-destination). |
 
 Table names may be schema-qualified (`public.events`, `mydb.events`); unqualified
 Postgres names resolve through the connection's `search_path`. Materialized views
@@ -623,9 +624,52 @@ apitap.transfer(
   mixed directory briefly.
 - **Format**: `format=parquet` only for now (ZSTD, same typed encoder as the
   BigQuery lane). `format=csv` returns when an S3-side concat lands.
-- **Modes**: `mode="replace"` only — objects have no upsert. Incremental
-  arrives with the Iceberg catalog destination, where append is a snapshot
-  commit.
+- **Modes**: `mode="replace"` only — objects have no upsert. For incremental,
+  use the [Iceberg destination](#apache-iceberg-destination), where append is
+  a snapshot commit.
+
+## Apache Iceberg destination
+
+```python
+apitap.transfer(
+    "postgres://user:pass@host/db",
+    "iceberg://catalog-host:8181/my_namespace?warehouse=my-wh"
+    "&endpoint=http://127.0.0.1:9000&access_key_id=…&secret_access_key=…",
+    table="public.events", mode="append")
+```
+
+- **Works with**: any Iceberg **REST catalog** — Lakekeeper, Apache Polaris,
+  Nessie, AWS Glue's REST endpoint, Cloudflare R2 Data Catalog, S3 Tables —
+  over S3-compatible object storage (the catalog's table `location` must be
+  `s3://…`). The URL host is the catalog; `endpoint=` is the object store
+  (MinIO et al., path-style), with the same credential story as `s3://`.
+- **URL params**: `warehouse=` (passed to `GET /v1/config`; required by
+  multi-warehouse catalogs like Lakekeeper), `base=` (path prefix for
+  catalogs served under one, e.g. `base=catalog` for Lakekeeper), `token=`
+  (bearer for the catalog), `tls=0/1` (defaults: http for loopback hosts,
+  https otherwise), plus `endpoint=/region=/access_key_id=/…` for storage.
+- **All three modes are real Iceberg semantics**:
+  - `replace` → an **overwrite snapshot**. Old snapshots survive — time
+    travel keeps working; readers flip atomically at the catalog commit.
+  - `append` → an **append snapshot** carrying the previous manifests plus
+    the delta's data files.
+  - `merge` → a **row-delta snapshot** (merge-on-read upsert): the delta's
+    merge-key values land as an equality-delete file alongside the delta's
+    data files in one commit. Single-column integer/text/uuid keys for now.
+- **State lives in the table**: the cursor watermark is written as table
+  properties (`apitap.watermark.<source>` + `apitap.watermark-cursor.<source>`)
+  **in the same catalog commit as the data** — transactional, queryable, no
+  local state files. A replace clears all watermark state; the next
+  incremental run **bootstraps from the destination's own parquet footer
+  statistics** (a few KB of ranged GETs), which also means apitap can pick up
+  incremental sync on an Iceberg table it never wrote — Spark/Trino/pyiceberg
+  output included. Switching cursor columns re-bootstraps instead of reusing
+  a stale value.
+- **Files**: parquet (ZSTD), field ids conformed to the table schema's own
+  ids, one file per pipe under `{location}/data/`. Table maintenance
+  (snapshot expiry, compaction) stays with your catalog/engine.
+- **Scope**: format-version 2 tables; single-level namespaces; concurrent
+  writers are handled by requirement-checked commits with 3 retries.
 
 ## Durability
 

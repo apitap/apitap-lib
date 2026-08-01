@@ -58,7 +58,7 @@ MySQL 8.4 servers. Ladder, methodology and raw logs:
 
 ## Routes
 
-Five sources × six destinations — **all 30 wired**, enforced by a test that fails
+Five sources × seven destinations — **all 35 wired**, enforced by a test that fails
 the build if any pair is neither implemented nor explicitly deferred with a reason.
 
 **Sources:** `postgres://` · `mysql://` · `gsheets://` (tabs as tables) ·
@@ -67,7 +67,10 @@ as typed tables)
 
 **Destinations:** `postgres://` · `mysql://` · `clickhouse://` · `bigquery://` ·
 `gcs://` (CSV.gz or Parquet) · `s3://` (S3-compatible — AWS, MinIO, R2,
-OVH/Scaleway/Hetzner object storage; Parquet, SigV4-signed, no SDK)
+OVH/Scaleway/Hetzner object storage; Parquet, SigV4-signed, no SDK) ·
+`iceberg://` (Apache Iceberg via any REST catalog — Lakekeeper, Polaris, Nessie,
+Glue, R2 Data Catalog, S3 Tables; **replace, append and merge are all real
+snapshot commits**, incremental state rides in the table itself)
 
 Each pair negotiates the fastest wire format both sides speak — for example:
 
@@ -127,8 +130,9 @@ apitap.transfer(
 `mode="append"` loads only rows past the last synced watermark; `mode="merge"`
 upserts the delta by primary key. The watermark lives in **`_apitap_state`** — a
 plain, queryable table in the destination database, one row per (table, source),
-written **in the same transaction as the data** on Postgres. No local state files,
-no opaque blobs, no extra columns in your rows. A 1M-row delta lands on a 10M-row
+written **in the same transaction as the data** on Postgres. On Iceberg it lives
+in the table's own properties, committed **in the same snapshot as the data**.
+No local state files, no opaque blobs, no extra columns in your rows. A 1M-row delta lands on a 10M-row
 table in ~10 s — cost is proportional to the delta, not the table.
 
 Multi-table runs share one pipe budget, so peak memory is a single table's ceiling
@@ -146,9 +150,13 @@ troubleshooting:
 ## Roadmap
 
 - [x] The route mesh — Postgres, MySQL, Google Sheets, GitHub files and the
-      GitHub API into Postgres, MySQL, ClickHouse, BigQuery, GCS and S3-compatible
-      object stores (MinIO, R2, …)
+      GitHub API into Postgres, MySQL, ClickHouse, BigQuery, GCS, S3-compatible
+      object stores (MinIO, R2, …) and Apache Iceberg
 - [x] Incremental sync — `mode="append"` / `mode="merge"` (transactional state table)
+- [x] Apache Iceberg destination — overwrite/append/row-delta snapshots on any
+      REST catalog; watermarks committed as table properties **in the same
+      snapshot as the data**; bootstrap from parquet footer stats (picks up
+      incremental on tables written by Spark/Trino/pyiceberg too)
 - [x] Multi-table and whole-schema transfers under one memory budget
 - [x] ClickHouse table engines — `engine=`, `order_by=`, `on_cluster=`
 - [ ] `read_postgres()` → Arrow / Polars
