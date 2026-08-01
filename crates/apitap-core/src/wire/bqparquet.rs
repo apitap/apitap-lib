@@ -677,6 +677,31 @@ impl ParquetEncoder {
     }
 }
 
+/// Render UNIX-epoch microseconds the way `render_cursor` renders a pgcopy
+/// timestamp — the Iceberg sink derives watermarks from parquet footer stats
+/// (already unix-based) and those strings must compare against state written
+/// from the wire path.
+pub(crate) fn render_ts_micros(unix_us: i64, utc: bool) -> Result<String> {
+    let secs = unix_us.div_euclid(1_000_000);
+    let micros = unix_us.rem_euclid(1_000_000) as u32;
+    let dt = chrono::DateTime::from_timestamp(secs, micros * 1000)
+        .ok_or_else(|| bad("cursor ts range"))?;
+    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    let frac = if micros == 0 {
+        String::new()
+    } else {
+        format!(".{}", format!("{micros:06}").trim_end_matches('0'))
+    };
+    Ok(if utc { format!("{base}{frac}+00") } else { format!("{base}{frac}") })
+}
+
+/// UNIX-epoch days → `YYYY-MM-DD` (same rendering as the wire path).
+pub(crate) fn render_date_days(unix_days: i64) -> Result<String> {
+    chrono::DateTime::from_timestamp(unix_days * 86_400, 0)
+        .ok_or_else(|| bad("cursor date range"))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+}
+
 /// Render a cursor value the way the TEXT lane would (PG's own style), so
 /// state rows stay comparable across lanes and runs.
 fn render_cursor(d: &Delivered, f: &[u8]) -> Result<String> {
@@ -689,29 +714,11 @@ fn render_cursor(d: &Delivered, f: &[u8]) -> Result<String> {
         Delivered::DateTime { utc } => {
             let us =
                 i64::from_be_bytes(f.try_into().map_err(|_| bad("cursor ts"))?) + PG_EPOCH_MICROS;
-            let secs = us.div_euclid(1_000_000);
-            let micros = us.rem_euclid(1_000_000) as u32;
-            let dt = chrono::DateTime::from_timestamp(secs, micros * 1000)
-                .ok_or_else(|| bad("cursor ts range"))?;
-            let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-            let frac = if micros == 0 {
-                String::new()
-            } else {
-                format!(".{}", format!("{micros:06}").trim_end_matches('0'))
-            };
-            if *utc {
-                format!("{base}{frac}+00")
-            } else {
-                format!("{base}{frac}")
-            }
+            render_ts_micros(us, *utc)?
         }
         Delivered::Date => {
             let days = i32::from_be_bytes(f.try_into().map_err(|_| bad("cursor date"))?);
-            let secs = (days as i64 + PG_EPOCH_DAYS as i64) * 86_400;
-            chrono::DateTime::from_timestamp(secs, 0)
-                .ok_or_else(|| bad("cursor date range"))?
-                .format("%Y-%m-%d")
-                .to_string()
+            render_date_days(days as i64 + PG_EPOCH_DAYS as i64)?
         }
         Delivered::Decimal { s, .. } => {
             // BIGINT UNSIGNED rides as Decimal{20,0} on MySQL sources — an

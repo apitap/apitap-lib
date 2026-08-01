@@ -538,6 +538,138 @@ impl IcebergSink {
     }
 }
 
+impl IcebergSink {
+    /// `max(cursor)` over the destination's CURRENT snapshot, from parquet
+    /// footer statistics — the Iceberg equivalent of the Postgres sink's
+    /// `SELECT max(cursor)` bootstrap. A few KB of ranged GETs per data file;
+    /// no data pages are read.
+    async fn dest_data_max(&self, meta: &TableMetadata, cursor: &str) -> Result<Option<String>> {
+        use iceberg::spec::{DataContentType as DC, Manifest};
+        let s3 = self.s3.clone().expect("storage bound");
+        let Some(snap) = meta.current_snapshot() else { return Ok(None) };
+        let list_bytes = s3.get_object(&self.uri_to_key(snap.manifest_list())?).await?;
+        let list = ManifestList::parse_with_version(&list_bytes, meta.format_version())
+            .map_err(|e| Error::Transfer(format!("iceberg: manifest list didn't parse: {e}")))?;
+        let mut acc: Option<String> = None;
+        let mut numeric = false;
+        let mut saw_file = false;
+        for mf in list.entries() {
+            let m_bytes = s3.get_object(&self.uri_to_key(&mf.manifest_path)?).await?;
+            let manifest = Manifest::parse_avro(&m_bytes)
+                .map_err(|e| Error::Transfer(format!("iceberg: manifest didn't parse: {e}")))?;
+            for entry in manifest.entries() {
+                let df = entry.data_file();
+                if df.content_type() != DC::Data || !entry.is_alive() {
+                    continue;
+                }
+                saw_file = true;
+                let (v, num) = self
+                    .footer_cursor_max(&s3, df.file_path(), df.file_size_in_bytes(), cursor)
+                    .await?;
+                numeric = num;
+                acc = wm_max(acc, Some(v), num);
+            }
+        }
+        let _ = numeric;
+        if !saw_file {
+            return Ok(None);
+        }
+        Ok(acc)
+    }
+
+    /// The cursor column's max in one parquet file, read from its footer.
+    async fn footer_cursor_max(
+        &self,
+        s3: &S3Conn,
+        path: &str,
+        size: u64,
+        cursor: &str,
+    ) -> Result<(String, bool)> {
+        use parquet::basic::{LogicalType, TimeUnit, Type as PhysicalType};
+        use parquet::file::metadata::ParquetMetaDataReader;
+        use parquet::file::statistics::Statistics;
+
+        let key = self.uri_to_key(path)?;
+        let tail_len = size.min(128 * 1024);
+        let mut tail = s3.get_range(&key, size - tail_len, tail_len).await?;
+        if tail.len() < 8 || &tail[tail.len() - 4..] != b"PAR1" {
+            return Err(Error::Transfer(format!("iceberg: {path} isn't parquet")));
+        }
+        let flen =
+            u32::from_le_bytes(tail[tail.len() - 8..tail.len() - 4].try_into().unwrap()) as u64;
+        if flen + 8 > tail_len {
+            tail = s3.get_range(&key, size - flen - 8, flen + 8).await?;
+        }
+        let meta_slice = &tail[tail.len() - 8 - flen as usize..tail.len() - 8];
+        let md = ParquetMetaDataReader::decode_metadata(meta_slice)
+            .map_err(|e| Error::Transfer(format!("iceberg: {path} footer: {e}")))?;
+        let descr = md.file_metadata().schema_descr();
+        let idx = (0..descr.num_columns())
+            .find(|&i| descr.column(i).name() == cursor)
+            .ok_or_else(|| {
+                Error::Transfer(format!(
+                    "iceberg bootstrap: data file {path} has no column '{cursor}'"
+                ))
+            })?;
+        let col = descr.column(idx);
+        let no_stats = || {
+            Error::InvalidInput(format!(
+                "iceberg: can't derive a bootstrap watermark for '{cursor}' from \
+                 {path} (missing/inexact column statistics) — run once with \
+                 mode='replace', or use an integer/timestamp cursor"
+            ))
+        };
+        let mut max_i: Option<i64> = None;
+        let mut max_s: Option<String> = None;
+        for rg in md.row_groups() {
+            match rg.column(idx).statistics() {
+                Some(Statistics::Int64(v)) => {
+                    let m = *v.max_opt().ok_or_else(no_stats)?;
+                    max_i = Some(max_i.map_or(m, |a| a.max(m)));
+                }
+                Some(Statistics::Int32(v)) => {
+                    let m = *v.max_opt().ok_or_else(no_stats)? as i64;
+                    max_i = Some(max_i.map_or(m, |a| a.max(m)));
+                }
+                Some(Statistics::ByteArray(v)) => {
+                    if !v.max_is_exact() {
+                        return Err(no_stats());
+                    }
+                    let m = v
+                        .max_opt()
+                        .and_then(|b| std::str::from_utf8(b.data()).ok())
+                        .ok_or_else(no_stats)?
+                        .to_string();
+                    max_s = Some(max_s.map_or(m.clone(), |a| a.max(m)));
+                }
+                _ => return Err(no_stats()),
+            }
+        }
+        match (col.physical_type(), col.logical_type(), max_i, max_s) {
+            (PhysicalType::INT64, Some(LogicalType::Timestamp { is_adjusted_to_u_t_c, unit }), Some(m), _) => {
+                if !matches!(unit, TimeUnit::MICROS(_)) {
+                    return Err(Error::InvalidInput(format!(
+                        "iceberg bootstrap: '{cursor}' uses a non-microsecond \
+                         timestamp unit — not supported"
+                    )));
+                }
+                Ok((
+                    crate::wire::bqparquet::render_ts_micros(m, is_adjusted_to_u_t_c)?,
+                    false,
+                ))
+            }
+            (PhysicalType::INT32, Some(LogicalType::Date), Some(m), _) => {
+                Ok((crate::wire::bqparquet::render_date_days(m)?, false))
+            }
+            (PhysicalType::INT64 | PhysicalType::INT32, None | Some(LogicalType::Integer { .. }), Some(m), _) => {
+                Ok((m.to_string(), true))
+            }
+            (PhysicalType::BYTE_ARRAY, _, _, Some(m)) => Ok((m, false)),
+            _ => Err(no_stats()),
+        }
+    }
+}
+
 impl crate::sink::Sink for IcebergSink {
     type Loader = IcebergLoader;
 
@@ -600,11 +732,22 @@ impl crate::sink::Sink for IcebergSink {
         let sibling = props
             .keys()
             .any(|k| k.starts_with("apitap.watermark.") && *k != self.wm_prop());
+        // No state anywhere (fresh table, or the last write was a replace,
+        // which clears state): bootstrap from the DATA, like the Postgres
+        // sink's `SELECT max(cursor)` — here that means the parquet footer
+        // statistics of the committed data files, a few KB of ranged GETs.
+        // Works on tables apitap never wrote (Spark/Trino/pyiceberg output).
+        let data_max = if own.is_none() && !sibling {
+            self.bind_storage(&meta)?;
+            self.dest_data_max(&meta, cursor).await?
+        } else {
+            None
+        };
         // The watermark property lands in the SAME catalog commit as the data
         // — state alone is authoritative, like the Postgres sink.
         let watermark = resolve_watermark(
             own,
-            None,
+            data_max,
             sibling,
             WmArbitration::StateAuthoritative,
             "iceberg",
@@ -922,18 +1065,21 @@ impl IcebergSink {
                     ),
                 },
             ];
-            // Watermark state rides the same commit. Replace resets EVERY
-            // source's state (the table's history restarted), then writes ours.
-            let stale: Vec<String> = meta
-                .properties()
-                .keys()
-                .filter(|k| k.starts_with("apitap.watermark.") && **k != self.wm_prop())
-                .cloned()
-                .collect();
-            if mode == Mode::Replace && !stale.is_empty() {
-                updates.push(TableUpdate::RemoveProperties { removals: stale });
-            }
-            if let Some(wm) = &new_wm {
+            // Watermark state rides the same commit. Replace clears EVERY
+            // source's state and writes none (house semantics: a replace run
+            // never seeds state; the next incremental bootstraps from data —
+            // here, footer statistics). Append/merge write their own key.
+            if mode == Mode::Replace {
+                let stale: Vec<String> = meta
+                    .properties()
+                    .keys()
+                    .filter(|k| k.starts_with("apitap.watermark."))
+                    .cloned()
+                    .collect();
+                if !stale.is_empty() {
+                    updates.push(TableUpdate::RemoveProperties { removals: stale });
+                }
+            } else if let Some(wm) = &new_wm {
                 updates.push(TableUpdate::SetProperties {
                     updates: HashMap::from([(self.wm_prop(), wm.clone())]),
                 });

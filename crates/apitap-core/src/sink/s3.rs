@@ -269,6 +269,53 @@ impl S3Conn {
             .map_err(|e| Error::Transfer(format!("s3 get {object}: {e}")))
     }
 
+    /// Ranged GET — the Iceberg sink reads parquet FOOTERS of committed data
+    /// files to derive a bootstrap watermark from their column statistics.
+    pub(crate) async fn get_range(&self, object: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let uri = self.uri_for(object);
+        let range = format!("bytes={start}-{}", start + len - 1);
+        let mut last = None;
+        for attempt in 1..=3u32 {
+            let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            // `range` is a signed header here — it changes the response bytes.
+            let headers = sigv4_headers(
+                &self.creds,
+                "GET",
+                &self.host,
+                &uri,
+                &[],
+                &self.region,
+                &amz_date,
+                &payload_hash(b""),
+                &[("range", range.clone())],
+            );
+            let url = format!("{}{}", self.endpoint, uri);
+            let mut req = self.client.get(&url);
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v);
+            }
+            match req.send().await {
+                Ok(r) if r.status().is_success() => {
+                    return r
+                        .bytes()
+                        .await
+                        .map(|b| b.to_vec())
+                        .map_err(|e| Error::Transfer(format!("s3 range get: {e}")));
+                }
+                Ok(r) if r.status().is_server_error() && attempt < 3 => {
+                    last = Some(Error::Transfer(format!("s3 range get: {}", r.status())));
+                }
+                Ok(r) => {
+                    return Err(Error::Transfer(format!("s3 range get {object}: {}", r.status())))
+                }
+                Err(e) if attempt < 3 => last = Some(Error::Transfer(format!("s3 range get: {e}"))),
+                Err(e) => return Err(Error::Transfer(format!("s3 range get: {e}"))),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        }
+        Err(last.unwrap_or_else(|| Error::Transfer("s3 range get: retries exhausted".into())))
+    }
+
     /// Canonical (signed) URI path for an object — encoded segments, kept '/'.
     fn uri_for(&self, object: &str) -> String {
         let key = object.split('/').map(enc_seg).collect::<Vec<_>>().join("/");
