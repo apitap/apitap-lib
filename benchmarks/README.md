@@ -632,6 +632,25 @@ wall time. Note dlt emits JSON columns with schema-coercion warnings; the
 checksum columns here (count, sum) pass — a full 16-aggregate cross-check of
 its JSON handling is future work.
 
+## PG → Google Cloud Storage — same fight, Google's object store
+
+10M rows into Parquet-on-GCS (real GCS, Montreal region, uploaded over the
+public internet from the OVH box), uniform 16 vCPU / 4 GB caps, validation by
+DuckDB reading every tool's objects back through GCS's S3-compat endpoint.
+Raw: [gcs-showdown-raw.log](gcs-showdown-raw.log).
+
+| tool | wall | peak mem | read-back checksum |
+|---|---|---|---|
+| **apitap** (`gcs://`, 8 pipes) | **16.3 s** | 787 MB | **MATCH** |
+| ingestr v1.1.15 | OOM-killed at 52 s | 4096 MB (= the cap) | **0 objects landed** |
+| dlt 1.29.1 (filesystem + pyarrow) | 383.3 s (23.5×) | 1708 MB | MATCH |
+
+The same shape as the S3 showdown, on a different cloud: ingestr read all 10M
+rows (≈208K rows/s) and was killed by the kernel during its load stage with
+nothing written; dlt landed correct data at 23.5× apitap's wall. Both of
+apitap's GCS formats also validate at 1M (`format=parquet` and the composed
+single-object `format=csv`) — counts and `sum(id)` exact.
+
 ## Constrain the tool, not the databases — PG → ClickHouse at 256 MB
 
 The other tables here cap *everything* — tool and databases alike. This one caps
