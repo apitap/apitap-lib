@@ -13,6 +13,7 @@ use std::future::Future;
 pub(crate) mod bigquery;
 pub(crate) mod clickhouse;
 pub(crate) mod gcs;
+pub(crate) mod iceberg;
 pub(crate) mod mysql;
 pub(crate) mod s3;
 pub(crate) mod postgres;

@@ -235,9 +235,17 @@ fn bad(what: &str) -> Error {
 // Parquet schema from the delivered types
 // ============================================================================
 
-fn parquet_field(name: &str, d: &Delivered) -> Result<Arc<Type>> {
+/// `id` is the 1-based column ordinal, written as the parquet field id. For
+/// BigQuery/GCS/S3 it is inert metadata; for Iceberg it is load-bearing — the
+/// table schema assigns the same ids, and readers resolve columns BY ID, so
+/// the two assignments must never drift.
+fn parquet_field(name: &str, d: &Delivered, id: i32) -> Result<Arc<Type>> {
     use PhysicalType as P;
-    let b = |p| Type::primitive_type_builder(name, p).with_repetition(Repetition::OPTIONAL);
+    let b = |p| {
+        Type::primitive_type_builder(name, p)
+            .with_repetition(Repetition::OPTIONAL)
+            .with_id(Some(id))
+    };
     let t = match d {
         Delivered::Int { .. } => b(P::INT64).build(),
         Delivered::Float32 => b(P::FLOAT).build(),
@@ -308,6 +316,19 @@ pub(crate) struct ParquetEncoder {
     // -- cursor watermark tracking (col index, numeric compare)
     cursor: Option<(usize, bool)>,
     pub(crate) wm: Option<String>,
+    // -- merge-key capture (col index) — every value of one column, retained
+    // for the Iceberg sink's equality-delete file. Delta-proportional memory.
+    capture: Option<usize>,
+    pub(crate) keys: KeyCap,
+}
+
+/// Captured merge-key values. Which arm is used is fixed at construction from
+/// the column's [`Delivered`] type; a NULL in the key column is an error.
+#[derive(Debug)]
+pub(crate) enum KeyCap {
+    None,
+    Int(Vec<i64>),
+    Text(Vec<String>),
 }
 
 impl ParquetEncoder {
@@ -316,10 +337,49 @@ impl ParquetEncoder {
         delivered: Vec<Delivered>,
         cursor: Option<(usize, bool)>,
     ) -> Result<Self> {
+        Self::new_ext(names, delivered, cursor, None, None)
+    }
+
+    /// `ids`: explicit parquet field ids (Iceberg tables that already exist own
+    /// their ids; ordinal 1..N otherwise). `capture`: column whose every value
+    /// is retained in [`Self::keys`].
+    pub(crate) fn new_ext(
+        names: Vec<String>,
+        delivered: Vec<Delivered>,
+        cursor: Option<(usize, bool)>,
+        ids: Option<Vec<i32>>,
+        capture: Option<usize>,
+    ) -> Result<Self> {
+        if let Some(ids) = &ids {
+            if ids.len() != names.len() {
+                return Err(Error::Transfer(format!(
+                    "parquet schema: {} field ids for {} columns",
+                    ids.len(),
+                    names.len()
+                )));
+            }
+        }
+        let keys = match capture {
+            None => KeyCap::None,
+            Some(i) => match &delivered[i] {
+                Delivered::Int { .. } => KeyCap::Int(Vec::new()),
+                Delivered::Uuid | Delivered::Text => KeyCap::Text(Vec::new()),
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "merge key column has type {other:?} — supported merge \
+                         key types on this destination: integer, text, uuid"
+                    )))
+                }
+            },
+        };
         let fields: Vec<Arc<Type>> = names
             .iter()
             .zip(delivered.iter())
-            .map(|(n, d)| parquet_field(n, d))
+            .enumerate()
+            .map(|(i, (n, d))| {
+                let id = ids.as_ref().map_or(i as i32 + 1, |v| v[i]);
+                parquet_field(n, d, id)
+            })
             .collect::<Result<_>>()?;
         let schema = Arc::new(
             Type::group_type_builder("schema")
@@ -352,6 +412,8 @@ impl ParquetEncoder {
             finished: false,
             cursor,
             wm: None,
+            capture,
+            keys,
         };
         enc.open_writer()?;
         Ok(enc)
@@ -465,6 +527,13 @@ impl ParquetEncoder {
             let len = i32::from_be_bytes(b[o..o + 4].try_into().unwrap());
             o += 4;
             if len == -1 {
+                if self.capture == Some(i) {
+                    return Err(Error::Transfer(
+                        "merge key column contains NULL — a merge key must \
+                         identify its row"
+                            .into(),
+                    ));
+                }
                 self.defs[i].push(0);
                 continue;
             }
@@ -477,6 +546,41 @@ impl ParquetEncoder {
                     let v = render_cursor(&self.delivered[i], f)?;
                     self.wm =
                         crate::plan::wm_max(self.wm.take(), Some(v), numeric);
+                }
+            }
+            if self.capture == Some(i) {
+                match &mut self.keys {
+                    KeyCap::Int(v) => v.push(match f.len() {
+                        2 => i16::from_be_bytes(f.try_into().unwrap()) as i64,
+                        4 => i32::from_be_bytes(f.try_into().unwrap()) as i64,
+                        8 => i64::from_be_bytes(f.try_into().unwrap()),
+                        n => {
+                            return Err(Error::Transfer(format!(
+                                "merge key: unexpected int width {n}"
+                            )))
+                        }
+                    }),
+                    KeyCap::Text(v) => v.push(match &self.delivered[i] {
+                        // pgcopy uuid is 16 raw bytes; render hyphenated
+                        // exactly like the data column does, so the delete
+                        // file and the data file agree byte-for-byte.
+                        Delivered::Uuid => {
+                            let b: [u8; 16] =
+                                f.try_into().map_err(|_| Error::Transfer("merge key: bad uuid".into()))?;
+                            let mut s = String::with_capacity(36);
+                            for (j, byte) in b.iter().enumerate() {
+                                if matches!(j, 4 | 6 | 8 | 10) {
+                                    s.push('-');
+                                }
+                                s.push_str(&format!("{byte:02x}"));
+                            }
+                            s
+                        }
+                        _ => std::str::from_utf8(f)
+                            .map_err(|_| Error::Transfer("merge key: invalid utf-8".into()))?
+                            .to_string(),
+                    }),
+                    KeyCap::None => unreachable!("capture set but keys uninitialized"),
                 }
             }
         }

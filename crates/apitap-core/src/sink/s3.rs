@@ -203,6 +203,72 @@ impl S3Conn {
         })
     }
 
+    /// Build a connection from resolved parts — the Iceberg sink lands data
+    /// under a table LOCATION owned by the catalog (`s3://bucket/…`), so the
+    /// bucket comes from that location, not from the user's URL.
+    pub(crate) fn from_parts(
+        bucket: String,
+        endpoint: Option<String>,
+        region: String,
+        creds: AwsCreds,
+    ) -> Result<Self> {
+        let (endpoint, host, path_style) = match endpoint {
+            Some(e) => {
+                let e = e.trim_end_matches('/').to_string();
+                let host = e
+                    .split_once("://")
+                    .map(|(_, h)| h.to_string())
+                    .ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "s3 endpoint must include a scheme, e.g. http://127.0.0.1:9000 — got '{e}'"
+                        ))
+                    })?;
+                (e, host, true)
+            }
+            None => {
+                let host = format!("{bucket}.s3.{region}.amazonaws.com");
+                (format!("https://{host}"), host, false)
+            }
+        };
+        Ok(Self {
+            client: reqwest::Client::new(),
+            creds,
+            bucket,
+            prefix: String::new(),
+            region,
+            endpoint,
+            host,
+            path_style,
+        })
+    }
+
+    /// Single-request PUT for small objects (manifests, delete files).
+    pub(crate) async fn put_object(&self, object: &str, body: Vec<u8>) -> Result<()> {
+        let uri = self.uri_for(object);
+        let hash = payload_hash(&body);
+        let r = self
+            .request(reqwest::Method::PUT, &uri, &[], body, &hash, &[])
+            .await?;
+        Self::check(r, "put object").await.map(|_| ())
+    }
+
+    /// Whole-object GET (manifest lists are KBs; never used for data files).
+    pub(crate) async fn get_object(&self, object: &str) -> Result<Vec<u8>> {
+        let uri = self.uri_for(object);
+        let r = self
+            .request(reqwest::Method::GET, &uri, &[], Vec::new(), &payload_hash(b""), &[])
+            .await?;
+        let status = r.status();
+        if !status.is_success() {
+            let body = r.text().await.unwrap_or_default();
+            return Err(Error::Transfer(format!("s3 get {object}: {status} {body:.200}")));
+        }
+        r.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| Error::Transfer(format!("s3 get {object}: {e}")))
+    }
+
     /// Canonical (signed) URI path for an object — encoded segments, kept '/'.
     fn uri_for(&self, object: &str) -> String {
         let key = object.split('/').map(enc_seg).collect::<Vec<_>>().join("/");
@@ -282,7 +348,7 @@ impl S3Conn {
         Ok(body)
     }
 
-    async fn create_multipart(&self, object: &str) -> Result<String> {
+    pub(crate) async fn create_multipart(&self, object: &str) -> Result<String> {
         let uri = self.uri_for(object);
         let q = vec![("uploads".to_string(), String::new())];
         let r = self
@@ -294,7 +360,7 @@ impl S3Conn {
     }
 
     /// Upload one part; returns its ETag for the completion manifest.
-    async fn upload_part(
+    pub(crate) async fn upload_part(
         &self,
         object: &str,
         upload_id: &str,
@@ -318,7 +384,7 @@ impl S3Conn {
         etag.ok_or_else(|| Error::Transfer("s3 upload part: response had no ETag".into()))
     }
 
-    async fn complete_multipart(
+    pub(crate) async fn complete_multipart(
         &self,
         object: &str,
         upload_id: &str,
@@ -346,7 +412,7 @@ impl S3Conn {
         Ok(())
     }
 
-    async fn abort_multipart(&self, object: &str, upload_id: &str) {
+    pub(crate) async fn abort_multipart(&self, object: &str, upload_id: &str) {
         let uri = self.uri_for(object);
         let q = vec![("uploadId".to_string(), upload_id.to_string())];
         let _ = self
@@ -354,7 +420,7 @@ impl S3Conn {
             .await;
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+    pub(crate) async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let uri = if self.path_style {
             format!("/{}", enc_seg(&self.bucket))
         } else {
@@ -383,7 +449,7 @@ impl S3Conn {
         Ok(out)
     }
 
-    async fn delete(&self, object: &str) -> Result<()> {
+    pub(crate) async fn delete(&self, object: &str) -> Result<()> {
         let uri = self.uri_for(object);
         let r = self
             .request(reqwest::Method::DELETE, &uri, &[], Vec::new(), &payload_hash(b""), &[])
@@ -394,7 +460,7 @@ impl S3Conn {
 
     /// Server-side copy (CopyObject, ≤ 5 GiB per object — a per-pipe staging
     /// part stays well under that at any pipe count we ship).
-    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+    pub(crate) async fn copy(&self, src: &str, dst: &str) -> Result<()> {
         let uri = self.uri_for(dst);
         let source = format!(
             "/{}/{}",
