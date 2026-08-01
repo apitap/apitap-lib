@@ -33,6 +33,10 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
 ] }
 bytes = "1"
+# SigV4 signing for the s3:// sink — all three already compiled via sqlx.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 # LOAD DATA LOCAL INFILE streaming for the MySQL sink — sqlx can't do it.
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
 serde = { version = "1", features = ["derive"] }

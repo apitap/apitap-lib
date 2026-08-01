@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::sink::bigquery::{BqConn, BqSink};
 use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
 use crate::sink::gcs::{GcsConn, GcsSink};
+use crate::sink::s3::{S3Conn, S3Sink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
 use crate::source::github::GithubSource;
@@ -66,6 +67,8 @@ const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, ta
 // GCS shares BigQuery's upload character: read + gzip/parquet-encode + upload,
 // bandwidth saturates past ~8 pipes.
 const TO_GCS: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+// Same shape as GCS: object-store staging, parquet lane, no compose cap.
+const TO_S3: Profile = TO_GCS;
 const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1, table_pipe_cap: 1 };
 const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
 // Same single-stream shape for the API entities (pagination is serial; the
@@ -214,6 +217,21 @@ impl DstScheme for GcsTo {
         GcsSink::bind(shared, table, cfg.budget)
     }
 }
+struct S3To;
+impl DstScheme for S3To {
+    type Sink = S3Sink;
+    type Shared = S3Conn;
+    const BARE_DEST: bool = true;
+    async fn connect(url: &str, dest_table: &str, parallel: usize, _cfg: &SinkCfg) -> Result<S3Sink> {
+        S3Sink::bind(S3Conn::parse(url).await?, dest_table, parallel)
+    }
+    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<S3Conn> {
+        S3Conn::parse(url).await
+    }
+    fn bind(shared: S3Conn, table: &str, cfg: &SinkCfg) -> Result<S3Sink> {
+        S3Sink::bind(shared, table, cfg.budget)
+    }
+}
 struct BqTo;
 impl DstScheme for BqTo {
     type Sink = BqSink;
@@ -346,17 +364,22 @@ routes! {
     "github"   -> "clickhouse" : GhFrom => ChTo, GITHUB,  pg_overlap = false;
     "github"   -> "mysql"      : GhFrom => MyTo, GITHUB,  pg_overlap = false;
     "postgres" -> "gcs"        : PgFrom => GcsTo, TO_GCS,  pg_overlap = false;
+    "postgres" -> "s3"         : PgFrom => S3To, TO_S3,  pg_overlap = false;
     "github+api" -> "postgres"  : GhApiFrom => PgTo, GH_API, pg_overlap = false;
     "github+api" -> "clickhouse": GhApiFrom => ChTo, GH_API, pg_overlap = false;
     "github+api" -> "mysql"     : GhApiFrom => MyTo, GH_API, pg_overlap = false;
     "github+api" -> "bigquery"  : GhApiFrom => BqTo, GH_API, pg_overlap = false;
     "github+api" -> "gcs"       : GhApiFrom => GcsTo, GH_API, pg_overlap = false;
+    "github+api" -> "s3"        : GhApiFrom => S3To, GH_API, pg_overlap = false;
     "mysql"    -> "bigquery"   : MyFrom => BqTo, TO_BQ,   pg_overlap = false;
     "mysql"    -> "gcs"        : MyFrom => GcsTo, TO_GCS, pg_overlap = false;
+    "mysql"    -> "s3"         : MyFrom => S3To, TO_S3, pg_overlap = false;
     "gsheets"  -> "bigquery"   : GsFrom => BqTo, GSHEETS, pg_overlap = false;
     "gsheets"  -> "gcs"        : GsFrom => GcsTo, GSHEETS, pg_overlap = false;
+    "gsheets"  -> "s3"         : GsFrom => S3To, GSHEETS, pg_overlap = false;
     "github"   -> "bigquery"   : GhFrom => BqTo, GITHUB,  pg_overlap = false;
     "github"   -> "gcs"        : GhFrom => GcsTo, GITHUB, pg_overlap = false;
+    "github"   -> "s3"         : GhFrom => S3To, GITHUB, pg_overlap = false;
 }
 
 /// Pairs consciously NOT in the table, each with its reason — the completeness
@@ -552,7 +575,7 @@ mod tests {
     #[test]
     fn every_source_reaches_every_destination_or_says_why_not() {
         const SOURCES: &[&str] = &["postgres", "mysql", "gsheets", "github", "github+api"];
-        const DESTS: &[&str] = &["postgres", "clickhouse", "mysql", "bigquery", "gcs"];
+        const DESTS: &[&str] = &["postgres", "clickhouse", "mysql", "bigquery", "gcs", "s3"];
         // The declared sets must EQUAL what the table mentions — a new adapter
         // wired with a single route line would otherwise silently escape the
         // matrix walk below.

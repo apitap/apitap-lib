@@ -14,6 +14,7 @@ pub(crate) mod bigquery;
 pub(crate) mod clickhouse;
 pub(crate) mod gcs;
 pub(crate) mod mysql;
+pub(crate) mod s3;
 pub(crate) mod postgres;
 
 /// Per-worker stream consumer on the sink side. One loader = one physical ingest

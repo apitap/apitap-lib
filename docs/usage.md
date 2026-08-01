@@ -58,6 +58,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | GitHub (source) | `github://` | `github://<owner>/<repo>[/dir]?ref=main` — CSV files as tables. See [GitHub source](#github-source-csv-files-as-tables). |
 | GitHub API (source) | `github+api://` | `github+api://<owner>/<repo>` — issues, PRs, commits, stars … as typed tables. See [GitHub API source](#github-api-source-the-project-as-tables). |
 | Google Cloud Storage (destination) | `gcs://` | `gcs://<bucket>[/prefix]?format=csv\|parquet&credentials=/path/key.json`. See [GCS destination](#gcs-destination-csv--parquet-files). |
+| S3-compatible (destination) | `s3://` | `s3://<bucket>[/prefix]?format=parquet[&endpoint=…]` — AWS, MinIO, R2, OVH/Scaleway/Hetzner. See [S3-compatible destination](#s3-compatible-destination-parquet-files). |
 
 Table names may be schema-qualified (`public.events`, `mydb.events`); unqualified
 Postgres names resolve through the connection's `search_path`. Materialized views
@@ -595,6 +596,36 @@ apitap.transfer(
   a blank line, which CSV readers silently drop — use Parquet). A Parquet
   finalize interrupted mid-rename can leave old and new parts mixed until the
   next successful run.
+
+## S3-compatible destination (Parquet files)
+
+```python
+apitap.transfer(
+    "postgres://user:pass@host/db",
+    "s3://my-bucket/lake?format=parquet&endpoint=http://127.0.0.1:9000"
+    "&access_key_id=…&secret_access_key=…",
+    table="public.events")
+```
+
+- **Works with**: AWS S3, MinIO, Cloudflare R2, and the S3-compatible object
+  storage at OVH/Scaleway/Hetzner. An explicit `endpoint=` selects path-style
+  addressing (what MinIO and friends expect); without it, requests go to
+  `https://{bucket}.s3.{region}.amazonaws.com`.
+- **Auth**: `access_key_id`/`secret_access_key`(/`session_token`) URL params
+  beat the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`
+  env vars. `region=` defaults to `AWS_REGION`, then `us-east-1`. Requests are
+  SigV4-signed; no AWS SDK involved.
+- **Layout**: workers stream S3 multipart uploads into
+  `{prefix}{table}__apitap_staging/part-NNNNN.parquet`, then finalize copies
+  parts to `{prefix}{table}/part-NNNNN.parquet` and sweeps staging plus any
+  stale apitap parts from a prior run (only `part-NNNNN.parquet` names are
+  ever deleted). Copies are per-object, not a transaction — readers can see a
+  mixed directory briefly.
+- **Format**: `format=parquet` only for now (ZSTD, same typed encoder as the
+  BigQuery lane). `format=csv` returns when an S3-side concat lands.
+- **Modes**: `mode="replace"` only — objects have no upsert. Incremental
+  arrives with the Iceberg catalog destination, where append is a snapshot
+  commit.
 
 ## Durability
 

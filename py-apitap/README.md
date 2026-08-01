@@ -58,7 +58,7 @@ MySQL 8.4 servers. Ladder, methodology and raw logs:
 
 ## Routes
 
-Five sources × five destinations — **all 25 wired**, enforced by a test that fails
+Five sources × six destinations — **all 30 wired**, enforced by a test that fails
 the build if any pair is neither implemented nor explicitly deferred with a reason.
 
 **Sources:** `postgres://` · `mysql://` · `gsheets://` (tabs as tables) ·
@@ -66,7 +66,8 @@ the build if any pair is neither implemented nor explicitly deferred with a reas
 as typed tables)
 
 **Destinations:** `postgres://` · `mysql://` · `clickhouse://` · `bigquery://` ·
-`gcs://` (CSV.gz or Parquet)
+`gcs://` (CSV.gz or Parquet) · `s3://` (S3-compatible — AWS, MinIO, R2,
+OVH/Scaleway/Hetzner object storage; Parquet, SigV4-signed, no SDK)
 
 Each pair negotiates the fastest wire format both sides speak — for example:
 
@@ -144,8 +145,9 @@ troubleshooting:
 
 ## Roadmap
 
-- [x] The 5 × 5 route mesh — Postgres, MySQL, Google Sheets, GitHub files and the
-      GitHub API into Postgres, MySQL, ClickHouse, BigQuery and GCS
+- [x] The route mesh — Postgres, MySQL, Google Sheets, GitHub files and the
+      GitHub API into Postgres, MySQL, ClickHouse, BigQuery, GCS and S3-compatible
+      object stores (MinIO, R2, …)
 - [x] Incremental sync — `mode="append"` / `mode="merge"` (transactional state table)
 - [x] Multi-table and whole-schema transfers under one memory budget
 - [x] ClickHouse table engines — `engine=`, `order_by=`, `on_cluster=`

@@ -113,6 +113,7 @@ def transfer(
     ``clickhouse://`` (``clickhouse+https://`` for TLS),
     ``bigquery://<project>/<dataset>?credentials=/path/key.json``,
     ``gcs://<bucket>[/prefix]?format=csv|parquet&credentials=/path/key.json``
+      s3://bucket[/prefix]?format=parquet&endpoint=…       (S3/MinIO/R2, Parquet files)
     (files: one composed .csv.gz per table, or a directory of Parquet parts)
     destinations — and
     each pair negotiates its fastest wire format (raw binary COPY passthrough,
