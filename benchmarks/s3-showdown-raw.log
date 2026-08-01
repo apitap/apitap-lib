@@ -1,0 +1,27 @@
+════════ pg→S3(MinIO) SHOWDOWN — 10M rows, 16cpu/4GB caps, 600s kill (2026-08-01) ════════
+[14:51:03] == apitap ==
+APITAP rows=10000000 pipes=8 wall=14.5s
+PEAK_MB 758.4
+[14:51:18] == ingestr ==
+[PROGRESS] 14:51:55 | Rows: 8,225,000 | Batches: 329 | Rate: 228470 rows/s | CPU: 130.1% | Mem: 1808 MB
+[PROGRESS] 14:51:58 | Rows: 8,950,000 | Batches: 358 | Rate: 229485 rows/s | CPU: 130.6% | Mem: 1883 MB
+[PROGRESS] 14:52:01 | Rows: 9,575,000 | Batches: 383 | Rate: 227973 rows/s | CPU: 130.4% | Mem: 1966 MB
+[PROGRESS] 14:52:04 | Rows: 10,000,000 | Batches: 400 | Rate: 222218 rows/s | CPU: 130.8% | Mem: 2756 MB
+INGESTR wall=48s rc=0
+PEAK_MB 4096.0
+[14:52:07] == dlt (filesystem+parquet, pyarrow) ==
+2026-08-01 14:58:20,834|[WARNING]|1|131831181812544|dlt|pyarrow.py|cast_arrow_array_as_column_schema:1365|Received `data_type='json'`, Arrow nested values require serialization to STRING. They will be JSON-encoded, which may slow extraction. If your destination supports nested types, enable them (`supports_nested_types=True`) and provide a 'json' column with 'x-nested-type' hint to load nested values natively. Otherwise, consider casting to STRING upstream (e.g., in a VIEW).
+2026-08-01 14:58:21,311|[WARNING]|1|131831181812544|dlt|extractors.py|_compute_tables:552|In resource: bench_data_10m, when merging arrow schema with dlt schema, several column hints were different. dlt schema hints were kept and arrow schema and data were unmodified. It is up to destination to coerce the differences when loading. Change log level to INFO for more details.
+DLT wall=379.2s
+PEAK_MB 2214.0
+[14:58:29] == validate ==
+PG: 10000000|50000005000000
+apitap: MATCH
+ingestr: READ-FAIL IO Error: No files found that match the pattern "s3://apitap-bench/showdown/ing/**/*.parquet"
+
+LINE  (pg=10000000|50000005000000)
+dlt: MATCH
+S3-SHOWDOWN2-DONE
+
+──── ingestr rerun with full output (fair capture of the failure) ────
+Starting data ingestion... → Killed (kernel OOM at the 4 GiB cgroup ceiling; 0 objects landed)

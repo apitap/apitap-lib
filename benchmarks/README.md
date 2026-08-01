@@ -606,6 +606,26 @@ objects and re-insert them through SQLAlchemy. MySQL's own `LOAD DATA`
 ingest speed is the floor on this route for every tool — apitap sits close
 to it.
 
+## PG → S3-compatible (MinIO) — the s3:// route's birth certificate
+
+10M rows into Parquet-on-MinIO, every tool capped at 16 vCPU / 4 GB, 600 s
+kill, and the SAME read-back validation for everyone: DuckDB reads each tool's
+parquet straight off the object store and checksums it against Postgres.
+Raw: [s3-showdown-raw.log](s3-showdown-raw.log).
+
+| tool | wall | peak mem | read-back checksum |
+|---|---|---|---|
+| **apitap** (`s3://`, 8 pipes) | **14.5 s** | 758 MB | **MATCH** |
+| ingestr v1.1.15 (S3 dest) | — | 4096 MB (= the cap) | **OOM-killed, 0 objects landed** |
+| dlt 1.29.1 (filesystem+parquet, pyarrow) | 379.2 s (26×) | 2214 MB | MATCH |
+
+ingestr read all 10M rows at ~228K rows/s (~1.3 cores) and was then killed by
+the kernel before writing a single object — the extract-then-load buffer
+crossed 4 GiB. dlt landed correct data (one 767 MiB parquet) at 26× apitap's
+wall time. Note dlt emits JSON columns with schema-coercion warnings; the
+checksum columns here (count, sum) pass — a full 16-aggregate cross-check of
+its JSON handling is future work.
+
 ## Constrain the tool, not the databases — PG → ClickHouse at 256 MB
 
 The other tables here cap *everything* — tool and databases alike. This one caps
