@@ -1,0 +1,103 @@
+════════ pg → Apache Iceberg SHOWDOWN — 3 phases, 16cpu/4GB caps (2026-08-01) ════════
+Rig: OVH 16vCPU/61GB · MinIO + apache/iceberg-rest-fixture · postgres:16-alpine source
+
+──── smoke suite (replace → append → merge, DuckDB-validated) ────
+══ 1) REPLACE: 10M rows pg → iceberg ══
+XFER t10m replace: 10,150,000 rows in 14.4s over 8 pipes
+VALIDATE t10m: rows=10,150,000 sum_id=51511255075000 snapshots=1 -> MATCH
+══ 2) APPEND: +100k delta (id cursor) ══
+XFER t10m append: 100,000 rows in 0.5s over 8 pipes
+VALIDATE t10m: rows=10,250,000 sum_id=52531255125000 snapshots=2 -> MATCH
+══ 3) MERGE: bootstrap on ts_val cursor, then upsert 50k updates + 50k inserts ══
+XFER t10m_merge merge: 10,250,000 rows in 15.5s over 8 pipes
+XFER t10m_merge merge: 150,000 rows in 2.3s over 8 pipes
+VALIDATE t10m_merge: rows=10,300,000 sum_id=53045005150000 snapshots=2 -> MATCH
+UPSERT CHECK: dest rows with small_str='UPDATED' = 200,000 (source has 200,000)
+══ SMOKE: ALL GREEN ══
+
+──── showdown (apitap vs dlt 1.29.1+pyiceberg vs pyiceberg-0.11.1-DIY) ────
+[16:24:47] cleanup: dest tables + prefixes + tool state
+[16:24:49] source: bench_data_10m @ 10300000 rows
+════════ PHASE A: FULL LOAD (10300000 rows) ════════
+[16:24:52] apitap full: running (cap 16cpu/4g, kill 1500s)
+RESULT apitap full: 10,300,000 rows in 15.2s over 8 pipes
+[16:25:08] apitap full: rc=0 peak=773MB
+VALIDATE apitap full: rows=10,300,000 vs src 10,300,000 -> MATCH
+[16:25:44] dlt full: running (cap 16cpu/4g, kill 1500s)
+2026-08-01 16:32:05,497|[WARNING]|15|129938836190016|dlt|pyarrow.py|cast_arrow_array_as_column_schema:1365|Received `data_type='json'`, Arrow nested values require serialization to STRING. They will be JSON-encoded, which may slow extraction. If your destination supports nested types, enable them (`supports_nested_types=True`) and provide a 'json' column with 'x-nested-type' hint to load nested values natively. Otherwise, consider casting to STRING upstream (e.g., in a VIEW).
+2026-08-01 16:32:05,946|[WARNING]|15|129938836190016|dlt|extractors.py|_compute_tables:552|In resource: bench_data_10m, when merging arrow schema with dlt schema, several column hints were different. dlt schema hints were kept and arrow schema and data were unmodified. It is up to destination to coerce the differences when loading. Change log level to INFO for more details.
+2026-08-01 16:32:07,438|[WARNING]|15|129938836190016|dlt|pyarrow.py|convert_array_to_arrow:1136|Default conversion to `string` for `data_type=json` failed. Using fallback strategies.
+2026-08-01 16:32:07,473|[WARNING]|15|129938836190016|dlt|pyarrow.py|cast_arrow_array_as_column_schema:1365|Received `data_type='json'`, Arrow nested values require serialization to STRING. They will be JSON-encoded, which may slow extraction. If your destination supports nested types, enable them (`supports_nested_types=True`) and provide a 'json' column with 'x-nested-type' hint to load nested values natively. Otherwise, consider casting to STRING upstream (e.g., in a VIEW).
+2026-08-01 16:32:07,957|[WARNING]|15|129938836190016|dlt|extractors.py|_compute_tables:552|In resource: bench_data_10m, when merging arrow schema with dlt schema, several column hints were different. dlt schema hints were kept and arrow schema and data were unmodified. It is up to destination to coerce the differences when loading. Change log level to INFO for more details.
+Unable to resolve region for bucket apitap-lake
+[16:32:11] dlt full: rc=137 peak=4096MB
+VALIDATE dlt full: rows=0 vs src 10,300,000 -> MISMATCH (00000-6a8b5a15-2a8a-4606-8052-e77c44f7fd7d.metadata.json)
+[16:32:40] diy full: running (cap 16cpu/4g, kill 1500s)
+[16:33:42] diy full: rc=137 peak=4096MB
+VALIDATE pyiceberg-diy full: FAILED (HTTPError: HTTP Error 404: Not Found)
+════════ PHASE B: APPEND +1M rows ════════
+[16:33:54] source now 11300000 rows
+[16:33:59] apitap append: running (cap 16cpu/4g, kill 900s)
+RESULT apitap append: 1,000,000 rows in 2.2s over 8 pipes
+[16:34:02] apitap append: rc=0 peak=541MB
+VALIDATE apitap append: rows=11,300,000 vs src 11,300,000 -> MATCH
+[16:34:39] dlt append: running (cap 16cpu/4g, kill 900s)
+2026-08-01 16:34:41,830|[WARNING]|15|126543941010240|dlt|pipeline.py|run:763|The pipeline `run` method will now load the pending load packages. The data you passed to the run function will not be extracted. In order to do that you must run the pipeline again
+Unable to resolve region for bucket apitap-lake
+[16:34:44] dlt append: rc=137 peak=4096MB
+VALIDATE dlt append: rows=0 vs src 11,300,000 -> MISMATCH (00000-6a8b5a15-2a8a-4606-8052-e77c44f7fd7d.metadata.json)
+[16:35:10] diy append: running (cap 16cpu/4g, kill 900s)
+Traceback (most recent call last):
+  File "/scripts/diy_leg.py", line 23, in <module>
+    q = f"SELECT * FROM bench_data_10m WHERE id > {state['max_id']}"
+                                                   ~~~~~^^^^^^^^^^
+KeyError: 'max_id'
+[16:35:12] diy append: rc=1 peak=813MB
+VALIDATE pyiceberg-diy append: FAILED (HTTPError: HTTP Error 404: Not Found)
+════════ PHASE C: MERGE 500k updates + 500k inserts ════════
+[16:35:28] source now 11800000 rows
+[16:35:32] apitap merge: running (cap 16cpu/4g, kill 1200s)
+RESULT apitap merge: 1,050,000 rows in 3.8s over 8 pipes
+[16:35:36] apitap merge: rc=0 peak=383MB
+/home/ubuntu/bench-iceberg-showdown.sh: line 11: 4108648 Killed                  $PY - "$1" "$N" "$S" "$2" <<'EOF'
+import duckdb, json, sys, urllib.request
+table, want_n, want_sum, label = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+try:
+    meta = json.load(urllib.request.urlopen(f"http://127.0.0.1:8181/v1/namespaces/bench/tables/{table}"))
+    loc = meta["metadata-location"]
+    c = duckdb.connect(); c.execute("INSTALL iceberg; LOAD iceberg;")
+    c.execute("SET s3_endpoint='127.0.0.1:9100'; SET s3_access_key_id='bench'; SET s3_secret_access_key='benchbench'; SET s3_use_ssl=false; SET s3_url_style='path';")
+    n, s = c.execute(f"SELECT count(*), sum(id) FROM iceberg_scan('{loc}')").fetchone()
+    ok = (n == want_n and s == want_sum)
+    print(f"VALIDATE {label}: rows={n:,} vs src {want_n:,} -> {'MATCH' if ok else 'MISMATCH'}", flush=True)
+except Exception as e:
+    print(f"VALIDATE {label}: FAILED ({type(e).__name__}: {str(e)[:150]})", flush=True)
+EOF
+
+[16:51:22] dlt merge: running (cap 16cpu/4g, kill 1200s)
+2026-08-01 16:51:24,860|[WARNING]|15|127716273378112|dlt|pipeline.py|run:763|The pipeline `run` method will now load the pending load packages. The data you passed to the run function will not be extracted. In order to do that you must run the pipeline again
+Unable to resolve region for bucket apitap-lake
+[16:51:27] dlt merge: rc=137 peak=4096MB
+VALIDATE dlt merge: rows=0 vs src 11,800,000 -> MISMATCH (00000-6a8b5a15-2a8a-4606-8052-e77c44f7fd7d.metadata.json)
+[16:51:56] diy merge: running (cap 16cpu/4g, kill 1200s)
+Traceback (most recent call last):
+  File "/scripts/diy_leg.py", line 25, in <module>
+    q = f"SELECT * FROM bench_data_10m WHERE ts_val > '{state['max_ts']}'"
+                                                        ~~~~~^^^^^^^^^^
+KeyError: 'max_ts'
+[16:51:58] diy merge: rc=1 peak=825MB
+VALIDATE pyiceberg-diy merge: FAILED (HTTPError: HTTP Error 404: Not Found)
+════════ NOTE: ingestr v1.1.15 has no Iceberg destination (verified: zero
+         mentions in the installed package) — cannot participate. ════════
+SHOWDOWN COMPLETE
+
+──── apitap merge validation (manual merge-on-read; duckdb iceberg_scan blew past 30GB RAM applying 1.05M equality deletes and was killed) ────
+files: seq1=16 seq2=8 delete=1
+MoR count=11,800,000 sum_id=69620005900000  -> MATCH (source 11,800,000 / 69620005900000)
+
+──── dlt fairness rerun v2 (root-clean state; AWS_ENDPOINT_URL/AWS_DEFAULT_REGION/creds env set) ────
+dlt fairness rerun v2 (root-clean state, fixed envs):
+[extract warnings elided — json→string coercion, schema-hint merge]
+Unable to resolve region for bucket apitap-lake
+peak=4096MB  (cap hit during pyiceberg load; kernel OOM-kill — 0 objects under dlt-sd/)
+Four dlt attempts total across phases + fairness rerun: zero rows landed in every one.

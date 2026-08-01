@@ -31,6 +31,12 @@ Companion write-ups in this directory:
   internal-VPC rig — apitap 30.3 s (×3, checksum-matched, ~3.3 GB/s); latest
   ingestr and dlt+pyarrow had landed 0 rows when cut.**
   Raw: [gcp-round-c-raw.log](gcp-round-c-raw.log).
+- **[iceberg-showdown.md](iceberg-showdown.md)** — the `iceberg://`
+  destination's three-phase showdown (full 10.3M / append +1M / merge 1M
+  upsert) at 16 vCPU / 4 GB: **apitap 15.2 s · 2.2 s · 3.8 s, all read-back
+  MATCH**; dlt+pyiceberg and the hand-written pyiceberg path OOM-killed at
+  the cap; ingestr has no Iceberg destination.
+  Raw: [iceberg-showdown-raw.log](iceberg-showdown-raw.log).
 
 ## What the harness measures (and how)
 
