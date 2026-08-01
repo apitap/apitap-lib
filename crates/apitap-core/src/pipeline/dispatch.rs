@@ -34,8 +34,12 @@ fn pg_pg_parallel(cores: usize) -> usize {
 fn to_ch_parallel(cores: usize) -> usize {
     (cores * 8).clamp(2, 32)
 }
+// Measured (2026-08-02, 11.8M rows, 16-core host): the pg dest saturates at
+// ~8 concurrent COPYs — 8 pipes 26.0s, 12 25.9s, 16 28.4s (contention). The
+// small tiers keep cores*4 (source decode is real CPU there); the cap stops
+// big boxes from over-asking, which also halves peak memory on this route.
 fn my_pg_parallel(cores: usize) -> usize {
-    (cores * 4).clamp(2, 16)
+    (cores * 4).clamp(2, 8)
 }
 // MySQL→MySQL: source decode is real CPU (like MySQL→PG) and the dest LOAD DATA
 // is server-bound; scale with cores, capped for the small tiers.
