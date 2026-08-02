@@ -92,6 +92,29 @@ row on top of two SQL round-trips per batch. apitap's drain is bounded by
 Postgres's own logical decoding (same 12.8 s as the ape-dts race); the
 apply is one clear-then-insert transaction.
 
+## Head-to-head 3: everyone at 0.5 cpu / 256 MB (2026-08-02)
+
+Same 650K-event window in ~20K-event transactions, every catch-up inside a
+`--cpus=0.5 --memory=256m` container, all three MATCH:
+
+| tool | catch-up |
+|---|---|
+| apitap `mode="log_based"` | **12.0 s** (3 windows, 132 MB peak) |
+| ape-dts (`rdb_merge`, 8 workers) | 22 s |
+| pipelinewise LOG_BASED | 227 s |
+
+The uncapped order flips at this tier: ape-dts's eight row-SQL workers
+contend for half a core, while apitap's apply is set-based — the
+destination server does the work, the client mostly waits. One honest
+asterisk: a window whose largest SINGLE transaction is 500K rows buffers
+it whole (v1 protocol) and measures a 307 MB peak — that shape needs the
+512 MB tier, where the full window still lands in 19.7 s at 0.5 cpu.
+
+Full-load at 10M rows, replace vs log_based bootstrap (uncapped box):
+pg 23.1→33.3 s (the +10 s is `ADD PRIMARY KEY` on 10M rows — paid once),
+ch 12.0→12.5 s, mysql 141.2→132.6 s, iceberg 14.8→14.8 s. The bootstrap
+is the replace path plus the identity, nothing hidden.
+
 ## The 44 MB tier (2026-08-02)
 
 The windowed drain (budget = cgroup limit minus a 24 MiB runtime reserve,
