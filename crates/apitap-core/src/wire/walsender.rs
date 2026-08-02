@@ -610,6 +610,9 @@ mod tests {
                 .await
                 .expect("ddl");
 
+                let _ = sql
+                    .simple_query("SELECT pg_drop_replication_slot('apitap_walsmoke')")
+                    .await; // leftover from an aborted run — best-effort
                 let rows = ws
                     .simple_query(
                         "CREATE_REPLICATION_SLOT apitap_walsmoke TEMPORARY LOGICAL \
@@ -622,14 +625,16 @@ mod tests {
                 println!("slot at {consistent_point}, snapshot {snapshot:?}");
                 assert!(snapshot.is_some(), "EXPORT_SNAPSHOT must yield a name");
 
+                // Two separate simple-query batches = two source transactions,
+                // so the drain sees two Commits.
                 sql.simple_query(
                     "INSERT INTO walsmoke VALUES (1,'a'),(2,''); \
                      UPDATE walsmoke SET v='b' WHERE id=1; \
-                     DELETE FROM walsmoke WHERE id=2; \
-                     TRUNCATE walsmoke",
+                     DELETE FROM walsmoke WHERE id=2",
                 )
                 .await
                 .expect("dml");
+                sql.simple_query("TRUNCATE walsmoke").await.expect("truncate");
 
                 let lsn = pgoutput::lsn_from_string(&consistent_point).unwrap();
                 ws.start_replication("apitap_walsmoke", lsn, "walsmoke_pub")
