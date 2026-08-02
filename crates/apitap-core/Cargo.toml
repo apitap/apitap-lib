@@ -54,6 +54,8 @@ parquet = { version = "54", default-features = false, features = ["snap", "zstd"
 iceberg = "0.10.0"
 uuid = { version = "1.24.0", features = ["v4"] }
 async-trait = "0.1.91"
+base64 = "0.23.0"
+md-5 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

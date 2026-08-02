@@ -1,0 +1,578 @@
+//! Minimal Postgres WALSENDER client — the replication connection
+//! `mode="log_based"` drains. Hand-rolled like the SigV4 and Iceberg-REST
+//! layers: mainline drivers can't open `replication=database` sessions, and
+//! the protocol surface we need is small and frozen — startup + auth
+//! (SCRAM-SHA-256 / md5 / cleartext), simple query (the replication grammar:
+//! IDENTIFY_SYSTEM, CREATE_REPLICATION_SLOT, START_REPLICATION), and
+//! CopyBoth framing (XLogData in, standby-status-update out).
+//!
+//! Regular SQL (state reads, prechecks) stays on sqlx over normal
+//! connections; this type is used ONLY for the walsender session.
+//!
+//! v1 scope: TCP without TLS (`sslmode=disable` semantics). A TLS-required
+//! server fails loudly at startup with a clear message — terminating TLS is
+//! on the roadmap, not silently skipped.
+
+use crate::error::{Error, Result};
+use crate::wire::pgoutput::lsn_to_string;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
+use tokio::net::TcpStream;
+
+/// Microseconds between the Unix and Postgres (2000-01-01) epochs.
+const PG_EPOCH_OFFSET_US: i64 = 946_684_800_000_000;
+
+pub(crate) struct Walsender {
+    stream: BufStream<TcpStream>,
+    /// Set once START_REPLICATION enters CopyBoth mode.
+    copying: bool,
+}
+
+/// One event out of the CopyBoth stream.
+#[derive(Debug)]
+pub(crate) enum WalEvent {
+    /// One pgoutput message payload starting at `wal_start`.
+    XLogData { wal_start: u64, payload: Vec<u8> },
+    /// Primary keepalive: server's current WAL end and whether it wants an
+    /// immediate reply.
+    Keepalive { wal_end: u64, reply_requested: bool },
+}
+
+/// A parsed simple-query result: rows of text-format columns.
+pub(crate) type Rows = Vec<Vec<Option<String>>>;
+
+struct ConnInfo {
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    db: String,
+}
+
+fn parse_url(url: &str) -> Result<ConnInfo> {
+    let u = reqwest::Url::parse(url)
+        .map_err(|e| Error::InvalidInput(format!("postgres url: {e}")))?;
+    let host = u
+        .host_str()
+        .ok_or_else(|| Error::InvalidInput("postgres url needs a host".into()))?
+        .to_string();
+    for (k, v) in u.query_pairs() {
+        if k == "sslmode" && v != "disable" && v != "prefer" {
+            return Err(Error::InvalidInput(format!(
+                "log_based: sslmode={v} on the replication connection isn't \
+                 supported yet — the walsender client speaks plain TCP for now \
+                 (sslmode=disable). TLS termination lands next."
+            )));
+        }
+    }
+    Ok(ConnInfo {
+        host,
+        port: u.port().unwrap_or(5432),
+        user: percent_decode(u.username())?,
+        password: percent_decode(u.password().unwrap_or(""))?,
+        db: u.path().trim_matches('/').to_string(),
+    })
+}
+
+fn percent_decode(s: &str) -> Result<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| Error::InvalidInput("bad percent-escape in url".into()))?;
+            out.push(h);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| Error::InvalidInput(format!("url not utf-8: {e}")))
+}
+
+impl Walsender {
+    /// Open a `replication=database` session and authenticate.
+    pub(crate) async fn connect(url: &str) -> Result<Self> {
+        let ci = parse_url(url)?;
+        let stream = TcpStream::connect((ci.host.as_str(), ci.port))
+            .await
+            .map_err(|e| Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port)))?;
+        stream.set_nodelay(true).ok();
+        let mut ws = Self { stream: BufStream::new(stream), copying: false };
+        ws.startup(&ci).await?;
+        Ok(ws)
+    }
+
+    async fn startup(&mut self, ci: &ConnInfo) -> Result<()> {
+        // StartupMessage: no tag; length + protocol 3.0 + kv pairs.
+        let mut body = Vec::with_capacity(128);
+        body.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
+        for (k, v) in [
+            ("user", ci.user.as_str()),
+            ("database", ci.db.as_str()),
+            ("replication", "database"),
+            ("client_encoding", "UTF8"),
+        ] {
+            body.extend_from_slice(k.as_bytes());
+            body.push(0);
+            body.extend_from_slice(v.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let len = (body.len() + 4) as u32;
+        self.stream.write_all(&len.to_be_bytes()).await.map_err(io_err)?;
+        self.stream.write_all(&body).await.map_err(io_err)?;
+        self.stream.flush().await.map_err(io_err)?;
+
+        // Auth conversation, then drain parameters until ReadyForQuery.
+        let mut scram: Option<ScramState> = None;
+        loop {
+            let (tag, msg) = self.read_message().await?;
+            match tag {
+                b'R' => {
+                    let code = u32::from_be_bytes(msg[0..4].try_into().unwrap());
+                    match code {
+                        0 => {} // AuthenticationOk
+                        3 => self.send_password(&ci.password).await?, // cleartext
+                        5 => {
+                            let salt: [u8; 4] = msg[4..8].try_into().unwrap();
+                            self.send_password(&md5_password(&ci.user, &ci.password, salt))
+                                .await?;
+                        }
+                        10 => {
+                            // SASL: mechanisms as cstr list. We speak
+                            // SCRAM-SHA-256 (no channel binding on plain TCP).
+                            let mechs = std::str::from_utf8(&msg[4..]).unwrap_or("");
+                            if !mechs.contains("SCRAM-SHA-256") {
+                                return Err(Error::Transfer(format!(
+                                    "walsender: server offers SASL {mechs:?}, only \
+                                     SCRAM-SHA-256 is supported"
+                                )));
+                            }
+                            let st = ScramState::start();
+                            let first = st.client_first();
+                            let mut b = Vec::new();
+                            b.extend_from_slice(b"SCRAM-SHA-256\0");
+                            b.extend_from_slice(&(first.len() as u32).to_be_bytes());
+                            b.extend_from_slice(first.as_bytes());
+                            self.send_msg(b'p', &b).await?;
+                            scram = Some(st);
+                        }
+                        11 => {
+                            let server_first = std::str::from_utf8(&msg[4..])
+                                .map_err(|_| bad_scram())?;
+                            let st = scram.as_mut().ok_or_else(bad_scram)?;
+                            let fin = st.client_final(server_first, &ci.password)?;
+                            self.send_msg(b'p', fin.as_bytes()).await?;
+                        }
+                        12 => {
+                            let server_final =
+                                std::str::from_utf8(&msg[4..]).map_err(|_| bad_scram())?;
+                            let st = scram.as_ref().ok_or_else(bad_scram)?;
+                            st.verify_server(server_final)?;
+                        }
+                        other => {
+                            return Err(Error::Transfer(format!(
+                                "walsender: unsupported auth method {other}"
+                            )))
+                        }
+                    }
+                }
+                b'S' | b'K' | b'N' => {} // ParameterStatus / BackendKeyData / Notice
+                b'Z' => return Ok(()),   // ReadyForQuery
+                b'E' => return Err(parse_error(&msg)),
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "walsender startup: unexpected message {:?}",
+                        other as char
+                    )))
+                }
+            }
+        }
+    }
+
+    async fn send_password(&mut self, pw: &str) -> Result<()> {
+        let mut b = pw.as_bytes().to_vec();
+        b.push(0);
+        self.send_msg(b'p', &b).await
+    }
+
+    async fn send_msg(&mut self, tag: u8, body: &[u8]) -> Result<()> {
+        self.stream.write_all(&[tag]).await.map_err(io_err)?;
+        self.stream
+            .write_all(&((body.len() + 4) as u32).to_be_bytes())
+            .await
+            .map_err(io_err)?;
+        self.stream.write_all(body).await.map_err(io_err)?;
+        self.stream.flush().await.map_err(io_err)?;
+        Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<(u8, Vec<u8>)> {
+        let mut head = [0u8; 5];
+        self.stream.read_exact(&mut head).await.map_err(io_err)?;
+        let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+        if len < 4 {
+            return Err(Error::Transfer("walsender: bad message length".into()));
+        }
+        let mut body = vec![0u8; len - 4];
+        self.stream.read_exact(&mut body).await.map_err(io_err)?;
+        Ok((head[0], body))
+    }
+
+    /// Run one simple-protocol query (the replication grammar included) and
+    /// collect text rows. Must not be called while in CopyBoth mode.
+    pub(crate) async fn simple_query(&mut self, sql: &str) -> Result<Rows> {
+        assert!(!self.copying, "simple_query during CopyBoth");
+        let mut b = sql.as_bytes().to_vec();
+        b.push(0);
+        self.send_msg(b'Q', &b).await?;
+        let mut rows = Vec::new();
+        let mut err: Option<Error> = None;
+        loop {
+            let (tag, msg) = self.read_message().await?;
+            match tag {
+                b'T' => {} // RowDescription — text rows, we index positionally
+                b'D' => {
+                    let n = u16::from_be_bytes(msg[0..2].try_into().unwrap()) as usize;
+                    let mut row = Vec::with_capacity(n);
+                    let mut o = 2usize;
+                    for _ in 0..n {
+                        let l = i32::from_be_bytes(msg[o..o + 4].try_into().unwrap());
+                        o += 4;
+                        if l < 0 {
+                            row.push(None);
+                        } else {
+                            let l = l as usize;
+                            row.push(Some(
+                                String::from_utf8_lossy(&msg[o..o + l]).into_owned(),
+                            ));
+                            o += l;
+                        }
+                    }
+                    rows.push(row);
+                }
+                b'C' | b'I' | b'S' | b'N' => {} // CommandComplete/EmptyQuery/ParameterStatus/Notice
+                b'E' => err = Some(parse_error(&msg)),
+                b'Z' => break,
+                b'W' => {
+                    // CopyBothResponse — START_REPLICATION accepted.
+                    self.copying = true;
+                    return Ok(rows);
+                }
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "walsender query: unexpected message {:?}",
+                        other as char
+                    )))
+                }
+            }
+        }
+        match err {
+            Some(e) => Err(e),
+            None => Ok(rows),
+        }
+    }
+
+    /// `START_REPLICATION SLOT ... LOGICAL ...` — enters CopyBoth mode.
+    pub(crate) async fn start_replication(
+        &mut self,
+        slot: &str,
+        start_lsn: u64,
+        publication: &str,
+    ) -> Result<()> {
+        let sql = format!(
+            "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '1', \
+             \"publication_names\" '{publication}')",
+            lsn_to_string(start_lsn)
+        );
+        self.simple_query(&sql).await?;
+        if !self.copying {
+            return Err(Error::Transfer(
+                "walsender: START_REPLICATION did not enter copy mode".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Next CopyBoth event. `None` when the server ended the stream.
+    pub(crate) async fn next_event(&mut self) -> Result<Option<WalEvent>> {
+        assert!(self.copying, "next_event outside CopyBoth");
+        loop {
+            let (tag, msg) = self.read_message().await?;
+            match tag {
+                b'd' => {
+                    match msg.first() {
+                        Some(b'w') => {
+                            let wal_start =
+                                u64::from_be_bytes(msg[1..9].try_into().unwrap());
+                            // bytes 9..17 wal_end, 17..25 server clock — unused
+                            return Ok(Some(WalEvent::XLogData {
+                                wal_start,
+                                payload: msg[25..].to_vec(),
+                            }));
+                        }
+                        Some(b'k') => {
+                            let wal_end = u64::from_be_bytes(msg[1..9].try_into().unwrap());
+                            let reply_requested = msg.get(17).copied().unwrap_or(0) == 1;
+                            return Ok(Some(WalEvent::Keepalive { wal_end, reply_requested }));
+                        }
+                        _ => {
+                            return Err(Error::Transfer(
+                                "walsender: unknown CopyData frame".into(),
+                            ))
+                        }
+                    }
+                }
+                b'c' => {
+                    // Server CopyDone: acknowledge and fall out of copy mode.
+                    self.copying = false;
+                    return Ok(None);
+                }
+                b'E' => return Err(parse_error(&msg)),
+                b'N' => {} // NoticeResponse
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "walsender copy: unexpected message {:?}",
+                        other as char
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Standby status update — reports `lsn` as written/flushed/applied.
+    /// This is the ONLY thing that lets Postgres discard slot WAL; callers
+    /// send it exactly once per run, after the destination commit.
+    pub(crate) async fn standby_status(&mut self, lsn: u64, request_reply: bool) -> Result<()> {
+        let now_us = chrono::Utc::now().timestamp_micros() - PG_EPOCH_OFFSET_US;
+        let mut b = Vec::with_capacity(35);
+        b.push(b'r');
+        for _ in 0..3 {
+            b.extend_from_slice(&lsn.to_be_bytes());
+        }
+        b.extend_from_slice(&now_us.to_be_bytes());
+        b.push(request_reply as u8);
+        self.send_msg(b'd', &b).await
+    }
+
+    /// Leave CopyBoth mode cleanly (CopyDone handshake) so the session can
+    /// run further simple queries or close gracefully.
+    pub(crate) async fn stop_replication(&mut self) -> Result<()> {
+        if !self.copying {
+            return Ok(());
+        }
+        self.send_msg(b'c', &[]).await?;
+        loop {
+            let (tag, msg) = self.read_message().await?;
+            match tag {
+                b'd' | b'N' | b'C' | b'c' => {} // drain in-flight data
+                b'E' => return Err(parse_error(&msg)),
+                b'Z' => {
+                    self.copying = false;
+                    return Ok(());
+                }
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "walsender stop: unexpected message {:?}",
+                        other as char
+                    )))
+                }
+            }
+        }
+    }
+}
+
+fn io_err(e: std::io::Error) -> Error {
+    Error::Transfer(format!("walsender io: {e}"))
+}
+
+fn bad_scram() -> Error {
+    Error::Transfer("walsender: malformed SCRAM exchange".into())
+}
+
+fn parse_error(msg: &[u8]) -> Error {
+    // ErrorResponse: fields of (type u8, cstr) until 0.
+    let (mut code, mut text) = (String::new(), String::new());
+    let mut i = 0;
+    while i < msg.len() && msg[i] != 0 {
+        let t = msg[i];
+        let end = msg[i + 1..].iter().position(|&c| c == 0).map(|p| i + 1 + p);
+        let Some(end) = end else { break };
+        let v = String::from_utf8_lossy(&msg[i + 1..end]).into_owned();
+        match t {
+            b'C' => code = v,
+            b'M' => text = v,
+            _ => {}
+        }
+        i = end + 1;
+    }
+    Error::Transfer(format!("walsender: server error {code}: {text}"))
+}
+
+fn md5_password(user: &str, password: &str, salt: [u8; 4]) -> String {
+    use md5::Md5;
+    let inner = hex::encode(Md5::digest(format!("{password}{user}")));
+    let outer = hex::encode(Md5::digest([inner.as_bytes(), &salt].concat()));
+    format!("md5{outer}")
+}
+
+// ============================================================================
+// SCRAM-SHA-256 (RFC 5802/7677), no channel binding (gs2 header "n,,").
+// ============================================================================
+
+struct ScramState {
+    nonce: String,
+    client_first_bare: String,
+    /// Set by client_final for verify_server.
+    server_signature: std::cell::RefCell<Option<Vec<u8>>>,
+}
+
+impl ScramState {
+    fn start() -> Self {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let client_first_bare = format!("n=,r={nonce}");
+        Self { nonce, client_first_bare, server_signature: Default::default() }
+    }
+
+    fn client_first(&self) -> String {
+        format!("n,,{}", self.client_first_bare)
+    }
+
+    fn client_final(&self, server_first: &str, password: &str) -> Result<String> {
+        let mut r = None;
+        let mut s = None;
+        let mut i = None;
+        for part in server_first.split(',') {
+            match part.split_once('=') {
+                Some(("r", v)) => r = Some(v.to_string()),
+                Some(("s", v)) => s = Some(v.to_string()),
+                Some(("i", v)) => i = v.parse::<u32>().ok(),
+                _ => {}
+            }
+        }
+        let (r, s, i) = (
+            r.ok_or_else(bad_scram)?,
+            s.ok_or_else(bad_scram)?,
+            i.ok_or_else(bad_scram)?,
+        );
+        if !r.starts_with(&self.nonce) {
+            return Err(Error::Transfer("walsender: SCRAM nonce mismatch".into()));
+        }
+        let salt = B64.decode(&s).map_err(|_| bad_scram())?;
+        let salted = hi(password.as_bytes(), &salt, i);
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = Sha256::digest(&client_key);
+        let without_proof = format!("c={},r={r}", B64.encode(b"n,,"));
+        let auth_message =
+            format!("{},{server_first},{without_proof}", self.client_first_bare);
+        let client_sig = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_sig.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        let server_key = hmac_sha256(&salted, b"Server Key");
+        *self.server_signature.borrow_mut() =
+            Some(hmac_sha256(&server_key, auth_message.as_bytes()));
+        Ok(format!("{without_proof},p={}", B64.encode(proof)))
+    }
+
+    fn verify_server(&self, server_final: &str) -> Result<()> {
+        let v = server_final
+            .strip_prefix("v=")
+            .ok_or_else(bad_scram)?
+            .trim_end_matches(['\0', '\n']);
+        let got = B64.decode(v).map_err(|_| bad_scram())?;
+        let want = self.server_signature.borrow();
+        if want.as_deref() == Some(got.as_slice()) {
+            Ok(())
+        } else {
+            Err(Error::Transfer(
+                "walsender: SCRAM server signature mismatch — wrong server?".into(),
+            ))
+        }
+    }
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
+    m.update(data);
+    m.finalize().into_bytes().to_vec()
+}
+
+/// PBKDF2-HMAC-SHA256 with dkLen = one block (RFC 2898 `Hi` from RFC 5802).
+fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+    let mut u = hmac_sha256(password, &[salt, &1u32.to_be_bytes()].concat());
+    let mut out = u.clone();
+    for _ in 1..iterations {
+        u = hmac_sha256(password, &u);
+        for (o, b) in out.iter_mut().zip(u.iter()) {
+            *o ^= b;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 7677's published SCRAM-SHA-256 test vector.
+    #[test]
+    fn scram_matches_the_rfc7677_vector() {
+        let st = ScramState {
+            nonce: "rOprNGfwEbeRWgbNEkqO".into(),
+            client_first_bare: "n=user,r=rOprNGfwEbeRWgbNEkqO".into(),
+            server_signature: Default::default(),
+        };
+        let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+                            s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        let fin = st.client_final(server_first, "pencil").unwrap();
+        assert_eq!(
+            fin,
+            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+             p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+        );
+        st.verify_server("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+            .unwrap();
+    }
+
+    #[test]
+    fn md5_password_matches_postgres_formula() {
+        // Known-answer computed with PG's own algorithm.
+        assert_eq!(
+            md5_password("u", "p", [1, 2, 3, 4]),
+            format!("md5{}", {
+                use md5::{Digest, Md5};
+                let inner = hex::encode(Md5::digest("pu"));
+                hex::encode(Md5::digest([inner.as_bytes(), &[1, 2, 3, 4][..]].concat()))
+            })
+        );
+    }
+
+    #[test]
+    fn error_response_parses_code_and_message() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"C42601\0");
+        msg.extend_from_slice(b"Msyntax error\0");
+        msg.push(0);
+        let e = parse_error(&msg);
+        let s = format!("{e}");
+        assert!(s.contains("42601") && s.contains("syntax error"));
+    }
+
+    #[test]
+    fn url_parse_rejects_tls_and_decodes_credentials() {
+        let ci = parse_url("postgres://u%40x:p%3Aw@h:5433/db").unwrap();
+        assert_eq!((ci.user.as_str(), ci.password.as_str()), ("u@x", "p:w"));
+        assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
+        assert!(parse_url("postgres://u:p@h/db?sslmode=require").is_err());
+    }
+}

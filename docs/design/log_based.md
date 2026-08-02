@@ -149,18 +149,21 @@ is ONE lsn per (source db, slot) — not per table (kills PipelineWise's
 `min()` disease); multi-table tasks share a slot + publication and commit
 one watermark. Iceberg: `apitap.watermark.*` properties, same shape.
 
-## Driver decision (open question #1 for review)
+## Driver decision (RESOLVED)
 
 Mainline `tokio-postgres`/sqlx can't open `replication=database`
-connections; ape-dts pins an apecloud fork of rust-postgres. Options:
-1. **Patch our vendored sqlx-core** (we already vendor it) — add the
-   startup parameter + CopyBoth mode + XLogData framing; pgoutput message
-   decode is ~300 lines we write regardless. House style (no new driver,
-   no fork dependency), moderate protocol work (CopyBoth is symmetric
-   COPY framing we partly have).
-2. Depend on the apecloud fork like ape-dts — fastest, but a second pg
-   driver in the tree pinned to someone else's git rev.
-Recommendation: (1).
+connections; ape-dts pins an apecloud fork of rust-postgres. Our vendored
+crate turns out to be `sqlx-core` only — the Postgres protocol lives in
+the unvendored `sqlx-postgres`, so "patch the vendor" would mean vendoring
+a large new crate. **Decision: hand-roll a minimal walsender client**
+(`wire/walsender.rs`): startup packet with `replication=database`, auth
+(SCRAM-SHA-256 / md5 / cleartext — sha2+hmac already in the tree), simple
+query for the replication commands, CopyBoth framing (XLogData in,
+standby-status-update out). ~600–900 lines including the pgoutput decoder
+that every option needs anyway; the SigV4/Iceberg-REST precedent says the
+hand-rolled protocol layers end up the most robust code we own. Regular
+SQL (state reads, prechecks, pg_current_wal_lsn) stays on sqlx over a
+normal connection.
 
 ## Scope v1
 
