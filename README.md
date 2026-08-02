@@ -205,10 +205,14 @@ use it for rebuildable destinations.
       drain windows fit the smallest tier: a 2.1M-event backlog replays in
       a 0.5 vCPU / 44 MB container (33 MB peak). Same 650K-event window,
       everyone capped at 0.5 vCPU / 256 MB: **apitap 12 s** vs ape-dts 22 s
-      vs pipelinewise 227 s, all row-matched
-      ([the ledger](benchmarks/logbased-cdc.md)). Many tables share ONE
-      replication slot (`tables=[…]` — same-LSN windows across members,
-      one retention risk, 22% faster than N slots), and a
+      vs ingestr 78 s vs pipelinewise 227 s, all row-matched — and apitap's
+      number is the same 12 s on a full 16-core box: the drain rides
+      pgoutput v2 streaming, a spill-free decode the server is told to use
+      per-session, an overlapped apply, and a socket pump, so the client
+      needs ONE core (0.48 measured) and the work happens set-based at the
+      destination ([the ledger](benchmarks/logbased-cdc.md)). Many tables
+      share ONE replication slot (`tables=[…]` — same-LSN windows across
+      members, one retention risk, 22% faster than N slots), and a
       ``{table: mode}`` dict mixes CDC and bulk modes in one call
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
 - [x] Postgres → BigQuery (dual lanes picked per box: binary COPY → Parquet
