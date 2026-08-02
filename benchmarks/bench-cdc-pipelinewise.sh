@@ -24,9 +24,17 @@ if ! $PSRC "SELECT 1 FROM pg_create_logical_replication_slot('w2j_probe','wal2js
 fi
 $PSRC "SELECT pg_drop_replication_slot('w2j_probe')" >/dev/null 2>&1 || true
 
-LOG "ensure tap/target venvs (own venvs — singer connectors pin conflicting deps)"
-[ -x ~/pw-tap/bin/tap-postgres ] || (python3 -m venv ~/pw-tap && ~/pw-tap/bin/pip install -q pipelinewise-tap-postgres)
-[ -x ~/pw-target/bin/target-postgres ] || (python3 -m venv ~/pw-target && ~/pw-target/bin/pip install -q pipelinewise-target-postgres)
+LOG "ensure the pw-race image (singer taps pin ancient deps — py3.10 + libpq)"
+if ! docker image inspect pw-race >/dev/null 2>&1; then
+  docker build -q -t pw-race - <<'DOCKEREOF'
+FROM python:3.10-slim
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN python -m venv /opt/tap && /opt/tap/bin/pip install -q pipelinewise-tap-postgres
+RUN python -m venv /opt/target && /opt/target/bin/pip install -q pipelinewise-target-postgres
+DOCKEREOF
+fi
+PW="docker run --rm --network host -v $HOME/pw-bench:/w pw-race"
 
 mkdir -p ~/pw-bench && cd ~/pw-bench
 cat > tap.json <<'EOF'
@@ -49,7 +57,7 @@ $PSRC "CREATE TABLE $T (id int PRIMARY KEY, v text, n bigint)" >/dev/null
 $PSRC "INSERT INTO $T SELECT g, 'v'||g, g*7 FROM generate_series(1,100000) g" >/dev/null
 
 LOG "discover + select the stream (LOG_BASED)"
-~/pw-tap/bin/tap-postgres --config tap.json --discover > catalog_raw.json
+$PW /opt/tap/bin/tap-postgres --config /w/tap.json --discover > catalog_raw.json
 python3 - <<'PY'
 import json
 c = json.load(open('catalog_raw.json'))
@@ -68,8 +76,8 @@ PY
 
 LOG "pipelinewise bootstrap (initial sync + slot)"
 t0=$(date +%s)
-~/pw-tap/bin/tap-postgres --config tap.json --properties catalog.json \
-  | ~/pw-target/bin/target-postgres --config target.json > out1.jsonl
+$PW bash -c "/opt/tap/bin/tap-postgres --config /w/tap.json --properties /w/catalog.json \
+  | /opt/target/bin/target-postgres --config /w/target.json > /w/out1.jsonl"
 tail -1 out1.jsonl > state.json
 echo "pipelinewise bootstrap: $(( $(date +%s) - t0 ))s"
 $PDST "SELECT count(*), sum(id), sum(n) FROM $T"
@@ -94,8 +102,8 @@ echo "source truth: $SRC_SUM"
 
 LOG "pipelinewise CDC catch-up (timed)"
 t0=$(date +%s)
-~/pw-tap/bin/tap-postgres --config tap.json --properties catalog.json --state state.json \
-  | ~/pw-target/bin/target-postgres --config target.json > out2.jsonl
+$PW bash -c "/opt/tap/bin/tap-postgres --config /w/tap.json --properties /w/catalog.json --state /w/state.json \
+  | /opt/target/bin/target-postgres --config /w/target.json > /w/out2.jsonl"
 PW_T=$(( $(date +%s) - t0 ))
 PW_SUM=$($PDST "SELECT count(*)||'|'||sum(id)||'|'||sum(n) FROM $T")
 echo "pipelinewise catch-up: ${PW_T}s — dst $PW_SUM $([ "$PW_SUM" = "$SRC_SUM" ] && echo MATCH || echo MISMATCH)"

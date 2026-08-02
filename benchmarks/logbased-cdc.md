@@ -70,14 +70,52 @@ data. Overlapping the drain with staging COPYs (stream every row version
 into staging as it decodes, collapse in SQL at the end) is the obvious
 next step and is not implemented yet.
 
+## Head-to-head 2: pipelinewise, same recipe (2026-08-02)
+
+Same shape as the ape-dts race — both tools' slots created BEFORE an
+identical 650K-event window (500K inserts + 100K updates + 50K deletes on a
+100K-row table), then timed until the destination matched the source
+exactly (`count`, `sum(id)`, `sum(n)`).
+
+| tool | catch-up | verdict |
+|---|---|---|
+| pipelinewise `tap-postgres` LOG_BASED → `target-postgres` | 86 s | MATCH |
+| apitap `mode="log_based"` | **15 s** (drain 12.8 + apply 2.4) | MATCH |
+
+Setup, for fairness: pipelinewise decodes via **wal2json** (built in the
+source container, `with_llvm=no`), `hard_delete=true`,
+`batch_size_rows=100000`, tap+target on Python 3.10 (their pinned deps
+don't build on 3.13), everything on the same box over localhost. Its 86 s
+is tap JSON-serializing every row + target COPYing into a temp table and
+merging per 100K batch — the singer pipe pays one JSON encode/decode per
+row on top of two SQL round-trips per batch. apitap's drain is bounded by
+Postgres's own logical decoding (same 12.8 s as the ape-dts race); the
+apply is one clear-then-insert transaction.
+
+## The 44 MB tier (2026-08-02)
+
+The windowed drain (budget = cgroup limit minus a 24 MiB runtime reserve,
+/8, floor 2 MiB) replays a **2.1M-event backlog inside a 0.5 cpu / 44 MB
+container**: 104 windows, 89 s, cgroup peak **32.6 MB**, destination
+byte-matched. Two real bugs surfaced building this: the pgoutput Relation
+registry must outlive one window (announced once per stream), and an
+existing publication must be checked for *membership*, not existence — a
+dropped-and-recreated source table silently empties it. Both fixed, both
+now covered by `e2e_logbased_capped.sh`.
+
 ## Reproduce
 
 ```bash
-# correctness
+# correctness (pg | ch | my | ice)
 APITAP_DEBUG=1 python e2e_logbased.py
+APITAP_DEBUG=1 python e2e_logbased_dests.py ch
 
-# the race (creates both slots, generates one window, times both tools)
-bash bench-cdc-showdown.sh
+# the races
+bash bench-cdc-showdown.sh        # vs ape-dts
+bash bench-cdc-pipelinewise.sh    # vs pipelinewise
+
+# the smallest tier
+bash e2e_logbased_capped.sh
 ```
 
 Raw: [logbased-cdc-raw.log](logbased-cdc-raw.log).

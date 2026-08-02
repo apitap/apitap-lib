@@ -26,7 +26,7 @@ SRC_PG = "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src"
 DST_PG = "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst"
 DST_CH = "clickhouse://default:bench@127.0.0.1:8124/default"
 SRC_MY = "mysql://root:bench@127.0.0.1:3307/bench?ssl-mode=disabled"
-DST_MY = "mysql://root:bench@127.0.0.1:3308/bench?ssl-mode=disabled"
+DST_MY = "mysql://root:bench@127.0.0.1:3308/bench"
 routes = [
     ("pg->pg 10M", SRC_PG, DST_PG, "bench_data_10m_cap"),
     ("pg->ch 10M", SRC_PG, DST_CH, "bench_data_10m_cap"),
