@@ -19,7 +19,7 @@ if ! $PSRC "SELECT 1 FROM pg_create_logical_replication_slot('w2j_probe','wal2js
   docker exec -u root apitap-bench-pg-src sh -c '
     apk add --no-cache build-base git postgresql-dev >/dev/null 2>&1 || apk add --no-cache build-base git >/dev/null;
     rm -rf /tmp/wal2json && git clone -q --depth 1 https://github.com/eulerto/wal2json /tmp/wal2json &&
-    cd /tmp/wal2json && make USE_PGXS=1 >/dev/null && make USE_PGXS=1 install >/dev/null && echo wal2json-installed'
+    cd /tmp/wal2json && make USE_PGXS=1 with_llvm=no >/dev/null && make USE_PGXS=1 with_llvm=no install >/dev/null && echo wal2json-installed'
   $PSRC "SELECT 1 FROM pg_create_logical_replication_slot('w2j_probe','wal2json')" >/dev/null
 fi
 $PSRC "SELECT pg_drop_replication_slot('w2j_probe')" >/dev/null 2>&1 || true

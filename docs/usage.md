@@ -749,11 +749,21 @@ apitap.transfer(
 - **Every later run** drains the slot from the last committed LSN to a
   stop-line captured at run start, collapses the window per primary key
   (an update that changes the PK becomes delete+insert; insert-then-delete
-  nets out; the last write wins), and applies it set-based: COPY into a
-  temp table, one `DELETE … USING`, one `INSERT … ON CONFLICT DO UPDATE`,
-  in **one destination transaction that also advances the LSN watermark**
-  (`_apitap_state`). Only after that commit is Postgres told the WAL may be
-  discarded — a crash at any point replays idempotently, never skips.
+  nets out; the last write wins), and applies it set-based: clear the
+  touched keys, bulk-insert the final row images, replay the small ordered
+  residue — **together with the LSN watermark**. Only after that is
+  Postgres told the WAL may be discarded — a crash at any point replays
+  idempotently, never skips. How the apply-plus-watermark lands is
+  per-engine: Postgres and MySQL commit it in one transaction
+  (`_apitap_state`); Iceberg commits equality deletes + data files + the
+  watermark property in **one snapshot**; ClickHouse (no transactions)
+  applies an idempotent window — lightweight `DELETE` join, plain
+  `INSERT`, state row written last — so a replay converges.
+- **Bounded memory**: the drain applies in windows sized off the cgroup
+  memory limit and stops only at transaction boundaries — a 2M-event
+  backlog replays in a 0.5-cpu / 44 MB container at a 33 MB peak (measured;
+  104 windows). One giant transaction still buffers whole: pgoutput ships
+  a transaction only after its commit.
 - **Scheduling**: run it from cron/Airflow at any cadence; the call is
   identical every time. An overlapping run fails fast (the slot shows
   active). A paused schedule loses nothing — Postgres retains WAL on the
@@ -769,9 +779,11 @@ apitap.transfer(
   key columns outside the replica identity fail with the exact `ALTER
   TABLE` to run. The replication connection speaks plain TCP for now
   (`sslmode` beyond disable/prefer is refused, not ignored).
-- **Scope today**: Postgres → Postgres, single table per call. MySQL and
-  Iceberg destinations (the delta is exactly an Iceberg row-delta commit)
-  are next; multi-table per slot after that.
+- **Scope today**: Postgres sources → **Postgres, ClickHouse, MySQL and
+  Iceberg** destinations, single table per call; multi-table per slot is
+  next. Iceberg needs a single-column primary key (equality-delete files
+  are single-key), and the parquet lane's bytea restriction applies there
+  as everywhere else.
 
 ## Durability
 
