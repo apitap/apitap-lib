@@ -365,18 +365,35 @@ impl Walsender {
     }
 
     /// `START_REPLICATION SLOT ... LOGICAL ...` — enters CopyBoth mode.
+    ///
+    /// Tries pgoutput proto v2 with `streaming` first: the server then ships
+    /// a big transaction WHILE decoding it (blocks flush every
+    /// `logical_decoding_work_mem`), so the client consumes concurrently
+    /// with the server's own WAL scan instead of waiting for the full
+    /// decode. The threshold is deliberately kept LOW on this path (stream
+    /// early = pipeline long). If the server refuses v2 (pre-14), fall back
+    /// to v1 with a big work_mem so nothing spills to pg_replslot files.
     pub(crate) async fn start_replication(
         &mut self,
         slot: &str,
         start_lsn: u64,
         publication: &str,
     ) -> Result<()> {
-        let sql = format!(
-            "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '1', \
-             \"publication_names\" '{publication}')",
+        self.simple_query("SET logical_decoding_work_mem = '64MB'").await.ok();
+        let v2 = format!(
+            "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '2', \
+             \"publication_names\" '{publication}', \"streaming\" 'true')",
             lsn_to_string(start_lsn)
         );
-        self.simple_query(&sql).await?;
+        if self.simple_query(&v2).await.is_err() || !self.copying {
+            self.simple_query("SET logical_decoding_work_mem = '1GB'").await.ok();
+            let v1 = format!(
+                "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '1', \
+                 \"publication_names\" '{publication}')",
+                lsn_to_string(start_lsn)
+            );
+            self.simple_query(&v1).await?;
+        }
         if !self.copying {
             return Err(Error::Transfer(
                 "walsender: START_REPLICATION did not enter copy mode".into(),
@@ -781,7 +798,7 @@ mod tests {
                 while commits < 2 {
                     match ws.next_event().await.expect("event") {
                         Some(WalEvent::XLogData { payload, .. }) => {
-                            match pgoutput::decode(&payload).expect("decode") {
+                            match pgoutput::decode(&payload, false).expect("decode") {
                                 PgoMessage::Insert { new, .. } => {
                                     ins += 1;
                                     if new.iter().any(|c| {

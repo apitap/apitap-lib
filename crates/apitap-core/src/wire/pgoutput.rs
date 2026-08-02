@@ -57,6 +57,15 @@ pub(crate) enum PgoMessage {
         cascade: bool,
         restart_identity: bool,
     },
+    /// proto v2 streaming: an in-progress transaction's block opens. Until
+    /// the matching StreamStop, every DML/Relation message carries a leading
+    /// xid (the decoder strips it when `in_stream`).
+    StreamStart { xid: u32 },
+    StreamStop,
+    /// The streamed transaction committed — its buffered ops are real now.
+    StreamCommit { xid: u32, end_lsn: u64 },
+    /// The streamed transaction rolled back — drop everything buffered.
+    StreamAbort { xid: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,10 +183,33 @@ fn short() -> Error {
 }
 
 /// Decode one pgoutput message (one XLogData payload).
-pub(crate) fn decode(payload: &[u8]) -> Result<PgoMessage> {
+/// `in_stream`: between StreamStart and StreamStop, DML/Relation/Type
+/// messages carry a leading Int32 xid (proto v2) — strip it before the
+/// v1-shaped body.
+pub(crate) fn decode(payload: &[u8], in_stream: bool) -> Result<PgoMessage> {
     let mut r = Reader::new(payload);
     let tag = r.u8()?;
+    if in_stream && matches!(tag, b'R' | b'Y' | b'I' | b'U' | b'D' | b'T') {
+        let _xid = r.u32()?;
+    }
     Ok(match tag {
+        b'S' => {
+            let xid = r.u32()?;
+            let _first_segment = r.u8()?;
+            PgoMessage::StreamStart { xid }
+        }
+        b'E' => PgoMessage::StreamStop,
+        b'c' => {
+            let xid = r.u32()?;
+            let _flags = r.u8()?;
+            let _commit_lsn = r.u64()?;
+            let end_lsn = r.u64()?;
+            PgoMessage::StreamCommit { xid, end_lsn }
+        }
+        b'A' => {
+            let xid = r.u32()?;
+            PgoMessage::StreamAbort { xid }
+        }
         b'B' => PgoMessage::Begin {
             final_lsn: r.u64()?,
             commit_ts_us: r.i64()?,
@@ -303,7 +335,7 @@ mod tests {
     fn begin_commit_roundtrip() {
         let b = frame(&[b"B", &7u64.to_be_bytes(), &99i64.to_be_bytes(), &5u32.to_be_bytes()]);
         assert_eq!(
-            decode(&b).unwrap(),
+            decode(&b, false).unwrap(),
             PgoMessage::Begin { final_lsn: 7, commit_ts_us: 99, xid: 5 }
         );
         let c = frame(&[
@@ -314,7 +346,7 @@ mod tests {
             &99i64.to_be_bytes(),
         ]);
         assert_eq!(
-            decode(&c).unwrap(),
+            decode(&c, false).unwrap(),
             PgoMessage::Commit { commit_lsn: 7, end_lsn: 8, commit_ts_us: 99 }
         );
     }
@@ -337,7 +369,7 @@ mod tests {
             &25u32.to_be_bytes(),
             &(-1i32).to_be_bytes(),
         ]);
-        let PgoMessage::Relation(r) = decode(&rel).unwrap() else { panic!() };
+        let PgoMessage::Relation(r) = decode(&rel, false).unwrap() else { panic!() };
         assert_eq!(r.rel_id, 42);
         assert_eq!(r.replica_identity, b'd');
         assert!(r.cols[0].key && !r.cols[1].key);
@@ -354,7 +386,7 @@ mod tests {
             b"n",
         ]);
         assert_eq!(
-            decode(&ins).unwrap(),
+            decode(&ins, false).unwrap(),
             PgoMessage::Insert {
                 rel_id: 42,
                 new: vec![Cell::Text(b"9".to_vec()), Cell::Null]
@@ -380,7 +412,7 @@ mod tests {
             b"9",
             b"u",
         ]);
-        let PgoMessage::Update { old, new, .. } = decode(&upd).unwrap() else { panic!() };
+        let PgoMessage::Update { old, new, .. } = decode(&upd, false).unwrap() else { panic!() };
         let old = old.unwrap();
         assert!(!old.full);
         assert_eq!(old.tuple, vec![Cell::Text(b"9".to_vec())]);
@@ -394,7 +426,7 @@ mod tests {
             b"t",
             &0u32.to_be_bytes(),
         ]);
-        let PgoMessage::Insert { new, .. } = decode(&ins).unwrap() else { panic!() };
+        let PgoMessage::Insert { new, .. } = decode(&ins, false).unwrap() else { panic!() };
         assert_eq!(new[0], Cell::Text(Vec::new()));
         assert_ne!(new[0], Cell::Null);
     }
@@ -409,7 +441,7 @@ mod tests {
             &43u32.to_be_bytes(),
         ]);
         assert_eq!(
-            decode(&t).unwrap(),
+            decode(&t, false).unwrap(),
             PgoMessage::Truncate { rel_ids: vec![42, 43], cascade: true, restart_identity: true }
         );
     }

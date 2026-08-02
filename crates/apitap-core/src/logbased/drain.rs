@@ -45,6 +45,19 @@ pub(crate) struct DrainSession {
     key_idx: HashMap<String, Vec<usize>>,
     wal_cols: HashMap<String, Vec<String>>,
     wal_oids: HashMap<String, Vec<u32>>,
+    /// proto v2 streamed transactions in flight, by xid: the server ships a
+    /// big transaction WHILE decoding it; its ops buffer here until Stream
+    /// Commit makes them real (Abort drops them). May span windows — a
+    /// budget break can only land between blocks, never inside one.
+    streams: HashMap<u32, Vec<(Arc<str>, StreamOp)>>,
+}
+
+/// Buffered op of a streamed (not-yet-committed) transaction.
+pub(crate) enum StreamOp {
+    Insert(Vec<Cell>),
+    Update(Option<Vec<Cell>>, Vec<Cell>),
+    Delete(Vec<Cell>),
+    Truncate,
 }
 
 /// `key_cols`: replica-identity/PK column NAMES per "schema.table" — chosen
@@ -70,7 +83,7 @@ pub(crate) async fn drain(
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
     // if the drain aborts mid-transaction.
-    let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
+    let mut tx_buf: Vec<(Arc<str>, StreamOp)> = Vec::new();
     let mut end_lsn = start_lsn;
     // Approximate bytes buffered across tx_buf + collapsers. Collapse dedup
     // (last-write-wins) makes true memory smaller — the count is conservative.
@@ -87,12 +100,7 @@ pub(crate) async fn drain(
             + 48
     }
 
-    enum TxOp {
-        Insert(Vec<Cell>),
-        Update(Option<Vec<Cell>>, Vec<Cell>),
-        Delete(Vec<Cell>),
-        Truncate,
-    }
+    let mut in_stream: Option<u32> = None;
 
     loop {
         if std::time::Instant::now() > deadline {
@@ -115,35 +123,16 @@ pub(crate) async fn drain(
                     // window may still be in flight — start_lsn would lie).
                     ws.standby_status(*applied.borrow(), false).await?;
                 }
-                if wal_end >= stop_line && tx_buf.is_empty() {
+                if wal_end >= stop_line && tx_buf.is_empty() && sess.streams.is_empty() {
                     // Server has shipped everything up to the stop-line and
                     // we're at a boundary: caught up.
                     break;
                 }
             }
-            Some(WalEvent::XLogData { payload, .. }) => match pgoutput::decode(&payload)? {
+            Some(WalEvent::XLogData { payload, .. }) => match pgoutput::decode(&payload, in_stream.is_some())? {
                 PgoMessage::Begin { .. } => tx_buf.clear(),
                 PgoMessage::Commit { end_lsn: e, .. } => {
-                    for (table, op) in tx_buf.drain(..) {
-                        // Lazy per-window collapser: the Relation message came
-                        // in THIS window or an earlier one — the session knows.
-                        if !collapsers.contains_key(table.as_ref()) {
-                            let ki = sess.key_idx.get(table.as_ref()).expect(
-                                "session key_idx exists for tracked table",
-                            );
-                            collapsers
-                                .insert(table.to_string(), Collapser::new(ki.clone()));
-                        }
-                        let c = collapsers
-                            .get_mut(table.as_ref())
-                            .expect("collapser just ensured");
-                        match op {
-                            TxOp::Insert(row) => c.insert(row)?,
-                            TxOp::Update(old, row) => c.update(old.as_deref(), row)?,
-                            TxOp::Delete(old) => c.delete(&old)?,
-                            TxOp::Truncate => c.truncate(),
-                        }
-                    }
+                    flush_ops(tx_buf.drain(..), &mut collapsers, &sess.key_idx)?;
                     end_lsn = e;
                     if e >= stop_line {
                         break;
@@ -152,6 +141,26 @@ pub(crate) async fn drain(
                         hit_budget = true;
                         break;
                     }
+                }
+                PgoMessage::StreamStart { xid } => {
+                    in_stream = Some(xid);
+                    sess.streams.entry(xid).or_default();
+                }
+                PgoMessage::StreamStop => in_stream = None,
+                PgoMessage::StreamCommit { xid, end_lsn: e } => {
+                    let ops = sess.streams.remove(&xid).unwrap_or_default();
+                    flush_ops(ops, &mut collapsers, &sess.key_idx)?;
+                    end_lsn = e;
+                    if e >= stop_line {
+                        break;
+                    }
+                    if buf_bytes >= max_buf_bytes {
+                        hit_budget = true;
+                        break;
+                    }
+                }
+                PgoMessage::StreamAbort { xid } => {
+                    sess.streams.remove(&xid);
                 }
                 PgoMessage::Relation(r) => {
                     let st = rel_state(&r, key_cols)?;
@@ -171,7 +180,11 @@ pub(crate) async fn drain(
                 PgoMessage::Insert { rel_id, new } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
                         buf_bytes += cells_bytes(&new);
-                        tx_buf.push((t, TxOp::Insert(new)));
+                        let op = StreamOp::Insert(new);
+                        match in_stream {
+                            Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
+                            None => tx_buf.push((t, op)),
+                        }
                     }
                 }
                 PgoMessage::Update { rel_id, old, new } => {
@@ -179,19 +192,31 @@ pub(crate) async fn drain(
                         let old = old.map(|o| o.tuple);
                         buf_bytes += cells_bytes(&new)
                             + old.as_deref().map_or(0, cells_bytes);
-                        tx_buf.push((t, TxOp::Update(old, new)));
+                        let op = StreamOp::Update(old, new);
+                        match in_stream {
+                            Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
+                            None => tx_buf.push((t, op)),
+                        }
                     }
                 }
                 PgoMessage::Delete { rel_id, old } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
                         buf_bytes += cells_bytes(&old.tuple);
-                        tx_buf.push((t, TxOp::Delete(old.tuple)));
+                        let op = StreamOp::Delete(old.tuple);
+                        match in_stream {
+                            Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
+                            None => tx_buf.push((t, op)),
+                        }
                     }
                 }
                 PgoMessage::Truncate { rel_ids, .. } => {
                     for rid in rel_ids {
                         if let Some(t) = tracked(&sess.rels, rid)? {
-                            tx_buf.push((t, TxOp::Truncate));
+                            let op = StreamOp::Truncate;
+                            match in_stream {
+                                Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
+                                None => tx_buf.push((t, op)),
+                            }
                         }
                     }
                 }
@@ -210,6 +235,32 @@ pub(crate) async fn drain(
         wal_oids: sess.wal_oids.clone(),
         hit_budget,
     })
+}
+
+/// Land one committed transaction's buffered ops in the per-window
+/// collapsers (lazy: the Relation may have arrived in an earlier window —
+/// the session's key_idx remembers).
+fn flush_ops(
+    ops: impl IntoIterator<Item = (Arc<str>, StreamOp)>,
+    collapsers: &mut HashMap<String, Collapser>,
+    key_idx: &HashMap<String, Vec<usize>>,
+) -> Result<()> {
+    for (table, op) in ops {
+        if !collapsers.contains_key(table.as_ref()) {
+            let ki = key_idx
+                .get(table.as_ref())
+                .expect("session key_idx exists for tracked table");
+            collapsers.insert(table.to_string(), Collapser::new(ki.clone()));
+        }
+        let c = collapsers.get_mut(table.as_ref()).expect("collapser just ensured");
+        match op {
+            StreamOp::Insert(row) => c.insert(row)?,
+            StreamOp::Update(old, row) => c.update(old.as_deref(), row)?,
+            StreamOp::Delete(old) => c.delete(&old)?,
+            StreamOp::Truncate => c.truncate(),
+        }
+    }
+    Ok(())
 }
 
 fn rel_state(r: &Relation, key_cols: &HashMap<String, Vec<String>>) -> Result<RelState> {
