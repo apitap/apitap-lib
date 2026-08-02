@@ -177,6 +177,16 @@ use it for rebuildable destinations.
       key); the watermark lives in `_apitap_state`, a queryable table in the
       destination, written in the same transaction as the data; cost proportional
       to the delta, not the table
+- [x] Batch CDC — `mode="log_based"`: Postgres logical replication on a
+      schedule, no daemon. Everything the WAL saw (inserts, updates incl.
+      PK changes, deletes, TRUNCATEs, TOAST handled) collapsed per key and
+      applied set-based to **Postgres, ClickHouse, MySQL or Iceberg**, with
+      the LSN watermark committed atomically with the data. Memory-bounded
+      drain windows fit the smallest tier: a 2.1M-event backlog replays in
+      a 0.5 vCPU / 44 MB container (33 MB peak). Same 650K-event window,
+      everyone capped at 0.5 vCPU / 256 MB: **apitap 12 s** vs ape-dts 22 s
+      vs pipelinewise 227 s, all row-matched
+      ([the ledger](benchmarks/logbased-cdc.md))
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
 - [x] Postgres → BigQuery (dual lanes picked per box: binary COPY → Parquet
       ZSTD, or CSV+gzip on small cores; parallel resumable load jobs → atomic
