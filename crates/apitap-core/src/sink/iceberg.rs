@@ -504,48 +504,73 @@ impl IcebergSink {
     }
 
     fn wm_prop(&self) -> String {
-        format!(
-            "apitap.watermark.{}",
-            self.source_id.as_deref().unwrap_or("default")
-        )
+        wm_prop_for(self.source_id.as_deref().unwrap_or("default"))
     }
 
-    /// Companion property recording WHICH column the watermark tracks — the
-    /// Postgres sink's state table has a cursor_col column for the same
-    /// reason: a run that switches cursors must not reuse the old value.
     fn cur_prop(&self) -> String {
-        format!(
-            "apitap.watermark-cursor.{}",
-            self.source_id.as_deref().unwrap_or("default")
-        )
+        cur_prop_for(self.source_id.as_deref().unwrap_or("default"))
     }
 
     /// Bind the S3 side from the catalog-assigned table location.
     fn bind_storage(&mut self, meta: &TableMetadata) -> Result<()> {
-        if meta.format_version() == FormatVersion::V1 {
-            return Err(Error::InvalidInput(
-                "iceberg: this is a format-version 1 table — apitap writes v2 \
-                 tables only (v1 is legacy; recreate the table as v2)"
-                    .into(),
-            ));
-        }
-        let location = meta.location().trim_end_matches('/').to_string();
-        let (bucket, key) = split_s3_uri(&location)?;
-        self.key_prefix = if key.is_empty() { String::new() } else { format!("{key}/") };
-        self.s3 = Some(S3Conn::from_parts(
-            bucket,
-            self.conn.s3_endpoint.clone(),
-            self.conn.region.clone(),
-            self.conn.creds.clone(),
-        )?);
+        let (s3, location, key_prefix) = storage_for(&self.conn, meta)?;
+        self.key_prefix = key_prefix;
+        self.s3 = Some(s3);
         self.location = location;
         self.meta = Some(meta.clone());
         Ok(())
     }
 
     fn uri_to_key(&self, uri: &str) -> Result<String> {
-        split_s3_uri(uri).map(|(_, k)| k)
+        uri_key(uri)
     }
+}
+
+fn wm_prop_for(source_id: &str) -> String {
+    format!("apitap.watermark.{source_id}")
+}
+
+/// Companion property recording WHICH column the watermark tracks — the
+/// Postgres sink's state table has a cursor_col column for the same
+/// reason: a run that switches cursors must not reuse the old value.
+fn cur_prop_for(source_id: &str) -> String {
+    format!("apitap.watermark-cursor.{source_id}")
+}
+
+/// (S3 client, table location, '/'-terminated key prefix) from catalog metadata.
+fn storage_for(conn: &IcebergConn, meta: &TableMetadata) -> Result<(S3Conn, String, String)> {
+    if meta.format_version() == FormatVersion::V1 {
+        return Err(Error::InvalidInput(
+            "iceberg: this is a format-version 1 table — apitap writes v2 \
+             tables only (v1 is legacy; recreate the table as v2)"
+                .into(),
+        ));
+    }
+    let location = meta.location().trim_end_matches('/').to_string();
+    let (bucket, key) = split_s3_uri(&location)?;
+    let key_prefix = if key.is_empty() { String::new() } else { format!("{key}/") };
+    let s3 = S3Conn::from_parts(
+        bucket,
+        conn.s3_endpoint.clone(),
+        conn.region.clone(),
+        conn.creds.clone(),
+    )?;
+    Ok((s3, location, key_prefix))
+}
+
+fn uri_key(uri: &str) -> Result<String> {
+    split_s3_uri(uri).map(|(_, k)| k)
+}
+
+/// Micros-since-epoch xor'd with fresh randomness, masked positive — unique
+/// against the metadata's snapshot list.
+fn fresh_snapshot_id(meta: &TableMetadata) -> i64 {
+    let mut id = (uuid::Uuid::new_v4().as_u128() as i64 ^ chrono::Utc::now().timestamp_micros())
+        & i64::MAX;
+    while meta.snapshots().any(|s| s.snapshot_id() == id) {
+        id = (id + 1) & i64::MAX;
+    }
+    id
 }
 
 impl IcebergSink {
@@ -956,17 +981,7 @@ impl IcebergSink {
         let mut meta = meta0;
         for attempt in 0..3u32 {
             let io = FileIO::new_with_memory();
-            let snapshot_id = {
-                // Micros-since-epoch xor'd with fresh randomness, masked
-                // positive — unique against the snapshot list by check below.
-                let mut id = (uuid::Uuid::new_v4().as_u128() as i64
-                    ^ chrono::Utc::now().timestamp_micros())
-                    & i64::MAX;
-                while meta.snapshots().any(|s| s.snapshot_id() == id) {
-                    id = (id + 1) & i64::MAX;
-                }
-                id
-            };
+            let snapshot_id = fresh_snapshot_id(&meta);
             let seq = meta.next_sequence_number();
             let parent = meta.current_snapshot_id();
 
@@ -1274,6 +1289,419 @@ fn write_delete_parquet(
 }
 
 // ============================================================================
+// log_based CDC surface (crate::logbased::dest_ice drives this)
+// ============================================================================
+
+/// The cursor name a log_based watermark records (mirrors the SQL dests'
+/// `_apitap_state.cursor_col = '_lsn'` contract).
+const CDC_CURSOR: &str = "_lsn";
+
+const NUMERIC_OID: u32 = 1700;
+
+/// LSN watermark from the table properties. `None` = no table, or a table
+/// with no log_based state for this source (fresh, or replaced — the replace
+/// path strips every apitap watermark property).
+pub(crate) async fn cdc_read_state(
+    conn: &IcebergConn,
+    table: &str,
+    source_id: &str,
+) -> Result<Option<u64>> {
+    let Some(meta) = conn.load_table(table).await? else {
+        return Ok(None);
+    };
+    let props = meta.properties();
+    match props.get(&cur_prop_for(source_id)) {
+        None => Ok(None),
+        Some(cur) if cur != CDC_CURSOR => Err(Error::InvalidInput(format!(
+            "log_based: iceberg table '{table}' tracks cursor '{cur}' for this \
+             source, not an LSN — it was written by mode append/merge. Use a \
+             different dest_table or clear the apitap.watermark* properties"
+        ))),
+        Some(_) => {
+            let wm = props.get(&wm_prop_for(source_id)).ok_or_else(|| {
+                Error::Transfer(format!(
+                    "log_based: iceberg table '{table}' has a watermark-cursor \
+                     property but no watermark — state is corrupt; clear the \
+                     apitap.watermark* properties to re-bootstrap"
+                ))
+            })?;
+            wm.parse::<u64>()
+                .map(Some)
+                .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{wm}'")))
+        }
+    }
+}
+
+/// Props-only watermark write (bootstrap finish, and windows with no traffic
+/// for the table). No snapshot: the data did not change.
+pub(crate) async fn cdc_set_watermark(
+    conn: &IcebergConn,
+    table: &str,
+    source_id: &str,
+    lsn: u64,
+) -> Result<()> {
+    let meta = conn.load_table(table).await?.ok_or_else(|| {
+        Error::Transfer(format!(
+            "log_based: iceberg table '{table}' is GONE — dropped mid-run? \
+             The next run re-bootstraps with a full load"
+        ))
+    })?;
+    let updates = vec![TableUpdate::SetProperties {
+        updates: HashMap::from([
+            (wm_prop_for(source_id), lsn.to_string()),
+            (cur_prop_for(source_id), CDC_CURSOR.to_string()),
+        ]),
+    }];
+    let requirements = vec![TableRequirement::UuidMatch { uuid: meta.uuid() }];
+    if conn.commit_table(table, &requirements, &updates).await? {
+        Ok(())
+    } else {
+        // UuidMatch only fails when the table was dropped and recreated —
+        // stamping an LSN onto a stranger's table would corrupt it.
+        Err(Error::Transfer(format!(
+            "log_based: iceberg watermark commit for '{table}' conflicted — \
+             was the table replaced by another writer?"
+        )))
+    }
+}
+
+/// [`Delivered`] for a WAL column by its Postgres type OID — MUST agree with
+/// `delivered_of_udt` in the Postgres source (the bootstrap's full load built
+/// the table from it). NUMERIC is handled by the caller: its precision/scale
+/// live in atttypmod, which the WAL relation capture doesn't carry, so the
+/// table's own declared decimal is authoritative there.
+fn oid_delivered(oid: u32) -> Option<Delivered> {
+    Some(match oid {
+        21 => Delivered::Int { bytes: 2, unsigned: false },
+        23 => Delivered::Int { bytes: 4, unsigned: false },
+        20 => Delivered::Int { bytes: 8, unsigned: false },
+        700 => Delivered::Float32,
+        701 => Delivered::Float64,
+        16 => Delivered::Bool,
+        1082 => Delivered::Date,
+        1114 => Delivered::DateTime { utc: false },
+        1184 => Delivered::DateTime { utc: true },
+        2950 => Delivered::Uuid,
+        17 => Delivered::Bytes,
+        114 | 3802 => Delivered::Json,
+        19 | 25 | 1042 | 1043 => Delivered::Text,
+        _ => return None,
+    })
+}
+
+/// One iceberg table, loaded and conformed against the WAL's column layout —
+/// everything a window apply needs.
+pub(crate) struct CdcBound {
+    conn: IcebergConn,
+    table: String,
+    meta: TableMetadata,
+    s3: S3Conn,
+    location: String,
+    key_prefix: String,
+    names: Vec<String>,
+    pub(crate) delivered: Vec<Delivered>,
+    pub(crate) field_ids: Vec<i32>,
+}
+
+pub(crate) async fn cdc_bind(
+    conn: &IcebergConn,
+    table: &str,
+    wal_cols: &[String],
+    wal_oids: &[u32],
+) -> Result<CdcBound> {
+    let meta = conn.load_table(table).await?.ok_or_else(|| {
+        Error::Transfer(format!(
+            "log_based: iceberg table '{table}' has a watermark but is GONE — \
+             dropped? The state went with it; the next run re-bootstraps"
+        ))
+    })?;
+    if !meta.default_partition_spec().fields().is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "log_based: iceberg table '{table}' is partitioned — the log_based \
+             apply writes unpartitioned tables only (same as merge)"
+        )));
+    }
+    let schema = meta.current_schema();
+    let delivered: Vec<Delivered> = wal_cols
+        .iter()
+        .zip(wal_oids.iter())
+        .map(|(n, &oid)| {
+            if oid == NUMERIC_OID {
+                return match schema
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .find(|f| &f.name == n)
+                    .map(|f| f.field_type.as_ref())
+                {
+                    Some(IceType::Primitive(PrimitiveType::Decimal { precision, scale })) => {
+                        Ok(Delivered::Decimal { p: *precision as u16, s: *scale as u16 })
+                    }
+                    _ => Err(Error::InvalidInput(format!(
+                        "log_based: column '{n}' is numeric on the source but not \
+                         a decimal at the iceberg destination — schema drift; drop \
+                         the table to re-bootstrap"
+                    ))),
+                };
+            }
+            oid_delivered(oid).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "log_based: column '{n}' (type oid {oid}) can't ride the \
+                     iceberg parquet lane — cast it away on the source or use \
+                     another destination"
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+    let field_ids = conform_ids(&meta, wal_cols, &delivered)?;
+    let (s3, location, key_prefix) = storage_for(conn, &meta)?;
+    Ok(CdcBound {
+        conn: conn.clone(),
+        table: table.to_string(),
+        meta,
+        s3,
+        location,
+        key_prefix,
+        names: wal_cols.to_vec(),
+        delivered,
+        field_ids,
+    })
+}
+
+/// One collapsed window, rendered: the data-file bytes plus the delete-key
+/// set (exactly one of `delete_ints`/`delete_texts` is populated — the PK's
+/// type picks the arm, like the merge path's KeyCap).
+pub(crate) struct CdcWindow {
+    /// Finished parquet bytes + row count (`None`: delete-only/truncate window).
+    pub(crate) data: Option<(Vec<u8>, u64)>,
+    pub(crate) delete_ints: Vec<i64>,
+    pub(crate) delete_texts: Vec<String>,
+    pub(crate) truncate: bool,
+    pub(crate) end_lsn: u64,
+}
+
+impl CdcBound {
+    /// ONE snapshot carries the window's data file, its equality-delete file
+    /// and the LSN watermark — the same all-or-nothing story as the Postgres
+    /// dest's single transaction. Same-snapshot data is exempt from its own
+    /// deletes (sequence inheritance), which is exactly the upsert we need.
+    /// A WAL TRUNCATE starts the manifest list fresh (no carry-over).
+    pub(crate) async fn cdc_commit(
+        &self,
+        source_id: &str,
+        pk_idx: usize,
+        w: CdcWindow,
+    ) -> Result<()> {
+        let run_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut uploaded: Vec<String> = Vec::new();
+        match self.cdc_commit_inner(source_id, pk_idx, w, &run_id, &mut uploaded).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The commit never happened — no snapshot references these
+                // objects; sweep them so a failed window leaves no stray bytes.
+                for k in &uploaded {
+                    let _ = self.s3.delete(k).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn cdc_commit_inner(
+        &self,
+        source_id: &str,
+        pk_idx: usize,
+        w: CdcWindow,
+        run_id: &str,
+        uploaded: &mut Vec<String>,
+    ) -> Result<()> {
+        let CdcWindow { data, delete_ints, delete_texts, truncate, end_lsn } = w;
+        let (data_file, added_rows, added_bytes) = match data {
+            Some((bytes, rows)) => {
+                let key = format!("{}data/{run_id}-cdc.parquet", self.key_prefix);
+                let path = format!("{}/data/{run_id}-cdc.parquet", self.location);
+                let size = bytes.len() as u64;
+                self.s3.put_object(&key, bytes).await?;
+                uploaded.push(key);
+                let df = DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(path)
+                    .file_format(DataFileFormat::Parquet)
+                    .partition(Struct::empty())
+                    .record_count(rows)
+                    .file_size_in_bytes(size)
+                    .build()
+                    .map_err(|e| Error::Transfer(format!("iceberg data file: {e}")))?;
+                (Some(df), rows, size)
+            }
+            None => (None, 0, 0),
+        };
+        let n_del = delete_ints.len() + delete_texts.len();
+        let delete_file = if n_del > 0 {
+            let fid = self.field_ids[pk_idx];
+            let bytes = write_delete_parquet(
+                &self.names[pk_idx],
+                &self.delivered[pk_idx],
+                fid,
+                &delete_ints,
+                &delete_texts,
+            )?;
+            let key = format!("{}data/{run_id}-deletes.parquet", self.key_prefix);
+            let path = format!("{}/data/{run_id}-deletes.parquet", self.location);
+            let size = bytes.len() as u64;
+            self.s3.put_object(&key, bytes).await?;
+            uploaded.push(key);
+            let df = DataFileBuilder::default()
+                .content(DataContentType::EqualityDeletes)
+                .file_path(path)
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .record_count(n_del as u64)
+                .file_size_in_bytes(size)
+                .equality_ids(Some(vec![fid]))
+                .build()
+                .map_err(|e| Error::Transfer(format!("iceberg delete file: {e}")))?;
+            Some(df)
+        } else {
+            None
+        };
+
+        let schema = self.meta.current_schema().clone();
+        let pspec = self.meta.default_partition_spec().as_ref().clone();
+        let mut meta = self.meta.clone();
+        for attempt in 0..3u32 {
+            let io = FileIO::new_with_memory();
+            let snapshot_id = fresh_snapshot_id(&meta);
+            let seq = meta.next_sequence_number();
+            let parent = meta.current_snapshot_id();
+
+            let mut manifests: Vec<ManifestFile> = Vec::new();
+            if !truncate {
+                if let Some(snap) = meta.current_snapshot() {
+                    let bytes = self.s3.get_object(&uri_key(snap.manifest_list())?).await?;
+                    let list = ManifestList::parse_with_version(&bytes, meta.format_version())
+                        .map_err(|e| {
+                            Error::Transfer(format!("iceberg: manifest list didn't parse: {e}"))
+                        })?;
+                    manifests.extend(list.consume_entries());
+                }
+            }
+            for (df, deletes, tag) in [(&data_file, false, "m0"), (&delete_file, true, "m1")] {
+                let Some(df) = df else { continue };
+                let (mut mf, bytes) = write_manifest_avro(
+                    &io,
+                    schema.clone(),
+                    pspec.clone(),
+                    snapshot_id,
+                    deletes,
+                    std::slice::from_ref(df),
+                    &format!("memory://{run_id}-{tag}-a{attempt}.avro"),
+                )
+                .await?;
+                let key = format!("{}metadata/{run_id}-a{attempt}-{tag}.avro", self.key_prefix);
+                self.s3.put_object(&key, bytes).await?;
+                mf.manifest_path =
+                    format!("{}/metadata/{run_id}-a{attempt}-{tag}.avro", self.location);
+                manifests.push(mf);
+            }
+
+            let list_buf = Arc::new(Mutex::new(Vec::new()));
+            {
+                let mut lw = ManifestListWriter::v2(
+                    Box::new(SharedWrite(list_buf.clone())),
+                    snapshot_id,
+                    parent,
+                    seq,
+                );
+                lw.add_manifests(manifests.into_iter())
+                    .map_err(|e| Error::Transfer(format!("iceberg manifest list: {e}")))?;
+                lw.close()
+                    .await
+                    .map_err(|e| Error::Transfer(format!("iceberg manifest list: {e}")))?;
+            }
+            let list_key = format!(
+                "{}metadata/snap-{snapshot_id}-{attempt}-{run_id}.avro",
+                self.key_prefix
+            );
+            let list_path = format!(
+                "{}/metadata/snap-{snapshot_id}-{attempt}-{run_id}.avro",
+                self.location
+            );
+            let list_bytes = std::mem::take(&mut *list_buf.lock().expect("list buf"));
+            self.s3.put_object(&list_key, list_bytes).await?;
+
+            let mut props = HashMap::from([
+                (
+                    "added-data-files".to_string(),
+                    if data_file.is_some() { "1" } else { "0" }.to_string(),
+                ),
+                ("added-records".to_string(), added_rows.to_string()),
+                ("added-files-size".to_string(), added_bytes.to_string()),
+            ]);
+            if delete_file.is_some() {
+                props.insert("added-delete-files".to_string(), "1".to_string());
+                props.insert("added-equality-deletes".to_string(), n_del.to_string());
+            }
+            let snapshot = Snapshot::builder()
+                .with_manifest_list(list_path)
+                .with_snapshot_id(snapshot_id)
+                .with_parent_snapshot_id(parent)
+                .with_sequence_number(seq)
+                .with_summary(Summary {
+                    operation: Operation::Overwrite,
+                    additional_properties: props,
+                })
+                .with_schema_id(meta.current_schema_id())
+                .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+                .build();
+
+            let updates = vec![
+                TableUpdate::AddSnapshot { snapshot },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: MAIN_BRANCH.to_string(),
+                    reference: SnapshotReference::new(
+                        snapshot_id,
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+                // Watermark state rides the SAME commit — data and LSN move
+                // together or not at all.
+                TableUpdate::SetProperties {
+                    updates: HashMap::from([
+                        (wm_prop_for(source_id), end_lsn.to_string()),
+                        (cur_prop_for(source_id), CDC_CURSOR.to_string()),
+                    ]),
+                },
+            ];
+            let requirements = vec![
+                TableRequirement::UuidMatch { uuid: meta.uuid() },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: parent,
+                },
+            ];
+            if self
+                .conn
+                .commit_table(&self.table, &requirements, &updates)
+                .await?
+            {
+                return Ok(());
+            }
+            meta = self
+                .conn
+                .load_table(&self.table)
+                .await?
+                .ok_or_else(|| Error::Transfer("iceberg: table vanished mid-commit".into()))?;
+        }
+        Err(Error::Transfer(
+            "iceberg: commit conflicted 3 times — another writer is racing this \
+             table; re-run the transfer"
+                .into(),
+        ))
+    }
+}
+
+// ============================================================================
 // Loader — one parquet data file per worker, multipart-streamed
 // ============================================================================
 
@@ -1381,6 +1809,22 @@ mod tests {
             IceType::Primitive(PrimitiveType::Decimal { precision: 38, scale: 0 })
         );
         assert_eq!(ice_type(&Delivered::Uuid), IceType::Primitive(PrimitiveType::String));
+    }
+
+    #[test]
+    fn wal_oids_deliver_like_the_bootstrap() {
+        // Must agree with delivered_of_udt in source/postgres.rs — the
+        // bootstrap's full load built the table's schema from it.
+        assert_eq!(oid_delivered(20), Some(Delivered::Int { bytes: 8, unsigned: false }));
+        assert_eq!(oid_delivered(21), Some(Delivered::Int { bytes: 2, unsigned: false }));
+        assert_eq!(oid_delivered(1184), Some(Delivered::DateTime { utc: true }));
+        assert_eq!(oid_delivered(1114), Some(Delivered::DateTime { utc: false }));
+        assert_eq!(oid_delivered(2950), Some(Delivered::Uuid));
+        assert_eq!(oid_delivered(1042), Some(Delivered::Text));
+        assert_eq!(oid_delivered(3802), Some(Delivered::Json));
+        assert_eq!(oid_delivered(17), Some(Delivered::Bytes));
+        assert_eq!(oid_delivered(869), None); // inet — the bootstrap's lane gate refuses it
+        assert_eq!(oid_delivered(NUMERIC_OID), None); // numeric defers to the table's decimal
     }
 
     #[test]

@@ -85,14 +85,14 @@ pub(crate) fn decode_bytea(t: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Render one raw text value for a ClickHouse TabSeparated body, translating
-/// Postgres-dialect forms by type OID (bytea → raw bytes, bool → true/false).
+/// Postgres-dialect forms by type OID. bytea stays in its `\x…` TEXT form —
+/// that is what the bulk pg→ch lane lands in the String column, and CDC must
+/// match the bootstrap byte-for-byte.
 pub(crate) fn render_ch_value(v: &[u8], oid: u32, out: &mut Vec<u8>) -> Result<()> {
     match oid {
-        BYTEA_OID => {
-            let raw = decode_bytea(v)?;
-            copy_escape(&raw, out);
-        }
-        BOOL_OID => out.extend_from_slice(if v == b"t" { b"true" } else { b"false" }),
+        // The bulk lane lands pg bool as UInt8 — 1/0 parses into both UInt8
+        // and Bool columns; "true" only into Bool.
+        BOOL_OID => out.push(if v == b"t" { b'1' } else { b'0' }),
         _ => copy_escape(v, out),
     }
     Ok(())
@@ -133,16 +133,9 @@ pub(crate) fn render_ch_key(key: &[&[u8]], oids: &[u32], out: &mut Vec<u8>) -> R
 }
 
 /// A ClickHouse SQL literal for one key value, typed by OID: numeric types
-/// render bare (validated), bytea keys are refused, everything else is a
-/// quoted string literal.
+/// render bare (validated), everything else (bytea's `\x…` text included) is
+/// a quoted string literal.
 pub(crate) fn ch_key_literal(v: &[u8], oid: u32) -> Result<String> {
-    if oid == BYTEA_OID {
-        return Err(Error::InvalidInput(
-            "log_based: bytea replica-identity keys are not supported for \
-             ClickHouse destinations"
-                .into(),
-        ));
-    }
     let s = std::str::from_utf8(v)
         .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
     if NUMERIC_OIDS.contains(&oid) {
@@ -272,21 +265,22 @@ mod tests {
     }
 
     #[test]
-    fn ch_bool_and_bytea_translate() {
+    fn ch_bool_translates_and_bytea_stays_text() {
         let mut out = Vec::new();
         render_ch_value(b"t", BOOL_OID, &mut out).unwrap();
         out.push(b'|');
         render_ch_value(b"f", BOOL_OID, &mut out).unwrap();
         out.push(b'|');
-        render_ch_value(b"\\x09", BYTEA_OID, &mut out).unwrap();
-        assert_eq!(out, b"true|false|\\t");
+        // bytea keeps its \x-text form (the bulk-lane convention), TSV-escaped.
+        render_ch_value(b"\\x0102", BYTEA_OID, &mut out).unwrap();
+        assert_eq!(out, b"1|0|\\\\x0102");
     }
 
     #[test]
     fn ch_key_literal_types() {
         assert_eq!(ch_key_literal(b"123", 20).unwrap(), "123");
         assert_eq!(ch_key_literal(b"a'b", 25).unwrap(), "'a\\'b'");
-        assert!(ch_key_literal(b"\\x00", BYTEA_OID).is_err());
+        assert_eq!(ch_key_literal(b"\\x00", BYTEA_OID).unwrap(), "'\\\\x00'");
         assert!(ch_key_literal(b"1; DROP", 20).is_err());
     }
 

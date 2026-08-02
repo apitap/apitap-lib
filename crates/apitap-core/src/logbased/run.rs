@@ -13,6 +13,7 @@
 
 use crate::error::{Error, Result};
 use crate::logbased::dest_ch::ChDest;
+use crate::logbased::dest_ice::IceDest;
 use crate::logbased::dest_my::MyDest;
 use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest};
 use crate::logbased::drain::{drain, DrainOutcome};
@@ -29,6 +30,7 @@ enum Dest {
     Pg(PgDest),
     Ch(ChDest),
     My(MyDest),
+    Ice(IceDest),
 }
 
 impl Dest {
@@ -37,14 +39,10 @@ impl Dest {
             "postgres" => Ok(Dest::Pg(PgDest::connect(dst_url).await?)),
             "clickhouse" => Ok(Dest::Ch(ChDest::connect(dst_url)?)),
             "mysql" => Ok(Dest::My(MyDest::connect(dst_url)?)),
-            "iceberg" => Err(Error::InvalidInput(
-                "log_based: iceberg destinations land next — postgres, \
-                 clickhouse and mysql are supported today"
-                    .into(),
-            )),
+            "iceberg" => Ok(Dest::Ice(IceDest::connect(dst_url).await?)),
             other => Err(Error::InvalidInput(format!(
                 "log_based: unsupported destination scheme '{other}' — use \
-                 postgres, clickhouse or mysql"
+                 postgres, clickhouse, mysql or iceberg"
             ))),
         }
     }
@@ -54,13 +52,14 @@ impl Dest {
             Dest::Pg(d) => d.read_state(dest_table, source_id).await,
             Dest::Ch(d) => d.read_state(dest_table, source_id).await,
             Dest::My(d) => d.read_state(dest_table, source_id).await,
+            Dest::Ice(d) => d.read_state(dest_table, source_id).await,
         }
     }
 
     /// Destination-specific knobs for the bootstrap's full load.
     fn tweak_bootstrap_opts(&self, o2: &mut TransferOptions, pk_cols: &[String]) {
         match self {
-            Dest::Pg(_) | Dest::My(_) => {}
+            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => {}
             Dest::Ch(d) => d.tweak_bootstrap_opts(o2, pk_cols),
         }
     }
@@ -79,9 +78,13 @@ impl Dest {
             Dest::Pg(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
             Dest::Ch(d) => d.write_state(dest_table, source_id, lsn, rows).await,
             Dest::My(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
+            Dest::Ice(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
         }
     }
 
+    /// `src` is the SOURCE pool — iceberg refetches masked-TOAST rows from
+    /// it (immutable snapshots have no destination row to read back); the
+    /// SQL destinations ignore it.
     async fn apply(
         &self,
         dest_table: &str,
@@ -89,24 +92,33 @@ impl Dest {
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
+        src: &PgPool,
     ) -> Result<u64> {
         match self {
             Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::My(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::Ice(d) => {
+                d.apply(dest_table, qualified_src, pk_cols, outcome, source_id, src).await
+            }
         }
     }
 }
 
 /// Bytes of row data one drain window may buffer before it must apply.
 /// Derived from the cgroup memory limit so CDC fits the same containers the
-/// bulk paths fit (44 MB is the measured single-pipe floor): the collapsed
-/// window plus its rendered apply body stay well under the cap. No cgroup
-/// limit = 256 MiB — still bounded on big boxes.
+/// bulk paths fit (44 MB is the measured single-pipe floor). The runtime
+/// baseline (interpreter + tokio + connection buffers) is reserved first;
+/// the collapsed window's REAL footprint runs ~3× the byte counter (hash
+/// map + Vec overhead) and the apply renders one body copy — hence /8 of
+/// what remains. No cgroup limit = 256 MiB, still bounded on big boxes.
+/// A single transaction always buffers whole regardless of the budget
+/// (pgoutput v1 only ships a transaction after its commit).
 fn window_budget() -> usize {
     const DEFAULT: usize = 256 << 20;
+    const BASELINE: u64 = 24 << 20;
     match crate::pipeline::mem_limit_bytes() {
-        Some(m) => ((m / 8) as usize).clamp(4 << 20, DEFAULT),
+        Some(m) => ((m.saturating_sub(BASELINE) / 8) as usize).clamp(2 << 20, DEFAULT),
         None => DEFAULT,
     }
 }
@@ -329,7 +341,7 @@ async fn drain_run(
         let t_apply = std::time::Instant::now();
         let (rows, applied_lsn) = if outcome.end_lsn > cur {
             let n = dest
-                .apply(dest_table, qualified, pk_cols, &outcome, source_id)
+                .apply(dest_table, qualified, pk_cols, &outcome, source_id, src)
                 .await?;
             (n, outcome.end_lsn)
         } else {
