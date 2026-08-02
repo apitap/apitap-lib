@@ -1,5 +1,54 @@
 # Batch CDC (`mode="log_based"`) — correctness suite and the ape-dts race
 
+## The speed campaign (2026-08-02, evening): 15.8s → 11.9s, race won
+
+Four levers, each measured before it was believed, in the order the
+evidence arrived:
+
+1. **Spill-free decode** — `pg_stat_replication_slots` showed the race
+   window's 500K-row transaction spilling **72 MB** to pg_replslot files
+   at the default `logical_decoding_work_mem=64MB`. The walsender startup
+   now rides `-c logical_decoding_work_mem=1GB` in the `options` field
+   (PGC_USERSET, no server config; plain-retry fallback). ape-dts CANNOT
+   do this — their tokio-postgres fork strips `options` from replication
+   URLs. Alone: 14.5s → 11.9s on the giant-tx shape.
+2. **Overlapped windows** — a spawned apply task lands window N while the
+   drain decodes N+1 (ape-dts's daemon pipeline, adopted batch-shaped);
+   the slot is confirmed only behind the applier's watch channel, and the
+   mid-drain keepalive reply now reports the APPLIED lsn (under overlap
+   the old start_lsn reply could confirm past unapplied WAL — a real trap
+   the design review caught). Window budget halves and caps at 24 MiB so
+   windows rotate even on big boxes.
+3. **The frame pump** — `strace -c` showed the drain client at 84% CPU,
+   58% of it kernel time: 11K recvfrom/s at ~400 B each plus 16K
+   epoll_wait/s (the walsender flushes per message). The socket now splits
+   at connect and START_REPLICATION hands the read half to a task that
+   only reads frames into a bounded channel — decode+collapse consume on
+   their own core and the sender never stalls on our processing.
+4. **proto v2 streaming** — the server ships a big transaction WHILE
+   decoding it (blocks flush every work_mem, kept LOW on this path), so
+   the client consumes concurrently with the server's WAL scan; v1
+   fallback for pre-14 servers. Streamed ops buffer per xid and become
+   real only at Stream Commit — the transaction-atomicity contract is
+   unchanged.
+
+Two hypotheses tested and REJECTED by measurement, for the record:
+docker-proxy bypass (direct container IP: no change — the proxy is not
+the bottleneck at 5 MB/s) and zero-alloc decode (ape-dts allocates MORE
+per event than we do and still raced well — pipeline shape beats alloc
+counts at 50-80K events/s).
+
+| 650K-event window, after | before | after |
+|---|---|---|
+| official race shape (giant tx) → pg | 15.8 s | **11.9 s** (ape-dts: 13-14 s) |
+| chunked → pg | 12.0 s | **10.5 s** |
+| giant tx → **clickhouse** | ~15 s | **10.2 s** |
+| chunked → **clickhouse** | ~15 s | **10.2 s** |
+| 44 MB tier, 2.1M events | 89 s / 32.6 MB peak | **72.9 s / 32.1 MB peak** |
+
+Every step re-validated by the full e2e suites (pg / ch / multi — all
+MATCH, TOAST included) before its number was recorded.
+
 Rig: OVH VPS (16 vCPU / 61 GB), `postgres:16-alpine` source with
 `wal_level=logical` and a second Postgres as destination, both on loopback.
 apitap built from main; ape-dts `apecloud/ape-dts:latest`.
