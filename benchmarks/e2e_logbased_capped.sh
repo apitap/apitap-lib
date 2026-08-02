@@ -18,6 +18,8 @@ docker run --rm --network host -v "$WHEELS":/w -v ~/cap-venv:/venv python:3.11-s
 echo "== reset + seed 1M"
 for s in $($PSRC "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%'"); do
   $PSRC "SELECT pg_drop_replication_slot('$s')" >/dev/null 2>&1 || true; done
+for p in $($PSRC "SELECT pubname FROM pg_publication WHERE pubname LIKE 'apitap_%'"); do
+  $PSRC "DROP PUBLICATION $p" >/dev/null 2>&1 || true; done
 $PSRC "DROP TABLE IF EXISTS $T" >/dev/null
 $PDST "DROP TABLE IF EXISTS $T; DELETE FROM _apitap_state WHERE dest_table='$T'" >/dev/null 2>&1 || true
 $PSRC "CREATE TABLE $T (id int PRIMARY KEY, v text, n bigint)" >/dev/null

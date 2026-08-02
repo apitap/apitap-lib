@@ -445,6 +445,37 @@ async fn ensure_publication(src: &PgPool, publication: &str, qualified: &str) ->
                  superuser): {e}"
             ))
         })?;
+        return Ok(());
+    }
+    // The publication existing is NOT enough: dropping and recreating the
+    // source table silently empties it, and an empty publication streams
+    // Begin/Commit pairs and no rows. Verify membership and re-add.
+    let (schema, bare) = qualified.split_once('.').unwrap_or(("public", qualified));
+    let member: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM pg_publication_tables \
+         WHERE pubname = $1 AND schemaname = $2 AND tablename = $3",
+    )
+    .bind(publication)
+    .bind(schema)
+    .bind(bare)
+    .fetch_optional(src)
+    .await
+    .map_err(db_err)?;
+    if member.is_none() {
+        sqlx::query(&format!(
+            "ALTER PUBLICATION {} ADD TABLE ONLY {}",
+            quote_ident(publication),
+            quote_table(qualified)
+        ))
+        .execute(src)
+        .await
+        .map_err(|e| {
+            Error::Transfer(format!(
+                "log_based: publication {publication} exists but no longer \
+                 carries {qualified} (source table dropped and recreated?) — \
+                 re-adding it failed: {e}"
+            ))
+        })?;
     }
     Ok(())
 }
