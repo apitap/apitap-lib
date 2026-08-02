@@ -19,6 +19,12 @@ pub(crate) struct DrainOutcome {
     /// Column names per table in WAL order (from Relation messages) — the
     /// apply layer aligns them to the destination plan by name.
     pub wal_cols: HashMap<String, Vec<String>>,
+    /// Column type OIDs per table, parallel to `wal_cols` — non-Postgres
+    /// destinations translate type-specific text forms (bytea, bool).
+    pub wal_oids: HashMap<String, Vec<u32>>,
+    /// The drain stopped at the memory budget, not the stop-line: the caller
+    /// applies this window, confirms the LSN, and drains again.
+    pub hit_budget: bool,
 }
 
 struct RelState {
@@ -30,21 +36,43 @@ struct RelState {
 /// `key_cols`: replica-identity/PK column NAMES per "schema.table" — chosen
 /// by the caller from the destination plan (works for REPLICA IDENTITY FULL
 /// tables too, where the WAL flags every column as key).
+///
+/// `max_buf_bytes` bounds the window's buffered row data so CDC fits small
+/// containers: past the budget the drain stops at the NEXT COMMIT BOUNDARY
+/// with `hit_budget` set (a single transaction larger than the budget still
+/// buffers whole — Postgres only ships a v1-protocol transaction after its
+/// commit, so sub-transaction spilling buys nothing upstream).
 pub(crate) async fn drain(
     ws: &mut Walsender,
     start_lsn: u64,
     stop_line: u64,
     key_cols: &HashMap<String, Vec<String>>,
     max_secs: u64,
+    max_buf_bytes: usize,
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut rels: HashMap<u32, RelState> = HashMap::new();
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
     let mut wal_cols: HashMap<String, Vec<String>> = HashMap::new();
+    let mut wal_oids: HashMap<String, Vec<u32>> = HashMap::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
     // if the drain aborts mid-transaction.
     let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
     let mut end_lsn = start_lsn;
+    // Approximate bytes buffered across tx_buf + collapsers. Collapse dedup
+    // (last-write-wins) makes true memory smaller — the count is conservative.
+    let mut buf_bytes = 0usize;
+    let mut hit_budget = false;
+
+    fn cells_bytes(row: &[Cell]) -> usize {
+        row.iter()
+            .map(|c| match c {
+                Cell::Text(t) => t.len() + 24,
+                _ => 8,
+            })
+            .sum::<usize>()
+            + 48
+    }
 
     enum TxOp {
         Insert(Vec<Cell>),
@@ -97,6 +125,10 @@ pub(crate) async fn drain(
                     if e >= stop_line {
                         break;
                     }
+                    if buf_bytes >= max_buf_bytes {
+                        hit_budget = true;
+                        break;
+                    }
                 }
                 PgoMessage::Relation(r) => {
                     let st = rel_state(&r, key_cols)?;
@@ -108,21 +140,30 @@ pub(crate) async fn drain(
                             st.table.to_string(),
                             r.cols.iter().map(|c| c.name.clone()).collect(),
                         );
+                        wal_oids.insert(
+                            st.table.to_string(),
+                            r.cols.iter().map(|c| c.type_oid).collect(),
+                        );
                     }
                     rels.insert(r.rel_id, st);
                 }
                 PgoMessage::Insert { rel_id, new } => {
                     if let Some(t) = tracked(&rels, rel_id)? {
+                        buf_bytes += cells_bytes(&new);
                         tx_buf.push((t, TxOp::Insert(new)));
                     }
                 }
                 PgoMessage::Update { rel_id, old, new } => {
                     if let Some(t) = tracked(&rels, rel_id)? {
-                        tx_buf.push((t, TxOp::Update(old.map(|o| o.tuple), new)));
+                        let old = old.map(|o| o.tuple);
+                        buf_bytes += cells_bytes(&new)
+                            + old.as_deref().map_or(0, cells_bytes);
+                        tx_buf.push((t, TxOp::Update(old, new)));
                     }
                 }
                 PgoMessage::Delete { rel_id, old } => {
                     if let Some(t) = tracked(&rels, rel_id)? {
+                        buf_bytes += cells_bytes(&old.tuple);
                         tx_buf.push((t, TxOp::Delete(old.tuple)));
                     }
                 }
@@ -145,6 +186,8 @@ pub(crate) async fn drain(
             .collect(),
         end_lsn,
         wal_cols,
+        wal_oids,
+        hit_budget,
     })
 }
 

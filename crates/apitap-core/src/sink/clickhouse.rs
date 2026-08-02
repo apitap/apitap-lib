@@ -195,7 +195,7 @@ fn ch_base_type(t: &str) -> String {
 
 
 /// Escape a string for a single-quoted ClickHouse literal.
-fn ch_str(s: &str) -> String {
+pub(crate) fn ch_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 

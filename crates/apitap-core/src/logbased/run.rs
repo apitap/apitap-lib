@@ -3,22 +3,113 @@
 //! First run (no state): create the slot with EXPORT_SNAPSHOT, full-load the
 //! table pinned to that snapshot (gap-free AND duplicate-free), store the
 //! slot's consistent_point as the LSN watermark. Every later run: drain the
-//! slot from the watermark to a stop-line, collapse, apply set-based in ONE
-//! destination transaction that also advances the watermark — and only then
-//! tell Postgres the WAL may go.
+//! slot from the watermark to a stop-line in MEMORY-BOUNDED windows; each
+//! window applies set-based at the destination together with the watermark —
+//! and only then is Postgres told the WAL may go.
+//!
+//! Source is always Postgres (logical replication). Destinations dispatch
+//! through [`Dest`]: Postgres applies in one transaction; ClickHouse has no
+//! transactions, so its window apply is idempotent instead (state row last).
 
 use crate::error::{Error, Result};
-use crate::logbased::collapse::{Collapsed, ResidueOp};
+use crate::logbased::dest_ch::ChDest;
+use crate::logbased::dest_my::MyDest;
+use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest};
 use crate::logbased::drain::{drain, DrainOutcome};
-use crate::wire::pgoutput::{lsn_from_string, Cell};
+use crate::wire::pgoutput::lsn_from_string;
 use crate::wire::walsender::Walsender;
 use crate::{Mode, TransferOptions, TransferReport};
 use md5::{Digest as _, Md5};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor, PgPool, Row};
+use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 
-const STATE_CURSOR: &str = "_lsn";
+/// One destination engine for the log_based apply path.
+enum Dest {
+    Pg(PgDest),
+    Ch(ChDest),
+    My(MyDest),
+}
+
+impl Dest {
+    async fn connect(dst_url: &str) -> Result<Dest> {
+        match crate::pipeline::norm(scheme(dst_url)) {
+            "postgres" => Ok(Dest::Pg(PgDest::connect(dst_url).await?)),
+            "clickhouse" => Ok(Dest::Ch(ChDest::connect(dst_url)?)),
+            "mysql" => Ok(Dest::My(MyDest::connect(dst_url)?)),
+            "iceberg" => Err(Error::InvalidInput(
+                "log_based: iceberg destinations land next — postgres, \
+                 clickhouse and mysql are supported today"
+                    .into(),
+            )),
+            other => Err(Error::InvalidInput(format!(
+                "log_based: unsupported destination scheme '{other}' — use \
+                 postgres, clickhouse or mysql"
+            ))),
+        }
+    }
+
+    async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        match self {
+            Dest::Pg(d) => d.read_state(dest_table, source_id).await,
+            Dest::Ch(d) => d.read_state(dest_table, source_id).await,
+            Dest::My(d) => d.read_state(dest_table, source_id).await,
+        }
+    }
+
+    /// Destination-specific knobs for the bootstrap's full load.
+    fn tweak_bootstrap_opts(&self, o2: &mut TransferOptions, pk_cols: &[String]) {
+        match self {
+            Dest::Pg(_) | Dest::My(_) => {}
+            Dest::Ch(d) => d.tweak_bootstrap_opts(o2, pk_cols),
+        }
+    }
+
+    /// After the bootstrap's full load landed: add identity where the engine
+    /// needs one, then write the state row.
+    async fn bootstrap_finish(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        pk_cols: &[String],
+        lsn: u64,
+        rows: u64,
+    ) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
+            Dest::Ch(d) => d.write_state(dest_table, source_id, lsn, rows).await,
+            Dest::My(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
+        }
+    }
+
+    async fn apply(
+        &self,
+        dest_table: &str,
+        qualified_src: &str,
+        pk_cols: &[String],
+        outcome: &DrainOutcome,
+        source_id: &str,
+    ) -> Result<u64> {
+        match self {
+            Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::My(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+        }
+    }
+}
+
+/// Bytes of row data one drain window may buffer before it must apply.
+/// Derived from the cgroup memory limit so CDC fits the same containers the
+/// bulk paths fit (44 MB is the measured single-pipe floor): the collapsed
+/// window plus its rendered apply body stay well under the cap. No cgroup
+/// limit = 256 MiB — still bounded on big boxes.
+fn window_budget() -> usize {
+    const DEFAULT: usize = 256 << 20;
+    match crate::pipeline::mem_limit_bytes() {
+        Some(m) => ((m / 8) as usize).clamp(4 << 20, DEFAULT),
+        None => DEFAULT,
+    }
+}
 
 pub(crate) async fn run_task(
     src_url: &str,
@@ -32,24 +123,13 @@ pub(crate) async fn run_task(
             "log_based needs a Postgres source (logical replication)".into(),
         ));
     }
-    if !matches!(scheme(dst_url), "postgres" | "postgresql") {
-        return Err(Error::InvalidInput(
-            "log_based supports Postgres destinations first — mysql and iceberg \
-             land next"
-                .into(),
-        ));
-    }
+    let dest = Dest::connect(dst_url).await?;
 
     let src = PgPoolOptions::new()
         .max_connections(2)
         .connect(src_url)
         .await
         .map_err(|e| Error::Transfer(format!("log_based: source connect: {e}")))?;
-    let dst = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(dst_url)
-        .await
-        .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))?;
 
     // Resolve the table's real (schema, name) + PK + column order on the source.
     let (schema_name, bare) = resolve_table(&src, table).await?;
@@ -70,13 +150,19 @@ pub(crate) async fn run_task(
     let publication = format!("{slot}_pub");
 
     ensure_publication(&src, &publication, &qualified).await?;
-    let wm = read_state(&dst, &dest_table, &source_id).await?;
+    let wm = dest.read_state(&dest_table, &source_id).await?;
 
     match wm {
-        None => bootstrap(src_url, dst_url, table, opts, &dst, &src, &slot, &publication, &dest_table, &source_id, &pk_cols, started).await,
+        None => {
+            bootstrap(
+                src_url, dst_url, table, opts, &dest, &src, &slot, &dest_table,
+                &source_id, &pk_cols, started,
+            )
+            .await
+        }
         Some(wm) => {
             drain_run(
-                src_url, &src, &dst, &slot, &publication, &qualified, &pk_cols,
+                src_url, &src, &dest, &slot, &publication, &qualified, &pk_cols,
                 &dest_table, &source_id, wm, started,
             )
             .await
@@ -92,10 +178,9 @@ async fn bootstrap(
     dst_url: &str,
     table: &str,
     opts: &TransferOptions,
-    dst: &PgPool,
+    dest: &Dest,
     src: &PgPool,
     slot: &str,
-    publication: &str,
     dest_table: &str,
     source_id: &str,
     pk_cols: &[String],
@@ -144,6 +229,7 @@ async fn bootstrap(
     // keep it open for the whole load (it is idle; the slot retains WAL).
     let mut o2 = opts.clone();
     o2.mode = Mode::Replace;
+    dest.tweak_bootstrap_opts(&mut o2, pk_cols);
     let sep = if src_url.contains('?') { '&' } else { '?' };
     let pinned_url = format!("{src_url}{sep}__apitap_snapshot={snapshot}");
     let report = match Box::pin(crate::transfer(&pinned_url, dst_url, table, &o2)).await {
@@ -159,20 +245,7 @@ async fn bootstrap(
     };
     ws.stop_replication().await.ok();
 
-    // The replace path lands data without constraints; the drain's upsert
-    // needs the identity — add it now (same move the merge bootstrap makes).
-    let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-    sqlx::query(&format!(
-        "ALTER TABLE {} ADD PRIMARY KEY ({pklist})",
-        quote_table(dest_table)
-    ))
-    .execute(dst)
-    .await
-    .map_err(db_err)?;
-
-    ensure_state_table(dst).await?;
-    write_state(dst, dest_table, source_id, lsn, report.rows).await?;
-    let _ = publication; // already ensured by the caller
+    dest.bootstrap_finish(dest_table, source_id, pk_cols, lsn, report.rows).await?;
 
     Ok(TransferReport {
         rows: report.rows,
@@ -181,13 +254,13 @@ async fn bootstrap(
     })
 }
 
-// ── every later run: drain + set-based apply ────────────────────────────────
+// ── every later run: windowed drain + set-based apply ───────────────────────
 
 #[allow(clippy::too_many_arguments)]
 async fn drain_run(
     src_url: &str,
     src: &PgPool,
-    dst: &PgPool,
+    dest: &Dest,
     slot: &str,
     publication: &str,
     qualified: &str,
@@ -239,220 +312,60 @@ async fn drain_run(
     key_cols.insert(qualified.to_string(), pk_cols.to_vec());
 
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
+    let budget = window_budget();
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
-    let t_drain = std::time::Instant::now();
-    let outcome = drain(&mut ws, wm, stop_line, &key_cols, 3600).await?;
-    let t_drain = t_drain.elapsed();
 
-    let t_apply = std::time::Instant::now();
-    let (rows, applied_lsn) = if outcome.end_lsn > wm {
-        let n = apply_pg(dst, dest_table, qualified, pk_cols, &outcome, source_id).await?;
-        (n, outcome.end_lsn)
-    } else {
-        (0, wm)
-    };
-    if dbg {
-        let c = outcome.tables.get(qualified);
-        eprintln!(
-            "[log_based] drain={:.1}s apply={:.1}s events={} deletes={} upserts={} residue={}",
-            t_drain.as_secs_f64(),
-            t_apply.elapsed().as_secs_f64(),
-            rows,
-            c.map_or(0, |c| c.deletes.len()),
-            c.map_or(0, |c| c.upserts.len()),
-            c.map_or(0, |c| c.residue.len()),
-        );
+    // Windowed drain: each window applies (with its watermark) before the
+    // next one buffers, so peak memory is the window budget — not the lag.
+    let mut cur = wm;
+    let mut total_rows = 0u64;
+    let mut windows = 0u32;
+    loop {
+        let t_drain = std::time::Instant::now();
+        let outcome = drain(&mut ws, cur, stop_line, &key_cols, 3600, budget).await?;
+        let t_drain = t_drain.elapsed();
+
+        let t_apply = std::time::Instant::now();
+        let (rows, applied_lsn) = if outcome.end_lsn > cur {
+            let n = dest
+                .apply(dest_table, qualified, pk_cols, &outcome, source_id)
+                .await?;
+            (n, outcome.end_lsn)
+        } else {
+            (0, cur)
+        };
+        total_rows += rows;
+        windows += 1;
+        if dbg {
+            let c = outcome.tables.get(qualified);
+            eprintln!(
+                "[log_based] window={windows} drain={:.1}s apply={:.1}s events={} \
+                 deletes={} upserts={} residue={} budget_hit={}",
+                t_drain.as_secs_f64(),
+                t_apply.elapsed().as_secs_f64(),
+                rows,
+                c.map_or(0, |c| c.deletes.len()),
+                c.map_or(0, |c| c.upserts.len()),
+                c.map_or(0, |c| c.residue.len()),
+                outcome.hit_budget,
+            );
+        }
+
+        // Destination committed — NOW the source may discard this window's WAL.
+        ws.standby_status(applied_lsn, false).await?;
+        cur = applied_lsn;
+        if !outcome.hit_budget {
+            break;
+        }
     }
-
-    // Destination committed — NOW the source may discard WAL.
-    ws.standby_status(applied_lsn, false).await?;
     ws.stop_replication().await.ok();
 
     Ok(TransferReport {
-        rows,
+        rows: total_rows,
         elapsed_ms: started.elapsed().as_millis() as u64,
         parallel: 1,
     })
-}
-
-/// Apply one collapsed window for one table in ONE destination transaction
-/// (truncate → deletes → upserts → residue → watermark).
-async fn apply_pg(
-    dst: &PgPool,
-    dest_table: &str,
-    qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
-    source_id: &str,
-) -> Result<u64> {
-    let Some(c) = outcome.tables.get(qualified_src) else {
-        // Foreign-table traffic only: nothing for our table, still advance.
-        ensure_state_table(dst).await?;
-        let mut tx = dst.begin().await.map_err(db_err)?;
-        upsert_state_tx(&mut tx, dest_table, source_id, outcome.end_lsn, 0).await?;
-        tx.commit().await.map_err(db_err)?;
-        return Ok(0);
-    };
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
-
-    ensure_state_table(dst).await?;
-    let ft = quote_table(dest_table);
-    let collist = wal_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-    let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-
-    let mut tx = dst.begin().await.map_err(db_err)?;
-
-    if c.truncate {
-        tx.execute(format!("TRUNCATE {ft}").as_str()).await.map_err(db_err)?;
-    }
-
-    // Delete phase covers the delete-set UNION every upsert's key: clearing
-    // the way first turns 450K index-probing ON CONFLICT upserts into 450K
-    // plain inserts (ape-dts's rdb_merge trick — measured 5x here).
-    let pk_idx: Vec<usize> = pk_cols
-        .iter()
-        .map(|k| {
-            wal_cols.iter().position(|c| c == k).ok_or_else(|| {
-                Error::Transfer(format!("log_based: PK column '{k}' not in WAL columns"))
-            })
-        })
-        .collect::<Result<_>>()?;
-    let clear_keys = !c.deletes.is_empty() || !c.upserts.is_empty();
-    if clear_keys {
-        tx.execute(
-            format!(
-                "CREATE TEMP TABLE _ap_del ON COMMIT DROP AS \
-                 SELECT {pklist} FROM {ft} WHERE false"
-            )
-            .as_str(),
-        )
-        .await
-        .map_err(db_err)?;
-        let mut copy = tx
-            .copy_in_raw(&format!("COPY _ap_del ({pklist}) FROM STDIN"))
-            .await
-            .map_err(db_err)?;
-        let mut buf = Vec::with_capacity(4 << 20);
-        for key in &c.deletes {
-            render_copy_row_keys(key, &mut buf);
-            if buf.len() > 4 << 20 {
-                copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
-            }
-        }
-        for row in &c.upserts {
-            let key: Vec<&[u8]> = pk_idx
-                .iter()
-                .map(|&i| match &row[i] {
-                    Cell::Text(t) => t.as_slice(),
-                    _ => b"".as_slice(), // key cells are Text by construction
-                })
-                .collect();
-            render_copy_key_refs(&key, &mut buf);
-            if buf.len() > 4 << 20 {
-                copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
-            }
-        }
-        if !buf.is_empty() {
-            copy.send(buf).await.map_err(db_err)?;
-        }
-        copy.finish().await.map_err(db_err)?;
-        let join = pk_cols
-            .iter()
-            .map(|k| format!("{ft}.{k} = _ap_del.{k}", k = quote_ident(k)))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        tx.execute(format!("DELETE FROM {ft} USING _ap_del WHERE {join}").as_str())
-            .await
-            .map_err(db_err)?;
-    }
-
-    // Upsert phase: COPY into a temp twin, then one INSERT … ON CONFLICT.
-    if !c.upserts.is_empty() {
-        tx.execute(
-            format!(
-                "CREATE TEMP TABLE _ap_up ON COMMIT DROP AS \
-                 SELECT {collist} FROM {ft} WHERE false"
-            )
-            .as_str(),
-        )
-        .await
-        .map_err(db_err)?;
-        let mut copy = tx
-            .copy_in_raw(&format!("COPY _ap_up ({collist}) FROM STDIN"))
-            .await
-            .map_err(db_err)?;
-        let mut buf = Vec::with_capacity(4 << 20);
-        for row in &c.upserts {
-            render_copy_row(row, &mut buf)?;
-            if buf.len() > 4 << 20 {
-                copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
-            }
-        }
-        if !buf.is_empty() {
-            copy.send(buf).await.map_err(db_err)?;
-        }
-        copy.finish().await.map_err(db_err)?;
-        // No ON CONFLICT: the delete phase already removed every one of
-        // these keys, so this is a straight bulk insert.
-        tx.execute(
-            format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up").as_str(),
-        )
-        .await
-        .map_err(db_err)?;
-    }
-
-    // Residue tail: serial, ordered (masked updates and their followers).
-    for op in &c.residue {
-        let sql = match op {
-            ResidueOp::MaskedUpdate { key, row } => {
-                let sets = wal_cols
-                    .iter()
-                    .zip(row.iter())
-                    .filter(|(cname, cell)| {
-                        !matches!(cell, Cell::UnchangedToast) && !pk_cols.contains(cname)
-                    })
-                    .map(|(cname, cell)| {
-                        format!("{} = {}", quote_ident(cname), cell_literal(cell))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if sets.is_empty() {
-                    continue;
-                }
-                format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, key))
-            }
-            ResidueOp::Upsert { row } => {
-                let vals = row.iter().map(cell_literal).collect::<Vec<_>>().join(", ");
-                let updates = wal_cols
-                    .iter()
-                    .filter(|cname| !pk_cols.contains(cname))
-                    .map(|cname| format!("{q} = EXCLUDED.{q}", q = quote_ident(cname)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let action = if updates.is_empty() {
-                    "DO NOTHING".to_string()
-                } else {
-                    format!("DO UPDATE SET {updates}")
-                };
-                format!(
-                    "INSERT INTO {ft} ({collist}) VALUES ({vals}) \
-                     ON CONFLICT ({pklist}) {action}"
-                )
-            }
-            ResidueOp::Delete { key } => {
-                format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key))
-            }
-        };
-        tx.execute(sql.as_str()).await.map_err(db_err)?;
-    }
-
-    upsert_state_tx(&mut tx, dest_table, source_id, outcome.end_lsn, c.events).await?;
-    tx.commit().await.map_err(db_err)?;
-    Ok(c.events)
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -467,14 +380,6 @@ fn hex_prefix(s: &str, n: usize) -> String {
 
 fn db_err(e: sqlx::Error) -> Error {
     Error::Transfer(format!("log_based: {e}"))
-}
-
-fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
-
-fn quote_table(t: &str) -> String {
-    t.split('.').map(quote_ident).collect::<Vec<_>>().join(".")
 }
 
 async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String)> {
@@ -526,177 +431,4 @@ async fn ensure_publication(src: &PgPool, publication: &str, qualified: &str) ->
         })?;
     }
     Ok(())
-}
-
-async fn ensure_state_table(dst: &PgPool) -> Result<()> {
-    dst.execute(
-        "CREATE TABLE IF NOT EXISTS _apitap_state (\
-           dest_table  text NOT NULL, \
-           source_id   text NOT NULL, \
-           cursor_col  text NOT NULL, \
-           watermark   text, \
-           mode        text NOT NULL, \
-           last_rows   bigint NOT NULL DEFAULT 0, \
-           synced_at   timestamptz NOT NULL DEFAULT now(), \
-           PRIMARY KEY (dest_table, source_id))",
-    )
-    .await
-    .map_err(db_err)?;
-    Ok(())
-}
-
-async fn read_state(dst: &PgPool, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
-    let row: Option<(Option<String>, String)> = sqlx::query_as(
-        "SELECT watermark, cursor_col FROM _apitap_state \
-         WHERE dest_table = $1 AND source_id = $2 AND mode = 'log_based'",
-    )
-    .bind(dest_table)
-    .bind(source_id)
-    .fetch_optional(dst)
-    .await
-    .or_else(|e| match &e {
-        // No state table at all = fresh destination.
-        sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(None),
-        _ => Err(db_err(e)),
-    })?;
-    match row {
-        None => Ok(None),
-        Some((wm, cursor)) => {
-            if cursor != STATE_CURSOR {
-                return Err(Error::InvalidInput(format!(
-                    "log_based: state row for this table tracks cursor '{cursor}', \
-                     not an LSN — it was written by mode append/merge. Use a \
-                     different dest_table or clear the state row"
-                )));
-            }
-            let wm = wm.ok_or_else(|| {
-                Error::Transfer("log_based: state row has NULL watermark".into())
-            })?;
-            wm.parse::<u64>()
-                .map(Some)
-                .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{wm}'")))
-        }
-    }
-}
-
-async fn write_state(
-    dst: &PgPool,
-    dest_table: &str,
-    source_id: &str,
-    lsn: u64,
-    rows: u64,
-) -> Result<()> {
-    let mut tx = dst.begin().await.map_err(db_err)?;
-    upsert_state_tx(&mut tx, dest_table, source_id, lsn, rows).await?;
-    tx.commit().await.map_err(db_err)
-}
-
-async fn upsert_state_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    dest_table: &str,
-    source_id: &str,
-    lsn: u64,
-    rows: u64,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO _apitap_state \
-           (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
-         VALUES ($1, $2, $3, $4, 'log_based', $5, now()) \
-         ON CONFLICT (dest_table, source_id) DO UPDATE SET \
-           cursor_col = EXCLUDED.cursor_col, watermark = EXCLUDED.watermark, \
-           mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()",
-    )
-    .bind(dest_table)
-    .bind(source_id)
-    .bind(STATE_CURSOR)
-    .bind(lsn.to_string())
-    .bind(rows as i64)
-    .execute(&mut **tx)
-    .await
-    .map_err(db_err)?;
-    Ok(())
-}
-
-/// COPY text-format rendering of one full row.
-fn render_copy_row(row: &[Cell], out: &mut Vec<u8>) -> Result<()> {
-    for (i, cell) in row.iter().enumerate() {
-        if i > 0 {
-            out.push(b'\t');
-        }
-        match cell {
-            Cell::Null => out.extend_from_slice(b"\\N"),
-            Cell::Text(t) => copy_escape(t, out),
-            Cell::UnchangedToast => {
-                return Err(Error::Transfer(
-                    "log_based: unchanged-TOAST cell reached the upsert path — \
-                     collapse bug"
-                        .into(),
-                ))
-            }
-        }
-    }
-    out.push(b'\n');
-    Ok(())
-}
-
-fn render_copy_row_keys(key: &[Vec<u8>], out: &mut Vec<u8>) {
-    for (i, k) in key.iter().enumerate() {
-        if i > 0 {
-            out.push(b'\t');
-        }
-        copy_escape(k, out);
-    }
-    out.push(b'\n');
-}
-
-fn render_copy_key_refs(key: &[&[u8]], out: &mut Vec<u8>) {
-    for (i, k) in key.iter().enumerate() {
-        if i > 0 {
-            out.push(b'\t');
-        }
-        copy_escape(k, out);
-    }
-    out.push(b'\n');
-}
-
-fn copy_escape(v: &[u8], out: &mut Vec<u8>) {
-    for &b in v {
-        match b {
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            _ => out.push(b),
-        }
-    }
-}
-
-/// SQL literal for a residue value (untyped literal — the column's type
-/// drives the parse, exactly like a hand-written UPDATE).
-fn cell_literal(cell: &Cell) -> String {
-    match cell {
-        Cell::Null | Cell::UnchangedToast => "NULL".into(),
-        Cell::Text(t) => format!("'{}'", String::from_utf8_lossy(t).replace('\'', "''")),
-    }
-}
-
-fn key_pred(pk_cols: &[String], key: &[Vec<u8>]) -> String {
-    pk_cols
-        .iter()
-        .zip(key.iter())
-        .map(|(c, v)| {
-            format!(
-                "{} = '{}'",
-                quote_ident(c),
-                String::from_utf8_lossy(v).replace('\'', "''")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ")
-}
-
-/// Suppress dead-code noise from `Collapsed` fields only read here.
-#[allow(dead_code)]
-fn _touch(c: &Collapsed) -> u64 {
-    c.events
 }

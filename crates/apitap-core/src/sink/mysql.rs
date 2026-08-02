@@ -37,7 +37,7 @@ type Registry = Arc<Mutex<HashMap<u64, mpsc::Receiver<std::io::Result<Bytes>>>>>
 
 /// Escape a string as a MySQL SQL single-quoted literal body (no surrounding
 /// quotes). Only used for the tiny state-row writes, never the bulk path.
-fn sql_lit(s: &str) -> String {
+pub(crate) fn sql_lit(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
@@ -68,6 +68,46 @@ pub(crate) struct MySqlShared {
     registry: Registry,
     next_id: Arc<AtomicU64>,
     db: String,
+}
+
+impl MySqlShared {
+    pub(crate) fn db(&self) -> &str {
+        &self.db
+    }
+
+    /// A pooled connection under the same 30 s deadline the sink uses.
+    pub(crate) async fn conn(&self) -> Result<mysql_async::Conn> {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), self.pool.get_conn()).await {
+            Ok(r) => r.map_err(|e| Error::Transfer(format!("mysql conn: {e}"))),
+            Err(_) => Err(Error::Transfer(
+                "mysql connection timed out after 30 s: the server accepted TCP but never \
+                 completed the protocol (seen with MySQL 8.4 + older clients; MySQL 8.0 is \
+                 known-good). Check the server version and connectivity"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Register one fully-rendered LOAD DATA body and return the stream id to
+    /// name in `LOAD DATA LOCAL INFILE 'apitap:{id}'`. The whole buffer sits
+    /// in the channel until the server pulls it — callers keep bodies
+    /// window-bounded (the log_based apply path).
+    pub(crate) fn register_infile(&self, body: Vec<u8>) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        // Capacity 2: the one data chunk fits, and dropping tx closes the file.
+        tx.clone()
+            .try_send(Ok(Bytes::from(body)))
+            .expect("fresh infile channel has capacity");
+        self.registry.lock().expect("infile registry").insert(id, rx);
+        id
+    }
+
+    /// Drop a registered stream that was never consumed (LOAD DATA failed
+    /// before the server asked for the file).
+    pub(crate) fn forget_infile(&self, id: u64) {
+        self.registry.lock().expect("infile registry").remove(&id);
+    }
 }
 
 impl MySqlSink {

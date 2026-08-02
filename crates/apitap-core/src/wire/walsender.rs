@@ -124,6 +124,10 @@ impl Walsender {
             ("database", ci.db.as_str()),
             ("replication", "database"),
             ("client_encoding", "UTF8"),
+            // Pin the session timezone: pgoutput renders timestamptz TEXT in
+            // the session's zone, and the apply paths (MySQL especially)
+            // depend on the offset being a fixed +00.
+            ("TimeZone", "UTC"),
         ] {
             body.extend_from_slice(k.as_bytes());
             body.push(0);
