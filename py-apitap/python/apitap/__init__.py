@@ -89,7 +89,7 @@ def transfer(
     dst: str,
     table: str | None = None,
     *,
-    tables: list[str] | None = None,
+    tables: list[str] | dict[str, str] | None = None,
     schema: str | None = None,
     dest_table: str | None = None,
     parallel: int | None = None,
@@ -142,7 +142,15 @@ def transfer(
             ``mysql://user:pass@host:3306/db``.
         dst: Destination URL (Postgres or ClickHouse).
         table: One source table, optionally schema-qualified (``public.events``).
-        tables: A list of source tables — moved in one call through one budget.
+        tables: A list of source tables — moved in one call through one budget —
+            or a ``{table: mode}`` dict giving EACH table its own mode in one
+            call (e.g. ``{"orders": "log_based", "dim_date": "replace"}``).
+            The dict form partitions by mode: bulk modes run through the
+            shared-budget pipeline; all ``log_based`` tables share ONE
+            replication slot (one publication, one drain pass, one snapshot-
+            pinned group bootstrap, one watermark — a CDC group fails as a
+            unit). A plain list with ``mode="log_based"`` is the all-CDC
+            version of the same group.
         schema: Move EVERY base table of this schema — pass the name explicitly
             (Postgres: ``schema="public"``; MySQL: the database, e.g.
             ``schema="mydb"``). Postgres also brings materialized views, and
@@ -221,11 +229,15 @@ def transfer(
             "dest_table applies to single-table transfers — multi-table runs "
             "keep the source names"
         )
+    specs = None
+    if isinstance(tables, dict):
+        specs, tables = [(t, m) for t, m in tables.items()], None
     elapsed_ms, budget, raw = _transfer_many(
         src,
         dst,
         tables=tables,
         schema=schema,
+        specs=specs,
         parallel=parallel,
         cursor=cursor,
         chunk_bytes=chunk_bytes,

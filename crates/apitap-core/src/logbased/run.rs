@@ -1,15 +1,17 @@
 //! The `mode="log_based"` task runner (docs/design/log_based.md).
 //!
-//! First run (no state): create the slot with EXPORT_SNAPSHOT, full-load the
-//! table pinned to that snapshot (gap-free AND duplicate-free), store the
-//! slot's consistent_point as the LSN watermark. Every later run: drain the
-//! slot from the watermark to a stop-line in MEMORY-BOUNDED windows; each
-//! window applies set-based at the destination together with the watermark —
-//! and only then is Postgres told the WAL may go.
-//!
-//! Source is always Postgres (logical replication). Destinations dispatch
-//! through [`Dest`]: Postgres applies in one transaction; ClickHouse has no
-//! transactions, so its window apply is idempotent instead (state row last).
+//! Runs a GROUP of tables over ONE replication slot (a single table is a
+//! group of one — its slot/state naming is unchanged from the single-table
+//! era). First run (no state anywhere): create the slot with
+//! EXPORT_SNAPSHOT, full-load every table pinned to that one snapshot
+//! (gap-free AND duplicate-free for the whole group), store the slot's
+//! consistent_point as each table's LSN watermark. Every later run: drain
+//! the slot ONCE from the group's minimum watermark to a stop-line in
+//! memory-bounded windows; each window applies per table together with the
+//! watermark — and only after every member committed is Postgres told the
+//! WAL may go. Recovery from a crash between two tables' commits is the
+//! min-watermark re-drain: the apply paths are idempotent, so the tables
+//! that were already ahead converge.
 
 use crate::error::{Error, Result};
 use crate::logbased::dest_ch::ChDest;
@@ -19,7 +21,7 @@ use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest};
 use crate::logbased::drain::{drain, DrainOutcome, DrainSession};
 use crate::wire::pgoutput::lsn_from_string;
 use crate::wire::walsender::Walsender;
-use crate::{Mode, TransferOptions, TransferReport};
+use crate::{Mode, MultiReport, TableResult, TransferOptions, TransferReport};
 use md5::{Digest as _, Md5};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -82,9 +84,6 @@ impl Dest {
         }
     }
 
-    /// `src` is the SOURCE pool — iceberg refetches masked-TOAST rows from
-    /// it (immutable snapshots have no destination row to read back); the
-    /// SQL destinations ignore it.
     async fn apply(
         &self,
         dest_table: &str,
@@ -103,6 +102,20 @@ impl Dest {
             }
         }
     }
+}
+
+/// One member of the slot group.
+struct TableCtx {
+    /// The table argument as the caller gave it (drives the bootstrap's
+    /// recursive `transfer`).
+    table_arg: String,
+    /// Resolved "schema.table" on the source (matches pgoutput's Relation).
+    qualified: String,
+    dest_table: String,
+    pk_cols: Vec<String>,
+    /// Per-table state key — the same identity a single-table run would use,
+    /// so state stays discoverable regardless of grouping.
+    source_id: String,
 }
 
 /// Bytes of row data one drain window may buffer before it must apply.
@@ -130,6 +143,64 @@ pub(crate) async fn run_task(
     opts: &TransferOptions,
 ) -> Result<TransferReport> {
     let started = std::time::Instant::now();
+    let (rows, parallel) =
+        run_group(src_url, dst_url, std::slice::from_ref(&table.to_string()), opts).await
+            .map(|mut v| v.pop().expect("one result per table"))?;
+    Ok(TransferReport {
+        rows,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        parallel,
+    })
+}
+
+pub(crate) async fn run_many(
+    src_url: &str,
+    dst_url: &str,
+    tables: &[String],
+    opts: &TransferOptions,
+) -> Result<MultiReport> {
+    let started = std::time::Instant::now();
+    if opts.dest_table.is_some() {
+        return Err(Error::InvalidInput(
+            "dest_table applies to single-table transfers — multi-table runs \
+             keep the source names"
+                .into(),
+        ));
+    }
+    let per_table_started = std::time::Instant::now();
+    let results = run_group(src_url, dst_url, tables, opts).await?;
+    let elapsed = per_table_started.elapsed().as_millis() as u64;
+    let budget = results.iter().map(|(_, p)| *p).max().unwrap_or(1);
+    Ok(MultiReport {
+        rows: results.iter().map(|(r, _)| *r).sum(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        budget,
+        tables: tables
+            .iter()
+            .zip(results)
+            .map(|(t, (rows, parallel))| TableResult {
+                table: t.clone(),
+                rows,
+                elapsed_ms: elapsed,
+                parallel,
+                error: None,
+            })
+            .collect(),
+    })
+}
+
+/// Run one slot group. Returns (rows, parallel) per table, caller order.
+/// A failure anywhere fails the WHOLE group — the slot is only confirmed
+/// past windows every member committed, so nothing is ever lost.
+async fn run_group(
+    src_url: &str,
+    dst_url: &str,
+    tables: &[String],
+    opts: &TransferOptions,
+) -> Result<Vec<(u64, usize)>> {
+    if tables.is_empty() {
+        return Err(Error::InvalidInput("tables list is empty".into()));
+    }
     if !matches!(scheme(src_url), "postgres" | "postgresql") {
         return Err(Error::InvalidInput(
             "log_based needs a Postgres source (logical replication)".into(),
@@ -143,61 +214,108 @@ pub(crate) async fn run_task(
         .await
         .map_err(|e| Error::Transfer(format!("log_based: source connect: {e}")))?;
 
-    // Resolve the table's real (schema, name) + PK + column order on the source.
-    let (schema_name, bare) = resolve_table(&src, table).await?;
-    let qualified = format!("{schema_name}.{bare}");
-    let pk_cols = pk_columns(&src, &qualified).await?;
-    if pk_cols.is_empty() {
-        return Err(Error::InvalidInput(format!(
-            "log_based: {qualified} has no primary key — updates/deletes need an \
-             identity. Add a PK (or ask for REPLICA IDENTITY FULL support)"
-        )));
+    // Resolve every member: real (schema, name) + PK on the source.
+    let single = tables.len() == 1;
+    let mut ctxs = Vec::with_capacity(tables.len());
+    for t in tables {
+        let (schema_name, bare) = resolve_table(&src, t).await?;
+        let qualified = format!("{schema_name}.{bare}");
+        let pk_cols = pk_columns(&src, &qualified).await?;
+        if pk_cols.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "log_based: {qualified} has no primary key — updates/deletes \
+                 need an identity. Add a PK (or ask for REPLICA IDENTITY FULL \
+                 support)"
+            )));
+        }
+        let dest_table = if single {
+            opts.dest_table.clone().unwrap_or_else(|| bare.clone())
+        } else {
+            bare.clone()
+        };
+        ctxs.push(TableCtx {
+            table_arg: t.clone(),
+            qualified,
+            dest_table,
+            source_id: crate::pipeline::source_identity(src_url, t),
+            pk_cols,
+        });
     }
-    let dest_table = opts.dest_table.clone().unwrap_or_else(|| bare.clone());
-    let source_id = crate::pipeline::source_identity(src_url, table);
+    {
+        let mut dests: Vec<&str> = ctxs.iter().map(|c| c.dest_table.as_str()).collect();
+        dests.sort_unstable();
+        dests.dedup();
+        if dests.len() != ctxs.len() {
+            return Err(Error::InvalidInput(
+                "log_based: two tables resolve to the same destination name".into(),
+            ));
+        }
+    }
 
-    // Stable slot/publication names for this sync pair.
-    let pair_hash = hex_prefix(&format!("{source_id}\u{1f}{dest_table}"), 12);
-    let slot = format!("apitap_{pair_hash}");
+    // Stable slot/publication names. A group of ONE keeps the historical
+    // single-table naming so existing slots stay owned; bigger groups hash
+    // their sorted membership — changing membership means a NEW slot (and a
+    // loud partial-state error below until the old state is cleared).
+    let slot = if single {
+        let c = &ctxs[0];
+        format!("apitap_{}", hex_prefix(&format!("{}\u{1f}{}", c.source_id, c.dest_table), 12))
+    } else {
+        let mut pairs: Vec<String> = ctxs
+            .iter()
+            .map(|c| format!("{}\u{1f}{}", c.source_id, c.dest_table))
+            .collect();
+        pairs.sort_unstable();
+        format!("apitap_g{}", hex_prefix(&pairs.join("\u{1e}"), 11))
+    };
     let publication = format!("{slot}_pub");
 
-    ensure_publication(&src, &publication, &qualified).await?;
-    let wm = dest.read_state(&dest_table, &source_id).await?;
+    let qualified_all: Vec<&str> = ctxs.iter().map(|c| c.qualified.as_str()).collect();
+    ensure_publication(&src, &publication, &qualified_all).await?;
 
-    match wm {
-        None => {
-            bootstrap(
-                src_url, dst_url, table, opts, &dest, &src, &slot, &dest_table,
-                &source_id, &pk_cols, started,
-            )
-            .await
-        }
-        Some(wm) => {
-            drain_run(
-                src_url, &src, &dest, &slot, &publication, &qualified, &pk_cols,
-                &dest_table, &source_id, wm, started,
-            )
-            .await
-        }
+    // Per-table watermarks: all absent = fresh bootstrap; all present = drain
+    // from the group minimum; a mix is a torn group — refuse loudly.
+    let mut wms = Vec::with_capacity(ctxs.len());
+    for c in &ctxs {
+        wms.push(dest.read_state(&c.dest_table, &c.source_id).await?);
+    }
+    let have: Vec<&TableCtx> =
+        ctxs.iter().zip(&wms).filter(|(_, w)| w.is_some()).map(|(c, _)| c).collect();
+    if !have.is_empty() && have.len() != ctxs.len() {
+        let missing: Vec<&str> = ctxs
+            .iter()
+            .zip(&wms)
+            .filter(|(_, w)| w.is_none())
+            .map(|(c, _)| c.dest_table.as_str())
+            .collect();
+        return Err(Error::InvalidInput(format!(
+            "log_based: the group has state for {} of {} tables (missing: {}) — \
+             group membership changed, or a bootstrap was interrupted. Clear \
+             the group's state rows (and drop slot {slot}) to re-bootstrap",
+            have.len(),
+            ctxs.len(),
+            missing.join(", ")
+        )));
+    }
+
+    if have.is_empty() {
+        bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
+    } else {
+        let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
+        drain_group(src_url, &src, &dest, &slot, &publication, &ctxs, wm).await
     }
 }
 
-// ── first run: slot + pinned full load ──────────────────────────────────────
+// ── first run: one slot, every table pinned to its snapshot ─────────────────
 
-#[allow(clippy::too_many_arguments)]
-async fn bootstrap(
+async fn bootstrap_group(
     src_url: &str,
     dst_url: &str,
-    table: &str,
     opts: &TransferOptions,
     dest: &Dest,
     src: &PgPool,
     slot: &str,
-    dest_table: &str,
-    source_id: &str,
-    pk_cols: &[String],
-    started: std::time::Instant,
-) -> Result<TransferReport> {
+    ctxs: &[TableCtx],
+) -> Result<Vec<(u64, usize)>> {
     // A slot with no matching state is a leftover from an aborted bootstrap —
     // start fresh (refuse if something is actively draining it).
     let stale: Option<(bool,)> =
@@ -236,52 +354,58 @@ async fn bootstrap(
         .ok_or_else(|| Error::Transfer("log_based: slot creation exported no snapshot".into()))?;
     let lsn = lsn_from_string(&consistent_point)?;
 
-    // Full load pinned to the exported snapshot. The walsender session must
-    // stay open until the load's workers have attached the snapshot — we
-    // keep it open for the whole load (it is idle; the slot retains WAL).
-    let mut o2 = opts.clone();
-    o2.mode = Mode::Replace;
-    dest.tweak_bootstrap_opts(&mut o2, pk_cols);
+    // Full loads pinned to the ONE exported snapshot — every member sees the
+    // same instant, so the whole group hands off gap-free. Sequential: each
+    // table still gets the full pipe budget, and per-table destination knobs
+    // (ClickHouse ORDER BY = that table's PK) stay per-table. The walsender
+    // session stays open for the whole load (idle; the slot retains WAL).
     let sep = if src_url.contains('?') { '&' } else { '?' };
     let pinned_url = format!("{src_url}{sep}__apitap_snapshot={snapshot}");
-    let report = match Box::pin(crate::transfer(&pinned_url, dst_url, table, &o2)).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Failed bootstrap leaves nothing behind: drop the slot.
-            let _ = sqlx::query("SELECT pg_drop_replication_slot($1)")
-                .bind(slot)
-                .execute(src)
-                .await;
-            return Err(e);
-        }
-    };
+    let mut out = Vec::with_capacity(ctxs.len());
+    for c in ctxs {
+        let mut o2 = opts.clone();
+        o2.mode = Mode::Replace;
+        o2.dest_table = Some(c.dest_table.clone());
+        dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
+        let report =
+            match Box::pin(crate::transfer(&pinned_url, dst_url, &c.table_arg, &o2)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Failed bootstrap leaves no STATE behind: drop the slot;
+                    // already-loaded members are plain tables the re-run will
+                    // replace again.
+                    let _ = sqlx::query("SELECT pg_drop_replication_slot($1)")
+                        .bind(slot)
+                        .execute(src)
+                        .await;
+                    return Err(Error::Transfer(format!(
+                        "log_based: bootstrap of {} failed (group rolled back to \
+                         no-state; re-run re-bootstraps all): {e}",
+                        c.qualified
+                    )));
+                }
+            };
+        out.push((report.rows, report.parallel));
+    }
     ws.stop_replication().await.ok();
 
-    dest.bootstrap_finish(dest_table, source_id, pk_cols, lsn, report.rows).await?;
-
-    Ok(TransferReport {
-        rows: report.rows,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        parallel: report.parallel,
-    })
+    for (c, (rows, _)) in ctxs.iter().zip(&out) {
+        dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows).await?;
+    }
+    Ok(out)
 }
 
-// ── every later run: windowed drain + set-based apply ───────────────────────
+// ── every later run: ONE windowed drain, applies fan out per table ──────────
 
-#[allow(clippy::too_many_arguments)]
-async fn drain_run(
+async fn drain_group(
     src_url: &str,
     src: &PgPool,
     dest: &Dest,
     slot: &str,
     publication: &str,
-    qualified: &str,
-    pk_cols: &[String],
-    dest_table: &str,
-    source_id: &str,
+    ctxs: &[TableCtx],
     wm: u64,
-    started: std::time::Instant,
-) -> Result<TransferReport> {
+) -> Result<Vec<(u64, usize)>> {
     // Reconcile against the slot before doing anything.
     let slot_row: Option<(Option<String>, bool)> = sqlx::query_as(
         "SELECT confirmed_flush_lsn::text, active FROM pg_replication_slots \
@@ -321,20 +445,22 @@ async fn drain_run(
     let stop_line = lsn_from_string(&stop_line.0)?;
 
     let mut key_cols = HashMap::new();
-    key_cols.insert(qualified.to_string(), pk_cols.to_vec());
+    for c in ctxs {
+        key_cols.insert(c.qualified.clone(), c.pk_cols.clone());
+    }
 
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let budget = window_budget();
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
 
-    // Windowed drain: each window applies (with its watermark) before the
-    // next one buffers, so peak memory is the window budget — not the lag.
-    // The session carries the Relation registry across windows (pgoutput
-    // announces a relation once per stream).
+    // Windowed drain: each window applies to EVERY member (traffic or not —
+    // absent tables advance their watermark, keeping the group's minimum
+    // moving) before the next window buffers; the slot is confirmed only
+    // after the whole group committed the window.
     let mut sess = DrainSession::default();
     let mut cur = wm;
-    let mut total_rows = 0u64;
+    let mut rows_per: Vec<u64> = vec![0; ctxs.len()];
     let mut windows = 0u32;
     loop {
         let t_drain = std::time::Instant::now();
@@ -343,32 +469,30 @@ async fn drain_run(
         let t_drain = t_drain.elapsed();
 
         let t_apply = std::time::Instant::now();
-        let (rows, applied_lsn) = if outcome.end_lsn > cur {
-            let n = dest
-                .apply(dest_table, qualified, pk_cols, &outcome, source_id, src)
-                .await?;
-            (n, outcome.end_lsn)
+        let applied_lsn = if outcome.end_lsn > cur {
+            for (i, c) in ctxs.iter().enumerate() {
+                rows_per[i] += dest
+                    .apply(&c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id, src)
+                    .await?;
+            }
+            outcome.end_lsn
         } else {
-            (0, cur)
+            cur
         };
-        total_rows += rows;
         windows += 1;
         if dbg {
-            let c = outcome.tables.get(qualified);
+            let events: u64 = outcome.tables.values().map(|c| c.events).sum();
             eprintln!(
-                "[log_based] window={windows} drain={:.1}s apply={:.1}s events={} \
-                 deletes={} upserts={} residue={} budget_hit={}",
+                "[log_based] window={windows} tables={} drain={:.1}s apply={:.1}s \
+                 events={events} budget_hit={}",
+                outcome.tables.len(),
                 t_drain.as_secs_f64(),
                 t_apply.elapsed().as_secs_f64(),
-                rows,
-                c.map_or(0, |c| c.deletes.len()),
-                c.map_or(0, |c| c.upserts.len()),
-                c.map_or(0, |c| c.residue.len()),
                 outcome.hit_budget,
             );
         }
 
-        // Destination committed — NOW the source may discard this window's WAL.
+        // Every member committed — NOW the source may discard this window's WAL.
         ws.standby_status(applied_lsn, false).await?;
         cur = applied_lsn;
         if !outcome.hit_budget {
@@ -377,11 +501,7 @@ async fn drain_run(
     }
     ws.stop_replication().await.ok();
 
-    Ok(TransferReport {
-        rows: total_rows,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        parallel: 1,
-    })
+    Ok(rows_per.into_iter().map(|r| (r, 1)).collect())
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -424,7 +544,14 @@ async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
     Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
 }
 
-async fn ensure_publication(src: &PgPool, publication: &str, qualified: &str) -> Result<()> {
+/// Create the publication carrying EVERY member, or — when it already
+/// exists — verify each member's MEMBERSHIP and re-add the missing (a
+/// dropped-and-recreated source table silently leaves its publication).
+async fn ensure_publication(
+    src: &PgPool,
+    publication: &str,
+    qualified_tables: &[&str],
+) -> Result<()> {
     let exists: Option<(i32,)> =
         sqlx::query_as("SELECT 1 FROM pg_publication WHERE pubname = $1")
             .bind(publication)
@@ -432,10 +559,14 @@ async fn ensure_publication(src: &PgPool, publication: &str, qualified: &str) ->
             .await
             .map_err(db_err)?;
     if exists.is_none() {
+        let list = qualified_tables
+            .iter()
+            .map(|q| format!("ONLY {}", quote_table(q)))
+            .collect::<Vec<_>>()
+            .join(", ");
         sqlx::query(&format!(
-            "CREATE PUBLICATION {} FOR TABLE ONLY {}",
-            quote_ident(publication),
-            quote_table(qualified)
+            "CREATE PUBLICATION {} FOR TABLE {list}",
+            quote_ident(publication)
         ))
         .execute(src)
         .await
@@ -447,35 +578,34 @@ async fn ensure_publication(src: &PgPool, publication: &str, qualified: &str) ->
         })?;
         return Ok(());
     }
-    // The publication existing is NOT enough: dropping and recreating the
-    // source table silently empties it, and an empty publication streams
-    // Begin/Commit pairs and no rows. Verify membership and re-add.
-    let (schema, bare) = qualified.split_once('.').unwrap_or(("public", qualified));
-    let member: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM pg_publication_tables \
-         WHERE pubname = $1 AND schemaname = $2 AND tablename = $3",
-    )
-    .bind(publication)
-    .bind(schema)
-    .bind(bare)
-    .fetch_optional(src)
-    .await
-    .map_err(db_err)?;
-    if member.is_none() {
-        sqlx::query(&format!(
-            "ALTER PUBLICATION {} ADD TABLE ONLY {}",
-            quote_ident(publication),
-            quote_table(qualified)
-        ))
-        .execute(src)
+    for qualified in qualified_tables {
+        let (schema, bare) = qualified.split_once('.').unwrap_or(("public", qualified));
+        let member: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM pg_publication_tables \
+             WHERE pubname = $1 AND schemaname = $2 AND tablename = $3",
+        )
+        .bind(publication)
+        .bind(schema)
+        .bind(bare)
+        .fetch_optional(src)
         .await
-        .map_err(|e| {
-            Error::Transfer(format!(
-                "log_based: publication {publication} exists but no longer \
-                 carries {qualified} (source table dropped and recreated?) — \
-                 re-adding it failed: {e}"
+        .map_err(db_err)?;
+        if member.is_none() {
+            sqlx::query(&format!(
+                "ALTER PUBLICATION {} ADD TABLE ONLY {}",
+                quote_ident(publication),
+                quote_table(qualified)
             ))
-        })?;
+            .execute(src)
+            .await
+            .map_err(|e| {
+                Error::Transfer(format!(
+                    "log_based: publication {publication} exists but no longer \
+                     carries {qualified} (source table dropped and recreated?) — \
+                     re-adding it failed: {e}"
+                ))
+            })?;
+        }
     }
     Ok(())
 }

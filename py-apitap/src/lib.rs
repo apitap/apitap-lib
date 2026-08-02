@@ -60,7 +60,7 @@ fn transfer(
 /// error), …])` — per-table failures ride in the rows, not as an exception, so the
 /// wrapper can report which tables landed.
 #[pyfunction]
-#[pyo3(signature = (src, dst, *, tables=None, schema=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None))]
+#[pyo3(signature = (src, dst, *, tables=None, schema=None, specs=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None))]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 fn transfer_many(
@@ -69,6 +69,7 @@ fn transfer_many(
     dst: String,
     tables: Option<Vec<String>>,
     schema: Option<String>,
+    specs: Option<Vec<(String, String)>>,
     parallel: Option<usize>,
     cursor: Option<String>,
     chunk_bytes: Option<usize>,
@@ -81,6 +82,20 @@ fn transfer_many(
     let mode: apitap_core::Mode = mode
         .parse()
         .map_err(|e: apitap_core::Error| PyValueError::new_err(e.to_string()))?;
+    // Per-table modes ({table: mode} on the Python side) parse up front so a
+    // typo fails before anything moves.
+    let parsed_specs: Option<Vec<(String, apitap_core::Mode)>> = match specs {
+        None => None,
+        Some(pairs) => Some(
+            pairs
+                .into_iter()
+                .map(|(t, m)| match m.parse::<apitap_core::Mode>() {
+                    Ok(m) => Ok((t, m)),
+                    Err(e) => Err(PyValueError::new_err(format!("table {t:?}: {e}"))),
+                })
+                .collect::<PyResult<_>>()?,
+        ),
+    };
     let opts = apitap_core::TransferOptions {
         parallel,
         cursor,
@@ -94,6 +109,9 @@ fn transfer_many(
     };
     let out = py.allow_threads(|| {
         rt().block_on(async {
+            if let Some(sp) = &parsed_specs {
+                return apitap_core::transfer_tables(&src, &dst, sp, &opts).await;
+            }
             match &tables {
                 Some(ts) => apitap_core::transfer_many(&src, &dst, ts, &opts).await,
                 None => apitap_core::transfer_schema(&src, &dst, schema.as_deref(), &opts).await,

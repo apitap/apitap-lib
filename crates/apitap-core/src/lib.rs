@@ -233,22 +233,75 @@ pub async fn transfer_many(
     tables: &[String],
     opts: &TransferOptions,
 ) -> Result<MultiReport> {
-    reject_logbased_multi(opts)?;
+    if opts.mode == Mode::LogBased {
+        // The whole list is ONE slot group: one publication, one drain pass,
+        // one shared watermark — never the bulk pipeline (which would run a
+        // cursor merge and silently drop deletes).
+        return logbased::run::run_many(src_url, dst_url, tables, opts).await;
+    }
     pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::List(tables), opts).await
 }
 
-/// log_based must not fall through to the bulk multi-table pipeline: it
-/// would run as a cursor merge and silently drop deletes.
-fn reject_logbased_multi(opts: &TransferOptions) -> Result<()> {
-    if opts.mode == Mode::LogBased {
-        return Err(Error::InvalidInput(
-            "log_based is single-table today — call transfer() once per table \
-             (each table gets its own slot and watermark). Multi-table per \
-             slot is on the roadmap"
-                .into(),
-        ));
+/// Copy MANY tables where EACH table names its own [`Mode`]. The call is
+/// partitioned by mode: every bulk mode (replace/append/merge) runs through
+/// the shared-budget pipeline as its own [`transfer_many`]-equivalent group,
+/// and all `log_based` tables form ONE replication-slot group. Groups run
+/// sequentially; per-table outcomes come back in ONE report (bulk tables
+/// keep their per-table failure isolation; a CDC group fails as a unit —
+/// its watermark is shared, so nothing is ever half-confirmed).
+pub async fn transfer_tables(
+    src_url: &str,
+    dst_url: &str,
+    specs: &[(String, Mode)],
+    opts: &TransferOptions,
+) -> Result<MultiReport> {
+    let started = std::time::Instant::now();
+    if specs.is_empty() {
+        return Err(Error::InvalidInput("tables list is empty".into()));
     }
-    Ok(())
+    {
+        let mut names: Vec<&str> = specs.iter().map(|(t, _)| t.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() != specs.len() {
+            return Err(Error::InvalidInput(
+                "the same table appears twice in the per-table mode map".into(),
+            ));
+        }
+    }
+    // Partition preserving the caller's order within each mode group.
+    let group = |m: Mode| -> Vec<String> {
+        specs.iter().filter(|(_, mm)| *mm == m).map(|(t, _)| t.clone()).collect()
+    };
+    let mut results: Vec<TableResult> = Vec::with_capacity(specs.len());
+    let mut budget = 0usize;
+    for mode in [Mode::Replace, Mode::Append, Mode::Merge, Mode::LogBased] {
+        let tables = group(mode);
+        if tables.is_empty() {
+            continue;
+        }
+        let mut o = opts.clone();
+        o.mode = mode;
+        let r = if mode == Mode::LogBased {
+            logbased::run::run_many(src_url, dst_url, &tables, &o).await?
+        } else {
+            pipeline::dispatch::multi(
+                src_url,
+                dst_url,
+                pipeline::dispatch::TableSel::List(&tables),
+                &o,
+            )
+            .await?
+        };
+        budget = budget.max(r.budget);
+        results.extend(r.tables);
+    }
+    Ok(MultiReport {
+        rows: results.iter().filter(|t| t.error.is_none()).map(|t| t.rows).sum(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        budget,
+        tables: results,
+    })
 }
 
 /// Copy EVERY table of a schema (MySQL: a database) in one call — same budget,
@@ -261,6 +314,12 @@ pub async fn transfer_schema(
     schema: Option<&str>,
     opts: &TransferOptions,
 ) -> Result<MultiReport> {
-    reject_logbased_multi(opts)?;
+    if opts.mode == Mode::LogBased {
+        return Err(Error::InvalidInput(
+            "log_based over a whole schema isn't supported yet — pass the \
+             tables explicitly (tables=[…] shares ONE replication slot)"
+                .into(),
+        ));
+    }
     pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::Schema(schema), opts).await
 }
