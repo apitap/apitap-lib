@@ -11,6 +11,14 @@ PDST="docker exec apitap-bench-pg-dst psql -U postgres -d apitap_bench_dst -Atc"
 PY=~/ice-run/bin/python
 T=cdc_speed
 SRC_URL="${SRC_URL:-postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src}"
+# DEST=ch measures the primary destination (clickhouse); default pg.
+if [ "${DEST:-pg}" = "ch" ]; then
+  DST_URL="clickhouse://default:bench@127.0.0.1:8124/default"
+  DST_CLEAN() { docker exec apitap-bench-ch clickhouse-client -u default --password bench -q "DROP TABLE IF EXISTS $T; DROP TABLE IF EXISTS ${T}__apitap_cdc_del; DELETE FROM \`_apitap_state\` WHERE dest_table = '$T'" 2>/dev/null || true; }
+else
+  DST_URL="postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst"
+  DST_CLEAN() { $PDST "DROP TABLE IF EXISTS $T; DELETE FROM _apitap_state WHERE dest_table='$T'" >/dev/null 2>&1 || true; }
+fi
 LOG(){ echo; echo "== $*"; }
 
 if [ -n "${WORKMEM:-}" ]; then
@@ -23,7 +31,7 @@ docker exec apitap-bench-pg-src psql -U postgres -Atc "SHOW logical_decoding_wor
 
 reset_rig() {
   $PSRC "DROP TABLE IF EXISTS $T" >/dev/null
-  $PDST "DROP TABLE IF EXISTS $T; DELETE FROM _apitap_state WHERE dest_table='$T'" >/dev/null 2>&1 || true
+  DST_CLEAN
   for s in $($PSRC "SELECT slot_name FROM pg_replication_slots"); do
     $PSRC "SELECT pg_drop_replication_slot('$s')" >/dev/null 2>&1 || true; done
   for p in $($PSRC "SELECT pubname FROM pg_publication WHERE pubname LIKE 'apitap_%'"); do
@@ -32,9 +40,7 @@ reset_rig() {
   $PSRC "INSERT INTO $T SELECT g, 'v'||g, g*7 FROM generate_series(1,100000) g" >/dev/null
   $PY -c "
 import apitap
-r = apitap.transfer('$SRC_URL',
-                    'postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst',
-                    table='$T', mode='log_based')
+r = apitap.transfer('$SRC_URL', '$DST_URL', table='$T', mode='log_based')
 print(f'  bootstrap {r.rows:,}')"
 }
 
@@ -55,9 +61,7 @@ drain_timed() { # $1 label, $2 perf-seconds (0 = no perf)
   APITAP_DEBUG=1 $PY -c "
 import time, apitap
 t0=time.time()
-r = apitap.transfer('$SRC_URL',
-                    'postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst',
-                    table='$T', mode='log_based')
+r = apitap.transfer('$SRC_URL', '$DST_URL', table='$T', mode='log_based')
 print(f'  $label: {r.rows:,} events in {time.time()-t0:.1f}s')"
   if [ "$perfsec" != "0" ]; then
     wait $PERF_WAITER 2>/dev/null || true
@@ -86,7 +90,7 @@ drain_timed "chunked drain" 0
 echo "  spills after:  $(spills)"
 
 LOG "cleanup"
-$PDST "DROP TABLE IF EXISTS $T; DELETE FROM _apitap_state WHERE dest_table='$T'" >/dev/null
+DST_CLEAN
 $PSRC "DROP TABLE IF EXISTS $T" >/dev/null
 for s in $($PSRC "SELECT slot_name FROM pg_replication_slots"); do
   $PSRC "SELECT pg_drop_replication_slot('$s')" >/dev/null 2>&1 || true; done

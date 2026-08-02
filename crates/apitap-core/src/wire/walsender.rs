@@ -18,16 +18,67 @@ use crate::wire::pgoutput::lsn_to_string;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 /// Microseconds between the Unix and Postgres (2000-01-01) epochs.
 const PG_EPOCH_OFFSET_US: i64 = 946_684_800_000_000;
 
+/// The socket rides as SPLIT halves so the CopyBoth read side can move into
+/// its own pump task (TCP is full-duplex — standby writes never contend).
+/// The pump is the ape-dts daemon shape adopted batch-side: a task whose
+/// only job is recv+frame, so the ~50K syscalls/s of a busy walsender run
+/// on their own core while decode+collapse consume from a channel.
 pub(crate) struct Walsender {
-    stream: BufStream<TcpStream>,
+    /// Read half — `None` while the pump task owns it (CopyBoth mode).
+    rd: Option<BufReader<OwnedReadHalf>>,
+    wr: BufWriter<OwnedWriteHalf>,
     /// Set once START_REPLICATION enters CopyBoth mode.
     copying: bool,
+    pump: Option<PumpHandle>,
+}
+
+struct PumpHandle {
+    frames: mpsc::Receiver<(u8, Vec<u8>)>,
+    task: tokio::task::JoinHandle<(BufReader<OwnedReadHalf>, Result<()>)>,
+}
+
+/// The pump: forward every frame until the consumer hangs up, an error
+/// lands, or ReadyForQuery ends the replication conversation. No select!
+/// over the read — a frame read is never cancelled mid-way (protocol
+/// desync is the documented trap).
+async fn pump_frames(
+    mut rd: BufReader<OwnedReadHalf>,
+    tx: mpsc::Sender<(u8, Vec<u8>)>,
+) -> (BufReader<OwnedReadHalf>, Result<()>) {
+    loop {
+        match read_frame(&mut rd).await {
+            Ok((tag, body)) => {
+                let done = tag == b'Z';
+                if tx.send((tag, body)).await.is_err() {
+                    return (rd, Ok(()));
+                }
+                if done {
+                    return (rd, Ok(()));
+                }
+            }
+            Err(e) => return (rd, Err(e)),
+        }
+    }
+}
+
+async fn read_frame(rd: &mut BufReader<OwnedReadHalf>) -> Result<(u8, Vec<u8>)> {
+    let mut head = [0u8; 5];
+    rd.read_exact(&mut head).await.map_err(io_err)?;
+    let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+    if len < 4 {
+        return Err(Error::Transfer("walsender: bad message length".into()));
+    }
+    let mut body = vec![0u8; len - 4];
+    rd.read_exact(&mut body).await.map_err(io_err)?;
+    Ok((head[0], body))
 }
 
 /// One event out of the CopyBoth stream.
@@ -124,12 +175,15 @@ impl Walsender {
             .await
             .map_err(|e| Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port)))?;
         stream.set_nodelay(true).ok();
-        // 8 KiB (BufStream's default) means a syscall every few WAL messages;
+        // 8 KiB (the tokio default) means a syscall every few WAL messages;
         // a drain moves millions. Same reasoning as the vendored sqlx socket
         // buffer bump (vendor/sqlx-core/src/net/socket/buffered.rs).
+        let (r, w) = stream.into_split();
         let mut ws = Self {
-            stream: BufStream::with_capacity(1 << 20, 64 << 10, stream),
+            rd: Some(BufReader::with_capacity(1 << 20, r)),
+            wr: BufWriter::with_capacity(64 << 10, w),
             copying: false,
+            pump: None,
         };
         ws.startup(&ci, options).await?;
         Ok(ws)
@@ -160,9 +214,9 @@ impl Walsender {
         }
         body.push(0);
         let len = (body.len() + 4) as u32;
-        self.stream.write_all(&len.to_be_bytes()).await.map_err(io_err)?;
-        self.stream.write_all(&body).await.map_err(io_err)?;
-        self.stream.flush().await.map_err(io_err)?;
+        self.wr.write_all(&len.to_be_bytes()).await.map_err(io_err)?;
+        self.wr.write_all(&body).await.map_err(io_err)?;
+        self.wr.flush().await.map_err(io_err)?;
 
         // Auth conversation, then drain parameters until ReadyForQuery.
         let mut scram: Option<ScramState> = None;
@@ -238,26 +292,22 @@ impl Walsender {
     }
 
     async fn send_msg(&mut self, tag: u8, body: &[u8]) -> Result<()> {
-        self.stream.write_all(&[tag]).await.map_err(io_err)?;
-        self.stream
+        self.wr.write_all(&[tag]).await.map_err(io_err)?;
+        self.wr
             .write_all(&((body.len() + 4) as u32).to_be_bytes())
             .await
             .map_err(io_err)?;
-        self.stream.write_all(body).await.map_err(io_err)?;
-        self.stream.flush().await.map_err(io_err)?;
+        self.wr.write_all(body).await.map_err(io_err)?;
+        self.wr.flush().await.map_err(io_err)?;
         Ok(())
     }
 
     async fn read_message(&mut self) -> Result<(u8, Vec<u8>)> {
-        let mut head = [0u8; 5];
-        self.stream.read_exact(&mut head).await.map_err(io_err)?;
-        let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
-        if len < 4 {
-            return Err(Error::Transfer("walsender: bad message length".into()));
-        }
-        let mut body = vec![0u8; len - 4];
-        self.stream.read_exact(&mut body).await.map_err(io_err)?;
-        Ok((head[0], body))
+        let rd = self
+            .rd
+            .as_mut()
+            .expect("direct read while the pump owns the read half");
+        read_frame(rd).await
     }
 
     /// Run one simple-protocol query (the replication grammar included) and
@@ -332,14 +382,45 @@ impl Walsender {
                 "walsender: START_REPLICATION did not enter copy mode".into(),
             ));
         }
+        // Hand the read half to the pump: from here until stop_replication,
+        // frames arrive through the channel while this task decodes.
+        let rd = self.rd.take().expect("read half present at copy start");
+        let (tx, rx) = mpsc::channel(8192);
+        let task = tokio::spawn(pump_frames(rd, tx));
+        self.pump = Some(PumpHandle { frames: rx, task });
         Ok(())
+    }
+
+    /// Take the pump down and reclaim the read half, surfacing its error.
+    async fn join_pump(&mut self, pump: PumpHandle) -> Result<()> {
+        let (rd, res) = pump
+            .task
+            .await
+            .map_err(|e| Error::Transfer(format!("walsender pump join: {e}")))?;
+        self.rd = Some(rd);
+        res
     }
 
     /// Next CopyBoth event. `None` when the server ended the stream.
     pub(crate) async fn next_event(&mut self) -> Result<Option<WalEvent>> {
         assert!(self.copying, "next_event outside CopyBoth");
         loop {
-            let (tag, msg) = self.read_message().await?;
+            let (tag, msg) = match self.pump.as_mut() {
+                Some(p) => match p.frames.recv().await {
+                    Some(f) => f,
+                    None => {
+                        // Pump exited without a server CopyDone: an error or
+                        // a hangup — join it and tell the truth.
+                        let pump = self.pump.take().expect("pump present");
+                        self.copying = false;
+                        self.join_pump(pump).await?;
+                        return Err(Error::Transfer(
+                            "walsender: stream ended unexpectedly".into(),
+                        ));
+                    }
+                },
+                None => self.read_message().await?,
+            };
             match tag {
                 b'd' => {
                     match msg.first() {
@@ -400,6 +481,25 @@ impl Walsender {
     /// Leave CopyBoth mode cleanly (CopyDone handshake) so the session can
     /// run further simple queries or close gracefully.
     pub(crate) async fn stop_replication(&mut self) -> Result<()> {
+        if let Some(mut pump) = self.pump.take() {
+            if self.copying {
+                self.send_msg(b'c', &[]).await?;
+                self.copying = false;
+            }
+            let mut err: Option<Error> = None;
+            loop {
+                match pump.frames.recv().await {
+                    Some((b'Z', _)) | None => break,
+                    Some((b'E', msg)) => err = Some(parse_error(&msg)),
+                    Some(_) => {} // drain in-flight frames
+                }
+            }
+            let res = self.join_pump(pump).await;
+            return match err {
+                Some(e) => Err(e),
+                None => res,
+            };
+        }
         if !self.copying {
             return Ok(());
         }
