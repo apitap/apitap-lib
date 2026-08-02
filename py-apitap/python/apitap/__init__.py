@@ -109,7 +109,10 @@ def transfer(
     tables, all-text, replace only), ``github://owner/repo[/dir]?ref=main``
     (CSV files are the tables, all-text, replace only),
     ``github+api://owner/repo`` (issues/PRs/commits/stars… as typed tables,
-    incremental where the API allows) sources; ``postgres://``,
+    incremental where the API allows) sources — Postgres sources additionally
+    support ``mode="log_based"`` batch CDC (logical replication: every WAL
+    operation, drained per scheduled run, snapshot-pinned bootstrap) —
+    ``postgres://``,
     ``clickhouse://`` (``clickhouse+https://`` for TLS),
     ``bigquery://<project>/<dataset>?credentials=/path/key.json``,
     ``gcs://<bucket>[/prefix]?format=csv|parquet&credentials=/path/key.json``

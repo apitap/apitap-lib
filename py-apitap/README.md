@@ -118,7 +118,7 @@ apitap.transfer(
     tables=None,         # a list of tables, or…
     schema=None,         # …a whole schema — one shared resource budget
     dest_table=None,     # defaults to `table`
-    mode="replace",      # "append" / "merge" for incremental
+    mode="replace",      # "append"/"merge" incremental · "log_based" batch CDC
     cursor=None,         # auto: integer PK; PK-less Postgres uses TID ranges
     parallel=None,       # auto: CPU- and memory-aware; an explicit value wins
     chunk_bytes=None,    # per-send coalescing, default 4 MiB
@@ -128,7 +128,13 @@ apitap.transfer(
 ```
 
 `mode="append"` loads only rows past the last synced watermark; `mode="merge"`
-upserts the delta by primary key. The watermark lives in **`_apitap_state`** — a
+upserts the delta by primary key. `mode="log_based"` is **batch CDC** for
+Postgres sources: the first run creates a logical replication slot and
+bootstraps with a full load pinned to the slot's exported snapshot (no gap,
+no duplicates); every later run drains the WAL delta — inserts, updates
+(PK changes included), deletes, TRUNCATEs, TOAST handled — and applies it
+set-based in one destination transaction that also advances the LSN
+watermark. Schedule the same call from cron/Airflow; no daemon. The watermark lives in **`_apitap_state`** — a
 plain, queryable table in the destination database, one row per (table, source),
 written **in the same transaction as the data** on Postgres. On Iceberg it lives
 in the table's own properties, committed **in the same snapshot as the data**.
@@ -153,6 +159,9 @@ troubleshooting:
       GitHub API into Postgres, MySQL, ClickHouse, BigQuery, GCS, S3-compatible
       object stores (MinIO, R2, …) and Apache Iceberg
 - [x] Incremental sync — `mode="append"` / `mode="merge"` (transactional state table)
+- [x] Batch CDC — `mode="log_based"`: logical-replication drains on a schedule,
+      every WAL operation captured, snapshot-pinned bootstrap, crash-safe
+      LSN watermark committed with the data (Postgres→Postgres first)
 - [x] Apache Iceberg destination — overwrite/append/row-delta snapshots on any
       REST catalog; watermarks committed as table properties **in the same
       snapshot as the data**; bootstrap from parquet footer stats (picks up

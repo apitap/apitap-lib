@@ -26,7 +26,7 @@ MYD='mysql://root:bench@127.0.0.1:3308/bench'   # second MySQL for the MySQL->My
 rm -rf pgo-data merged.profdata && mkdir -p pgo-data && chmod 777 pgo-data
 
 echo "== 1/3 instrumented build =="
-rm -f benchmarks/wheels/*.whl
+rm -f benchmarks/wheels/*.whl 2>/dev/null || true
 docker run --rm -v "$REPO":/io -v apitap-bench-cargo:/root/.cargo/registry \
     -e RUSTFLAGS="-Cprofile-generate=/pgodata" \
     ghcr.io/pyo3/maturin build --release -m py-apitap/Cargo.toml -o benchmarks/wheels
@@ -55,6 +55,30 @@ for _ in 1 2; do
     train "$PS" "$S3T" public.bench_data_1m   # s3 multipart + parquet encode
     train "$PS" "$ICET" public.bench_data_1m  # iceberg: same lane + REST commit
 done
+# log_based CDC (0.17.0): pgoutput decode + collapse + walsender are new hot
+# branches. Bootstrap + one drained window against the logical-wal source.
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc \
+    "DROP TABLE IF EXISTS pgo_cdc; CREATE TABLE pgo_cdc(id int primary key, v text); \
+     INSERT INTO pgo_cdc SELECT g, 'v'||g FROM generate_series(1,200000) g" >/dev/null
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$PS', '$PD', table='pgo_cdc', mode='log_based')"
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc \
+    "INSERT INTO pgo_cdc SELECT g, 'w'||g FROM generate_series(200001,400000) g; \
+     UPDATE pgo_cdc SET v='u' WHERE id <= 50000; DELETE FROM pgo_cdc WHERE id BETWEEN 60000 AND 70000" >/dev/null
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$PS', '$PD', table='pgo_cdc', mode='log_based')"
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc \
+    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%'; \
+     DROP TABLE pgo_cdc" >/dev/null 2>&1 || true
+docker exec apitap-bench-pg-dst psql -U postgres -d apitap_bench_dst -Atc \
+    "DROP TABLE IF EXISTS pgo_cdc; DELETE FROM _apitap_state WHERE dest_table='pgo_cdc'" >/dev/null 2>&1 || true
+
 # GCS (both formats) needs live GCP creds: set GCS_TRAIN_URL to the parquet
 # URL (gcs://bucket/prefix?format=parquet&credentials=/abs/key.json) and
 # GCS_TRAIN_SA to the key path; skipped otherwise.
@@ -90,7 +114,7 @@ docker run --rm -v "$REPO":/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c \
     'rustup component add llvm-tools-preview >/dev/null 2>&1; \
      $(find /root/.rustup -name llvm-profdata | head -1) merge -o /io/merged.profdata /io/pgo-data/*.profraw'
 find crates py-apitap vendor -name '*.rs' -exec touch {} +
-rm -f benchmarks/wheels/*.whl
+rm -f benchmarks/wheels/*.whl 2>/dev/null || true
 docker run --rm -v "$REPO":/io -v apitap-bench-cargo:/root/.cargo/registry \
     -e RUSTFLAGS="-Cprofile-use=/io/merged.profdata" \
     ghcr.io/pyo3/maturin build --release -m py-apitap/Cargo.toml -o benchmarks/wheels
