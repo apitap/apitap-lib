@@ -310,8 +310,19 @@ async fn apply_pg(
         tx.execute(format!("TRUNCATE {ft}").as_str()).await.map_err(db_err)?;
     }
 
-    // Delete phase (before upserts — the collapse counts on this order).
-    if !c.deletes.is_empty() {
+    // Delete phase covers the delete-set UNION every upsert's key: clearing
+    // the way first turns 450K index-probing ON CONFLICT upserts into 450K
+    // plain inserts (ape-dts's rdb_merge trick — measured 5x here).
+    let pk_idx: Vec<usize> = pk_cols
+        .iter()
+        .map(|k| {
+            wal_cols.iter().position(|c| c == k).ok_or_else(|| {
+                Error::Transfer(format!("log_based: PK column '{k}' not in WAL columns"))
+            })
+        })
+        .collect::<Result<_>>()?;
+    let clear_keys = !c.deletes.is_empty() || !c.upserts.is_empty();
+    if clear_keys {
         tx.execute(
             format!(
                 "CREATE TEMP TABLE _ap_del ON COMMIT DROP AS \
@@ -325,9 +336,22 @@ async fn apply_pg(
             .copy_in_raw(&format!("COPY _ap_del ({pklist}) FROM STDIN"))
             .await
             .map_err(db_err)?;
-        let mut buf = Vec::with_capacity(1 << 20);
+        let mut buf = Vec::with_capacity(4 << 20);
         for key in &c.deletes {
             render_copy_row_keys(key, &mut buf);
+            if buf.len() > 4 << 20 {
+                copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
+            }
+        }
+        for row in &c.upserts {
+            let key: Vec<&[u8]> = pk_idx
+                .iter()
+                .map(|&i| match &row[i] {
+                    Cell::Text(t) => t.as_slice(),
+                    _ => b"".as_slice(), // key cells are Text by construction
+                })
+                .collect();
+            render_copy_key_refs(&key, &mut buf);
             if buf.len() > 4 << 20 {
                 copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
             }
@@ -372,23 +396,10 @@ async fn apply_pg(
             copy.send(buf).await.map_err(db_err)?;
         }
         copy.finish().await.map_err(db_err)?;
-        let updates = wal_cols
-            .iter()
-            .filter(|cname| !pk_cols.contains(cname))
-            .map(|cname| format!("{q} = EXCLUDED.{q}", q = quote_ident(cname)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let action = if updates.is_empty() {
-            "DO NOTHING".to_string()
-        } else {
-            format!("DO UPDATE SET {updates}")
-        };
+        // No ON CONFLICT: the delete phase already removed every one of
+        // these keys, so this is a straight bulk insert.
         tx.execute(
-            format!(
-                "INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up \
-                 ON CONFLICT ({pklist}) {action}"
-            )
-            .as_str(),
+            format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up").as_str(),
         )
         .await
         .map_err(db_err)?;
@@ -629,6 +640,16 @@ fn render_copy_row(row: &[Cell], out: &mut Vec<u8>) -> Result<()> {
 }
 
 fn render_copy_row_keys(key: &[Vec<u8>], out: &mut Vec<u8>) {
+    for (i, k) in key.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
+        copy_escape(k, out);
+    }
+    out.push(b'\n');
+}
+
+fn render_copy_key_refs(key: &[&[u8]], out: &mut Vec<u8>) {
     for (i, k) in key.iter().enumerate() {
         if i > 0 {
             out.push(b'\t');

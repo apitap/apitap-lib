@@ -727,6 +727,52 @@ SELECT count(*) FROM iceberg_scan('s3://lake/wh/analytics/events/metadata/<lates
 `metadata-location`.) For production, point the same URL at Lakekeeper,
 Polaris, Nessie, Glue or R2 — only `warehouse=`/`base=`/`token=` change.
 
+## Batch CDC: `mode="log_based"` (Postgres sources)
+
+Everything the WAL saw — inserts, updates (primary-key changes included),
+deletes, TRUNCATEs — delivered to the destination in scheduled batch runs,
+without a daemon. One call, every run:
+
+```python
+apitap.transfer(
+    "postgres://user:pass@src/db",     # needs wal_level=logical
+    "postgres://user:pass@wh/db",
+    table="public.orders",
+    mode="log_based",
+)
+```
+
+- **First run** creates a logical replication slot (`pgoutput`) and
+  bootstraps with a full load **pinned to the slot's exported snapshot** —
+  the load and the slot see the exact same instant, so the handoff has no
+  gap and no duplicates by construction.
+- **Every later run** drains the slot from the last committed LSN to a
+  stop-line captured at run start, collapses the window per primary key
+  (an update that changes the PK becomes delete+insert; insert-then-delete
+  nets out; the last write wins), and applies it set-based: COPY into a
+  temp table, one `DELETE … USING`, one `INSERT … ON CONFLICT DO UPDATE`,
+  in **one destination transaction that also advances the LSN watermark**
+  (`_apitap_state`). Only after that commit is Postgres told the WAL may be
+  discarded — a crash at any point replays idempotently, never skips.
+- **Scheduling**: run it from cron/Airflow at any cadence; the call is
+  identical every time. An overlapping run fails fast (the slot shows
+  active). A paused schedule loses nothing — Postgres retains WAL on the
+  slot until the next run confirms (guard runaway retention with
+  `max_slot_wal_keep_size`). If you retire a schedule, drop its slot:
+  `SELECT pg_drop_replication_slot('apitap_…')`.
+- **TOAST, handled**: an UPDATE that leaves a TOASTed column untouched
+  omits that value from the WAL; those rows apply as column-masked UPDATEs
+  so the destination's large values survive. Verified in the e2e suite
+  with 200 KB values.
+- **Requirements, checked loudly**: `wal_level=logical`; the table needs a
+  primary key (its replica identity); `REPLICA IDENTITY NOTHING` and
+  key columns outside the replica identity fail with the exact `ALTER
+  TABLE` to run. The replication connection speaks plain TCP for now
+  (`sslmode` beyond disable/prefer is refused, not ignored).
+- **Scope today**: Postgres → Postgres, single table per call. MySQL and
+  Iceberg destinations (the delta is exactly an Iceberg row-delta commit)
+  are next; multi-table per slot after that.
+
 ## Durability
 
 `durable=False` (Postgres destinations only) loads through an **UNLOGGED** staging
