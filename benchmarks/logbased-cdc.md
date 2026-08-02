@@ -229,6 +229,26 @@ slot to manage instead of N retention risks, and per-run fixed cost ×1
 instead of ×N — with many small tables the ~0.3–0.5 s per-call overhead
 is the dominant term. Reproduce: `bench-cdc-multitable.sh`.
 
+## Head-to-head 4: ingestr CDC (2026-08-02, v1.1.15)
+
+Same recipe (their `postgres+cdc://` batch mode — the direct equivalent
+of `mode="log_based"`: catch up between LSNs, exit), same 650K window,
+slot+publication before the window, row-verified:
+
+| tool | uncapped | 0.5 cpu / 256 MB |
+|---|---|---|
+| apitap `mode="log_based"` | **12.0 s** | **12.0 s** |
+| ape-dts | 13-14 s | 22 s |
+| ingestr `postgres+cdc://` | 39 s | 78 s |
+| pipelinewise LOG_BASED | 86 s | 227 s |
+
+Fair credit: ingestr's CDC is correct (row-matched, and its 100K
+bootstrap snapshot took 2-3 s — far cleaner than pipelinewise). But the
+dlt engine underneath pays the same per-event tax as every row-pipeline:
+~17K events/s against our ~54K, and it halves again the moment the CPU
+is honest — while apitap's number doesn't move at all between the full
+box and half a core. Reproduce: `bench-cdc-ingestr.sh`.
+
 ## The 44 MB tier (2026-08-02)
 
 The windowed drain (budget = cgroup limit minus a 24 MiB runtime reserve,
