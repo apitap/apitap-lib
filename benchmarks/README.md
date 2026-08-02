@@ -31,6 +31,13 @@ Companion write-ups in this directory:
   internal-VPC rig — apitap 30.3 s (×3, checksum-matched, ~3.3 GB/s); latest
   ingestr and dlt+pyarrow had landed 0 rows when cut.**
   Raw: [gcp-round-c-raw.log](gcp-round-c-raw.log).
+- **[logbased-cdc.md](logbased-cdc.md)** — `mode="log_based"` batch CDC: the
+  correctness e2e (PK-change, insert+delete-in-window, empty string, 200 KB
+  unchanged-TOAST — all row-by-row validated) and a head-to-head against
+  ape-dts on one 650K-event window. Includes the apply mistake their
+  design caught us in (ON CONFLICT vs clear-then-insert, 16.2 s → 2.8 s)
+  and where the remaining time honestly goes (Postgres's own logical
+  decoding). Raw: [logbased-cdc-raw.log](logbased-cdc-raw.log).
 - **[iceberg-showdown.md](iceberg-showdown.md)** — the `iceberg://`
   destination's three-phase showdown (full 10.3M / append +1M / merge 1M
   upsert) at 16 vCPU / 4 GB: **apitap 15.2 s · 2.2 s · 3.8 s, all read-back

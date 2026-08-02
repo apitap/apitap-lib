@@ -1,0 +1,44 @@
+════ log_based CDC — correctness e2e + ape-dts race (2026-08-02) ════
+Rig: OVH 16vCPU/61GB, postgres:16-alpine wal_level=logical (src :5544) -> postgres:16-alpine (dst :5545)
+
+──── e2e suite (after the delete-then-insert apply fix) ────
+[log_based] drain=0.0s apply=0.1s events=21 deletes=12 upserts=8 residue=1
+[log_based] drain=0.0s apply=0.0s events=0 deletes=0 upserts=0 residue=0
+[log_based] drain=0.0s apply=0.0s events=3 deletes=0 upserts=2 residue=0
+[log_based] drain=12.5s apply=3.0s events=650000 deletes=50000 upserts=450000 residue=0
+run1 bootstrap: rows=100,000 in 0.4s
+CHECK after bootstrap: MATCH (src 100000|5000050000 / dst 100000|5000050000)
+run2 drain: rows=21 in 0.2s
+CHECK after mixed window: MATCH (src 99992|5001249850 / dst 99992|5001249850)
+run3 empty: rows=0 in 0.1s
+CHECK after empty drain: MATCH (src 99992|5001249850 / dst 99992|5001249850)
+run4 truncate: rows=3 in 0.1s
+CHECK after truncate window: MATCH (src 2|3 / dst 2|3)
+run5 heavy: rows=650,000 in 15.7s
+CHECK after heavy window: MATCH (src 450002|104249775003 / dst 450002|104249775003)
+
+E2E LOG_BASED: ALL GREEN
+
+──── head-to-head: apitap log_based vs ape-dts rdb_merge, identical 650K window ────
+[01:26:07] ── setup: fresh cdc_race (100K seed), two dests
+NOTICE:  table "cdc_race" does not exist, skipping
+[01:26:08] ── apitap bootstrap (slot + pinned full load)
+apitap bootstrap: 100,000 rows in 0.4s
+[01:26:09] ── ape-dts: seed dest + create its slot (brief cdc start, then stop)
+apedts dest seeded: 100,000 rows
+apitap_ebffcacb206c|3/1A4209D8
+apedts_bench|3/1A420C50
+[01:26:32] ── generate the 650K-event window (identical for both)
+[01:26:35] source now: 550000|198749825000|228750225000
+[01:26:35] ── apitap log_based catch-up
+[log_based] drain=12.1s apply=16.2s events=650000 deletes=50000 upserts=450000 residue=0
+APITAP CATCH-UP: 650,000 events in 28.4s
+[01:27:04] apitap dest: 550000|198749825000|228750225000 vs src: 550000|198749825000|228750225000 → MATCH
+[01:27:04] ── ape-dts catch-up (poll until equal, kill at 900s)
+[01:27:27] APE-DTS CATCH-UP: caught up in 13s → MATCH
+CDC SHOWDOWN COMPLETE
+
+NOTE: the showdown log above records apitap FIRST CUT (28.4s, apply=16.2s with
+ON CONFLICT). After clearing keys first + bulk insert the same window is 15.8s
+(drain=12.8s apply=2.8s), see the e2e block above. ape-dts: 13s (daemon, overlaps
+decode with apply).
