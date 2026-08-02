@@ -49,6 +49,18 @@ counts at 50-80K events/s).
 Every step re-validated by the full e2e suites (pg / ch / multi — all
 MATCH, TOAST included) before its number was recorded.
 
+**At the 10M scale** (`bench-cdc-10m-validate.sh`, all row-verified):
+full-load parity holds post-campaign (ch 13.5/13.2 s replace/bootstrap,
+pg 21.7/33.5 s — the delta is still the one-time ADD PRIMARY KEY), and a
+2.5M-event window (with a 1M-row SINGLE transaction riding the v2
+streaming path) drains into **clickhouse in 36.7 s** (~68K events/s,
+consistent with the 650K-window rate) and postgres in 70.6 s. The honest
+read on pg: at multi-million-event windows it becomes APPLY-bound — the
+delete-join against a big indexed table outweighs the drain, and overlap
+can only hide apply up to the drain's own duration. The next lever there
+is a parallel apply (ape-dts phases its deletes/inserts across 8 workers;
+our set-based phases have the same barrier structure to exploit).
+
 Rig: OVH VPS (16 vCPU / 61 GB), `postgres:16-alpine` source with
 `wal_level=logical` and a second Postgres as destination, both on loopback.
 apitap built from main; ape-dts `apecloud/ape-dts:latest`.
