@@ -71,6 +71,19 @@ pg-to-pg takes 62.4 s (peak 81 MB) — the half-core client pumping ~700 MB
 of COPY binary is the bulk-path bottleneck there, a dest-tuning item, not
 a CDC one.
 
+**Full load, both tools, same 10M-row 15-column table**
+(`bench-fullload-apedts.sh` — their snapshot mode, dest structure
+pre-created per their contract; both row-count-complete):
+
+| pg→pg full load 10M | uncapped | 0.5 cpu / 256 MB |
+|---|---|---|
+| ape-dts (snapshot, 8 workers, batch-200 INSERTs) | 238 s | 878 s |
+| apitap (binary COPY, staging + swap) | **21.7 s** (11×) | **62.4 s** (14×) |
+
+With clickhouse as the destination apitap's capped 23.0 s makes it 38×.
+No mystery: row-SQL INSERTs versus the wire format the databases
+themselves would use.
+
 **The scale race, and what it costs** (same 2.5M-event window, both
 row-verified): ape-dts catches up into pg in **45 s** to apitap's 60 s —
 an honest loss at this shape — but the resource ledger reframes it:
