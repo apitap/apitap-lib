@@ -738,6 +738,12 @@ impl crate::sink::Sink for MySqlSink {
             Mode::Merge => Err(Error::InvalidInput(
                 "merge is not supported for MySQL destinations yet".into(),
             )),
+            Mode::LogBased => Err(Error::InvalidInput(
+                "log_based is not supported for MySQL destinations yet — CDC \
+                 deltas need the merge apply path, which MySQL destinations \
+                 don't have; use a postgres destination"
+                    .into(),
+            )),
         }
     }
 }

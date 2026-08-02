@@ -1434,6 +1434,12 @@ impl crate::sink::Sink for BqSink {
                 }
                 Ok(())
             }
+            Mode::LogBased => Err(Error::InvalidInput(
+                "log_based is not supported for BigQuery destinations yet — CDC \
+                 deltas need row-level deletes (MERGE DML); use a postgres, mysql \
+                 or iceberg destination"
+                    .into(),
+            )),
             Mode::Merge => Err(Error::InvalidInput(
                 "merge is not supported for BigQuery destinations yet".into(),
             )),

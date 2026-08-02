@@ -1233,6 +1233,12 @@ impl crate::sink::Sink for ChSink {
                 }
                 Ok(())
             }
+            Mode::LogBased => Err(Error::InvalidInput(
+                "log_based is not supported for ClickHouse destinations yet — CDC \
+                 deltas need row-level deletes (a ReplacingMergeTree/sign design is \
+                 planned); use a postgres, mysql or iceberg destination"
+                    .into(),
+            )),
             Mode::Merge => Err(Error::InvalidInput(
                 "merge is not supported for ClickHouse destinations yet".into(),
             )),

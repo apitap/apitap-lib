@@ -1053,7 +1053,8 @@ impl IcebergSink {
             let operation = match mode {
                 Mode::Replace => Operation::Overwrite,
                 Mode::Append => Operation::Append,
-                Mode::Merge => Operation::Overwrite, // row-delta commits stamp overwrite
+                // Row-delta commits (merge, and log_based's delta) stamp overwrite.
+                Mode::Merge | Mode::LogBased => Operation::Overwrite,
             };
             let mut props = HashMap::from([
                 ("added-data-files".to_string(), data_files.len().to_string()),

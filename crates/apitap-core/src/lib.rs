@@ -51,6 +51,14 @@ pub enum Mode {
     /// watermark are merged by the destination's primary key
     /// (`INSERT … ON CONFLICT DO UPDATE`). Bootstraps like `Append`.
     Merge,
+    /// Batch CDC from a Postgres source's logical replication slot: every
+    /// operation the WAL saw — inserts, updates (PK changes included),
+    /// deletes, truncates — drained since the last run and applied set-based.
+    /// The first run creates the slot and bootstraps with a full load pinned
+    /// to the slot's exported snapshot (gap-free, duplicate-free); the LSN
+    /// watermark commits in the same destination transaction as the data,
+    /// and the slot is only advanced afterwards. See docs/design/log_based.md.
+    LogBased,
 }
 
 impl std::str::FromStr for Mode {
@@ -60,6 +68,7 @@ impl std::str::FromStr for Mode {
             "replace" => Ok(Mode::Replace),
             "append" => Ok(Mode::Append),
             "merge" => Ok(Mode::Merge),
+            "log_based" => Ok(Mode::LogBased),
             other => Err(Error::InvalidInput(format!(
                 "mode must be 'replace', 'append' or 'merge' (got '{other}')"
             ))),

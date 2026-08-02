@@ -209,6 +209,7 @@ impl PgSink {
             Mode::Replace => "replace",
             Mode::Append => "append",
             Mode::Merge => "merge",
+            Mode::LogBased => "log_based",
         })
         .bind(rows as i64)
         .execute(&mut **tx)
@@ -642,7 +643,10 @@ impl crate::sink::Sink for PgSink {
                     .await
                     .map_err(|e| Error::Transfer(format!("append commit: {e}")))
             }
-            Mode::Merge => {
+            // A CDC delta lands exactly like a merge for the UPSERT half; the
+            // delete half and the masked-update residue are applied by the
+            // log_based engine inside this same transaction (see logbased::apply).
+            Mode::Merge | Mode::LogBased => {
                 let keys = self
                     .merge_keys
                     .iter()
