@@ -452,7 +452,10 @@ async fn drain_group(
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     // Two windows are resident under overlap (one applying, one draining) —
     // the budget halves so peak memory stays at the single-window ceiling.
-    let budget = (window_budget() / 2).max(1 << 20);
+    // The cap matters on BIG boxes too: overlap only pays while windows
+    // rotate, so past ~24 MiB of buffered rows the marginal collapse-dedup
+    // is worth less than hiding the apply under the next drain.
+    let budget = (window_budget() / 2).clamp(1 << 20, 24 << 20);
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
 
