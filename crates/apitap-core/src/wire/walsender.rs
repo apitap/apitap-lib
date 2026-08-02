@@ -104,7 +104,13 @@ impl Walsender {
             .await
             .map_err(|e| Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port)))?;
         stream.set_nodelay(true).ok();
-        let mut ws = Self { stream: BufStream::new(stream), copying: false };
+        // 8 KiB (BufStream's default) means a syscall every few WAL messages;
+        // a drain moves millions. Same reasoning as the vendored sqlx socket
+        // buffer bump (vendor/sqlx-core/src/net/socket/buffered.rs).
+        let mut ws = Self {
+            stream: BufStream::with_capacity(1 << 20, 64 << 10, stream),
+            copying: false,
+        };
         ws.startup(&ci).await?;
         Ok(ws)
     }

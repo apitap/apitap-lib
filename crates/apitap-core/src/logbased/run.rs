@@ -238,16 +238,32 @@ async fn drain_run(
     let mut key_cols = HashMap::new();
     key_cols.insert(qualified.to_string(), pk_cols.to_vec());
 
+    let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
+    let t_drain = std::time::Instant::now();
     let outcome = drain(&mut ws, wm, stop_line, &key_cols, 3600).await?;
+    let t_drain = t_drain.elapsed();
 
+    let t_apply = std::time::Instant::now();
     let (rows, applied_lsn) = if outcome.end_lsn > wm {
         let n = apply_pg(dst, dest_table, qualified, pk_cols, &outcome, source_id).await?;
         (n, outcome.end_lsn)
     } else {
         (0, wm)
     };
+    if dbg {
+        let c = outcome.tables.get(qualified);
+        eprintln!(
+            "[log_based] drain={:.1}s apply={:.1}s events={} deletes={} upserts={} residue={}",
+            t_drain.as_secs_f64(),
+            t_apply.elapsed().as_secs_f64(),
+            rows,
+            c.map_or(0, |c| c.deletes.len()),
+            c.map_or(0, |c| c.upserts.len()),
+            c.map_or(0, |c| c.residue.len()),
+        );
+    }
 
     // Destination committed — NOW the source may discard WAL.
     ws.standby_status(applied_lsn, false).await?;
