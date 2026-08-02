@@ -22,6 +22,19 @@ report = apitap.transfer(
 print(f"{report.rows:,} rows in {report.elapsed_ms} ms over {report.parallel} pipes")
 ```
 
+The same call does batch CDC — logical replication on a schedule, no daemon —
+and mixes modes per table:
+
+```python
+apitap.transfer(src, dst, table="public.orders", mode="log_based")   # full WAL capture
+
+apitap.transfer(src, dst, tables={          # one call, one slot for the CDC tables
+    "orders":    "log_based",
+    "customers": "log_based",
+    "dim_date":  "replace",
+})
+```
+
 ## Why apitap exists
 
 apitap is built around one simple belief: **moving a lot of data should not
@@ -39,7 +52,10 @@ container (~26M rows/minute, peak RSS 170.8 MB), the same table still completes
 inside a **44 MB** cap, and on three dedicated machines the identical transfer
 takes **30.3 seconds** (~3.3 GB/s, checksum-matched). The tools we compare
 against were OOM-killed in ~21 s on the small box and had landed **zero rows**
-when cut on the big one. Every step got here the same way: one lever at a
+when cut on the big one. The same belief now covers CDC: on one 650K-event
+replication window with every tool capped at 0.5 vCPU / 256 MB, apitap
+catches up in **12 s** where ape-dts takes 22 s and pipelinewise 227 s —
+all three row-matched ([benchmarks/logbased-cdc.md](benchmarks/logbased-cdc.md)). Every step got here the same way: one lever at a
 time, measured, checksum-validated, and written down in
 [benchmarks/README.md](benchmarks/README.md) including the caveats and our own
 mistakes — the profiling story behind the last 2-2.5× is
@@ -85,6 +101,10 @@ durability semantics, troubleshooting — lives in [docs/usage.md](docs/usage.md
 - **Warehouse-native ingestion.** BigQuery gets rotating parallel load jobs
   (Parquet or CSV, picked per box) and an atomic copy — the free path end to
   end, with incremental state that never needs DML (sandbox projects work).
+- **Set-based CDC apply.** A drained replication window is collapsed per key
+  and applied as bulk statements — clear the touched keys, insert the final
+  images — so the destination server does the work and the client barely
+  needs a CPU. Row-at-a-time appliers pay per event; this pays per window.
 
 **Measured against [ingestr](https://github.com/bruin-data/ingestr)** — running their
 own benchmark (their exact schema, value generators, and CLI invocation, at their
