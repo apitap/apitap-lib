@@ -61,6 +61,16 @@ can only hide apply up to the drain's own duration. The next lever there
 is a parallel apply (ape-dts phases its deletes/inserts across 8 workers;
 our set-based phases have the same barrier structure to exploit).
 
+**The home arena at scale** (0.5 cpu / 256 MB, the tier this project is
+FOR — same 2.5M-event window in normal-sized transactions, both
+row-verified): **apitap 43.6 s** (peak 245 MB, avg 0.48 cores — exactly
+its ration) vs **ape-dts 92 s**. The uncapped order inverts 2.1× the
+moment resources are honest. And the 30-second question at this tier:
+a 10M-row full load lands in **23.0 s into clickhouse** (peak 140 MB);
+pg-to-pg takes 62.4 s (peak 81 MB) — the half-core client pumping ~700 MB
+of COPY binary is the bulk-path bottleneck there, a dest-tuning item, not
+a CDC one.
+
 **The scale race, and what it costs** (same 2.5M-event window, both
 row-verified): ape-dts catches up into pg in **45 s** to apitap's 60 s —
 an honest loss at this shape — but the resource ledger reframes it:
