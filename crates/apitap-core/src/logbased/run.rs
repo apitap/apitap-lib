@@ -73,7 +73,7 @@ pub(crate) async fn run_task(
     let wm = read_state(&dst, &dest_table, &source_id).await?;
 
     match wm {
-        None => bootstrap(src_url, dst_url, table, opts, &dst, &src, &slot, &publication, &dest_table, &source_id, started).await,
+        None => bootstrap(src_url, dst_url, table, opts, &dst, &src, &slot, &publication, &dest_table, &source_id, &pk_cols, started).await,
         Some(wm) => {
             drain_run(
                 src_url, &src, &dst, &slot, &publication, &qualified, &pk_cols,
@@ -98,6 +98,7 @@ async fn bootstrap(
     publication: &str,
     dest_table: &str,
     source_id: &str,
+    pk_cols: &[String],
     started: std::time::Instant,
 ) -> Result<TransferReport> {
     // A slot with no matching state is a leftover from an aborted bootstrap —
@@ -157,6 +158,17 @@ async fn bootstrap(
         }
     };
     ws.stop_replication().await.ok();
+
+    // The replace path lands data without constraints; the drain's upsert
+    // needs the identity — add it now (same move the merge bootstrap makes).
+    let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+    sqlx::query(&format!(
+        "ALTER TABLE {} ADD PRIMARY KEY ({pklist})",
+        quote_table(dest_table)
+    ))
+    .execute(dst)
+    .await
+    .map_err(db_err)?;
 
     ensure_state_table(dst).await?;
     write_state(dst, dest_table, source_id, lsn, report.rows).await?;
