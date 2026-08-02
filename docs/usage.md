@@ -783,16 +783,42 @@ apitap.transfer(
   Iceberg** destinations. Iceberg needs a single-column primary key
   (equality-delete files are single-key), and the parquet lane's bytea
   restriction applies there as everywhere else.
-- **Many tables, ONE slot**: `tables=["orders", "customers"]` with
-  `mode="log_based"` forms a slot GROUP — one publication, one decode pass
-  per run (instead of Postgres decoding the same WAL once per table), one
-  snapshot-pinned bootstrap for every member, and the slot is confirmed
-  only after the whole group committed. Quiet tables advance their
-  watermark with the group. Changing the group's membership is a NEW slot —
-  the run refuses loudly until the old state is cleared.
-- **A mode per table, one call**: `tables={"orders": "log_based",
-  "events": "append", "dim_date": "replace"}` — bulk modes ride the
-  shared-budget pipeline, the log_based tables share their slot group.
+- **Many tables, ONE slot**: a list of tables forms a slot GROUP — one
+  publication, one drain pass per run, one snapshot-pinned bootstrap for
+  every member, and the slot is confirmed only after the whole group
+  committed:
+
+  ```python
+  apitap.transfer(src, dst, tables=["orders", "customers", "items"],
+                  mode="log_based")
+  ```
+
+  Every member lands at the SAME LSN each window (separate slots would
+  leave each table at its own moment), one slot carries the WAL-retention
+  risk instead of N, and the per-run fixed cost is paid once — measured
+  22% faster than three separate slots on an identical 3×220K-event
+  workload, with the gap growing as tables multiply
+  ([the ledger](../benchmarks/logbased-cdc.md)). Quiet tables advance
+  their watermark with the group. Changing the group's membership is a
+  NEW slot — the run refuses loudly until the old state is cleared. A
+  group fails as a unit: nothing is confirmed past a window every member
+  committed.
+- **A mode per table, one call**: pass a dict —
+
+  ```python
+  apitap.transfer(src, dst, tables={
+      "orders":    "log_based",   # CDC — shares one slot with customers
+      "customers": "log_based",
+      "events":    "append",      # bulk modes ride the shared-budget pipeline
+      "dim_date":  "replace",
+  })
+  ```
+- **Sizing, measured** (650K-event catch-up, all row-matched): 12.0 s at
+  0.5 vCPU / 256 MB — vs ape-dts 22 s and pipelinewise 227 s under the
+  same cap. The 44 MB tier replays a 2.1M-event backlog at a 33 MB peak.
+  Budget one transaction's whole row data in RAM: a single 500K-row
+  transaction measured a 307 MB peak (needs the 512 MB tier); normal-sized
+  transactions fit the smallest containers.
 
 ## Durability
 

@@ -186,7 +186,10 @@ use it for rebuildable destinations.
       a 0.5 vCPU / 44 MB container (33 MB peak). Same 650K-event window,
       everyone capped at 0.5 vCPU / 256 MB: **apitap 12 s** vs ape-dts 22 s
       vs pipelinewise 227 s, all row-matched
-      ([the ledger](benchmarks/logbased-cdc.md))
+      ([the ledger](benchmarks/logbased-cdc.md)). Many tables share ONE
+      replication slot (`tables=[…]` — same-LSN windows across members,
+      one retention risk, 22% faster than N slots), and a
+      ``{table: mode}`` dict mixes CDC and bulk modes in one call
 - [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
 - [x] Postgres → BigQuery (dual lanes picked per box: binary COPY → Parquet
       ZSTD, or CSV+gzip on small cores; parallel resumable load jobs → atomic

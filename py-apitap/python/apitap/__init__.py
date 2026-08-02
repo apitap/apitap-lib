@@ -169,12 +169,18 @@ def transfer(
         mode: ``"replace"`` (default, full refresh + atomic swap), ``"append"``
             (incremental: only rows with cursor past the destination's current
             ``max(cursor)`` are loaded — stateless, the watermark lives in the data;
-            bootstraps as replace when the table doesn't exist), or ``"merge"``
+            bootstraps as replace when the table doesn't exist), ``"merge"``
             (Postgres destinations: incremental upsert by the destination's
-            PRIMARY KEY). Incremental modes require a cursor (integer or
-            timestamp column). Append assumes the cursor is monotonic with
-            COMMIT order — for update-prone or concurrently-written tables use
-            merge with an ``updated_at`` cursor. See docs/usage.md.
+            PRIMARY KEY), or ``"log_based"`` (Postgres sources: batch CDC via
+            logical replication — every WAL operation incl. deletes and
+            TRUNCATEs, drained per scheduled run into Postgres, ClickHouse,
+            MySQL or Iceberg; first run bootstraps snapshot-pinned, the LSN
+            watermark commits atomically with the data, and a table list
+            shares ONE replication slot). Incremental modes require a cursor
+            (integer or timestamp column). Append assumes the cursor is
+            monotonic with COMMIT order — for update-prone or
+            concurrently-written tables use merge with an ``updated_at``
+            cursor. See docs/usage.md.
         engine: ClickHouse destinations only. Engine of the table apitap creates —
             any MergeTree-family spelling, Replicated included: ``"MergeTree"``
             (default), ``"ReplacingMergeTree(ins_dt)"``,
