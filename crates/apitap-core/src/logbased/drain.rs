@@ -64,6 +64,7 @@ pub(crate) async fn drain(
     key_cols: &HashMap<String, Vec<String>>,
     max_secs: u64,
     max_buf_bytes: usize,
+    applied: &tokio::sync::watch::Receiver<u64>,
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
@@ -109,9 +110,10 @@ pub(crate) async fn drain(
             None => break,
             Some(WalEvent::Keepalive { wal_end, reply_requested }) => {
                 if reply_requested {
-                    // Never confirm progress mid-drain: report the start
-                    // watermark; the real confirm happens after dest commit.
-                    ws.standby_status(start_lsn, false).await?;
+                    // Never confirm progress mid-drain: report the last lsn
+                    // the APPLY side committed (under overlap the previous
+                    // window may still be in flight — start_lsn would lie).
+                    ws.standby_status(*applied.borrow(), false).await?;
                 }
                 if wal_end >= stop_line && tx_buf.is_empty() {
                     // Server has shipped everything up to the stop-line and

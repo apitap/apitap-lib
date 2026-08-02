@@ -301,7 +301,7 @@ async fn run_group(
         bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
     } else {
         let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
-        drain_group(src_url, &src, &dest, &slot, &publication, &ctxs, wm).await
+        drain_group(src_url, &src, dest, &slot, &publication, &ctxs, wm).await
     }
 }
 
@@ -400,7 +400,7 @@ async fn bootstrap_group(
 async fn drain_group(
     src_url: &str,
     src: &PgPool,
-    dest: &Dest,
+    dest: Dest,
     slot: &str,
     publication: &str,
     ctxs: &[TableCtx],
@@ -450,56 +450,124 @@ async fn drain_group(
     }
 
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
-    let budget = window_budget();
+    // Two windows are resident under overlap (one applying, one draining) —
+    // the budget halves so peak memory stays at the single-window ceiling.
+    let budget = (window_budget() / 2).max(1 << 20);
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
 
-    // Windowed drain: each window applies to EVERY member (traffic or not —
-    // absent tables advance their watermark, keeping the group's minimum
-    // moving) before the next window buffers; the slot is confirmed only
-    // after the whole group committed the window.
+    // Overlapped windows (ape-dts's daemon trick, batch-shaped): the drain
+    // task keeps the walsender and decodes window N+1 WHILE a spawned apply
+    // task lands window N. The slot is confirmed only after the apply task
+    // reports a window fully committed (watch channel carries the last
+    // committed end_lsn back) — never past unapplied WAL, exactly like the
+    // serial loop, just off the clock.
+    let (win_tx, mut win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(1);
+    let (applied_tx, mut applied_rx) = tokio::sync::watch::channel::<u64>(wm);
+    let actxs: Vec<(String, String, Vec<String>, String)> = ctxs
+        .iter()
+        .map(|c| {
+            (c.dest_table.clone(), c.qualified.clone(), c.pk_cols.clone(), c.source_id.clone())
+        })
+        .collect();
+    let apool = src.clone();
+    let apply_task: tokio::task::JoinHandle<Result<Vec<u64>>> = tokio::spawn(async move {
+        let mut rows_per = vec![0u64; actxs.len()];
+        while let Some(o) = win_rx.recv().await {
+            let t_apply = std::time::Instant::now();
+            for (i, (dest_table, qualified, pk_cols, source_id)) in actxs.iter().enumerate() {
+                rows_per[i] +=
+                    dest.apply(dest_table, qualified, pk_cols, &o, source_id, &apool).await?;
+            }
+            if std::env::var("APITAP_DEBUG").is_ok() {
+                let events: u64 = o.tables.values().map(|c| c.events).sum();
+                eprintln!(
+                    "[log_based] applied lsn={} events={events} in {:.1}s",
+                    o.end_lsn,
+                    t_apply.elapsed().as_secs_f64(),
+                );
+            }
+            // Receiver may be gone on a drain-side abort — nothing to do.
+            let _ = applied_tx.send(o.end_lsn);
+        }
+        Ok(rows_per)
+    });
+
     let mut sess = DrainSession::default();
     let mut cur = wm;
-    let mut rows_per: Vec<u64> = vec![0; ctxs.len()];
     let mut windows = 0u32;
+    // The previous window's end_lsn: sent to the applier, not yet confirmed.
+    let mut pending: Option<u64> = None;
+    let mut drain_err: Option<Error> = None;
     loop {
         let t_drain = std::time::Instant::now();
-        let outcome =
-            drain(&mut ws, &mut sess, cur, stop_line, &key_cols, 3600, budget).await?;
-        let t_drain = t_drain.elapsed();
-
-        let t_apply = std::time::Instant::now();
-        let applied_lsn = if outcome.end_lsn > cur {
-            for (i, c) in ctxs.iter().enumerate() {
-                rows_per[i] += dest
-                    .apply(&c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id, src)
-                    .await?;
+        let outcome = match drain(
+            &mut ws, &mut sess, cur, stop_line, &key_cols, 3600, budget, &applied_rx,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                drain_err = Some(e);
+                break;
             }
-            outcome.end_lsn
-        } else {
-            cur
         };
         windows += 1;
         if dbg {
             let events: u64 = outcome.tables.values().map(|c| c.events).sum();
             eprintln!(
-                "[log_based] window={windows} tables={} drain={:.1}s apply={:.1}s \
-                 events={events} budget_hit={}",
+                "[log_based] window={windows} tables={} drain={:.1}s events={events} \
+                 budget_hit={}",
                 outcome.tables.len(),
-                t_drain.as_secs_f64(),
-                t_apply.elapsed().as_secs_f64(),
+                t_drain.elapsed().as_secs_f64(),
                 outcome.hit_budget,
             );
         }
-
-        // Every member committed — NOW the source may discard this window's WAL.
-        ws.standby_status(applied_lsn, false).await?;
-        cur = applied_lsn;
-        if !outcome.hit_budget {
+        let end = outcome.end_lsn;
+        let hit = outcome.hit_budget;
+        if end > cur {
+            if win_tx.send(outcome).await.is_err() {
+                // Apply task died — its JoinHandle carries the real error.
+                break;
+            }
+        }
+        // Confirm the PREVIOUS window once applied (bounds resident windows
+        // to two and keeps the slot's confirmed LSN strictly behind commits).
+        if let Some(p) = pending.take() {
+            if applied_rx.wait_for(|&a| a >= p).await.is_err() {
+                break;
+            }
+            ws.standby_status(p, false).await?;
+        }
+        if end > cur {
+            pending = Some(end);
+            cur = end;
+        }
+        if !hit {
             break;
         }
     }
+    drop(win_tx);
+    // Wait for the final in-flight window, confirm, then collect the applier.
+    if drain_err.is_none() {
+        if let Some(p) = pending {
+            if applied_rx.wait_for(|&a| a >= p).await.is_ok() {
+                ws.standby_status(p, false).await?;
+            }
+        }
+    }
+    let joined = apply_task.await;
     ws.stop_replication().await.ok();
+    if let Some(e) = drain_err {
+        return Err(e);
+    }
+    let rows_per = match joined {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(j) => {
+            return Err(Error::Transfer(format!("log_based: apply task panicked: {j}")))
+        }
+    };
 
     Ok(rows_per.into_iter().map(|r| (r, 1)).collect())
 }

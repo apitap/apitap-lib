@@ -165,17 +165,21 @@ impl PgDest {
                 let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
                 render_key_row(&refs, &mut buf);
                 if buf.len() > 4 << 20 {
-                    copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
+                    // send(&buf) keeps the 4 MiB capacity — mem::take would
+                    // regrow it from zero every chunk on the timed path.
+                    copy.send(&buf[..]).await.map_err(db_err)?;
+                    buf.clear();
                 }
             }
             for row in &c.upserts {
                 render_key_row(&row_key_refs(row, &pk_idx), &mut buf);
                 if buf.len() > 4 << 20 {
-                    copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
+                    copy.send(&buf[..]).await.map_err(db_err)?;
+                    buf.clear();
                 }
             }
             if !buf.is_empty() {
-                copy.send(buf).await.map_err(db_err)?;
+                copy.send(&buf[..]).await.map_err(db_err)?;
             }
             copy.finish().await.map_err(db_err)?;
             let join = pk_cols
@@ -207,11 +211,12 @@ impl PgDest {
             for row in &c.upserts {
                 render_copy_row(row, &mut buf)?;
                 if buf.len() > 4 << 20 {
-                    copy.send(std::mem::take(&mut buf)).await.map_err(db_err)?;
+                    copy.send(&buf[..]).await.map_err(db_err)?;
+                    buf.clear();
                 }
             }
             if !buf.is_empty() {
-                copy.send(buf).await.map_err(db_err)?;
+                copy.send(&buf[..]).await.map_err(db_err)?;
             }
             copy.finish().await.map_err(db_err)?;
             // No ON CONFLICT: the delete phase already removed every one of

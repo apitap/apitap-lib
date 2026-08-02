@@ -98,7 +98,27 @@ fn percent_decode(s: &str) -> Result<String> {
 
 impl Walsender {
     /// Open a `replication=database` session and authenticate.
+    ///
+    /// The first attempt rides GUCs in the startup `options` field: raising
+    /// `logical_decoding_work_mem` keeps a big transaction's ReorderBuffer
+    /// off pg_replslot spill files (measured 14.5s → 11.9s on a 500K-row-tx
+    /// window). It is PGC_USERSET, so no server config is needed — but if
+    /// the server rejects the options for any reason, retry plain rather
+    /// than fail a connection that worked fine before this optimization.
     pub(crate) async fn connect(url: &str) -> Result<Self> {
+        let workmem =
+            std::env::var("APITAP_DECODE_WORKMEM").unwrap_or_else(|_| "1GB".to_string());
+        if !matches!(workmem.as_str(), "" | "0" | "off") {
+            let opts = format!("-c logical_decoding_work_mem={workmem}");
+            match Self::connect_with(url, Some(&opts)).await {
+                Ok(ws) => return Ok(ws),
+                Err(_) => {} // fall through to a plain startup
+            }
+        }
+        Self::connect_with(url, None).await
+    }
+
+    async fn connect_with(url: &str, options: Option<&str>) -> Result<Self> {
         let ci = parse_url(url)?;
         let stream = TcpStream::connect((ci.host.as_str(), ci.port))
             .await
@@ -111,15 +131,15 @@ impl Walsender {
             stream: BufStream::with_capacity(1 << 20, 64 << 10, stream),
             copying: false,
         };
-        ws.startup(&ci).await?;
+        ws.startup(&ci, options).await?;
         Ok(ws)
     }
 
-    async fn startup(&mut self, ci: &ConnInfo) -> Result<()> {
+    async fn startup(&mut self, ci: &ConnInfo, options: Option<&str>) -> Result<()> {
         // StartupMessage: no tag; length + protocol 3.0 + kv pairs.
         let mut body = Vec::with_capacity(128);
         body.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
-        for (k, v) in [
+        let mut params: Vec<(&str, &str)> = vec![
             ("user", ci.user.as_str()),
             ("database", ci.db.as_str()),
             ("replication", "database"),
@@ -128,7 +148,11 @@ impl Walsender {
             // the session's zone, and the apply paths (MySQL especially)
             // depend on the offset being a fixed +00.
             ("TimeZone", "UTC"),
-        ] {
+        ];
+        if let Some(o) = options {
+            params.push(("options", o));
+        }
+        for (k, v) in params {
             body.extend_from_slice(k.as_bytes());
             body.push(0);
             body.extend_from_slice(v.as_bytes());
