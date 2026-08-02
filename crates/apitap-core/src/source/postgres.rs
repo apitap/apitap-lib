@@ -56,12 +56,31 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
 
 pub(crate) struct PgSource {
     pool: PgPool,
+    /// log_based bootstrap: exported snapshot every COPY span pins itself to
+    /// (each span runs in REPEATABLE READ + SET TRANSACTION SNAPSHOT).
+    snapshot: Option<std::sync::Arc<str>>,
 }
 
 impl PgSource {
     pub(crate) async fn connect(url: &str, max_conns: usize) -> Result<Self> {
+        // The snapshot rides an internal URL param so it can cross the
+        // scheme-dispatch boundary without widening every trait; it is
+        // stripped before sqlx sees the URL.
+        let (url, snapshot) = match url.split_once("__apitap_snapshot=") {
+            Some((head, tail)) => {
+                let (snap, rest) = tail.split_once('&').map_or((tail, ""), |(a, b)| (a, b));
+                let mut clean = head.trim_end_matches(['?', '&']).to_string();
+                if !rest.is_empty() {
+                    clean.push(if clean.contains('?') { '&' } else { '?' });
+                    clean.push_str(rest);
+                }
+                (clean, Some(std::sync::Arc::<str>::from(snap)))
+            }
+            None => (url.to_string(), None),
+        };
         Ok(Self {
-            pool: connect_pool(url, max_conns as u32).await?,
+            pool: connect_pool(&url, max_conns as u32).await?,
+            snapshot,
         })
     }
 }
@@ -460,6 +479,7 @@ impl Source for PgSource {
                 mode,
                 loader,
                 chunk,
+                self.snapshot.clone(),
             )));
         }
         let mut rows = 0u64;
@@ -569,6 +589,7 @@ async fn copy_out_worker<L: Loader>(
     mode: PgReadMode,
     mut loader: L,
     chunk: usize,
+    snapshot: Option<std::sync::Arc<str>>,
 ) -> Result<u64> {
     let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
     if matches!(mode, PgReadMode::FrameStrip) {
@@ -577,7 +598,47 @@ async fn copy_out_worker<L: Loader>(
         crate::wire::pgcopy::header(&mut out);
     }
     while let Some(sql) = pop(&queue) {
-        let mut stream = match pool.copy_out_raw(&sql).await {
+        // With a pinned snapshot each span runs on a dedicated connection in
+        // REPEATABLE READ + SET TRANSACTION SNAPSHOT — every worker sees the
+        // exact table state of the slot's consistent point.
+        let mut pinned_conn = match &snapshot {
+            None => None,
+            Some(snap) => {
+                let mut conn = match pool.acquire().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(loader
+                            .abort(Error::Transfer(format!("pin acquire: {e}")))
+                            .await)
+                    }
+                };
+                let pin = async {
+                    use sqlx::Executor as _;
+                    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                        .await?;
+                    conn.execute(
+                        format!("SET TRANSACTION SNAPSHOT '{}'", snap.replace('\'', "''"))
+                            .as_str(),
+                    )
+                    .await?;
+                    Ok::<_, sqlx::Error>(())
+                }
+                .await;
+                if let Err(e) = pin {
+                    return Err(loader
+                        .abort(Error::Transfer(format!(
+                            "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
+                             walsender session still open?"
+                        )))
+                        .await);
+                }
+                Some(conn)
+            }
+        };
+        let mut stream = match match &mut pinned_conn {
+            Some(conn) => conn.copy_out_raw(&sql).await,
+            None => pool.copy_out_raw(&sql).await,
+        } {
             Ok(s) => s,
             Err(e) => {
                 return Err(loader
@@ -616,6 +677,11 @@ async fn copy_out_worker<L: Loader>(
             return Err(loader
                 .abort(Error::Transfer("pg binary COPY ended mid-stream".into()))
                 .await);
+        }
+        drop(stream);
+        if let Some(mut conn) = pinned_conn {
+            use sqlx::Executor as _;
+            let _ = conn.execute("COMMIT").await;
         }
     }
     if matches!(mode, PgReadMode::FrameStrip) {

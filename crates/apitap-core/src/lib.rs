@@ -70,7 +70,7 @@ impl std::str::FromStr for Mode {
             "merge" => Ok(Mode::Merge),
             "log_based" => Ok(Mode::LogBased),
             other => Err(Error::InvalidInput(format!(
-                "mode must be 'replace', 'append' or 'merge' (got '{other}')"
+                "mode must be 'replace', 'append', 'merge' or 'log_based' (got '{other}')"
             ))),
         }
     }
@@ -208,6 +208,9 @@ pub async fn transfer(
     table: &str,
     opts: &TransferOptions,
 ) -> Result<TransferReport> {
+    if opts.mode == Mode::LogBased {
+        return logbased::run::run_task(src_url, dst_url, table, opts).await;
+    }
     pipeline::dispatch::single(src_url, dst_url, table, opts).await
 }
 
