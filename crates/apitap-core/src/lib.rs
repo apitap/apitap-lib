@@ -26,6 +26,7 @@
 mod dialect;
 mod error;
 mod aws;
+mod logbased;
 mod gcp;
 mod pipeline;
 mod plan;
