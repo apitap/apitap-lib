@@ -312,11 +312,12 @@ impl Walsender {
                         Some(b'w') => {
                             let wal_start =
                                 u64::from_be_bytes(msg[1..9].try_into().unwrap());
-                            // bytes 9..17 wal_end, 17..25 server clock — unused
-                            return Ok(Some(WalEvent::XLogData {
-                                wal_start,
-                                payload: msg[25..].to_vec(),
-                            }));
+                            // bytes 9..17 wal_end, 17..25 server clock — unused.
+                            // Shift the header off in place: one alloc per
+                            // message, not two (drains at ~1M events/window).
+                            let mut payload = msg;
+                            payload.drain(..25);
+                            return Ok(Some(WalEvent::XLogData { wal_start, payload }));
                         }
                         Some(b'k') => {
                             let wal_end = u64::from_be_bytes(msg[1..9].try_into().unwrap());

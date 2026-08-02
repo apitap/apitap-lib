@@ -8,6 +8,7 @@ use crate::logbased::collapse::{Collapsed, Collapser};
 use crate::wire::pgoutput::{self, Cell, PgoMessage, Relation};
 use crate::wire::walsender::{WalEvent, Walsender};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub(crate) struct DrainOutcome {
     /// Collapsed window per "schema.table".
@@ -21,7 +22,7 @@ pub(crate) struct DrainOutcome {
 }
 
 struct RelState {
-    table: String,
+    table: Arc<str>,
     key_idx: Vec<usize>,
     tracked: bool,
 }
@@ -42,7 +43,7 @@ pub(crate) async fn drain(
     let mut wal_cols: HashMap<String, Vec<String>> = HashMap::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
     // if the drain aborts mid-transaction.
-    let mut tx_buf: Vec<(String, TxOp)> = Vec::new();
+    let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
     let mut end_lsn = start_lsn;
 
     enum TxOp {
@@ -58,11 +59,12 @@ pub(crate) async fn drain(
             // discarded; end_lsn still points at the last complete commit.
             break;
         }
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next_event()).await;
-        let ev = match ev {
-            Err(_) => continue, // poll tick — re-check the deadline
-            Ok(r) => r?,
-        };
+        // No per-event timeout: cancelling next_event mid-read would tear a
+        // half-consumed frame off the stream (protocol desync), and a timer
+        // per message is real overhead at millions of events. The server's
+        // keepalives (~wal_sender_timeout/2) wake this loop on idle streams,
+        // so the deadline above is checked at least that often.
+        let ev = ws.next_event().await?;
         match ev {
             None => break,
             Some(WalEvent::Keepalive { wal_end, reply_requested }) => {
@@ -82,7 +84,7 @@ pub(crate) async fn drain(
                 PgoMessage::Commit { end_lsn: e, .. } => {
                     for (table, op) in tx_buf.drain(..) {
                         let c = collapsers
-                            .get_mut(&table)
+                            .get_mut(table.as_ref())
                             .expect("collapser exists for tracked table");
                         match op {
                             TxOp::Insert(row) => c.insert(row)?,
@@ -100,10 +102,10 @@ pub(crate) async fn drain(
                     let st = rel_state(&r, key_cols)?;
                     if st.tracked {
                         collapsers
-                            .entry(st.table.clone())
+                            .entry(st.table.to_string())
                             .or_insert_with(|| Collapser::new(st.key_idx.clone()));
                         wal_cols.insert(
-                            st.table.clone(),
+                            st.table.to_string(),
                             r.cols.iter().map(|c| c.name.clone()).collect(),
                         );
                     }
@@ -147,14 +149,15 @@ pub(crate) async fn drain(
 }
 
 fn rel_state(r: &Relation, key_cols: &HashMap<String, Vec<String>>) -> Result<RelState> {
-    let table = format!("{}.{}", r.namespace, r.name);
-    let Some(want) = key_cols.get(&table) else {
+    let table_s = format!("{}.{}", r.namespace, r.name);
+    let table: Arc<str> = table_s.as_str().into();
+    let Some(want) = key_cols.get(&table_s) else {
         return Ok(RelState { table, key_idx: Vec::new(), tracked: false });
     };
     if r.replica_identity == b'n' {
         return Err(Error::InvalidInput(format!(
-            "log_based: table {table} has REPLICA IDENTITY NOTHING — updates and \
-             deletes carry no key. Run: ALTER TABLE {table} REPLICA IDENTITY \
+            "log_based: table {table_s} has REPLICA IDENTITY NOTHING — updates and \
+             deletes carry no key. Run: ALTER TABLE {table_s} REPLICA IDENTITY \
              DEFAULT (with a primary key) or FULL"
         )));
     }
@@ -166,7 +169,7 @@ fn rel_state(r: &Relation, key_cols: &HashMap<String, Vec<String>>) -> Result<Re
                 .position(|c| &c.name == k)
                 .ok_or_else(|| {
                     Error::Transfer(format!(
-                        "log_based: key column '{k}' not in WAL relation for {table}"
+                        "log_based: key column '{k}' not in WAL relation for {table_s}"
                     ))
                 })
         })
@@ -177,9 +180,9 @@ fn rel_state(r: &Relation, key_cols: &HashMap<String, Vec<String>>) -> Result<Re
         for &i in &key_idx {
             if !r.cols[i].key {
                 return Err(Error::InvalidInput(format!(
-                    "log_based: key column '{}' of {table} is not part of the \
+                    "log_based: key column '{}' of {table_s} is not part of the \
                      source's REPLICA IDENTITY — old images won't carry it. \
-                     Use the source PK as the key, or ALTER TABLE {table} \
+                     Use the source PK as the key, or ALTER TABLE {table_s} \
                      REPLICA IDENTITY FULL",
                     r.cols[i].name
                 )));
@@ -189,7 +192,7 @@ fn rel_state(r: &Relation, key_cols: &HashMap<String, Vec<String>>) -> Result<Re
     Ok(RelState { table, key_idx, tracked: true })
 }
 
-fn tracked(rels: &HashMap<u32, RelState>, rel_id: u32) -> Result<Option<String>> {
+fn tracked(rels: &HashMap<u32, RelState>, rel_id: u32) -> Result<Option<Arc<str>>> {
     match rels.get(&rel_id) {
         Some(st) if st.tracked => Ok(Some(st.table.clone())),
         Some(_) => Ok(None),
