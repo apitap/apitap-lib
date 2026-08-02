@@ -115,6 +115,25 @@ pg 23.1→33.3 s (the +10 s is `ADD PRIMARY KEY` on 10M rows — paid once),
 ch 12.0→12.5 s, mysql 141.2→132.6 s, iceberg 14.8→14.8 s. The bootstrap
 is the replace path plus the identity, nothing hidden.
 
+## Multi-table: one slot vs three (2026-08-02)
+
+Identical 3-table workload (200K rows each, then 220K events each = 660K
+total), both setups row-verified:
+
+| setup | catch-up |
+|---|---|
+| three single-table slots, sequential | 18.3 s (6.0 s each) |
+| ONE group slot (`tables=[…]`) | **14.3 s** (−22%) |
+
+Honest reading: the win is NOT N× — pgoutput only *renders* the rows its
+publication carries, so what repeats per slot is the WAL scan/reorder, not
+the rendering (two extra scans ≈ 4 s here). The structural wins are what
+you can't buy back with separate slots: every member lands at the SAME
+LSN each window (separate slots leave each table at its own moment), one
+slot to manage instead of N retention risks, and per-run fixed cost ×1
+instead of ×N — with many small tables the ~0.3–0.5 s per-call overhead
+is the dominant term. Reproduce: `bench-cdc-multitable.sh`.
+
 ## The 44 MB tier (2026-08-02)
 
 The windowed drain (budget = cgroup limit minus a 24 MiB runtime reserve,
