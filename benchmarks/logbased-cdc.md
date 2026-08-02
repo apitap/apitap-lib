@@ -61,6 +61,17 @@ can only hide apply up to the drain's own duration. The next lever there
 is a parallel apply (ape-dts phases its deletes/inserts across 8 workers;
 our set-based phases have the same barrier structure to exploit).
 
+**The scale race, and what it costs** (same 2.5M-event window, both
+row-verified): ape-dts catches up into pg in **45 s** to apitap's 60 s —
+an honest loss at this shape — but the resource ledger reframes it:
+apitap's run averages **1.00 core** (measured via cgroup cpu.stat under a
+4-cpu cap; wall identical to uncapped) while ape-dts spends 8 apply
+workers. At EQUAL cpu (the 0.5-core race above) the order inverts hard
+(12 s vs 22 s). Peak RAM for the window: **630 MB**, dominated by the
+1M-row single transaction buffered whole; the same event count in
+normal-sized transactions runs at 32 MB. Into clickhouse apitap does the
+window in 36.7 s on that same single core.
+
 Rig: OVH VPS (16 vCPU / 61 GB), `postgres:16-alpine` source with
 `wal_level=logical` and a second Postgres as destination, both on loopback.
 apitap built from main; ape-dts `apecloud/ape-dts:latest`.
