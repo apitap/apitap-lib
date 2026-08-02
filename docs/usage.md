@@ -780,10 +780,19 @@ apitap.transfer(
   TABLE` to run. The replication connection speaks plain TCP for now
   (`sslmode` beyond disable/prefer is refused, not ignored).
 - **Scope today**: Postgres sources → **Postgres, ClickHouse, MySQL and
-  Iceberg** destinations, single table per call; multi-table per slot is
-  next. Iceberg needs a single-column primary key (equality-delete files
-  are single-key), and the parquet lane's bytea restriction applies there
-  as everywhere else.
+  Iceberg** destinations. Iceberg needs a single-column primary key
+  (equality-delete files are single-key), and the parquet lane's bytea
+  restriction applies there as everywhere else.
+- **Many tables, ONE slot**: `tables=["orders", "customers"]` with
+  `mode="log_based"` forms a slot GROUP — one publication, one decode pass
+  per run (instead of Postgres decoding the same WAL once per table), one
+  snapshot-pinned bootstrap for every member, and the slot is confirmed
+  only after the whole group committed. Quiet tables advance their
+  watermark with the group. Changing the group's membership is a NEW slot —
+  the run refuses loudly until the old state is cleared.
+- **A mode per table, one call**: `tables={"orders": "log_based",
+  "events": "append", "dim_date": "replace"}` — bulk modes ride the
+  shared-budget pipeline, the log_based tables share their slot group.
 
 ## Durability
 
