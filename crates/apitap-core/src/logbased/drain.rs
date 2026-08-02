@@ -33,6 +33,20 @@ struct RelState {
     tracked: bool,
 }
 
+/// Per-STREAM decode state that outlives one window: pgoutput announces a
+/// Relation ONCE per walsender session, so a windowed drain (budget loop)
+/// must carry the registry from window to window or the second window sees
+/// "row event for unknown relation".
+#[derive(Default)]
+pub(crate) struct DrainSession {
+    rels: HashMap<u32, RelState>,
+    /// Key-column indices by "schema.table" — later windows build their
+    /// collapsers from this (no Relation message re-arrives for them).
+    key_idx: HashMap<String, Vec<usize>>,
+    wal_cols: HashMap<String, Vec<String>>,
+    wal_oids: HashMap<String, Vec<u32>>,
+}
+
 /// `key_cols`: replica-identity/PK column NAMES per "schema.table" — chosen
 /// by the caller from the destination plan (works for REPLICA IDENTITY FULL
 /// tables too, where the WAL flags every column as key).
@@ -44,6 +58,7 @@ struct RelState {
 /// commit, so sub-transaction spilling buys nothing upstream).
 pub(crate) async fn drain(
     ws: &mut Walsender,
+    sess: &mut DrainSession,
     start_lsn: u64,
     stop_line: u64,
     key_cols: &HashMap<String, Vec<String>>,
@@ -51,10 +66,7 @@ pub(crate) async fn drain(
     max_buf_bytes: usize,
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
-    let mut rels: HashMap<u32, RelState> = HashMap::new();
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
-    let mut wal_cols: HashMap<String, Vec<String>> = HashMap::new();
-    let mut wal_oids: HashMap<String, Vec<u32>> = HashMap::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
     // if the drain aborts mid-transaction.
     let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
@@ -111,9 +123,18 @@ pub(crate) async fn drain(
                 PgoMessage::Begin { .. } => tx_buf.clear(),
                 PgoMessage::Commit { end_lsn: e, .. } => {
                     for (table, op) in tx_buf.drain(..) {
+                        // Lazy per-window collapser: the Relation message came
+                        // in THIS window or an earlier one — the session knows.
+                        if !collapsers.contains_key(table.as_ref()) {
+                            let ki = sess.key_idx.get(table.as_ref()).expect(
+                                "session key_idx exists for tracked table",
+                            );
+                            collapsers
+                                .insert(table.to_string(), Collapser::new(ki.clone()));
+                        }
                         let c = collapsers
                             .get_mut(table.as_ref())
-                            .expect("collapser exists for tracked table");
+                            .expect("collapser just ensured");
                         match op {
                             TxOp::Insert(row) => c.insert(row)?,
                             TxOp::Update(old, row) => c.update(old.as_deref(), row)?,
@@ -133,28 +154,26 @@ pub(crate) async fn drain(
                 PgoMessage::Relation(r) => {
                     let st = rel_state(&r, key_cols)?;
                     if st.tracked {
-                        collapsers
-                            .entry(st.table.to_string())
-                            .or_insert_with(|| Collapser::new(st.key_idx.clone()));
-                        wal_cols.insert(
+                        sess.key_idx.insert(st.table.to_string(), st.key_idx.clone());
+                        sess.wal_cols.insert(
                             st.table.to_string(),
                             r.cols.iter().map(|c| c.name.clone()).collect(),
                         );
-                        wal_oids.insert(
+                        sess.wal_oids.insert(
                             st.table.to_string(),
                             r.cols.iter().map(|c| c.type_oid).collect(),
                         );
                     }
-                    rels.insert(r.rel_id, st);
+                    sess.rels.insert(r.rel_id, st);
                 }
                 PgoMessage::Insert { rel_id, new } => {
-                    if let Some(t) = tracked(&rels, rel_id)? {
+                    if let Some(t) = tracked(&sess.rels, rel_id)? {
                         buf_bytes += cells_bytes(&new);
                         tx_buf.push((t, TxOp::Insert(new)));
                     }
                 }
                 PgoMessage::Update { rel_id, old, new } => {
-                    if let Some(t) = tracked(&rels, rel_id)? {
+                    if let Some(t) = tracked(&sess.rels, rel_id)? {
                         let old = old.map(|o| o.tuple);
                         buf_bytes += cells_bytes(&new)
                             + old.as_deref().map_or(0, cells_bytes);
@@ -162,14 +181,14 @@ pub(crate) async fn drain(
                     }
                 }
                 PgoMessage::Delete { rel_id, old } => {
-                    if let Some(t) = tracked(&rels, rel_id)? {
+                    if let Some(t) = tracked(&sess.rels, rel_id)? {
                         buf_bytes += cells_bytes(&old.tuple);
                         tx_buf.push((t, TxOp::Delete(old.tuple)));
                     }
                 }
                 PgoMessage::Truncate { rel_ids, .. } => {
                     for rid in rel_ids {
-                        if let Some(t) = tracked(&rels, rid)? {
+                        if let Some(t) = tracked(&sess.rels, rid)? {
                             tx_buf.push((t, TxOp::Truncate));
                         }
                     }
@@ -185,8 +204,8 @@ pub(crate) async fn drain(
             .map(|(t, c)| (t, c.finish()))
             .collect(),
         end_lsn,
-        wal_cols,
-        wal_oids,
+        wal_cols: sess.wal_cols.clone(),
+        wal_oids: sess.wal_oids.clone(),
         hit_budget,
     })
 }

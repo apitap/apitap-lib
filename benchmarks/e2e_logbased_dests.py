@@ -25,6 +25,10 @@ DESTS = {
 T = "cdc_demo"
 which = sys.argv[1]
 DST = DESTS[which]
+# The parquet lane refuses bytea outright (pre-existing bulk-path limit,
+# "cast it in a source view") — the ice leg runs without the blob column.
+HAS_BLOB = which != "ice"
+
 
 
 def sh(args):
@@ -99,10 +103,11 @@ def rows_src():
     blob = ("coalesce(encode(convert_to(blob::text,'UTF8'),'base64'),'<N>')"
             if which == "ch"
             else "coalesce(upper(encode(blob,'hex')),'<N>')")
+    tail = f"||'|'||{blob}" if HAS_BLOB else ""
     return src(
         f"SELECT id||'|'||coalesce(v,'<N>')||'|'||coalesce(big,'<N>')||'|'"
-        f"||coalesce((flag::int)::text,'<N>')||'|'"
-        f"||{blob} FROM {T} ORDER BY id")
+        f"||coalesce((flag::int)::text,'<N>')"
+        f"{tail} FROM {T} ORDER BY id")
 
 
 def rows_dst():
@@ -111,9 +116,14 @@ def rows_dst():
             f"SELECT concat(toString(id),'|',ifNull(v,'<N>'),'|',ifNull(big,'<N>'),'|',"
             f"ifNull(toString(toUInt8(flag)),'<N>'),'|',ifNull(base64Encode(blob),'<N>')) "
             f"FROM {T} ORDER BY id")
-    return my(
-        f"SELECT CONCAT(id,'|',COALESCE(v,'<N>'),'|',COALESCE(big,'<N>'),'|',"
-        f"COALESCE(flag,'<N>'),'|',COALESCE(HEX(`blob`),'<N>')) FROM {T} ORDER BY id")
+    if which == "my":
+        return my(
+            f"SELECT CONCAT(id,'|',COALESCE(v,'<N>'),'|',COALESCE(big,'<N>'),'|',"
+            f"COALESCE(flag,'<N>'),'|',COALESCE(HEX(`blob`),'<N>')) FROM {T} ORDER BY id")
+    q = (f"SELECT id || '|' || coalesce(v,'<N>') || '|' || coalesce(big,'<N>') || '|' "
+         f"|| coalesce(cast(cast(flag as int) as varchar),'<N>') "
+         f"FROM iceberg_scan('{ice_meta()['metadata-location']}') ORDER BY id")
+    return "\n".join(r[0] for r in duck().execute(q).fetchall())
 
 
 def check(label):
@@ -133,6 +143,10 @@ def check(label):
 
 
 def state_mode():
+    if which == "ice":
+        props = ice_meta()["metadata"].get("properties", {})
+        cur = [v for k, v in props.items() if k.startswith("apitap.watermark-cursor.")]
+        return "log_based" if cur == ["_lsn"] else f"bad-props:{props}"
     if which == "ch":
         return ch(f"SELECT mode FROM `_apitap_state` FINAL WHERE dest_table = '{T}'")
     return my(f"SELECT mode FROM _apitap_state WHERE dest_table = '{T}'")
@@ -145,11 +159,13 @@ if which == "ch":
     ch(f"DROP TABLE IF EXISTS {T}__apitap_cdc_del")
     ch(f"DELETE FROM `_apitap_state` WHERE dest_table = '{T}'") if ch(
         f"SELECT count() FROM system.tables WHERE name = '_apitap_state'") != "0" else None
-else:
+elif which == "my":
     my(f"DROP TABLE IF EXISTS {T}")
     my(f"DELETE FROM _apitap_state WHERE dest_table = '{T}'") if my(
         "SELECT COUNT(*) FROM information_schema.tables "
         "WHERE table_schema='bench' AND table_name='_apitap_state'") != "0" else None
+else:
+    ice_drop()
 for s in src("SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%'").splitlines():
     if s:
         src(f"SELECT pg_drop_replication_slot('{s}')")
@@ -157,12 +173,15 @@ for p in src("SELECT pubname FROM pg_publication WHERE pubname LIKE 'apitap_%'")
     if p:
         src(f"DROP PUBLICATION {p}")
 
+blob_col = "blob bytea," if HAS_BLOB else ""
+blob_ins = ", decode(lpad(to_hex(g), 8, '0'), 'hex')" if HAS_BLOB else ""
+blob_names = ", blob" if HAS_BLOB else ""
 src(f"""CREATE TABLE {T} (
       id int PRIMARY KEY, v text, big text,
-      flag boolean, blob bytea,
+      flag boolean, {blob_col}
       ts timestamp DEFAULT now())""")
-src(f"INSERT INTO {T}(id, v, big, flag, blob) "
-    f"SELECT g, 'v'||g, NULL, g % 2 = 0, decode(lpad(to_hex(g), 8, '0'), 'hex') "
+src(f"INSERT INTO {T}(id, v, big, flag{blob_names}) "
+    f"SELECT g, 'v'||g, NULL, g % 2 = 0{blob_ins} "
     f"FROM generate_series(1, 100000) g")
 src(f"UPDATE {T} SET big = repeat('x', 200000) WHERE id = 42")  # real TOAST
 
@@ -173,13 +192,17 @@ check("after bootstrap")
 assert state_mode() == "log_based", state_mode()
 
 # ── window 1: the full op mix across several transactions ───────────────────
-src(f"INSERT INTO {T}(id, v, flag, blob) VALUES (100001, 'new', true, '\\x00ff'), (100002, '', NULL, NULL)")
+if HAS_BLOB:
+    src(f"INSERT INTO {T}(id, v, flag, blob) VALUES (100001, 'new', true, '\\x00ff'), (100002, '', NULL, NULL)")
+else:
+    src(f"INSERT INTO {T}(id, v, flag) VALUES (100001, 'new', true), (100002, '', NULL)")
 src(f"UPDATE {T} SET v = 'updated', flag = NOT flag WHERE id <= 5")
 src(f"DELETE FROM {T} WHERE id BETWEEN 10 AND 19")
 src(f"UPDATE {T} SET id = 999999 WHERE id = 7")                        # PK change
 src(f"UPDATE {T} SET v = 'toast-kept' WHERE id = 42")                  # unchanged TOAST
 src(f"INSERT INTO {T}(id, v) VALUES (100003, 'gone'); DELETE FROM {T} WHERE id = 100003")
-src(f"UPDATE {T} SET blob = '\\xdeadbeef' WHERE id = 100")             # bytea update
+if HAS_BLOB:
+    src(f"UPDATE {T} SET blob = '\\xdeadbeef' WHERE id = 100")         # bytea update
 r = run("run2 drain")
 assert r.rows > 0
 check("after mixed window")
@@ -198,7 +221,10 @@ check("after heavy window")
 
 # ── TRUNCATE capture ────────────────────────────────────────────────────────
 src(f"TRUNCATE {T}")
-src(f"INSERT INTO {T}(id, v, flag, blob) VALUES (1, 'post-trunc', true, '\\x01')")
+if HAS_BLOB:
+    src(f"INSERT INTO {T}(id, v, flag, blob) VALUES (1, 'post-trunc', true, '\\x01')")
+else:
+    src(f"INSERT INTO {T}(id, v, flag) VALUES (1, 'post-trunc', true)")
 r = run("run5 truncate")
 check("after truncate")
 
@@ -209,9 +235,11 @@ src(f"DROP TABLE IF EXISTS {T} CASCADE")
 if which == "ch":
     ch(f"DROP TABLE IF EXISTS {T}")
     ch(f"DELETE FROM `_apitap_state` WHERE dest_table = '{T}'")
-else:
+elif which == "my":
     my(f"DROP TABLE IF EXISTS {T}")
     my(f"DELETE FROM _apitap_state WHERE dest_table = '{T}'")
+else:
+    ice_drop()
 for s in src("SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%'").splitlines():
     if s:
         src(f"SELECT pg_drop_replication_slot('{s}')")

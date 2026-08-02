@@ -16,7 +16,7 @@ use crate::logbased::dest_ch::ChDest;
 use crate::logbased::dest_ice::IceDest;
 use crate::logbased::dest_my::MyDest;
 use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest};
-use crate::logbased::drain::{drain, DrainOutcome};
+use crate::logbased::drain::{drain, DrainOutcome, DrainSession};
 use crate::wire::pgoutput::lsn_from_string;
 use crate::wire::walsender::Walsender;
 use crate::{Mode, TransferOptions, TransferReport};
@@ -330,12 +330,16 @@ async fn drain_run(
 
     // Windowed drain: each window applies (with its watermark) before the
     // next one buffers, so peak memory is the window budget — not the lag.
+    // The session carries the Relation registry across windows (pgoutput
+    // announces a relation once per stream).
+    let mut sess = DrainSession::default();
     let mut cur = wm;
     let mut total_rows = 0u64;
     let mut windows = 0u32;
     loop {
         let t_drain = std::time::Instant::now();
-        let outcome = drain(&mut ws, cur, stop_line, &key_cols, 3600, budget).await?;
+        let outcome =
+            drain(&mut ws, &mut sess, cur, stop_line, &key_cols, 3600, budget).await?;
         let t_drain = t_drain.elapsed();
 
         let t_apply = std::time::Instant::now();
