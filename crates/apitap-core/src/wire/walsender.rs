@@ -575,4 +575,103 @@ mod tests {
         assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
         assert!(parse_url("postgres://u:p@h/db?sslmode=require").is_err());
     }
+
+    /// LIVE smoke against a real Postgres (`wal_level=logical`):
+    ///
+    ///   WAL_URL=postgres://user:pass@host/db \
+    ///   cargo test -p apitap-core walsender_live -- --ignored --nocapture
+    ///
+    /// Creates a TEMPORARY slot (auto-dropped on disconnect), starts
+    /// replication, generates a little traffic via a second walsender
+    /// session's simple-query support, and decodes the events end-to-end.
+    #[test]
+    #[ignore]
+    fn walsender_live() {
+        use crate::wire::pgoutput::{self, PgoMessage};
+        let url = std::env::var("WAL_URL").expect("set WAL_URL");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut ws = Walsender::connect(&url).await.expect("connect");
+                let sys = ws.simple_query("IDENTIFY_SYSTEM").await.expect("identify");
+                println!("IDENTIFY_SYSTEM: {sys:?}");
+
+                // A second session drives DDL/DML (walsender database mode
+                // runs plain SQL too — same trick ape-dts leans on).
+                let mut sql = Walsender::connect(&url).await.expect("sql conn");
+                sql.simple_query(
+                    "DROP TABLE IF EXISTS walsmoke; \
+                     CREATE TABLE walsmoke(id int primary key, v text); \
+                     DROP PUBLICATION IF EXISTS walsmoke_pub; \
+                     CREATE PUBLICATION walsmoke_pub FOR TABLE walsmoke",
+                )
+                .await
+                .expect("ddl");
+
+                let rows = ws
+                    .simple_query(
+                        "CREATE_REPLICATION_SLOT apitap_walsmoke TEMPORARY LOGICAL \
+                         pgoutput EXPORT_SNAPSHOT",
+                    )
+                    .await
+                    .expect("create slot");
+                let consistent_point = rows[0][1].clone().expect("consistent_point");
+                let snapshot = rows[0][2].clone();
+                println!("slot at {consistent_point}, snapshot {snapshot:?}");
+                assert!(snapshot.is_some(), "EXPORT_SNAPSHOT must yield a name");
+
+                sql.simple_query(
+                    "INSERT INTO walsmoke VALUES (1,'a'),(2,''); \
+                     UPDATE walsmoke SET v='b' WHERE id=1; \
+                     DELETE FROM walsmoke WHERE id=2; \
+                     TRUNCATE walsmoke",
+                )
+                .await
+                .expect("dml");
+
+                let lsn = pgoutput::lsn_from_string(&consistent_point).unwrap();
+                ws.start_replication("apitap_walsmoke", lsn, "walsmoke_pub")
+                    .await
+                    .expect("start replication");
+
+                let (mut ins, mut upd, mut del, mut trunc, mut commits) = (0, 0, 0, 0, 0);
+                let mut empty_string_seen = false;
+                while commits < 2 {
+                    match ws.next_event().await.expect("event") {
+                        Some(WalEvent::XLogData { payload, .. }) => {
+                            match pgoutput::decode(&payload).expect("decode") {
+                                PgoMessage::Insert { new, .. } => {
+                                    ins += 1;
+                                    if new.iter().any(|c| {
+                                        matches!(c, pgoutput::Cell::Text(t) if t.is_empty())
+                                    }) {
+                                        empty_string_seen = true;
+                                    }
+                                }
+                                PgoMessage::Update { .. } => upd += 1,
+                                PgoMessage::Delete { .. } => del += 1,
+                                PgoMessage::Truncate { .. } => trunc += 1,
+                                PgoMessage::Commit { .. } => commits += 1,
+                                _ => {}
+                            }
+                        }
+                        Some(WalEvent::Keepalive { reply_requested, .. }) => {
+                            if reply_requested {
+                                ws.standby_status(lsn, false).await.unwrap();
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                assert_eq!((ins, upd, del, trunc), (2, 1, 1, 1), "full op coverage");
+                assert!(empty_string_seen, "empty string must arrive as Text(\"\"), not Null");
+                ws.stop_replication().await.expect("clean stop");
+                sql.simple_query("DROP TABLE walsmoke; DROP PUBLICATION walsmoke_pub")
+                    .await
+                    .expect("cleanup");
+                println!("walsender live smoke: ALL OPS CAPTURED, clean stop");
+            });
+    }
 }
