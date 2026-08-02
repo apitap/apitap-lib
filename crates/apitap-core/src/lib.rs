@@ -233,7 +233,22 @@ pub async fn transfer_many(
     tables: &[String],
     opts: &TransferOptions,
 ) -> Result<MultiReport> {
+    reject_logbased_multi(opts)?;
     pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::List(tables), opts).await
+}
+
+/// log_based must not fall through to the bulk multi-table pipeline: it
+/// would run as a cursor merge and silently drop deletes.
+fn reject_logbased_multi(opts: &TransferOptions) -> Result<()> {
+    if opts.mode == Mode::LogBased {
+        return Err(Error::InvalidInput(
+            "log_based is single-table today — call transfer() once per table \
+             (each table gets its own slot and watermark). Multi-table per \
+             slot is on the roadmap"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Copy EVERY table of a schema (MySQL: a database) in one call — same budget,
@@ -246,5 +261,6 @@ pub async fn transfer_schema(
     schema: Option<&str>,
     opts: &TransferOptions,
 ) -> Result<MultiReport> {
+    reject_logbased_multi(opts)?;
     pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::Schema(schema), opts).await
 }
