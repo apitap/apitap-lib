@@ -174,3 +174,26 @@ Verdicts the control settles:
 - Product guidance this yields: LIVE data → lazy() direct (9.2s, no
   staging); REPEATED analytics → to_parquet once (74s), then scan at
   file speed (2.8s/query). Both are one-liners.
+
+## Control 2: plain polars + connectorx ladder — same infra, 50M @0.5cpu
+
+Same containers, same table, same query (filter + small group_by via
+read_database_uri then .lazy().collect(streaming) — the eager read must
+complete before any query runs):
+
+| tier | result |
+|---|---|
+| 256MB / 1GB / 2GB | OOM-killed |
+| 16GB | OOM-killed (~8 min of reading first) |
+| 24GB | OOM-killed (~12 min of reading first) |
+
+96x our working tier and it still cannot START the query — the
+materialize-first architecture needs the whole 50M x 15-col frame plus
+conversion transients in RAM. Higher tiers not attempted (production
+shares the host). The ladder sentence: apitap answers this query in a
+256MB container in 9.2s; plain polars+connectorx has no answer at any
+tier up to 24GB.
+
+Also measured, to_parquet compression @0.5cpu/256MB (10M): zstd 80.5s /
+0.44GB beats snappy 89.9s / 0.84GB — the encoder path, not the
+compressor, is the cost; the zstd default stands.
