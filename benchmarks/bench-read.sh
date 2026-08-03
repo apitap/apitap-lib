@@ -40,7 +40,11 @@ print(f"  pandas.read_sql          : {time.time()-t0:6.1f}s rows={len(pdf):,}")
 del pdf
 PY
 
-LOG "LEG 2: 1M-row to_polars at 0.5 cpu / 256 MB (with cgroup peak)"
+LOG "LEG 2: 1M-row (narrow) to_polars at 0.5 cpu / 256 MB (with cgroup peak)"
+# A 15-column 1M frame is ~200MB materialized — no tool fits that in 256MB;
+# the narrow table makes this leg about the READERS, not the frame.
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc   "DROP TABLE IF EXISTS read_1m; CREATE TABLE read_1m AS SELECT g AS id, 'v'||g AS v, g*7 AS n FROM generate_series(1,1000000) g" >/dev/null
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc   "ALTER TABLE read_1m ADD PRIMARY KEY (id)" >/dev/null
 for tool in apitap connectorx; do
   docker run --rm --network host $CAP -v ~/read-venv:/venv python:3.11-slim sh -c "
 /venv/bin/python - <<PYEOF
@@ -48,11 +52,11 @@ import time
 t0=time.time()
 if '$tool' == 'apitap':
     import apitap
-    df = apitap.read('$URI', table='bench_data_1m').to_polars()
+    df = apitap.read('$URI', table='read_1m').to_polars()
 else:
     import connectorx as cx
     df = cx.read_sql('postgresql://postgres:bench@127.0.0.1:5544/apitap_bench_src',
-                     'SELECT * FROM bench_data_1m', return_type='polars')
+                     'SELECT * FROM read_1m', return_type='polars')
 peak=int(open('/sys/fs/cgroup/memory.peak').read())
 print(f'  [$tool] 1M to_polars: {time.time()-t0:5.1f}s rows={df.height:,} peak={peak/1048576:.0f}MB')
 PYEOF" || echo "  [$tool] FAILED/OOM at 256MB"
@@ -78,4 +82,5 @@ df = cx.read_sql('postgresql://postgres:bench@127.0.0.1:5544/apitap_bench_src',
                  'SELECT * FROM bench_data_10m_cap', return_type='polars')
 print(f'  [connectorx] 10M at 256MB: {time.time()-t0:5.1f}s rows={df.height:,}')
 PYEOF" || echo "  [connectorx] 10M at 256MB: OOM-KILLED (materializes the table — cannot stream)"
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc "DROP TABLE IF EXISTS read_1m" >/dev/null
 echo done

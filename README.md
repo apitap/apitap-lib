@@ -220,7 +220,13 @@ use it for rebuildable destinations.
       share ONE replication slot (`tables=[…]` — same-LSN windows across
       members, one retention risk, 22% faster than N slots), and a
       ``{table: mode}`` dict mixes CDC and bulk modes in one call
-- [ ] Postgres → Parquet / Arrow (`read_postgres()` → pyarrow / Polars, zero-copy FFI)
+- [x] Postgres → Polars / Arrow — `apitap.read(src, table=…).to_polars()`:
+      parallel binary-COPY pipes decoded into Arrow batches in Rust, handed
+      to Python zero-copy (hand-rolled Arrow C stream, no pyarrow
+      dependency). **10M rows → DataFrame in 14.7 s** vs connectorx 55.9 s
+      vs pandas 295 s — and it STREAMS: 10M rows aggregated at
+      0.5 vCPU / 256 MB (130 MB peak) where materializing readers OOM
+      ([the ledger](benchmarks/read-showdown.md))
 - [x] Postgres → BigQuery (dual lanes picked per box: binary COPY → Parquet
       ZSTD, or CSV+gzip on small cores; parallel resumable load jobs → atomic
       multi-source copy; DML-free incremental state, sandbox-safe —
