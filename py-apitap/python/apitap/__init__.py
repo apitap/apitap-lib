@@ -166,8 +166,8 @@ class Reader:
 
         Ten million rows aggregate in a 256 MB container this way — the full
         DataFrame never exists. The query's COLUMN PROJECTION is pushed all
-        the way into the SQL: a query touching 2 of 15 columns makes
-        Postgres serialize and this side decode only those 2. Predicates
+        the way into the SQL: a query touching 2 of 15 columns makes the
+        server serialize and this side decode only those 2. Predicates
         and head() prune per batch. One-shot: collect once.
         """
         try:
@@ -271,23 +271,25 @@ def read(
     query: str | None = None,
     columns: list[str] | None = None,
 ) -> Reader:
-    """Read a Postgres table straight into a DataFrame, at wire speed.
+    """Read a Postgres or MySQL table straight into a DataFrame, at wire speed.
 
     One line, no knobs required::
 
         df = apitap.read("postgres://user:pass@host/db", table="public.orders").to_polars()
+        df = apitap.read("mysql://user:pass@host/db", table="orders").to_polars()
 
-    The engine runs the same parallel binary-COPY range pipes the transfer
+    The engine runs the same parallel binary range pipes the transfer
     routes use and decodes them into Arrow batches in Rust — Python only
     ever receives buffer pointers. Memory stays bounded (batches in
     flight, sized off the cgroup limit), so big tables read fine from
     small containers.
 
     Args:
-        src: ``postgres://`` source URL.
+        src: ``postgres://`` or ``mysql://`` source URL.
         table: Source table, optionally schema-qualified.
         cursor: Integer column to range-split on (default: the integer PK;
-            PK-less tables fall back to TID ranges).
+            PK-less Postgres tables fall back to TID ranges, PK-less MySQL
+            tables read as one stream).
         parallel: Concurrent range pipes; default auto. ``1`` = source order.
         query: Raw SQL instead of a table (coming next — refused loudly today).
         columns: Read only these columns, in this order (default: all).

@@ -9,6 +9,7 @@ use super::{pop, spans, WorkQueue};
 use crate::sink::Loader;
 use crate::source::Source;
 use crate::error::{Error, Result};
+use crate::wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, CellVal};
 use crate::wire::pgcopy as pgc;
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::wire::rowbinary::varint;
@@ -178,6 +179,118 @@ fn my_pg(c: &ColumnPlan) -> Result<(PgEnc, Delivered)> {
                 "mysql type '{other}' is not supported yet"
             )))
         }
+    })
+}
+
+/// How to decode a MySQL binary-protocol cell STRAIGHT into an Arrow column
+/// builder — the read path's direct lane ([`MySqlSource::run_arrow_read`]).
+/// No intermediate COPY stream: one dispatch and at most one copy per cell.
+#[derive(Clone, Copy)]
+enum MyAr {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    /// BIGINT UNSIGNED — exact as Decimal128(20,0), mirroring `my_pg`.
+    U64Dec,
+    F32,
+    F64,
+    /// NEWDECIMAL ASCII text → scaled i128, ONE conversion (the COPY lane
+    /// pays text → pg-numeric groups → i128).
+    Dec { scale: u32 },
+    Date,
+    /// DATETIME and TIMESTAMP decode identically (session is UTC-pinned);
+    /// only the delivered tag differs.
+    DateTime,
+    Year,
+    Str,
+    Bin,
+}
+
+/// (direct-Arrow decoder, delivery) for one MySQL column. Deliveries MIRROR
+/// [`my_pg`] exactly (asserted by test) — the read schema must not depend on
+/// which lane runs.
+fn my_ar(c: &ColumnPlan) -> Result<(MyAr, Delivered)> {
+    let unsigned = c.native_ddl.as_deref().unwrap_or("").contains("unsigned");
+    let int = |bytes: u8| Delivered::Int {
+        bytes,
+        unsigned: false,
+    };
+    Ok(match c.udt.as_str() {
+        "tinyint" if unsigned => (MyAr::U8, int(2)),
+        "tinyint" => (MyAr::I8, int(2)),
+        "smallint" if unsigned => (MyAr::U16, int(4)),
+        "smallint" => (MyAr::I16, int(2)),
+        "mediumint" | "int" if unsigned => (MyAr::U32, int(8)),
+        "mediumint" | "int" => (MyAr::I32, int(4)),
+        "bigint" if unsigned => (MyAr::U64Dec, Delivered::Decimal { p: 20, s: 0 }),
+        "bigint" => (MyAr::I64, int(8)),
+        "float" => (MyAr::F32, Delivered::Float32),
+        "double" => (MyAr::F64, Delivered::Float64),
+        "decimal" => match (c.precision, c.scale) {
+            (Some(p), Some(s)) => (
+                MyAr::Dec {
+                    scale: s.max(0) as u32,
+                },
+                Delivered::Decimal {
+                    p: p as u16,
+                    s: s as u16,
+                },
+            ),
+            // arrow_kind(None) — the read planner rewrites the column to
+            // longtext before encoders derive; this arm is a parity mirror.
+            _ => (MyAr::Str, Delivered::Decimal { p: 0, s: 0 }),
+        },
+        "date" => (MyAr::Date, Delivered::Date),
+        "datetime" => (MyAr::DateTime, Delivered::DateTime { utc: false }),
+        "timestamp" => (MyAr::DateTime, Delivered::DateTime { utc: true }),
+        "year" => (MyAr::Year, int(2)),
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set"
+        | "time" => (MyAr::Str, Delivered::Text),
+        // Parity mirror — rewritten to longtext by the read planner.
+        "json" => (MyAr::Str, Delivered::Json),
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" | "bit" => {
+            (MyAr::Bin, Delivered::Bytes)
+        }
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "mysql type '{other}' is not supported yet"
+            )))
+        }
+    })
+}
+
+/// Fixed-width little-endian read with a loud width check (cold on the
+/// error path; the happy path compiles to one unaligned load).
+#[inline]
+fn le<const N: usize>(b: &[u8]) -> Result<[u8; N]> {
+    b.try_into()
+        .map_err(|_| Error::Transfer(format!("mysql cell width {} (want {N})", b.len())))
+}
+
+/// One non-NULL binary-protocol cell → the column's [`CellVal`].
+#[inline]
+fn ar_cell<'a>(b: &'a [u8], enc: MyAr) -> Result<CellVal<'a>> {
+    Ok(match enc {
+        MyAr::I8 => CellVal::I16(i8::from_le_bytes(le::<1>(b)?) as i16),
+        MyAr::U8 => CellVal::I16(b[0] as i16),
+        MyAr::I16 => CellVal::I16(i16::from_le_bytes(le::<2>(b)?)),
+        MyAr::U16 => CellVal::I32(u16::from_le_bytes(le::<2>(b)?) as i32),
+        MyAr::I32 => CellVal::I32(i32::from_le_bytes(le::<4>(b)?)),
+        MyAr::U32 => CellVal::I64(u32::from_le_bytes(le::<4>(b)?) as i64),
+        MyAr::I64 => CellVal::I64(i64::from_le_bytes(le::<8>(b)?)),
+        MyAr::U64Dec => CellVal::Dec128(u64::from_le_bytes(le::<8>(b)?) as i128),
+        MyAr::F32 => CellVal::F32(f32::from_le_bytes(le::<4>(b)?)),
+        MyAr::F64 => CellVal::F64(f64::from_le_bytes(le::<8>(b)?)),
+        MyAr::Dec { scale } => CellVal::Dec128(dec_bytes_to_scaled_i128(b, scale)?),
+        MyAr::Date => CellVal::DateDays(bin_date_days(b)? as i32),
+        MyAr::DateTime => CellVal::TsMicros(bin_datetime_micros(b)?),
+        MyAr::Year => CellVal::I16(u16::from_le_bytes(le::<2>(b)?) as i16),
+        MyAr::Str => CellVal::Str(b),
+        MyAr::Bin => CellVal::Bin(b),
     })
 }
 
@@ -1132,9 +1245,155 @@ async fn row_worker<L: Loader>(
     loader.finish().await
 }
 
+impl MySqlSource {
+    /// The read path's DIRECT lane: binary-protocol cells decode straight
+    /// into per-worker [`BatchBuilder`]s — no intermediate COPY stream, no
+    /// bounds walk, varlen values copied exactly once. Sealed batches go
+    /// into `tx` (bounded — backpressure is the channel). Returns total
+    /// rows. `APITAP_MY_ARROW=0` keeps the COPY lane for A/B.
+    pub(crate) async fn run_arrow_read(
+        &self,
+        plan: &TablePlan,
+        stmts: Vec<String>,
+        kinds: Vec<ArrowKind>,
+        batch_bytes: usize,
+        tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+        workers: usize,
+    ) -> Result<u64> {
+        let encs: std::sync::Arc<Vec<MyAr>> = std::sync::Arc::new(
+            plan.cols
+                .iter()
+                .map(|c| my_ar(c).map(|(e, _)| e))
+                .collect::<Result<_>>()?,
+        );
+        let queue = super::work_queue(stmts);
+        let mut tasks = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            tasks.push(tokio::spawn(arrow_row_worker(
+                self.pool.clone(),
+                queue.clone(),
+                encs.clone(),
+                BatchBuilder::new(kinds.clone(), batch_bytes),
+                tx.clone(),
+            )));
+        }
+        let mut rows = 0u64;
+        for t in tasks {
+            rows += t
+                .await
+                .map_err(|e| Error::Transfer(format!("join: {e}")))??;
+        }
+        Ok(rows)
+    }
+}
+
+/// One direct-lane worker: pull span statements until the queue drains,
+/// stream rows, append cells column-by-column, seal by size. The seal
+/// check runs every 64 rows — `acc_bytes` sums every column and is too
+/// hot for every row.
+async fn arrow_row_worker(
+    pool: MySqlPool,
+    queue: WorkQueue,
+    encs: std::sync::Arc<Vec<MyAr>>,
+    mut bb: BatchBuilder,
+    tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+) -> Result<u64> {
+    use futures::TryStreamExt;
+    let dbg = std::env::var_os("APITAP_DEBUG").is_some();
+    let (mut t_fetch, mut t_dec, mut t_send) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    let cancelled = || Error::Transfer("read cancelled by consumer".into());
+    let mut since_seal = 0u32;
+    while let Some(sql) = pop(&queue) {
+        let mut rows = sqlx::query(&sql).fetch(&pool);
+        loop {
+            let tf = dbg.then(std::time::Instant::now);
+            let row = rows
+                .try_next()
+                .await
+                .map_err(|e| Error::Transfer(format!("mysql read: {e}")))?;
+            if let Some(tf) = tf {
+                t_fetch += tf.elapsed();
+            }
+            let Some(row) = row else { break };
+            let td = dbg.then(std::time::Instant::now);
+            for (i, enc) in encs.iter().enumerate() {
+                match raw_cell(&row, i)? {
+                    None => bb.append_cell(i, CellVal::Null),
+                    Some(b) => bb.append_cell(i, ar_cell(b, *enc)?),
+                }
+            }
+            bb.row_done();
+            if let Some(td) = td {
+                t_dec += td.elapsed();
+            }
+            since_seal += 1;
+            if since_seal >= 64 {
+                since_seal = 0;
+                if let Some(batch) = bb.take_ready() {
+                    let ts = dbg.then(std::time::Instant::now);
+                    tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
+                    if let Some(ts) = ts {
+                        t_send += ts.elapsed();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(batch) = bb.finish()? {
+        tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
+    }
+    if dbg {
+        eprintln!(
+            "[my arrow worker] fetch(wire+parse)={:.1}s decode(cpu)={:.1}s send(backpressure)={:.1}s",
+            t_fetch.as_secs_f64(),
+            t_dec.as_secs_f64(),
+            t_send.as_secs_f64()
+        );
+    }
+    Ok(bb.rows_total())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The direct-Arrow lane must deliver EXACTLY what the COPY lane
+    /// delivers — the read schema (and polars dtypes) cannot depend on
+    /// which lane runs. One matrix over every udt the mappers know.
+    #[test]
+    fn my_ar_delivery_mirrors_my_pg() {
+        let col = |udt: &str, ddl: Option<&str>, p: Option<i32>, s: Option<i32>| ColumnPlan {
+            name: "c".into(),
+            nullable: true,
+            int_pk: false,
+            native_ddl: ddl.map(|d| d.to_string()),
+            udt: udt.into(),
+            precision: p,
+            scale: s,
+        };
+        let mut cases: Vec<ColumnPlan> = Vec::new();
+        for udt in [
+            "tinyint", "smallint", "mediumint", "int", "bigint", "float", "double", "date",
+            "datetime", "timestamp", "year", "char", "varchar", "tinytext", "text",
+            "mediumtext", "longtext", "enum", "set", "time", "json", "binary", "varbinary",
+            "tinyblob", "blob", "mediumblob", "longblob", "bit",
+        ] {
+            cases.push(col(udt, None, None, None));
+            cases.push(col(udt, Some(&format!("{udt} unsigned")), None, None));
+        }
+        cases.push(col("decimal", None, Some(18), Some(4)));
+        cases.push(col("decimal", None, Some(65), Some(10)));
+        cases.push(col("decimal", None, None, None));
+        for c in &cases {
+            let pg = my_pg(c).expect("my_pg").1;
+            let ar = my_ar(c).expect("my_ar").1;
+            assert_eq!(pg, ar, "udt={} ddl={:?}", c.udt, c.native_ddl);
+        }
+    }
 
     fn tw(enc: MyTsv, b: &[u8]) -> String {
         let mut o = Vec::new();

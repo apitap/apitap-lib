@@ -66,6 +66,7 @@ pub fn arrow_kind(d: &Delivered) -> Option<ArrowKind> {
 
 /// One sealed column, buffers in Arrow C layout (validity bitmap LSB-first;
 /// utf8/binary carry i32 offsets starting at 0).
+#[derive(Debug, PartialEq)]
 pub enum FinishedCol {
     I16 { validity: Option<Vec<u8>>, data: Vec<i16> },
     I32 { validity: Option<Vec<u8>>, data: Vec<i32> },
@@ -80,6 +81,7 @@ pub enum FinishedCol {
 }
 
 /// One sealed batch: `rows` rows across `cols` (parallel to the schema).
+#[derive(Debug, PartialEq)]
 pub struct ArrowBatch {
     pub rows: usize,
     pub cols: Vec<FinishedCol>,
@@ -298,6 +300,26 @@ pub struct BatchBuilder {
     fr_left: usize,
 }
 
+/// One decoded cell for the row-major append surface
+/// ([`BatchBuilder::append_cell`]). Lifetimes borrow the source's wire
+/// buffer — varlen bytes copy exactly once, into the column buffer.
+pub enum CellVal<'a> {
+    Null,
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Bool(bool),
+    Dec128(i128),
+    /// Days since the Unix epoch (Date32 column).
+    DateDays(i32),
+    /// Micros since the Unix epoch (either timestamp column).
+    TsMicros(i64),
+    Str(&'a [u8]),
+    Bin(&'a [u8]),
+}
+
 /// Why [`BatchBuilder::push_framed`] returned.
 pub enum FramedPush {
     /// Consumed up to an element that needs more bytes — REFILL the window
@@ -363,6 +385,61 @@ impl BatchBuilder {
             st_rows: 0,
             fr_left: 0,
         }
+    }
+
+    /// Append one already-decoded cell of the CURRENT row (columns in
+    /// order, then [`Self::row_done`]) — the row-major surface for sources
+    /// that decode their own wire (MySQL binary protocol). Varlen values
+    /// land in the column buffer in ONE copy; there is no intermediate
+    /// COPY stream, no bounds walk, no staging. The variant must match the
+    /// column's kind — encoders and kinds derive from the same plan, so a
+    /// mismatch is a construction bug and panics loudly.
+    #[inline]
+    pub fn append_cell(&mut self, c: usize, val: CellVal) {
+        let r = self.rows;
+        match (&mut self.cols[c], val) {
+            (ColB::I16 { v, d }, CellVal::I16(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::I32 { v, d }, CellVal::I32(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::I64 { v, d }, CellVal::I64(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::F32 { v, d }, CellVal::F32(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::F64 { v, d }, CellVal::F64(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::Bool { v, d }, CellVal::Bool(x)) => { push_bit(d, r, x); mark(v, r, true); }
+            (ColB::Dec { v, d, .. }, CellVal::Dec128(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::D32 { v, d }, CellVal::DateDays(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::Ts { v, d }, CellVal::TsMicros(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::Utf8 { v, off, d }, CellVal::Str(b)) => {
+                d.extend_from_slice(b);
+                off.push(d.len() as i32);
+                mark(v, r, true);
+            }
+            (ColB::Bin { v, off, d }, CellVal::Bin(b)) => {
+                d.extend_from_slice(b);
+                off.push(d.len() as i32);
+                mark(v, r, true);
+            }
+            (col, CellVal::Null) => match col {
+                ColB::I16 { v, d } => { d.push(0); mark(v, r, false); }
+                ColB::I32 { v, d } | ColB::D32 { v, d } => { d.push(0); mark(v, r, false); }
+                ColB::I64 { v, d } | ColB::Ts { v, d } => { d.push(0); mark(v, r, false); }
+                ColB::F32 { v, d } => { d.push(0.0); mark(v, r, false); }
+                ColB::F64 { v, d } => { d.push(0.0); mark(v, r, false); }
+                ColB::Bool { v, d } => { push_bit(d, r, false); mark(v, r, false); }
+                ColB::Dec { v, d, .. } => { d.push(0); mark(v, r, false); }
+                ColB::Utf8 { v, off, d } | ColB::Bin { v, off, d } => {
+                    off.push(d.len() as i32);
+                    mark(v, r, false);
+                }
+            },
+            _ => unreachable!("append_cell: cell/kind mismatch (planner bug)"),
+        }
+    }
+
+    /// Close the current row (every column appended exactly once). Seal
+    /// checks stay with the caller ([`Self::take_ready`] at its own
+    /// cadence — `acc_bytes` sums every column, too hot for every row).
+    #[inline]
+    pub fn row_done(&mut self) {
+        self.rows += 1;
     }
 
     /// Framed-window entry: `win` is the RAW wire window — CopyData headers
@@ -927,6 +1004,119 @@ impl BatchBuilder {
 mod tests {
     use super::*;
     use crate::wire::pgcopy;
+
+    /// GOLDEN cross-check: the row-major append surface must produce the
+    /// byte-identical batch the COPY-stream decode produces for the same
+    /// logical rows — validity backfill, empty strings, IEEE specials,
+    /// epoch rebasing, everything.
+    #[test]
+    fn append_surface_matches_the_copy_decode() {
+        let kinds = vec![
+            ArrowKind::Int16,
+            ArrowKind::Int32,
+            ArrowKind::Int64,
+            ArrowKind::Float32,
+            ArrowKind::Float64,
+            ArrowKind::Bool,
+            ArrowKind::Decimal { p: 18, s: 4 },
+            ArrowKind::Date32,
+            ArrowKind::TimestampUtc,
+            ArrowKind::Utf8,
+            ArrowKind::Binary,
+        ];
+        let n = kinds.len();
+
+        // Path A: the COPY stream.
+        let mut s = Vec::new();
+        pgcopy::header(&mut s);
+        pgcopy::tuple_start(n, &mut s);
+        pgcopy::field(&(-7i16).to_be_bytes(), &mut s);
+        pgcopy::field(&123_456i32.to_be_bytes(), &mut s);
+        pgcopy::field(&(-9_876_543_210i64).to_be_bytes(), &mut s);
+        pgcopy::field(&1.5f32.to_be_bytes(), &mut s);
+        pgcopy::field(&(-2.25f64).to_be_bytes(), &mut s);
+        pgcopy::field(&[1], &mut s);
+        pgcopy::numeric_field_from_str("1234.5678", &mut s).unwrap();
+        pgcopy::field(&0i32.to_be_bytes(), &mut s); // 2000-01-01
+        pgcopy::field(&1_500_000i64.to_be_bytes(), &mut s);
+        pgcopy::field(b"hello", &mut s);
+        pgcopy::field(&[0xDE, 0xAD], &mut s);
+        pgcopy::tuple_start(n, &mut s);
+        for _ in 0..n {
+            pgcopy::null_field(&mut s);
+        }
+        pgcopy::tuple_start(n, &mut s);
+        pgcopy::field(&32_000i16.to_be_bytes(), &mut s);
+        pgcopy::field(&(-1i32).to_be_bytes(), &mut s);
+        pgcopy::field(&42i64.to_be_bytes(), &mut s);
+        pgcopy::field(&f32::NEG_INFINITY.to_be_bytes(), &mut s);
+        pgcopy::field(&f64::NAN.to_be_bytes(), &mut s);
+        pgcopy::field(&[], &mut s); // empty field = false
+        pgcopy::numeric_field_from_str("-0.5000", &mut s).unwrap();
+        pgcopy::field(&365i32.to_be_bytes(), &mut s);
+        pgcopy::field(&(-1_000_000i64).to_be_bytes(), &mut s);
+        pgcopy::field(b"", &mut s);
+        pgcopy::field(&[1, 2, 3], &mut s);
+        pgcopy::trailer(&mut s);
+        let mut a = BatchBuilder::new(kinds.clone(), usize::MAX >> 1);
+        a.push(&s).unwrap();
+        let batch_a = a.finish().unwrap().expect("rows");
+
+        // Path B: the same logical rows through append_cell.
+        let mut b = BatchBuilder::new(kinds, usize::MAX >> 1);
+        let ed = pgcopy::PG_EPOCH_DAYS; // unix days of 2000-01-01
+        let em = pgcopy::PG_EPOCH_MICROS;
+        b.append_cell(0, CellVal::I16(-7));
+        b.append_cell(1, CellVal::I32(123_456));
+        b.append_cell(2, CellVal::I64(-9_876_543_210));
+        b.append_cell(3, CellVal::F32(1.5));
+        b.append_cell(4, CellVal::F64(-2.25));
+        b.append_cell(5, CellVal::Bool(true));
+        b.append_cell(6, CellVal::Dec128(12_345_678));
+        b.append_cell(7, CellVal::DateDays(ed));
+        b.append_cell(8, CellVal::TsMicros(em + 1_500_000));
+        b.append_cell(9, CellVal::Str(b"hello"));
+        b.append_cell(10, CellVal::Bin(&[0xDE, 0xAD]));
+        b.row_done();
+        for c in 0..11 {
+            b.append_cell(c, CellVal::Null);
+        }
+        b.row_done();
+        b.append_cell(0, CellVal::I16(32_000));
+        b.append_cell(1, CellVal::I32(-1));
+        b.append_cell(2, CellVal::I64(42));
+        b.append_cell(3, CellVal::F32(f32::NEG_INFINITY));
+        b.append_cell(4, CellVal::F64(f64::NAN));
+        b.append_cell(5, CellVal::Bool(false));
+        b.append_cell(6, CellVal::Dec128(-5_000));
+        b.append_cell(7, CellVal::DateDays(ed + 365));
+        b.append_cell(8, CellVal::TsMicros(em - 1_000_000));
+        b.append_cell(9, CellVal::Str(b""));
+        b.append_cell(10, CellVal::Bin(&[1, 2, 3]));
+        b.row_done();
+        let batch_b = b.finish().unwrap().expect("rows");
+
+        assert_eq!(batch_a.rows, 3);
+        assert_eq!(batch_b.rows, 3);
+        // NaN != NaN under PartialEq — compare the f64 column by bits.
+        let (fa, fb) = match (&batch_a.cols[4], &batch_b.cols[4]) {
+            (
+                FinishedCol::F64 { validity: va, data: da },
+                FinishedCol::F64 { validity: vb, data: db },
+            ) => {
+                assert_eq!(va, vb);
+                (
+                    da.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    db.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                )
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(fa, fb);
+        for c in [0, 1, 2, 3, 5, 6, 7, 8, 9, 10] {
+            assert_eq!(batch_a.cols[c], batch_b.cols[c], "col {c}");
+        }
+    }
 
     #[test]
     fn kind_map_mirrors_the_parquet_gate() {

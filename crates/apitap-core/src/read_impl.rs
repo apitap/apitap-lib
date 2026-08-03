@@ -1,16 +1,22 @@
 //! The wiring behind [`crate::read_start`]: probe → arrow lane →
-//! span statements → the SAME parallel COPY workers every bulk route uses,
+//! span statements → the SAME parallel workers every bulk route uses,
 //! with an [`ArrowLoader`] per worker feeding sealed batches into one
 //! bounded channel the consumer pulls from. Batch size and channel depth
 //! come from the cgroup budget — the 256 MB (and 44 MB) tiers hold by
 //! arithmetic, not hope.
+//!
+//! Two sources speak this path: Postgres rides its raw COPY plane
+//! (framed windows straight off the walsender socket), MySQL rides the
+//! transfer route's binary-protocol workers, which already emit the same
+//! PG binary-COPY stream the batch builder decodes — one wire vocabulary,
+//! two databases.
 
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Profile};
 use crate::plan::{Delivered, WireFormat};
 use crate::read::{ArrowField, ReadHandle, ReadOptions};
 use crate::sink::Loader;
-use crate::source::{postgres::PgSource, Source};
+use crate::source::{mysql::MySqlSource, postgres::PgSource, Source};
 use crate::wire::arrowcol::{arrow_kind, ArrowBatch, ArrowKind, BatchBuilder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,18 +43,37 @@ fn tune_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tune_allocator() {}
 
+/// The per-source seams of the read path. Everything else — spans, workers,
+/// the batch builder, the memory model — is the shared [`Source`] machinery.
+#[derive(Clone, Copy, PartialEq)]
+enum ReadDialect {
+    Pg,
+    My,
+}
+
+fn read_dialect(src_url: &str) -> Result<ReadDialect> {
+    let scheme = src_url.split("://").next().unwrap_or("");
+    match scheme {
+        "postgres" | "postgresql" => Ok(ReadDialect::Pg),
+        "mysql" => Ok(ReadDialect::My),
+        _ => Err(Error::InvalidInput(format!(
+            "read: unsupported source scheme '{scheme}' — postgres:// and \
+             mysql:// today"
+        ))),
+    }
+}
+
 /// Schema-only probe: what [`start`] would emit, WITHOUT starting workers.
 /// The lazy plugin registers this schema up front, then starts the real
 /// read later with the query's projection pushed down.
 pub(crate) async fn schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>> {
-    let scheme = src_url.split("://").next().unwrap_or("");
-    if !matches!(scheme, "postgres" | "postgresql") {
-        return Err(Error::InvalidInput(format!(
-            "read: unsupported source scheme '{scheme}' — Postgres first \
-             (mysql lands next)"
-        )));
+    match read_dialect(src_url)? {
+        ReadDialect::Pg => schema_with(PgSource::connect(src_url, 1).await?, table).await,
+        ReadDialect::My => schema_with(MySqlSource::connect(src_url, 1).await?, table).await,
     }
-    let src = PgSource::connect(src_url, 1).await?;
+}
+
+async fn schema_with<S: Source>(src: S, table: &str) -> Result<Vec<ArrowField>> {
     let plan = src.probe(table).await?;
     let lane = src.plan_lane(&plan, WireFormat::PgCopyBinary);
     Ok(lane
@@ -74,18 +99,14 @@ pub(crate) async fn start(
             "read: query= lands next — pass table= (and optionally cursor=) today".into(),
         ));
     }
-    let scheme = src_url.split("://").next().unwrap_or("");
-    if !matches!(scheme, "postgres" | "postgresql") {
-        return Err(Error::InvalidInput(format!(
-            "read: unsupported source scheme '{scheme}' — Postgres first \
-             (mysql lands next)"
-        )));
-    }
+    let dialect = read_dialect(src_url)?;
 
-    // Read-side profile: pipes mostly WAIT (network + server-side COPY), so
+    // Read-side profile: pipes mostly WAIT (network + server-side reads), so
     // fractional-CPU boxes still want several — the 0.5-core sweep measured
     // 1 pipe 46.7s vs 5 pipes 26.7s on the same box. Floor at 4; the cgroup
-    // MEMORY cap still shrinks it on tiny-RAM tiers.
+    // MEMORY cap still shrinks it on tiny-RAM tiers. MySQL workers pay real
+    // client-side decode CPU on top — same profile for now, its own sweep
+    // owns the number once profiled.
     let profile = Profile {
         auto_parallel: |c| (c / 2).max(4).min(8),
         span_mult: 6,
@@ -108,18 +129,66 @@ pub(crate) async fn start(
         }
     }
 
-    let src = PgSource::connect(src_url, parallel + 1).await?;
+    match dialect {
+        ReadDialect::Pg => {
+            let src = PgSource::connect(src_url, parallel + 1).await?;
+            let rp = plan_read(&src, dialect, table, opts, parallel).await?;
+            Ok(launch_loaders(src, rp, chunk))
+        }
+        ReadDialect::My => {
+            let src = MySqlSource::connect(src_url, parallel + 1).await?;
+            let rp = plan_read(&src, dialect, table, opts, parallel).await?;
+            // Direct-Arrow lane by default: cells decode straight into the
+            // column builders (one dispatch, one copy). APITAP_MY_ARROW=0
+            // keeps the COPY lane — the same A/B-and-escape-hatch pattern
+            // as the pg raw plane's APITAP_RAW_COPY.
+            if std::env::var("APITAP_MY_ARROW").is_ok_and(|v| v == "0") {
+                Ok(launch_loaders(src, rp, chunk))
+            } else {
+                Ok(launch_my_arrow(src, rp))
+            }
+        }
+    }
+}
+
+/// Everything [`start`] resolves before workers move: the probed plan, the
+/// lane, per-column Arrow kinds/schema, span statements, and the residency
+/// numbers (worker count, channel depth, batch seal size).
+struct ReadPlan {
+    plan: crate::plan::TablePlan,
+    lane: crate::plan::Lane,
+    kinds: Vec<ArrowKind>,
+    schema: Vec<ArrowField>,
+    stmts: Vec<String>,
+    used: usize,
+    cap: usize,
+    batch_bytes: usize,
+}
+
+async fn plan_read<S: Source>(
+    src: &S,
+    dialect: ReadDialect,
+    table: &str,
+    opts: &ReadOptions,
+    parallel: usize,
+) -> Result<ReadPlan> {
     let mut plan = src.probe(table).await?;
     plan.cursor = opts.cursor.clone().or_else(|| plan.single_int_pk());
     let mut lane = src.plan_lane(&plan, WireFormat::PgCopyBinary);
-    // Spans arrive verbatim (FrameRaw): the batch builder walks each span's
-    // own header/trailer, so the strip-and-recopy stage — one full memcpy
-    // of the stream plus a 4 MiB accumulator per pipe — disappears.
-    lane.raw_frames = true;
+    if dialect == ReadDialect::Pg {
+        // Spans arrive verbatim (FrameRaw): the batch builder walks each
+        // span's own header/trailer, so the strip-and-recopy stage — one full
+        // memcpy of the stream plus a 4 MiB accumulator per pipe —
+        // disappears. PG-only: the framed windows are raw walsender wire;
+        // MySQL workers synthesize their COPY stream client-side and feed the
+        // plain (chunk-boundary-safe) push path.
+        lane.raw_frames = true;
+    }
 
     // Column projection (the lazy plugin pushes polars' with_columns here):
-    // the SELECT list narrows, so Postgres serializes and this side decodes
-    // ONLY what the query touches — requested order preserved.
+    // the SELECT list narrows, so the server serializes and this side decodes
+    // ONLY what the query touches — requested order preserved. plan.cols
+    // narrows in lockstep: MySQL derives its per-column encoders from there.
     if let Some(want) = &opts.columns {
         let idx: Vec<usize> = want
             .iter()
@@ -141,15 +210,29 @@ pub(crate) async fn start(
     }
 
     // Arrow vocabulary per column; anything outside it (arrays, intervals,
-    // enums, huge NUMERIC, json/jsonb, uuid) rides `::text` as Utf8 — the
-    // simple contract: every table reads, exotic columns read as strings.
+    // enums, huge NUMERIC, json/jsonb, uuid) rides as Utf8 — the simple
+    // contract: every table reads, exotic columns read as strings. HOW the
+    // text arrives is per-dialect: Postgres rewrites the SELECT (`::text`,
+    // the server serializes text); MySQL rewrites the column's udt so the
+    // client-side encoder (derived from plan.cols, not the lane) emits a
+    // plain text field — json and oversized NEWDECIMAL already arrive as
+    // utf8 bytes on the binary protocol, no server cast needed.
     let mut kinds = Vec::with_capacity(lane.cols.len());
     let mut schema = Vec::with_capacity(lane.cols.len());
-    for (lc, pc) in lane.cols.iter_mut().zip(plan.cols.iter()) {
+    for (lc, pc) in lane.cols.iter_mut().zip(plan.cols.iter_mut()) {
         let kind = match arrow_kind(&lc.delivered) {
             Some(k) => k,
             None => {
-                lc.select = format!("({})::text", lc.select);
+                match dialect {
+                    ReadDialect::Pg => {
+                        lc.select = format!("({})::text", lc.select);
+                    }
+                    ReadDialect::My => {
+                        pc.udt = "longtext".into();
+                        pc.precision = None;
+                        pc.scale = None;
+                    }
+                }
                 lc.delivered = Delivered::Text;
                 ArrowKind::Utf8
             }
@@ -158,7 +241,7 @@ pub(crate) async fn start(
         schema.push(ArrowField { name: pc.name.clone(), kind, nullable: pc.nullable });
     }
 
-    let want = if parallel > 1 { parallel * profile.span_mult } else { 1 };
+    let want = if parallel > 1 { parallel * 6 } else { 1 };
     let stmts = src.span_stmts(table, &plan, &lane, want, None).await?;
     let used = parallel.min(stmts.len()).max(1);
 
@@ -185,6 +268,13 @@ pub(crate) async fn start(
         },
     };
 
+    Ok(ReadPlan { plan, lane, kinds, schema, stmts, used, cap, batch_bytes })
+}
+
+/// The COPY-stream lane: one [`ArrowLoader`] per worker behind the source's
+/// own `run_workers` (Postgres always; MySQL under `APITAP_MY_ARROW=0`).
+fn launch_loaders<S: Source + 'static>(src: S, rp: ReadPlan, chunk: usize) -> ReadHandle {
+    let ReadPlan { plan, lane, kinds, schema, stmts, used, cap, batch_bytes } = rp;
     let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);
     let completed = Arc::new(AtomicBool::new(false));
     let loaders: Vec<ArrowLoader> = (0..used)
@@ -206,7 +296,30 @@ pub(crate) async fn start(
         drop(tx);
     });
 
-    Ok(ReadHandle::new(schema, rx, supervisor, completed))
+    ReadHandle::new(schema, rx, supervisor, completed)
+}
+
+/// The MySQL direct-Arrow lane: workers append decoded cells straight into
+/// their builders and ship sealed batches — no Loader, no byte stream.
+fn launch_my_arrow(src: MySqlSource, rp: ReadPlan) -> ReadHandle {
+    let ReadPlan { plan, kinds, schema, stmts, used, cap, batch_bytes, .. } = rp;
+    let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);
+    let completed = Arc::new(AtomicBool::new(false));
+
+    let done = completed.clone();
+    let supervisor = tokio::spawn(async move {
+        if let Err(e) = src
+            .run_arrow_read(&plan, stmts, kinds, batch_bytes, tx.clone(), used)
+            .await
+        {
+            let _ = tx.send(Err(e)).await;
+        }
+        // Same ordering contract as the loader lane.
+        done.store(true, Ordering::Release);
+        drop(tx);
+    });
+
+    ReadHandle::new(schema, rx, supervisor, completed)
 }
 
 /// One per worker: parses the worker's COPY stream into columnar builders
