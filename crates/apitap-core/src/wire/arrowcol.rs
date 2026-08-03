@@ -191,99 +191,7 @@ impl ColB {
         }
     }
 
-    /// NULL still occupies a slot: fixed types push a zero placeholder,
-    /// varlen repeats the last offset.
-    fn push_null(&mut self, row: usize) {
-        match self {
-            ColB::I16 { v, d } => { mark(v, row, false); d.push(0); }
-            ColB::I32 { v, d } | ColB::D32 { v, d } => { mark(v, row, false); d.push(0); }
-            ColB::I64 { v, d } | ColB::Ts { v, d } => { mark(v, row, false); d.push(0); }
-            ColB::F32 { v, d } => { mark(v, row, false); d.push(0.0); }
-            ColB::F64 { v, d } => { mark(v, row, false); d.push(0.0); }
-            ColB::Bool { v, d } => { mark(v, row, false); push_bit(d, row, false); }
-            ColB::Dec { v, d, .. } => { mark(v, row, false); d.push(0); }
-            ColB::Utf8 { v, off, .. } | ColB::Bin { v, off, .. } => {
-                mark(v, row, false);
-                off.push(*off.last().expect("offsets seeded with 0"));
-            }
-        }
-    }
 
-    /// Decode one non-NULL Postgres binary field. Widths are strict: the
-    /// declared kind fixes the wire width, so a mismatch is corruption.
-    fn push_field(&mut self, f: &[u8], row: usize) -> Result<()> {
-        match self {
-            ColB::I16 { v, d } => {
-                d.push(i16::from_be_bytes(
-                    f.try_into().map_err(|_| bad(&format!("int2 width {}", f.len())))?,
-                ));
-                mark(v, row, true);
-            }
-            ColB::I32 { v, d } => {
-                d.push(i32::from_be_bytes(
-                    f.try_into().map_err(|_| bad(&format!("int4 width {}", f.len())))?,
-                ));
-                mark(v, row, true);
-            }
-            ColB::I64 { v, d } => {
-                d.push(i64::from_be_bytes(
-                    f.try_into().map_err(|_| bad(&format!("int8 width {}", f.len())))?,
-                ));
-                mark(v, row, true);
-            }
-            ColB::F32 { v, d } => {
-                d.push(f32::from_be_bytes(f.try_into().map_err(|_| bad("float4"))?));
-                mark(v, row, true);
-            }
-            ColB::F64 { v, d } => {
-                d.push(f64::from_be_bytes(f.try_into().map_err(|_| bad("float8"))?));
-                mark(v, row, true);
-            }
-            ColB::Bool { v, d } => {
-                push_bit(d, row, f.first().copied().unwrap_or(0) != 0);
-                mark(v, row, true);
-            }
-            ColB::Dec { v, d, s } => {
-                d.push(numeric_to_scaled_i128(f, *s)?);
-                mark(v, row, true);
-            }
-            ColB::D32 { v, d } => {
-                let days = i32::from_be_bytes(f.try_into().map_err(|_| bad("date"))?);
-                if days == i32::MAX || days == i32::MIN {
-                    return Err(Error::Transfer(
-                        "date 'infinity' has no Arrow representation — cast or \
-                         filter it in a source view"
-                            .into(),
-                    ));
-                }
-                d.push(days.checked_add(PG_EPOCH_DAYS).ok_or_else(|| bad("date range"))?);
-                mark(v, row, true);
-            }
-            ColB::Ts { v, d } => {
-                let us = i64::from_be_bytes(f.try_into().map_err(|_| bad("timestamp"))?);
-                if us == i64::MAX || us == i64::MIN {
-                    return Err(Error::Transfer(
-                        "timestamp 'infinity' has no Arrow representation — cast \
-                         or filter it in a source view"
-                            .into(),
-                    ));
-                }
-                d.push(us.checked_add(PG_EPOCH_MICROS).ok_or_else(|| bad("timestamp range"))?);
-                mark(v, row, true);
-            }
-            // Utf8 fields arrive as final UTF-8 bytes — jsonb/uuid were
-            // rewritten to ::text upstream (arrow_kind returns None there).
-            ColB::Utf8 { v, off, d } | ColB::Bin { v, off, d } => {
-                d.extend_from_slice(f);
-                off.push(
-                    i32::try_from(d.len())
-                        .map_err(|_| bad("varlen column past i32 offsets in one batch"))?,
-                );
-                mark(v, row, true);
-            }
-        }
-        Ok(())
-    }
 
     /// Resident bytes (data + offsets), for the batch seal gate.
     fn bytes(&self) -> usize {
@@ -376,6 +284,28 @@ pub struct BatchBuilder {
     buf: Vec<u8>,
     /// Inside a span (header consumed, trailer not yet seen).
     in_span: bool,
+    // -- micro-batch transpose staging: (offset, len) per field for up to
+    // ST_K complete tuples, COLUMN-major. The decode then runs per COLUMN:
+    // one variant dispatch per column per micro-batch instead of per field
+    // per row — the per-field jump table alone profiled ~10% of a 0.5-core
+    // read, and the tight per-column loops vectorize.
+    st_off: Vec<u32>,
+    st_len: Vec<i32>,
+    st_rows: usize,
+}
+
+/// Tuples staged per micro-batch. 15 cols × 64 × 8 B ≈ 7.7 KB of staging —
+/// comfortably L1-resident next to the wire window it points into.
+const ST_K: usize = 64;
+
+/// Why `stage_tuples` stopped.
+enum StageStop {
+    /// ST_K tuples staged — decode and stage again.
+    Full,
+    /// Data ran out mid-tuple — decode what staged, keep the tail.
+    Incomplete,
+    /// The next item is the span trailer (not consumed).
+    Trailer,
 }
 
 impl BatchBuilder {
@@ -393,6 +323,9 @@ impl BatchBuilder {
             rows_sealed: 0,
             buf: Vec::with_capacity(64 << 10),
             in_span: false,
+            st_off: vec![0; kinds.len() * ST_K],
+            st_len: vec![0; kinds.len() * ST_K],
+            st_rows: 0,
         }
     }
 
@@ -446,6 +379,8 @@ impl BatchBuilder {
     /// Walk headers, tuples and trailers in sequence until the data runs
     /// out mid-element; returns bytes consumed. A trailer closes the span
     /// and the next bytes (if any) must open the next span's header.
+    /// Tuples move in micro-batches: stage up to [`ST_K`] complete tuples'
+    /// field descriptors, then decode them COLUMN by column.
     fn walk(&mut self, data: &[u8]) -> Result<usize> {
         let mut pos = 0usize;
         loop {
@@ -464,82 +399,284 @@ impl BatchBuilder {
                 pos += 19 + ext;
                 self.in_span = true;
             }
-            match self.try_tuple(&data[pos..])? {
-                Some((consumed, trailer)) => {
-                    pos += consumed;
-                    if trailer {
-                        self.in_span = false;
-                    } else {
-                        self.rows += 1;
-                    }
+            let (end, stop) = self.stage_tuples(data, pos)?;
+            if self.st_rows > 0 {
+                self.decode_staged(data)?;
+            }
+            pos = end;
+            match stop {
+                StageStop::Full => {}
+                StageStop::Incomplete => return Ok(pos),
+                StageStop::Trailer => {
+                    pos += 2;
+                    self.in_span = false;
                 }
-                None => return Ok(pos),
             }
         }
     }
 
-    /// Bounds-first: prove the tuple complete, then decode. A fused
-    /// single pass with arithmetic rollback was MEASURED SLOWER here
-    /// (16.0-16.3s vs 14.6-15.2s, 10M @0.5cpu ×3 runs each): fusing
-    /// re-imposes per-field bounds checks on the decode and breaks the
-    /// tight pure-scan loop LLVM optimizes below. Two passes stay.
-    /// `Ok(None)` = incomplete (wait for more input, nothing consumed).
-    fn try_tuple(&mut self, b: &[u8]) -> Result<Option<(usize, bool)>> {
-        if b.len() < 2 {
-            return Ok(None);
-        }
-        let ncols = i16::from_be_bytes(b[..2].try_into().unwrap());
-        if ncols == -1 {
-            return Ok(Some((2, true)));
-        }
-        if ncols as usize != self.cols.len() {
-            return Err(Error::Transfer(format!(
-                "pg binary COPY: tuple has {ncols} fields, expected {}",
-                self.cols.len()
-            )));
-        }
-        // Pass 1: bounds walk.
-        let mut off = 2usize;
-        for _ in 0..self.cols.len() {
-            if b.len() < off + 4 {
-                return Ok(None);
+    /// Bounds-walk up to [`ST_K`] complete tuples starting at `start`,
+    /// recording each field's (absolute offset, len) column-major into the
+    /// staging arrays. Nothing is decoded here — a tuple that turns out
+    /// incomplete is simply not staged, so there is never anything to
+    /// roll back. Returns (end of staged bytes, why we stopped).
+    fn stage_tuples(&mut self, data: &[u8], start: usize) -> Result<(usize, StageStop)> {
+        let ncols = self.cols.len();
+        let mut pos = start;
+        self.st_rows = 0;
+        while self.st_rows < ST_K {
+            if data.len() - pos < 2 {
+                return Ok((pos, StageStop::Incomplete));
             }
-            let len = i32::from_be_bytes(b[off..off + 4].try_into().unwrap());
-            off += 4;
-            if len < -1 {
+            let nc = i16::from_be_bytes(data[pos..pos + 2].try_into().unwrap());
+            if nc == -1 {
+                return Ok((pos, StageStop::Trailer));
+            }
+            if nc as usize != ncols {
                 return Err(Error::Transfer(format!(
-                    "pg binary COPY: corrupt field length {len}"
+                    "pg binary COPY: tuple has {nc} fields, expected {ncols}"
                 )));
             }
-            if len > 0 {
-                if b.len() < off + len as usize {
-                    return Ok(None);
+            let k = self.st_rows;
+            let mut o = pos + 2;
+            for c in 0..ncols {
+                if data.len() - o < 4 {
+                    return Ok((pos, StageStop::Incomplete));
                 }
-                off += len as usize;
+                let len = i32::from_be_bytes(data[o..o + 4].try_into().unwrap());
+                o += 4;
+                if len < -1 {
+                    return Err(Error::Transfer(format!(
+                        "pg binary COPY: corrupt field length {len}"
+                    )));
+                }
+                if len == -1 {
+                    self.st_len[c * ST_K + k] = -1;
+                } else {
+                    if data.len() - o < len as usize {
+                        return Ok((pos, StageStop::Incomplete));
+                    }
+                    self.st_off[c * ST_K + k] = o as u32;
+                    self.st_len[c * ST_K + k] = len;
+                    o += len as usize;
+                }
             }
+            pos = o;
+            self.st_rows += 1;
         }
-        // Pass 2: decode (complete by construction). Pass 1 walked these
-        // exact offsets against b.len() with the same column count, so the
-        // reads skip the redundant bounds checks — this loop runs once per
-        // field of every row and profiled at 26.5% of a 0.5-core read.
-        let row = self.rows;
-        let mut o = 2usize;
-        for col in self.cols.iter_mut() {
-            // SAFETY: pass 1 proved b holds 4 length bytes at `o`.
-            let len =
-                i32::from_be_bytes(unsafe { b.as_ptr().add(o).cast::<[u8; 4]>().read() });
-            o += 4;
-            if len == -1 {
-                col.push_null(row);
-                continue;
-            }
-            // SAFETY: pass 1 proved b holds `len` payload bytes at `o`.
-            let f = unsafe { std::slice::from_raw_parts(b.as_ptr().add(o), len as usize) };
-            o += len as usize;
-            col.push_field(f, row)?;
-        }
-        Ok(Some((off, false)))
+        Ok((pos, StageStop::Full))
     }
+
+    /// Decode the staged micro-batch COLUMN by column: one variant dispatch
+    /// per column, then a tight loop over its staged values. The unchecked
+    /// reads are justified exactly as the old two-pass was: `stage_tuples`
+    /// proved every (offset, len) against `data.len()`.
+    fn decode_staged(&mut self, data: &[u8]) -> Result<()> {
+        let n = self.st_rows;
+        let row0 = self.rows;
+        for (c, col) in self.cols.iter_mut().enumerate() {
+            let offs = &self.st_off[c * ST_K..c * ST_K + n];
+            let lens = &self.st_len[c * ST_K..c * ST_K + n];
+            // SAFETY (whole match): every non-NULL (offs[k], lens[k]) was
+            // bounds-proven against `data` by stage_tuples this micro-batch.
+            match col {
+                ColB::I16 { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0);
+                            continue;
+                        }
+                        if len != 2 {
+                            return Err(bad(&format!("int2 width {len}")));
+                        }
+                        let p = unsafe { data.as_ptr().add(offs[k] as usize) };
+                        d.push(i16::from_be_bytes(unsafe { p.cast::<[u8; 2]>().read() }));
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::I32 { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0);
+                            continue;
+                        }
+                        if len != 4 {
+                            return Err(bad(&format!("int4 width {len}")));
+                        }
+                        let p = unsafe { data.as_ptr().add(offs[k] as usize) };
+                        d.push(i32::from_be_bytes(unsafe { p.cast::<[u8; 4]>().read() }));
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::I64 { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0);
+                            continue;
+                        }
+                        if len != 8 {
+                            return Err(bad(&format!("int8 width {len}")));
+                        }
+                        let p = unsafe { data.as_ptr().add(offs[k] as usize) };
+                        d.push(i64::from_be_bytes(unsafe { p.cast::<[u8; 8]>().read() }));
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::F32 { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0.0);
+                            continue;
+                        }
+                        if len != 4 {
+                            return Err(bad("float4"));
+                        }
+                        let p = unsafe { data.as_ptr().add(offs[k] as usize) };
+                        d.push(f32::from_be_bytes(unsafe { p.cast::<[u8; 4]>().read() }));
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::F64 { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0.0);
+                            continue;
+                        }
+                        if len != 8 {
+                            return Err(bad("float8"));
+                        }
+                        let p = unsafe { data.as_ptr().add(offs[k] as usize) };
+                        d.push(f64::from_be_bytes(unsafe { p.cast::<[u8; 8]>().read() }));
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::Bool { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            push_bit(d, row0 + k, false);
+                            continue;
+                        }
+                        let on = len > 0
+                            && unsafe { *data.as_ptr().add(offs[k] as usize) } != 0;
+                        push_bit(d, row0 + k, on);
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::Dec { v, d, s } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0);
+                            continue;
+                        }
+                        let f = unsafe {
+                            std::slice::from_raw_parts(
+                                data.as_ptr().add(offs[k] as usize),
+                                len as usize,
+                            )
+                        };
+                        d.push(numeric_to_scaled_i128(f, *s)?);
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::D32 { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0);
+                            continue;
+                        }
+                        if len != 4 {
+                            return Err(bad("date"));
+                        }
+                        let p = unsafe { data.as_ptr().add(offs[k] as usize) };
+                        let days =
+                            i32::from_be_bytes(unsafe { p.cast::<[u8; 4]>().read() });
+                        if days == i32::MAX || days == i32::MIN {
+                            return Err(Error::Transfer(
+                                "date 'infinity' has no Arrow representation — cast or \
+                                 filter it in a source view"
+                                    .into(),
+                            ));
+                        }
+                        d.push(
+                            days.checked_add(PG_EPOCH_DAYS)
+                                .ok_or_else(|| bad("date range"))?,
+                        );
+                        mark(v, row0 + k, true);
+                    }
+                }
+                ColB::Ts { v, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            d.push(0);
+                            continue;
+                        }
+                        if len != 8 {
+                            return Err(bad("timestamp"));
+                        }
+                        let p = unsafe { data.as_ptr().add(offs[k] as usize) };
+                        let us = i64::from_be_bytes(unsafe { p.cast::<[u8; 8]>().read() });
+                        if us == i64::MAX || us == i64::MIN {
+                            return Err(Error::Transfer(
+                                "timestamp 'infinity' has no Arrow representation — cast \
+                                 or filter it in a source view"
+                                    .into(),
+                            ));
+                        }
+                        d.push(
+                            us.checked_add(PG_EPOCH_MICROS)
+                                .ok_or_else(|| bad("timestamp range"))?,
+                        );
+                        mark(v, row0 + k, true);
+                    }
+                }
+                // Utf8 fields arrive as final UTF-8 bytes — jsonb/uuid were
+                // rewritten to ::text upstream (arrow_kind returns None there).
+                ColB::Utf8 { v, off, d } | ColB::Bin { v, off, d } => {
+                    for k in 0..n {
+                        let len = lens[k];
+                        if len == -1 {
+                            mark(v, row0 + k, false);
+                            off.push(*off.last().expect("offsets seeded with 0"));
+                            continue;
+                        }
+                        let f = unsafe {
+                            std::slice::from_raw_parts(
+                                data.as_ptr().add(offs[k] as usize),
+                                len as usize,
+                            )
+                        };
+                        d.extend_from_slice(f);
+                        off.push(i32::try_from(d.len()).map_err(|_| {
+                            bad("varlen column past i32 offsets in one batch")
+                        })?);
+                        mark(v, row0 + k, true);
+                    }
+                }
+            }
+        }
+        self.rows += n;
+        self.st_rows = 0;
+        Ok(())
+    }
+
 
     fn acc_bytes(&self) -> usize {
         self.cols.iter().map(ColB::bytes).sum()
