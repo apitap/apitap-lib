@@ -124,7 +124,7 @@ ranges) at 0.5 vCPU. What fits where, measured not guessed:
 | full streaming drain, all 15 cols | **59.1s** / 133MB | — |
 | group_by of 1M buckets | OOM | **17.4s** / 1004MB |
 | exact median over 50M floats | OOM | **12.6s** / 931MB |
-| text filter + group on string cols | OOM | OOM (see 2GB note) |
+| text filter + group on string cols | OOM | OOM — needs 2GB: **28.3s** / 1848MB |
 
 The engine's share stays flat (~100-130MB) in every leg — the growth is
 polars' COMPUTE state (group tables, full columns for exact quantiles),
