@@ -18,7 +18,7 @@ use crate::wire::pgoutput::lsn_to_string;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -39,6 +39,15 @@ pub(crate) struct Walsender {
     copying: bool,
     /// COPY OUT reached ReadyForQuery (`copy_out_next` state).
     copy_eof: bool,
+    /// COPY OUT frame-scan state, carried across `fill_buf` windows: a
+    /// partially-read message header, and how many payload bytes of the
+    /// current message remain (to copy for 'd' / to skip for the rest).
+    co_head: [u8; 5],
+    co_head_len: u8,
+    co_tag: u8,
+    co_left: usize,
+    /// ErrorResponse body accumulates here ('E' payload spans windows too).
+    co_err: Vec<u8>,
     pump: Option<PumpHandle>,
 }
 
@@ -198,6 +207,11 @@ impl Walsender {
             wr: BufWriter::with_capacity(64 << 10, w),
             copying: false,
             copy_eof: false,
+            co_head: [0; 5],
+            co_head_len: 0,
+            co_tag: 0,
+            co_left: 0,
+            co_err: Vec::new(),
             pump: None,
         };
         ws.startup(&ci, options, replication).await?;
@@ -393,6 +407,10 @@ impl Walsender {
     pub(crate) async fn copy_out_start(&mut self, sql: &str) -> Result<()> {
         assert!(!self.copying, "copy_out during CopyBoth");
         self.copy_eof = false;
+        self.co_head_len = 0;
+        self.co_tag = 0;
+        self.co_left = 0;
+        self.co_err.clear();
         let mut b = sql.as_bytes().to_vec();
         b.push(0);
         self.send_msg(b'Q', &b).await?;
@@ -420,62 +438,128 @@ impl Walsender {
     /// least `target` bytes or the COPY ends. Returns `false` exactly once:
     /// when the stream is consumed through ReadyForQuery and `buf` is empty.
     ///
-    /// The whole point of this plane: per ROW the cost is a 5-byte header
-    /// parse plus one memcpy out of the 1 MiB `BufReader` — no allocation,
-    /// no refcount, no future-stack poll.
+    /// The frame scan is SYNCHRONOUS over `fill_buf` windows: one await
+    /// refills ~1 MiB, then message headers parse and payload runs copy in
+    /// a plain loop. The previous shape (two async `read_exact` per
+    /// message ≈ per row) profiled at 23.7% of a 0.5-core read — 20M
+    /// future polls per 10M rows was the whole cost.
     pub(crate) async fn copy_out_next(&mut self, buf: &mut Vec<u8>, target: usize) -> Result<bool> {
         buf.clear();
         if self.copy_eof {
             return Ok(false);
         }
-        let rd = self
-            .rd
-            .as_mut()
-            .expect("copy_out while the pump owns the read half");
         loop {
-            let mut head = [0u8; 5];
-            rd.read_exact(&mut head).await.map_err(io_err)?;
-            let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
-            if len < 4 {
-                return Err(Error::Transfer("copy_out: bad message length".into()));
+            let rd = self
+                .rd
+                .as_mut()
+                .expect("copy_out while the pump owns the read half");
+            // ONE await per window; everything below is a sync scan.
+            let avail = rd.fill_buf().await.map_err(io_err)?;
+            if avail.is_empty() {
+                return Err(Error::Transfer(
+                    "copy_out: connection closed mid-stream".into(),
+                ));
             }
-            let len = len - 4;
-            match head[0] {
-                b'd' => {
-                    let start = buf.len();
-                    buf.resize(start + len, 0);
-                    rd.read_exact(&mut buf[start..]).await.map_err(io_err)?;
-                    if buf.len() >= target {
-                        return Ok(true);
+            let n = avail.len();
+            let mut i = 0usize;
+            let mut done = false;
+            let mut err: Option<Error> = None;
+            // Local copies keep the scan in registers; write back after.
+            let mut co_tag = self.co_tag;
+            let mut co_left = self.co_left;
+            while i < n {
+                if co_left > 0 {
+                    // Inside a message payload: one run, bounded by the window.
+                    let take = (n - i).min(co_left);
+                    match co_tag {
+                        b'd' => buf.extend_from_slice(&avail[i..i + take]),
+                        b'E' => self.co_err.extend_from_slice(&avail[i..i + take]),
+                        _ => {} // Z status byte / CopyDone / CommandComplete / …
+                    }
+                    co_left -= take;
+                    i += take;
+                    if co_left == 0 {
+                        match co_tag {
+                            b'Z' => {
+                                done = true;
+                                break;
+                            }
+                            b'E' => {
+                                err = Some(parse_error(&std::mem::take(&mut self.co_err)));
+                                break;
+                            }
+                            // A filled piece returns; the tail of the window
+                            // stays buffered for the next call.
+                            b'd' if buf.len() >= target => break,
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                let (tag, len) = if self.co_head_len == 0 && n - i >= 5 {
+                    // Common case: the whole header sits in the window.
+                    let tag = avail[i];
+                    let len =
+                        u32::from_be_bytes(avail[i + 1..i + 5].try_into().unwrap()) as usize;
+                    i += 5;
+                    (tag, len)
+                } else {
+                    // Straddling header: accumulate across windows.
+                    let have = self.co_head_len as usize;
+                    let take = (n - i).min(5 - have);
+                    self.co_head[have..have + take].copy_from_slice(&avail[i..i + take]);
+                    self.co_head_len += take as u8;
+                    i += take;
+                    if self.co_head_len < 5 {
+                        break; // window exhausted mid-header
+                    }
+                    self.co_head_len = 0;
+                    (
+                        self.co_head[0],
+                        u32::from_be_bytes(self.co_head[1..5].try_into().unwrap()) as usize,
+                    )
+                };
+                if len < 4 {
+                    err = Some(Error::Transfer("copy_out: bad message length".into()));
+                    break;
+                }
+                match tag {
+                    b'd' | b'Z' | b'E' | b'c' | b'C' | b'S' | b'N' | b'A' => {}
+                    other => {
+                        err = Some(Error::Transfer(format!(
+                            "copy_out: unexpected message {:?}",
+                            other as char
+                        )));
+                        break;
                     }
                 }
-                b'Z' => {
-                    // ReadyForQuery — skip the status byte, surface any tail.
-                    let mut skip = vec![0u8; len];
-                    rd.read_exact(&mut skip).await.map_err(io_err)?;
-                    self.copy_eof = true;
-                    return Ok(!buf.is_empty());
+                co_tag = tag;
+                co_left = len - 4;
+                // Z carries a status byte and E a body in practice, but a
+                // zero-payload one must still terminate, not no-op.
+                if co_left == 0 && matches!(tag, b'Z' | b'E') {
+                    if tag == b'Z' {
+                        done = true;
+                    } else {
+                        err = Some(parse_error(&[]));
+                    }
+                    break;
                 }
-                b'E' => {
-                    let mut body = vec![0u8; len];
-                    rd.read_exact(&mut body).await.map_err(io_err)?;
-                    let e = parse_error(&body);
-                    self.copy_eof = true;
-                    self.drain_to_ready().await?;
-                    return Err(e);
-                }
-                // CopyDone / CommandComplete / ParameterStatus / Notice — all
-                // tiny, all skippable on the way to ReadyForQuery.
-                b'c' | b'C' | b'S' | b'N' => {
-                    let mut skip = vec![0u8; len];
-                    rd.read_exact(&mut skip).await.map_err(io_err)?;
-                }
-                other => {
-                    return Err(Error::Transfer(format!(
-                        "copy_out: unexpected message {:?}",
-                        other as char
-                    )))
-                }
+            }
+            self.co_tag = co_tag;
+            self.co_left = co_left;
+            rd.consume(i);
+            if let Some(e) = err {
+                self.copy_eof = true;
+                self.drain_to_ready().await?;
+                return Err(e);
+            }
+            if done {
+                self.copy_eof = true;
+                return Ok(!buf.is_empty());
+            }
+            if buf.len() >= target {
+                return Ok(true);
             }
         }
     }
