@@ -19,6 +19,18 @@ df = apitap.read("postgres://…/db", table="public.orders").to_polars()
 | connectorx → polars | 55.9 s | 3.8× |
 | `pandas.read_sql` | 295.4 s | 20× |
 
+## Materializing is a RAM problem, not a CPU one
+
+The 15-column 10M frame measures a **5.14 GB peak RSS** to materialize
+(the ~2 GB frame plus the Arrow→polars conversion transient) — so
+"10M → DataFrame in 256 MB" is physics, not a benchmark, and no reader
+passes it. With the RAM honest and the CPU capped instead:
+
+| 10M → polars @ 0.5 vCPU / 6 GB | wall | peak |
+|---|---|---|
+| apitap | **57.3 s** | 4.8 GB |
+| connectorx | **OOM-killed** (its transient tops 6 GB) | — |
+
 ## The home tier: 0.5 vCPU / 256 MB
 
 | leg | apitap | connectorx |
