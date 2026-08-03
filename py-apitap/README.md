@@ -152,25 +152,31 @@ The GIL is released for the whole transfer. Errors are `ValueError` for bad inpu
 ### `apitap.read()` → Arrow / polars
 
 ```python
-df  = apitap.read(src, table="events").to_polars()   # polars DataFrame
-tbl = apitap.read(src, table="events").to_arrow()    # pyarrow Table
+df = apitap.read(src, table="events").to_polars()    # polars DataFrame
 
-import pyarrow as pa                                 # constant-memory streaming
-reader = pa.RecordBatchReader.from_stream(apitap.read(src, table="events"))
-for batch in reader:
-    ...
+# tables BIGGER than RAM: one line, ordinary polars, streaming underneath —
+top = (apitap.read(src, table="events").lazy()
+       .filter(pl.col("amount") > 100)
+       .group_by("status").agg(pl.len())
+       .collect(engine="streaming"))
+
+apitap.read(src, table="events").to_parquet("events.parquet")  # pg → Parquet
+tbl = apitap.read(src, table="events").to_arrow()              # pyarrow Table
 ```
 
 The same parallel binary-COPY pipes every transfer route uses feed Rust-side
 Arrow column builders; batches cross into Python zero-copy through the Arrow
 C stream protocol (`__arrow_c_stream__`), so polars, pyarrow, duckdb and
 pandas consume the reader natively — the wheel depends on none of them.
-Typed end to end (int16/32/64, float32/64, bool, decimal128, date32,
-timestamp µs, utf8, binary); uuid/jsonb/exotics arrive as text, so every
-table reads. Measured on the bench box: 10M rows → polars in **14.6 s**
-(connectorx 55.9 s, pandas 295 s, same box); the streaming loop pulls the
-same ten million rows through **0.5 vCPU / 256 MB** in ~15 s at a flat
-~130 MB — a materializing reader cannot finish that container at all.
+`.lazy()` registers the stream as a polars scan: column pruning and
+predicates push into it, and no loop ever appears in your code. Typed end
+to end (int16/32/64, float32/64, bool, decimal128, date32, timestamp µs,
+utf8, binary); uuid/jsonb/exotics arrive as text, so every table reads.
+Measured on the bench box: 10M rows → polars in **14.6 s** (connectorx
+55.9 s, pandas 295 s, same box). In a **0.5 vCPU / 256 MB** container the
+same ten million rows stream through in **14.2 s** flat at ~138 MB, and a
+real `.lazy()` filter + group_by lands in ~19 s at 183 MB peak — a
+materializing reader cannot finish that container at all.
 `parallel=1` preserves source order; `cursor=` picks the split column.
 
 Full usage guide — connection URLs, per-route type mappings, incremental semantics,
@@ -193,8 +199,9 @@ troubleshooting:
 - [x] Multi-table and whole-schema transfers under one memory budget
 - [x] ClickHouse table engines — `engine=`, `order_by=`, `on_cluster=`
 - [x] `apitap.read()` → Arrow / polars / pyarrow / duckdb — zero-copy Arrow C
-      stream, 10M → polars 14.6 s (connectorx 55.9 s), streams 10M rows through
-      a 0.5 vCPU / 256 MB container at a flat ~130 MB
+      stream, 10M → polars 14.6 s (connectorx 55.9 s); `.lazy()` runs ordinary
+      polars queries over 10M rows inside a 0.5 vCPU / 256 MB container;
+      `.to_parquet()` streams a table to a file at constant memory
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
 - [ ] MySQL source for `read()`
 - [ ] Snowflake destination

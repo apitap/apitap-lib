@@ -91,6 +91,12 @@ class Reader:
     """A running parallel read. Consume it ONCE, whichever way you like:
 
     - ``reader.to_polars()`` — the one-liner (needs ``pip install polars``)
+    - ``reader.lazy()`` — a polars LazyFrame: write ordinary polars
+      (filter/group_by/agg) and ``.collect(engine="streaming")`` pulls the
+      table through in constant memory — 10M rows fit a 256 MB container
+    - ``for df in reader.batches():`` — small polars DataFrames, one per
+      Arrow batch, constant memory
+    - ``reader.to_parquet(path)`` — table → Parquet file, constant memory
     - ``pl.DataFrame(reader)`` / ``pa.table(reader)`` / DuckDB — via the
       Arrow PyCapsule protocol, zero-copy
     - ``reader.to_arrow()`` / ``reader.to_pandas()``
@@ -145,6 +151,87 @@ class Reader:
 
     def to_pandas(self):
         return self.to_arrow().to_pandas()
+
+    def lazy(self):
+        """A polars LazyFrame over the STREAM — write ordinary polars and let
+        ``collect(engine="streaming")`` pull batches through constant memory::
+
+            top = (apitap.read(src, table="events")
+                   .lazy()
+                   .filter(pl.col("amount") > 100)
+                   .group_by("status").agg(pl.len())
+                   .collect(engine="streaming"))
+
+        Ten million rows aggregate in a 256 MB container this way — the full
+        DataFrame never exists. Column pruning, predicates and head() are
+        pushed into the stream. One-shot like every Reader: collect once.
+        """
+        try:
+            import polars as pl
+            import pyarrow as pa
+            from polars.io.plugins import register_io_source
+        except ImportError as e:
+            raise ImportError(
+                "lazy() needs polars >= 1.0 and pyarrow — "
+                "pip install polars pyarrow"
+            ) from e
+
+        reader = pa.RecordBatchReader.from_stream(self)
+        schema = pl.from_arrow(reader.schema.empty_table()).schema
+
+        def source(with_columns, predicate, n_rows, batch_size):
+            taken = 0
+            for batch in reader:
+                df = pl.from_arrow(batch)
+                if with_columns is not None:
+                    df = df.select(with_columns)
+                if predicate is not None:
+                    df = df.filter(predicate)
+                if n_rows is not None:
+                    remaining = n_rows - taken
+                    if remaining <= 0:
+                        return
+                    if df.height > remaining:
+                        df = df.head(remaining)
+                taken += df.height
+                yield df
+
+        return register_io_source(source, schema=schema)
+
+    def batches(self):
+        """Iterate the table as SMALL polars DataFrames — one per Arrow
+        batch, constant memory, no pyarrow ceremony::
+
+            for df in apitap.read(src, table="events").batches():
+                ...   # df is a plain polars DataFrame, a few MB each
+        """
+        try:
+            import polars as pl
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError(
+                "batches() needs polars and pyarrow — pip install polars pyarrow"
+            ) from e
+        for batch in pa.RecordBatchReader.from_stream(self):
+            yield pl.from_arrow(batch)
+
+    def to_parquet(self, path, *, compression="zstd", **writer_kwargs):
+        """Stream the table into a Parquet file at constant memory; returns
+        the row count. ``apitap.read(src, table="t").to_parquet("t.parquet")``
+        moves a 10M-row table through a 256 MB container."""
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError as e:
+            raise ImportError("to_parquet() needs pyarrow — pip install pyarrow") from e
+        reader = pa.RecordBatchReader.from_stream(self)
+        rows = 0
+        with pq.ParquetWriter(path, reader.schema, compression=compression,
+                              **writer_kwargs) as w:
+            for batch in reader:
+                w.write_batch(batch)
+                rows += batch.num_rows
+        return rows
 
 
 def read(
