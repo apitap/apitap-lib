@@ -16,11 +16,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// One-time allocator tuning for the batch cycle: column buffers run 1–32 MiB
+/// and churn every batch — above glibc's default M_MMAP_THRESHOLD (128 KiB)
+/// each one is a fresh mmap the kernel zeroes page by page (clear_page_erms
+/// profiled ~13% of a 0.5-core run) and a munmap on free. Raising the
+/// threshold keeps them in the arena, where freed blocks come back warm.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_allocator() {
+    // Only above the tight tiers: arena reuse holds freed blocks, and on a
+    // 256 MB box that retention measured +20-30 MB peak — there, glibc's
+    // default mmap/munmap behavior IS the memory ceiling working as intended.
+    if pipeline::mem_limit_bytes().is_some_and(|m| m < 512 << 20) {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 64 << 20);
+    });
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_allocator() {}
+
 pub(crate) async fn start(
     src_url: &str,
     table: &str,
     opts: &ReadOptions,
 ) -> Result<ReadHandle> {
+    tune_allocator();
     if opts.query.is_some() {
         return Err(Error::InvalidInput(
             "read: query= lands next — pass table= (and optionally cursor=) today".into(),
@@ -48,12 +70,26 @@ pub(crate) async fn start(
         cursor: opts.cursor.clone(),
         ..Default::default()
     };
-    let (chunk, parallel) = pipeline::knobs(&topts, &profile)?;
+    let (chunk, mut parallel) = pipeline::knobs(&topts, &profile)?;
+    if opts.parallel.is_none() {
+        if let Some(m) = pipeline::mem_limit_bytes() {
+            // Read pipes hold no sink-side buffers, so the transfer model's
+            // 10×chunk-per-pipe cap overshoots here. Measured on the 256 MB
+            // tier (10M rows, 0.5 core): 5 pipes 26.7s/194MB peak, 6 pipes
+            // 24.8s/211MB, 7 pipes 25.6s/238MB — 6 is the knee. ~36 MB per
+            // pipe reproduces that knee and scales down with the budget.
+            parallel = ((m.saturating_sub(40 << 20)) / (36 << 20)).clamp(1, 8) as usize;
+        }
+    }
 
     let src = PgSource::connect(src_url, parallel + 1).await?;
     let mut plan = src.probe(table).await?;
     plan.cursor = opts.cursor.clone().or_else(|| plan.single_int_pk());
     let mut lane = src.plan_lane(&plan, WireFormat::PgCopyBinary);
+    // Spans arrive verbatim (FrameRaw): the batch builder walks each span's
+    // own header/trailer, so the strip-and-recopy stage — one full memcpy
+    // of the stream plus a 4 MiB accumulator per pipe — disappears.
+    lane.raw_frames = true;
 
     // Arrow vocabulary per column; anything outside it (arrays, intervals,
     // enums, huge NUMERIC, json/jsonb, uuid) rides `::text` as Utf8 — the
@@ -91,7 +127,10 @@ pub(crate) async fn start(
             b
         }
         None => match mem {
-            Some(m) => ((m.saturating_sub(40 << 20) as usize) / (4 * (used + cap + 1)))
+            // 56 MiB reserve (was 40): the raw COPY plane carries ~8 MB of
+            // per-worker read buffers, and 250 MB peaks in a 256 MB cgroup
+            // were two pages from the OOM killer. Headroom is a feature.
+            Some(m) => ((m.saturating_sub(56 << 20) as usize) / (4 * (used + cap + 1)))
                 .clamp(1 << 20, 32 << 20),
             None => 16 << 20,
         },

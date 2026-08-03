@@ -140,15 +140,27 @@ enum ColB {
 }
 
 /// Fresh offsets vec: Arrow wants a leading 0 plus one entry per row.
-fn offsets0(cap: usize) -> Vec<i32> {
-    let mut o = Vec::with_capacity(cap / 16 + 1);
+fn offsets0(entries: usize) -> Vec<i32> {
+    let mut o = Vec::with_capacity(entries);
     o.push(0);
     o
 }
 
+/// Adaptive re-reserve for the next batch's buffer: the batch that just
+/// sealed ended at `last_bytes`, so reserve that plus 1/8 slack, clamped
+/// to [4 KiB, 32 MiB]. A threshold seal fires when the columns together
+/// hold ~batch_bytes, so sum(last_bytes) ≈ batch_bytes and the total
+/// reservation stays near 1.13x batch_bytes — but skewed per column, so
+/// a varlen column that eats most of the batch no longer pays geometric
+/// growth reallocs against a uniform batch_bytes/ncols split.
+fn adaptive(last_bytes: usize) -> usize {
+    (last_bytes + last_bytes / 8).clamp(4096, 32 << 20)
+}
+
 impl ColB {
-    /// `cap` = per-column byte budget (batch_bytes / ncols), a modest
-    /// pre-reserve so a steady stream never reallocates mid-batch.
+    /// `cap` = per-column byte budget (batch_bytes / ncols) for the FIRST
+    /// batch only — there is no size history yet, so the budget splits
+    /// uniformly. Every later batch re-reserves adaptively at seal.
     fn new(k: &ArrowKind, cap: usize) -> Self {
         match k {
             ArrowKind::Int16 => ColB::I16 { v: None, d: Vec::with_capacity(cap / 2) },
@@ -168,12 +180,12 @@ impl ColB {
             }
             ArrowKind::Utf8 => ColB::Utf8 {
                 v: None,
-                off: offsets0(cap),
+                off: offsets0(cap / 16 + 1),
                 d: Vec::with_capacity(cap),
             },
             ArrowKind::Binary => ColB::Bin {
                 v: None,
-                off: offsets0(cap),
+                off: offsets0(cap / 16 + 1),
                 d: Vec::with_capacity(cap),
             },
         }
@@ -287,48 +299,59 @@ impl ColB {
         }
     }
 
-    /// Move the buffers out as-is and re-arm with the same modest reserve.
-    fn seal(&mut self, cap: usize) -> FinishedCol {
+    /// Move the buffers out as-is and re-arm ADAPTIVELY: each fresh Vec
+    /// pre-reserves from the sealed batch's FINAL byte size (+1/8 slack,
+    /// clamped — see [`adaptive`]). Validity stays lazy (`None` until the
+    /// first NULL), so it carries no pre-reserve to adapt.
+    fn seal(&mut self) -> FinishedCol {
         use std::mem::replace;
         match self {
-            ColB::I16 { v, d } => FinishedCol::I16 {
-                validity: v.take(),
-                data: replace(d, Vec::with_capacity(cap / 2)),
-            },
-            ColB::I32 { v, d } | ColB::D32 { v, d } => FinishedCol::I32 {
-                validity: v.take(),
-                data: replace(d, Vec::with_capacity(cap / 4)),
-            },
-            ColB::I64 { v, d } | ColB::Ts { v, d } => FinishedCol::I64 {
-                validity: v.take(),
-                data: replace(d, Vec::with_capacity(cap / 8)),
-            },
-            ColB::F32 { v, d } => FinishedCol::F32 {
-                validity: v.take(),
-                data: replace(d, Vec::with_capacity(cap / 4)),
-            },
-            ColB::F64 { v, d } => FinishedCol::F64 {
-                validity: v.take(),
-                data: replace(d, Vec::with_capacity(cap / 8)),
-            },
-            ColB::Bool { v, d } => FinishedCol::Bool {
-                validity: v.take(),
-                data: replace(d, Vec::with_capacity(cap / 8)),
-            },
-            ColB::Dec { v, d, .. } => FinishedCol::Dec128 {
-                validity: v.take(),
-                data: replace(d, Vec::with_capacity(cap / 16)),
-            },
-            ColB::Utf8 { v, off, d } => FinishedCol::Utf8 {
-                validity: v.take(),
-                offsets: replace(off, offsets0(cap)),
-                data: replace(d, Vec::with_capacity(cap)),
-            },
-            ColB::Bin { v, off, d } => FinishedCol::Bin {
-                validity: v.take(),
-                offsets: replace(off, offsets0(cap)),
-                data: replace(d, Vec::with_capacity(cap)),
-            },
+            ColB::I16 { v, d } => {
+                let cap = adaptive(d.len() * 2) / 2;
+                FinishedCol::I16 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+            }
+            ColB::I32 { v, d } | ColB::D32 { v, d } => {
+                let cap = adaptive(d.len() * 4) / 4;
+                FinishedCol::I32 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+            }
+            ColB::I64 { v, d } | ColB::Ts { v, d } => {
+                let cap = adaptive(d.len() * 8) / 8;
+                FinishedCol::I64 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+            }
+            ColB::F32 { v, d } => {
+                let cap = adaptive(d.len() * 4) / 4;
+                FinishedCol::F32 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+            }
+            ColB::F64 { v, d } => {
+                let cap = adaptive(d.len() * 8) / 8;
+                FinishedCol::F64 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+            }
+            ColB::Bool { v, d } => {
+                let cap = adaptive(d.len());
+                FinishedCol::Bool { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+            }
+            ColB::Dec { v, d, .. } => {
+                let cap = adaptive(d.len() * 16) / 16;
+                FinishedCol::Dec128 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+            }
+            ColB::Utf8 { v, off, d } => {
+                let dcap = adaptive(d.len());
+                let ocap = adaptive(off.len() * 4) / 4;
+                FinishedCol::Utf8 {
+                    validity: v.take(),
+                    offsets: replace(off, offsets0(ocap)),
+                    data: replace(d, Vec::with_capacity(dcap)),
+                }
+            }
+            ColB::Bin { v, off, d } => {
+                let dcap = adaptive(d.len());
+                let ocap = adaptive(off.len() * 4) / 4;
+                FinishedCol::Bin {
+                    validity: v.take(),
+                    offsets: replace(off, offsets0(ocap)),
+                    data: replace(d, Vec::with_capacity(dcap)),
+                }
+            }
         }
     }
 }
@@ -337,109 +360,130 @@ impl ColB {
 // Streaming builder: COPY-binary chunks in → sealed ArrowBatches out
 // ============================================================================
 
-/// Per-worker streaming builder: feed raw COPY-binary chunks (one 19-byte
-/// header per worker stream, then tuples, 0xFFFF trailer at end — the
-/// FrameStrip lane's shape), seal a batch whenever ~`batch_bytes` of column
-/// data accumulated.
+/// Per-worker streaming builder: feed raw COPY-binary bytes as a sequence
+/// of SPANS (19-byte header, tuples, 0xFFFF trailer — then possibly the
+/// next span's header). One synthetic-stream worker feed is simply the
+/// one-span case. Seals a batch whenever ~`batch_bytes` accumulated.
 pub struct BatchBuilder {
     cols: Vec<ColB>,
-    /// Per-column reserve target — batch_bytes / ncols.
-    cap: usize,
     batch_bytes: usize,
     /// Rows in the current (unsealed) batch.
     rows: usize,
     rows_sealed: u64,
-    // -- COPY framing state (bounds-first; see bqparquet's module docs)
+    // -- COPY framing state (bounds-first; see bqparquet's module docs).
+    // `buf` holds ONLY the unconsumed tail (header-in-progress or one
+    // straddling tuple) — chunks are otherwise walked in place.
     buf: Vec<u8>,
-    pos: usize,
-    header_done: bool,
-    finished: bool,
+    /// Inside a span (header consumed, trailer not yet seen).
+    in_span: bool,
 }
 
 impl BatchBuilder {
     pub fn new(kinds: Vec<ArrowKind>, batch_bytes: usize) -> Self {
-        // The reserve clamps: a huge batch_bytes (the materialize fast
-        // path never seals mid-stream) must not pre-allocate huge Vecs —
-        // growth amortizes from here.
+        // First-batch reserve only (no size history yet): a uniform
+        // batch_bytes/ncols split, clamped — a huge batch_bytes (the
+        // materialize fast path never seals mid-stream) must not
+        // pre-allocate huge Vecs. Each seal then re-reserves per column
+        // from that column's actual final sizes (see ColB::seal).
         let cap = (batch_bytes / kinds.len().max(1)).min(32 << 20);
         Self {
             cols: kinds.iter().map(|k| ColB::new(k, cap)).collect(),
-            cap,
             batch_bytes,
             rows: 0,
             rows_sealed: 0,
-            buf: Vec::with_capacity(1 << 20),
-            pos: 0,
-            header_done: false,
-            finished: false,
+            buf: Vec::with_capacity(64 << 10),
+            in_span: false,
         }
     }
 
     /// Consume one raw chunk. Complete tuples decode into the column
     /// builders; a partial tail is buffered for the next chunk (bounds-
     /// first two-pass — a tuple split across chunks never rolls back).
+    ///
+    /// The chunk is walked IN PLACE: `self.buf` only ever holds the header
+    /// (until complete) or one straddling tuple's bytes. Buffering whole
+    /// chunks instead measured ~1.4 GB of extra memcpy per 10M-row stream.
+    /// Invariant at every return: `buf` holds exactly the unconsumed tail.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn push(&mut self, chunk: &[u8]) -> Result<()> {
-        if self.pos > 0 && self.pos == self.buf.len() {
-            self.buf.clear();
-            self.pos = 0;
-        }
-        if self.pos > (1 << 20) {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-        self.buf.extend_from_slice(chunk);
-
-        if !self.header_done {
-            if self.buf.len() - self.pos < 19 {
+        let mut start = 0usize;
+        // Top-up: while a straddling header/tuple sits in `buf`, feed it
+        // bites (doubling, so a huge single value stays O(n)) until it
+        // completes, then fall through to the in-place walk.
+        let mut bite = 16 << 10;
+        while !self.buf.is_empty() {
+            if start >= chunk.len() {
                 return Ok(());
             }
-            if &self.buf[self.pos..self.pos + 11] != b"PGCOPY\n\xff\r\n\0" {
-                return Err(Error::Transfer("pg binary COPY: bad header".into()));
+            let take = (chunk.len() - start).min(bite);
+            bite = (bite * 2).min(64 << 20);
+            self.buf.extend_from_slice(&chunk[start..start + take]);
+            start += take;
+            // O(1) swap frees `self` for the builders while we read the buffer.
+            let buf = std::mem::take(&mut self.buf);
+            let r = self.walk(&buf);
+            self.buf = buf;
+            let consumed = r?;
+            if consumed == self.buf.len() {
+                self.buf.clear();
+                break;
             }
-            let ext = u32::from_be_bytes(self.buf[self.pos + 15..self.pos + 19].try_into().unwrap())
-                as usize;
-            if self.buf.len() - self.pos < 19 + ext {
-                return Ok(());
-            }
-            self.pos += 19 + ext;
-            self.header_done = true;
+            // Still incomplete: compact the tail to the front and top up.
+            let len = self.buf.len();
+            self.buf.copy_within(consumed.., 0);
+            self.buf.truncate(len - consumed);
         }
 
-        // O(1) swap frees `self` for the builders while we read the buffer.
-        let buf = std::mem::take(&mut self.buf);
-        let mut res = Ok(());
-        while !self.finished {
-            match self.try_tuple(&buf[self.pos..]) {
-                Ok(Some((consumed, trailer))) => {
-                    self.pos += consumed;
-                    if trailer {
-                        self.finished = true;
-                    } else {
-                        self.rows += 1;
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    res = Err(e);
-                    break;
-                }
+        if start < chunk.len() {
+            let consumed = start + self.walk(&chunk[start..])?;
+            if consumed < chunk.len() {
+                self.buf.extend_from_slice(&chunk[consumed..]);
             }
-        }
-        self.buf = buf;
-        res?;
-        // The worker stream is ONE header + tuples + one trailer — anything
-        // after the trailer means the framing upstream is broken.
-        if self.finished && self.pos < self.buf.len() {
-            return Err(Error::Transfer(
-                "pg binary COPY: bytes after the trailer".into(),
-            ));
         }
         Ok(())
     }
 
-    /// Bounds-first: prove the tuple complete, then decode. `Ok(None)` =
-    /// incomplete (wait for more input, nothing consumed or emitted).
+    /// Walk headers, tuples and trailers in sequence until the data runs
+    /// out mid-element; returns bytes consumed. A trailer closes the span
+    /// and the next bytes (if any) must open the next span's header.
+    fn walk(&mut self, data: &[u8]) -> Result<usize> {
+        let mut pos = 0usize;
+        loop {
+            if !self.in_span {
+                let b = &data[pos..];
+                if b.len() < 19 {
+                    return Ok(pos);
+                }
+                if &b[..11] != b"PGCOPY\n\xff\r\n\0" {
+                    return Err(Error::Transfer("pg binary COPY: bad header".into()));
+                }
+                let ext = u32::from_be_bytes(b[15..19].try_into().unwrap()) as usize;
+                if b.len() < 19 + ext {
+                    return Ok(pos);
+                }
+                pos += 19 + ext;
+                self.in_span = true;
+            }
+            match self.try_tuple(&data[pos..])? {
+                Some((consumed, trailer)) => {
+                    pos += consumed;
+                    if trailer {
+                        self.in_span = false;
+                    } else {
+                        self.rows += 1;
+                    }
+                }
+                None => return Ok(pos),
+            }
+        }
+    }
+
+    /// Bounds-first: prove the tuple complete, then decode. A fused
+    /// single pass with arithmetic rollback was MEASURED SLOWER here
+    /// (16.0-16.3s vs 14.6-15.2s, 10M @0.5cpu ×3 runs each): fusing
+    /// re-imposes per-field bounds checks on the decode and breaks the
+    /// tight pure-scan loop LLVM optimizes below. Two passes stay.
+    /// `Ok(None)` = incomplete (wait for more input, nothing consumed).
     fn try_tuple(&mut self, b: &[u8]) -> Result<Option<(usize, bool)>> {
         if b.len() < 2 {
             return Ok(None);
@@ -474,19 +518,25 @@ impl BatchBuilder {
                 off += len as usize;
             }
         }
-        // Pass 2: decode (complete by construction).
+        // Pass 2: decode (complete by construction). Pass 1 walked these
+        // exact offsets against b.len() with the same column count, so the
+        // reads skip the redundant bounds checks — this loop runs once per
+        // field of every row and profiled at 26.5% of a 0.5-core read.
         let row = self.rows;
         let mut o = 2usize;
-        for i in 0..self.cols.len() {
-            let len = i32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        for col in self.cols.iter_mut() {
+            // SAFETY: pass 1 proved b holds 4 length bytes at `o`.
+            let len =
+                i32::from_be_bytes(unsafe { b.as_ptr().add(o).cast::<[u8; 4]>().read() });
             o += 4;
             if len == -1 {
-                self.cols[i].push_null(row);
+                col.push_null(row);
                 continue;
             }
-            let f = &b[o..o + len as usize];
+            // SAFETY: pass 1 proved b holds `len` payload bytes at `o`.
+            let f = unsafe { std::slice::from_raw_parts(b.as_ptr().add(o), len as usize) };
             o += len as usize;
-            self.cols[i].push_field(f, row)?;
+            col.push_field(f, row)?;
         }
         Ok(Some((off, false)))
     }
@@ -499,10 +549,9 @@ impl BatchBuilder {
         let rows = self.rows;
         self.rows = 0;
         self.rows_sealed += rows as u64;
-        let cap = self.cap;
         ArrowBatch {
             rows,
-            cols: self.cols.iter_mut().map(|c| c.seal(cap)).collect(),
+            cols: self.cols.iter_mut().map(ColB::seal).collect(),
         }
     }
 
@@ -515,9 +564,10 @@ impl BatchBuilder {
         Some(self.seal())
     }
 
-    /// Stream over (trailer seen): the final partial batch, if any rows.
+    /// Stream over (every span closed): the final partial batch, if any
+    /// rows. Mid-span or mid-element leftovers mean truncation — loud.
     pub fn finish(&mut self) -> Result<Option<ArrowBatch>> {
-        if !self.finished {
+        if self.in_span || !self.buf.is_empty() {
             return Err(Error::Transfer(
                 "pg binary COPY: stream ended without the trailer".into(),
             ));
@@ -755,6 +805,64 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_reseal_keeps_content_exact_across_many_batches() {
+        // Varlen-heavy: the Utf8 column dwarfs the uniform batch_bytes/2
+        // split, so every seal re-reserves from that column's history.
+        // Only correctness is observable (capacity is not), so walk every
+        // sealed batch and check each row's string and int round-tripped.
+        let make = |i: i64| format!("row-{i}-{}", "x".repeat(200 + (i as usize * 37) % 57));
+        let mut b = BatchBuilder::new(vec![ArrowKind::Utf8, ArrowKind::Int64], 4096);
+        let mut s = Vec::new();
+        pgcopy::header(&mut s);
+        b.push(&s).unwrap();
+        let n = 64i64;
+        let mut sealed = Vec::new();
+        for i in 0..n {
+            let mut t = Vec::new();
+            pgcopy::tuple_start(2, &mut t);
+            pgcopy::field(make(i).as_bytes(), &mut t);
+            pgcopy::field(&i.to_be_bytes(), &mut t);
+            b.push(&t).unwrap();
+            if let Some(batch) = b.take_ready() {
+                sealed.push(batch);
+            }
+        }
+        let mut t = Vec::new();
+        pgcopy::trailer(&mut t);
+        b.push(&t).unwrap();
+        if let Some(tail) = b.finish().unwrap() {
+            sealed.push(tail);
+        }
+        assert!(sealed.len() >= 3, "want >= 3 seals, got {}", sealed.len());
+        assert_eq!(sealed.iter().map(|x| x.rows).sum::<usize>(), n as usize);
+        assert_eq!(b.rows_total(), n as u64);
+        let mut i = 0i64;
+        for batch in &sealed {
+            assert!(batch.rows > 0);
+            match (&batch.cols[0], &batch.cols[1]) {
+                (
+                    FinishedCol::Utf8 { validity, offsets, data },
+                    FinishedCol::I64 { validity: v2, data: ints },
+                ) => {
+                    assert!(validity.is_none() && v2.is_none());
+                    assert_eq!(offsets.len(), batch.rows + 1);
+                    assert_eq!(offsets[0], 0); // re-seeded at every seal
+                    assert_eq!(*offsets.last().unwrap() as usize, data.len());
+                    assert_eq!(ints.len(), batch.rows);
+                    for r in 0..batch.rows {
+                        let (a, z) = (offsets[r] as usize, offsets[r + 1] as usize);
+                        assert_eq!(&data[a..z], make(i).as_bytes(), "row {i}");
+                        assert_eq!(ints[r], i);
+                        i += 1;
+                    }
+                }
+                _ => panic!("layout"),
+            }
+        }
+        assert_eq!(i, n);
+    }
+
+    #[test]
     fn date_and_timestamp_infinity_error_loudly() {
         for (kind, field) in [
             (ArrowKind::Date32, i32::MAX.to_be_bytes().to_vec()),
@@ -789,13 +897,48 @@ mod tests {
         let batch = b.finish().unwrap().expect("partial after trailer");
         assert_eq!(batch.rows, 1);
         assert_eq!(b.rows_total(), 1);
-        // Bytes after the trailer: loud, whether in the same chunk or later.
+        // Bytes after the trailer must be the NEXT span's header: a short
+        // junk tail buffers and turns loud at finish() (truncation), and 19
+        // bytes of non-header junk are loud at push (bad header).
         let mut b = BatchBuilder::new(vec![ArrowKind::Int16], 1 << 20);
         b.push(&with_trailer).unwrap();
-        assert!(b.push(&[0]).is_err());
+        b.push(&[0]).unwrap();
+        assert!(b.finish().is_err());
         let mut junk_tail = with_trailer.clone();
-        junk_tail.push(0);
+        junk_tail.extend_from_slice(&[0u8; 19]);
         let mut b = BatchBuilder::new(vec![ArrowKind::Int16], 1 << 20);
         assert!(b.push(&junk_tail).is_err());
+    }
+
+    #[test]
+    fn multi_span_streams_concatenate_rows() {
+        // The FrameRaw lane: several spans, each with its own header and
+        // trailer, fed at pathological chunk sizes — rows just continue.
+        let mut spans = Vec::new();
+        for base in [0i64, 100, 200] {
+            let mut s = Vec::new();
+            pgcopy::header(&mut s);
+            for i in 0..3i64 {
+                pgcopy::tuple_start(1, &mut s);
+                pgcopy::field(&(base + i).to_be_bytes(), &mut s);
+            }
+            pgcopy::trailer(&mut s);
+            spans.extend_from_slice(&s);
+        }
+        for chunk_size in [1usize, 7, spans.len()] {
+            let mut b = BatchBuilder::new(vec![ArrowKind::Int64], 1 << 20);
+            for c in spans.chunks(chunk_size) {
+                b.push(c).unwrap();
+            }
+            let batch = b.finish().unwrap().expect("rows");
+            assert_eq!(batch.rows, 9, "chunk_size={chunk_size}");
+            match &batch.cols[0] {
+                FinishedCol::I64 { validity, data } => {
+                    assert!(validity.is_none());
+                    assert_eq!(data, &[0, 1, 2, 100, 101, 102, 200, 201, 202]);
+                }
+                _ => panic!("layout"),
+            }
+        }
     }
 }

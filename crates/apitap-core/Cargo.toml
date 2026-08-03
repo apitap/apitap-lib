@@ -21,6 +21,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 chrono = { version = "0.4", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Allocator tuning on the read hot path (M_MMAP_THRESHOLD; glibc Linux only).
+libc = "0.2"
 futures = "0.3"
 thiserror = "2"
 num_cpus = "1"

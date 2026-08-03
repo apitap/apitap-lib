@@ -61,3 +61,52 @@ One honest note found (and fixed) by this bench: the first FFI cut leaked
 every batch through a no-op child release callback — the 256 MB probe
 caught it in minutes (+40 MB per batch, flat after the fix). Small tiers
 are not just a market: they are a leak detector.
+
+## The speed campaign (branch read-speed)
+
+A cpu-clock flamegraph at the 0.5-core regime (perf attach starves on
+this VPS — fork-mode inside the CPUQuota scope is the recipe) split the
+budget two ways: `BatchBuilder::push` 26.5% self, and ~30-35% under
+sqlx's copy stream — one refcounted `Bytes` per CopyData message ≈ per
+ROW, through four future layers. 10M rows = a 10M-poll storm.
+
+Four knives, each measured at 0.5 vCPU / 256 MB / 10M rows, each kept
+only if the number moved:
+
+| state | wall | peak |
+|---|---|---|
+| campaign start (auto-parallel floor fix) | 26.7 s (p=5) | 194 MB |
+| p=6 sweet spot (sweep) | 24.8 s | 211 MB |
+| + raw COPY plane, NUMERIC fast path, adaptive reserve | 20.7 s | 197 MB |
+| + FrameRaw (spans verbatim → builder, no strip/accumulator) | **14.6 s** | **102 MB** |
+
+- **Raw COPY plane**: the walsender stack grew `connect_sql` +
+  `copy_out_start/next` — frames coalesce out of a 1 MiB read buffer
+  into one reused Vec. No per-row Bytes, no poll storm. Falls back to
+  sqlx on TLS URLs; `APITAP_RAW_COPY=0/1` forces either plane.
+- **NUMERIC fast path**: ndigits ≤ 3 short-circuits (u64 header load,
+  pow-10 table) — 2.0-2.1× on money-shaped numerics, bit-identical by a
+  3,400-case oracle grid against the general path.
+- **Adaptive pre-reserve**: each seal re-reserves per column from that
+  column's actual final size (+1/8), so varlen columns stop paying
+  geometric-growth reallocs against a uniform split.
+- **FrameRaw**: the read lane ships span payloads verbatim; the builder
+  walks headers/trailers natively (multi-span), chunks decode IN PLACE
+  (buffered tail = one straddling tuple, not the stream). Two full-stream
+  memcpys and six 4 MiB accumulators vanished — that is the RAM halving.
+- **auto-parallel**: read's own memory model lands AUTO on 6 pipes at
+  256 MB — 14.6 s with no knobs.
+
+Tried and rejected by measurement (so nobody retries them without new
+data): fusing the bounds+decode passes (16.0-16.3 s vs 14.6-15.2 s —
+fusing re-imposes per-field bounds checks and breaks the pure-scan loop
+LLVM optimizes); mallopt arena tuning at tight tiers (+20-30 MB peak,
+zero speed); pipes > 6 at 0.5 core (CPU-bound, 7 measured slower); the
+raw plane as default for the TRANSFER FrameStrip lane (pg→pg COPY-in
+paced ~1 s slower by the new flush pattern — modes must not regress, so
+transfer keeps sqlx until that flush is reworked).
+
+Wheel-level (Python, streaming AUTO, same tier): 57.3 s at campaign
+start → 18.8 s mid-campaign → tracks the engine at ~15 s with the final
+build. pg→ch and the other transfer modes: unchanged (regression matrix
+vs the released 0.20.0 wheel, twice, inside noise).

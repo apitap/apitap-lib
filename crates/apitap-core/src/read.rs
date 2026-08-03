@@ -5,7 +5,7 @@
 //! ([`crate::wire::arrowcol`]) and this orchestration.
 
 use crate::error::{Error, Result};
-use crate::wire::arrowcol::{arrow_kind, ArrowBatch, ArrowKind, BatchBuilder};
+use crate::wire::arrowcol::{ArrowBatch, ArrowKind};
 
 /// Tuning for [`read_start`]. Defaults are auto everywhere — the simple
 /// call needs nothing but a URL and a table.

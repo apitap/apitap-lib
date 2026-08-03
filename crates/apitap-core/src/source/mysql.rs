@@ -884,7 +884,7 @@ impl Source for MySqlSource {
                 LaneCol { delivered, select }
             })
             .collect();
-        Lane { format, cols }
+        Lane { format, cols, raw_frames: false }
     }
 
     async fn span_stmts(

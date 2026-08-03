@@ -56,6 +56,9 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
 
 pub(crate) struct PgSource {
     pool: PgPool,
+    /// Clean URL (snapshot param stripped) — the raw COPY plane dials its
+    /// own plain-TCP connections from it.
+    url: std::sync::Arc<str>,
     /// log_based bootstrap: exported snapshot every COPY span pins itself to
     /// (each span runs in REPEATABLE READ + SET TRANSACTION SNAPSHOT).
     snapshot: Option<std::sync::Arc<str>>,
@@ -80,6 +83,7 @@ impl PgSource {
         };
         Ok(Self {
             pool: connect_pool(&url, max_conns as u32).await?,
+            url: std::sync::Arc::from(url.as_str()),
             snapshot,
         })
     }
@@ -334,7 +338,7 @@ impl Source for PgSource {
                 }
             })
             .collect();
-        Lane { format, cols }
+        Lane { format, cols, raw_frames: false }
     }
 
     async fn span_stmts(
@@ -449,7 +453,13 @@ impl Source for PgSource {
         let mut tasks = Vec::with_capacity(loaders.len());
         for loader in loaders {
             let mode = match lane.format {
-                WireFormat::PgCopyBinary => PgReadMode::FrameStrip,
+                WireFormat::PgCopyBinary => {
+                    if lane.raw_frames {
+                        PgReadMode::FrameRaw
+                    } else {
+                        PgReadMode::FrameStrip
+                    }
+                }
                 WireFormat::RowBinary => PgReadMode::Transcode(
                     plan.cols
                         .iter()
@@ -475,6 +485,7 @@ impl Source for PgSource {
             };
             tasks.push(tokio::spawn(copy_out_worker(
                 self.pool.clone(),
+                self.url.clone(),
                 queue.clone(),
                 mode,
                 loader,
@@ -540,6 +551,11 @@ fn delivered_of_udt(c: &ColumnPlan) -> Delivered {
 enum PgReadMode {
     /// Raw binary passthrough with per-span framing stripped (see [`SpanStrip`]).
     FrameStrip,
+    /// Span payloads verbatim — every span keeps its own COPY header/trailer
+    /// and pieces go to the loader as they fill, with NO intermediate `out`
+    /// accumulation. The Arrow builder walks spans natively; stripping for it
+    /// measured as a full extra memcpy of the stream.
+    FrameRaw,
     /// Binary → RowBinary, fresh [`Transcoder`] per span (it consumes the framing).
     Transcode(Vec<(RbType, bool)>),
     /// Binary → MySQL `LOAD DATA` TSV, fresh [`PgToMyTsv`] per span.
@@ -585,6 +601,7 @@ impl SpanState {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn copy_out_worker<L: Loader>(
     pool: PgPool,
+    url: std::sync::Arc<str>,
     queue: WorkQueue,
     mode: PgReadMode,
     mut loader: L,
@@ -597,7 +614,108 @@ async fn copy_out_worker<L: Loader>(
         // trailer are stripped so the spans concatenate into one valid COPY stream.
         crate::wire::pgcopy::header(&mut out);
     }
+    // Raw COPY plane (FrameStrip only — binary COPY is timezone-proof, and
+    // it is the lane read() and pg→pg bulk ride). sqlx's copy_out_raw hands
+    // over one refcounted Bytes per CopyData message ≈ per ROW, through
+    // TryAsyncStream+Fuse+Instrumented+PgStream — a 10M-row read is a
+    // 10M-poll storm that profiled at ~30% of a 0.5-core budget. The raw
+    // plane coalesces frames out of a 1 MiB read buffer into one reused Vec.
+    // Dial failure (TLS URL, refused options) falls back to the sqlx plane;
+    // APITAP_RAW_COPY=0 forces the old plane for A/B runs.
+    // Default: FrameRaw (the read lane) only. On FrameStrip the raw read is
+    // faster but the 256 KiB piece → 4 MiB accumulator flush pattern paced
+    // the pg→pg COPY-in ~1s slower (24.1 vs 23.0, measured twice) — modes
+    // must not regress, so the transfer lanes keep sqlx until that flush is
+    // reworked. APITAP_RAW_COPY=1 forces it on everywhere, =0 disables all.
+    let raw_wanted = match std::env::var("APITAP_RAW_COPY").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => matches!(mode, PgReadMode::FrameStrip | PgReadMode::FrameRaw),
+        _ => matches!(mode, PgReadMode::FrameRaw),
+    };
+    let mut raw = if raw_wanted {
+        crate::wire::walsender::Walsender::connect_sql(&url).await.ok()
+    } else {
+        None
+    };
+    let mut piece: Vec<u8> = Vec::new();
     while let Some(sql) = pop(&queue) {
+        if let Some(ws) = raw.as_mut() {
+            if let Some(snap) = &snapshot {
+                let pin = format!(
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; \
+                     SET TRANSACTION SNAPSHOT '{}'",
+                    snap.replace('\'', "''")
+                );
+                if let Err(e) = ws.simple_query(&pin).await {
+                    return Err(loader
+                        .abort(Error::Transfer(format!(
+                            "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
+                             walsender session still open?"
+                        )))
+                        .await);
+                }
+            }
+            if let Err(e) = ws.copy_out_start(&sql).await {
+                return Err(loader
+                    .abort(Error::Transfer(format!("COPY OUT: {e}")))
+                    .await);
+            }
+            if matches!(mode, PgReadMode::FrameRaw) {
+                // Verbatim spans: each filled piece ships as-is (the Arrow
+                // builder walks the framing itself); truncation is caught by
+                // the builder's finish(). No strip, no `out` — zero recopy.
+                loop {
+                    match ws.copy_out_next(&mut piece, 256 << 10).await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            return Err(loader
+                                .abort(Error::Transfer(format!("pg read: {e}")))
+                                .await)
+                        }
+                    }
+                    let fresh = loader.reclaim().unwrap_or_default();
+                    let full = std::mem::replace(&mut piece, fresh);
+                    loader.send(full).await?;
+                }
+            } else {
+                let mut state = SpanState::Strip(SpanStrip::new());
+                loop {
+                    match ws.copy_out_next(&mut piece, 256 << 10).await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            return Err(loader
+                                .abort(Error::Transfer(format!("pg read: {e}")))
+                                .await)
+                        }
+                    }
+                    if let Err(e) = state.push(&piece, &mut out) {
+                        return Err(loader.abort(e).await);
+                    }
+                    if out.len() >= chunk {
+                        let fresh = loader
+                            .reclaim()
+                            .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024));
+                        let full = std::mem::replace(&mut out, fresh);
+                        loader.send(full).await?;
+                    }
+                }
+                if !state.finished() {
+                    return Err(loader
+                        .abort(Error::Transfer("pg binary COPY ended mid-stream".into()))
+                        .await);
+                }
+            }
+            if snapshot.is_some() {
+                if let Err(e) = ws.simple_query("COMMIT").await {
+                    return Err(loader
+                        .abort(Error::Transfer(format!("COMMIT: {e}")))
+                        .await);
+                }
+            }
+            continue;
+        }
         // With a pinned snapshot each span runs on a dedicated connection in
         // REPEATABLE READ + SET TRANSACTION SNAPSHOT — every worker sees the
         // exact table state of the slot's consistent point.
@@ -650,6 +768,9 @@ async fn copy_out_worker<L: Loader>(
             PgReadMode::Transcode(cols) => SpanState::Rb(Transcoder::new(cols.clone())),
             PgReadMode::MyTsv(cols) => SpanState::My(PgToMyTsv::new(cols.clone())),
             PgReadMode::FrameStrip => SpanState::Strip(SpanStrip::new()),
+            // Verbatim passthrough keeps each span's framing — exactly what
+            // the multi-span Arrow builder wants from the fallback plane too.
+            PgReadMode::FrameRaw => SpanState::Raw,
             PgReadMode::Text => SpanState::Raw,
         };
         loop {

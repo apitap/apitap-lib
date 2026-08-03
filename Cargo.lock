@@ -146,6 +146,7 @@ dependencies = [
  "iceberg",
  "itoa",
  "jsonwebtoken",
+ "libc",
  "md-5",
  "mysql_async",
  "num_cpus",

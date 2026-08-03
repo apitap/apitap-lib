@@ -182,6 +182,124 @@ mod tests {
         assert!(numeric_field_from_str(&too_wide, &mut Vec::new()).is_err());
     }
 
+    /// Encode {ndigits, weight, sign, dscale, groups} to the PG binary numeric wire
+    /// payload (the part after the 4-byte field length): four be i16/u16 header
+    /// fields, then the u16 be digit groups.
+    fn pg_numeric_payload(
+        ndigits: i16,
+        weight: i16,
+        sign: u16,
+        dscale: u16,
+        groups: &[u16],
+    ) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + groups.len() * 2);
+        v.extend(ndigits.to_be_bytes());
+        v.extend(weight.to_be_bytes());
+        v.extend(sign.to_be_bytes());
+        v.extend(dscale.to_be_bytes());
+        for g in groups {
+            v.extend(g.to_be_bytes());
+        }
+        v
+    }
+
+    /// The dispatching decoder (fast path + fallback) must agree with the general
+    /// decoder on both values and error messages.
+    fn assert_same(f: &[u8], ctx: &str) {
+        let fast = numeric_to_scaled_i128_raw(f);
+        let general = numeric_to_scaled_i128_raw_general(f);
+        match (fast, general) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "value mismatch for {ctx}"),
+            (Err(a), Err(b)) => {
+                assert_eq!(a.to_string(), b.to_string(), "error mismatch for {ctx}")
+            }
+            (a, b) => panic!("Ok/Err mismatch for {ctx}: fast={a:?} general={b:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_fast_path_matches_general_path() {
+        // Grid over every header field the fast path dispatches on, with digit
+        // patterns covering 0, 1, and the max group 9999. Cases land on both sides
+        // of every fast-path precondition (ndigits <= 3, |exp10| <= 26), so this
+        // also proves the fallback boundary is seamless.
+        const PATTERNS: [[u16; 6]; 3] = [
+            [0, 1, 9999, 0, 9999, 1],
+            [9999, 9999, 9999, 9999, 9999, 9999],
+            [1234, 0, 42, 9999, 1, 7],
+        ];
+        for ndigits in 0..=6i16 {
+            for weight in -3..=5i16 {
+                for sign in [0x0000u16, 0x4000] {
+                    for dscale in 0..=8u16 {
+                        for pat in &PATTERNS {
+                            let groups = &pat[..ndigits as usize];
+                            let f = pg_numeric_payload(ndigits, weight, sign, dscale, groups);
+                            assert_same(
+                                &f,
+                                &format!(
+                                    "ndigits={ndigits} weight={weight} sign={sign:#06x} \
+                                     dscale={dscale} groups={groups:?}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_fast_path_boundary_shifts() {
+        // With ndigits=1, exp10 = weight*4 + dscale: this sweep crosses the ±26
+        // fast-path window and reaches the general path's overflow error
+        // (weight=8, dscale=6 → 10^38 shift on 9999) — parity on every cell.
+        for dscale in 0..=6u16 {
+            for weight in [-9i16, -7, 5, 6, 7, 8] {
+                let f = pg_numeric_payload(1, weight, 0x0000, dscale, &[9999]);
+                assert_same(&f, &format!("boundary weight={weight} dscale={dscale}"));
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_fast_path_defers_on_specials_and_malformed() {
+        // NaN / +Inf / -Inf sentinels and an unknown sign word: identical errors.
+        for sign in [0xC000u16, 0xD000, 0xF000, 0x1234] {
+            let f = pg_numeric_payload(0, 0, sign, 0, &[]);
+            assert_same(&f, &format!("special sign {sign:#06x}"));
+            assert!(numeric_to_scaled_i128_raw(&f).is_err());
+        }
+        // Truncated header and truncated digit area: identical errors.
+        assert_same(&[], "empty payload");
+        assert_same(&[0, 1, 0, 0, 0, 0], "short header");
+        let mut f = pg_numeric_payload(3, 0, 0x0000, 0, &[1, 2, 3]);
+        f.truncate(10); // claims 3 groups, carries 1
+        assert_same(&f, "truncated digits");
+        // Extreme weights: nonzero value overflows in the general path (the fast
+        // path must defer and surface the same error); zero stays zero.
+        let f = pg_numeric_payload(1, 12_000, 0x0000, 0, &[1]);
+        assert_same(&f, "huge weight, nonzero");
+        assert!(numeric_to_scaled_i128_raw(&f).is_err());
+        let f = pg_numeric_payload(0, 12_000, 0x0000, 3, &[]);
+        assert_same(&f, "huge weight, zero");
+        assert_eq!(numeric_to_scaled_i128_raw(&f).unwrap(), (0, 3));
+    }
+
+    #[test]
+    fn numeric_wrapper_rescale_unchanged() {
+        // 1234.5678 as (ndigits=2, weight=0, dscale=4) through the scale wrapper.
+        let f = pg_numeric_payload(2, 0, 0x0000, 4, &[1234, 5678]);
+        assert_eq!(numeric_to_scaled_i128(&f, 4).unwrap(), 12_345_678);
+        assert_eq!(numeric_to_scaled_i128(&f, 6).unwrap(), 1_234_567_800);
+        assert_eq!(numeric_to_scaled_i128(&f, 2).unwrap(), 123_456); // truncates
+        let f = pg_numeric_payload(2, 0, 0x4000, 4, &[1234, 5678]);
+        assert_eq!(numeric_to_scaled_i128(&f, 4).unwrap(), -12_345_678);
+        // 0.5000 stored with negative weight (ndigits=1, weight=-1, group 5000).
+        let f = pg_numeric_payload(1, -1, 0x0000, 4, &[5000]);
+        assert_eq!(numeric_to_scaled_i128(&f, 4).unwrap(), 5_000);
+    }
+
     #[test]
     fn framing_helpers_emit_the_wire_shapes() {
         let mut out = Vec::new();
@@ -217,6 +335,7 @@ fn bad(what: &str) -> Error {
 
 /// PG binary NUMERIC (ndigits, weight, sign, dscale + base-10000 digit groups) → an
 /// integer scaled to exactly `scale` decimal places.
+#[inline]
 pub(crate) fn numeric_to_scaled_i128(f: &[u8], scale: u32) -> Result<i128> {
     let (acc_scaled_dscale, dscale) = numeric_to_scaled_i128_raw(f)?;
     // acc is scaled to dscale places; rescale to the declared scale.
@@ -230,8 +349,68 @@ pub(crate) fn numeric_to_scaled_i128(f: &[u8], scale: u32) -> Result<i128> {
     })
 }
 
+/// 10^0 ..= 10^26 — the largest decimal shift the fast path in
+/// `numeric_to_scaled_i128_raw` applies without checked arithmetic:
+/// three base-10000 groups keep acc < 10^12, and 10^12 · 10^26 = 10^38 < i128::MAX.
+const POW10: [i128; 27] = {
+    let mut t = [1i128; 27];
+    let mut i = 1;
+    while i < 27 {
+        t[i] = t[i - 1] * 10;
+        i += 1;
+    }
+    t
+};
+
 /// → (value scaled to `dscale` decimal places, dscale).
+///
+/// Fast path for the money-shaped common case (this runs once per row per Decimal
+/// column on the Arrow read hot path): 0..=3 digit groups, a plain +/- sign word,
+/// and a total decimal shift within ±26 — decoded with unchecked arithmetic, which
+/// the bounds above prove safe. Every other shape — NaN/Infinity sentinels, unknown
+/// sign words, truncated payloads, long digit strings, extreme weights — falls
+/// through to the general decoder, which is the behavioral oracle.
+#[inline]
 pub(crate) fn numeric_to_scaled_i128_raw(f: &[u8]) -> Result<(i128, i32)> {
+    // One 8-byte big-endian load covers the whole header; fields fall out of shifts.
+    if let Some(hdr) = f.get(..8) {
+        let hdr = u64::from_be_bytes(hdr.try_into().unwrap());
+        let ndigits = (hdr >> 48) as u16; // i16 on the wire; negative → > 3 → defer
+        let sign = (hdr >> 16) as u16;
+        if ndigits <= 3 && (sign == 0x0000 || sign == 0x4000) {
+            let nd = ndigits as usize;
+            if let Some(d) = f.get(8..8 + nd * 2) {
+                let dscale = (hdr & 0xFFFF) as i32;
+                if nd == 0 {
+                    // Zero: the general path yields (0, dscale) for every weight.
+                    return Ok((0, dscale));
+                }
+                let weight = (hdr >> 32) as u16 as i16 as i32;
+                // Accumulate in u64 (three 0..=9999 groups < 10^12); widen once.
+                let mut acc: u64 = 0;
+                for ch in d.chunks_exact(2) {
+                    acc = acc * 10_000 + u16::from_be_bytes([ch[0], ch[1]]) as u64;
+                }
+                let exp10 = (weight - nd as i32 + 1) * 4 + dscale;
+                if (-26..=26).contains(&exp10) {
+                    let v = if exp10 >= 0 {
+                        acc as i128 * POW10[exp10 as usize]
+                    } else {
+                        // acc >= 0 here, so one division by 10^k is bit-identical
+                        // to the general path's k successive divisions by 10.
+                        acc as i128 / POW10[(-exp10) as usize]
+                    };
+                    return Ok((if sign == 0x4000 { -v } else { v }, dscale));
+                }
+            }
+        }
+    }
+    numeric_to_scaled_i128_raw_general(f)
+}
+
+/// The general decoder: handles every wire shape, and serves as the oracle the fast
+/// path must match bit-for-bit (see `numeric_fast_path_matches_general_path`).
+fn numeric_to_scaled_i128_raw_general(f: &[u8]) -> Result<(i128, i32)> {
     if f.len() < 8 {
         return Err(bad("numeric"));
     }

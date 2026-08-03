@@ -257,6 +257,7 @@ impl Source for GsheetsSource {
     fn plan_lane(&self, plan: &TablePlan, format: WireFormat) -> Lane {
         Lane {
             format,
+            raw_frames: false,
             cols: plan
                 .cols
                 .iter()

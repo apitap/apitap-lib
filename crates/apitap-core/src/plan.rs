@@ -125,6 +125,11 @@ pub(crate) struct LaneCol {
 pub(crate) struct Lane {
     pub format: WireFormat,
     pub cols: Vec<LaneCol>,
+    /// PgCopyBinary only: deliver span payloads verbatim (each span keeps its
+    /// own COPY header/trailer) instead of stripping to one synthetic stream.
+    /// The Arrow read path sets this — its builder walks spans natively, so
+    /// the strip-and-recopy stage would be a pure memcpy tax.
+    pub raw_frames: bool,
 }
 
 /// Incremental delta filter, pushed into every source read statement (the min/max

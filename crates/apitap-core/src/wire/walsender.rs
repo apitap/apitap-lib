@@ -37,6 +37,8 @@ pub(crate) struct Walsender {
     wr: BufWriter<OwnedWriteHalf>,
     /// Set once START_REPLICATION enters CopyBoth mode.
     copying: bool,
+    /// COPY OUT reached ReadyForQuery (`copy_out_next` state).
+    copy_eof: bool,
     pump: Option<PumpHandle>,
 }
 
@@ -161,15 +163,27 @@ impl Walsender {
             std::env::var("APITAP_DECODE_WORKMEM").unwrap_or_else(|_| "1GB".to_string());
         if !matches!(workmem.as_str(), "" | "0" | "off") {
             let opts = format!("-c logical_decoding_work_mem={workmem}");
-            match Self::connect_with(url, Some(&opts)).await {
+            match Self::connect_with(url, Some(&opts), true).await {
                 Ok(ws) => return Ok(ws),
                 Err(_) => {} // fall through to a plain startup
             }
         }
-        Self::connect_with(url, None).await
+        Self::connect_with(url, None, true).await
     }
 
-    async fn connect_with(url: &str, options: Option<&str>) -> Result<Self> {
+    /// Plain (non-replication) SQL session on the same hand-rolled stack.
+    ///
+    /// This is the COPY OUT data plane: sqlx's `copy_out_raw` yields one
+    /// refcounted `Bytes` per CopyData message (≈ one per ROW) through four
+    /// future layers — a 10M-row read is a 10M-poll storm that profiled at
+    /// ~30% of the 0.5-core budget. Here the frames coalesce straight out of
+    /// a 1 MiB read buffer into one reused Vec. Plain TCP only — callers
+    /// fall back to the sqlx plane when the URL demands TLS.
+    pub(crate) async fn connect_sql(url: &str) -> Result<Self> {
+        Self::connect_with(url, None, false).await
+    }
+
+    async fn connect_with(url: &str, options: Option<&str>, replication: bool) -> Result<Self> {
         let ci = parse_url(url)?;
         let stream = TcpStream::connect((ci.host.as_str(), ci.port))
             .await
@@ -183,26 +197,35 @@ impl Walsender {
             rd: Some(BufReader::with_capacity(1 << 20, r)),
             wr: BufWriter::with_capacity(64 << 10, w),
             copying: false,
+            copy_eof: false,
             pump: None,
         };
-        ws.startup(&ci, options).await?;
+        ws.startup(&ci, options, replication).await?;
         Ok(ws)
     }
 
-    async fn startup(&mut self, ci: &ConnInfo, options: Option<&str>) -> Result<()> {
+    async fn startup(
+        &mut self,
+        ci: &ConnInfo,
+        options: Option<&str>,
+        replication: bool,
+    ) -> Result<()> {
         // StartupMessage: no tag; length + protocol 3.0 + kv pairs.
         let mut body = Vec::with_capacity(128);
         body.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
         let mut params: Vec<(&str, &str)> = vec![
             ("user", ci.user.as_str()),
             ("database", ci.db.as_str()),
-            ("replication", "database"),
             ("client_encoding", "UTF8"),
             // Pin the session timezone: pgoutput renders timestamptz TEXT in
             // the session's zone, and the apply paths (MySQL especially)
-            // depend on the offset being a fixed +00.
+            // depend on the offset being a fixed +00. The SQL plane pins it
+            // too — the sqlx pool it replaces does the same in after_connect.
             ("TimeZone", "UTC"),
         ];
+        if replication {
+            params.push(("replication", "database"));
+        }
         if let Some(o) = options {
             params.push(("options", o));
         }
@@ -361,6 +384,108 @@ impl Walsender {
         match err {
             Some(e) => Err(e),
             None => Ok(rows),
+        }
+    }
+
+    /// Send `COPY ... TO STDOUT` and consume up to the CopyOutResponse.
+    /// On a server error the conversation is drained back to ReadyForQuery
+    /// so the connection stays usable for the next span.
+    pub(crate) async fn copy_out_start(&mut self, sql: &str) -> Result<()> {
+        assert!(!self.copying, "copy_out during CopyBoth");
+        self.copy_eof = false;
+        let mut b = sql.as_bytes().to_vec();
+        b.push(0);
+        self.send_msg(b'Q', &b).await?;
+        loop {
+            let (tag, msg) = self.read_message().await?;
+            match tag {
+                b'H' => return Ok(()), // CopyOutResponse
+                b'S' | b'N' => {}      // ParameterStatus / Notice
+                b'E' => {
+                    let e = parse_error(&msg);
+                    self.drain_to_ready().await?;
+                    return Err(e);
+                }
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "copy_out: unexpected message {:?}",
+                        other as char
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Append CopyData payloads into `buf` (cleared first) until it holds at
+    /// least `target` bytes or the COPY ends. Returns `false` exactly once:
+    /// when the stream is consumed through ReadyForQuery and `buf` is empty.
+    ///
+    /// The whole point of this plane: per ROW the cost is a 5-byte header
+    /// parse plus one memcpy out of the 1 MiB `BufReader` — no allocation,
+    /// no refcount, no future-stack poll.
+    pub(crate) async fn copy_out_next(&mut self, buf: &mut Vec<u8>, target: usize) -> Result<bool> {
+        buf.clear();
+        if self.copy_eof {
+            return Ok(false);
+        }
+        let rd = self
+            .rd
+            .as_mut()
+            .expect("copy_out while the pump owns the read half");
+        loop {
+            let mut head = [0u8; 5];
+            rd.read_exact(&mut head).await.map_err(io_err)?;
+            let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+            if len < 4 {
+                return Err(Error::Transfer("copy_out: bad message length".into()));
+            }
+            let len = len - 4;
+            match head[0] {
+                b'd' => {
+                    let start = buf.len();
+                    buf.resize(start + len, 0);
+                    rd.read_exact(&mut buf[start..]).await.map_err(io_err)?;
+                    if buf.len() >= target {
+                        return Ok(true);
+                    }
+                }
+                b'Z' => {
+                    // ReadyForQuery — skip the status byte, surface any tail.
+                    let mut skip = vec![0u8; len];
+                    rd.read_exact(&mut skip).await.map_err(io_err)?;
+                    self.copy_eof = true;
+                    return Ok(!buf.is_empty());
+                }
+                b'E' => {
+                    let mut body = vec![0u8; len];
+                    rd.read_exact(&mut body).await.map_err(io_err)?;
+                    let e = parse_error(&body);
+                    self.copy_eof = true;
+                    self.drain_to_ready().await?;
+                    return Err(e);
+                }
+                // CopyDone / CommandComplete / ParameterStatus / Notice — all
+                // tiny, all skippable on the way to ReadyForQuery.
+                b'c' | b'C' | b'S' | b'N' => {
+                    let mut skip = vec![0u8; len];
+                    rd.read_exact(&mut skip).await.map_err(io_err)?;
+                }
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "copy_out: unexpected message {:?}",
+                        other as char
+                    )))
+                }
+            }
+        }
+    }
+
+    async fn drain_to_ready(&mut self) -> Result<()> {
+        loop {
+            let (tag, _) = self.read_message().await?;
+            if tag == b'Z' {
+                return Ok(());
+            }
         }
     }
 
