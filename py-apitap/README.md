@@ -177,7 +177,7 @@ decimal128, date32, timestamp µs, utf8, binary); uuid/jsonb/exotics
 arrive as text, so every table reads.
 Measured on the bench box: 10M rows → polars in **14.9 s** (connectorx
 55.9 s, pandas 295 s, same box). In a **0.5 vCPU / 256 MB** container:
-the same ten million rows stream through in **13.6 s** flat at ~130 MB;
+the same ten million rows stream through in **13.2 s** flat at ~100 MB;
 a real `.lazy()` filter + group_by over them lands in **2.4 s** — and the
 same query over FIFTY million rows in **9.1 s** at a flat ~140 MB, tying
 raw SQL run inside Postgres itself. plain polars

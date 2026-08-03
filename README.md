@@ -225,7 +225,7 @@ use it for rebuildable destinations.
       to Python zero-copy (hand-rolled Arrow C stream, no pyarrow
       dependency). **10M rows → DataFrame in 14.9 s** vs connectorx 55.9 s
       vs pandas 295 s — and it STREAMS: 10M through 0.5 vCPU / 256 MB in
-      **13.6 s flat at ~130 MB**, and `.lazy()` pushes each query's column
+      **13.2 s flat at ~100 MB**, and `.lazy()` pushes each query's column
       projection into the SQL: filter+group_by over **50M rows in 9.1 s**
       on that same container, tying raw SQL-in-Postgres, while plain
       polars/connectorx OOMs on every box up to 24 GB
