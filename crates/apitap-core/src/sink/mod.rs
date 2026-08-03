@@ -38,6 +38,24 @@ pub(crate) trait Loader: Send + 'static {
     fn reclaim(&mut self) -> Option<Vec<u8>> {
         None
     }
+    /// Frame-aware fast lane: this loader can consume a RAW wire window
+    /// (CopyData headers embedded) in place. Only the Arrow read loader
+    /// says yes; everyone else keeps the copying planes.
+    fn framed_capable(&self) -> bool {
+        false
+    }
+    /// Consume one raw window ([`Loader::framed_capable`] loaders only).
+    /// Returns bytes consumed and why the scan stopped.
+    fn send_framed(
+        &mut self,
+        _win: &[u8],
+    ) -> impl Future<Output = Result<(usize, crate::wire::arrowcol::FramedPush)>> + Send {
+        async move {
+            Err(Error::Transfer(
+                "send_framed on a loader that is not framed_capable".into(),
+            ))
+        }
+    }
     /// Close the stream cleanly. Returns rows ingested if this sink reports them
     /// (Postgres COPY does; ClickHouse counts via [`Sink::rows_staged`] instead).
     fn finish(self) -> impl Future<Output = Result<u64>> + Send;

@@ -292,11 +292,46 @@ pub struct BatchBuilder {
     st_off: Vec<u32>,
     st_len: Vec<i32>,
     st_rows: usize,
+    /// Framed mode ([`Self::push_framed`]): payload bytes remaining of the
+    /// current CopyData message — 0 means the next bytes are a 5-byte
+    /// message header.
+    fr_left: usize,
+}
+
+/// Why [`BatchBuilder::push_framed`] returned.
+pub enum FramedPush {
+    /// Consumed up to an element that needs more bytes — REFILL the window
+    /// (append more data after the unconsumed tail) and call again. The
+    /// window owner must GROW on zero progress; a fixed re-lease of the
+    /// same bytes would spin (the fill_buf lease bug this replaced).
+    NeedMore,
+    /// A non-CopyData message header starts at the consumed offset — the
+    /// wire layer handles it (CommandComplete, ReadyForQuery, …).
+    Control,
+    /// A tuple straddles CopyData messages (bytes not contiguous): the
+    /// caller falls back to the copying plane, resuming INSIDE the current
+    /// payload with this many bytes left. Never observed from Postgres
+    /// (one row per message), but the protocol does not forbid it.
+    Straddle(usize),
 }
 
 /// Tuples staged per micro-batch. 15 cols × 64 × 8 B ≈ 7.7 KB of staging —
 /// comfortably L1-resident next to the wire window it points into.
 const ST_K: usize = 64;
+
+/// Why the FRAMED staging stopped.
+enum StageStopF {
+    /// ST_K tuples staged — decode and stage again.
+    Full,
+    /// Window exhausted mid-element — refill (append) and call again.
+    NeedMore,
+    /// A non-CopyData header at the returned offset.
+    Control,
+    /// Tuple bytes are split across CopyData messages — fall back.
+    Straddle,
+    /// The span trailer marker is next (not consumed).
+    Trailer,
+}
 
 /// Why `stage_tuples` stopped.
 enum StageStop {
@@ -326,6 +361,94 @@ impl BatchBuilder {
             st_off: vec![0; kinds.len() * ST_K],
             st_len: vec![0; kinds.len() * ST_K],
             st_rows: 0,
+            fr_left: 0,
+        }
+    }
+
+    /// Framed-window entry: `win` is the RAW wire window — CopyData headers
+    /// still embedded. Stages and decodes tuples in place, skipping the
+    /// 5-byte 'd' headers inline (`fr_left` counts down each payload; one
+    /// payload is one row from Postgres, so headers land on tuple
+    /// boundaries). The buffered-tail path is NOT used here: an element
+    /// that runs past the window edge is left unconsumed and the caller
+    /// refills (appending — see [`FramedPush::NeedMore`]).
+    pub fn push_framed(&mut self, win: &[u8]) -> Result<(usize, FramedPush)> {
+        debug_assert!(self.buf.is_empty(), "framed and buffered modes don't mix");
+        let mut pos = 0usize;
+        loop {
+            // Frame layer: position ourselves inside a 'd' payload.
+            if self.fr_left == 0 {
+                if win.len() - pos < 5 {
+                    return Ok((pos, FramedPush::NeedMore));
+                }
+                if win[pos] != b'd' {
+                    return Ok((pos, FramedPush::Control));
+                }
+                let len =
+                    u32::from_be_bytes(win[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                if len < 4 {
+                    return Err(Error::Transfer("copy_out: bad message length".into()));
+                }
+                pos += 5;
+                self.fr_left = len - 4;
+                continue;
+            }
+            let payload_end = (pos + self.fr_left).min(win.len());
+            // Span layer: header/trailer arrive as their own small payloads.
+            if !self.in_span {
+                let b = &win[pos..payload_end];
+                if b.len() < 19 {
+                    if pos + self.fr_left > win.len() {
+                        return Ok((pos, FramedPush::NeedMore));
+                    }
+                    let left = self.fr_left;
+                    self.fr_left = 0;
+                    return Ok((pos, FramedPush::Straddle(left)));
+                }
+                if &b[..11] != b"PGCOPY\n\xff\r\n\0" {
+                    return Err(Error::Transfer("pg binary COPY: bad header".into()));
+                }
+                let ext = u32::from_be_bytes(b[15..19].try_into().unwrap()) as usize;
+                if b.len() < 19 + ext {
+                    if pos + self.fr_left > win.len() {
+                        return Ok((pos, FramedPush::NeedMore));
+                    }
+                    let left = self.fr_left;
+                    self.fr_left = 0;
+                    return Ok((pos, FramedPush::Straddle(left)));
+                }
+                pos += 19 + ext;
+                self.fr_left -= 19 + ext;
+                self.in_span = true;
+                continue;
+            }
+            // Tuple layer: stage up to ST_K rows ACROSS payloads (the
+            // staging hops 'd' headers itself — one payload is one row).
+            let (end, stop) = self.stage_framed(win, pos)?;
+            if self.st_rows > 0 {
+                self.decode_staged(win)?;
+            }
+            pos = end;
+            match stop {
+                StageStopF::Full => {}
+                StageStopF::NeedMore => return Ok((pos, FramedPush::NeedMore)),
+                StageStopF::Control => return Ok((pos, FramedPush::Control)),
+                StageStopF::Straddle => {
+                    let left = self.fr_left;
+                    self.fr_left = 0;
+                    return Ok((pos, FramedPush::Straddle(left)));
+                }
+                StageStopF::Trailer => {
+                    if self.fr_left < 2 {
+                        let left = self.fr_left;
+                        self.fr_left = 0;
+                        return Ok((pos, FramedPush::Straddle(left)));
+                    }
+                    pos += 2;
+                    self.fr_left -= 2;
+                    self.in_span = false;
+                }
+            }
         }
     }
 
@@ -465,6 +588,88 @@ impl BatchBuilder {
             self.st_rows += 1;
         }
         Ok((pos, StageStop::Full))
+    }
+
+    /// Framed staging: like [`Self::stage_tuples`], but hops the 5-byte
+    /// CopyData headers INLINE at tuple boundaries (updating `fr_left`), so
+    /// a micro-batch still collects up to [`ST_K`] rows even though
+    /// Postgres ships one row per message — bounding the batch by a single
+    /// payload measured 15.4s vs 13.1s (per-column dispatch per ROW).
+    fn stage_framed(&mut self, win: &[u8], start: usize) -> Result<(usize, StageStopF)> {
+        let ncols = self.cols.len();
+        let mut pos = start;
+        self.st_rows = 0;
+        while self.st_rows < ST_K {
+            if self.fr_left == 0 {
+                if win.len() - pos < 5 {
+                    return Ok((pos, StageStopF::NeedMore));
+                }
+                if win[pos] != b'd' {
+                    return Ok((pos, StageStopF::Control));
+                }
+                let len =
+                    u32::from_be_bytes(win[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                if len < 4 {
+                    return Err(Error::Transfer("copy_out: bad message length".into()));
+                }
+                pos += 5;
+                self.fr_left = len - 4;
+                continue;
+            }
+            let pe = (pos + self.fr_left).min(win.len());
+            if pe - pos < 2 {
+                return Ok((pos, if pos + self.fr_left > win.len() {
+                    StageStopF::NeedMore
+                } else {
+                    StageStopF::Straddle
+                }));
+            }
+            let nc = i16::from_be_bytes(win[pos..pos + 2].try_into().unwrap());
+            if nc == -1 {
+                return Ok((pos, StageStopF::Trailer));
+            }
+            if nc as usize != ncols {
+                return Err(Error::Transfer(format!(
+                    "pg binary COPY: tuple has {nc} fields, expected {ncols}"
+                )));
+            }
+            let k = self.st_rows;
+            let mut o = pos + 2;
+            for c in 0..ncols {
+                if pe - o < 4 {
+                    return Ok((pos, if pos + self.fr_left > win.len() {
+                        StageStopF::NeedMore
+                    } else {
+                        StageStopF::Straddle
+                    }));
+                }
+                let len = i32::from_be_bytes(win[o..o + 4].try_into().unwrap());
+                o += 4;
+                if len < -1 {
+                    return Err(Error::Transfer(format!(
+                        "pg binary COPY: corrupt field length {len}"
+                    )));
+                }
+                if len == -1 {
+                    self.st_len[c * ST_K + k] = -1;
+                } else {
+                    if pe - o < len as usize {
+                        return Ok((pos, if pos + self.fr_left > win.len() {
+                            StageStopF::NeedMore
+                        } else {
+                            StageStopF::Straddle
+                        }));
+                    }
+                    self.st_off[c * ST_K + k] = o as u32;
+                    self.st_len[c * ST_K + k] = len;
+                    o += len as usize;
+                }
+            }
+            self.fr_left -= o - pos;
+            pos = o;
+            self.st_rows += 1;
+        }
+        Ok((pos, StageStopF::Full))
     }
 
     /// Decode the staged micro-batch COLUMN by column: one variant dispatch
@@ -1045,6 +1250,78 @@ mod tests {
         junk_tail.extend_from_slice(&[0u8; 19]);
         let mut b = BatchBuilder::new(vec![ArrowKind::Int16], 1 << 20);
         assert!(b.push(&junk_tail).is_err());
+    }
+
+    /// Wrap `payload` as one CopyData message ('d' + len + payload).
+    fn dmsg(payload: &[u8], out: &mut Vec<u8>) {
+        out.push(b'd');
+        out.extend(((payload.len() + 4) as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn framed_owned_window_decodes_and_stops_at_control() {
+        // The wire shape the framed plane sees: span header, one message
+        // per ROW, trailer, then a control message ('C'). The window GROWS
+        // on refill (appends) — the driver mimics co_refill, including the
+        // tiny-grow case that deadlocked the fill_buf lease design.
+        let mut hdr = Vec::new();
+        pgcopy::header(&mut hdr);
+        let mut wire = Vec::new();
+        dmsg(&hdr, &mut wire);
+        for i in 0..200i64 {
+            let mut t = Vec::new();
+            pgcopy::tuple_start(2, &mut t);
+            pgcopy::field(&i.to_be_bytes(), &mut t);
+            pgcopy::field(format!("row-{i}").as_bytes(), &mut t);
+            dmsg(&t, &mut wire);
+        }
+        let mut tr = Vec::new();
+        pgcopy::trailer(&mut tr);
+        dmsg(&tr, &mut wire);
+        let control_at = wire.len();
+        wire.extend_from_slice(b"CxxxxRUBBISH"); // 'C' header starts here
+
+        for grow in [3usize, 17, 1024, wire.len()] {
+            let mut b = BatchBuilder::new(vec![ArrowKind::Int64, ArrowKind::Utf8], 1 << 20);
+            let mut lo = 0usize; // consumed
+            let mut hi = 0usize; // window end — grows like a refill
+            let mut spins = 0usize;
+            let stopped_at = loop {
+                if hi < wire.len() {
+                    hi = (hi + grow).min(wire.len());
+                }
+                let (consumed, stop) = b.push_framed(&wire[lo..hi]).unwrap();
+                lo += consumed;
+                match stop {
+                    FramedPush::NeedMore => {
+                        // Progress = consumed bytes OR a grown window;
+                        // both stalled would be the deadlock we killed.
+                        if consumed == 0 && hi == wire.len() {
+                            spins += 1;
+                            assert!(spins < 3, "zero progress at grow={grow}");
+                        }
+                    }
+                    FramedPush::Control => break lo,
+                    FramedPush::Straddle(_) => panic!("no straddles in this stream"),
+                }
+            };
+            assert_eq!(stopped_at, control_at, "grow={grow}");
+            let batch = b.finish().unwrap().expect("rows");
+            assert_eq!(batch.rows, 200, "grow={grow}");
+            match (&batch.cols[0], &batch.cols[1]) {
+                (
+                    FinishedCol::I64 { data, .. },
+                    FinishedCol::Utf8 { offsets, data: d, .. },
+                ) => {
+                    assert_eq!(data[0], 0);
+                    assert_eq!(data[199], 199);
+                    let (a, z) = (offsets[199] as usize, offsets[200] as usize);
+                    assert_eq!(&d[a..z], b"row-199");
+                }
+                _ => panic!("layout"),
+            }
+        }
     }
 
     #[test]

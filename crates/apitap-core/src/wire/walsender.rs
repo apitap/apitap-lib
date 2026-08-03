@@ -39,6 +39,12 @@ pub(crate) struct Walsender {
     copying: bool,
     /// COPY OUT reached ReadyForQuery (`copy_out_next` state).
     copy_eof: bool,
+    /// OWNED sliding window for the framed COPY plane: consumed prefix
+    /// compacts away, refills APPEND (and grow past the target when one
+    /// element is larger than the window — the property the fill_buf lease
+    /// could not give, where zero-progress re-leases spun forever).
+    co_win: Vec<u8>,
+    co_win_pos: usize,
     /// COPY OUT frame-scan state, carried across `fill_buf` windows: a
     /// partially-read message header, and how many payload bytes of the
     /// current message remain (to copy for 'd' / to skip for the rest).
@@ -207,6 +213,8 @@ impl Walsender {
             wr: BufWriter::with_capacity(64 << 10, w),
             copying: false,
             copy_eof: false,
+            co_win: Vec::new(),
+            co_win_pos: 0,
             co_head: [0; 5],
             co_head_len: 0,
             co_tag: 0,
@@ -560,6 +568,118 @@ impl Walsender {
             }
             if buf.len() >= target {
                 return Ok(true);
+            }
+        }
+    }
+
+    /// The unconsumed owned window.
+    pub(crate) fn co_window(&self) -> &[u8] {
+        &self.co_win[self.co_win_pos..]
+    }
+
+    pub(crate) fn co_advance(&mut self, n: usize) {
+        self.co_win_pos += n;
+    }
+
+    /// Compact the consumed prefix, then APPEND fresh bytes: first any
+    /// leftovers the BufReader holds, else a direct socket read. Always
+    /// adds at least one byte or errors — the zero-progress guarantee the
+    /// framed consumer relies on.
+    pub(crate) async fn co_refill(&mut self) -> Result<()> {
+        if self.co_win_pos > 0 {
+            let len = self.co_win.len();
+            self.co_win.copy_within(self.co_win_pos.., 0);
+            self.co_win.truncate(len - self.co_win_pos);
+            self.co_win_pos = 0;
+        }
+        let rd = self
+            .rd
+            .as_mut()
+            .expect("copy_out while the pump owns the read half");
+        let buffered_len = {
+            let b = rd.buffer();
+            if !b.is_empty() {
+                self.co_win.extend_from_slice(b);
+                b.len()
+            } else {
+                0
+            }
+        };
+        if buffered_len > 0 {
+            rd.consume(buffered_len);
+            return Ok(());
+        }
+        self.co_win.reserve(256 << 10);
+        let n = rd
+            .get_mut()
+            .read_buf(&mut self.co_win)
+            .await
+            .map_err(io_err)?;
+        if n == 0 {
+            return Err(Error::Transfer(
+                "copy_out: connection closed mid-stream".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Handle ONE control message at the head of the owned window (the
+    /// framed consumer stopped on a non-'d' header). Returns true when the
+    /// COPY conversation is DONE (ReadyForQuery consumed).
+    pub(crate) async fn co_control(&mut self) -> Result<bool> {
+        loop {
+            while self.co_window().len() < 5 {
+                self.co_refill().await?;
+            }
+            let w = self.co_window();
+            let tag = w[0];
+            let len = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+            if len < 4 {
+                return Err(Error::Transfer("copy_out: bad message length".into()));
+            }
+            while self.co_window().len() < 5 + (len - 4) {
+                self.co_refill().await?;
+            }
+            let body_len = len - 4;
+            match tag {
+                b'Z' => {
+                    self.co_advance(5 + body_len);
+                    self.copy_eof = true;
+                    return Ok(true);
+                }
+                b'E' => {
+                    let body = self.co_window()[5..5 + body_len].to_vec();
+                    self.co_advance(5 + body_len);
+                    let e = parse_error(&body);
+                    self.copy_eof = true;
+                    // Drain to ReadyForQuery through the window.
+                    loop {
+                        while self.co_window().len() < 5 {
+                            self.co_refill().await?;
+                        }
+                        let w = self.co_window();
+                        let t = w[0];
+                        let l = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+                        while self.co_window().len() < 1 + l {
+                            self.co_refill().await?;
+                        }
+                        self.co_advance(1 + l);
+                        if t == b'Z' {
+                            return Err(e);
+                        }
+                    }
+                }
+                // CopyDone / CommandComplete / ParameterStatus / Notice / …
+                b'c' | b'C' | b'S' | b'N' | b'A' => {
+                    self.co_advance(5 + body_len);
+                    return Ok(false);
+                }
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "copy_out: unexpected message {:?}",
+                        other as char
+                    )))
+                }
             }
         }
     }

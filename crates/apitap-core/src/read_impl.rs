@@ -232,6 +232,25 @@ impl Loader for ArrowLoader {
         Ok(())
     }
 
+    fn framed_capable(&self) -> bool {
+        true
+    }
+
+    async fn send_framed(
+        &mut self,
+        win: &[u8],
+    ) -> Result<(usize, crate::wire::arrowcol::FramedPush)> {
+        let r = self.b.push_framed(win)?;
+        // One seal check per window fill — cheap at this cadence.
+        if let Some(batch) = self.b.take_ready() {
+            self.tx
+                .send(Ok(batch))
+                .await
+                .map_err(|_| Error::Transfer("read cancelled by consumer".into()))?;
+        }
+        Ok(r)
+    }
+
     fn reclaim(&mut self) -> Option<Vec<u8>> {
         self.spare.take().map(|mut v| {
             v.clear();

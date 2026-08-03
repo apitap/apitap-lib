@@ -660,7 +660,105 @@ async fn copy_out_worker<L: Loader>(
                     .abort(Error::Transfer(format!("COPY OUT: {e}")))
                     .await);
             }
-            if matches!(mode, PgReadMode::FrameRaw) {
+            if matches!(mode, PgReadMode::FrameRaw) && loader.framed_capable() {
+                // Framed OWNED window: the builder walks the raw wire bytes
+                // in place (CopyData headers included) — the per-piece
+                // memcpy (13% of a 0.5-core read) is gone. The window
+                // compacts + APPENDS on refill, so an element bigger than
+                // one fill can always make progress (the fill_buf lease
+                // version of this deadlocked exactly there).
+                use crate::wire::arrowcol::FramedPush;
+                'copy: loop {
+                    if ws.co_window().is_empty() {
+                        if let Err(e) = ws.co_refill().await {
+                            return Err(loader
+                                .abort(Error::Transfer(format!("pg read: {e}")))
+                                .await);
+                        }
+                    }
+                    let step = match loader.send_framed(ws.co_window()).await {
+                        Ok(r) => r,
+                        Err(e) => return Err(loader.abort(e).await),
+                    };
+                    ws.co_advance(step.0);
+                    match step.1 {
+                        FramedPush::NeedMore => {
+                            if let Err(e) = ws.co_refill().await {
+                                return Err(loader
+                                    .abort(Error::Transfer(format!("pg read: {e}")))
+                                    .await);
+                            }
+                        }
+                        FramedPush::Control => match ws.co_control().await {
+                            Ok(true) => break 'copy,
+                            Ok(false) => {}
+                            Err(e) => {
+                                return Err(loader
+                                    .abort(Error::Transfer(format!("pg read: {e}")))
+                                    .await)
+                            }
+                        },
+                        FramedPush::Straddle(mut left) => {
+                            // Cross-message element (legal, never observed
+                            // from Postgres): ship the rest of this stream's
+                            // payload bytes through the plain buffered path.
+                            loop {
+                                while left > 0 {
+                                    if ws.co_window().is_empty() {
+                                        if let Err(e) = ws.co_refill().await {
+                                            return Err(loader
+                                                .abort(Error::Transfer(format!(
+                                                    "pg read: {e}"
+                                                )))
+                                                .await);
+                                        }
+                                    }
+                                    let take = ws.co_window().len().min(left);
+                                    piece.clear();
+                                    piece.extend_from_slice(&ws.co_window()[..take]);
+                                    ws.co_advance(take);
+                                    left -= take;
+                                    let fresh = loader.reclaim().unwrap_or_default();
+                                    let full = std::mem::replace(&mut piece, fresh);
+                                    loader.send(full).await?;
+                                }
+                                while ws.co_window().len() < 5 {
+                                    if let Err(e) = ws.co_refill().await {
+                                        return Err(loader
+                                            .abort(Error::Transfer(format!("pg read: {e}")))
+                                            .await);
+                                    }
+                                }
+                                let w = ws.co_window();
+                                if w[0] != b'd' {
+                                    match ws.co_control().await {
+                                        Ok(true) => break 'copy,
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            return Err(loader
+                                                .abort(Error::Transfer(format!(
+                                                    "pg read: {e}"
+                                                )))
+                                                .await)
+                                        }
+                                    }
+                                }
+                                let len =
+                                    u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+                                if len < 4 {
+                                    return Err(loader
+                                        .abort(Error::Transfer(
+                                            "copy_out: bad message length".into(),
+                                        ))
+                                        .await);
+                                }
+                                ws.co_advance(5);
+                                left = len - 4;
+                            }
+                        }
+                    }
+                }
+            } else if matches!(mode, PgReadMode::FrameRaw) {
                 // Verbatim spans: each filled piece ships as-is (the Arrow
                 // builder walks the framing itself); truncation is caught by
                 // the builder's finish(). No strip, no `out` — zero recopy.
