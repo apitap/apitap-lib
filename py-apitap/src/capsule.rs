@@ -188,12 +188,6 @@ unsafe extern "C" fn release_array(a: *mut ArrowArray) {
     (*a).release = None;
 }
 
-unsafe extern "C" fn release_array_child_noop(a: *mut ArrowArray) {
-    if !a.is_null() {
-        (*a).release = None;
-    }
-}
-
 fn export_col(col: FinishedCol, rows: usize) -> *mut ArrowArray {
     let mut keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
     let mut bufs: Vec<*const c_void> = Vec::with_capacity(3);
@@ -269,7 +263,10 @@ fn export_col(col: FinishedCol, rows: usize) -> *mut ArrowArray {
         buffers: unsafe { (*priv_ptr)._buffers.as_ptr() as *mut *const c_void },
         children: null_mut(),
         dictionary: null_mut(),
-        release: Some(release_array_child_noop),
+        // The REAL release: a column's data buffers live in ITS private_data
+        // and must be freed when the parent's release walks the children (a
+        // no-op here leaked every batch — found by the 256 MB probe).
+        release: Some(release_array),
         private_data: priv_ptr as *mut c_void,
     });
     Box::into_raw(arr)

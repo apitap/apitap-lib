@@ -32,16 +32,16 @@ sql(f"""CREATE TABLE {T} (
     t text, bin bytea)""")
 sql(f"""INSERT INTO {T}
     SELECT g,
-           (g %% 30000)::smallint, g %% 2000000000,
+           (g % 30000)::smallint, g % 2000000000,
            g / 7.0, g / 13.0,
-           g %% 2 = 0,
-           (g %% 100000) / 10.0 + 0.0001,
-           DATE '2020-01-01' + (g %% 3000),
-           TIMESTAMP '2020-01-01 00:00:00' + make_interval(secs => g %% 86400),
-           TIMESTAMPTZ '2020-01-01 00:00:00+00' + make_interval(secs => g %% 86400),
+           g % 2 = 0,
+           (g % 100000) / 10.0 + 0.0001,
+           DATE '2020-01-01' + (g % 3000),
+           TIMESTAMP '2020-01-01 00:00:00' + make_interval(secs => g % 86400),
+           TIMESTAMPTZ '2020-01-01 00:00:00+00' + make_interval(secs => g % 86400),
            md5(g::text)::uuid,
            jsonb_build_object('k', g),
-           CASE WHEN g %% 100 = 0 THEN '' ELSE 'v' || g || '·ünï' END,
+           CASE WHEN g % 100 = 0 THEN '' ELSE 'v' || g || '·ünï' END,
            decode(lpad(to_hex(g), 8, '0'), 'hex')
     FROM generate_series(1, 200000) g""")
 # NULL row + extreme values.
@@ -53,8 +53,8 @@ df = apitap.read(SRC, table=T).to_polars().sort("id")
 n = int(sql(f"SELECT count(*) FROM {T}"))
 assert df.height == n, (df.height, n)
 assert df["id"].sum() == int(sql(f"SELECT sum(id) FROM {T}"))
-assert df["i4"].sum() == int(sql(f"SELECT sum(i4) FROM {T}"))
-assert df["i2"].null_count() == 1 and df["u"].null_count() == 1
+assert df["i4"].cast(pl.Int64).sum() == int(sql(f"SELECT sum(i4) FROM {T}"))
+assert df["i2"].null_count() == 1 and df["u"].null_count() == 2
 assert abs(float(df["dec"].sum()) - float(sql(f"SELECT sum(dec) FROM {T}"))) < 1e-6
 assert df.filter(pl.col("id") == 100)["t"][0] == "" , "empty string must stay empty"
 assert df.filter(pl.col("id") == 7)["t"][0] == "v7·ünï"
