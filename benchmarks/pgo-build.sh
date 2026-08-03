@@ -30,7 +30,7 @@ rm -f benchmarks/wheels/*.whl 2>/dev/null || true
 docker run --rm -v "$REPO":/io -v apitap-bench-cargo:/root/.cargo/registry \
     -e RUSTFLAGS="-Cprofile-generate=/pgodata" \
     ghcr.io/pyo3/maturin build --release -m py-apitap/Cargo.toml -o benchmarks/wheels
-printf 'FROM python:3.12-slim\nCOPY *.whl /tmp/\nRUN pip install --no-cache-dir /tmp/*.whl\n' \
+printf 'FROM python:3.12-slim\nCOPY *.whl /tmp/\nRUN pip install --no-cache-dir /tmp/*.whl pyarrow\n' \
     | docker build -q -t apitap-pgo:inst -f- benchmarks/wheels
 
 echo "== 2/3 training (all routes, 1M) =="
@@ -108,6 +108,21 @@ apitap.transfer('$PS', '$BQ_TRAIN_URL', table='public.bench_data_1m',
                 dest_table='pgo_train_bq', parallel=$par)"
     done
 fi
+
+# read() -> Arrow (0.21.0): the arrowcol builders, raw COPY plane and the
+# capsule stream are new hot branches — train BOTH consumption shapes
+# (streaming pull and the materialize fast path).
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap, pyarrow as pa
+rdr = pa.RecordBatchReader.from_stream(apitap.read('$PS', table='public.bench_data_1m'))
+assert sum(b.num_rows for b in rdr) == 1_000_000"
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap
+assert apitap.read('$PS', table='public.bench_data_1m').to_arrow().num_rows == 1_000_000"
 
 echo "== 3/3 merge + optimized build =="
 docker run --rm -v "$REPO":/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c \

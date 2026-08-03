@@ -149,6 +149,30 @@ The GIL is released for the whole transfer. Errors are `ValueError` for bad inpu
 (unknown table, unsupported type — always at probe time, never mid-copy) and
 `RuntimeError` for transfer failures.
 
+### `apitap.read()` → Arrow / polars
+
+```python
+df  = apitap.read(src, table="events").to_polars()   # polars DataFrame
+tbl = apitap.read(src, table="events").to_arrow()    # pyarrow Table
+
+import pyarrow as pa                                 # constant-memory streaming
+reader = pa.RecordBatchReader.from_stream(apitap.read(src, table="events"))
+for batch in reader:
+    ...
+```
+
+The same parallel binary-COPY pipes every transfer route uses feed Rust-side
+Arrow column builders; batches cross into Python zero-copy through the Arrow
+C stream protocol (`__arrow_c_stream__`), so polars, pyarrow, duckdb and
+pandas consume the reader natively — the wheel depends on none of them.
+Typed end to end (int16/32/64, float32/64, bool, decimal128, date32,
+timestamp µs, utf8, binary); uuid/jsonb/exotics arrive as text, so every
+table reads. Measured on the bench box: 10M rows → polars in **14.6 s**
+(connectorx 55.9 s, pandas 295 s, same box); the streaming loop pulls the
+same ten million rows through **0.5 vCPU / 256 MB** in ~15 s at a flat
+~130 MB — a materializing reader cannot finish that container at all.
+`parallel=1` preserves source order; `cursor=` picks the split column.
+
 Full usage guide — connection URLs, per-route type mappings, incremental semantics,
 troubleshooting:
 [docs/usage.md](https://github.com/apitap/apitap-lib/blob/main/docs/usage.md).
@@ -168,7 +192,11 @@ troubleshooting:
       incremental on tables written by Spark/Trino/pyiceberg too)
 - [x] Multi-table and whole-schema transfers under one memory budget
 - [x] ClickHouse table engines — `engine=`, `order_by=`, `on_cluster=`
-- [ ] `read_postgres()` → Arrow / Polars
+- [x] `apitap.read()` → Arrow / polars / pyarrow / duckdb — zero-copy Arrow C
+      stream, 10M → polars 14.6 s (connectorx 55.9 s), streams 10M rows through
+      a 0.5 vCPU / 256 MB container at a flat ~130 MB
+- [ ] `query=` for `read()` (arbitrary SQL, not just tables)
+- [ ] MySQL source for `read()`
 - [ ] Snowflake destination
 - [ ] aarch64 + macOS wheels
 
