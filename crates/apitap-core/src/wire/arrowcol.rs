@@ -378,6 +378,7 @@ impl BatchBuilder {
     /// Consume one raw chunk. Complete tuples decode into the column
     /// builders; a partial tail is buffered for the next chunk (bounds-
     /// first two-pass — a tuple split across chunks never rolls back).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn push(&mut self, chunk: &[u8]) -> Result<()> {
         if self.pos > 0 && self.pos == self.buf.len() {
             self.buf.clear();

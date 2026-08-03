@@ -131,6 +131,7 @@ struct ArrowLoader {
 }
 
 impl Loader for ArrowLoader {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         self.b.push(&buf)?;
         self.spare = Some(buf);
