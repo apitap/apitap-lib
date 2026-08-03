@@ -34,10 +34,12 @@ pub(crate) async fn start(
         )));
     }
 
-    // Read-side profile: decode is cheap per worker; the destination of the
-    // bytes is the consumer's RAM, so parallelism is for source bandwidth.
+    // Read-side profile: pipes mostly WAIT (network + server-side COPY), so
+    // fractional-CPU boxes still want several — the 0.5-core sweep measured
+    // 1 pipe 46.7s vs 5 pipes 26.7s on the same box. Floor at 4; the cgroup
+    // MEMORY cap still shrinks it on tiny-RAM tiers.
     let profile = Profile {
-        auto_parallel: |c| (c / 2).clamp(1, 8),
+        auto_parallel: |c| (c / 2).max(4).min(8),
         span_mult: 6,
         table_pipe_cap: usize::MAX,
     };
