@@ -110,3 +110,39 @@ Wheel-level (Python, streaming AUTO, same tier): 57.3 s at campaign
 start → 18.8 s mid-campaign → tracks the engine at ~15 s with the final
 build. pg→ch and the other transfer modes: unchanged (regression matrix
 vs the released 0.20.0 wheel, twice, inside noise).
+
+## Heavy-query boundary map (50M rows, branch read-10s, 2026-08-03)
+
+The lazy() plugin raced on bench_data_50m (22 GB, 15 cols, no PK — TID
+ranges) at 0.5 vCPU. What fits where, measured not guessed:
+
+| query shape | 256 MB | 1 GB |
+|---|---|---|
+| filter + small group_by (2/15 cols) | **9.2s** / 137MB | — |
+| 6 aggregations over 5 numeric cols | **17.6s** / 159MB | — |
+| join vs a local Python DataFrame + agg | **16.2s** / 212MB | — |
+| full streaming drain, all 15 cols | **59.1s** / 133MB | — |
+| group_by of 1M buckets | OOM | **17.4s** / 1004MB |
+| exact median over 50M floats | OOM | **12.6s** / 931MB |
+| text filter + group on string cols | OOM | OOM (see 2GB note) |
+
+The engine's share stays flat (~100-130MB) in every leg — the growth is
+polars' COMPUTE state (group tables, full columns for exact quantiles),
+which is proportional to the intermediate result, not the table. That is
+the honest sentence for the docs: memory follows the ANSWER's working
+set, never the table.
+
+Context ties: the simple-query leg TIES raw SQL-in-postgres (9.2s both)
+— the polars API costs nothing over not transferring. plain polars
+(read_database_uri, eager AND .lazy()-after) is OOM-killed on every leg
+at 256MB. And plus-cores does NOT speed the thin-column legs (user
+measured 3 cpus: 10.2s vs 9.2s): postgres's 22 GB scan is the floor —
+which is exactly the frugality thesis, a half core saturates what the
+database can serve.
+
+KNOWN UPSTREAM BUG (polars 1.43.2, latest): sort()/top_k() over a
+register_io_source plugin panics polars' streaming engine
+(expr_to_ir.rs:619 unreachable; io_sources/batch.rs:107 unwrap). A
+10-row pure-polars repro does NOT trigger it — narrowing in progress
+before filing upstream. Until fixed: aggregate first, or
+to_parquet() -> scan_parquet() for sorted outputs.
