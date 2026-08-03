@@ -168,16 +168,23 @@ The same parallel binary-COPY pipes every transfer route uses feed Rust-side
 Arrow column builders; batches cross into Python zero-copy through the Arrow
 C stream protocol (`__arrow_c_stream__`), so polars, pyarrow, duckdb and
 pandas consume the reader natively — the wheel depends on none of them.
-`.lazy()` registers the stream as a polars scan: column pruning and
-predicates push into it, and no loop ever appears in your code. Typed end
-to end (int16/32/64, float32/64, bool, decimal128, date32, timestamp µs,
-utf8, binary); uuid/jsonb/exotics arrive as text, so every table reads.
-Measured on the bench box: 10M rows → polars in **14.6 s** (connectorx
-55.9 s, pandas 295 s, same box). In a **0.5 vCPU / 256 MB** container the
-same ten million rows stream through in **14.2 s** flat at ~138 MB, and a
-real `.lazy()` filter + group_by lands in ~19 s at 183 MB peak — a
-materializing reader cannot finish that container at all.
-`parallel=1` preserves source order; `cursor=` picks the split column.
+`.lazy()` registers the stream as a polars scan and pushes the query's
+COLUMN PROJECTION all the way into the SQL: a query touching 2 of 15
+columns makes Postgres serialize and this side decode only those 2 — the
+compute itself (filter/group/join) stays in polars, and no loop ever
+appears in your code. Typed end to end (int16/32/64, float32/64, bool,
+decimal128, date32, timestamp µs, utf8, binary); uuid/jsonb/exotics
+arrive as text, so every table reads.
+Measured on the bench box: 10M rows → polars in **14.9 s** (connectorx
+55.9 s, pandas 295 s, same box). In a **0.5 vCPU / 256 MB** container:
+the same ten million rows stream through in **13.6 s** flat at ~130 MB;
+a real `.lazy()` filter + group_by over them lands in **2.4 s** — and the
+same query over FIFTY million rows in **9.1 s** at a flat ~140 MB, tying
+raw SQL run inside Postgres itself. plain polars
+(`read_database_uri`, with or without `.lazy()`) is OOM-killed on that
+box — and on every box we tried up to 24 GB.
+`parallel=1` preserves source order; `cursor=` picks the split column;
+`columns=` reads a projection directly.
 
 Full usage guide — connection URLs, per-route type mappings, incremental semantics,
 troubleshooting:
@@ -199,9 +206,10 @@ troubleshooting:
 - [x] Multi-table and whole-schema transfers under one memory budget
 - [x] ClickHouse table engines — `engine=`, `order_by=`, `on_cluster=`
 - [x] `apitap.read()` → Arrow / polars / pyarrow / duckdb — zero-copy Arrow C
-      stream, 10M → polars 14.6 s (connectorx 55.9 s); `.lazy()` runs ordinary
-      polars queries over 10M rows inside a 0.5 vCPU / 256 MB container;
-      `.to_parquet()` streams a table to a file at constant memory
+      stream, 10M → polars 14.9 s (connectorx 55.9 s); `.lazy()` runs ordinary
+      polars queries with projection pushdown — 50M rows, filter+group_by,
+      0.5 vCPU / 256 MB: 9.1 s; `.to_parquet()` streams a table to a file at
+      constant memory; `columns=` for direct projections
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
 - [ ] MySQL source for `read()`
 - [ ] Snowflake destination
