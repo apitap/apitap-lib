@@ -820,6 +820,36 @@ apitap.transfer(
   transaction measured a 307 MB peak (needs the 512 MB tier); normal-sized
   transactions fit the smallest containers.
 
+## Reading into DataFrames: `apitap.read()`
+
+One line from Postgres to Polars, at wire speed:
+
+```python
+import apitap
+
+df = apitap.read("postgres://user:pass@host/db", table="public.orders").to_polars()
+```
+
+The engine runs the same parallel binary-COPY range pipes the transfer
+routes use, decodes them into Arrow batches in Rust, and hands buffers to
+Python zero-copy (a hand-rolled Arrow C stream — no pyarrow dependency in
+the wheel). `pl.DataFrame(reader)`, `pa.table(reader)` and DuckDB consume
+the same object via the Arrow PyCapsule protocol; `.to_arrow()` /
+`.to_pandas()` are one call away.
+
+- **Typed end to end**: int16/32/64, float32/64, bool, decimal128(p,s),
+  date, timestamp µs (naive and UTC), text, bytea. uuid/jsonb and exotic
+  types (arrays, enums, intervals, NUMERIC beyond 38 digits) arrive as
+  text — every table reads.
+- **Streams, never swallows**: batches decode when the consumer pulls
+  (`pyarrow.RecordBatchReader.from_stream(reader)`), sized off the cgroup
+  limit — 10M rows aggregate on 0.5 vCPU / 256 MB at a flat ~130 MB.
+- **Order**: parallel pipes emit batches in nondeterministic order; pass
+  `parallel=1` for source order, or sort the frame.
+- Measured against the field ([benchmarks/read-showdown.md](../benchmarks/read-showdown.md)):
+  10M rows → DataFrame in **14.7 s** vs connectorx 55.9 s vs
+  `pandas.read_sql` 295 s.
+
 ## Durability
 
 `durable=False` (Postgres destinations only) loads through an **UNLOGGED** staging
