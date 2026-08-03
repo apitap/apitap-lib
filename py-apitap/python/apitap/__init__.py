@@ -101,15 +101,27 @@ class Reader:
     frame (cheaper than giving up parallel read bandwidth).
     """
 
-    def __init__(self, native):
-        self._native = native
+    def __init__(self, src, table, cursor, parallel, query):
+        self._args = (src, table, cursor, parallel, query)
+        self._native = None
+
+    def _start(self, materialize: bool):
+        # The engine starts on FIRST consumption and picks its strategy
+        # from how you consume: to_polars()/to_arrow() build one giant
+        # batch per pipe in Rust (fewest FFI crossings, no rechunk);
+        # streaming consumers get cgroup-sized batches, memory bounded.
+        if self._native is None:
+            src, table, cursor, parallel, query = self._args
+            self._native = _read(src, table, cursor=cursor, parallel=parallel,
+                                 query=query, materialize=materialize)
+        return self._native
 
     def __arrow_c_stream__(self, requested_schema=None):
-        return self._native.__arrow_c_stream__(requested_schema)
+        return self._start(False).__arrow_c_stream__(requested_schema)
 
     @property
     def columns(self):
-        return self._native.columns()
+        return self._start(False).columns()
 
     def to_polars(self):
         """The primary path: ``apitap.read(...).to_polars()``."""
@@ -120,6 +132,7 @@ class Reader:
                 "to_polars() needs polars — pip install polars "
                 "(or use to_arrow() / to_pandas())"
             ) from e
+        self._start(True)
         return pl.DataFrame(self)
 
     def to_arrow(self):
@@ -127,6 +140,7 @@ class Reader:
             import pyarrow as pa
         except ImportError as e:
             raise ImportError("to_arrow() needs pyarrow — pip install pyarrow") from e
+        self._start(True)
         return pa.table(self)
 
     def to_pandas(self):
@@ -163,7 +177,11 @@ def read(
     """
     if (table is None) == (query is None):
         raise ValueError("pass exactly one of table=…, query=…")
-    return Reader(_read(src, table, cursor=cursor, parallel=parallel, query=query))
+    if query is not None:
+        raise ValueError(
+            "read: query= lands next — pass table= (and optionally cursor=) today"
+        )
+    return Reader(src, table, cursor, parallel, query)
 
 
 def transfer(

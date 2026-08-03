@@ -209,7 +209,7 @@ impl Drop for PgRead {
 /// Start a parallel Arrow read; setup errors surface here as normal Python
 /// exceptions, before any stream exists.
 #[pyfunction]
-#[pyo3(signature = (src, table=None, *, cursor=None, parallel=None, query=None))]
+#[pyo3(signature = (src, table=None, *, cursor=None, parallel=None, query=None, materialize=false))]
 fn read(
     py: Python<'_>,
     src: String,
@@ -217,9 +217,17 @@ fn read(
     cursor: Option<String>,
     parallel: Option<usize>,
     query: Option<String>,
+    materialize: bool,
 ) -> PyResult<PgRead> {
     let table = table.unwrap_or_default();
-    let opts = apitap_core::ReadOptions { parallel, cursor, query };
+    let opts = apitap_core::ReadOptions {
+        parallel,
+        cursor,
+        query,
+        // to_polars()'s fast path: one giant batch per worker, no
+        // mid-stream sealing, minimal FFI crossings.
+        batch_bytes: materialize.then_some(usize::MAX >> 1),
+    };
     let handle = py
         .allow_threads(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
         .map_err(|e| match e {

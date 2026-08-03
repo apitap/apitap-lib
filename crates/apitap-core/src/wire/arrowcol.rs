@@ -358,7 +358,10 @@ pub struct BatchBuilder {
 
 impl BatchBuilder {
     pub fn new(kinds: Vec<ArrowKind>, batch_bytes: usize) -> Self {
-        let cap = batch_bytes / kinds.len().max(1);
+        // The reserve clamps: a huge batch_bytes (the materialize fast
+        // path never seals mid-stream) must not pre-allocate huge Vecs —
+        // growth amortizes from here.
+        let cap = (batch_bytes / kinds.len().max(1)).min(32 << 20);
         Self {
             cols: kinds.iter().map(|k| ColB::new(k, cap)).collect(),
             cap,

@@ -78,14 +78,21 @@ pub(crate) async fn start(
     // Residency model: N partial builders + C sealed batches in the channel
     // + 1 batch held by the consumer + N chunk buffers.
     let mem = pipeline::mem_limit_bytes();
-    let cap = match mem {
+    let mut cap = match mem {
         Some(m) if m < 128 << 20 => 1,
         _ => 2,
     };
-    let batch_bytes = match mem {
-        Some(m) => ((m.saturating_sub(40 << 20) as usize) / (4 * (used + cap + 1)))
-            .clamp(1 << 20, 32 << 20),
-        None => 16 << 20,
+    let batch_bytes = match opts.batch_bytes {
+        Some(b) => {
+            // Materialize fast path: one giant batch per worker.
+            cap = 1;
+            b
+        }
+        None => match mem {
+            Some(m) => ((m.saturating_sub(40 << 20) as usize) / (4 * (used + cap + 1)))
+                .clamp(1 << 20, 32 << 20),
+            None => 16 << 20,
+        },
     };
 
     let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);

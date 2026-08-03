@@ -20,6 +20,10 @@ pub struct ReadOptions {
     pub cursor: Option<String>,
     /// Raw SQL instead of a table (single stream; `table` ignored).
     pub query: Option<String>,
+    /// Seal threshold override. `None` = auto from the cgroup budget;
+    /// a huge value = the materialize fast path (each worker builds ONE
+    /// giant batch — fewer FFI crossings, no consumer-side rechunk).
+    pub batch_bytes: Option<usize>,
 }
 
 /// One column of the result schema.
