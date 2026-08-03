@@ -2,6 +2,12 @@
 
 **Move whole tables between databases at wire speed, in bounded memory.**
 
+Despite the name, this is not an API-client library: apitap is a Rust
+transfer engine that speaks the databases' own wire formats — binary
+`COPY`, RowBinary, `LOAD DATA`, logical replication. How it compares to
+Airbyte-class tools, CDC daemons and Python pipelines, with measured
+numbers: [docs/vs.md](docs/vs.md).
+
 apitap is the open-source transfer engine behind [apitap cloud](https://apitap.dev) — a
 Rust core with Python bindings, in the spirit of Polars. It moves data the way the
 databases themselves would: raw wire-format streams, parallel range pipes, atomic swaps,
