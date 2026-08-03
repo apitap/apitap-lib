@@ -146,3 +146,31 @@ register_io_source plugin panics polars' streaming engine
 10-row pure-polars repro does NOT trigger it — narrowing in progress
 before filing upstream. Until fixed: aggregate first, or
 to_parquet() -> scan_parquet() for sorted outputs.
+
+## Control: pure polars scan_parquet (no apitap) — same 50M, same caps
+
+Dump once via apitap.to_parquet (73.7s uncapped; 22 GB row-store → 1.00 GB
+zstd columnar), then the same battery on pl.scan_parquet:
+
+| query | apitap lazy (live pg) | scan_parquet (local file) |
+|---|---|---|
+| filter + small group @256MB | 9.2s / 137MB | **2.8s / 44MB** |
+| multi-agg @256MB | 17.6s / 159MB | 9.7s / 59MB |
+| join-local @256MB | 16.2s / 212MB | 10.0s / 49MB |
+| 1M-group agg @256MB → @1GB | OOM → 17.4s | OOM → 12.6s |
+| exact median @256MB → @1GB | OOM → 12.6s | OOM → 6.9s |
+| top_k @256MB | polars PANIC (plugin bug) | OOM |
+
+Verdicts the control settles:
+- The 256MB/1GB boundaries are polars' COMPUTE state — pure scan_parquet
+  OOMs on exactly the same legs. Not a plugin defect.
+- The row-store tax is real and quantified: the same query is 9.2s from
+  live Postgres (22 GB of pages must be read to extract 2 columns; raw
+  SQL ties at 9.2s; +cores don't help) vs 2.8s from a columnar file that
+  reads only the touched columns.
+- top_k at 256MB fails EVERYWHERE (native: OOM) — our plugin's panic is
+  still upstream-report-worthy (a panic is not a clean error), but no
+  path fits a 50M sort in 256MB today.
+- Product guidance this yields: LIVE data → lazy() direct (9.2s, no
+  staging); REPEATED analytics → to_parquet once (74s), then scan at
+  file speed (2.8s/query). Both are one-liners.
