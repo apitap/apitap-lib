@@ -2,8 +2,11 @@
 //! The GIL is released for the whole transfer (`allow_threads`), so other Python
 //! threads keep running while bytes move.
 
+mod capsule;
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::ffi::CStr;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
@@ -132,10 +135,108 @@ fn transfer_many(
     }
 }
 
+static STREAM_NAME: &CStr = c"arrow_array_stream";
+
+unsafe extern "C" fn stream_capsule_destructor(cap: *mut pyo3::ffi::PyObject) {
+    let p = pyo3::ffi::PyCapsule_GetPointer(cap, STREAM_NAME.as_ptr());
+    if p.is_null() {
+        pyo3::ffi::PyErr_Clear();
+        return;
+    }
+    let stream = p as *mut capsule::ArrowArrayStream;
+    if let Some(rel) = (*stream).release {
+        rel(stream);
+    }
+    drop(Box::from_raw(stream));
+}
+
+/// The native read stream: hand it to any Arrow consumer via
+/// `__arrow_c_stream__` (PyCapsule protocol). One-shot — the capsule owns
+/// the stream after the first call.
+#[pyclass]
+struct PgRead {
+    stream: Option<usize>, // *mut ArrowArrayStream, kept as usize for Send
+    names: Vec<String>,
+}
+
+#[pymethods]
+impl PgRead {
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_stream__(
+        &mut self,
+        py: Python<'_>,
+        requested_schema: Option<PyObject>,
+    ) -> PyResult<PyObject> {
+        let _ = requested_schema;
+        let ptr = self
+            .stream
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("read stream already consumed"))?
+            as *mut capsule::ArrowArrayStream;
+        unsafe {
+            let cap = pyo3::ffi::PyCapsule_New(
+                ptr as *mut std::ffi::c_void,
+                STREAM_NAME.as_ptr(),
+                Some(stream_capsule_destructor),
+            );
+            if cap.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            Ok(PyObject::from_owned_ptr(py, cap))
+        }
+    }
+
+    /// Column names, for repr/debug without consuming the stream.
+    fn columns(&self) -> Vec<String> {
+        self.names.clone()
+    }
+}
+
+impl Drop for PgRead {
+    fn drop(&mut self) {
+        if let Some(p) = self.stream.take() {
+            let stream = p as *mut capsule::ArrowArrayStream;
+            unsafe {
+                if let Some(rel) = (*stream).release {
+                    rel(stream);
+                }
+                drop(Box::from_raw(stream));
+            }
+        }
+    }
+}
+
+/// Start a parallel Arrow read; setup errors surface here as normal Python
+/// exceptions, before any stream exists.
+#[pyfunction]
+#[pyo3(signature = (src, table=None, *, cursor=None, parallel=None, query=None))]
+fn read(
+    py: Python<'_>,
+    src: String,
+    table: Option<String>,
+    cursor: Option<String>,
+    parallel: Option<usize>,
+    query: Option<String>,
+) -> PyResult<PgRead> {
+    let table = table.unwrap_or_default();
+    let opts = apitap_core::ReadOptions { parallel, cursor, query };
+    let handle = py
+        .allow_threads(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
+        .map_err(|e| match e {
+            apitap_core::Error::InvalidInput(m) => PyValueError::new_err(m),
+            e => PyRuntimeError::new_err(e.to_string()),
+        })?;
+    let names = handle.schema.iter().map(|f| f.name.clone()).collect();
+    let stream = capsule::new_stream(handle) as usize;
+    Ok(PgRead { stream: Some(stream), names })
+}
+
 #[pymodule]
 fn _apitap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(transfer, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_many, m)?)?;
+    m.add_function(wrap_pyfunction!(read, m)?)?;
+    m.add_class::<PgRead>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

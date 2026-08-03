@@ -22,11 +22,14 @@ from dataclasses import dataclass
 
 from apitap._apitap import (
     __version__,
+    read as _read,
     transfer as _transfer,
     transfer_many as _transfer_many,
 )
 
 __all__ = [
+    "read",
+    "Reader",
     "transfer",
     "TransferReport",
     "TableResult",
@@ -82,6 +85,85 @@ class MultiTransferError(RuntimeError):
         # message, so spell out both — a worker-process failure must arrive
         # intact, report included, not die re-raising with a TypeError.
         return (MultiTransferError, (self.args[0], self.report))
+
+
+class Reader:
+    """A running parallel read. Consume it ONCE, whichever way you like:
+
+    - ``reader.to_polars()`` — the one-liner (needs ``pip install polars``)
+    - ``pl.DataFrame(reader)`` / ``pa.table(reader)`` / DuckDB — via the
+      Arrow PyCapsule protocol, zero-copy
+    - ``reader.to_arrow()`` / ``reader.to_pandas()``
+
+    Batches stream on demand: memory holds the batches in flight, never the
+    table. With ``parallel > 1`` row order across batches is
+    nondeterministic — pass ``parallel=1`` for source order, or sort the
+    frame (cheaper than giving up parallel read bandwidth).
+    """
+
+    def __init__(self, native):
+        self._native = native
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        return self._native.__arrow_c_stream__(requested_schema)
+
+    @property
+    def columns(self):
+        return self._native.columns()
+
+    def to_polars(self):
+        """The primary path: ``apitap.read(...).to_polars()``."""
+        try:
+            import polars as pl
+        except ImportError as e:
+            raise ImportError(
+                "to_polars() needs polars — pip install polars "
+                "(or use to_arrow() / to_pandas())"
+            ) from e
+        return pl.DataFrame(self)
+
+    def to_arrow(self):
+        try:
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError("to_arrow() needs pyarrow — pip install pyarrow") from e
+        return pa.table(self)
+
+    def to_pandas(self):
+        return self.to_arrow().to_pandas()
+
+
+def read(
+    src: str,
+    table: str | None = None,
+    *,
+    cursor: str | None = None,
+    parallel: int | None = None,
+    query: str | None = None,
+) -> Reader:
+    """Read a Postgres table straight into a DataFrame, at wire speed.
+
+    One line, no knobs required::
+
+        df = apitap.read("postgres://user:pass@host/db", table="public.orders").to_polars()
+
+    The engine runs the same parallel binary-COPY range pipes the transfer
+    routes use and decodes them into Arrow batches in Rust — Python only
+    ever receives buffer pointers. Memory stays bounded (batches in
+    flight, sized off the cgroup limit), so big tables read fine from
+    small containers.
+
+    Args:
+        src: ``postgres://`` source URL.
+        table: Source table, optionally schema-qualified.
+        cursor: Integer column to range-split on (default: the integer PK;
+            PK-less tables fall back to TID ranges).
+        parallel: Concurrent range pipes; default auto. ``1`` = source order.
+        query: Raw SQL instead of a table (coming next — refused loudly today).
+    """
+    if (table is None) == (query is None):
+        raise ValueError("pass exactly one of table=…, query=…")
+    return Reader(_read(src, table, cursor=cursor, parallel=parallel, query=query))
 
 
 def transfer(

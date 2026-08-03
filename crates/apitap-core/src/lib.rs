@@ -24,6 +24,8 @@
 //! ```
 
 mod dialect;
+mod read;
+mod read_impl;
 mod error;
 mod aws;
 mod logbased;
@@ -35,6 +37,8 @@ mod source;
 mod wire;
 
 pub use error::{Error, Result};
+pub use read::{read_start, ArrowField, ReadHandle, ReadOptions};
+pub use wire::arrowcol::{ArrowBatch, ArrowKind, FinishedCol};
 
 /// How rows land in the destination table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

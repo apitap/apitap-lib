@@ -1,6 +1,7 @@
 //! Pure wire-format encoders/decoders, database-session-free: Postgres binary
 //! COPY framing, ClickHouse RowBinary, Parquet for BigQuery load jobs.
 
+pub(crate) mod arrowcol;
 pub(crate) mod bqparquet;
 pub(crate) mod csvout;
 pub(crate) mod mytsv;
