@@ -20,6 +20,10 @@ pub struct ReadOptions {
     pub cursor: Option<String>,
     /// Raw SQL instead of a table (single stream; `table` ignored).
     pub query: Option<String>,
+    /// Read ONLY these columns (source order preserved). `None` = all.
+    /// The polars lazy plugin pushes its projection through here — a query
+    /// that touches 2 of 15 columns then decodes 2 of 15 columns.
+    pub columns: Option<Vec<String>>,
     /// Seal threshold override. `None` = auto from the cgroup budget;
     /// a huge value = the materialize fast path (each worker builds ONE
     /// giant batch — fewer FFI crossings, no consumer-side rechunk).
@@ -90,6 +94,13 @@ impl Drop for ReadHandle {
 /// Probe, plan spans, spawn the scan and return the pull handle. Setup
 /// errors (bad URL, missing table, unsupported types) surface HERE, before
 /// any stream object exists on the Python side.
+/// Schema-only probe (no workers started): the fields `read_start` would
+/// emit for this table. The polars lazy plugin registers this up front and
+/// starts the real read later with the query's projection pushed down.
+pub async fn read_schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>> {
+    crate::read_impl::schema(src_url, table).await
+}
+
 pub async fn read_start(src_url: &str, table: &str, opts: &ReadOptions) -> Result<ReadHandle> {
     crate::read_impl::start(src_url, table, opts).await
 }

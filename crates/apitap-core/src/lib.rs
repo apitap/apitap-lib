@@ -37,7 +37,7 @@ mod source;
 mod wire;
 
 pub use error::{Error, Result};
-pub use read::{read_start, ArrowField, ReadHandle, ReadOptions};
+pub use read::{read_schema, read_start, ArrowField, ReadHandle, ReadOptions};
 pub use wire::arrowcol::{ArrowBatch, ArrowKind, FinishedCol};
 
 /// How rows land in the destination table.

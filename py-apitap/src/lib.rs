@@ -209,7 +209,7 @@ impl Drop for PgRead {
 /// Start a parallel Arrow read; setup errors surface here as normal Python
 /// exceptions, before any stream exists.
 #[pyfunction]
-#[pyo3(signature = (src, table=None, *, cursor=None, parallel=None, query=None, materialize=false))]
+#[pyo3(signature = (src, table=None, *, cursor=None, parallel=None, query=None, materialize=false, columns=None))]
 fn read(
     py: Python<'_>,
     src: String,
@@ -218,6 +218,7 @@ fn read(
     parallel: Option<usize>,
     query: Option<String>,
     materialize: bool,
+    columns: Option<Vec<String>>,
 ) -> PyResult<PgRead> {
     let table = table.unwrap_or_default();
     let opts = apitap_core::ReadOptions {
@@ -227,6 +228,7 @@ fn read(
         // to_polars()'s fast path: one giant batch per worker, no
         // mid-stream sealing, minimal FFI crossings.
         batch_bytes: materialize.then_some(usize::MAX >> 1),
+        columns,
     };
     let handle = py
         .allow_threads(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
@@ -239,11 +241,51 @@ fn read(
     Ok(PgRead { stream: Some(stream), names })
 }
 
+/// Schema-only probe: (name, dtype-tag, nullable) per column, no workers
+/// started. Tags: i16 i32 i64 f32 f64 bool date ts:utc ts:naive str bin
+/// decimal:<p>:<s> — the Python wrapper maps them onto polars dtypes for
+/// the lazy plugin's up-front schema registration.
+#[pyfunction]
+fn read_schema(
+    py: Python<'_>,
+    src: String,
+    table: String,
+) -> PyResult<Vec<(String, String, bool)>> {
+    let fields = py
+        .allow_threads(|| rt().block_on(apitap_core::read_schema(&src, &table)))
+        .map_err(|e| match e {
+            apitap_core::Error::InvalidInput(m) => PyValueError::new_err(m),
+            e => PyRuntimeError::new_err(e.to_string()),
+        })?;
+    Ok(fields
+        .into_iter()
+        .map(|f| {
+            use apitap_core::ArrowKind as K;
+            let tag = match f.kind {
+                K::Int16 => "i16".to_string(),
+                K::Int32 => "i32".to_string(),
+                K::Int64 => "i64".to_string(),
+                K::Float32 => "f32".to_string(),
+                K::Float64 => "f64".to_string(),
+                K::Bool => "bool".to_string(),
+                K::Decimal { p, s } => format!("decimal:{p}:{s}"),
+                K::Date32 => "date".to_string(),
+                K::TimestampUtc => "ts:utc".to_string(),
+                K::TimestampNaive => "ts:naive".to_string(),
+                K::Utf8 => "str".to_string(),
+                K::Binary => "bin".to_string(),
+            };
+            (f.name, tag, f.nullable)
+        })
+        .collect())
+}
+
 #[pymodule]
 fn _apitap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(transfer, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_many, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;
+    m.add_function(wrap_pyfunction!(read_schema, m)?)?;
     m.add_class::<PgRead>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

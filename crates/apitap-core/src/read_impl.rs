@@ -37,6 +37,32 @@ fn tune_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tune_allocator() {}
 
+/// Schema-only probe: what [`start`] would emit, WITHOUT starting workers.
+/// The lazy plugin registers this schema up front, then starts the real
+/// read later with the query's projection pushed down.
+pub(crate) async fn schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>> {
+    let scheme = src_url.split("://").next().unwrap_or("");
+    if !matches!(scheme, "postgres" | "postgresql") {
+        return Err(Error::InvalidInput(format!(
+            "read: unsupported source scheme '{scheme}' — Postgres first \
+             (mysql lands next)"
+        )));
+    }
+    let src = PgSource::connect(src_url, 1).await?;
+    let plan = src.probe(table).await?;
+    let lane = src.plan_lane(&plan, WireFormat::PgCopyBinary);
+    Ok(lane
+        .cols
+        .iter()
+        .zip(plan.cols.iter())
+        .map(|(lc, pc)| ArrowField {
+            name: pc.name.clone(),
+            kind: arrow_kind(&lc.delivered).unwrap_or(ArrowKind::Utf8),
+            nullable: pc.nullable,
+        })
+        .collect())
+}
+
 pub(crate) async fn start(
     src_url: &str,
     table: &str,
@@ -90,6 +116,29 @@ pub(crate) async fn start(
     // own header/trailer, so the strip-and-recopy stage — one full memcpy
     // of the stream plus a 4 MiB accumulator per pipe — disappears.
     lane.raw_frames = true;
+
+    // Column projection (the lazy plugin pushes polars' with_columns here):
+    // the SELECT list narrows, so Postgres serializes and this side decodes
+    // ONLY what the query touches — requested order preserved.
+    if let Some(want) = &opts.columns {
+        let idx: Vec<usize> = want
+            .iter()
+            .map(|w| {
+                plan.cols.iter().position(|c| &c.name == w).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "read: column '{w}' is not in {table} (columns: {})",
+                        plan.cols
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
+        lane.cols = idx.iter().map(|&i| lane.cols[i].clone()).collect();
+        plan.cols = idx.iter().map(|&i| plan.cols[i].clone()).collect();
+    }
 
     // Arrow vocabulary per column; anything outside it (arrays, intervals,
     // enums, huge NUMERIC, json/jsonb, uuid) rides `::text` as Utf8 — the

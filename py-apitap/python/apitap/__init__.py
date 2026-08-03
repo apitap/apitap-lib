@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from apitap._apitap import (
     __version__,
     read as _read,
+    read_schema as _read_schema,
     transfer as _transfer,
     transfer_many as _transfer_many,
 )
@@ -107,8 +108,8 @@ class Reader:
     frame (cheaper than giving up parallel read bandwidth).
     """
 
-    def __init__(self, src, table, cursor, parallel, query):
-        self._args = (src, table, cursor, parallel, query)
+    def __init__(self, src, table, cursor, parallel, query, columns=None):
+        self._args = (src, table, cursor, parallel, query, columns)
         self._native = None
 
     def _start(self, materialize: bool):
@@ -117,9 +118,10 @@ class Reader:
         # batch per pipe in Rust (fewest FFI crossings, no rechunk);
         # streaming consumers get cgroup-sized batches, memory bounded.
         if self._native is None:
-            src, table, cursor, parallel, query = self._args
+            src, table, cursor, parallel, query, columns = self._args
             self._native = _read(src, table, cursor=cursor, parallel=parallel,
-                                 query=query, materialize=materialize)
+                                 query=query, materialize=materialize,
+                                 columns=columns)
         return self._native
 
     def __arrow_c_stream__(self, requested_schema=None):
@@ -163,28 +165,54 @@ class Reader:
                    .collect(engine="streaming"))
 
         Ten million rows aggregate in a 256 MB container this way — the full
-        DataFrame never exists. Column pruning, predicates and head() are
-        pushed into the stream. One-shot like every Reader: collect once.
+        DataFrame never exists. The query's COLUMN PROJECTION is pushed all
+        the way into the SQL: a query touching 2 of 15 columns makes
+        Postgres serialize and this side decode only those 2. Predicates
+        and head() prune per batch. One-shot: collect once.
         """
         try:
             import polars as pl
-            import pyarrow as pa
             from polars.io.plugins import register_io_source
         except ImportError as e:
             raise ImportError(
                 "lazy() needs polars >= 1.0 and pyarrow — "
                 "pip install polars pyarrow"
             ) from e
+        if self._native is not None:
+            raise RuntimeError(
+                "lazy() must be this Reader's first consumption — make a "
+                "fresh apitap.read(...) for it"
+            )
+        src, table, cursor, parallel, query, _ = self._args
 
-        reader = pa.RecordBatchReader.from_stream(self)
-        schema = pl.from_arrow(reader.schema.empty_table()).schema
+        def dtype(tag):
+            if tag.startswith("decimal:"):
+                _, p, s = tag.split(":")
+                return pl.Decimal(int(p), int(s))
+            return {
+                "i16": pl.Int16, "i32": pl.Int32, "i64": pl.Int64,
+                "f32": pl.Float32, "f64": pl.Float64, "bool": pl.Boolean,
+                "date": pl.Date, "ts:utc": pl.Datetime("us", "UTC"),
+                "ts:naive": pl.Datetime("us"), "str": pl.String,
+                "bin": pl.Binary,
+            }[tag]
+
+        # Cheap schema-only probe — the engine starts LATER, inside the
+        # collect, once polars has told us which columns the query needs.
+        schema = pl.Schema(
+            {name: dtype(tag) for name, tag, _ in _read_schema(src, table)}
+        )
 
         def source(with_columns, predicate, n_rows, batch_size):
+            import pyarrow as pa
+            cols = list(with_columns) if with_columns is not None else None
+            native = _read(src, table, cursor=cursor, parallel=parallel,
+                           query=query, materialize=False, columns=cols)
             taken = 0
-            for batch in reader:
+            # The engine emits exactly the requested columns in the
+            # requested order — no per-batch select needed.
+            for batch in pa.RecordBatchReader.from_stream(native):
                 df = pl.from_arrow(batch)
-                if with_columns is not None:
-                    df = df.select(with_columns)
                 if predicate is not None:
                     df = df.filter(predicate)
                 if n_rows is not None:
@@ -241,6 +269,7 @@ def read(
     cursor: str | None = None,
     parallel: int | None = None,
     query: str | None = None,
+    columns: list[str] | None = None,
 ) -> Reader:
     """Read a Postgres table straight into a DataFrame, at wire speed.
 
@@ -261,6 +290,8 @@ def read(
             PK-less tables fall back to TID ranges).
         parallel: Concurrent range pipes; default auto. ``1`` = source order.
         query: Raw SQL instead of a table (coming next — refused loudly today).
+        columns: Read only these columns, in this order (default: all).
+            ``.lazy()`` fills this automatically from the query's projection.
     """
     if (table is None) == (query is None):
         raise ValueError("pass exactly one of table=…, query=…")
@@ -268,7 +299,7 @@ def read(
         raise ValueError(
             "read: query= lands next — pass table= (and optionally cursor=) today"
         )
-    return Reader(src, table, cursor, parallel, query)
+    return Reader(src, table, cursor, parallel, query, columns)
 
 
 def transfer(
