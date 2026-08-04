@@ -165,7 +165,12 @@ orders = apitap.read("postgres://…", table="orders").lazy()
 events = apitap.read("mysql://…", table="events").lazy()
 daily = orders.join(events, on="id").group_by("day").agg(pl.len()).collect(engine="streaming")
 
-apitap.read(src, table="events").to_parquet("events.parquet")  # → Parquet
+# land a FILTERED projection straight to Parquet, streaming end to end:
+(apitap.read(src, table="events").lazy()
+ .filter(pl.col("amount") > 100).select("id", "amount")
+ .sink_parquet("events.parquet", compression="zstd"))
+
+apitap.read(src, table="events").to_parquet("events.parquet")  # full-table dump
 tbl = apitap.read(src, table="events").to_arrow()              # pyarrow Table
 ```
 
@@ -190,10 +195,20 @@ ten million Postgres rows stream through in **13.2 s** flat at ~100 MB;
 **29 s at 126 MB** on the same half core — count-style thin scans in
 **3.4 s** — where driver-based readers take 51 s for the same drain;
 a real `.lazy()` filter + group_by lands in **2.4 s** — and the
-same query over FIFTY million rows in **9.1 s** at a flat ~140 MB, tying
-raw SQL run inside Postgres itself. plain polars
-(`read_database_uri`, with or without `.lazy()`) is OOM-killed on that
-box — and on every box we tried up to 24 GB.
+same query over FIFTY million rows in **9.9 s** at a flat ~180 MB, tying
+raw SQL run inside Postgres itself. The lazy plan also SINKS: 50M rows
+filtered and landed as Parquet in **34 s inside that same container**,
+row-count-verified against the database. Cross-engine works at scale —
+a Postgres-50M × MySQL-50M join (one polars expression, 100M rows,
+digit-verified) runs in **165 s on 4 cores**, and two engines extract
+CONCURRENTLY: 50M from Postgres + 50M from MySQL, aggregated per day and
+joined across engines, **154 s total on the half-core / 256 MB box** —
+the Postgres leg hides entirely inside the MySQL scan.
+Alternatives, same cage, same query, same digits: plain polars
+(`read_database_uri`/connectorx) is OOM-killed at 256 MB — and needs
+1–2 GB before it survives at all; ADBC (`iter_batches`) does stream, but
+single-connection: **45.2 s where apitap takes 9.9 s** (4–5× across every
+shape we measured).
 `parallel=1` preserves source order; `cursor=` picks the split column;
 `columns=` reads a projection directly.
 

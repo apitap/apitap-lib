@@ -220,16 +220,19 @@ use it for rebuildable destinations.
       share ONE replication slot (`tables=[…]` — same-LSN windows across
       members, one retention risk, 22% faster than N slots), and a
       ``{table: mode}`` dict mixes CDC and bulk modes in one call
-- [x] Postgres → Polars / Arrow — `apitap.read(src, table=…).to_polars()`:
-      parallel binary-COPY pipes decoded into Arrow batches in Rust, handed
+- [x] Postgres & MySQL → Polars / Arrow — `apitap.read(src, table=…)`:
+      parallel range pipes decoded into Arrow batches in Rust, handed
       to Python zero-copy (hand-rolled Arrow C stream, no pyarrow
-      dependency). **10M rows → DataFrame in 14.9 s** vs connectorx 55.9 s
-      vs pandas 295 s — and it STREAMS: 10M through 0.5 vCPU / 256 MB in
-      **13.2 s flat at ~100 MB**, and `.lazy()` pushes each query's column
-      projection into the SQL: filter+group_by over **50M rows in 9.1 s**
-      on that same container, tying raw SQL-in-Postgres, while plain
-      polars/connectorx OOMs on every box up to 24 GB
-      ([the ledger](benchmarks/read-showdown.md))
+      dependency). Postgres rides raw binary COPY; MySQL rides its own
+      hand-rolled wire client (TLS included) — **1.8× a driver-based full
+      drain, 5× on thin scans**. `.lazy()` pushes each query's column
+      projection into the SQL: filter+group_by over **50M rows in 9.9 s
+      on 0.5 vCPU / 256 MB**, tying raw SQL-in-Postgres; the same lazy
+      plan sinks a filtered projection to Parquet (50M rows, 34 s, same
+      cage) and joins ACROSS engines in one polars expression (Postgres
+      50M × MySQL 50M, digit-verified). Same cage, same query: plain
+      polars/connectorx is OOM-killed until 1–2 GB; ADBC streams but runs
+      4–5× behind ([the ledger](benchmarks/read-showdown.md))
 - [x] Postgres → BigQuery (dual lanes picked per box: binary COPY → Parquet
       ZSTD, or CSV+gzip on small cores; parallel resumable load jobs → atomic
       multi-source copy; DML-free incremental state, sandbox-safe —
