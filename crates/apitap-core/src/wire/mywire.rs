@@ -635,6 +635,52 @@ impl MyWire {
         }
     }
 
+    // ---- binlog replication ------------------------------------------------
+
+    /// Become a replica: session dance + COM_BINLOG_DUMP from `file`:`pos`.
+    /// TERMINAL — after this the connection only streams binlog events
+    /// (control queries need their own connection). `server_id` must be
+    /// nonzero and unique per attached replica; a heartbeat is requested so
+    /// idle streams still wake the drain loop.
+    pub(crate) async fn binlog_dump(
+        &mut self,
+        server_id: u32,
+        file: &str,
+        pos: u32,
+        heartbeat_secs: u64,
+    ) -> Result<()> {
+        // Mirror the server's checksum setting — without this the server
+        // refuses to stream to a >=5.6 replica when binlog_checksum=CRC32.
+        self.exec("SET @master_binlog_checksum = @@global.binlog_checksum")
+            .await?;
+        let ns = heartbeat_secs.max(1) * 1_000_000_000;
+        self.exec(&format!("SET @master_heartbeat_period = {ns}"))
+            .await?;
+        self.seq = 0;
+        let mut cmd = Vec::with_capacity(11 + file.len());
+        cmd.push(0x12); // COM_BINLOG_DUMP
+        cmd.extend_from_slice(&pos.to_le_bytes());
+        cmd.extend_from_slice(&0u16.to_le_bytes()); // flags: 0 = block/stream
+        cmd.extend_from_slice(&server_id.to_le_bytes());
+        cmd.extend_from_slice(file.as_bytes());
+        self.write_packet(&cmd).await
+        // From here the sequence id runs continuously (wrapping) for the
+        // connection's lifetime — read_packet's check already handles wrap.
+    }
+
+    /// Next raw binlog event: the full event bytes (19-byte header + body,
+    /// checksum still attached — the decoder strips it per the session's
+    /// algorithm). `None` only in non-block mode; ERR packets become errors.
+    pub(crate) async fn next_binlog_event(&mut self) -> Result<Option<&[u8]>> {
+        let p = self.read_packet().await?;
+        match p.first() {
+            Some(0x00) => Ok(Some(&p[1..])),
+            Some(0xFF) => Err(parse_err(&p[1..])),
+            Some(0xFE) if p.len() <= 9 => Ok(None),
+            _ => Err(desync("binlog stream packet")),
+        }
+    }
+
     /// COM_STMT_CLOSE — fire and forget (no server response).
     pub(crate) async fn stmt_close(&mut self, stmt_id: u32) -> Result<()> {
         self.seq = 0;
@@ -654,6 +700,134 @@ impl MyWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live binlog-protocol probe — the layout questions the manuals leave
+    /// fuzzy (checksum on the FDE and on artificial events, heartbeat
+    /// framing, event-header fields) answered by a real server before
+    /// mybinlog.rs commits to them:
+    ///
+    ///   MY_URL=mysql://root:bench@127.0.0.1:3307/bench \
+    ///   cargo test -p apitap-core binlog_probe_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn binlog_probe_live() {
+        let url = std::env::var("MY_URL").expect("set MY_URL");
+        let name = |t: u8| match t {
+            2 => "QUERY",
+            4 => "ROTATE",
+            15 => "FORMAT_DESCRIPTION",
+            16 => "XID",
+            19 => "TABLE_MAP",
+            27 => "HEARTBEAT",
+            30 => "WRITE_ROWS_v2",
+            31 => "UPDATE_ROWS_v2",
+            32 => "DELETE_ROWS_v2",
+            33 => "GTID",
+            34 => "ANONYMOUS_GTID",
+            35 => "PREVIOUS_GTIDS",
+            40 => "TRANSACTION_PAYLOAD",
+            41 => "HEARTBEAT_V2",
+            _ => "?",
+        };
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // Control connection: coordinates + traffic generation.
+                let pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&url)
+                    .await
+                    .expect("control pool");
+                let row: (String, u64, String, String, String) =
+                    sqlx::query_as("SHOW MASTER STATUS")
+                        .fetch_one(&pool)
+                        .await
+                        .expect("master status");
+                let (file, pos) = (row.0, row.1 as u32);
+                println!("== coordinates {file}:{pos}");
+
+                let gen = {
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                        for sql in [
+                            "DROP TABLE IF EXISTS bench.cdc_probe",
+                            "CREATE TABLE bench.cdc_probe (id INT PRIMARY KEY, v VARCHAR(300), d DECIMAL(12,4), ts TIMESTAMP(6) NULL, b TINYINT(1))",
+                            "INSERT INTO bench.cdc_probe VALUES (1, REPEAT('x',260), 1234.5678, '2026-08-05 01:02:03.000004', 1)",
+                            "UPDATE bench.cdc_probe SET v='updated', d=NULL WHERE id=1",
+                            "DELETE FROM bench.cdc_probe WHERE id=1",
+                        ] {
+                            sqlx::query(sql).execute(&pool).await.expect(sql);
+                        }
+                    })
+                };
+
+                let mut w = MyWire::connect(&url).await.expect("replica connect");
+                w.binlog_dump(0x6170_6901, &file, pos, 2)
+                    .await
+                    .expect("binlog dump");
+                println!("== streaming");
+
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let mut n = 0;
+                while std::time::Instant::now() < end && n < 80 {
+                    let ev = tokio::time::timeout(
+                        std::time::Duration::from_secs(6),
+                        w.next_binlog_event(),
+                    )
+                    .await;
+                    let e = match ev {
+                        Err(_) => {
+                            println!("-- 6s idle, no heartbeat");
+                            continue;
+                        }
+                        Ok(r) => match r.expect("event") {
+                            Some(e) => e.to_vec(),
+                            None => {
+                                println!("== EOF");
+                                break;
+                            }
+                        },
+                    };
+                    n += 1;
+                    assert!(e.len() >= 19, "short event {}: {:02x?}", e.len(), e);
+                    let ts = u32::from_le_bytes(e[0..4].try_into().unwrap());
+                    let typ = e[4];
+                    let declared = u32::from_le_bytes(e[9..13].try_into().unwrap());
+                    let log_pos = u32::from_le_bytes(e[13..17].try_into().unwrap());
+                    let flags = u16::from_le_bytes(e[17..19].try_into().unwrap());
+                    println!(
+                        "[{n:02}] {:<20} ts={ts} declared={declared} actual={} log_pos={log_pos} flags={flags:#06x} tail={:02x?}",
+                        name(typ),
+                        e.len(),
+                        &e[e.len() - 4..]
+                    );
+                    if typ == 15 {
+                        println!(
+                            "     FDE binlog_ver={} header_len={} alg_byte@[len-5]={} (declared==actual? {})",
+                            u16::from_le_bytes(e[19..21].try_into().unwrap()),
+                            e[19 + 2 + 50 + 4],
+                            e[e.len() - 5],
+                            declared as usize == e.len()
+                        );
+                    }
+                    if typ == 4 {
+                        println!(
+                            "     ROTATE artificial={} pos={} name={:?}",
+                            ts == 0,
+                            u64::from_le_bytes(e[19..27].try_into().unwrap()),
+                            String::from_utf8_lossy(&e[27..e.len() - 4])
+                        );
+                    }
+                }
+                gen.await.expect("traffic");
+                println!("== {n} events seen");
+                assert!(n > 0, "no events streamed");
+            });
+    }
 
     #[test]
     fn lenenc_all_widths() {

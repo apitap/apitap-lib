@@ -5,6 +5,7 @@ pub(crate) mod arrowcol;
 pub(crate) mod bqparquet;
 pub(crate) mod csvout;
 pub(crate) mod mytsv;
+pub(crate) mod mybinlog;
 pub(crate) mod mywire;
 pub(crate) mod pgcopy;
 pub(crate) mod pgoutput;
