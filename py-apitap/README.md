@@ -186,7 +186,9 @@ arrive as text, so every table reads.
 Measured on the bench box: 10M rows → polars in **14.9 s** (connectorx
 55.9 s, pandas 295 s, same box). In a **0.5 vCPU / 256 MB** container:
 ten million Postgres rows stream through in **13.2 s** flat at ~100 MB;
-**11.8 million MySQL rows in 3.7 s at 126 MB** on the same half core;
+11.8 million MySQL rows (15 columns, string-heavy) stream through in
+**29 s at 126 MB** on the same half core — count-style thin scans in
+**3.4 s** — where driver-based readers take 51 s for the same drain;
 a real `.lazy()` filter + group_by lands in **2.4 s** — and the
 same query over FIFTY million rows in **9.1 s** at a flat ~140 MB, tying
 raw SQL run inside Postgres itself. plain polars
@@ -220,9 +222,9 @@ troubleshooting:
       0.5 vCPU / 256 MB: 9.1 s; `.to_parquet()` streams a table to a file at
       constant memory; `columns=` for direct projections
 - [x] MySQL source for `read()` — a hand-rolled wire client decodes
-      binary-protocol rows straight into Arrow: 11.8M rows → polars in
-      **3.7 s on 0.5 vCPU / 256 MB**; cross-engine joins (MySQL × Postgres)
-      are one ordinary polars expression
+      binary-protocol rows straight into Arrow, 1.8× a driver-based full
+      drain (5.5× on thin scans) at 0.5 vCPU / 256 MB; cross-engine joins
+      (MySQL × Postgres) are one ordinary polars expression
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
 - [ ] Snowflake destination
 - [ ] aarch64 + macOS wheels

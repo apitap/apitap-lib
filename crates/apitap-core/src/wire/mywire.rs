@@ -4,12 +4,13 @@
 //! read; this speaks the binary protocol straight off a buffered socket and
 //! hands each row's payload to the direct-Arrow decoders in place.
 //!
-//! Scope: plain TCP; auth = caching_sha2_password FAST path and
-//! mysql_native_password (with AuthSwitch both ways). The schema probe's
-//! sqlx connection has just authenticated, so the server's caching_sha2
-//! cache is warm and the fast path holds; a server that still demands full
-//! auth (or TLS) fails the canary connect and the read rides the sqlx lane
-//! instead — never a hard failure.
+//! Production coverage: plain TCP and TLS (`ssl-mode=preferred/required`,
+//! MySQL semantics — encrypt without certificate verification; `verify_ca`
+//! and `verify_identity` ride the sqlx lane, which verifies). Auth =
+//! caching_sha2_password (fast path everywhere; FULL auth over TLS sends
+//! the password on the encrypted channel) and mysql_native_password, with
+//! AuthSwitch both ways. Anything else fails the canary connect and the
+//! read rides the sqlx lane instead — never a hard failure.
 //!
 //! Regular SQL (probe, spans, transfers) stays on sqlx; this type exists
 //! ONLY for read workers draining span SELECTs.
@@ -17,14 +18,16 @@
 use crate::error::{Error, Result};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
+use tokio_rustls::rustls;
 
 // Capability flags (the subset we speak).
 const CLIENT_LONG_PASSWORD: u32 = 0x1;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x8;
 const CLIENT_PROTOCOL_41: u32 = 0x200;
+const CLIENT_SSL: u32 = 0x800;
 const CLIENT_SECURE_CONNECTION: u32 = 0x8000;
 const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
 const CLIENT_PLUGIN_AUTH_LENENC: u32 = 1 << 21;
@@ -33,9 +36,22 @@ const CLIENT_DEPRECATE_EOF: u32 = 1 << 24;
 /// utf8mb4_general_ci — every 8.x and 5.7 server accepts it.
 const CHARSET_UTF8MB4: u8 = 45;
 
+/// Everything the wire rides on — TCP or TLS, behind one vtable (reads are
+/// 1 MiB-buffered, so the dynamic dispatch is per syscall, not per row).
+trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
+type IoBox = Box<dyn Io>;
+
+#[derive(Clone, Copy, PartialEq)]
+enum SslPref {
+    Disabled,
+    Preferred,
+    Required,
+}
+
 pub(crate) struct MyWire {
-    rd: BufReader<OwnedReadHalf>,
-    wr: BufWriter<OwnedWriteHalf>,
+    rd: BufReader<tokio::io::ReadHalf<IoBox>>,
+    wr: BufWriter<tokio::io::WriteHalf<IoBox>>,
     seq: u8,
     /// Reused payload buffer — one packet at a time, continuations appended.
     buf: Vec<u8>,
@@ -49,6 +65,7 @@ pub(crate) struct MyConnInfo {
     pub user: String,
     pub password: String,
     pub db: String,
+    ssl: SslPref,
 }
 
 pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
@@ -58,17 +75,23 @@ pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
         .host_str()
         .ok_or_else(|| Error::InvalidInput("mysql url needs a host".into()))?
         .to_string();
-    // ssl-mode=required/verify_* means the user WANTS TLS — the raw plane
-    // is plaintext, so refuse and let the caller fall back to sqlx.
+    // MySQL ssl-mode semantics: required = encrypt WITHOUT verifying the
+    // certificate (that's what the server tooling does too). verify_ca /
+    // verify_identity want real verification — the sqlx lane provides it.
+    let mut ssl = SslPref::Preferred;
     for (k, v) in u.query_pairs() {
         if k == "ssl-mode" || k == "sslmode" {
-            let v = v.to_lowercase();
-            if v != "disabled" && v != "preferred" {
-                return Err(Error::InvalidInput(format!(
-                    "raw mysql plane: ssl-mode={v} needs TLS — riding the \
-                     sqlx lane instead"
-                )));
-            }
+            ssl = match v.to_lowercase().as_str() {
+                "disabled" => SslPref::Disabled,
+                "preferred" => SslPref::Preferred,
+                "required" => SslPref::Required,
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "raw mysql plane: ssl-mode={other} verifies \
+                         certificates — riding the sqlx lane instead"
+                    )))
+                }
+            };
         }
     }
     Ok(MyConnInfo {
@@ -77,6 +100,7 @@ pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
         user: pct(u.username())?,
         password: pct(u.password().unwrap_or(""))?,
         db: u.path().trim_matches('/').to_string(),
+        ssl,
     })
 }
 
@@ -192,26 +216,278 @@ fn scramble(plugin: &str, password: &str, nonce: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// The server's initial handshake, parsed.
+struct Handshake {
+    caps: u32,
+    nonce: Vec<u8>,
+    plugin: String,
+}
+
+fn parse_handshake(p: &[u8]) -> Result<Handshake> {
+    if p.first() == Some(&0xFF) {
+        return Err(parse_err(&p[1..]));
+    }
+    if p.first() != Some(&10) {
+        return Err(desync("handshake protocol version"));
+    }
+    let mut pos = 1 + p[1..]
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| desync("handshake server version"))?
+        + 1
+        + 4;
+    if p.len() < pos + 8 + 1 + 2 {
+        return Err(desync("short handshake"));
+    }
+    let mut nonce = Vec::with_capacity(20);
+    nonce.extend_from_slice(&p[pos..pos + 8]);
+    pos += 8 + 1; // auth-data-1 + filler
+    let cap_low = u16::from_le_bytes([p[pos], p[pos + 1]]) as u32;
+    pos += 2;
+    let mut caps = cap_low;
+    let mut plugin = String::new();
+    if p.len() > pos + 1 + 2 {
+        pos += 1 + 2; // charset + status
+        let cap_high = u16::from_le_bytes([p[pos], p[pos + 1]]) as u32;
+        caps |= cap_high << 16;
+        pos += 2;
+        let auth_len = p[pos] as usize;
+        pos += 1 + 10; // auth-data length + reserved
+        if caps & CLIENT_SECURE_CONNECTION != 0 {
+            let n = auth_len.saturating_sub(8).max(13) - 1; // drop trailing NUL
+            if p.len() < pos + n {
+                return Err(desync("short handshake auth data"));
+            }
+            nonce.extend_from_slice(&p[pos..pos + n]);
+            pos += n + 1;
+        }
+        if caps & CLIENT_PLUGIN_AUTH != 0 {
+            let end = p[pos..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|e| pos + e)
+                .unwrap_or(p.len());
+            plugin = String::from_utf8_lossy(&p[pos..end]).into_owned();
+        }
+    }
+    if plugin.is_empty() {
+        plugin = "mysql_native_password".into();
+    }
+    Ok(Handshake { caps, nonce, plugin })
+}
+
+/// Accept-anything verifier: MySQL `ssl-mode=required` semantics — the
+/// channel is encrypted, the certificate is NOT verified (server certs are
+/// auto-generated self-signed in the default install). Users who want
+/// verification say `verify_ca`/`verify_identity` and get the sqlx lane.
+#[derive(Debug)]
+struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+async fn tls_upgrade(tcp: TcpStream, host: &str) -> Result<IoBox> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Transfer(format!("mysql tls: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| Error::Transfer(format!("mysql tls servername: {e}")))?;
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(name, tcp)
+        .await
+        .map_err(io_err)?;
+    Ok(Box::new(tls))
+}
+
+/// One packet read straight off the raw TCP socket (pre-TLS phase only).
+async fn read_packet_raw(tcp: &mut TcpStream, seq: &mut u8) -> Result<Vec<u8>> {
+    let mut head = [0u8; 4];
+    tcp.read_exact(&mut head).await.map_err(io_err)?;
+    let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
+    if head[3] != *seq {
+        return Err(desync("packet sequence"));
+    }
+    *seq = seq.wrapping_add(1);
+    let mut body = vec![0u8; len];
+    tcp.read_exact(&mut body).await.map_err(io_err)?;
+    Ok(body)
+}
+
 impl MyWire {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let info = parse_my_url(url)?;
-        let stream = TcpStream::connect((info.host.as_str(), info.port))
+        tokio::time::timeout(std::time::Duration::from_secs(10), Self::connect_inner(&info))
+            .await
+            .map_err(|_| Error::Connect("mysql wire: connect timed out (10s)".into()))?
+    }
+
+    async fn connect_inner(info: &MyConnInfo) -> Result<Self> {
+        let mut tcp = TcpStream::connect((info.host.as_str(), info.port))
             .await
             .map_err(io_err)?;
-        stream.set_nodelay(true).map_err(io_err)?;
-        let (r, w) = stream.into_split();
+        tcp.set_nodelay(true).map_err(io_err)?;
+
+        let mut seq = 0u8;
+        let hs = parse_handshake(&read_packet_raw(&mut tcp, &mut seq).await?)?;
+
+        let use_tls = match info.ssl {
+            SslPref::Disabled => false,
+            SslPref::Preferred => hs.caps & CLIENT_SSL != 0,
+            SslPref::Required => {
+                if hs.caps & CLIENT_SSL == 0 {
+                    return Err(Error::Connect(
+                        "mysql wire: ssl-mode=required but the server offers no TLS".into(),
+                    ));
+                }
+                true
+            }
+        };
+
+        let want = CLIENT_LONG_PASSWORD
+            | CLIENT_CONNECT_WITH_DB
+            | CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_PLUGIN_AUTH_LENENC
+            | CLIENT_DEPRECATE_EOF;
+        let mut use_caps = want & (hs.caps | CLIENT_LONG_PASSWORD);
+        if use_caps & CLIENT_PROTOCOL_41 == 0 {
+            return Err(desync("server without PROTOCOL_41"));
+        }
+
+        let io: IoBox = if use_tls {
+            use_caps |= CLIENT_SSL;
+            // SSLRequest: the 32-byte HandshakeResponse prefix, then the
+            // socket upgrades and the real response continues INSIDE TLS.
+            let mut req = vec![32, 0, 0, seq];
+            seq = seq.wrapping_add(1);
+            req.extend_from_slice(&use_caps.to_le_bytes());
+            req.extend_from_slice(&(1u32 << 24).to_le_bytes());
+            req.push(CHARSET_UTF8MB4);
+            req.extend_from_slice(&[0u8; 23]);
+            tcp.write_all(&req).await.map_err(io_err)?;
+            tls_upgrade(tcp, &info.host).await?
+        } else {
+            Box::new(tcp)
+        };
+
+        let (r, w) = tokio::io::split(io);
         let mut me = Self {
             rd: BufReader::with_capacity(1 << 20, r),
             wr: BufWriter::new(w),
-            seq: 0,
+            seq,
             buf: Vec::with_capacity(64 << 10),
-            deprecate_eof: false,
+            deprecate_eof: use_caps & CLIENT_DEPRECATE_EOF != 0,
         };
-        me.handshake(&info).await?;
+        me.authenticate(info, &hs, use_caps, use_tls).await?;
         // TIMESTAMP columns then arrive as UTC wall time — the same session
         // pin the sqlx pool applies (delivery says utc:true; keep it true).
         me.exec("SET time_zone = '+00:00'").await?;
         Ok(me)
+    }
+
+    async fn authenticate(
+        &mut self,
+        info: &MyConnInfo,
+        hs: &Handshake,
+        use_caps: u32,
+        use_tls: bool,
+    ) -> Result<()> {
+        let auth = scramble(&hs.plugin, &info.password, &hs.nonce)?;
+        let mut hr = Vec::with_capacity(128);
+        hr.extend_from_slice(&use_caps.to_le_bytes());
+        hr.extend_from_slice(&(1u32 << 24).to_le_bytes()); // max packet
+        hr.push(CHARSET_UTF8MB4);
+        hr.extend_from_slice(&[0u8; 23]);
+        hr.extend_from_slice(info.user.as_bytes());
+        hr.push(0);
+        hr.push(auth.len() as u8); // lenenc: our scrambles are ≤ 32 bytes
+        hr.extend_from_slice(&auth);
+        hr.extend_from_slice(info.db.as_bytes());
+        hr.push(0);
+        hr.extend_from_slice(hs.plugin.as_bytes());
+        hr.push(0);
+        self.write_packet(&hr).await?;
+
+        // Post-handshake: OK / ERR / AuthSwitch (0xFE) / AuthMoreData (0x01).
+        loop {
+            let p = self.read_packet().await?.to_vec();
+            match p.first() {
+                Some(0x00) => return Ok(()),
+                Some(0xFF) => return Err(parse_err(&p[1..])),
+                Some(0xFE) => {
+                    // AuthSwitchRequest: plugin NUL + fresh nonce.
+                    let body = &p[1..];
+                    let z = body
+                        .iter()
+                        .position(|&b| b == 0)
+                        .ok_or_else(|| desync("auth switch packet"))?;
+                    let plugin = String::from_utf8_lossy(&body[..z]).into_owned();
+                    let mut nonce = &body[z + 1..];
+                    if nonce.last() == Some(&0) {
+                        nonce = &nonce[..nonce.len() - 1];
+                    }
+                    let auth = scramble(&plugin, &info.password, nonce)?;
+                    self.write_packet(&auth).await?;
+                }
+                Some(0x01) => match p.get(1) {
+                    // caching_sha2 fast-auth success — OK packet follows.
+                    Some(0x03) => continue,
+                    // Full auth: over TLS the password rides the encrypted
+                    // channel (what mainline clients do). Over plaintext the
+                    // RSA exchange is out of scope — sqlx lane.
+                    Some(0x04) => {
+                        if use_tls {
+                            let mut pw = info.password.as_bytes().to_vec();
+                            pw.push(0);
+                            self.write_packet(&pw).await?;
+                        } else {
+                            return Err(Error::Transfer(
+                                "raw mysql plane: full sha2 auth needs TLS \
+                                 (cold auth cache on a plaintext connection) \
+                                 — riding the sqlx lane instead"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    _ => return Err(desync("auth more-data")),
+                },
+                _ => return Err(desync("auth response")),
+            }
+        }
     }
 
     // ---- packet layer -----------------------------------------------------
@@ -263,130 +539,6 @@ impl MyWire {
             }
         }
         self.wr.flush().await.map_err(io_err)
-    }
-
-    // ---- handshake --------------------------------------------------------
-
-    async fn handshake(&mut self, info: &MyConnInfo) -> Result<()> {
-        let p = self.read_packet().await?.to_vec();
-        if p.first() == Some(&0xFF) {
-            return Err(parse_err(&p[1..]));
-        }
-        if p.first() != Some(&10) {
-            return Err(desync("handshake protocol version"));
-        }
-        // server version (NUL) + thread id (4)
-        let mut pos = 1 + p[1..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| desync("handshake server version"))?
-            + 1
-            + 4;
-        if p.len() < pos + 8 + 1 + 2 {
-            return Err(desync("short handshake"));
-        }
-        let mut nonce = Vec::with_capacity(20);
-        nonce.extend_from_slice(&p[pos..pos + 8]);
-        pos += 8 + 1; // auth-data-1 + filler
-        let cap_low = u16::from_le_bytes([p[pos], p[pos + 1]]) as u32;
-        pos += 2;
-        let mut caps = cap_low;
-        let mut plugin = String::new();
-        if p.len() > pos + 1 + 2 {
-            pos += 1 + 2; // charset + status
-            let cap_high = u16::from_le_bytes([p[pos], p[pos + 1]]) as u32;
-            caps |= cap_high << 16;
-            pos += 2;
-            let auth_len = p[pos] as usize;
-            pos += 1 + 10; // auth-data length + reserved
-            if caps & CLIENT_SECURE_CONNECTION != 0 {
-                let n = auth_len.saturating_sub(8).max(13) - 1; // drop trailing NUL
-                if p.len() < pos + n {
-                    return Err(desync("short handshake auth data"));
-                }
-                nonce.extend_from_slice(&p[pos..pos + n]);
-                pos += n + 1;
-            }
-            if caps & CLIENT_PLUGIN_AUTH != 0 {
-                let end = p[pos..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map(|e| pos + e)
-                    .unwrap_or(p.len());
-                plugin = String::from_utf8_lossy(&p[pos..end]).into_owned();
-            }
-        }
-        if plugin.is_empty() {
-            plugin = "mysql_native_password".into();
-        }
-
-        let want = CLIENT_LONG_PASSWORD
-            | CLIENT_CONNECT_WITH_DB
-            | CLIENT_PROTOCOL_41
-            | CLIENT_SECURE_CONNECTION
-            | CLIENT_PLUGIN_AUTH
-            | CLIENT_PLUGIN_AUTH_LENENC
-            | CLIENT_DEPRECATE_EOF;
-        let use_caps = want & (caps | CLIENT_LONG_PASSWORD);
-        if use_caps & CLIENT_PROTOCOL_41 == 0 {
-            return Err(desync("server without PROTOCOL_41"));
-        }
-        self.deprecate_eof = use_caps & CLIENT_DEPRECATE_EOF != 0;
-
-        let auth = scramble(&plugin, &info.password, &nonce)?;
-        let mut hr = Vec::with_capacity(128);
-        hr.extend_from_slice(&use_caps.to_le_bytes());
-        hr.extend_from_slice(&(1u32 << 24).to_le_bytes()); // max packet
-        hr.push(CHARSET_UTF8MB4);
-        hr.extend_from_slice(&[0u8; 23]);
-        hr.extend_from_slice(info.user.as_bytes());
-        hr.push(0);
-        hr.push(auth.len() as u8); // lenenc: our scrambles are ≤ 32 bytes
-        hr.extend_from_slice(&auth);
-        hr.extend_from_slice(info.db.as_bytes());
-        hr.push(0);
-        hr.extend_from_slice(plugin.as_bytes());
-        hr.push(0);
-        self.write_packet(&hr).await?;
-
-        // Post-handshake: OK / ERR / AuthSwitch (0xFE) / AuthMoreData (0x01).
-        loop {
-            let p = self.read_packet().await?.to_vec();
-            match p.first() {
-                Some(0x00) => return Ok(()),
-                Some(0xFF) => return Err(parse_err(&p[1..])),
-                Some(0xFE) => {
-                    // AuthSwitchRequest: plugin NUL + fresh nonce.
-                    let body = &p[1..];
-                    let z = body
-                        .iter()
-                        .position(|&b| b == 0)
-                        .ok_or_else(|| desync("auth switch packet"))?;
-                    let plugin = String::from_utf8_lossy(&body[..z]).into_owned();
-                    let mut nonce = &body[z + 1..];
-                    if nonce.last() == Some(&0) {
-                        nonce = &nonce[..nonce.len() - 1];
-                    }
-                    let auth = scramble(&plugin, &info.password, nonce)?;
-                    self.write_packet(&auth).await?;
-                }
-                Some(0x01) => match p.get(1) {
-                    // caching_sha2 fast-auth success — OK packet follows.
-                    Some(0x03) => continue,
-                    // Full auth wanted: plaintext RSA exchange is out of
-                    // scope — the canary fails and the sqlx lane runs.
-                    Some(0x04) => {
-                        return Err(Error::Transfer(
-                            "raw mysql plane: server demands full sha2 auth \
-                             (cold auth cache) — riding the sqlx lane instead"
-                                .into(),
-                        ))
-                    }
-                    _ => return Err(desync("auth more-data")),
-                },
-                _ => return Err(desync("auth response")),
-            }
-        }
     }
 
     // ---- commands ---------------------------------------------------------
@@ -556,6 +708,41 @@ mod tests {
         assert_eq!(i.password, "p#w");
         assert_eq!(i.port, 3307);
         assert_eq!(i.db, "bench");
-        assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=required").is_err());
+        assert!(matches!(i.ssl, SslPref::Disabled));
+        // required is now spoken natively (encrypt, no verification)…
+        let i = parse_my_url("mysql://u:p@h/db?ssl-mode=required").unwrap();
+        assert!(matches!(i.ssl, SslPref::Required));
+        // …and no ssl-mode means preferred, like the mainline client.
+        let i = parse_my_url("mysql://u:p@h/db").unwrap();
+        assert!(matches!(i.ssl, SslPref::Preferred));
+        // verification modes ride the sqlx lane.
+        assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=verify_ca").is_err());
+    }
+
+    #[test]
+    fn handshake_parses_caps_nonce_and_plugin() {
+        // A minimal HandshakeV10: proto 10, version "8.0.0", thread id,
+        // 8B nonce-1, filler, caps low (PROTOCOL_41|SSL|SECURE), charset,
+        // status, caps high (PLUGIN_AUTH|DEPRECATE_EOF), auth len 21,
+        // 10B reserved, 12B nonce-2 + NUL, plugin name.
+        let mut p = vec![10];
+        p.extend_from_slice(b"8.0.0\0");
+        p.extend_from_slice(&42u32.to_le_bytes());
+        p.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 0]);
+        let low = (CLIENT_PROTOCOL_41 | CLIENT_SSL | CLIENT_SECURE_CONNECTION) as u16;
+        p.extend_from_slice(&low.to_le_bytes());
+        p.push(45);
+        p.extend_from_slice(&2u16.to_le_bytes());
+        let high = ((CLIENT_PLUGIN_AUTH | CLIENT_DEPRECATE_EOF) >> 16) as u16;
+        p.extend_from_slice(&high.to_le_bytes());
+        p.push(21);
+        p.extend_from_slice(&[0u8; 10]);
+        p.extend_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0]);
+        p.extend_from_slice(b"caching_sha2_password\0");
+        let hs = parse_handshake(&p).unwrap();
+        assert_eq!(hs.nonce, (1..=20).collect::<Vec<u8>>());
+        assert_eq!(hs.plugin, "caching_sha2_password");
+        assert!(hs.caps & CLIENT_SSL != 0);
+        assert!(hs.caps & CLIENT_DEPRECATE_EOF != 0);
     }
 }
