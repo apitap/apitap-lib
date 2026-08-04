@@ -160,25 +160,34 @@ top = (apitap.read(src, table="events").lazy()
        .group_by("status").agg(pl.len())
        .collect(engine="streaming"))
 
-apitap.read(src, table="events").to_parquet("events.parquet")  # pg → Parquet
+# MySQL reads the same way — and joins ACROSS engines are just polars:
+orders = apitap.read("postgres://…", table="orders").lazy()
+events = apitap.read("mysql://…", table="events").lazy()
+daily = orders.join(events, on="id").group_by("day").agg(pl.len()).collect(engine="streaming")
+
+apitap.read(src, table="events").to_parquet("events.parquet")  # → Parquet
 tbl = apitap.read(src, table="events").to_arrow()              # pyarrow Table
 ```
 
-The same parallel binary-COPY pipes every transfer route uses feed Rust-side
+The same parallel pipes every transfer route uses feed Rust-side
 Arrow column builders; batches cross into Python zero-copy through the Arrow
 C stream protocol (`__arrow_c_stream__`), so polars, pyarrow, duckdb and
 pandas consume the reader natively — the wheel depends on none of them.
+Postgres rides raw binary COPY; MySQL rides its own hand-rolled wire
+client — binary-protocol rows decode straight off the socket into the
+column builders (no driver, no per-row allocations).
 `.lazy()` registers the stream as a polars scan and pushes the query's
 COLUMN PROJECTION all the way into the SQL: a query touching 2 of 15
-columns makes Postgres serialize and this side decode only those 2 — the
+columns makes the server serialize and this side decode only those 2 — the
 compute itself (filter/group/join) stays in polars, and no loop ever
 appears in your code. Typed end to end (int16/32/64, float32/64, bool,
 decimal128, date32, timestamp µs, utf8, binary); uuid/jsonb/exotics
 arrive as text, so every table reads.
 Measured on the bench box: 10M rows → polars in **14.9 s** (connectorx
 55.9 s, pandas 295 s, same box). In a **0.5 vCPU / 256 MB** container:
-the same ten million rows stream through in **13.2 s** flat at ~100 MB;
-a real `.lazy()` filter + group_by over them lands in **2.4 s** — and the
+ten million Postgres rows stream through in **13.2 s** flat at ~100 MB;
+**11.8 million MySQL rows in 3.7 s at 126 MB** on the same half core;
+a real `.lazy()` filter + group_by lands in **2.4 s** — and the
 same query over FIFTY million rows in **9.1 s** at a flat ~140 MB, tying
 raw SQL run inside Postgres itself. plain polars
 (`read_database_uri`, with or without `.lazy()`) is OOM-killed on that
@@ -210,8 +219,11 @@ troubleshooting:
       polars queries with projection pushdown — 50M rows, filter+group_by,
       0.5 vCPU / 256 MB: 9.1 s; `.to_parquet()` streams a table to a file at
       constant memory; `columns=` for direct projections
+- [x] MySQL source for `read()` — a hand-rolled wire client decodes
+      binary-protocol rows straight into Arrow: 11.8M rows → polars in
+      **3.7 s on 0.5 vCPU / 256 MB**; cross-engine joins (MySQL × Postgres)
+      are one ordinary polars expression
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
-- [ ] MySQL source for `read()`
 - [ ] Snowflake destination
 - [ ] aarch64 + macOS wheels
 

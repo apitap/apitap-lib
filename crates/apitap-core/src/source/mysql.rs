@@ -10,6 +10,7 @@ use crate::sink::Loader;
 use crate::source::Source;
 use crate::error::{Error, Result};
 use crate::wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, CellVal};
+use crate::wire::mywire::{self, MyWire};
 use crate::wire::pgcopy as pgc;
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::wire::rowbinary::varint;
@@ -730,6 +731,8 @@ fn write_datetime(b: &[u8], out: &mut Vec<u8>) -> Result<()> {
 
 pub(crate) struct MySqlSource {
     pool: MySqlPool,
+    /// Kept for the raw read plane's own worker connections.
+    url: std::sync::Arc<str>,
 }
 
 impl MySqlSource {
@@ -746,7 +749,7 @@ impl MySqlSource {
             .connect(url)
             .await
             .map_err(|e| Error::Connect(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self { pool, url: url.into() })
     }
 }
 
@@ -1266,16 +1269,43 @@ impl MySqlSource {
                 .map(|c| my_ar(c).map(|(e, _)| e))
                 .collect::<Result<_>>()?,
         );
+        // Raw plane canary: one throwaway handshake decides the lane for
+        // the whole read. Anything it can't do (TLS demanded, cold sha2
+        // auth cache, exotic plugin) rides sqlx — never a hard failure.
+        // APITAP_MY_RAW=0 forces the sqlx lane for A/B.
+        let mut raw = !std::env::var("APITAP_MY_RAW").is_ok_and(|v| v == "0");
+        if raw {
+            match MyWire::connect(&self.url).await {
+                Ok(w) => w.quit().await,
+                Err(e) => {
+                    if std::env::var_os("APITAP_DEBUG").is_some() {
+                        eprintln!("[my raw] canary failed, sqlx lane: {e}");
+                    }
+                    raw = false;
+                }
+            }
+        }
         let queue = super::work_queue(stmts);
         let mut tasks = Vec::with_capacity(workers);
         for _ in 0..workers {
-            tasks.push(tokio::spawn(arrow_row_worker(
-                self.pool.clone(),
-                queue.clone(),
-                encs.clone(),
-                BatchBuilder::new(kinds.clone(), batch_bytes),
-                tx.clone(),
-            )));
+            let bb = BatchBuilder::new(kinds.clone(), batch_bytes);
+            tasks.push(if raw {
+                tokio::spawn(raw_arrow_worker(
+                    self.url.clone(),
+                    queue.clone(),
+                    encs.clone(),
+                    bb,
+                    tx.clone(),
+                ))
+            } else {
+                tokio::spawn(arrow_row_worker(
+                    self.pool.clone(),
+                    queue.clone(),
+                    encs.clone(),
+                    bb,
+                    tx.clone(),
+                ))
+            });
         }
         let mut rows = 0u64;
         for t in tasks {
@@ -1285,6 +1315,120 @@ impl MySqlSource {
         }
         Ok(rows)
     }
+}
+
+/// Walk one raw binary-protocol row payload straight into the builder.
+/// Layout: 0x00 header, NULL bitmap with a 2-bit offset, then values in
+/// column order — fixed little-endian for ints/floats, `[len][fields]` for
+/// temporals, length-encoded bytes for the rest: exactly what [`ar_cell`]
+/// already decodes, minus sqlx's per-row machinery around it.
+fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
+    #[inline]
+    fn take<'a>(p: &'a [u8], pos: usize, n: usize) -> Result<&'a [u8]> {
+        p.get(pos..pos + n)
+            .ok_or_else(|| Error::Transfer("mysql wire: truncated row".into()))
+    }
+    let n = encs.len();
+    let bm_len = (n + 7 + 2) / 8;
+    let bm = take(p, 1, bm_len)?;
+    let mut pos = 1 + bm_len;
+    for (i, enc) in encs.iter().enumerate() {
+        let bit = i + 2;
+        if bm[bit / 8] & (1 << (bit % 8)) != 0 {
+            bb.append_cell(i, CellVal::Null);
+            continue;
+        }
+        let cell = match enc {
+            MyAr::I8 | MyAr::U8 => take(p, pos, 1)?,
+            MyAr::I16 | MyAr::U16 | MyAr::Year => take(p, pos, 2)?,
+            MyAr::I32 | MyAr::U32 | MyAr::F32 => take(p, pos, 4)?,
+            MyAr::I64 | MyAr::U64Dec | MyAr::F64 => take(p, pos, 8)?,
+            MyAr::Date | MyAr::DateTime => {
+                let l = *p
+                    .get(pos)
+                    .ok_or_else(|| Error::Transfer("mysql wire: truncated row".into()))?
+                    as usize;
+                take(p, pos, 1 + l)?
+            }
+            MyAr::Dec { .. } | MyAr::Str | MyAr::Bin => {
+                let (l, h) = mywire::lenenc(&p[pos..])?;
+                let b = take(p, pos + h, l as usize)?;
+                pos += h; // the prefix; the value advances below
+                b
+            }
+        };
+        bb.append_cell(i, ar_cell(cell, *enc)?);
+        pos += cell.len();
+    }
+    Ok(())
+}
+
+/// One raw-plane worker: own TCP connection, prepared span SELECTs, rows
+/// walked in place from the socket buffer into the column builders.
+async fn raw_arrow_worker(
+    url: std::sync::Arc<str>,
+    queue: WorkQueue,
+    encs: std::sync::Arc<Vec<MyAr>>,
+    mut bb: BatchBuilder,
+    tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+) -> Result<u64> {
+    let dbg = std::env::var_os("APITAP_DEBUG").is_some();
+    let (mut t_fetch, mut t_dec, mut t_send) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    let cancelled = || Error::Transfer("read cancelled by consumer".into());
+    let mut w = MyWire::connect(&url).await?;
+    let mut since_seal = 0u32;
+    while let Some(sql) = pop(&queue) {
+        let (sid, ncols) = w.prepare(&sql).await?;
+        if ncols != encs.len() {
+            return Err(Error::Transfer(format!(
+                "mysql wire: span returned {ncols} columns, planned {}",
+                encs.len()
+            )));
+        }
+        w.execute(sid).await?;
+        loop {
+            let tf = dbg.then(std::time::Instant::now);
+            let row = w.next_row().await?;
+            if let Some(tf) = tf {
+                t_fetch += tf.elapsed();
+            }
+            let Some(p) = row else { break };
+            let td = dbg.then(std::time::Instant::now);
+            walk_raw_row(p, &encs, &mut bb)?;
+            bb.row_done();
+            if let Some(td) = td {
+                t_dec += td.elapsed();
+            }
+            since_seal += 1;
+            if since_seal >= 64 {
+                since_seal = 0;
+                if let Some(batch) = bb.take_ready() {
+                    let ts = dbg.then(std::time::Instant::now);
+                    tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
+                    if let Some(ts) = ts {
+                        t_send += ts.elapsed();
+                    }
+                }
+            }
+        }
+        w.stmt_close(sid).await?;
+    }
+    if let Some(batch) = bb.finish()? {
+        tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
+    }
+    if dbg {
+        eprintln!(
+            "[my raw worker] fetch(wire)={:.1}s decode(cpu)={:.1}s send(backpressure)={:.1}s",
+            t_fetch.as_secs_f64(),
+            t_dec.as_secs_f64(),
+            t_send.as_secs_f64()
+        );
+    }
+    Ok(bb.rows_total())
 }
 
 /// One direct-lane worker: pull span statements until the queue drains,
@@ -1360,6 +1504,82 @@ async fn arrow_row_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The raw-plane row walker against a hand-built binary-protocol row:
+    /// nulls via the offset-2 bitmap, fixed widths, temporal `[len][...]`
+    /// payloads, and a lenenc string long enough to need a 2-byte prefix.
+    #[test]
+    fn raw_row_walker_decodes_a_synthetic_packet() {
+        use crate::wire::arrowcol::FinishedCol;
+        let encs = [
+            MyAr::I32,
+            MyAr::Str,
+            MyAr::Dec { scale: 2 },
+            MyAr::Date,
+            MyAr::I64,
+        ];
+        let kinds = vec![
+            ArrowKind::Int32,
+            ArrowKind::Utf8,
+            ArrowKind::Decimal { p: 10, s: 2 },
+            ArrowKind::Date32,
+            ArrowKind::Int64,
+        ];
+        // Bitmap: (5 cols + 2 offset + 7) / 8 = 1 byte.
+        // Row 1: 42, "hi", "12.34", 2024-02-08, NULL(i64 → bit 6).
+        let mut p = vec![0x00, 0b0100_0000];
+        p.extend_from_slice(&42i32.to_le_bytes());
+        p.extend_from_slice(&[2, b'h', b'i']);
+        p.extend_from_slice(&[5, b'1', b'2', b'.', b'3', b'4']);
+        p.extend_from_slice(&[4, 0xe8, 0x07, 2, 8]); // 2024-02-08
+        let mut bb = BatchBuilder::new(kinds.clone(), usize::MAX >> 1);
+        walk_raw_row(&p, &encs, &mut bb).unwrap();
+        bb.row_done();
+        // Row 2: NULL i32 (bit 2), 300-byte string (lenenc 0xFC), rest set.
+        let mut p = vec![0x00, 0b0000_0100];
+        p.extend_from_slice(&[0xFC, 0x2C, 0x01]); // 300
+        p.extend_from_slice(&[b'x'; 300]);
+        p.extend_from_slice(&[1, b'7']);
+        p.extend_from_slice(&[0]); // zero-length date payload is the ZERO date
+        p.extend_from_slice(&(-5i64).to_le_bytes());
+        // zero date must error loudly (same policy as the COPY lane)
+        let err = walk_raw_row(&p, &encs, &mut bb).unwrap_err();
+        assert!(format!("{err}").contains("DATE"), "{err}");
+        // Row 2 fixed: real date.
+        let mut p = vec![0x00, 0b0000_0100];
+        p.extend_from_slice(&[0xFC, 0x2C, 0x01]);
+        p.extend_from_slice(&[b'x'; 300]);
+        p.extend_from_slice(&[1, b'7']);
+        p.extend_from_slice(&[4, 0xe8, 0x07, 2, 9]);
+        p.extend_from_slice(&(-5i64).to_le_bytes());
+        let mut bb = BatchBuilder::new(kinds, usize::MAX >> 1);
+        walk_raw_row(&p, &encs, &mut bb).unwrap();
+        bb.row_done();
+        let batch = bb.finish().unwrap().expect("rows");
+        assert_eq!(batch.rows, 1);
+        match &batch.cols[0] {
+            FinishedCol::I32 { validity, data } => {
+                assert!(validity.is_some());
+                assert_eq!(data, &vec![0]);
+            }
+            _ => unreachable!(),
+        }
+        match &batch.cols[1] {
+            FinishedCol::Utf8 { offsets, data, .. } => {
+                assert_eq!(offsets, &vec![0, 300]);
+                assert!(data.iter().all(|&b| b == b'x'));
+            }
+            _ => unreachable!(),
+        }
+        match &batch.cols[2] {
+            FinishedCol::Dec128 { data, .. } => assert_eq!(data, &vec![700]),
+            _ => unreachable!(),
+        }
+        match &batch.cols[4] {
+            FinishedCol::I64 { data, .. } => assert_eq!(data, &vec![-5]),
+            _ => unreachable!(),
+        }
+    }
 
     /// The direct-Arrow lane must deliver EXACTLY what the COPY lane
     /// delivers — the read schema (and polars dtypes) cannot depend on

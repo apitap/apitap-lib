@@ -132,6 +132,21 @@ import apitap, pyarrow as pa
 rdr = pa.RecordBatchReader.from_stream(
     apitap.read('$PS', table='public.bench_data_1m', columns=['big_int', 'regular_int']))
 assert sum(b.num_rows for b in rdr) == 1_000_000"
+# 0.24.0: the mysql read lanes — the RAW wire plane (mywire packet walk +
+# append_cell) and the sqlx direct-Arrow fallback are both hot shapes.
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap, pyarrow as pa
+rdr = pa.RecordBatchReader.from_stream(apitap.read('$MY', table='bench_my_1m'))
+assert sum(b.num_rows for b in rdr) == 1_000_000"
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    -e APITAP_MY_RAW=0 apitap-pgo:inst python -c "
+import apitap, pyarrow as pa
+rdr = pa.RecordBatchReader.from_stream(
+    apitap.read('$MY', table='bench_my_1m', columns=['big_int', 'regular_int']))
+assert sum(b.num_rows for b in rdr) == 1_000_000"
 
 echo "== 3/3 merge + optimized build =="
 docker run --rm -v "$REPO":/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c \

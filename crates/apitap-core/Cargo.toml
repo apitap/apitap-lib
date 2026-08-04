@@ -37,6 +37,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 bytes = "1"
 # SigV4 signing for the s3:// sink — all three already compiled via sqlx.
 sha2 = "0.10"
+# mysql_native_password scramble on the raw MySQL read plane (wire/mywire.rs).
+sha1 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 # LOAD DATA LOCAL INFILE streaming for the MySQL sink — sqlx can't do it.
