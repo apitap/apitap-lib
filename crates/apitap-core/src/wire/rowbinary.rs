@@ -110,58 +110,73 @@ impl Transcoder {
             self.pos = 0;
         }
 
-        // Fast path: nothing pending — transcode complete tuples straight from `input`
-        // and buffer only the partial tail. Postgres emits one CopyData per row, so
-        // after the header this is ~every push; the unconditional copy-into-buf was an
-        // extra full-stream memcpy.
-        if self.header_done && self.buf.is_empty() {
-            let mut off = 0usize;
+        let mut inp = input;
+
+        // Pending header or partial tuple: feed it in doubling slices until it
+        // parses through, then fall into the fast path with the rest of `inp`.
+        // Appending the whole piece here instead would strand every coalesced
+        // raw-plane piece (~256 KiB, arbitrary split points) on this path for
+        // the rest of the stream — one extra full-stream memcpy.
+        let mut step = 4 << 10;
+        while !inp.is_empty() && !(self.header_done && self.buf.is_empty()) {
+            let take = step.min(inp.len());
+            step = (step * 2).min(1 << 20);
+            self.buf.extend_from_slice(&inp[..take]);
+            inp = &inp[take..];
+
+            if !self.header_done {
+                if self.buf.len() - self.pos < 19 {
+                    continue;
+                }
+                if &self.buf[self.pos..self.pos + 11] != b"PGCOPY\n\xff\r\n\0" {
+                    return Err(Error::Transfer("pg binary COPY: bad header".into()));
+                }
+                let ext =
+                    u32::from_be_bytes(self.buf[self.pos + 15..self.pos + 19].try_into().unwrap())
+                        as usize;
+                if self.buf.len() - self.pos < 19 + ext {
+                    continue;
+                }
+                self.pos += 19 + ext;
+                self.header_done = true;
+            }
             while !self.finished {
-                match try_tuple_at(&self.cols, &input[off..], out)? {
+                match try_tuple_at(&self.cols, &self.buf[self.pos..], out)? {
                     Some((consumed, finished)) => {
-                        off += consumed;
+                        self.pos += consumed;
                         self.finished = finished;
                     }
                     None => break,
                 }
             }
-            if off < input.len() && !self.finished {
-                self.buf.extend_from_slice(&input[off..]);
-            }
-            return Ok(());
-        }
-
-        // Slow path: header pending or a partial tuple carried over a chunk boundary.
-        if self.pos > (1 << 20) {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-        self.buf.extend_from_slice(input);
-
-        if !self.header_done {
-            if self.buf.len() - self.pos < 19 {
+            if self.finished {
                 return Ok(());
             }
-            if &self.buf[self.pos..self.pos + 11] != b"PGCOPY\n\xff\r\n\0" {
-                return Err(Error::Transfer("pg binary COPY: bad header".into()));
+            if self.pos == self.buf.len() {
+                self.buf.clear();
+                self.pos = 0;
+            } else if self.pos > (1 << 20) {
+                self.buf.drain(..self.pos);
+                self.pos = 0;
             }
-            let ext = u32::from_be_bytes(self.buf[self.pos + 15..self.pos + 19].try_into().unwrap())
-                as usize;
-            if self.buf.len() - self.pos < 19 + ext {
-                return Ok(());
-            }
-            self.pos += 19 + ext;
-            self.header_done = true;
         }
 
+        // Fast path: nothing pending — transcode complete tuples straight from `inp`
+        // and buffer only the partial tail. Postgres emits one CopyData per row, so
+        // on the sqlx plane this is ~every push; the raw plane lands here for the
+        // bulk of each coalesced piece.
+        let mut off = 0usize;
         while !self.finished {
-            match try_tuple_at(&self.cols, &self.buf[self.pos..], out)? {
+            match try_tuple_at(&self.cols, &inp[off..], out)? {
                 Some((consumed, finished)) => {
-                    self.pos += consumed;
+                    off += consumed;
                     self.finished = finished;
                 }
                 None => break,
             }
+        }
+        if off < inp.len() && !self.finished {
+            self.buf.extend_from_slice(&inp[off..]);
         }
         Ok(())
     }
@@ -380,13 +395,25 @@ mod tests {
         expected.extend([1u8, 0]); // null flag, false
 
         // Feed in pathological 3-byte chunks to exercise partial-tuple buffering.
-        let mut t = Transcoder::new(cols);
+        let mut t = Transcoder::new(cols.clone());
         let mut out = Vec::new();
         for c in input.chunks(3) {
             t.push(c, &mut out).unwrap();
         }
         assert!(t.finished());
         assert_eq!(out, expected);
+
+        // Raw-plane shape: a dangling carry followed by one big coalesced piece.
+        // The pending prefix must complete through the carry and the remainder
+        // must ride the fast path, leaving the carry buffer empty mid-stream.
+        for split in [1usize, 7, 21, 25] {
+            let mut t = Transcoder::new(cols.clone());
+            let mut out = Vec::new();
+            t.push(&input[..split], &mut out).unwrap();
+            t.push(&input[split..], &mut out).unwrap();
+            assert!(t.finished(), "split {split}");
+            assert_eq!(out, expected, "split {split}");
+        }
     }
 
     #[test]

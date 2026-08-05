@@ -622,15 +622,18 @@ async fn copy_out_worker<L: Loader>(
     // plane coalesces frames out of a 1 MiB read buffer into one reused Vec.
     // Dial failure (TLS URL, refused options) falls back to the sqlx plane;
     // APITAP_RAW_COPY=0 forces the old plane for A/B runs.
-    // Default: FrameRaw (the read lane) only. On FrameStrip the raw read is
-    // faster but the 256 KiB piece → 4 MiB accumulator flush pattern paced
-    // the pg→pg COPY-in ~1s slower (24.1 vs 23.0, measured twice) — modes
-    // must not regress, so the transfer lanes keep sqlx until that flush is
-    // reworked. APITAP_RAW_COPY=1 forces it on everywhere, =0 disables all.
+    // Default: FrameRaw (the read lane) and Transcode (pg→ch: no sink
+    // backpressure, and the raw plane measured 24.8s → 20.0s median @0.5cpu
+    // ×5 interleaved, checksum-exact; 14.4s → 13.2s at 16cpu). FrameStrip
+    // stays sqlx — the 256 KiB piece → 4 MiB accumulator flush pattern paced
+    // the dest-bound pg→pg COPY-in ~1s slower (24.1 vs 23.0, measured twice).
+    // MyTsv stays sqlx for the same dest-bound reason (12.1s → 12.9s and
+    // +200 MB peak under =1). APITAP_RAW_COPY=1 forces raw on everywhere,
+    // =0 disables all.
     let raw_wanted = match std::env::var("APITAP_RAW_COPY").ok().as_deref() {
         Some("0") => false,
-        Some("1") => matches!(mode, PgReadMode::FrameStrip | PgReadMode::FrameRaw),
-        _ => matches!(mode, PgReadMode::FrameRaw),
+        Some("1") => !matches!(mode, PgReadMode::Text),
+        _ => matches!(mode, PgReadMode::FrameRaw | PgReadMode::Transcode(_)),
     };
     let mut raw = if raw_wanted {
         crate::wire::walsender::Walsender::connect_sql(&url).await.ok()
@@ -777,7 +780,11 @@ async fn copy_out_worker<L: Loader>(
                     loader.send(full).await?;
                 }
             } else {
-                let mut state = SpanState::Strip(SpanStrip::new());
+                let mut state = match &mode {
+                    PgReadMode::Transcode(cols) => SpanState::Rb(Transcoder::new(cols.clone())),
+                    PgReadMode::MyTsv(cols) => SpanState::My(PgToMyTsv::new(cols.clone())),
+                    _ => SpanState::Strip(SpanStrip::new()),
+                };
                 loop {
                     match ws.copy_out_next(&mut piece, 256 << 10).await {
                         Ok(true) => {}

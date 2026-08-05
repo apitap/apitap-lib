@@ -117,55 +117,70 @@ impl PgToMyTsv {
             self.pos = 0;
         }
 
-        // Fast path: nothing pending — render complete tuples straight from
-        // `input`, buffer only a partial tail (one CopyData ≈ one row).
-        if self.header_done && self.buf.is_empty() {
-            let mut off = 0usize;
+        let mut inp = input;
+
+        // Pending header or partial tuple: feed it in doubling slices until it
+        // parses through, then fall into the fast path with the rest of `inp`
+        // (see Transcoder::push — same carry discipline, same raw-plane reason).
+        let mut step = 4 << 10;
+        while !inp.is_empty() && !(self.header_done && self.buf.is_empty()) {
+            let take = step.min(inp.len());
+            step = (step * 2).min(1 << 20);
+            self.buf.extend_from_slice(&inp[..take]);
+            inp = &inp[take..];
+
+            if !self.header_done {
+                if self.buf.len() - self.pos < 19 {
+                    continue;
+                }
+                if &self.buf[self.pos..self.pos + 11] != b"PGCOPY\n\xff\r\n\0" {
+                    return Err(Error::Transfer("pg binary COPY: bad header".into()));
+                }
+                let ext =
+                    u32::from_be_bytes(self.buf[self.pos + 15..self.pos + 19].try_into().unwrap())
+                        as usize;
+                if self.buf.len() - self.pos < 19 + ext {
+                    continue;
+                }
+                self.pos += 19 + ext;
+                self.header_done = true;
+            }
             while !self.finished {
-                match try_tuple_at(&self.cols, &input[off..], out)? {
+                match try_tuple_at(&self.cols, &self.buf[self.pos..], out)? {
                     Some((consumed, finished)) => {
-                        off += consumed;
+                        self.pos += consumed;
                         self.finished = finished;
                     }
                     None => break,
                 }
             }
-            if off < input.len() && !self.finished {
-                self.buf.extend_from_slice(&input[off..]);
-            }
-            return Ok(());
-        }
-
-        if self.pos > (1 << 20) {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-        self.buf.extend_from_slice(input);
-
-        if !self.header_done {
-            if self.buf.len() - self.pos < 19 {
+            if self.finished {
                 return Ok(());
             }
-            if &self.buf[self.pos..self.pos + 11] != b"PGCOPY\n\xff\r\n\0" {
-                return Err(Error::Transfer("pg binary COPY: bad header".into()));
+            if self.pos == self.buf.len() {
+                self.buf.clear();
+                self.pos = 0;
+            } else if self.pos > (1 << 20) {
+                self.buf.drain(..self.pos);
+                self.pos = 0;
             }
-            let ext = u32::from_be_bytes(self.buf[self.pos + 15..self.pos + 19].try_into().unwrap())
-                as usize;
-            if self.buf.len() - self.pos < 19 + ext {
-                return Ok(());
-            }
-            self.pos += 19 + ext;
-            self.header_done = true;
         }
 
+        // Fast path: nothing pending — render complete tuples straight from
+        // `inp`, buffer only a partial tail (one CopyData ≈ one row on sqlx;
+        // the bulk of each coalesced piece on the raw plane).
+        let mut off = 0usize;
         while !self.finished {
-            match try_tuple_at(&self.cols, &self.buf[self.pos..], out)? {
+            match try_tuple_at(&self.cols, &inp[off..], out)? {
                 Some((consumed, finished)) => {
-                    self.pos += consumed;
+                    off += consumed;
                     self.finished = finished;
                 }
                 None => break,
             }
+        }
+        if off < inp.len() && !self.finished {
+            self.buf.extend_from_slice(&inp[off..]);
         }
         Ok(())
     }
