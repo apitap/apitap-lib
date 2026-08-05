@@ -129,9 +129,11 @@ apitap.transfer(
 
 `mode="append"` loads only rows past the last synced watermark; `mode="merge"`
 upserts the delta by primary key. `mode="log_based"` is **batch CDC** for
-Postgres sources: the first run creates a logical replication slot and
-bootstraps with a full load pinned to the slot's exported snapshot (no gap,
-no duplicates); every later run drains the WAL delta — inserts, updates
+Postgres and MySQL sources. Postgres: the first run creates a logical
+replication slot and bootstraps with a full load pinned to the slot's
+exported snapshot (no gap, no duplicates). MySQL: the binlog coordinate is
+captured before an idempotent full load — same guarantee, no slot needed.
+Every later run drains the log delta — inserts, updates
 (PK changes included), deletes, TRUNCATEs, TOAST handled — and applies it
 set-based in one destination transaction that also advances the LSN
 watermark. Schedule the same call from cron/Airflow; no daemon. The watermark lives in **`_apitap_state`** — a
