@@ -239,3 +239,36 @@ remains of my→pg is the **destination's** ~450K rows/s COPY ceiling, which is
 the next session's target (with `sqlx BinaryRow::decode_with` at 6.3% +
 async-stream yielding at ~8.5%, a raw-protocol MySQL reader is the source-side
 endgame if it ever becomes the wall again).
+
+## Session 4 — the source-drain campaign (2026-08-05)
+
+Two knives from a five-map research fan-out (apitap lanes × DuckDB source ×
+external SOTA), both settled by interleaved A/B @0.5cpu/256MB.
+
+**Knife 1 — KEPT: pg→ch rides the raw COPY plane.** The Transcode lane left
+sqlx `copy_out_raw` (one refcounted `Bytes` + full poll stack per CopyData ≈
+per row — the poll storm the walsender plane was built to kill) for 256 KiB
+coalesced pieces. Prerequisite found by review, not measurement: a coalesced
+piece that ends mid-tuple used to strand the whole rest of the stream on the
+transcoder's copy-into-carry slow path — the carry now feeds in doubling
+slices and returns to the fast path. Receipts (5v5 interleaved, ClickHouse
+per-column cityHash64 checksums exact): **24.8 s → 20.0 s median (−19%)
+@0.5cpu/256MB**; 14.4 → 13.2 s at 16cpu. pg→my under the same plane measured
++0.8 s and +200 MB peak (dest-bound pacing, same story as FrameStrip) — MyTsv
+keeps sqlx by default.
+
+**Knife 2 — REJECTED: MyWire windowed drain.** The DuckDB-shape transplant
+(owned window, synchronous packet walk, zero-copy row slices, no per-packet
+zeroing) **lost at every window size**: 64K 23.8–24.0 s, 256K 23.9–25.3 s,
+1M 24.4–25.8 s vs the per-packet plane's 18.9–20.3 s (11.8M-row drain
+@0.5cpu/256MB, ×2 rounds interleaved, checksums matched, CDC e2e green).
+Why the premise failed: MyWire's baseline was never sqlx — its BufReader
+already coalesces socket reads at 1 MiB, so the window only removed two
+already-cheap ready-await memcpys per row, while *adding* a coarser yield
+cadence. The debug split showed decode itself slowing (2.1→3.1 s,
+cache-cold reads from a big window) and fetch growing: six workers on half
+a core rely on the per-row awaits' fine-grained cooperative yielding to keep
+all six TCP streams flowing; an 8K-row synchronous walk starves the other
+five sockets until the server's send windows close. The per-packet plane is
+the right shape for this concurrency — do not re-window it without new
+evidence.
