@@ -222,9 +222,12 @@ troubleshooting:
       GitHub API into Postgres, MySQL, ClickHouse, BigQuery, GCS, S3-compatible
       object stores (MinIO, R2, …) and Apache Iceberg
 - [x] Incremental sync — `mode="append"` / `mode="merge"` (transactional state table)
-- [x] Batch CDC — `mode="log_based"`: logical-replication drains on a schedule,
-      every WAL operation captured, snapshot-pinned bootstrap, crash-safe
-      LSN watermark committed with the data (Postgres→Postgres first)
+- [x] Batch CDC — `mode="log_based"`: log drains on a schedule, every
+      operation captured, snapshot-pinned bootstrap, a crash-safe watermark
+      committed with the data. **Postgres (logical replication) and MySQL
+      (binlog) sources**, into Postgres/ClickHouse/MySQL — the MySQL race:
+      a 650K-event backlog caught up in **15.6 s on 0.5 vCPU / 256 MB**
+      where ape-dts did not converge in 900 s; windows fit a 64 MB container
 - [x] Apache Iceberg destination — overwrite/append/row-delta snapshots on any
       REST catalog; watermarks committed as table properties **in the same
       snapshot as the data**; bootstrap from parquet footer stats (picks up

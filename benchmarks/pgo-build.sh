@@ -148,6 +148,29 @@ rdr = pa.RecordBatchReader.from_stream(
     apitap.read('$MY', table='bench_my_1m', columns=['big_int', 'regular_int']))
 assert sum(b.num_rows for b in rdr) == 1_000_000"
 
+# 0.25.0: the mysql binlog CDC lanes (mywire dump, mybinlog decode,
+# collapse+apply) — one small bootstrap+mutate+drain cycle trains them.
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import subprocess, apitap
+m = lambda q: subprocess.run(['mysql','-h','127.0.0.1','-P','3307','-uroot','-pbench','-N','-e',q], check=True)
+" 2>/dev/null || true
+docker exec apitap-bench-my mysql -uroot -pbench -N -e "DROP TABLE IF EXISTS bench.pgo_cdc; CREATE TABLE bench.pgo_cdc (id INT PRIMARY KEY, v VARCHAR(40), d DECIMAL(10,2)); INSERT INTO bench.pgo_cdc SELECT id, small_str, decimal_val FROM bench.bench_my_1m LIMIT 50000;"
+docker exec apitap-bench-pg-dst psql -U postgres -d apitap_bench_dst -Atc "DROP TABLE IF EXISTS pgo_cdc; DO \$\$ BEGIN IF to_regclass('_apitap_state') IS NOT NULL THEN DELETE FROM _apitap_state WHERE dest_table='pgo_cdc'; END IF; END \$\$;" >/dev/null
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$MY', 'postgresql://postgres:bench@127.0.0.1:5545/apitap_bench_dst', table='pgo_cdc', mode='log_based')"
+docker exec apitap-bench-my mysql -uroot -pbench -N -e "UPDATE bench.pgo_cdc SET d = d + 1 WHERE id <= 20000; DELETE FROM bench.pgo_cdc WHERE id > 45000;"
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$MY', 'postgresql://postgres:bench@127.0.0.1:5545/apitap_bench_dst', table='pgo_cdc', mode='log_based')"
+docker exec apitap-bench-pg-dst psql -U postgres -d apitap_bench_dst -Atc "DROP TABLE IF EXISTS pgo_cdc; DELETE FROM _apitap_state WHERE dest_table='pgo_cdc';" >/dev/null
+
 echo "== 3/3 merge + optimized build =="
 docker run --rm -v "$REPO":/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c \
     'rustup component add llvm-tools-preview >/dev/null 2>&1; \
