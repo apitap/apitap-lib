@@ -12,8 +12,9 @@
 //! AuthSwitch both ways. Anything else fails the canary connect and the
 //! read rides the sqlx lane instead — never a hard failure.
 //!
-//! Regular SQL (probe, spans, transfers) stays on sqlx; this type exists
-//! ONLY for read workers draining span SELECTs.
+//! Regular SQL (probe, control queries) stays on sqlx; this type carries
+//! the span-SELECT drains — the Arrow read workers and the transfer lanes'
+//! raw row pump — plus the binlog replication stream.
 
 use crate::error::{Error, Result};
 use sha1::Sha1;

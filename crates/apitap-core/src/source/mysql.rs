@@ -409,17 +409,19 @@ fn want(b: &[u8], w: usize, i: usize) -> Result<()> {
     Ok(())
 }
 
-/// Encode one column as RowBinary straight from the wire bytes. MySQL's binary
-/// protocol stores ints/floats little-endian fixed-width — exactly RowBinary's layout,
-/// so those are pure copies.
+/// Encode one column as RowBinary straight from the wire bytes (`cell` comes
+/// from sqlx's [`raw_cell`] or the raw plane's [`walk_raw_cells`] — same
+/// slices either way). MySQL's binary protocol stores ints/floats
+/// little-endian fixed-width — exactly RowBinary's layout, so those are pure
+/// copies.
 fn encode_value(
-    row: &MySqlRow,
+    cell: Option<&[u8]>,
     i: usize,
     ty: MyRb,
     nullable: bool,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let Some(b) = raw_cell(row, i)? else {
+    let Some(b) = cell else {
         if !nullable {
             return Err(Error::Transfer(format!("NULL in non-nullable column {i}")));
         }
@@ -467,8 +469,8 @@ fn encode_value(
 /// Encode one column as a Postgres binary-COPY field straight from the wire bytes
 /// (little-endian in, big-endian out). The staging table carries no NOT NULL
 /// constraints, so NULL is always legal.
-fn encode_pg(row: &MySqlRow, i: usize, enc: PgEnc, out: &mut Vec<u8>) -> Result<()> {
-    let Some(b) = raw_cell(row, i)? else {
+fn encode_pg(cell: Option<&[u8]>, i: usize, enc: PgEnc, out: &mut Vec<u8>) -> Result<()> {
+    let Some(b) = cell else {
         pgc::null_field(out);
         return Ok(());
     };
@@ -1090,16 +1092,51 @@ impl Source for MySqlSource {
             WireFormat::MyTsv => MyEnc::Tsv(plan.cols.iter().map(my_tsv).collect()),
             WireFormat::TabSeparated => unreachable!("can_produce refuses the PG text dialect for the MySQL source"),
         };
+        // Raw-plane canary, same dance as the Arrow lane: one probe connect
+        // decides, refused dialects (TLS-verify, exotic auth) ride sqlx, and
+        // APITAP_MY_RAW=0 forces the sqlx lane for A/B.
+        let wire: Option<std::sync::Arc<Vec<MyAr>>> =
+            if std::env::var("APITAP_MY_RAW").is_ok_and(|v| v == "0") {
+                None
+            } else {
+                match plan
+                    .cols
+                    .iter()
+                    .map(|c| my_ar(c).map(|(e, _)| e))
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Err(_) => None,
+                    Ok(w) => match MyWire::connect(&self.url).await {
+                        Ok(_) => Some(std::sync::Arc::new(w)),
+                        Err(e) => {
+                            if std::env::var_os("APITAP_DEBUG").is_some() {
+                                eprintln!("[apitap] mysql raw transfer plane declined: {e}");
+                            }
+                            None
+                        }
+                    },
+                }
+            };
         let queue = super::work_queue(stmts);
         let mut tasks = Vec::with_capacity(loaders.len());
         for loader in loaders {
-            tasks.push(tokio::spawn(row_worker(
-                self.pool.clone(),
-                queue.clone(),
-                enc.clone(),
-                loader,
-                chunk,
-            )));
+            tasks.push(match &wire {
+                Some(w) => tokio::spawn(raw_transfer_worker(
+                    self.url.clone(),
+                    queue.clone(),
+                    enc.clone(),
+                    w.clone(),
+                    loader,
+                    chunk,
+                )),
+                None => tokio::spawn(row_worker(
+                    self.pool.clone(),
+                    queue.clone(),
+                    enc.clone(),
+                    loader,
+                    chunk,
+                )),
+            });
         }
         let mut rows = 0u64;
         for t in tasks {
@@ -1161,7 +1198,8 @@ async fn row_worker<L: Loader>(
                 MyEnc::RowBinary(plan) => {
                     let mut r = Ok(());
                     for (i, (ty, nullable)) in plan.iter().enumerate() {
-                        r = encode_value(&row, i, *ty, *nullable, &mut out);
+                        r = raw_cell(&row, i)
+                            .and_then(|c| encode_value(c, i, *ty, *nullable, &mut out));
                         if r.is_err() {
                             break;
                         }
@@ -1197,7 +1235,7 @@ async fn row_worker<L: Loader>(
                     pgc::tuple_start(plan.len(), &mut out);
                     let mut r = Ok(());
                     for (i, e) in plan.iter().enumerate() {
-                        r = encode_pg(&row, i, *e, &mut out);
+                        r = raw_cell(&row, i).and_then(|c| encode_pg(c, i, *e, &mut out));
                         if r.is_err() {
                             break;
                         }
@@ -1240,6 +1278,129 @@ async fn row_worker<L: Loader>(
     if dbg {
         eprintln!(
             "[my worker] fetch(wire+parse)={:.1}s encode(cpu)={:.1}s send(backpressure)={:.1}s",
+            t_fetch.as_secs_f64(),
+            t_enc.as_secs_f64(),
+            t_send.as_secs_f64()
+        );
+    }
+    loader.finish().await
+}
+
+/// [`row_worker`]'s raw-plane twin: own TCP connection, prepared span
+/// SELECTs, row payloads walked in place off the socket buffer straight into
+/// the lane encoders — sqlx's per-row machinery (BinaryRow allocation,
+/// async-stream yields, tracing spans) is gone. Wire slices are identical to
+/// what [`raw_cell`] hands over, so the encoders don't know which plane fed
+/// them.
+async fn raw_transfer_worker<L: Loader>(
+    url: std::sync::Arc<str>,
+    queue: WorkQueue,
+    enc: MyEnc,
+    wire: std::sync::Arc<Vec<MyAr>>,
+    mut loader: L,
+    chunk: usize,
+) -> Result<u64> {
+    let dbg = std::env::var("APITAP_DEBUG").is_ok();
+    let (mut t_fetch, mut t_enc, mut t_send) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
+    if let MyEnc::PgCopy(_) = &enc {
+        pgc::header(&mut out);
+    }
+    let mut w = match MyWire::connect(&url).await {
+        Ok(w) => w,
+        Err(e) => return Err(loader.abort(e).await),
+    };
+    while let Some(sql) = pop(&queue) {
+        let (sid, ncols) = match w.prepare(&sql).await {
+            Ok(v) => v,
+            Err(e) => return Err(loader.abort(e).await),
+        };
+        if ncols != wire.len() {
+            return Err(loader
+                .abort(Error::Transfer(format!(
+                    "mysql wire: span returned {ncols} columns, planned {}",
+                    wire.len()
+                )))
+                .await);
+        }
+        if let Err(e) = w.execute(sid).await {
+            return Err(loader.abort(e).await);
+        }
+        loop {
+            let tf = dbg.then(std::time::Instant::now);
+            let row = match w.next_row().await {
+                Ok(r) => r,
+                Err(e) => return Err(loader.abort(e).await),
+            };
+            if let Some(tf) = tf {
+                t_fetch += tf.elapsed();
+            }
+            let Some(p) = row else { break };
+            let te = dbg.then(std::time::Instant::now);
+            let step = match &enc {
+                MyEnc::RowBinary(plan) => walk_raw_cells(p, &wire, |i, c| {
+                    encode_value(c, i, plan[i].0, plan[i].1, &mut out)
+                }),
+                MyEnc::Tsv(encs) => {
+                    let r = walk_raw_cells(p, &wire, |i, c| {
+                        if i > 0 {
+                            out.push(b'\t');
+                        }
+                        match c {
+                            None => {
+                                out.extend_from_slice(b"\\N");
+                                Ok(())
+                            }
+                            Some(b) => tsv_write(encs[i], b, &mut out),
+                        }
+                    });
+                    if r.is_ok() {
+                        out.push(b'\n');
+                    }
+                    r
+                }
+                MyEnc::PgCopy(plan) => {
+                    pgc::tuple_start(plan.len(), &mut out);
+                    walk_raw_cells(p, &wire, |i, c| encode_pg(c, i, plan[i], &mut out))
+                }
+            };
+            if let Some(te) = te {
+                t_enc += te.elapsed();
+            }
+            if let Err(e) = step {
+                return Err(loader.abort(e).await);
+            }
+            if out.len() >= chunk {
+                let full = std::mem::replace(
+                    &mut out,
+                    loader
+                        .reclaim()
+                        .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024)),
+                );
+                let ts = std::time::Instant::now();
+                loader.send(full).await?;
+                if dbg {
+                    t_send += ts.elapsed();
+                }
+            }
+        }
+        if let Err(e) = w.stmt_close(sid).await {
+            return Err(loader.abort(e).await);
+        }
+    }
+    if let MyEnc::PgCopy(_) = &enc {
+        pgc::trailer(&mut out);
+    }
+    if !out.is_empty() {
+        loader.send(out).await?;
+    }
+    if dbg {
+        eprintln!(
+            "[my raw transfer] fetch(wire)={:.1}s encode(cpu)={:.1}s send(backpressure)={:.1}s",
             t_fetch.as_secs_f64(),
             t_enc.as_secs_f64(),
             t_send.as_secs_f64()
@@ -1317,12 +1478,17 @@ impl MySqlSource {
     }
 }
 
-/// Walk one raw binary-protocol row payload straight into the builder.
-/// Layout: 0x00 header, NULL bitmap with a 2-bit offset, then values in
-/// column order — fixed little-endian for ints/floats, `[len][fields]` for
-/// temporals, length-encoded bytes for the rest: exactly what [`ar_cell`]
-/// already decodes, minus sqlx's per-row machinery around it.
-fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
+/// Walk one raw binary-protocol row payload, handing each column's wire
+/// bytes (`None` for NULL) to `cell` in column order. Layout: 0x00 header,
+/// NULL bitmap with a 2-bit offset, then values — fixed little-endian for
+/// ints/floats, `[len][fields]` for temporals, length-encoded bytes for the
+/// rest. The slices match what sqlx's [`raw_cell`] hands the encoders
+/// (temporals keep their length byte, varlen values lose their prefix), so
+/// the Arrow lane and the transfer lanes share this one frame.
+fn walk_raw_cells<F>(p: &[u8], encs: &[MyAr], mut cell: F) -> Result<()>
+where
+    F: FnMut(usize, Option<&[u8]>) -> Result<()>,
+{
     #[inline]
     fn take<'a>(p: &'a [u8], pos: usize, n: usize) -> Result<&'a [u8]> {
         p.get(pos..pos + n)
@@ -1335,10 +1501,10 @@ fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
     for (i, enc) in encs.iter().enumerate() {
         let bit = i + 2;
         if bm[bit / 8] & (1 << (bit % 8)) != 0 {
-            bb.append_cell(i, CellVal::Null);
+            cell(i, None)?;
             continue;
         }
-        let cell = match enc {
+        let b = match enc {
             MyAr::I8 | MyAr::U8 => take(p, pos, 1)?,
             MyAr::I16 | MyAr::U16 | MyAr::Year => take(p, pos, 2)?,
             MyAr::I32 | MyAr::U32 | MyAr::F32 => take(p, pos, 4)?,
@@ -1357,10 +1523,25 @@ fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
                 b
             }
         };
-        bb.append_cell(i, ar_cell(cell, *enc)?);
-        pos += cell.len();
+        cell(i, Some(b))?;
+        pos += b.len();
     }
     Ok(())
+}
+
+/// Walk one raw row payload straight into the Arrow builder — the read
+/// lane's binding of [`walk_raw_cells`].
+fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
+    walk_raw_cells(p, encs, |i, c| match c {
+        None => {
+            bb.append_cell(i, CellVal::Null);
+            Ok(())
+        }
+        Some(b) => {
+            bb.append_cell(i, ar_cell(b, encs[i])?);
+            Ok(())
+        }
+    })
 }
 
 /// One raw-plane worker: own TCP connection, prepared span SELECTs, rows

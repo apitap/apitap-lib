@@ -272,3 +272,17 @@ all six TCP streams flowing; an 8K-row synchronous walk starves the other
 five sockets until the server's send windows close. The per-packet plane is
 the right shape for this concurrency — do not re-window it without new
 evidence.
+
+**Knife 3 — KEPT: the transfer lanes ride MyWire.** The mysql→* transfer
+row pump left sqlx (BinaryRow allocation + async-stream + tracing per row)
+for the same per-packet plane the Arrow readers use: one shared
+`walk_raw_cells` frame walks each binary row payload and hands the encoders
+the exact slices sqlx's `raw_cell` handed them, so `encode_value`/
+`encode_pg`/`tsv_write` cannot tell which plane fed them. Canary connect +
+`APITAP_MY_RAW=0` keep the sqlx lane as the fallback and the A/B hatch.
+Receipts (interleaved @0.5cpu/256MB, ClickHouse per-column checksums exact):
+**my→ch 11.8M 48.3 s → 27.5 s median (−43%)**; my→my flat-to-better
+(15.8 → 14.9 s mean, LOAD DATA dest-bound); my→pg control 4.8 → 3.5 s;
+host my→ch flat (13.3 vs 13.5 s — server-bound there, as the profile
+predicted). Peak RSS on the winning route +25–35 MB (89–102 → 120–134 MB),
+half the 256 MB cap — paid for a 1.75× throughput jump.
