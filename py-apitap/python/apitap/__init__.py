@@ -383,6 +383,16 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
                 if "\x00" in x or "\\" in x:
                     raise ValueError("unsafe byte in literal")
                 return "'" + x.replace("'", "''") + "'", True, False
+            if t == "Date":
+                # Days since the epoch — both dialects take DATE 'Y-M-D', and
+                # a DATE column compares to it with identical ordering on
+                # either side of the wire (no collation, no timezone).
+                if isinstance(x, bool) or not isinstance(x, int):
+                    raise ValueError("non-int date payload")
+                import datetime
+
+                d = datetime.date(1970, 1, 1) + datetime.timedelta(days=x)
+                return "DATE '" + d.isoformat() + "'", False, False
         raise ValueError(f"literal {v!r}")
 
     def walk(n):

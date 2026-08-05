@@ -67,7 +67,29 @@ pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
 
 
 /// The container/cgroup memory limit, if one is set (v2 `memory.max`, v1 fallback).
+///
+/// `APITAP_MEM_BUDGET` overrides it for containers this engine SHARES with a
+/// hungry consumer — a polars sink, an embedded engine. The auto-sizing here
+/// spends the whole limit on batches and pipes, so on a shared box the cgroup
+/// number is the machine's budget, not ours: measured on the TPC-H lake demo,
+/// `read().lazy().sink_parquet()` in a 256 MB container is OOM-killed at the
+/// cgroup-derived size (and still is at 384 MB, since the batches grow with
+/// the box), and lands cleanly with `APITAP_MEM_BUDGET=96M`. Plain bytes, or
+/// an `M`/`G` suffix.
 pub(crate) fn mem_limit_bytes() -> Option<u64> {
+    if let Ok(s) = std::env::var("APITAP_MEM_BUDGET") {
+        let s = s.trim();
+        let (num, mult) = match s.chars().last() {
+            Some('M') | Some('m') => (&s[..s.len() - 1], 1 << 20),
+            Some('G') | Some('g') => (&s[..s.len() - 1], 1 << 30),
+            _ => (s, 1),
+        };
+        if let Ok(n) = num.trim().parse::<u64>() {
+            if n > 0 {
+                return Some(n.saturating_mul(mult));
+            }
+        }
+    }
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
         let s = s.trim();
         if s != "max" {
