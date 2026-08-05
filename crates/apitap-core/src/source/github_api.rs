@@ -744,6 +744,7 @@ impl Source for GithubApiSource {
         Lane {
             format,
             raw_frames: false,
+            push_where: None,
             cols: plan
                 .cols
                 .iter()

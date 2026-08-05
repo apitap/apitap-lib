@@ -130,6 +130,11 @@ pub(crate) struct Lane {
     /// The Arrow read path sets this — its builder walks spans natively, so
     /// the strip-and-recopy stage would be a pure memcpy tax.
     pub raw_frames: bool,
+    /// Pushed-down query predicate, ANDed into every span statement
+    /// (including min/max probes — it only narrows the ranges). Set by the
+    /// read path from [`crate::ReadOptions::push_where`]; transfers leave it
+    /// `None`.
+    pub push_where: Option<String>,
 }
 
 /// Incremental delta filter, pushed into every source read statement (the min/max

@@ -28,6 +28,12 @@ pub struct ReadOptions {
     /// a huge value = the materialize fast path (each worker builds ONE
     /// giant batch — fewer FFI crossings, no consumer-side rechunk).
     pub batch_bytes: Option<usize>,
+    /// SQL predicate ANDed into every span statement — the lazy plugin's
+    /// FILTER pushdown. The server filters, so the wire and the decoders
+    /// only carry survivors. Rendered by the trusted dialect-aware
+    /// translator, never raw user text; the client-side filter still runs,
+    /// so this is bandwidth, never correctness.
+    pub push_where: Option<String>,
 }
 
 /// One column of the result schema.

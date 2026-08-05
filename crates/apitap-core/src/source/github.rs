@@ -420,6 +420,7 @@ impl Source for GithubSource {
         Lane {
             format,
             raw_frames: false,
+            push_where: None,
             cols: plan
                 .cols
                 .iter()

@@ -203,11 +203,32 @@ class Reader:
             {name: dtype(tag) for name, tag, _ in _read_schema(src, table)}
         )
 
+        str_cols = {
+            n for n, dt in schema.items() if dt in (pl.String, pl.Binary)
+        }
+        float_cols = {
+            n for n, dt in schema.items() if dt in (pl.Float32, pl.Float64)
+        }
+        is_my = src.split("://", 1)[0].lower().startswith("mysql")
+
         def source(with_columns, predicate, n_rows, batch_size):
             import pyarrow as pa
             cols = list(with_columns) if with_columns is not None else None
+            # FILTER pushdown: a conservative subset of the predicate is
+            # rendered as SQL and ANDed into every span statement — the
+            # server filters, so the wire and the decoders only carry
+            # survivors. The polars filter below still runs on whatever
+            # arrives: the pushdown is bandwidth, never correctness.
+            where = (
+                _predicate_sql(
+                    predicate, set(schema.names()), str_cols, float_cols, is_my
+                )
+                if predicate is not None
+                else None
+            )
             native = _read(src, table, cursor=cursor, parallel=parallel,
-                           query=query, materialize=False, columns=cols)
+                           query=query, materialize=False, columns=cols,
+                           push_where=where)
             taken = 0
             # The engine emits exactly the requested columns in the
             # requested order — no per-batch select needed.
@@ -288,6 +309,130 @@ class Reader:
             if buf:
                 flush()
         return rows
+
+
+def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
+    """Render a polars predicate as a SQL WHERE fragment, or None.
+
+    Only a conservative subset crosses the wire: arithmetic (+ - * %) and
+    comparisons over non-string columns, equality/inequality on strings
+    (range comparisons on text differ between server collations and
+    polars byte order), AND/OR, boolean and numeric literals. Casts are
+    elided only around literals (polars' automatic widening) — a cast over
+    a COLUMN changes values and must not be dropped. `!=` between two
+    float subtrees is refused (Postgres defines NaN = NaN as true; IEEE
+    says false). Backslashes in string literals are refused (their meaning
+    depends on server escape modes this session never pinned). Column
+    names must exist in the schema; anything else — including any
+    surprise in the serialized expression tree, which is not a stable
+    format across polars versions — returns None and the filter simply
+    stays client-side. The client-side filter runs regardless, so this
+    function is a bandwidth optimization and never a correctness
+    dependency.
+    """
+    import json
+
+    try:
+        raw = predicate.meta.serialize(format="json")
+        ir = json.loads(raw)
+    except Exception:
+        return None
+
+    CMP = {"Eq": "=", "NotEq": "<>", "Lt": "<", "LtEq": "<=",
+           "Gt": ">", "GtEq": ">="}
+    STR_OK = {"Eq", "NotEq"}
+    ARITH = {"Plus": "+", "Minus": "-", "Multiply": "*", "Modulus": "%"}
+    LOGIC = {"And": "AND", "Or": "OR", "LogicalAnd": "AND", "LogicalOr": "OR"}
+    INT_T = {"Int", "Int8", "Int16", "Int32", "Int64",
+             "UInt8", "UInt16", "UInt32", "UInt64"}
+    FLOAT_T = {"Float", "Float32", "Float64"}
+
+    def quote(name):
+        if is_my:
+            return "`" + name.replace("`", "``") + "`"
+        return '"' + name.replace('"', '""') + '"'
+
+    def lit(v):
+        # -> (sql, stringy, floaty)
+        if isinstance(v, dict) and len(v) == 1:
+            (t, x), = v.items()
+            if t in ("Dyn", "Scalar"):
+                return lit(x)
+            if t in INT_T:
+                if isinstance(x, bool) or not isinstance(x, int):
+                    raise ValueError("non-int payload")
+                return str(x), False, False
+            if t in FLOAT_T:
+                if not isinstance(x, (int, float)) or isinstance(x, bool):
+                    raise ValueError("non-float payload")
+                f = float(x)
+                if f != f or f in (float("inf"), float("-inf")):
+                    raise ValueError("non-finite literal")
+                return repr(f), False, True
+            if t == "Boolean":
+                if not isinstance(x, bool):
+                    raise ValueError("non-bool payload")
+                return ("TRUE" if x else "FALSE"), False, False
+            if t in ("String", "StrOwned", "Str"):
+                if not isinstance(x, str):
+                    raise ValueError("non-str payload")
+                if "\x00" in x or "\\" in x:
+                    raise ValueError("unsafe byte in literal")
+                return "'" + x.replace("'", "''") + "'", True, False
+        raise ValueError(f"literal {v!r}")
+
+    def walk(n):
+        # -> (sql, stringy, floaty)
+        if not isinstance(n, dict) or len(n) != 1:
+            raise ValueError(f"node {n!r}")
+        (k, v), = n.items()
+        if k == "Column":
+            name = v if isinstance(v, str) else v.get("name")
+            if name not in allowed:
+                raise ValueError(f"unknown column {name!r}")
+            return quote(name), name in str_cols, name in float_cols
+        if k == "Literal":
+            return lit(v)
+        if k == "Cast":
+            # Elide ONLY the widening casts polars wraps around literals.
+            # A cast over a column changes the values being compared —
+            # dropping it would make the server filter on different data
+            # than polars sees (rows lost silently, the client filter
+            # cannot resurrect what never arrived).
+            inner = v.get("expr")
+            if not (isinstance(inner, dict) and set(inner) == {"Literal"}):
+                raise ValueError("cast over non-literal")
+            dt = json.dumps(v.get("dtype", ""))
+            if not any(t in dt for t in ("Int", "Float", "UInt")):
+                raise ValueError("non-numeric cast")
+            return walk(inner)
+        if k == "BinaryExpr":
+            op = v["op"]
+            if not isinstance(op, str):
+                raise ValueError(f"op shape {op!r}")
+            left, ls, lf = walk(v["left"])
+            right, rs, rf = walk(v["right"])
+            floaty = lf or rf
+            if op in LOGIC:
+                return f"({left} {LOGIC[op]} {right})", False, False
+            if op in CMP:
+                if (ls or rs) and op not in STR_OK:
+                    raise ValueError("string range comparison")
+                if op == "NotEq" and lf and rf:
+                    raise ValueError("float != float (NaN semantics differ)")
+                return f"({left} {CMP[op]} {right})", False, False
+            if op in ARITH:
+                if ls or rs:
+                    raise ValueError("string arithmetic")
+                return f"({left} {ARITH[op]} {right})", False, floaty
+            raise ValueError(f"op {op!r}")
+        raise ValueError(f"node kind {k!r}")
+
+    try:
+        sql, stringy, _ = walk(ir)
+        return None if stringy else sql
+    except Exception:
+        return None
 
 
 def read(

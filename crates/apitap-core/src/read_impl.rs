@@ -184,6 +184,11 @@ async fn plan_read<S: Source>(
         // plain (chunk-boundary-safe) push path.
         lane.raw_frames = true;
     }
+    // Predicate pushdown (the lazy plugin's filter): every span statement
+    // gains an AND, so the server filters and the decoders only see
+    // survivors. The client-side filter still runs — bandwidth, never
+    // correctness.
+    lane.push_where = opts.push_where.clone();
 
     // Column projection (the lazy plugin pushes polars' with_columns here):
     // the SELECT list narrows, so the server serializes and this side decodes

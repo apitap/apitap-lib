@@ -338,7 +338,7 @@ impl Source for PgSource {
                 }
             })
             .collect();
-        Lane { format, cols, raw_frames: false }
+        Lane { format, cols, raw_frames: false, push_where: None }
     }
 
     async fn span_stmts(
@@ -363,10 +363,19 @@ impl Source for PgSource {
             }
         };
         // Incremental predicate — appended to EVERY statement in this fn, including
-        // the min/max probe and the ctid fallback.
-        let dpred = delta
+        // the min/max probe and the ctid fallback. The pushed-down query
+        // predicate (lazy filter) joins it on the SPAN statements only: in
+        // the min/max probe it would kill the index min/max shortcut and
+        // cost a full scan before the first row flows (measured: +10s on a
+        // 10M MySQL leg). The unfiltered range is a superset — the spans
+        // themselves still filter, so correctness is untouched.
+        let dprobe = delta
             .map(|d| format!(" AND {} {} {}", quote_ident(&d.col), d.op, d.literal))
             .unwrap_or_default();
+        let mut dpred = dprobe.clone();
+        if let Some(w) = &lane.push_where {
+            dpred.push_str(&format!(" AND ({w})"));
+        }
 
         // Span strategy, in measured order of preference: integer-cursor ranges (index
         // scan on a correlated PK beat TID ranges by ~4% at 16 pipes), then CTID page
@@ -385,7 +394,7 @@ impl Source for PgSource {
                 let qcol = quote_ident(col);
                 let (lo, hi): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
                     "SELECT min({qcol})::int8, max({qcol})::int8 FROM {src_t} \
-                     WHERE true{dpred}"
+                     WHERE true{dprobe}"
                 ))
                 .fetch_one(&self.pool)
                 .await
@@ -402,9 +411,11 @@ impl Source for PgSource {
                              TO STDOUT ({copy_opts})"
                         ));
                     }
-                } else if delta.is_some() {
-                    // Empty delta: no rows past the watermark. One statement that
-                    // reads nothing keeps the pipeline uniform.
+                } else if delta.is_some() || lane.push_where.is_some() {
+                    // Empty delta or a pushed predicate matching nothing: the
+                    // min/max probe already proved zero surviving rows, so one
+                    // statement that reads nothing keeps the pipeline uniform
+                    // (instead of a full scan that returns nothing).
                     stmts.push(format!(
                         "COPY (SELECT {select_list} FROM {src_t} WHERE false) \
                          TO STDOUT ({copy_opts})"

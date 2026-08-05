@@ -1002,7 +1002,7 @@ impl Source for MySqlSource {
                 LaneCol { delivered, select }
             })
             .collect();
-        Lane { format, cols, raw_frames: false }
+        Lane { format, cols, raw_frames: false, push_where: None }
     }
 
     async fn span_stmts(
@@ -1021,9 +1021,16 @@ impl Source for MySqlSource {
             .collect::<Vec<_>>()
             .join(", ");
         // Incremental predicate — pushed into every statement, min/max probe included.
-        let dpred = delta
+        let dprobe = delta
             .map(|d| format!(" AND {} {} {}", my_ident(&d.col), d.op, d.literal))
             .unwrap_or_default();
+        // Pushed-down query predicate (lazy filter) — span statements only:
+        // in the min/max probe it kills the index shortcut and costs a
+        // single-threaded full scan up front (measured +10s on 10M rows).
+        let mut dpred = dprobe.clone();
+        if let Some(w) = &lane.push_where {
+            dpred.push_str(&format!(" AND ({w})"));
+        }
         // Integer cursors range-split; timestamp cursors (valid for incremental
         // watermarks) fall through to a single filtered stream.
         let int_cursor = plan.cursor.as_deref().and_then(|c| {
@@ -1043,7 +1050,7 @@ impl Source for MySqlSource {
             if let Some(col) = &int_cursor {
                 let qcol = my_ident(col);
                 let (lo, hi): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
-                    "SELECT MIN({qcol}), MAX({qcol}) FROM {src_t} WHERE true{dpred}"
+                    "SELECT MIN({qcol}), MAX({qcol}) FROM {src_t} WHERE true{dprobe}"
                 ))
                 .fetch_one(&self.pool)
                 .await
@@ -1055,7 +1062,9 @@ impl Source for MySqlSource {
                              WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}"
                         ));
                     }
-                } else if delta.is_some() {
+                } else if delta.is_some() || lane.push_where.is_some() {
+                    // min/max proved zero surviving rows — read nothing
+                    // instead of a full scan that returns nothing.
                     stmts.push(format!("SELECT {select_list} FROM {src_t} WHERE false"));
                 }
             }
