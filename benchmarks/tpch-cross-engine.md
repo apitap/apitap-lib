@@ -61,10 +61,32 @@ parts = [pl.scan_parquet(f"/land/lineitem_buckets/bucket={k}/*.parquet")
 
 **Independent truth** — DuckDB answering the same question from the raw
 `dbgen` CSVs, 16 cores, no memory cap: **20.3 s**, and every digit matches
-(`8.911096e+09 / 245169`, …). The point is not that half a core beats 16;
-DuckDB starts from local files and finishes the whole thing in 20 s. The
-point is that the same answer, to the digit, came out of **two live
-databases through a 256 MB box**.
+(`8.911096e+09 / 245169`, …).
+
+DuckDB can also skip the lake entirely: its `postgres` and `mysql`
+extensions `ATTACH` both live databases and join them in one statement. So
+the fair scoreboard, same question, identical answer on every row:
+
+| approach | cores | RAM | wall |
+|---|---|---|---|
+| apitap + polars pipeline (land → bucket → join) | 0.5 | 256 MB | **74.5 s** |
+| DuckDB, ATTACH both live databases | 0.5 | 256 MB | 146.0 s |
+| DuckDB, ATTACH both live databases | 16 | unlimited | 77.1 s |
+| DuckDB, raw local CSVs (no databases) | 16 | unlimited | 20.3 s |
+
+Three honest readings. **(1)** In the same cage we are ~2× faster, and the
+difference is all in the extraction path — the filters run in the servers
+and the wire carries only survivors. **(2)** DuckDB on 16 cores (77.1 s)
+ties our half core (74.5 s): the wall is the wire and the source servers,
+not compute, so 32× the CPU buys almost nothing. **(3)** The 20.3 s row is
+a different game — the data is already local files; that is the floor once
+extraction is somebody else's problem. Credit where it is due: DuckDB's
+join survives 256 MB where polars' needs 1.4 GB, which is why the lake here
+is bucketed.
+
+And the pipeline leaves something behind: a reusable 224 MB bucketed lake.
+The second question costs stage 2 only — **19.5 s** — where the direct join
+pulls all 100M rows across the wire again.
 
 Filter selectivity, for scale: 49.5M lineitem rows → 26,678,288 survive the
 ship-date filter; 49.5M orders → 24,049,698 survive the order-date filter;
