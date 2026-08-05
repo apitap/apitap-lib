@@ -185,7 +185,12 @@ client — binary-protocol rows decode straight off the socket into the
 column builders (no driver, no per-row allocations).
 `.lazy()` registers the stream as a polars scan and pushes the query's
 COLUMN PROJECTION all the way into the SQL: a query touching 2 of 15
-columns makes the server serialize and this side decode only those 2 — the
+columns makes the server serialize and this side decode only those 2 — and
+as of 0.26, the FILTER pushes too: a conservative subset of the predicate
+(arithmetic, comparisons, AND/OR) becomes a SQL `WHERE`, so the server
+skips serializing rows the query was going to drop (a 50M-row `%3` filter
++ group_by fell from 11.9 s to **7.0 s** on half a core; anything the
+translator can't prove safe simply stays a client-side filter). The
 compute itself (filter/group/join) stays in polars, and no loop ever
 appears in your code. Typed end to end (int16/32/64, float32/64, bool,
 decimal128, date32, timestamp µs, utf8, binary); uuid/jsonb/exotics

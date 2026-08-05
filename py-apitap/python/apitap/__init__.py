@@ -167,8 +167,12 @@ class Reader:
         Ten million rows aggregate in a 256 MB container this way — the full
         DataFrame never exists. The query's COLUMN PROJECTION is pushed all
         the way into the SQL: a query touching 2 of 15 columns makes the
-        server serialize and this side decode only those 2. Predicates
-        and head() prune per batch. One-shot: collect once.
+        server serialize and this side decode only those 2. The FILTER
+        pushes too when a conservative SQL translation exists (arithmetic,
+        comparisons, AND/OR — see ``_predicate_sql``): the server then
+        skips serializing the dropped rows entirely. Predicates always
+        re-run client-side, and head() prunes per batch. One-shot: collect
+        once.
         """
         try:
             import polars as pl
