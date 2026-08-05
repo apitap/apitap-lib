@@ -8,5 +8,7 @@ pub(crate) mod dest_ice;
 pub(crate) mod dest_my;
 pub(crate) mod dest_pg;
 pub(crate) mod drain;
+pub(crate) mod myrun;
+pub(crate) mod mysource;
 pub(crate) mod rowtext;
 pub(crate) mod run;

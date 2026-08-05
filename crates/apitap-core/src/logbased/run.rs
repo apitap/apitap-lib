@@ -84,6 +84,27 @@ impl Dest {
         }
     }
 
+    /// Apply for sources that carry no Postgres pool (the MySQL binlog
+    /// path). Iceberg is refused at the gate, so the three engines that
+    /// need nothing from the source are all that reach this.
+    async fn apply_no_src(
+        &self,
+        dest_table: &str,
+        qualified_src: &str,
+        pk_cols: &[String],
+        outcome: &DrainOutcome,
+        source_id: &str,
+    ) -> Result<u64> {
+        match self {
+            Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::My(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::Ice(_) => Err(Error::InvalidInput(
+                "log_based: iceberg needs a Postgres source in this release".into(),
+            )),
+        }
+    }
+
     async fn apply(
         &self,
         dest_table: &str,
@@ -201,10 +222,15 @@ async fn run_group(
     if tables.is_empty() {
         return Err(Error::InvalidInput("tables list is empty".into()));
     }
+    if scheme(src_url) == "mysql" {
+        return run_group_mysql(src_url, dst_url, tables, opts).await;
+    }
     if !matches!(scheme(src_url), "postgres" | "postgresql") {
-        return Err(Error::InvalidInput(
-            "log_based needs a Postgres source (logical replication)".into(),
-        ));
+        return Err(Error::InvalidInput(format!(
+            "log_based needs a Postgres source (logical replication) or a \
+             MySQL source (binlog) — got '{}'",
+            scheme(src_url)
+        )));
     }
     let dest = Dest::connect(dst_url).await?;
 
@@ -306,6 +332,122 @@ async fn run_group(
 }
 
 // ── first run: one slot, every table pinned to its snapshot ─────────────────
+
+// ── MySQL source: same shape, binlog instead of a slot ─────────────────────
+
+/// `mode="log_based"` from MySQL. Bootstrap = coordinate-then-full-load
+/// (the overlap is safe because every apply is idempotent by PK); later
+/// runs stream the binlog in windows and apply each one with its watermark.
+async fn run_group_mysql(
+    src_url: &str,
+    dst_url: &str,
+    tables: &[String],
+    opts: &TransferOptions,
+) -> Result<Vec<(u64, usize)>> {
+    use crate::logbased::myrun;
+
+    let dest = Dest::connect(dst_url).await?;
+    if matches!(dest, Dest::Ice(_)) {
+        return Err(Error::InvalidInput(
+            "log_based: mysql → iceberg lands next — postgres, clickhouse and \
+             mysql destinations work today"
+                .into(),
+        ));
+    }
+    let pool = myrun::control_pool(src_url).await?;
+    let default_db = src_url
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.split('?').next())
+        .unwrap_or("")
+        .to_string();
+    let single = tables.len() == 1;
+    let ctxs = myrun::resolve(&pool, &default_db, tables, single, opts).await?;
+
+    // State arbitration mirrors the Postgres path: all-absent bootstraps,
+    // all-present drains, a mix is a torn group.
+    let mut marks = Vec::with_capacity(ctxs.len());
+    for c in &ctxs {
+        marks.push(dest.read_state(&c.dest_table, &c.source_id).await?);
+    }
+    let present = marks.iter().filter(|m| m.is_some()).count();
+    if present != 0 && present != marks.len() {
+        let missing: Vec<&str> = ctxs
+            .iter()
+            .zip(&marks)
+            .filter(|(_, m)| m.is_none())
+            .map(|(c, _)| c.qualified.as_str())
+            .collect();
+        return Err(Error::Transfer(format!(
+            "log_based: torn group — these members have no watermark: {}. \
+             Clear the group's state rows to re-bootstrap all of them",
+            missing.join(", ")
+        )));
+    }
+
+    if present == 0 {
+        let su = src_url.to_string();
+        let du = dst_url.to_string();
+        let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, o2| {
+            let su = su.clone();
+            let du = du.clone();
+            async move {
+                let r = Box::pin(crate::transfer(&su, &du, &table_arg, &o2)).await?;
+                Ok((r.rows, r.parallel))
+            }
+        })
+        .await?;
+        for (c, (rows, _)) in ctxs.iter().zip(&out) {
+            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows)
+                .await?;
+        }
+        return Ok(out);
+    }
+
+    // Drain from the group minimum — members ahead converge idempotently.
+    let wm = marks.iter().flatten().copied().min().unwrap_or(0);
+    let seed = ctxs
+        .iter()
+        .map(|c| c.source_id.as_str())
+        .collect::<Vec<_>>()
+        .join("\x1e");
+    let budget = (window_budget() / 2).clamp(1 << 20, 24 << 20);
+    let dbg = std::env::var("APITAP_DEBUG").is_ok();
+    let rows_applied = std::cell::Cell::new(0u64);
+
+    myrun::drain_windows(
+        src_url,
+        &pool,
+        &ctxs,
+        wm,
+        &seed,
+        30,
+        budget,
+        |outcome| {
+            let dest = &dest;
+            let ctxs = &ctxs;
+            let rows_applied = &rows_applied;
+            async move {
+                let end = outcome.end_lsn;
+                for c in ctxs.iter() {
+                    // Every member applies — a table with no traffic in this
+                    // window still advances its watermark.
+                    let n = dest
+                        .apply_no_src(&c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id)
+                        .await?;
+                    rows_applied.set(rows_applied.get() + n);
+                }
+                if dbg {
+                    eprintln!("[my cdc] window applied → watermark {end}");
+                }
+                Ok(end)
+            }
+        },
+    )
+    .await?;
+
+    Ok(ctxs.iter().map(|_| (rows_applied.get(), 1)).collect())
+}
 
 async fn bootstrap_group(
     src_url: &str,
