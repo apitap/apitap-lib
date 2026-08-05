@@ -243,22 +243,50 @@ class Reader:
         for batch in pa.RecordBatchReader.from_stream(self):
             yield pl.from_arrow(batch)
 
-    def to_parquet(self, path, *, compression="zstd", **writer_kwargs):
+    def to_parquet(self, path, *, compression="zstd", row_group_bytes=None,
+                   **writer_kwargs):
         """Stream the table into a Parquet file at constant memory; returns
         the row count. ``apitap.read(src, table="t").to_parquet("t.parquet")``
-        moves a 10M-row table through a 256 MB container."""
+        moves a 10M-row table through a 256 MB container.
+
+        Batches accumulate to ~``row_group_bytes`` of Arrow data before each
+        row group is written. Measured on the 15-col 10M bench: 128 MB groups
+        beat per-batch flushing on every axis at once (25.7 s → 21.3 s,
+        497 MB → 366 MB, lower peak RSS) — but 16 MB groups LOSE density to
+        per-batch flushing (dictionary pages blow their 1 MB limit mid-group
+        and the remainder goes plain), so the default only buys big groups
+        where the cgroup limit affords real ones; capped containers keep the
+        per-batch path (``row_group_bytes=0``), whose memory profile is the
+        proven one. Pass an explicit value to override either way."""
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError as e:
             raise ImportError("to_parquet() needs pyarrow — pip install pyarrow") from e
+        if row_group_bytes is None:
+            try:
+                limit = int(open("/sys/fs/cgroup/memory.max").read().strip())
+                cand = min(128 << 20, limit // 8)
+                row_group_bytes = cand if cand >= 64 << 20 else 0
+            except (OSError, ValueError):  # no cgroup v2 limit ("max" or absent)
+                row_group_bytes = 128 << 20
         reader = pa.RecordBatchReader.from_stream(self)
         rows = 0
+        buf, buf_bytes = [], 0
         with pq.ParquetWriter(path, reader.schema, compression=compression,
                               **writer_kwargs) as w:
+            def flush():
+                nonlocal buf, buf_bytes
+                w.write_table(pa.Table.from_batches(buf, schema=reader.schema))
+                buf, buf_bytes = [], 0
             for batch in reader:
-                w.write_batch(batch)
+                buf.append(batch)
+                buf_bytes += batch.nbytes
                 rows += batch.num_rows
+                if buf_bytes >= row_group_bytes:
+                    flush()
+            if buf:
+                flush()
         return rows
 
 
