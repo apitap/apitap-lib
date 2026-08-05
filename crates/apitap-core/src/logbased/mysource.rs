@@ -72,6 +72,18 @@ pub(crate) async fn master_position(
 /// Refuse loudly the server settings that would silently corrupt a CDC
 /// stream, instead of decoding garbage.
 pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
+    // MariaDB's binlog dialect diverges (its own GTID events, capability
+    // vars) — refuse loudly instead of desyncing mid-stream.
+    let (ver,): (String,) = sqlx::query_as("SELECT VERSION()")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("probe version: {e}")))?;
+    if ver.to_lowercase().contains("mariadb") {
+        return Err(Error::InvalidInput(format!(
+            "log_based: {ver} is MariaDB — its binlog dialect differs from \
+             MySQL's and is not supported yet (MySQL 5.7/8.x works)"
+        )));
+    }
     let want = [
         ("log_bin", "ON", "binary logging is off — set log_bin=ON"),
         ("binlog_format", "ROW", "binlog_format must be ROW"),
