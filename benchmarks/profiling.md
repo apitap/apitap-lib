@@ -273,6 +273,20 @@ five sockets until the server's send windows close. The per-packet plane is
 the right shape for this concurrency — do not re-window it without new
 evidence.
 
+**Knife 4 — KEPT: lazy filter pushdown.** The lazy plane pushed only its
+projection; the predicate ran client-side, so a selective filter still paid
+full-table serialize + wire + decode. A conservative SQL translation of the
+predicate now joins the span statements (both dialects), with three
+verifier-caught traps encoded: casts elide only over literals (over a
+column = silent row loss), the min/max span probe stays unfiltered (with
+the predicate it full-scans before the first row — measured +10.4s on a
+10M MySQL leg), and anything surprising refuses into None with the
+client-side filter still running (pushdown is bandwidth, never
+correctness). Receipts @0.5cpu/256MB, results digit-exact: the 50M
+`% 3 == 0` group_by drops 12.0 s → 7.0 s; a 10M MySQL two-term filter
+4.1 s → 3.1 s with peak 100 → 64 MB; an untranslatable predicate stays
+flat (0.9 s / 0.9 s).
+
 **Knife 3 — KEPT: the transfer lanes ride MyWire.** The mysql→* transfer
 row pump left sqlx (BinaryRow allocation + async-stream + tracing per row)
 for the same per-packet plane the Arrow readers use: one shared
