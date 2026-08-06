@@ -153,13 +153,20 @@ impl ChDest {
         // is a plain bulk INSERT (same move as the pg apply).
         if !c.deletes.is_empty() || !c.upserts.is_empty() {
             let del = ch_ident(&format!("{dest_table}__apitap_cdc_del"));
-            self.ch.exec(&format!("DROP TABLE IF EXISTS {del}")).await?;
+            // The key table is created ONCE and truncated per window. The old
+            // DROP → CREATE → … → DROP cycle spent three HTTP round trips of
+            // pure ceremony on every window of every table, and at ~20k events
+            // per window that ceremony is a real slice of the apply: the whole
+            // window is only ~7 round trips. CREATE IF NOT EXISTS + TRUNCATE is
+            // two, and TRUNCATE leaves the same empty table the CREATE did, so
+            // a replayed window still sees exactly the state it expects.
             self.ch
                 .exec(&format!(
-                    "CREATE TABLE {del} ENGINE = MergeTree ORDER BY tuple() AS \
-                     SELECT {pklist} FROM {ft} WHERE 0"
+                    "CREATE TABLE IF NOT EXISTS {del} ENGINE = MergeTree \
+                     ORDER BY tuple() AS SELECT {pklist} FROM {ft} WHERE 0"
                 ))
                 .await?;
+            self.ch.exec(&format!("TRUNCATE TABLE {del}")).await?;
             let mut buf = Vec::with_capacity(1 << 20);
             for key in &c.deletes {
                 let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
@@ -180,7 +187,6 @@ impl ChDest {
                 format!("({pklist}) IN (SELECT {pklist} FROM {del})")
             };
             self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
-            self.ch.exec(&format!("DROP TABLE {del}")).await?;
         }
 
         if !c.upserts.is_empty() {
