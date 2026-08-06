@@ -99,7 +99,19 @@ pub(crate) struct RelationCol {
 pub(crate) enum Cell {
     Null,
     /// Text-format value bytes (UTF-8 by construction on the wire).
-    Text(Vec<u8>),
+    ///
+    /// `Bytes`, not `Vec<u8>`: one XLogData frame is one pgoutput message is
+    /// one row, so every cell is a refcounted slice of the frame the row
+    /// arrived in — a pointer bump instead of a heap allocation. A 15-column
+    /// row cost 15 mallocs and 15 frees before; it costs none now. At 1.35M
+    /// changes that is 22.5M allocation pairs removed. Measured motivation:
+    /// `perf` put ~40% of a capped drain's samples in the glibc malloc/free
+    /// region, and swapping in tcmalloc/jemalloc — which makes those
+    /// allocations cheap without removing them — won 6 rounds out of 6.
+    /// Every glibc tuning knob we tried (M_MMAP_THRESHOLD, M_TRIM_THRESHOLD
+    /// at two sizes, both together) was a wash or worse; see
+    /// benchmarks/cdc-apply-profile.md.
+    Text(bytes::Bytes),
     /// The column is TOASTed and UNCHANGED — its value was not shipped.
     /// Apply must not touch this column at the destination.
     UnchangedToast,
@@ -109,12 +121,16 @@ pub(crate) type Tuple = Vec<Cell>;
 
 struct Reader<'a> {
     b: &'a [u8],
+    /// The frame this reader is walking, kept so text cells can be carved out
+    /// of it as refcounted slices instead of copies. `b` stays a plain slice
+    /// so every other accessor is untouched.
+    src: &'a bytes::Bytes,
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Self { b, pos: 0 }
+    fn new(src: &'a bytes::Bytes) -> Self {
+        Self { b: &src[..], src, pos: 0 }
     }
     fn u8(&mut self) -> Result<u8> {
         let v = *self.b.get(self.pos).ok_or_else(short)?;
@@ -163,7 +179,13 @@ impl<'a> Reader<'a> {
                 b'u' => Cell::UnchangedToast,
                 b't' => {
                     let len = self.u32()? as usize;
-                    Cell::Text(self.take(len)?.to_vec())
+                    // `slice_ref` maps the borrowed run back onto the owning
+                    // Bytes with no copy. An empty value yields Bytes::new(),
+                    // which is still `Text`, not `Null` — that distinction is
+                    // load-bearing (see the module docs and the empty-string
+                    // test).
+                    let run = self.take(len)?;
+                    Cell::Text(self.src.slice_ref(run))
                 }
                 // 'b' (binary) can only appear if we asked for it — we don't.
                 other => {
@@ -186,7 +208,7 @@ fn short() -> Error {
 /// `in_stream`: between StreamStart and StreamStop, DML/Relation/Type
 /// messages carry a leading Int32 xid (proto v2) — strip it before the
 /// v1-shaped body.
-pub(crate) fn decode(payload: &[u8], in_stream: bool) -> Result<PgoMessage> {
+pub(crate) fn decode(payload: &bytes::Bytes, in_stream: bool) -> Result<PgoMessage> {
     let mut r = Reader::new(payload);
     let tag = r.u8()?;
     if in_stream && matches!(tag, b'R' | b'Y' | b'I' | b'U' | b'D' | b'T') {
@@ -327,8 +349,8 @@ pub(crate) fn lsn_from_string(s: &str) -> Result<u64> {
 mod tests {
     use super::*;
 
-    fn frame(parts: &[&[u8]]) -> Vec<u8> {
-        parts.concat()
+    fn frame(parts: &[&[u8]]) -> bytes::Bytes {
+        bytes::Bytes::from(parts.concat())
     }
 
     #[test]
@@ -389,7 +411,7 @@ mod tests {
             decode(&ins, false).unwrap(),
             PgoMessage::Insert {
                 rel_id: 42,
-                new: vec![Cell::Text(b"9".to_vec()), Cell::Null]
+                new: vec![Cell::Text(bytes::Bytes::from_static(b"9")), Cell::Null]
             }
         );
     }
@@ -415,7 +437,7 @@ mod tests {
         let PgoMessage::Update { old, new, .. } = decode(&upd, false).unwrap() else { panic!() };
         let old = old.unwrap();
         assert!(!old.full);
-        assert_eq!(old.tuple, vec![Cell::Text(b"9".to_vec())]);
+        assert_eq!(old.tuple, vec![Cell::Text(bytes::Bytes::from_static(b"9"))]);
         assert_eq!(new[1], Cell::UnchangedToast);
         // The empty string stays a VALUE, never Null.
         let ins = frame(&[
@@ -427,7 +449,7 @@ mod tests {
             &0u32.to_be_bytes(),
         ]);
         let PgoMessage::Insert { new, .. } = decode(&ins, false).unwrap() else { panic!() };
-        assert_eq!(new[0], Cell::Text(Vec::new()));
+        assert_eq!(new[0], Cell::Text(bytes::Bytes::new()));
         assert_ne!(new[0], Cell::Null);
     }
 

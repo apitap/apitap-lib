@@ -346,7 +346,7 @@ async fn refetch_masked(
                         let v: Option<String> = r.try_get(i).map_err(db_err)?;
                         *cell = match v {
                             None => Cell::Null,
-                            Some(s) => Cell::Text(s.into_bytes()),
+                            Some(s) => Cell::Text(bytes::Bytes::from(s)),
                         };
                     }
                 }
@@ -452,7 +452,7 @@ mod tests {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     fn t(s: &str) -> Cell {
-        Cell::Text(s.as_bytes().to_vec())
+        Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()))
     }
     fn key1(s: &str) -> Key {
         vec![s.as_bytes().to_vec()]

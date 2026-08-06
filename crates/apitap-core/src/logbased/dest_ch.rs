@@ -22,11 +22,26 @@ const STATE_CURSOR: &str = "_lsn";
 
 pub(crate) struct ChDest {
     ch: ChConn,
+    /// DDL this connection has already issued. `CREATE TABLE IF NOT EXISTS` is
+    /// idempotent but not free: it is a full HTTP round trip against a window
+    /// that only has ~7 of them, repeated for every window of every table. The
+    /// first window creates; the rest remember. A dropped-out-from-under-us
+    /// table would resurface as a loud error on the next statement, which is
+    /// the same failure the unconditional CREATE would have hidden.
+    ensured: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ChDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self { ch: ChConn::parse(url)? })
+        Ok(Self {
+            ch: ChConn::parse(url)?,
+            ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
+        })
+    }
+
+    /// True the FIRST time this connection is asked about `key`.
+    fn first_time(&self, key: &str) -> bool {
+        self.ensured.lock().unwrap().insert(key.to_string())
     }
 
     /// Default the created table's ORDER BY to the PK so the per-window
@@ -42,6 +57,9 @@ impl ChDest {
     }
 
     async fn ensure_state_table(&self) -> Result<()> {
+        if !self.first_time("\u{1}state") {
+            return Ok(());
+        }
         self.ch
             .exec(
                 "CREATE TABLE IF NOT EXISTS `_apitap_state` (\
@@ -153,13 +171,34 @@ impl ChDest {
         // is a plain bulk INSERT (same move as the pg apply).
         if !c.deletes.is_empty() || !c.upserts.is_empty() {
             let del = ch_ident(&format!("{dest_table}__apitap_cdc_del"));
-            self.ch.exec(&format!("DROP TABLE IF EXISTS {del}")).await?;
-            self.ch
-                .exec(&format!(
-                    "CREATE TABLE {del} ENGINE = MergeTree ORDER BY tuple() AS \
-                     SELECT {pklist} FROM {ft} WHERE 0"
-                ))
-                .await?;
+            // The key table is built ONCE per run and truncated per window. The
+            // old DROP → CREATE → … → DROP cycle spent three HTTP round trips of
+            // pure ceremony on every window of every table, and at ~20k events
+            // per window that ceremony is a real slice of the apply: the whole
+            // window is only ~7 round trips. TRUNCATE leaves the same empty
+            // table the CREATE did, so a replayed window still sees exactly the
+            // state it expects.
+            //
+            // The first-time path DROPs before creating rather than relying on
+            // IF NOT EXISTS. `AS SELECT {pklist} FROM {ft} WHERE 0` freezes the
+            // key table's COLUMN SET and TYPES at creation, and the per-window
+            // insert names its columns explicitly — so if the source primary key
+            // gains a column (or a PK column changes type), an inherited table
+            // from an earlier run would make every window fail forever with a
+            // ClickHouse error naming an internal table. The old per-window DROP
+            // healed that on the next window; memoizing the DDL took the healing
+            // away with it. One DROP per run restores it and still costs one
+            // round trip per run instead of three per window.
+            if self.first_time(&del) {
+                self.ch.exec(&format!("DROP TABLE IF EXISTS {del}")).await?;
+                self.ch
+                    .exec(&format!(
+                        "CREATE TABLE {del} ENGINE = MergeTree \
+                         ORDER BY tuple() AS SELECT {pklist} FROM {ft} WHERE 0"
+                    ))
+                    .await?;
+            }
+            self.ch.exec(&format!("TRUNCATE TABLE {del}")).await?;
             let mut buf = Vec::with_capacity(1 << 20);
             for key in &c.deletes {
                 let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
@@ -180,7 +219,6 @@ impl ChDest {
                 format!("({pklist}) IN (SELECT {pklist} FROM {del})")
             };
             self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
-            self.ch.exec(&format!("DROP TABLE {del}")).await?;
         }
 
         if !c.upserts.is_empty() {
@@ -242,7 +280,7 @@ impl ChDest {
                             // straight back out, no OID translation.
                             full[i] = match tsv_unescape(f) {
                                 None => Cell::Null,
-                                Some(v) => Cell::Text(v),
+                                Some(v) => Cell::Text(bytes::Bytes::from(v)),
                             };
                             // Mark: this cell must NOT be re-translated.
                         }

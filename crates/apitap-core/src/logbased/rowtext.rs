@@ -68,7 +68,7 @@ pub(crate) fn row_key_refs<'a>(row: &'a [Cell], pk_idx: &[usize]) -> Vec<&'a [u8
     pk_idx
         .iter()
         .map(|&i| match &row[i] {
-            Cell::Text(t) => t.as_slice(),
+            Cell::Text(t) => &t[..],
             _ => b"".as_slice(),
         })
         .collect()
