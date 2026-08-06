@@ -53,7 +53,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 |---|---|---|
 | Postgres | `postgres://` or `postgresql://` | standard DSN: `postgres://user:pass@host:5432/db` |
 | MySQL | `mysql://` | `mysql://user:pass@host:3306/db` — MySQL 8 negotiates TLS by default; on a trusted network add `?ssl-mode=disabled` (measured: −20% wall on a 10M-row transfer — the whole stream otherwise pays AES-GCM). |
-| ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. |
+| ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. Also works as a **source** into ClickHouse — see [ClickHouse source](#clickhouse-source-ch--ch). |
 | Google Sheets (source) | `gsheets://` | `gsheets://<spreadsheet_id>?credentials=/path/key.json` — the id from the sheet's URL. See [Google Sheets source](#google-sheets-source). |
 | GitHub (source) | `github://` | `github://<owner>/<repo>[/dir]?ref=main` — CSV files as tables. See [GitHub source](#github-source-csv-files-as-tables). |
 | GitHub API (source) | `github+api://` | `github+api://<owner>/<repo>` — issues, PRs, commits, stars … as typed tables. See [GitHub API source](#github-api-source-the-project-as-tables). |
@@ -139,9 +139,35 @@ prefer NOT NULL columns).
 
 ## The route matrix
 
-Every source reaches every destination — all 25 pairs, enforced by a
-completeness test (`cargo test` fails on any pair that is neither wired nor
-consciously deferred), so a new source can't ship half-wired.
+Every source reaches every destination, enforced by a completeness test
+(`cargo test` fails on any pair that is neither wired nor consciously
+deferred with a reason), so a new source can't ship half-wired.
+
+### ClickHouse source (ch → ch)
+
+```python
+apitap.transfer("clickhouse://user:pass@src-host:8123/db",
+                "clickhouse://user:pass@dst-host:8123/db",
+                table="events")
+```
+
+ClickHouse-to-ClickHouse relays `RowBinary` untouched — the source asks for
+the format the destination already eats, so no encoder runs in between:
+**10M rows server-to-server in 8.4 s, or 20.6 s at peak 125 MB inside a
+0.5 CPU / 256 MB container**, checksum-exact. Two details worth knowing:
+
+- Every column is `CAST` to the type the destination will declare, because
+  the widths do not round-trip (`Date` is 2 bytes on the wire but lands as
+  `Date32` at 4; `DateTime` is 4 and lands as `DateTime64(6)` at 8). Types
+  outside the delivery vocabulary — `Array`, `Map`, `Tuple`, `Enum`,
+  `IPv4/6`, `Int128+` — arrive as `String`, so every table transfers.
+- Plain `MergeTree` tables split across parallel spans on their integer
+  sorting key. `ReplacingMergeTree` and the rest of the collapsing family
+  read as **one span**: a merge between two requests rewrites rows, so N
+  separate snapshots would not agree.
+
+Other destinations from a ClickHouse source (`postgres`, `mysql`,
+`iceberg`, …) are deferred with a reason — each needs its own wire encoder.
 
 Type notes for Postgres → MySQL — the lane covers integers, floats, `bool`,
 `date`, `timestamp`/`timestamptz`, `NUMERIC` within MySQL's `DECIMAL` bounds

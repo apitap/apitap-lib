@@ -65,6 +65,43 @@ roadmap; the per-core efficiency gap (~8×) is the durable part.
   state, retry-safety included. Multi-table with per-table modes is a
   dict.
 
+## apitap and DuckDB are not the same tool
+
+This one comes up often enough to answer with numbers, because both can
+"read Postgres". **DuckDB is an analytical engine — it computes. apitap is
+a movement engine — it moves, and hands the result to polars/DuckDB.**
+DuckDB's home is data it already owns (its own storage, local Parquet/CSV);
+reading a live database through its scanner extensions is a bolt-on, not
+what it is optimized for.
+
+The same question — a TPC-H-style join of a 49.5M-row Postgres table
+against a 49.5M-row MySQL table — answered four ways, identical results to
+the digit ([full receipts](../benchmarks/tpch-cross-engine.md)):
+
+| approach | cores | RAM | wall |
+|---|---|---|---|
+| apitap + polars (land → bucket → join) | 0.5 | 256 MB | **74.5 s** |
+| DuckDB, `ATTACH` both live databases | 0.5 | 256 MB | 146.0 s |
+| DuckDB, `ATTACH` both live databases | 16 | unlimited | 77.1 s |
+| DuckDB, raw local CSVs (no databases) | 16 | unlimited | 20.3 s |
+
+Read it honestly in both directions. In the same container we are ~2×
+faster, and the whole difference is the extraction path — the filters run
+inside the servers and the wire carries only survivors. DuckDB on 16 cores
+merely ties our half core, which says the wall is the wire and the source
+servers, not compute. And the last row is a different game entirely: once
+the data is already local files, DuckDB finishes in 20 s and we do not
+compete there. Credit where it is due — DuckDB's join survives a 256 MB
+box where polars' hash join wants 1.4 GB.
+
+**Use apitap when** you are moving tables between systems (pg→ch, my→pg,
+→Iceberg, →Parquet), replicating continuously (binlog/WAL CDC), pulling
+big tables into Python on a small machine, or need type-exact movement
+across engines. **Use DuckDB when** the data is already local and you want
+SQL over it. **Use both** for the shape that keeps winning: apitap extracts
+and lands the lake, DuckDB or polars computes on it — the second question
+then costs one local scan instead of another full extraction.
+
 ## What the comparison gets right
 
 Tools like Airbyte earn their place on **connector breadth**: hundreds

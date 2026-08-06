@@ -99,6 +99,25 @@ Rig: OVH VPS (16 vCPU / 61 GB), `postgres:16-alpine` source with
 `wal_level=logical` and a second Postgres as destination, both on loopback.
 apitap built from main; ape-dts `apecloud/ape-dts:latest`.
 
+## Under sustained load: 40M changes, ten tables, 256 MB
+
+A separate stress ledger — [cdc-stress.md](cdc-stress.md) — pushes ten
+Postgres tables into ClickHouse with the CDC side confined to 0.5 CPU /
+256 MB and the writer unconstrained: bootstrap 10M rows in **10.7 s**
+(937K rows/s, peak 62 MB), then three rounds of 10M changes each, drained
+at **51-56K changes/s** with peak RSS **87-91 MB** — while the replication
+slot held up to **2,322 MB of WAL**. Falling behind costs disk in Postgres,
+not memory in the worker. All 40,000,000 rows matched per table.
+
+That run also found the real ceiling, and it is not row count:
+
+> **CDC memory is bounded by your largest TRANSACTION, not by how many rows
+> you change.** Logical decoding hands a transaction over as a unit, so a
+> single 1M-row `INSERT … SELECT` is a ~200 MB window that no budget can
+> slice — it OOM-killed a 256 MB worker. The identical 10M rows committed
+> in 10K-row batches moved at 87 MB peak. Chunk bulk backfills, or run them
+> as a `replace`/`append` transfer instead of through the change stream.
+
 ## Correctness first (the e2e suite)
 
 `e2e_logbased.py` runs the whole lifecycle against live Postgres and
