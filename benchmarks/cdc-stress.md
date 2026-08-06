@@ -1,9 +1,10 @@
-# CDC under load: 40M changes through a 256 MB box (2026-08-05)
+# CDC under load: 80M changes through a 256 MB box (2026-08-05)
 
-How hard can you push log-based CDC on half a core? Ten Postgres tables into
-ClickHouse, with everything on the CDC side confined to **0.5 CPU / 256 MB**
-while the writer runs unconstrained on the host — the honest shape, because in
-production the application is never the thing you starve.
+How hard can you push log-based CDC on half a core? Ten tables into ClickHouse
+— once from Postgres, once from MySQL — with everything on the CDC side
+confined to **0.5 CPU / 256 MB** while the writer runs unconstrained on the
+host, the honest shape, because in production the application is never the
+thing you starve. 40M rows verified per source, 80M in total.
 
 | phase | work | result |
 |---|---|---|
@@ -34,6 +35,37 @@ that grows with its lag is a CDC reader that dies on the day it matters.
 **Bootstrap is a different animal from apply**: 937K rows/s for the full load vs
 ~55K changes/s for the stream. Bulk COPY moves rows in blocks; a change stream
 carries per-row identity, key lookups and upsert semantics. Expect the ratio.
+
+## The same rig, MySQL binlog instead of Postgres WAL
+
+Identical shape — ten tables, 1M rows each, three rounds of 10M changes in
+10K-row transactions, CDC side in the same 0.5 CPU / 256 MB box:
+
+| phase | MySQL → ClickHouse | Postgres → ClickHouse |
+|---|---|---|
+| bootstrap 10M rows | **9.1 s** (1,095K rows/s), peak 51 MB | 10.7 s (937K rows/s), peak 62 MB |
+| round 1 · 10M changes | **116.6 s — 86K/s**, peak 67 MB | 196.4 s — 51K/s, peak 87 MB |
+| round 2 · 10M changes | **121.4 s — 82K/s**, peak 67 MB | 182.2 s — 55K/s, peak 91 MB |
+| round 3 · 10M changes | **120.8 s — 83K/s**, peak 66 MB | 179.6 s — 56K/s, peak 87 MB |
+| log the source held | ~720 MB of binlog per 10M changes | ~1.9–2.3 GB of WAL per 10M changes |
+| verify | 40,000,000 = 40,000,000, 0 mismatched | 40,000,000 = 40,000,000, 0 mismatched |
+
+**MySQL's binlog lane is ~1.5× faster on the same box and uses less memory**,
+and the source-side log is roughly a third of the size: a ROW-format binlog
+event carries the row image, while Postgres WAL also carries full-page images
+and index maintenance. Sizing follows: 10M changes/minute needs roughly **one
+core on the MySQL lane** against ~1.5–2 on the Postgres one.
+
+### One number in this run was wrong, and the run is what caught it
+
+The MySQL drain first reported *100,000,000* changes for a 10M-change round —
+ten times the truth, exactly the number of tables in the group. A probe
+settled it: writing 300 changes to one table and 200 to another reported
+`500` for **all ten** tables and `5,000` overall. The applied data was
+correct every time (all 40M rows matched); the accounting was not — one
+group-wide counter was handed back to each member instead of a per-table
+count. Fixed, and the same probe now reports 300 / 200 / 0 … and 500 overall.
+The throughput figures above are the corrected ones.
 
 ## The wall you will actually hit: transaction size
 
@@ -69,8 +101,9 @@ commits.
 
 Scripts are in this directory: `cdc_stress_seed.py` (10 tables × 1M),
 `cdc_burst.py` (10M changes in N-row transactions), `cdc_drain.py` (one drain,
-capped), `cdc_verify.py` (per-table truth), driven by `cdc_stress.sh`. The
-drain is one call — ten tables share one slot, one group, one watermark:
+capped), `cdc_verify.py` (per-table truth), driven by `cdc_stress.sh` — and
+`my_cdc_*.py` / `my_cdc_stress.sh` for the MySQL edition. The drain is one
+call — ten tables share one slot, one group, one watermark:
 
 ```python
 apitap.transfer(PG, CH, tables=[f"cdc_t{i:02d}" for i in range(1, 11)],

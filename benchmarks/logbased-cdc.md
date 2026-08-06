@@ -109,6 +109,11 @@ at **51-56K changes/s** with peak RSS **87-91 MB** — while the replication
 slot held up to **2,322 MB of WAL**. Falling behind costs disk in Postgres,
 not memory in the worker. All 40,000,000 rows matched per table.
 
+The MySQL binlog lane ran the identical rig **~1.5× faster on less memory** —
+82–86K changes/s at 66–67 MB peak, bootstrap 10M rows in 9.1 s — and its
+source-side log is about a third the size (a ROW binlog event carries the row
+image; WAL also carries full-page images).
+
 That run also found the real ceiling, and it is not row count:
 
 > **CDC memory is bounded by your largest TRANSACTION, not by how many rows
