@@ -17,6 +17,7 @@ use crate::sink::iceberg::{IcebergConn, IcebergSink};
 use crate::sink::s3::{S3Conn, S3Sink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
+use crate::source::clickhouse::ChSource;
 use crate::source::github::GithubSource;
 use crate::source::github_api::GithubApiSource;
 use crate::source::gsheets::GsheetsSource;
@@ -76,6 +77,11 @@ const TO_GCS: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, t
 const TO_S3: Profile = TO_GCS;
 // Iceberg = the S3 write path + a catalog commit at the end; same shape.
 const TO_ICEBERG: Profile = TO_GCS;
+// ch→ch: both ends are HTTP against a columnar server that parallelizes each
+// query internally. The client only relays bytes (RowBinary in, RowBinary out),
+// so pipes buy overlapped network + server-side scans, not client CPU — the
+// same shape as the other ClickHouse-bound routes.
+const CH_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
 const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1, table_pipe_cap: 1 };
 const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
 // Same single-stream shape for the API entities (pagination is serial; the
@@ -119,6 +125,13 @@ impl SrcScheme for MyFrom {
     type Src = MySqlSource;
     async fn connect(url: &str, pool: usize) -> Result<MySqlSource> {
         MySqlSource::connect(url, pool).await
+    }
+}
+struct ChFrom;
+impl SrcScheme for ChFrom {
+    type Src = ChSource;
+    async fn connect(url: &str, pool: usize) -> Result<ChSource> {
+        ChSource::connect(url, pool).await
     }
 }
 struct GsFrom;
@@ -407,15 +420,27 @@ routes! {
     "github"   -> "gcs"        : GhFrom => GcsTo, GITHUB, pg_overlap = false;
     "github"   -> "s3"         : GhFrom => S3To, GITHUB, pg_overlap = false;
     "github"   -> "iceberg"    : GhFrom => IceTo, GITHUB, pg_overlap = false;
+    "clickhouse" -> "clickhouse": ChFrom => ChTo, CH_CH, pg_overlap = false;
 }
 
 /// Pairs consciously NOT in the table, each with its reason — the completeness
 /// test forces every (source, destination) combination to be either WIRED or
 /// listed HERE. Adding a source without covering every destination fails the
 /// build, on purpose: "new source reaches every destination" is a contract now.
-/// Currently empty: all 25 pairs are wired.
 #[cfg(test)]
-const NOT_YET: &[(&str, &str, &str)] = &[];
+const NOT_YET: &[(&str, &str, &str)] = &[
+    // The ClickHouse source speaks RowBinary — which is exactly what the
+    // ClickHouse sink eats, so ch→ch needs no encoder at all. Every other
+    // destination wants PgCopyBinary (postgres/s3/iceberg, and the parquet
+    // lanes of gcs/bigquery) or MyTsv (mysql): each is a new data-plane
+    // encoder, per the cost model in plan.rs.
+    ("clickhouse", "postgres", "needs a ClickHouse→PgCopyBinary encoder"),
+    ("clickhouse", "mysql", "needs a ClickHouse→MyTsv encoder"),
+    ("clickhouse", "bigquery", "needs a ClickHouse→PgCopyBinary encoder"),
+    ("clickhouse", "gcs", "needs a ClickHouse→PgCopyBinary encoder"),
+    ("clickhouse", "s3", "needs a ClickHouse→PgCopyBinary encoder"),
+    ("clickhouse", "iceberg", "needs a ClickHouse→PgCopyBinary encoder"),
+];
 
 pub(crate) async fn single(
     src_url: &str,
@@ -601,7 +626,8 @@ mod tests {
 
     #[test]
     fn every_source_reaches_every_destination_or_says_why_not() {
-        const SOURCES: &[&str] = &["postgres", "mysql", "gsheets", "github", "github+api"];
+        const SOURCES: &[&str] =
+            &["postgres", "mysql", "gsheets", "github", "github+api", "clickhouse"];
         const DESTS: &[&str] = &["postgres", "clickhouse", "mysql", "bigquery", "gcs", "s3", "iceberg"];
         // The declared sets must EQUAL what the table mentions — a new adapter
         // wired with a single route line would otherwise silently escape the

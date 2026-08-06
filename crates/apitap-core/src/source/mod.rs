@@ -10,6 +10,7 @@ use crate::plan::{Delta, Lane, TablePlan, WireFormat};
 use crate::sink::Loader;
 use std::future::Future;
 
+pub(crate) mod clickhouse;
 pub(crate) mod csvfile;
 pub(crate) mod github;
 pub(crate) mod github_api;

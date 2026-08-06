@@ -63,6 +63,41 @@ impl ChConn {
         ]
     }
 
+    pub(crate) fn database(&self) -> &str {
+        &self.database
+    }
+
+    /// Streaming `SELECT` for the ClickHouse SOURCE. `wait_end_of_query=0` is the
+    /// whole point: the sink's `=1` materializes the entire result server-side
+    /// before sending a byte (measured: 452 MB for a 1M-row table), which no
+    /// capped container survives. The cost is that a mid-stream failure still
+    /// answers 200 with its exception glued to the body — the source's row-count
+    /// check is what catches that.
+    pub(crate) async fn query_stream(&self, sql: &str) -> Result<reqwest::Response> {
+        let resp = self
+            .client
+            .post(&self.base)
+            .basic_auth(&self.user, Some(&self.password))
+            .query(&[
+                ("database", self.database.as_str()),
+                ("wait_end_of_query", "0"),
+                ("session_timezone", "UTC"),
+            ])
+            .body(sql.to_string())
+            .send()
+            .await
+            .map_err(|e| Error::Connect(format!("clickhouse: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Transfer(format!(
+                "clickhouse {status}: {}",
+                body.trim()
+            )));
+        }
+        Ok(resp)
+    }
+
     /// Run a statement with no input data (DDL, small SELECTs); returns the body.
     /// The SQL travels as the POST body — a body-less POST has no Content-Length and
     /// ClickHouse rejects it with 411.
