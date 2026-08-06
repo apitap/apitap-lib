@@ -171,17 +171,29 @@ impl ChDest {
         // is a plain bulk INSERT (same move as the pg apply).
         if !c.deletes.is_empty() || !c.upserts.is_empty() {
             let del = ch_ident(&format!("{dest_table}__apitap_cdc_del"));
-            // The key table is created ONCE and truncated per window. The old
-            // DROP → CREATE → … → DROP cycle spent three HTTP round trips of
+            // The key table is built ONCE per run and truncated per window. The
+            // old DROP → CREATE → … → DROP cycle spent three HTTP round trips of
             // pure ceremony on every window of every table, and at ~20k events
             // per window that ceremony is a real slice of the apply: the whole
-            // window is only ~7 round trips. CREATE IF NOT EXISTS + TRUNCATE is
-            // two, and TRUNCATE leaves the same empty table the CREATE did, so
-            // a replayed window still sees exactly the state it expects.
+            // window is only ~7 round trips. TRUNCATE leaves the same empty
+            // table the CREATE did, so a replayed window still sees exactly the
+            // state it expects.
+            //
+            // The first-time path DROPs before creating rather than relying on
+            // IF NOT EXISTS. `AS SELECT {pklist} FROM {ft} WHERE 0` freezes the
+            // key table's COLUMN SET and TYPES at creation, and the per-window
+            // insert names its columns explicitly — so if the source primary key
+            // gains a column (or a PK column changes type), an inherited table
+            // from an earlier run would make every window fail forever with a
+            // ClickHouse error naming an internal table. The old per-window DROP
+            // healed that on the next window; memoizing the DDL took the healing
+            // away with it. One DROP per run restores it and still costs one
+            // round trip per run instead of three per window.
             if self.first_time(&del) {
+                self.ch.exec(&format!("DROP TABLE IF EXISTS {del}")).await?;
                 self.ch
                     .exec(&format!(
-                        "CREATE TABLE IF NOT EXISTS {del} ENGINE = MergeTree \
+                        "CREATE TABLE {del} ENGINE = MergeTree \
                          ORDER BY tuple() AS SELECT {pklist} FROM {ft} WHERE 0"
                     ))
                     .await?;

@@ -305,7 +305,16 @@ fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Res
         if bit(&nullbm, k) {
             out.push(Cell::Null);
         } else {
-            out.push(Cell::Text(bytes::Bytes::from(decode_cell(r, c)?)));
+            // `into_boxed_slice` first: `Bytes::from(Vec<u8>)` is only free when
+            // len == capacity, and the temporal and DECIMAL arms of decode_cell
+            // build their text with format!/push_str, which leaves slack — so a
+            // plain From would heap a Shared box and ADD an allocation on the
+            // one CDC path that has no shared frame to slice from. The pg lane's
+            // win does not transfer here; this only makes sure we do not make
+            // MySQL worse while taking it.
+            out.push(Cell::Text(bytes::Bytes::from(
+                decode_cell(r, c)?.into_boxed_slice(),
+            )));
         }
         k += 1;
     }
