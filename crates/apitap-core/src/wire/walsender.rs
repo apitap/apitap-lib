@@ -58,7 +58,7 @@ pub(crate) struct Walsender {
 }
 
 struct PumpHandle {
-    frames: mpsc::Receiver<(u8, Vec<u8>)>,
+    frames: mpsc::Receiver<(u8, bytes::Bytes)>,
     task: tokio::task::JoinHandle<(BufReader<OwnedReadHalf>, Result<()>)>,
 }
 
@@ -68,7 +68,7 @@ struct PumpHandle {
 /// desync is the documented trap).
 async fn pump_frames(
     mut rd: BufReader<OwnedReadHalf>,
-    tx: mpsc::Sender<(u8, Vec<u8>)>,
+    tx: mpsc::Sender<(u8, bytes::Bytes)>,
 ) -> (BufReader<OwnedReadHalf>, Result<()>) {
     loop {
         match read_frame(&mut rd).await {
@@ -86,23 +86,25 @@ async fn pump_frames(
     }
 }
 
-async fn read_frame(rd: &mut BufReader<OwnedReadHalf>) -> Result<(u8, Vec<u8>)> {
+async fn read_frame(rd: &mut BufReader<OwnedReadHalf>) -> Result<(u8, bytes::Bytes)> {
     let mut head = [0u8; 5];
     rd.read_exact(&mut head).await.map_err(io_err)?;
     let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
     if len < 4 {
         return Err(Error::Transfer("walsender: bad message length".into()));
     }
-    let mut body = vec![0u8; len - 4];
+    // BytesMut, so every text cell downstream is a refcounted slice of this
+    // one allocation instead of getting its own malloc (see pgoutput::Cell).
+    let mut body = bytes::BytesMut::zeroed(len - 4);
     rd.read_exact(&mut body).await.map_err(io_err)?;
-    Ok((head[0], body))
+    Ok((head[0], body.freeze()))
 }
 
 /// One event out of the CopyBoth stream.
 #[derive(Debug)]
 pub(crate) enum WalEvent {
     /// One pgoutput message payload starting at `wal_start`.
-    XLogData { wal_start: u64, payload: Vec<u8> },
+    XLogData { wal_start: u64, payload: bytes::Bytes },
     /// Primary keepalive: server's current WAL end and whether it wants an
     /// immediate reply.
     Keepalive { wal_end: u64, reply_requested: bool },
@@ -347,7 +349,7 @@ impl Walsender {
         Ok(())
     }
 
-    async fn read_message(&mut self) -> Result<(u8, Vec<u8>)> {
+    async fn read_message(&mut self) -> Result<(u8, bytes::Bytes)> {
         let rd = self
             .rd
             .as_mut()
@@ -774,10 +776,10 @@ impl Walsender {
                             let wal_start =
                                 u64::from_be_bytes(msg[1..9].try_into().unwrap());
                             // bytes 9..17 wal_end, 17..25 server clock — unused.
-                            // Shift the header off in place: one alloc per
-                            // message, not two (drains at ~1M events/window).
-                            let mut payload = msg;
-                            payload.drain(..25);
+                            // A Bytes slice, so dropping the header is a
+                            // pointer bump — the old `drain(..25)` memmoved
+                            // every payload at ~1M events/window.
+                            let payload = msg.slice(25..);
                             return Ok(Some(WalEvent::XLogData { wal_start, payload }));
                         }
                         Some(b'k') => {

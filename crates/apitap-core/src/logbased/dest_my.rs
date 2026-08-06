@@ -405,7 +405,7 @@ fn my_literal(cell: &Cell, oid: u32) -> Result<String> {
             std::str::from_utf8(bytea_hex(t)?)
                 .map_err(|_| Error::Transfer("log_based: non-UTF8 bytea hex".into()))?
         ),
-        BOOL_OID => (if t.as_slice() == b"t" { "1" } else { "0" }).into(),
+        BOOL_OID => (if &t[..] == b"t" { "1" } else { "0" }).into(),
         TIMESTAMPTZ_OID | TIMETZ_OID => {
             let s = strip_utc_offset(t)?;
             format!("'{}'", sql_lit(&String::from_utf8_lossy(s)))
@@ -422,7 +422,7 @@ fn key_pred(pk_cols: &[String], key: &[Vec<u8>], pk_oids: &[u32]) -> Result<Stri
             Ok(format!(
                 "{} = {}",
                 my_ident(c),
-                my_literal(&Cell::Text(v.clone()), oid)?
+                my_literal(&Cell::Text(bytes::Bytes::from(v.clone())), oid)?
             ))
         })
         .collect::<Result<Vec<_>>>()?

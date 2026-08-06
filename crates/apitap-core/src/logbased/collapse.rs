@@ -93,7 +93,13 @@ impl Collapser {
         self.key_idx
             .iter()
             .map(|&i| match row.get(i) {
-                Some(Cell::Text(t)) => Ok(t.clone()),
+                // Key stays owned (`Vec<Vec<u8>>`) on purpose: a Bytes key
+                // would pin the whole frame it was carved from, and a
+                // delete-only key under REPLICA IDENTITY FULL would then hold
+                // a full old row image alive for the window instead of ~8
+                // bytes. Copying the key columns keeps window memory bounded
+                // by what the 256 MB tier budgets for.
+                Some(Cell::Text(t)) => Ok(t.to_vec()),
                 Some(Cell::Null) | None => Err(Error::Transfer(
                     "log_based: NULL/missing replica-identity key column in row \
                      image — is REPLICA IDENTITY sane on the source table?"
@@ -232,7 +238,7 @@ mod tests {
     use super::*;
 
     fn t(s: &str) -> Cell {
-        Cell::Text(s.as_bytes().to_vec())
+        Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()))
     }
     fn key(parts: &[&str]) -> Key {
         parts.iter().map(|p| p.as_bytes().to_vec()).collect()

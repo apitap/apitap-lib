@@ -268,7 +268,7 @@ impl ChDest {
                             // straight back out, no OID translation.
                             full[i] = match tsv_unescape(f) {
                                 None => Cell::Null,
-                                Some(v) => Cell::Text(v),
+                                Some(v) => Cell::Text(bytes::Bytes::from(v)),
                             };
                             // Mark: this cell must NOT be re-translated.
                         }

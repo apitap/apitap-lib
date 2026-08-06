@@ -305,7 +305,7 @@ fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Res
         if bit(&nullbm, k) {
             out.push(Cell::Null);
         } else {
-            out.push(Cell::Text(decode_cell(r, c)?));
+            out.push(Cell::Text(bytes::Bytes::from(decode_cell(r, c)?)));
         }
         k += 1;
     }
@@ -942,8 +942,8 @@ mod tests {
         let ev = parse_rows(&b, EV_WRITE_ROWS, &map).unwrap();
         assert_eq!(ev.rows.len(), 1);
         let after = ev.rows[0].1.clone().unwrap();
-        assert_eq!(after[0], Cell::Text(b"7".to_vec()));
-        assert_eq!(after[1], Cell::Text(b"hi".to_vec()));
+        assert_eq!(after[0], Cell::Text(bytes::Bytes::from_static(b"7")));
+        assert_eq!(after[1], Cell::Text(bytes::Bytes::from_static(b"hi")));
         assert_eq!(after[2], Cell::Null);
 
         // A partial image (MINIMAL): column 2 absent -> UnchangedToast.
@@ -959,7 +959,7 @@ mod tests {
         let ev = parse_rows(&b, EV_WRITE_ROWS, &map).unwrap();
         let after = ev.rows[0].1.clone().unwrap();
         assert_eq!(after[1], Cell::UnchangedToast, "absent column must not read as NULL");
-        assert_eq!(after[2], Cell::Text(b"9".to_vec()));
+        assert_eq!(after[2], Cell::Text(bytes::Bytes::from_static(b"9")));
     }
 
     #[test]
@@ -978,7 +978,7 @@ mod tests {
             "bench.t".into(),
             TableSchema { names: vec!["id".into()], key: vec![true], unsigned: vec![false] },
         );
-        let ev = RowsEvent { table_id: 42, rows: vec![(None, Some(vec![Cell::Text(b"1".to_vec())]))] };
+        let ev = RowsEvent { table_id: 42, rows: vec![(None, Some(vec![Cell::Text(bytes::Bytes::from_static(b"1"))]))] };
         let msgs = to_messages(&mut st, EV_WRITE_ROWS, ev).unwrap();
         match &msgs[0] {
             PgoMessage::Relation(r) => {
