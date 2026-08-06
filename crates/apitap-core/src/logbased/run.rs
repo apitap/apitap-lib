@@ -413,7 +413,11 @@ async fn run_group_mysql(
         .join("\x1e");
     let budget = (window_budget() / 2).clamp(1 << 20, 24 << 20);
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
-    let rows_applied = std::cell::Cell::new(0u64);
+    // One counter PER TABLE. A single group-wide counter handed the same
+    // total to every member, so a 10-table group reported 10× the changes it
+    // actually applied (the data was right; the number was not).
+    let rows_applied: Vec<std::cell::Cell<u64>> =
+        ctxs.iter().map(|_| std::cell::Cell::new(0u64)).collect();
 
     myrun::drain_windows(
         src_url,
@@ -429,13 +433,13 @@ async fn run_group_mysql(
             let rows_applied = &rows_applied;
             async move {
                 let end = outcome.end_lsn;
-                for c in ctxs.iter() {
+                for (c, acc) in ctxs.iter().zip(rows_applied.iter()) {
                     // Every member applies — a table with no traffic in this
                     // window still advances its watermark.
                     let n = dest
                         .apply_no_src(&c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id)
                         .await?;
-                    rows_applied.set(rows_applied.get() + n);
+                    acc.set(acc.get() + n);
                 }
                 if dbg {
                     eprintln!("[my cdc] window applied → watermark {end}");
@@ -446,7 +450,7 @@ async fn run_group_mysql(
     )
     .await?;
 
-    Ok(ctxs.iter().map(|_| (rows_applied.get(), 1)).collect())
+    Ok(rows_applied.iter().map(|a| (a.get(), 1)).collect())
 }
 
 async fn bootstrap_group(
