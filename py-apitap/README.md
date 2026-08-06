@@ -58,12 +58,12 @@ MySQL 8.4 servers. Ladder, methodology and raw logs:
 
 ## Routes
 
-Five sources × seven destinations — **all 35 wired**, enforced by a test that fails
-the build if any pair is neither implemented nor explicitly deferred with a reason.
+Six sources × seven destinations, enforced by a test that fails the build if any
+pair is neither implemented nor explicitly deferred with a reason.
 
-**Sources:** `postgres://` · `mysql://` · `gsheets://` (tabs as tables) ·
-`github://` (repo CSVs as tables) · `github+api://` (issues, PRs, commits, stars …
-as typed tables)
+**Sources:** `postgres://` · `mysql://` · `clickhouse://` (→ ClickHouse today) ·
+`gsheets://` (tabs as tables) · `github://` (repo CSVs as tables) ·
+`github+api://` (issues, PRs, commits, stars … as typed tables)
 
 **Destinations:** `postgres://` · `mysql://` · `clickhouse://` · `bigquery://` ·
 `gcs://` (CSV.gz or Parquet) · `s3://` (S3-compatible — AWS, MinIO, R2,
@@ -80,6 +80,7 @@ Each pair negotiates the fastest wire format both sides speak — for example:
 | `postgres://` → `clickhouse://` | binary COPY transcoded in-flight to `RowBinary` |
 | `postgres://` → `mysql://` | binary COPY rendered in-flight as `LOAD DATA` text |
 | `mysql://` → `postgres://` | wire decode → binary COPY (exact decimals to `DECIMAL(65,30)`) |
+| `clickhouse://` → `clickhouse://` | `RowBinary` relayed untouched — 10M rows server-to-server in 8.4 s, or 20.6 s in a 256 MB container |
 | any → `bigquery://` | Parquet or CSV load jobs — free path, sandbox-safe |
 
 Every transfer stages and swaps in atomically — readers never see a partial table,
