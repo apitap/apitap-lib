@@ -151,3 +151,78 @@ CDC apply path is exactly the small-allocation churn that rejection said such
 allocators *do* fix. Different workload, different answer. Shipping a global
 allocator would change the bulk path too, which is where mimalloc lost, so the
 preferred fix remains **allocating less**.
+
+## Every glibc knob, and why none of them was the answer
+
+If the allocator is the cost, the cheap move is to tune it rather than refactor.
+Three rounds each, interleaved, same rig:
+
+| arm | r1 | r2 | r3 | median |
+|---|---|---|---|---|
+| glibc as shipped | 46.2 | 46.8 | 42.5 | 46.2 s |
+| `MALLOC_TRIM_THRESHOLD_=64M` | 50.4 | 44.9 | 44.6 | 44.9 s |
+| `MALLOC_TRIM_THRESHOLD_=128M` | 53.1 | 57.0 | 50.7 | 53.1 s |
+| trim 64M + `MALLOC_MMAP_THRESHOLD_=64M` | 72.9 | 50.1 | 48.8 | 50.1 s |
+
+A wash at best, worse at the larger sizes. An earlier three-round sweep had the
+mmap knob flat on its own and the combined arm at 44.2 / 44.2 / 52.2 — two
+identical numbers that looked like a mechanism and were not. **Twice in this
+session a two-round agreement was called a finding and the third round killed
+it.** Both retractions are why the knife below ran to six rounds.
+
+A knob can make an allocation cheaper. It cannot make it not happen. That is
+what tcmalloc was doing that no setting reproduced, and it is why the fix had
+to be in our code.
+
+## The knife: `Cell::Text(Bytes)`
+
+One XLogData frame is one pgoutput message is one row, so a text cell can be a
+refcounted slice of the frame instead of its own `Vec<u8>`. `read_frame` now
+returns `BytesMut::freeze()`, `Cell::Text` carries `bytes::Bytes`, and
+`payload.drain(..25)` — a memmove of every payload — becomes `msg.slice(25..)`.
+
+`Key` deliberately stays `Vec<Vec<u8>>`. A Bytes key pins the frame it came
+from; a delete-only key under REPLICA IDENTITY FULL would then hold a whole old
+row image for the window instead of ~8 bytes. Wrong trade at the 256 MB tier.
+
+Two wheels, same `maturin build --release`, same tree, differing only in this
+change. Six interleaved rounds, each side from a dropped-and-reseeded
+destination:
+
+| round | baseline | Bytes cells | delta |
+|---|---|---|---|
+| 1 | 53.3 | 43.2 | −19.0% |
+| 2 | 47.0 | 42.7 | −9.1% |
+| 3 | 45.9 | 46.5 | +1.3% |
+| 4 | 48.7 | 43.8 | −10.1% |
+| 5 | 49.2 | 44.8 | −8.9% |
+| 6 | 57.7 | 50.1 | −13.2% |
+| **median** | **48.95 s** | **44.30 s** | **−9.5%** |
+
+Wins 5 of 6. Predicted 5-9 s before the build; got 4.65 s — **missed low**.
+CPU-seconds are flat (21.7 vs 21.65 mean) and peak RSS is +5 MB (104 → 109).
+So the win is not in doing less work, it is in **not blocking**: saturation
+moves from 84-93% to 94-97%, the same shape tcmalloc produced. Destination row
+state verified against the source on ten tables and six aggregates, twice.
+
+## Three measurements thrown away, and why
+
+All three produced numbers that looked reasonable. That is what made them
+dangerous.
+
+1. **The destination grew across rounds.** `heavy_drain` never resets, so every
+   round added ~750k net rows and the DELETE got steadily more expensive —
+   glibc went 44.6 s to 83.7 s on identical work across one afternoon.
+   Interleaved within-round comparisons survive this; cross-round ones do not.
+   Fixed by dropping and reseeding per side.
+2. **A silently failed bootstrap.** The A/B discarded the bootstrap step's
+   output, so when it failed the measured call did the full load instead of the
+   CDC window and reported "3,750,000 changes at 300K/s" — a bootstrap wearing
+   a drain's label. Fixed by asserting the row counts of both phases.
+3. **PGO versus no PGO.** The first A/B compared a plain-release branch wheel
+   against the PGO-built PyPI wheel and read −1.3%. PGO is worth ~12% on this
+   rig, so that comparison measured the build, not the change. **The same flaw
+   applies to the two knives already committed on this branch** (86b799b,
+   22a2d63): their −9.4% and −9.0% were measured while carrying a 12% handicap
+   and understate their effect. Recorded rather than quietly re-run, because
+   the error happens to favour us and that is exactly when it should be stated.
