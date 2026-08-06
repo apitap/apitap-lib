@@ -46,6 +46,54 @@ ape-dts's 8 apply workers take the pg-destination cell (45 s vs 60 s) —
 while apitap averages **1.00 measured core**. Parallel apply is on the
 roadmap; the per-core efficiency gap (~8×) is the durable part.
 
+## apitap vs Debezium vs Flink CDC — different leagues, honestly
+
+The comparison above is against tools that do the same job. Debezium and
+Flink CDC mostly do a **different** one, and picking between them is
+architecture, not benchmarking:
+
+- **Debezium produces events.** It reads the WAL/binlog and publishes change
+  events — through Kafka Connect, or standalone via Debezium Server. Landing
+  those events in a table is a *second* component (a JDBC/ClickHouse sink
+  connector) that you deploy and operate.
+- **Flink CDC processes streams.** On top of change capture it gives you
+  joins, windows, stateful aggregation, checkpointed exactly-once — a real
+  distributed engine, with a JobManager, TaskManagers and a state backend.
+- **apitap moves rows point to point.** Read the log, collapse per key,
+  apply to the destination — one call, one process, no bus in between.
+
+| | apitap `mode="log_based"` | Debezium | Flink CDC |
+|---|---|---|---|
+| deployment | `pip install`, one function call | JVM + Kafka/Connect (or Debezium Server) + a sink connector | a Flink cluster + state backend + checkpoint storage |
+| footprint | **87–91 MB peak, 0.5 vCPU** (measured over 40M changes) | JVM heap, typically GB-class per component | GB-class per TaskManager |
+| lands the data itself | yes — creates the table, upserts by PK, stages and swaps | no — emits events; a sink connector applies them | yes, if you write the job |
+| latency | your schedule (seconds → minutes) | continuous, sub-second | continuous, sub-second |
+| sources | Postgres, MySQL | Postgres, MySQL, MongoDB, SQL Server, Oracle, Db2, Cassandra, Spanner, Vitess … | Debezium's breadth, plus Flink connectors |
+| fan-out / replay | point to point | an event bus many consumers share and replay by offset | via Kafka, or checkpointed state |
+| stream processing | none — compute lives downstream | none (transforms only) | the whole point |
+| scaling | vertical: ~55K changes/s per half core → **10M changes/min ≈ 1.5–2 cores** | partition by table across connectors | horizontal task slots |
+
+**What apitap is genuinely better at:** the cost and weight of keeping a
+warehouse copy fresh. There is no broker to run, no JVM to tune, no cluster
+to babysit; the drain fits a 256 MB container and its memory does not grow
+when it falls behind — a 2,322 MB WAL backlog left peak RSS at 91 MB,
+because the queue lives in Postgres where it belongs
+([the stress ledger](../benchmarks/cdc-stress.md)).
+
+**Where it honestly loses:** anything below one-second freshness; sources
+beyond Postgres and MySQL; topologies where several systems must consume
+the same change stream and replay it independently; and any pipeline whose
+job is to *compute* on the stream rather than land it. Our schema-evolution
+story is also thinner than Debezium's, and one very large transaction still
+costs memory proportional to itself — logical decoding hands a commit over
+as a unit, and applying pgoutput's in-progress stream chunks is future work.
+
+**The rule of thumb:** if a change stream has exactly one consumer and that
+consumer is a database, apitap replaces the whole Debezium + Kafka + sink
+stack, and the bus was pure overhead. The moment a second and third consumer
+need that same stream — or someone needs to join it in flight — Kafka and
+Flink start paying for themselves, and you should let them.
+
 ## The claims worth correcting, point by point
 
 - **"Needs hand-written out-of-memory logic."** Bounded memory is the
