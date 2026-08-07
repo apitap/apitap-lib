@@ -34,11 +34,47 @@ fn run_cdc<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio current_thread runtime")
-        .block_on(fut)
+    // Quota-aware: current_thread is a measured win at the half-core tier
+    // (RSS −10MB, wall neutral) but it CAPS the pipeline at one thread — a
+    // 1-core proof run used only 0.55 cores of a 1.0 quota and gained just
+    // 8%. Above ~0.6 core of quota the multi-thread runtime gets the pump,
+    // drain and apply genuinely overlapping again.
+    if cpu_quota_cores().map_or(true, |q| q <= 0.6) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio current_thread runtime")
+            .block_on(fut)
+    } else {
+        rt().block_on(fut)
+    }
+}
+
+/// cgroup v2 `cpu.max` ("<quota> <period>" or "max ..."), then v1. `None`
+/// means unlimited/unknown — treated as small-tier (the conservative side:
+/// current_thread never regressed wall anywhere we measured, multi-thread
+/// is only provably better when a real >0.6-core quota exists).
+fn cpu_quota_cores() -> Option<f64> {
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let mut it = s.split_whitespace();
+        if let (Some(q), Some(p)) = (it.next(), it.next()) {
+            if q != "max" {
+                if let (Ok(q), Ok(p)) = (q.parse::<f64>(), p.parse::<f64>()) {
+                    if p > 0.0 {
+                        return Some(q / p);
+                    }
+                }
+            }
+        }
+    }
+    let q = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?;
+    let p = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?;
+    let (q, p) = (q.trim().parse::<f64>().ok()?, p.trim().parse::<f64>().ok()?);
+    if q > 0.0 && p > 0.0 {
+        Some(q / p)
+    } else {
+        None
+    }
 }
 
 /// Returns `(rows, elapsed_ms, parallel)`; the Python wrapper turns it into a report.
