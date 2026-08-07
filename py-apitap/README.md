@@ -81,7 +81,7 @@ Each pair negotiates the fastest wire format both sides speak — for example:
 | `postgres://` → `mysql://` | binary COPY rendered in-flight as `LOAD DATA` text |
 | `mysql://` → `postgres://` | wire decode → binary COPY (exact decimals to `DECIMAL(65,30)`) |
 | `clickhouse://` → `clickhouse://` | `RowBinary` relayed untouched — 10M rows server-to-server in 8.4 s, or 20.6 s in a 256 MB container |
-| `postgres://`/`mysql://` → `clickhouse://`, `mode="log_based"` | change streams: 40M changes verified per source at 51-86K changes/s on **half a core** ([the stress ledger](https://apitap.dev/docs/cdc-stress)) |
+| `postgres://`/`mysql://` → `clickhouse://`, `mode="log_based"` | change streams: 40M+ changes verified per source at **34–132K changes/s** on **half a core** — v0.29.0: 132K/s on 5-column rows, 34K/s at 15 wide columns ([the stress ledger](https://apitap.dev/docs/cdc-stress)) |
 | any → `bigquery://` | Parquet or CSV load jobs — free path, sandbox-safe |
 
 Every transfer stages and swaps in atomically — readers never see a partial table,
