@@ -35,6 +35,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
 ] }
 bytes = "1"
+# Collapse-map hasher: our own PK bytes, hashDoS not in the threat model.
+foldhash = "0.2"
 # SigV4 signing for the s3:// sink — all three already compiled via sqlx.
 sha2 = "0.10"
 # mysql_native_password scramble on the raw MySQL read plane (wire/mywire.rs).
