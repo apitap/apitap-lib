@@ -129,3 +129,26 @@ code. Sketch only; do not build without sign-off.
 
 Honest projection if Arc A lands: ~36-38s -> ~31-33s. 150K/s wide remains
 outside both arcs combined; the receipts will say where it stops.
+
+## Addendum 3 — patch-part deletes (Arc A): verdict
+
+A/B on CH 25.8.29 dest (:8126), same wheel both sides, lever = `APITAP_PATCH_DELETE=0`,
+3 interleaved rounds, full reset+reseed per leg, cdc-pg wide 1.5M:
+
+| side | r1 | r2 | r3 | median |
+|---|---|---|---|---|
+| rewrite (mode off) | 42.5s | 41.3s | 39.7s | 41.3s |
+| patch (lightweight_update) | 40.1s | 40.7s | 42.0s | 40.7s |
+
+**Wall: TIE** (−0.6s median, under the 2% lane wall). Client is 95–97% quota-saturated
+on both sides — DELETE wait was never on the critical path at 0.5cpu.
+
+**Server: CONFIRMED WIN.** query_log split: delete avg 89.9ms → 16ms (−82%), ~9.0s →
+~1.3s per round server-side. MutatePart: all 1020 from the rewrite side; patch side
+rewrote ZERO parts — merge debt and dest disk churn eliminated. Verification exact
+(t01/t05/t10 count+sum(id) MATCH).
+
+**Decision: gate stays** (committed). Free on <25.7, strictly reduces destination load
+on ≥25.7; pays wall only when the dest is the bottleneck (weak CH, bigger delete share,
+shared box). Not a 25s card at 0.5cpu — the wall is client CPU. Remaining 25s/150K
+paths: Arc B (pull-apply, needs sign-off), or accept the recorded plateau.
