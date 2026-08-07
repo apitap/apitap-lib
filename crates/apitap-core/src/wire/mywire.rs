@@ -669,13 +669,53 @@ impl MyWire {
         // connection's lifetime — read_packet's check already handles wrap.
     }
 
+    /// Read one packet payload into a FRESH owned buffer (16MB continuations
+    /// appended), for the binlog stream only. The query path keeps the reused
+    /// `self.buf` + borrowed-slice shape; the binlog drain holds events across
+    /// awaits, and the borrow forced mysource to copy every event — this hands
+    /// out ownership instead. `read_buf` through a `limit()` fills the spare
+    /// capacity WITHOUT zeroing it first (the packet body used to be memset
+    /// and then immediately overwritten), and the limit guarantees we can
+    /// never consume bytes of the next packet's header.
+    async fn read_packet_owned(&mut self) -> Result<bytes::Bytes> {
+        use bytes::BufMut;
+        let mut out = bytes::BytesMut::new();
+        loop {
+            let mut head = [0u8; 4];
+            self.rd.read_exact(&mut head).await.map_err(io_err)?;
+            let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
+            if head[3] != self.seq {
+                return Err(desync("packet sequence"));
+            }
+            self.seq = self.seq.wrapping_add(1);
+            let need = out.len() + len;
+            out.reserve(len);
+            while out.len() < need {
+                let want = need - out.len();
+                let n = self
+                    .rd
+                    .read_buf(&mut (&mut out).limit(want))
+                    .await
+                    .map_err(io_err)?;
+                if n == 0 {
+                    return Err(desync("binlog stream closed mid-packet"));
+                }
+            }
+            if len < 0xFF_FFFF {
+                return Ok(out.freeze());
+            }
+        }
+    }
+
     /// Next raw binlog event: the full event bytes (19-byte header + body,
     /// checksum still attached — the decoder strips it per the session's
     /// algorithm). `None` only in non-block mode; ERR packets become errors.
-    pub(crate) async fn next_binlog_event(&mut self) -> Result<Option<&[u8]>> {
-        let p = self.read_packet().await?;
+    /// Owned `Bytes`: the drain buffers events across windows, and handing
+    /// ownership out deletes the copy-per-event it used to make.
+    pub(crate) async fn next_binlog_event(&mut self) -> Result<Option<bytes::Bytes>> {
+        let p = self.read_packet_owned().await?;
         match p.first() {
-            Some(0x00) => Ok(Some(&p[1..])),
+            Some(0x00) => Ok(Some(p.slice(1..))),
             Some(0xFF) => Err(parse_err(&p[1..])),
             Some(0xFE) if p.len() <= 9 => Ok(None),
             _ => Err(desync("binlog stream packet")),

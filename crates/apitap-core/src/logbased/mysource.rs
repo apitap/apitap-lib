@@ -207,7 +207,8 @@ pub(crate) async fn drain_binlog(
         let Some(raw) = w.next_binlog_event().await? else {
             break;
         };
-        let raw = raw.to_vec();
+        // `raw` is an owned Bytes now — the old borrowed-slice shape forced a
+        // full copy of every event here.
         let (h, body) = bl::split_event(&raw, true)?;
 
         match h.event_type {
