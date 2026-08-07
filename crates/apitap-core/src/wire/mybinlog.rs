@@ -318,6 +318,10 @@ fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Res
         }
         k += 1;
     }
+    // Exact capacity before the buffer becomes the row's frame: collapse
+    // retains frames whole, and the presized rowbuf's slack was +14MB peak
+    // on the narrow rig. One small realloc per row buys it back.
+    frame.shrink_to_fit();
     Ok(Tuple::from_rendered(frame, cells))
 }
 
