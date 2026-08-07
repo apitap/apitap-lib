@@ -104,3 +104,28 @@ Touches: pgoutput, mybinlog, collapse, drain, rowtext, dest_ch/pg/my/ice,
 mysource (~300-400 lines). After it lands, the road below ~35s is
 architectural (narrower rows already do 132K/s; more CPU; or the parked
 CH≥25.7 patch-parts) — a product decision, not a knife.
+
+## Addendum 2 — the 150K/s directive and the trade arcs (2026-08-07)
+
+User target restated: 150K changes/s on the WIDE 15-col pg rig at 0.5cpu/256MB
+= 1.5M in 10s. Measured walls against it: client 18.5 CPU-s forces ~37s;
+server apply sums ~15s. Ordinary knives are exhausted (frame-native measured
+FLAT on wall PGO-vs-PGO — it does what PGO does, not additive; kept as a
+memory knife, peak now 81-89MB, −15%).
+
+Arc A — patch-part deletes, UNBLOCKED: CH 25.8.29 stood up as
+apitap-bench-ch3 (:8126); the #87265 probe with OUR predicate shape
+(DELETE ... IN (SELECT) under lightweight_delete_mode='lightweight_update',
+block-number/offset columns on) returns CORRECT results (99,500 / 0).
+Next: the ~10-line dest_ch gate (server-version probe + provenance check +
+SETTINGS clause), then a full A/B against the 25.8 destination. Expected:
+server DELETE 6.8s -> ~0.5s; version-gated (24.8 LTS unchanged).
+
+Arc B — pull-apply design (kills the render+outbound half of the client
+wall): decode WAL for keys/windows, let ClickHouse pull row bodies itself.
+Changes window semantics (converges to final state; not per-window image
+replay) — a DESIGN decision needing its own correctness argument before any
+code. Sketch only; do not build without sign-off.
+
+Honest projection if Arc A lands: ~36-38s -> ~31-33s. 150K/s wide remains
+outside both arcs combined; the receipts will say where it stops.
