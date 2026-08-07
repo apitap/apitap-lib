@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::logbased::collapse::{Collapsed, Collapser};
-use crate::wire::pgoutput::{self, Cell, PgoMessage, Relation};
+use crate::wire::pgoutput::{self, PgoMessage, Relation, Tuple};
 use crate::wire::walsender::{WalEvent, Walsender};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,9 +54,9 @@ pub(crate) struct DrainSession {
 
 /// Buffered op of a streamed (not-yet-committed) transaction.
 pub(crate) enum StreamOp {
-    Insert(Vec<Cell>),
-    Update(Option<Vec<Cell>>, Vec<Cell>),
-    Delete(Vec<Cell>),
+    Insert(Tuple),
+    Update(Option<Tuple>, Tuple),
+    Delete(Tuple),
     Truncate,
 }
 
@@ -90,14 +90,11 @@ pub(crate) async fn drain(
     let mut buf_bytes = 0usize;
     let mut hit_budget = false;
 
-    fn cells_bytes(row: &[Cell]) -> usize {
-        row.iter()
-            .map(|c| match c {
-                Cell::Text(t) => t.len() + 24,
-                _ => 8,
-            })
-            .sum::<usize>()
-            + 48
+    fn cells_bytes(row: &Tuple) -> usize {
+        // Truthful residency: a buffered row pins its WHOLE frame plus the
+        // range vec. (Old accounting summed cell lengths, which under-counted
+        // exactly when Bytes cells began pinning frames.)
+        row.frame.len() + row.cells.len() * 12 + 48
     }
 
     let mut in_stream: Option<u32> = None;
@@ -191,7 +188,7 @@ pub(crate) async fn drain(
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
                         let old = old.map(|o| o.tuple);
                         buf_bytes += cells_bytes(&new)
-                            + old.as_deref().map_or(0, cells_bytes);
+                            + old.as_ref().map_or(0, cells_bytes);
                         let op = StreamOp::Update(old, new);
                         match in_stream {
                             Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
@@ -255,7 +252,7 @@ fn flush_ops(
         let c = collapsers.get_mut(table.as_ref()).expect("collapser just ensured");
         match op {
             StreamOp::Insert(row) => c.insert(row)?,
-            StreamOp::Update(old, row) => c.update(old.as_deref(), row)?,
+            StreamOp::Update(old, row) => c.update(old.as_ref(), row)?,
             StreamOp::Delete(old) => c.delete(&old)?,
             StreamOp::Truncate => c.truncate(),
         }

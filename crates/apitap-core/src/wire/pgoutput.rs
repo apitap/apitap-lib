@@ -117,13 +117,106 @@ pub(crate) enum Cell {
     UnchangedToast,
 }
 
-pub(crate) type Tuple = Vec<Cell>;
+/// One cell as a RANGE into its row's frame — `Copy`, 12 bytes against the
+/// 40 of `Cell`, and crucially: no refcount. The 0.28.0 Bytes cells removed
+/// 22.5M mallocs but left 45M atomic ops plus one Arc-promotion alloc per
+/// frame; ranges remove those too. `Cell` (owned) survives for the residue
+/// tail, which is rare and materializes explicitly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CellR {
+    Null,
+    /// (offset, len) into `Tuple::frame`.
+    Text(u32, u32),
+    UnchangedToast,
+}
+
+/// A borrowed view of one cell — consumers pattern-match this exactly like
+/// they matched `Cell`, with `&[u8]` where `Bytes` used to be.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Cellv<'a> {
+    Null,
+    Text(&'a [u8]),
+    UnchangedToast,
+}
+
+/// One row: the frame it arrived in plus range cells. Clone = one refcount
+/// bump + one small memcpy of the range vec, however wide the row is.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Tuple {
+    pub frame: bytes::Bytes,
+    pub cells: Vec<CellR>,
+}
+
+impl Tuple {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.cells.len()
+    }
+    #[inline]
+    pub(crate) fn view(&self, i: usize) -> Cellv<'_> {
+        match self.cells[i] {
+            CellR::Null => Cellv::Null,
+            CellR::Text(o, l) => Cellv::Text(&self.frame[o as usize..(o + l) as usize]),
+            CellR::UnchangedToast => Cellv::UnchangedToast,
+        }
+    }
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Option<Cellv<'_>> {
+        if i < self.cells.len() {
+            Some(self.view(i))
+        } else {
+            None
+        }
+    }
+    pub(crate) fn views(&self) -> impl Iterator<Item = Cellv<'_>> + '_ {
+        (0..self.cells.len()).map(|i| self.view(i))
+    }
+    pub(crate) fn has_toast(&self) -> bool {
+        self.cells.iter().any(|c| matches!(c, CellR::UnchangedToast))
+    }
+    /// Materialize owned cells — the residue tail's format. Rare by design.
+    pub(crate) fn to_cells(&self) -> Vec<Cell> {
+        self.cells
+            .iter()
+            .map(|c| match *c {
+                CellR::Null => Cell::Null,
+                CellR::Text(o, l) => {
+                    Cell::Text(self.frame.slice(o as usize..(o + l) as usize))
+                }
+                CellR::UnchangedToast => Cell::UnchangedToast,
+            })
+            .collect()
+    }
+    /// Build a Tuple that owns freshly rendered bytes (the MySQL lane, whose
+    /// decoder renders values rather than slicing a shared frame).
+    pub(crate) fn from_rendered(frame: Vec<u8>, cells: Vec<CellR>) -> Self {
+        Self { frame: bytes::Bytes::from(frame), cells }
+    }
+
+    /// Build from owned cells by concatenation — test rigs and slow paths.
+    #[allow(dead_code)]
+    pub(crate) fn from_cells(cells: &[Cell]) -> Self {
+        let mut frame = Vec::new();
+        let mut rs = Vec::with_capacity(cells.len());
+        for c in cells {
+            match c {
+                Cell::Null => rs.push(CellR::Null),
+                Cell::UnchangedToast => rs.push(CellR::UnchangedToast),
+                Cell::Text(t) => {
+                    let o = frame.len() as u32;
+                    frame.extend_from_slice(t);
+                    rs.push(CellR::Text(o, t.len() as u32));
+                }
+            }
+        }
+        Tuple::from_rendered(frame, rs)
+    }
+}
 
 struct Reader<'a> {
     b: &'a [u8],
-    /// The frame this reader is walking, kept so text cells can be carved out
-    /// of it as refcounted slices instead of copies. `b` stays a plain slice
-    /// so every other accessor is untouched.
+    /// The frame, kept so tuples can carry it out whole — cells are ranges
+    /// into it, resolved lazily by `Tuple::view`.
     src: &'a bytes::Bytes,
     pos: usize,
 }
@@ -172,20 +265,20 @@ impl<'a> Reader<'a> {
     }
     fn tuple(&mut self) -> Result<Tuple> {
         let n = self.u16()? as usize;
-        let mut cols = Vec::with_capacity(n);
+        let mut cells = Vec::with_capacity(n);
         for _ in 0..n {
-            cols.push(match self.u8()? {
-                b'n' => Cell::Null,
-                b'u' => Cell::UnchangedToast,
+            cells.push(match self.u8()? {
+                b'n' => CellR::Null,
+                b'u' => CellR::UnchangedToast,
                 b't' => {
                     let len = self.u32()? as usize;
-                    // `slice_ref` maps the borrowed run back onto the owning
-                    // Bytes with no copy. An empty value yields Bytes::new(),
-                    // which is still `Text`, not `Null` — that distinction is
-                    // load-bearing (see the module docs and the empty-string
-                    // test).
-                    let run = self.take(len)?;
-                    Cell::Text(self.src.slice_ref(run))
+                    // A RANGE into the frame — no slice_ref, no refcount, no
+                    // promotion. An empty value is Text(o, 0), still `Text`,
+                    // never `Null` — that distinction is load-bearing (module
+                    // docs + the empty-string test).
+                    let start = self.pos as u32;
+                    self.take(len)?;
+                    CellR::Text(start, len as u32)
                 }
                 // 'b' (binary) can only appear if we asked for it — we don't.
                 other => {
@@ -196,7 +289,7 @@ impl<'a> Reader<'a> {
                 }
             });
         }
-        Ok(cols)
+        Ok(Tuple { frame: self.src.clone(), cells })
     }
 }
 
@@ -407,13 +500,9 @@ mod tests {
             b"9",
             b"n",
         ]);
-        assert_eq!(
-            decode(&ins, false).unwrap(),
-            PgoMessage::Insert {
-                rel_id: 42,
-                new: vec![Cell::Text(bytes::Bytes::from_static(b"9")), Cell::Null]
-            }
-        );
+        let PgoMessage::Insert { rel_id, new } = decode(&ins, false).unwrap() else { panic!() };
+        assert_eq!(rel_id, 42);
+        assert_eq!(new.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9")), Cell::Null]);
     }
 
     #[test]
@@ -437,8 +526,8 @@ mod tests {
         let PgoMessage::Update { old, new, .. } = decode(&upd, false).unwrap() else { panic!() };
         let old = old.unwrap();
         assert!(!old.full);
-        assert_eq!(old.tuple, vec![Cell::Text(bytes::Bytes::from_static(b"9"))]);
-        assert_eq!(new[1], Cell::UnchangedToast);
+        assert_eq!(old.tuple.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9"))]);
+        assert_eq!(new.view(1), Cellv::UnchangedToast);
         // The empty string stays a VALUE, never Null.
         let ins = frame(&[
             b"I",
@@ -449,8 +538,8 @@ mod tests {
             &0u32.to_be_bytes(),
         ]);
         let PgoMessage::Insert { new, .. } = decode(&ins, false).unwrap() else { panic!() };
-        assert_eq!(new[0], Cell::Text(bytes::Bytes::new()));
-        assert_ne!(new[0], Cell::Null);
+        assert_eq!(new.view(0), Cellv::Text(b""));
+        assert_ne!(new.view(0), Cellv::Null);
     }
 
     #[test]

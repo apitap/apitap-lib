@@ -8,7 +8,7 @@
 //! dialect, not what other engines parse.
 
 use crate::error::{Error, Result};
-use crate::wire::pgoutput::Cell;
+use crate::wire::pgoutput::{Cell, Cellv, Tuple};
 
 pub(crate) const BYTEA_OID: u32 = 17;
 pub(crate) const BOOL_OID: u32 = 16;
@@ -83,15 +83,15 @@ pub(crate) fn copy_escape(v: &[u8], out: &mut Vec<u8>) {
 }
 
 /// One full row, Postgres-dialect text (COPY text for a pg destination).
-pub(crate) fn render_copy_row(row: &[Cell], out: &mut Vec<u8>) -> Result<()> {
-    for (i, cell) in row.iter().enumerate() {
+pub(crate) fn render_copy_row(row: &Tuple, out: &mut Vec<u8>) -> Result<()> {
+    for (i, cell) in row.views().enumerate() {
         if i > 0 {
             out.push(b'\t');
         }
         match cell {
-            Cell::Null => out.extend_from_slice(b"\\N"),
-            Cell::Text(t) => copy_escape(t, out),
-            Cell::UnchangedToast => {
+            Cellv::Null => out.extend_from_slice(b"\\N"),
+            Cellv::Text(t) => copy_escape(t, out),
+            Cellv::UnchangedToast => {
                 return Err(Error::Transfer(
                     "log_based: unchanged-TOAST cell reached the bulk path — \
                      collapse bug"
@@ -117,11 +117,11 @@ pub(crate) fn pk_indices(pk_cols: &[String], wal_cols: &[String]) -> Result<Vec<
 }
 
 /// Borrow an upsert row's key cells (key cells are `Text` by construction).
-pub(crate) fn row_key_refs<'a>(row: &'a [Cell], pk_idx: &[usize]) -> Vec<&'a [u8]> {
+pub(crate) fn row_key_refs<'a>(row: &'a Tuple, pk_idx: &[usize]) -> Vec<&'a [u8]> {
     pk_idx
         .iter()
-        .map(|&i| match &row[i] {
-            Cell::Text(t) => &t[..],
+        .map(|&i| match row.view(i) {
+            Cellv::Text(t) => t,
             _ => b"".as_slice(),
         })
         .collect()
@@ -160,8 +160,31 @@ pub(crate) fn render_ch_value(v: &[u8], oid: u32, out: &mut Vec<u8>) -> Result<(
     Ok(())
 }
 
-/// One full row for ClickHouse TabSeparated, type-aware.
-pub(crate) fn render_ch_row(row: &[Cell], oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
+/// One full row for ClickHouse TabSeparated, type-aware (frame-native path).
+pub(crate) fn render_ch_row(row: &Tuple, oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
+    for (i, cell) in row.views().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
+        match cell {
+            Cellv::Null => out.extend_from_slice(b"\\N"),
+            Cellv::Text(t) => render_ch_value(t, oids[i], out)?,
+            Cellv::UnchangedToast => {
+                return Err(Error::Transfer(
+                    "log_based: unchanged-TOAST cell reached the bulk path — \
+                     collapse bug"
+                        .into(),
+                ))
+            }
+        }
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+/// Residue-tail variants over OWNED cells (`ResidueOp` materializes rows out
+/// of the frame-native fast path; rare by design).
+pub(crate) fn render_ch_row_cells(row: &[Cell], oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
     for (i, cell) in row.iter().enumerate() {
         if i > 0 {
             out.push(b'\t');
@@ -180,6 +203,16 @@ pub(crate) fn render_ch_row(row: &[Cell], oids: &[u32], out: &mut Vec<u8>) -> Re
     }
     out.push(b'\n');
     Ok(())
+}
+
+pub(crate) fn row_key_refs_cells<'a>(row: &'a [Cell], pk_idx: &[usize]) -> Vec<&'a [u8]> {
+    pk_idx
+        .iter()
+        .map(|&i| match &row[i] {
+            Cell::Text(t) => &t[..],
+            _ => b"".as_slice(),
+        })
+        .collect()
 }
 
 /// One key row (owned or borrowed cells) for ClickHouse TabSeparated.
@@ -251,15 +284,15 @@ pub(crate) fn render_my_value(v: &[u8], oid: u32, out: &mut Vec<u8>) -> Result<(
 }
 
 /// One full row for a MySQL LOAD DATA body, type-aware.
-pub(crate) fn render_my_row(row: &[Cell], oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
-    for (i, cell) in row.iter().enumerate() {
+pub(crate) fn render_my_row(row: &Tuple, oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
+    for (i, cell) in row.views().enumerate() {
         if i > 0 {
             out.push(b'\t');
         }
         match cell {
-            Cell::Null => out.extend_from_slice(b"\\N"),
-            Cell::Text(t) => render_my_value(t, oids[i], out)?,
-            Cell::UnchangedToast => {
+            Cellv::Null => out.extend_from_slice(b"\\N"),
+            Cellv::Text(t) => render_my_value(t, oids[i], out)?,
+            Cellv::UnchangedToast => {
                 return Err(Error::Transfer(
                     "log_based: unchanged-TOAST cell reached the bulk path — \
                      collapse bug"

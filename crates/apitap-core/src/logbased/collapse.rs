@@ -18,7 +18,7 @@
 //!   the `truncate` flag — apply order is truncate → deletes → upserts.
 
 use crate::error::{Error, Result};
-use crate::wire::pgoutput::Cell;
+use crate::wire::pgoutput::{Cell, Cellv, Tuple};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
@@ -32,7 +32,7 @@ pub(crate) struct Collapsed {
     /// Destination rows to delete (dedup'd). Applied FIRST.
     pub deletes: Vec<Key>,
     /// Final row images to land (one per surviving key). Applied second.
-    pub upserts: Vec<Vec<Cell>>,
+    pub upserts: Vec<Tuple>,
     /// Ordered tail for keys that touched an unchanged-TOAST update: once a
     /// key needs a masked UPDATE, every later event on that key stays in
     /// this ordered list (sticky per key — the set phases can no longer
@@ -75,7 +75,7 @@ pub(crate) struct Collapser {
     /// Row images by insertion order. The KEY is not stored here — an earlier
     /// version kept `(Key, Vec<Cell>)` and `finish()` threw the key away,
     /// which cost a clone per upsert for nothing.
-    upserts: Vec<Option<Vec<Cell>>>,
+    upserts: Vec<Option<Tuple>>,
     deletes: Vec<Key>,
     residue: Vec<ResidueOp>,
     truncate: bool,
@@ -96,7 +96,7 @@ impl Collapser {
     }
 
     /// Key of a FULL row tuple (new image) — from the key column indices.
-    fn key_of_row(&self, row: &[Cell]) -> Result<Key> {
+    fn key_of_row(&self, row: &Tuple) -> Result<Key> {
         self.key_idx
             .iter()
             .map(|&i| match row.get(i) {
@@ -106,13 +106,13 @@ impl Collapser {
                 // a full old row image alive for the window instead of ~8
                 // bytes. Copying the key columns keeps window memory bounded
                 // by what the 256 MB tier budgets for.
-                Some(Cell::Text(t)) => Ok(t.to_vec()),
-                Some(Cell::Null) | None => Err(Error::Transfer(
+                Some(Cellv::Text(t)) => Ok(t.to_vec()),
+                Some(Cellv::Null) | None => Err(Error::Transfer(
                     "log_based: NULL/missing replica-identity key column in row \
                      image — is REPLICA IDENTITY sane on the source table?"
                         .into(),
                 )),
-                Some(Cell::UnchangedToast) => Err(Error::Transfer(
+                Some(Cellv::UnchangedToast) => Err(Error::Transfer(
                     "log_based: replica-identity key column arrived as \
                      unchanged-TOAST — unsupported layout"
                         .into(),
@@ -124,11 +124,11 @@ impl Collapser {
     /// Key of an OLD image. `K` images carry ONLY key columns as Text, with
     /// non-key columns Null; `O` (FULL) images carry everything — either
     /// way the key columns are at the same indices.
-    fn key_of_old(&self, old: &[Cell]) -> Result<Key> {
+    fn key_of_old(&self, old: &Tuple) -> Result<Key> {
         self.key_of_row(old)
     }
 
-    pub(crate) fn insert(&mut self, row: Vec<Cell>) -> Result<()> {
+    pub(crate) fn insert(&mut self, row: Tuple) -> Result<()> {
         self.events += 1;
         let key = self.key_of_row(&row)?;
         // ONE map operation per event. The old shape did a residue pre-check
@@ -136,7 +136,7 @@ impl Collapser {
         // walks of a Vec<Vec<u8>> key for every change.
         match self.map.entry(key) {
             Entry::Occupied(mut e) => match *e.get() {
-                Slot::Residue => self.residue.push(ResidueOp::Upsert { row }),
+                Slot::Residue => self.residue.push(ResidueOp::Upsert { row: row.to_cells() }),
                 Slot::Upsert(seq) => {
                     // Last write wins in place.
                     self.upserts[seq] = Some(row);
@@ -157,7 +157,7 @@ impl Collapser {
         Ok(())
     }
 
-    pub(crate) fn update(&mut self, old: Option<&[Cell]>, row: Vec<Cell>) -> Result<()> {
+    pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple) -> Result<()> {
         self.events += 1;
         let new_key = self.key_of_row(&row)?;
         if let Some(old) = old {
@@ -167,7 +167,7 @@ impl Collapser {
                 self.put_delete(old_key);
             }
         }
-        let toast = row.iter().any(|c| matches!(c, Cell::UnchangedToast));
+        let toast = row.has_toast();
         match self.map.entry(new_key) {
             Entry::Occupied(mut e) => match *e.get() {
                 Slot::Residue => {
@@ -176,9 +176,9 @@ impl Collapser {
                     // path, where the op itself must carry it.
                     if toast {
                         let key = e.key().clone();
-                        self.residue.push(ResidueOp::MaskedUpdate { key, row });
+                        self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
                     } else {
-                        self.residue.push(ResidueOp::Upsert { row });
+                        self.residue.push(ResidueOp::Upsert { row: row.to_cells() });
                     }
                 }
                 Slot::Upsert(seq) if !toast => {
@@ -195,14 +195,14 @@ impl Collapser {
                     // key goes sticky. A pending SET-phase upsert stays where
                     // it is (phases run before the tail — correct order).
                     let key = e.key().clone();
-                    self.residue.push(ResidueOp::MaskedUpdate { key, row });
+                    self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
                     e.insert(Slot::Residue);
                 }
             },
             Entry::Vacant(e) => {
                 if toast {
                     let key = e.key().clone();
-                    self.residue.push(ResidueOp::MaskedUpdate { key, row });
+                    self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
                     e.insert(Slot::Residue);
                 } else {
                     let seq = self.upserts.len();
@@ -214,7 +214,7 @@ impl Collapser {
         Ok(())
     }
 
-    pub(crate) fn delete(&mut self, old: &[Cell]) -> Result<()> {
+    pub(crate) fn delete(&mut self, old: &Tuple) -> Result<()> {
         self.events += 1;
         let key = self.key_of_old(old)?;
         match self.map.entry(key) {
@@ -291,6 +291,12 @@ mod tests {
     fn t(s: &str) -> Cell {
         Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()))
     }
+    fn row(cells: &[Cell]) -> Tuple {
+        Tuple::from_cells(cells)
+    }
+    fn cells_of(ups: &[Tuple]) -> Vec<Vec<Cell>> {
+        ups.iter().map(|u| u.to_cells()).collect()
+    }
     fn key(parts: &[&str]) -> Key {
         parts.iter().map(|p| p.as_bytes().to_vec()).collect()
     }
@@ -302,20 +308,20 @@ mod tests {
     #[test]
     fn last_write_wins_and_order_survives() {
         let mut cl = c();
-        cl.insert(vec![t("1"), t("a")]).unwrap();
-        cl.insert(vec![t("2"), t("b")]).unwrap();
-        cl.update(None, vec![t("1"), t("a2")]).unwrap();
+        cl.insert(row(&[t("1"), t("a")])).unwrap();
+        cl.insert(row(&[t("2"), t("b")])).unwrap();
+        cl.update(None, row(&[t("1"), t("a2")])).unwrap();
         let out = cl.finish();
         assert_eq!(out.deletes.len(), 0);
-        assert_eq!(out.upserts, vec![vec![t("1"), t("a2")], vec![t("2"), t("b")]]);
+        assert_eq!(cells_of(&out.upserts), vec![vec![t("1"), t("a2")], vec![t("2"), t("b")]]);
         assert_eq!(out.events, 3);
     }
 
     #[test]
     fn insert_then_delete_nets_to_delete() {
         let mut cl = c();
-        cl.insert(vec![t("1"), t("a")]).unwrap();
-        cl.delete(&[t("1"), Cell::Null]).unwrap();
+        cl.insert(row(&[t("1"), t("a")])).unwrap();
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
         let out = cl.finish();
         assert_eq!(out.upserts.len(), 0);
         assert_eq!(out.deletes, vec![key(&["1"])]);
@@ -324,27 +330,27 @@ mod tests {
     #[test]
     fn delete_then_reinsert_keeps_both_phases() {
         let mut cl = c();
-        cl.delete(&[t("1"), Cell::Null]).unwrap();
-        cl.insert(vec![t("1"), t("new")]).unwrap();
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
+        cl.insert(row(&[t("1"), t("new")])).unwrap();
         let out = cl.finish();
         assert_eq!(out.deletes, vec![key(&["1"])]);
-        assert_eq!(out.upserts, vec![vec![t("1"), t("new")]]);
+        assert_eq!(cells_of(&out.upserts), vec![vec![t("1"), t("new")]]);
     }
 
     #[test]
     fn pk_change_update_deletes_the_old_identity() {
         let mut cl = c();
-        cl.insert(vec![t("1"), t("a")]).unwrap();
-        cl.update(Some(&[t("1"), Cell::Null]), vec![t("9"), t("a")]).unwrap();
+        cl.insert(row(&[t("1"), t("a")])).unwrap();
+        cl.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("9"), t("a")])).unwrap();
         let out = cl.finish();
         assert_eq!(out.deletes, vec![key(&["1"])]);
-        assert_eq!(out.upserts, vec![vec![t("9"), t("a")]]);
+        assert_eq!(cells_of(&out.upserts), vec![vec![t("9"), t("a")]]);
     }
 
     #[test]
     fn unchanged_toast_routes_to_residue_not_upsert() {
         let mut cl = c();
-        cl.update(Some(&[t("1"), Cell::Null]), vec![t("1"), Cell::UnchangedToast])
+        cl.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("1"), Cell::UnchangedToast]))
             .unwrap();
         let out = cl.finish();
         assert!(out.upserts.is_empty());
@@ -357,15 +363,15 @@ mod tests {
     #[test]
     fn residue_is_sticky_and_ordered_per_key() {
         let mut cl = c();
-        cl.insert(vec![t("1"), t("a")]).unwrap();
-        cl.update(Some(&[t("1"), Cell::Null]), vec![t("1"), Cell::UnchangedToast])
+        cl.insert(row(&[t("1"), t("a")])).unwrap();
+        cl.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("1"), Cell::UnchangedToast]))
             .unwrap();
         // Later full update on the same key must FOLLOW the masked update.
-        cl.update(Some(&[t("1"), Cell::Null]), vec![t("1"), t("z")]).unwrap();
-        cl.delete(&[t("1"), Cell::Null]).unwrap();
+        cl.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("1"), t("z")])).unwrap();
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
         let out = cl.finish();
         // The original insert stays in the set phase (applies first)…
-        assert_eq!(out.upserts, vec![vec![t("1"), t("a")]]);
+        assert_eq!(cells_of(&out.upserts), vec![vec![t("1"), t("a")]]);
         // …and the tail replays in order: masked, full upsert, delete.
         assert!(matches!(out.residue[0], ResidueOp::MaskedUpdate { .. }));
         assert!(matches!(out.residue[1], ResidueOp::Upsert { .. }));
@@ -375,19 +381,19 @@ mod tests {
     #[test]
     fn truncate_wipes_prior_window_and_flags() {
         let mut cl = c();
-        cl.insert(vec![t("1"), t("a")]).unwrap();
-        cl.delete(&[t("2"), Cell::Null]).unwrap();
+        cl.insert(row(&[t("1"), t("a")])).unwrap();
+        cl.delete(&row(&[t("2"), Cell::Null])).unwrap();
         cl.truncate();
-        cl.insert(vec![t("3"), t("post")]).unwrap();
+        cl.insert(row(&[t("3"), t("post")])).unwrap();
         let out = cl.finish();
         assert!(out.truncate);
         assert!(out.deletes.is_empty());
-        assert_eq!(out.upserts, vec![vec![t("3"), t("post")]]);
+        assert_eq!(cells_of(&out.upserts), vec![vec![t("3"), t("post")]]);
     }
 
     #[test]
     fn null_key_fails_loudly() {
         let mut cl = c();
-        assert!(cl.insert(vec![Cell::Null, t("a")]).is_err());
+        assert!(cl.insert(row(&[Cell::Null, t("a")])).is_err());
     }
 }

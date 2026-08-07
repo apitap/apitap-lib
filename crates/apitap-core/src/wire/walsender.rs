@@ -1132,8 +1132,8 @@ mod tests {
                             match pgoutput::decode(&payload, false).expect("decode") {
                                 PgoMessage::Insert { new, .. } => {
                                     ins += 1;
-                                    if new.iter().any(|c| {
-                                        matches!(c, pgoutput::Cell::Text(t) if t.is_empty())
+                                    if new.views().any(|c| {
+                                        matches!(c, pgoutput::Cellv::Text(t) if t.is_empty())
                                     }) {
                                         empty_string_seen = true;
                                     }

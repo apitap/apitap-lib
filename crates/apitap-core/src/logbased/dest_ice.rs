@@ -249,12 +249,20 @@ fn resolve_window<'a>(c: &'a Collapsed, pk_idx: &[usize]) -> Vec<(Key, Fin<'a>)>
         }
     }
     let key_of = |row: &[Cell]| -> Key {
+        crate::logbased::rowtext::row_key_refs_cells(row, pk_idx)
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let key_of_t = |row: &crate::wire::pgoutput::Tuple| -> Key {
         row_key_refs(row, pk_idx).into_iter().map(<[u8]>::to_vec).collect()
     };
     let mut order: Vec<(Key, Fin<'a>)> = Vec::with_capacity(c.upserts.len());
     let mut index: HashMap<Key, usize> = HashMap::with_capacity(c.upserts.len());
     for row in &c.upserts {
-        put(&mut order, &mut index, key_of(row), Fin::Row(row));
+        // Iceberg is the coolest lane: it materializes owned cells here and
+        // keeps its patch/refetch machinery unchanged.
+        put(&mut order, &mut index, key_of_t(row), Fin::Owned(row.to_cells()));
     }
     for op in &c.residue {
         match op {
@@ -462,7 +470,10 @@ mod tests {
     fn residue_replay_lands_final_rows_in_order() {
         let c = Collapsed {
             deletes: vec![key1("9")],
-            upserts: vec![vec![t("1"), t("a")], vec![t("2"), t("b")]],
+            upserts: vec![
+                crate::wire::pgoutput::Tuple::from_cells(&[t("1"), t("a")]),
+                crate::wire::pgoutput::Tuple::from_cells(&[t("2"), t("b")]),
+            ],
             residue: vec![
                 ResidueOp::MaskedUpdate {
                     key: key1("1"),

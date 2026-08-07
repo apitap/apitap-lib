@@ -19,7 +19,7 @@ use crate::logbased::collapse::{Collapsed, Collapser};
 use crate::logbased::drain::DrainOutcome;
 use crate::wire::mybinlog::{self as bl, BinlogState, TableSchema};
 use crate::wire::mywire::MyWire;
-use crate::wire::pgoutput::{Cell, PgoMessage};
+use crate::wire::pgoutput::{PgoMessage, Tuple};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -318,7 +318,7 @@ pub(crate) async fn drain_binlog(
                     };
                     match op {
                         TxOp::Insert(row) => c.insert(row)?,
-                        TxOp::Update(old, row) => c.update(old.as_deref(), row)?,
+                        TxOp::Update(old, row) => c.update(old.as_ref(), row)?,
                         TxOp::Delete(old) => c.delete(&old)?,
                     }
                 }
@@ -362,17 +362,13 @@ pub(crate) async fn drain_binlog(
 }
 
 enum TxOp {
-    Insert(Vec<Cell>),
-    Update(Option<Vec<Cell>>, Vec<Cell>),
-    Delete(Vec<Cell>),
+    Insert(Tuple),
+    Update(Option<Tuple>, Tuple),
+    Delete(Tuple),
 }
 
-fn cells_bytes(row: &[Cell]) -> usize {
-    row.iter()
-        .map(|c| match c {
-            Cell::Text(t) => t.len() + 24,
-            _ => 8,
-        })
+fn cells_bytes(row: &Tuple) -> usize {
+    std::iter::once(row.frame.len() + row.cells.len() * 12)
         .sum::<usize>()
         + 48
 }

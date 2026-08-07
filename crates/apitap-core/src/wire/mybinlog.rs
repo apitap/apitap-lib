@@ -16,7 +16,7 @@
 //! stripping 4 bytes uniformly when checksums are on is correct.
 
 use crate::error::{Error, Result};
-use crate::wire::pgoutput::{Cell, OldImage, PgoMessage, Relation, RelationCol, Tuple};
+use crate::wire::pgoutput::{Cell, CellR, Cellv, OldImage, PgoMessage, Relation, RelationCol, Tuple};
 use std::collections::HashMap;
 
 /// The 19-byte common header every event after v4 carries.
@@ -295,30 +295,30 @@ fn bit(bm: &[u8], i: usize) -> bool {
 fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Result<Tuple> {
     let n_present = (0..ncols).filter(|&i| bit(present, i)).count();
     let nullbm = r.take((n_present + 7) / 8)?.to_vec();
-    let mut out = Vec::with_capacity(ncols);
+    // ONE buffer per row: every decoded value renders into `frame`, and cells
+    // are ranges into it. The previous shape allocated per cell (a Vec from
+    // decode_cell, then a boxed-slice Bytes) — ~15 allocation pairs per row on
+    // the lane with no shared wire frame to slice from. This IS that lane's
+    // arena.
+    let mut frame = Vec::with_capacity(ncols * 16);
+    let mut cells = Vec::with_capacity(ncols);
     let mut k = 0usize; // index within the present/null bitmaps
     for (i, c) in cols.iter().enumerate().take(ncols) {
         if !bit(present, i) {
-            out.push(Cell::UnchangedToast);
+            cells.push(CellR::UnchangedToast);
             continue;
         }
         if bit(&nullbm, k) {
-            out.push(Cell::Null);
+            cells.push(CellR::Null);
         } else {
-            // `into_boxed_slice` first: `Bytes::from(Vec<u8>)` is only free when
-            // len == capacity, and the temporal and DECIMAL arms of decode_cell
-            // build their text with format!/push_str, which leaves slack — so a
-            // plain From would heap a Shared box and ADD an allocation on the
-            // one CDC path that has no shared frame to slice from. The pg lane's
-            // win does not transfer here; this only makes sure we do not make
-            // MySQL worse while taking it.
-            out.push(Cell::Text(bytes::Bytes::from(
-                decode_cell(r, c)?.into_boxed_slice(),
-            )));
+            let start = frame.len() as u32;
+            let v = decode_cell(r, c)?;
+            frame.extend_from_slice(&v);
+            cells.push(CellR::Text(start, v.len() as u32));
         }
         k += 1;
     }
-    Ok(out)
+    Ok(Tuple::from_rendered(frame, cells))
 }
 
 /// Decode one non-NULL packed binlog value into destination-ready TEXT.
@@ -1094,9 +1094,9 @@ mod tests {
         let ev = parse_rows(&b, EV_WRITE_ROWS, &map).unwrap();
         assert_eq!(ev.rows.len(), 1);
         let after = ev.rows[0].1.clone().unwrap();
-        assert_eq!(after[0], Cell::Text(bytes::Bytes::from_static(b"7")));
-        assert_eq!(after[1], Cell::Text(bytes::Bytes::from_static(b"hi")));
-        assert_eq!(after[2], Cell::Null);
+        assert_eq!(after.view(0), Cellv::Text(b"7"));
+        assert_eq!(after.view(1), Cellv::Text(b"hi"));
+        assert_eq!(after.view(2), Cellv::Null);
 
         // A partial image (MINIMAL): column 2 absent -> UnchangedToast.
         let mut b = Vec::new();
@@ -1110,8 +1110,8 @@ mod tests {
         b.extend_from_slice(&9i32.to_le_bytes());
         let ev = parse_rows(&b, EV_WRITE_ROWS, &map).unwrap();
         let after = ev.rows[0].1.clone().unwrap();
-        assert_eq!(after[1], Cell::UnchangedToast, "absent column must not read as NULL");
-        assert_eq!(after[2], Cell::Text(bytes::Bytes::from_static(b"9")));
+        assert_eq!(after.view(1), Cellv::UnchangedToast, "absent column must not read as NULL");
+        assert_eq!(after.view(2), Cellv::Text(b"9"));
     }
 
     #[test]
@@ -1130,7 +1130,7 @@ mod tests {
             "bench.t".into(),
             TableSchema { names: vec!["id".into()], key: vec![true], unsigned: vec![false] },
         );
-        let ev = RowsEvent { table_id: 42, rows: vec![(None, Some(vec![Cell::Text(bytes::Bytes::from_static(b"1"))]))] };
+        let ev = RowsEvent { table_id: 42, rows: vec![(None, Some(Tuple::from_cells(&[Cell::Text(bytes::Bytes::from_static(b"1"))])))] };
         let msgs = to_messages(&mut st, EV_WRITE_ROWS, ev).unwrap();
         match &msgs[0] {
             PgoMessage::Relation(r) => {

@@ -12,8 +12,8 @@ use crate::error::{Error, Result};
 use crate::logbased::collapse::ResidueOp;
 use crate::logbased::drain::DrainOutcome;
 use crate::logbased::rowtext::{
-    ch_key_literal, pk_indices, render_ch_key, render_ch_row, render_ch_value, row_key_refs,
-    tsv_unescape,
+    ch_key_literal, pk_indices, render_ch_key, render_ch_row, render_ch_row_cells,
+    render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
 };
 use crate::sink::clickhouse::{ch_ident, ch_str, ChConn};
 use crate::wire::pgoutput::Cell;
@@ -296,14 +296,14 @@ impl ChDest {
                         .await?;
                 }
                 ResidueOp::Upsert { row } => {
-                    let key: Vec<Vec<u8>> = row_key_refs(row, &pk_idx)
+                    let key: Vec<Vec<u8>> = row_key_refs_cells(row, &pk_idx)
                         .into_iter()
                         .map(|k| k.to_vec())
                         .collect();
                     let pred = key_pred(pk_cols, &key, &pk_oids)?;
                     self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
                     let mut buf = Vec::new();
-                    render_ch_row(row, oids, &mut buf)?;
+                    render_ch_row_cells(row, oids, &mut buf)?;
                     self.ch
                         .insert_stream(
                             &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
