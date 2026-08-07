@@ -73,3 +73,34 @@ Interleaved same-round comparisons stayed valid all night; absolute numbers
 did not (identical work: 40.4→47.7s across hours). Every number above is a
 within-round or same-block comparison. The bench harness needs a per-round
 full reset baked in before the next campaign.
+
+## Addendum — the 25s hunt, fresh-cage evidence (2026-08-07 morning)
+
+Fresh cage (all three bench containers restarted, binlogs purged): 0.29.0 PGO
+baseline 42.3/44.2/44.1 (median 44.1s, ~20.2 CPU-s, 93% saturated).
+
+The current_thread knife erased the futex pool entirely (158K calls → zero);
+the syscall census is now recvfrom 168K + epoll_wait 176K (~1 wall-s total).
+Fresh flat profile: bytes refcount 7.5% (down from 17.3% — uncontended now),
+Reader::tuple+drain 5.2%, key_of_row 2.0%, copy_escape 1.85% (was 12.0%),
+pump+read_frame 2.2%. Server r3: INSERT 8.17s + DELETE 6.76s, hidden.
+
+**The honest plateau: ~32-33s** for this 15-column workload — that is the
+client-CPU-forced wall if every visible our-code symbol were removed
+perfectly. 25s = 60K wide changes/s on half a core; nothing we have measured
+does that on a full core.
+
+**Next knife, specified (build in a fresh session):** frame-native rows.
+`Tuple` becomes `{ frame: Bytes, cells: Vec<CellR> }`,
+`CellR = Null | Range(u32,u32) | UnchangedToast` (Copy, 12B vs 40B):
+- kills the per-cell slice_ref/clone/drop entirely (7.5% + the 1.5M
+  KIND_VEC→Arc promotion allocs hiding in malloc);
+- Reader::tuple builds ranges, not Bytes (its 2.7% shrinks with it);
+- the MySQL lane gets its row-arena for free: decode_cell renders into ONE
+  per-row buffer that becomes the frame (15 allocs/row → 1);
+- Key stays Vec<Vec<u8>> (the retention rule from 0.28.0 holds).
+Predicted: cdc-pg 44 → ~39s, cdc-my 7.6 → ~6s. Abort under 2s on pg.
+Touches: pgoutput, mybinlog, collapse, drain, rowtext, dest_ch/pg/my/ice,
+mysource (~300-400 lines). After it lands, the road below ~35s is
+architectural (narrower rows already do 132K/s; more CPU; or the parked
+CH≥25.7 patch-parts) — a product decision, not a knife.
