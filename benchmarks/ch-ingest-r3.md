@@ -177,3 +177,30 @@ at step 1. Code reverted (never committed); receipts stay here.
 Standing physics from this A/B: wall 40.4s at avg 0.484 cores = the wall IS
 client CPU (19.5s / 0.5 core ≈ 39s). The 25s target = client cpu ≤12.5s (−36%);
 150K/s wide = ≤5.0s (−74%), with us as the engine.
+
+## Addendum 5 — the physics terminus (z13/z13b receipts)
+
+Question: can ANY engine do cdc-pg wide 1.5M under 25s (or 150K/s) at 0.5cpu/256MB?
+
+Oracle: `pg_recvlogical` (postgres's own C client) draining the IDENTICAL pgoutput
+stream (same publication, same 1.5M burst) to /dev/null in the same cage — zero
+decode, zero collapse, zero render, zero destination.
+
+| run | wall | user | sys | avg cores |
+|---|---|---|---|---|
+| z13 | 37.4s | — | — | — |
+| z13b | 36.9s | 3.8s | 12.8s | 0.45 / 0.50 (90% saturated) |
+
+The empty receiver is CAGE-CPU-BOUND, and 77% of its CPU is KERNEL time — the
+TCP receive path for ~900MB of WAL. Receiving this stream costs ~16.6s of CPU;
+at 0.5 cores that is a ~34-37s wall for ANYONE. Matches our own profile (z10:
+>50% kernel, recvfrom 168K calls) — we pay the same rx tax.
+
+**apitap full pipeline: 40.4s = the physics floor + 8%.** Decode + collapse
+dedup + render + HTTP ship + exact idempotent apply, all inside +3.0s of an
+empty C receiver.
+
+Verdict: 25s and 150K/s wide at 0.5 core are not engineering targets on this
+rig — the floor alone is ~37s. The remaining levers change the physics, not the
+engine: fewer bytes on the wire, more cores, or not receiving the stream (pull —
+rejected on identity). Campaign closes here, at the floor.
