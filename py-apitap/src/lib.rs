@@ -17,6 +17,30 @@ fn rt() -> &'static Runtime {
     RT.get_or_init(|| Runtime::new().expect("tokio runtime"))
 }
 
+/// log_based rides a fresh current_thread runtime on the CALLING thread
+/// instead of the shared multi-thread one. The CDC pipeline is three tasks
+/// (frame pump, decode+collapse, apply) whose Bytes cells share refcounts:
+/// on the multi-thread runtime the tasks land on different workers and the
+/// atomic increments ping-pong cache lines between cores — a post-knife
+/// flamegraph put bytes::shared_clone at 14.4% of samples with an ~18%
+/// futex/syscall pool beside it. On one thread the atomics are uncontended
+/// and the channel hops never cross cores. I/O overlap survives (tasks
+/// interleave cooperatively at every await); only true CPU parallelism is
+/// lost, which the capped tier never had — and the historical receipt is
+/// that log_based's number "does not move" between the full box and half a
+/// core. Bulk lanes keep the shared runtime: their parallel range pipes DO
+/// use the cores.
+fn run_cdc<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current_thread runtime")
+        .block_on(fut)
+}
+
 /// Returns `(rows, elapsed_ms, parallel)`; the Python wrapper turns it into a report.
 #[pyfunction]
 #[pyo3(signature = (src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None))]
@@ -50,7 +74,14 @@ fn transfer(
         order_by,
         on_cluster,
     };
-    let out = py.allow_threads(|| rt().block_on(apitap_core::transfer(&src, &dst, &table, &opts)));
+    let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
+    let out = py.allow_threads(|| {
+        if cdc {
+            run_cdc(apitap_core::transfer(&src, &dst, &table, &opts))
+        } else {
+            rt().block_on(apitap_core::transfer(&src, &dst, &table, &opts))
+        }
+    });
     match out {
         Ok(r) => Ok((r.rows, r.elapsed_ms, r.parallel)),
         Err(apitap_core::Error::InvalidInput(m)) => Err(PyValueError::new_err(m)),
@@ -110,8 +141,9 @@ fn transfer_many(
         order_by,
         on_cluster,
     };
+    let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
     let out = py.allow_threads(|| {
-        rt().block_on(async {
+        let fut = async {
             if let Some(sp) = &parsed_specs {
                 return apitap_core::transfer_tables(&src, &dst, sp, &opts).await;
             }
@@ -119,7 +151,12 @@ fn transfer_many(
                 Some(ts) => apitap_core::transfer_many(&src, &dst, ts, &opts).await,
                 None => apitap_core::transfer_schema(&src, &dst, schema.as_deref(), &opts).await,
             }
-        })
+        };
+        if cdc {
+            run_cdc(fut)
+        } else {
+            rt().block_on(fut)
+        }
     });
     match out {
         Ok(r) => Ok((

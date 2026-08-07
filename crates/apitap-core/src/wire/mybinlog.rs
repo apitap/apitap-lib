@@ -327,59 +327,65 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
     match c.kind {
         MT_TINY => {
             let v = r.u8()?;
-            if c.unsigned { s(v.to_string()) } else { s((v as i8).to_string()) }
+            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i8)) }
         }
         MT_SHORT => {
             let v = r.u16le()?;
-            if c.unsigned { s(v.to_string()) } else { s((v as i16).to_string()) }
+            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i16)) }
         }
         MT_INT24 => {
             let b = r.take(3)?;
             let raw = u32::from_le_bytes([b[0], b[1], b[2], 0]);
             if c.unsigned {
-                s(raw.to_string())
+                Ok(int_bytes(raw))
             } else {
                 // Sign-extend 24 bits.
                 let v = if raw & 0x80_0000 != 0 { (raw | 0xFF00_0000) as i32 } else { raw as i32 };
-                s(v.to_string())
+                Ok(int_bytes(v))
             }
         }
         MT_LONG => {
             let v = r.u32le()?;
-            if c.unsigned { s(v.to_string()) } else { s((v as i32).to_string()) }
+            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i32)) }
         }
         MT_LONGLONG => {
             let v = r.u64le()?;
-            if c.unsigned { s(v.to_string()) } else { s((v as i64).to_string()) }
+            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i64)) }
         }
         MT_FLOAT => {
             let v = f32::from_le_bytes(r.take(4)?.try_into().unwrap());
             let mut buf = ryu::Buffer::new();
-            s(buf.format(v).to_string())
+            Ok(buf.format(v).as_bytes().to_vec())
         }
         MT_DOUBLE => {
             let v = f64::from_le_bytes(r.take(8)?.try_into().unwrap());
             let mut buf = ryu::Buffer::new();
-            s(buf.format(v).to_string())
+            Ok(buf.format(v).as_bytes().to_vec())
         }
         MT_YEAR => {
             let v = r.u8()? as u32;
-            s(if v == 0 { "0000".into() } else { (1900 + v).to_string() })
+            if v == 0 { Ok(b"0000".to_vec()) } else { Ok(int_bytes(1900 + v)) }
         }
         MT_DATE => {
             let b = r.take(3)?;
             let v = u32::from_le_bytes([b[0], b[1], b[2], 0]);
             let (y, m, d) = (v >> 9, (v >> 5) & 0xF, v & 0x1F);
-            s(format!("{y:04}-{m:02}-{d:02}"))
+            let mut out = Vec::with_capacity(10);
+            push_year(&mut out, y);
+            out.push(b'-');
+            push2(&mut out, m);
+            out.push(b'-');
+            push2(&mut out, d);
+            Ok(out)
         }
         MT_TIMESTAMP => {
             let secs = r.u32le()? as i64;
-            s(fmt_epoch(secs, 0))
+            Ok(fmt_epoch(secs, 0))
         }
         MT_TIMESTAMP2 => {
             let secs = i32::from_be_bytes(r.take(4)?.try_into().unwrap()) as i64;
             let frac = read_frac(r, c.meta as u8)?;
-            s(fmt_epoch(secs, frac))
+            Ok(fmt_epoch(secs, frac))
         }
         MT_DATETIME2 => {
             // 5 bytes big-endian, 40 bits: sign(1) yearmonth(17) day(5)
@@ -398,9 +404,20 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             let mi = (v >> 6) & 0x3F;
             let sec = v & 0x3F;
             let frac = read_frac(r, c.meta as u8)?;
-            let mut out = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{sec:02}");
+            let mut out = Vec::with_capacity(26);
+            push_year(&mut out, y as u32);
+            out.push(b'-');
+            push2(&mut out, mo as u32);
+            out.push(b'-');
+            push2(&mut out, d as u32);
+            out.push(b' ');
+            push2(&mut out, h as u32);
+            out.push(b':');
+            push2(&mut out, mi as u32);
+            out.push(b':');
+            push2(&mut out, sec as u32);
             push_frac(&mut out, frac, c.meta as u8);
-            s(out)
+            Ok(out)
         }
         MT_TIME2 => {
             let b = r.take(3)?;
@@ -410,14 +427,24 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             let mi = (v >> 6) & 0x3F;
             let sec = v & 0x3F;
             let frac = read_frac(r, c.meta as u8)?;
-            let mut out = format!("{h:02}:{mi:02}:{sec:02}");
+            let mut out = Vec::with_capacity(18);
+            if h < 100 {
+                push2(&mut out, h);
+            } else {
+                // TIME can reach 838 hours; {h:02} printed full digits too.
+                out.extend_from_slice(itoa::Buffer::new().format(h).as_bytes());
+            }
+            out.push(b':');
+            push2(&mut out, mi);
+            out.push(b':');
+            push2(&mut out, sec);
             push_frac(&mut out, frac, c.meta as u8);
-            s(out)
+            Ok(out)
         }
         MT_NEWDECIMAL => {
             let precision = (c.meta >> 8) as u32;
             let scale = (c.meta & 0xFF) as u32;
-            s(decode_decimal(r, precision, scale)?)
+            decode_decimal(r, precision, scale)
         }
         MT_VARCHAR | MT_VAR_STRING => {
             // The prefix width follows the declared max length in BYTES.
@@ -524,27 +551,97 @@ fn read_frac(r: &mut R<'_>, fsp: u8) -> Result<u32> {
     })
 }
 
-fn push_frac(out: &mut String, frac: u32, fsp: u8) {
+/// "00".."99" as one flat table — the two-digit building block the temporal
+/// renderers use instead of core::fmt (fmt machinery profiled ~10% of the
+/// capped my→ch CDC drain; a schema A/B put the whole temporal+decimal cell
+/// cost at ~20% of the lane).
+static DIGITS2: [u8; 200] = *b"00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
+#[inline(always)]
+fn push2(out: &mut Vec<u8>, v: u32) {
+    debug_assert!(v < 100);
+    let i = (v as usize % 100) * 2;
+    out.extend_from_slice(&DIGITS2[i..i + 2]);
+}
+
+/// Years are 4-digit in every valid MySQL temporal; corrupt/edge encodings
+/// (17-bit yearmonth can reach 10082) fall back to full digits, matching
+/// what `{y:04}` printed before.
+#[inline(always)]
+fn push_year(out: &mut Vec<u8>, y: u32) {
+    if y < 10_000 {
+        push2(out, y / 100);
+        push2(out, y % 100);
+    } else {
+        out.extend_from_slice(itoa::Buffer::new().format(y).as_bytes());
+    }
+}
+
+#[inline(always)]
+fn int_bytes<T: itoa::Integer>(v: T) -> Vec<u8> {
+    itoa::Buffer::new().format(v).as_bytes().to_vec()
+}
+
+/// Zero-padded fixed-width decimal digits (base-1e9 group middles and the
+/// fractional remainder of NEWDECIMAL — where leading zeros are data).
+fn push_padded(out: &mut Vec<u8>, mut v: u32, width: usize) {
+    let mut pow = 10u32.pow(width as u32 - 1);
+    for _ in 0..width {
+        out.push(b'0' + (v / pow) as u8);
+        v %= pow;
+        pow = pow.max(1) / 10;
+    }
+}
+
+fn push_frac(out: &mut Vec<u8>, frac: u32, fsp: u8) {
     if fsp > 0 {
-        let digits = fsp.min(6) as usize;
-        let scaled = frac / 10u32.pow(6 - digits as u32);
-        out.push('.');
-        out.push_str(&format!("{scaled:0digits$}", digits = digits));
+        let digits = fsp.min(6) as u32;
+        let mut scaled = frac / 10u32.pow(6 - digits);
+        out.push(b'.');
+        let mut pow = 10u32.pow(digits - 1);
+        for _ in 0..digits {
+            out.push(b'0' + (scaled / pow) as u8);
+            scaled %= pow;
+            pow = pow.max(1) / 10;
+        }
     }
 }
 
 /// Unix seconds (+ micros) → `YYYY-MM-DD HH:MM:SS[.ffffff]+00` — the
 /// timestamptz text every destination's renderer expects.
-fn fmt_epoch(secs: i64, micros: u32) -> String {
+fn fmt_epoch(secs: i64, micros: u32) -> Vec<u8> {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let mut out = format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+    let mut out = Vec::with_capacity(29);
+    push_year(&mut out, y as u32);
+    out.push(b'-');
+    push2(&mut out, m);
+    out.push(b'-');
+    push2(&mut out, d);
+    out.push(b' ');
+    push2(&mut out, h as u32);
+    out.push(b':');
+    push2(&mut out, mi as u32);
+    out.push(b':');
+    push2(&mut out, s as u32);
     if micros > 0 {
-        out.push_str(&format!(".{micros:06}"));
+        out.push(b'.');
+        push2(&mut out, micros / 10_000);
+        push2(&mut out, (micros / 100) % 100);
+        push2(&mut out, micros % 100);
     }
-    out.push_str("+00");
+    out.extend_from_slice(b"+00");
     out
 }
 
@@ -565,7 +662,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// NEWDECIMAL: base-1e9 groups, big-endian, sign in the top bit of the
 /// first byte (negative values arrive one's-complemented).
-fn decode_decimal(r: &mut R<'_>, precision: u32, scale: u32) -> Result<String> {
+fn decode_decimal(r: &mut R<'_>, precision: u32, scale: u32) -> Result<Vec<u8>> {
     const DIG_PER: u32 = 9;
     const BYTES_FOR: [usize; 10] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
     let int_digits = precision - scale;
@@ -584,45 +681,50 @@ fn decode_decimal(r: &mut R<'_>, precision: u32, scale: u32) -> Result<String> {
         }
     }
     let mut rd = R::new(&b);
-    let mut int_part = String::new();
+    let mut out = Vec::with_capacity(precision as usize + 3);
+    if negative {
+        out.push(b'-');
+    }
+    let int_start = out.len();
+    // The leading group renders unpadded (its leading zeros are not data);
+    // every later group is a fixed 9-digit block. Byte-identical to the
+    // String version this replaced — including a literal "0" leading group,
+    // which stays a rendered zero exactly as `v.to_string()` produced.
     if int_rest > 0 {
         let n = BYTES_FOR[int_rest as usize];
         let mut v = 0u32;
         for byte in rd.take(n)? {
             v = (v << 8) | *byte as u32;
         }
-        int_part.push_str(&v.to_string());
+        out.extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
     }
     for _ in 0..int_full {
         let v = u32::from_be_bytes(rd.take(4)?.try_into().unwrap());
-        if int_part.is_empty() {
-            int_part.push_str(&v.to_string());
+        if out.len() == int_start {
+            out.extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
         } else {
-            int_part.push_str(&format!("{v:09}"));
+            push_padded(&mut out, v, 9);
         }
     }
-    if int_part.is_empty() {
-        int_part.push('0');
+    if out.len() == int_start {
+        out.push(b'0');
     }
-    let mut frac_part = String::new();
-    for _ in 0..frac_full {
-        let v = u32::from_be_bytes(rd.take(4)?.try_into().unwrap());
-        frac_part.push_str(&format!("{v:09}"));
-    }
-    if frac_rest > 0 {
-        let n = BYTES_FOR[frac_rest as usize];
-        let mut v = 0u32;
-        for byte in rd.take(n)? {
-            v = (v << 8) | *byte as u32;
+    if scale > 0 {
+        out.push(b'.');
+        for _ in 0..frac_full {
+            let v = u32::from_be_bytes(rd.take(4)?.try_into().unwrap());
+            push_padded(&mut out, v, 9);
         }
-        frac_part.push_str(&format!("{v:0w$}", w = frac_rest as usize));
+        if frac_rest > 0 {
+            let n = BYTES_FOR[frac_rest as usize];
+            let mut v = 0u32;
+            for byte in rd.take(n)? {
+                v = (v << 8) | *byte as u32;
+            }
+            push_padded(&mut out, v, frac_rest as usize);
+        }
     }
-    let sign = if negative { "-" } else { "" };
-    Ok(if scale > 0 {
-        format!("{sign}{int_part}.{frac_part}")
-    } else {
-        format!("{sign}{int_part}")
-    })
+    Ok(out)
 }
 
 /// A decoded ROWS event, ready to become `PgoMessage`s.
@@ -774,6 +876,47 @@ pub(crate) const TYPE_TX_PAYLOAD: u8 = EV_TRANSACTION_PAYLOAD;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn digit_renderers_match_the_fmt_oracle() {
+        // fmt_epoch vs the format! it replaced.
+        for (secs, micros) in [
+            (0i64, 0u32),
+            (1, 5),
+            (951_827_696, 123_456),
+            (-1, 0),
+            (2_147_483_647, 999_999),
+        ] {
+            let days = secs.div_euclid(86_400);
+            let rem = secs.rem_euclid(86_400);
+            let (y, m, d) = civil_from_days(days);
+            let (h, mi, sc) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+            let mut want = format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sc:02}");
+            if micros > 0 {
+                want.push_str(&format!(".{micros:06}"));
+            }
+            want.push_str("+00");
+            assert_eq!(fmt_epoch(secs, micros), want.into_bytes(), "secs={secs}");
+        }
+        // push_frac truncation vs the format! it replaced, all fsp widths.
+        for fsp in 1u8..=6 {
+            for frac in [0u32, 5, 123_456, 999_999, 500_000] {
+                let mut got = Vec::new();
+                push_frac(&mut got, frac, fsp);
+                let digits = fsp.min(6) as usize;
+                let scaled = frac / 10u32.pow(6 - digits as u32);
+                let want = format!(".{scaled:0digits$}", digits = digits);
+                assert_eq!(got, want.into_bytes(), "fsp={fsp} frac={frac}");
+            }
+        }
+        // push_padded is the {v:0width$} of the decimal middle groups.
+        let mut got = Vec::new();
+        push_padded(&mut got, 5, 9);
+        assert_eq!(got, b"000000005");
+        let mut got = Vec::new();
+        push_padded(&mut got, 987_654_321, 9);
+        assert_eq!(got, b"987654321");
+    }
+
     use super::*;
 
     fn hdr(t: u8, body: &[u8], log_pos: u32) -> Vec<u8> {

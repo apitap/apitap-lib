@@ -19,6 +19,7 @@
 
 use crate::error::{Error, Result};
 use crate::wire::pgoutput::Cell;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 /// A replica-identity key: the key columns' text values in key-column order.
@@ -67,8 +68,14 @@ enum Slot {
 pub(crate) struct Collapser {
     /// Indices of the key columns within the row tuple.
     key_idx: Vec<usize>,
-    map: HashMap<Key, Slot>,
-    upserts: Vec<Option<(Key, Vec<Cell>)>>,
+    /// foldhash: the keys are our own PK bytes from a database we connect
+    /// to — hashDoS is not in the threat model, and SipHash was 6.5% of the
+    /// capped my→ch drain's samples.
+    map: HashMap<Key, Slot, foldhash::fast::RandomState>,
+    /// Row images by insertion order. The KEY is not stored here — an earlier
+    /// version kept `(Key, Vec<Cell>)` and `finish()` threw the key away,
+    /// which cost a clone per upsert for nothing.
+    upserts: Vec<Option<Vec<Cell>>>,
     deletes: Vec<Key>,
     residue: Vec<ResidueOp>,
     truncate: bool,
@@ -79,7 +86,7 @@ impl Collapser {
     pub(crate) fn new(key_idx: Vec<usize>) -> Self {
         Self {
             key_idx,
-            map: HashMap::new(),
+            map: HashMap::default(),
             upserts: Vec::new(),
             deletes: Vec::new(),
             residue: Vec::new(),
@@ -124,11 +131,29 @@ impl Collapser {
     pub(crate) fn insert(&mut self, row: Vec<Cell>) -> Result<()> {
         self.events += 1;
         let key = self.key_of_row(&row)?;
-        if matches!(self.map.get(&key), Some(Slot::Residue)) {
-            self.residue.push(ResidueOp::Upsert { row });
-            return Ok(());
+        // ONE map operation per event. The old shape did a residue pre-check
+        // get, then put_upsert's own get, then an insert — three hash+probe
+        // walks of a Vec<Vec<u8>> key for every change.
+        match self.map.entry(key) {
+            Entry::Occupied(mut e) => match *e.get() {
+                Slot::Residue => self.residue.push(ResidueOp::Upsert { row }),
+                Slot::Upsert(seq) => {
+                    // Last write wins in place.
+                    self.upserts[seq] = Some(row);
+                }
+                Slot::Delete => {
+                    // (delete then re-insert keeps both: delete phase first.)
+                    let seq = self.upserts.len();
+                    self.upserts.push(Some(row));
+                    e.insert(Slot::Upsert(seq));
+                }
+            },
+            Entry::Vacant(e) => {
+                let seq = self.upserts.len();
+                self.upserts.push(Some(row));
+                e.insert(Slot::Upsert(seq));
+            }
         }
-        self.put_upsert(key, row);
         Ok(())
     }
 
@@ -142,33 +167,75 @@ impl Collapser {
                 self.put_delete(old_key);
             }
         }
-        let sticky = matches!(self.map.get(&new_key), Some(Slot::Residue));
-        if sticky || row.iter().any(|c| matches!(c, Cell::UnchangedToast)) {
-            // Cannot ride the fat upsert path — either the missing TOAST
-            // values would overwrite real data, or an earlier event on this
-            // key already lives in the ordered tail. Any pending SET-phase
-            // upsert for the key stays where it is (the phases run before
-            // the tail, so it lands first — correct order).
-            if row.iter().any(|c| matches!(c, Cell::UnchangedToast)) {
-                self.residue.push(ResidueOp::MaskedUpdate { key: new_key.clone(), row });
-            } else {
-                self.residue.push(ResidueOp::Upsert { row });
+        let toast = row.iter().any(|c| matches!(c, Cell::UnchangedToast));
+        match self.map.entry(new_key) {
+            Entry::Occupied(mut e) => match *e.get() {
+                Slot::Residue => {
+                    // Sticky: later events on a residue key stay in the
+                    // ordered tail. The key is only cloned on the masked
+                    // path, where the op itself must carry it.
+                    if toast {
+                        let key = e.key().clone();
+                        self.residue.push(ResidueOp::MaskedUpdate { key, row });
+                    } else {
+                        self.residue.push(ResidueOp::Upsert { row });
+                    }
+                }
+                Slot::Upsert(seq) if !toast => {
+                    self.upserts[seq] = Some(row);
+                }
+                Slot::Delete if !toast => {
+                    let seq = self.upserts.len();
+                    self.upserts.push(Some(row));
+                    e.insert(Slot::Upsert(seq));
+                }
+                _ => {
+                    // Masked TOAST update on a non-residue key: the missing
+                    // values would overwrite real data on the fat path, so the
+                    // key goes sticky. A pending SET-phase upsert stays where
+                    // it is (phases run before the tail — correct order).
+                    let key = e.key().clone();
+                    self.residue.push(ResidueOp::MaskedUpdate { key, row });
+                    e.insert(Slot::Residue);
+                }
+            },
+            Entry::Vacant(e) => {
+                if toast {
+                    let key = e.key().clone();
+                    self.residue.push(ResidueOp::MaskedUpdate { key, row });
+                    e.insert(Slot::Residue);
+                } else {
+                    let seq = self.upserts.len();
+                    self.upserts.push(Some(row));
+                    e.insert(Slot::Upsert(seq));
+                }
             }
-            self.map.insert(new_key, Slot::Residue);
-            return Ok(());
         }
-        self.put_upsert(new_key, row);
         Ok(())
     }
 
     pub(crate) fn delete(&mut self, old: &[Cell]) -> Result<()> {
         self.events += 1;
         let key = self.key_of_old(old)?;
-        if matches!(self.map.get(&key), Some(Slot::Residue)) {
-            self.residue.push(ResidueOp::Delete { key });
-            return Ok(());
+        match self.map.entry(key) {
+            Entry::Occupied(mut e) => match *e.get() {
+                Slot::Residue => {
+                    let key = e.key().clone();
+                    self.residue.push(ResidueOp::Delete { key });
+                }
+                Slot::Upsert(seq) => {
+                    // insert-then-delete nets to delete-only.
+                    self.upserts[seq] = None;
+                    self.deletes.push(e.key().clone());
+                    e.insert(Slot::Delete);
+                }
+                Slot::Delete => {}
+            },
+            Entry::Vacant(e) => {
+                self.deletes.push(e.key().clone());
+                e.insert(Slot::Delete);
+            }
         }
-        self.put_delete(key);
         Ok(())
     }
 
@@ -183,36 +250,25 @@ impl Collapser {
         self.truncate = true;
     }
 
-    fn put_upsert(&mut self, key: Key, row: Vec<Cell>) {
-        match self.map.get(&key) {
-            Some(Slot::Upsert(seq)) => {
-                // Last write wins in place.
-                self.upserts[*seq] = Some((key, row));
-            }
-            Some(Slot::Residue) => unreachable!("residue keys handled by callers"),
-            Some(Slot::Delete) | None => {
-                // (delete then re-insert keeps both: delete phase runs first.)
-                let seq = self.upserts.len();
-                self.upserts.push(Some((key.clone(), row)));
-                self.map.insert(key, Slot::Upsert(seq));
-            }
-        }
-    }
-
+    /// Old-identity kill on a PK-changing update. Entry-shaped like the rest;
+    /// a residue-slotted old key follows the ordered tail.
     fn put_delete(&mut self, key: Key) {
-        match self.map.get(&key) {
-            Some(Slot::Upsert(seq)) => {
-                // insert-then-delete nets to delete-only.
-                let seq = *seq;
-                self.upserts[seq] = None;
-                self.deletes.push(key.clone());
-                self.map.insert(key, Slot::Delete);
-            }
-            Some(Slot::Residue) => unreachable!("residue keys handled by callers"),
-            Some(Slot::Delete) => {}
-            None => {
-                self.deletes.push(key.clone());
-                self.map.insert(key, Slot::Delete);
+        match self.map.entry(key) {
+            Entry::Occupied(mut e) => match *e.get() {
+                Slot::Residue => {
+                    let key = e.key().clone();
+                    self.residue.push(ResidueOp::Delete { key });
+                }
+                Slot::Upsert(seq) => {
+                    self.upserts[seq] = None;
+                    self.deletes.push(e.key().clone());
+                    e.insert(Slot::Delete);
+                }
+                Slot::Delete => {}
+            },
+            Entry::Vacant(e) => {
+                self.deletes.push(e.key().clone());
+                e.insert(Slot::Delete);
             }
         }
     }
@@ -220,12 +276,7 @@ impl Collapser {
     pub(crate) fn finish(self) -> Collapsed {
         Collapsed {
             deletes: self.deletes,
-            upserts: self
-                .upserts
-                .into_iter()
-                .flatten()
-                .map(|(_, row)| row)
-                .collect(),
+            upserts: self.upserts.into_iter().flatten().collect(),
             residue: self.residue,
             truncate: self.truncate,
             events: self.events,
