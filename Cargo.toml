@@ -9,6 +9,11 @@ license = "MIT"
 repository = "https://github.com/apitap/apitap-lib"
 
 [profile.release]
+# fat LTO was A/B'd 2026-08-07 on the capped CDC lanes and came back
+# UNRESOLVABLE on a drifted bench box (pg within-round median −1.1s but
+# absolute median +0.6s, one +5.7s round against an outlier-fast base; my
+# flat). Reverted to thin; re-test on a freshly reset box before a release
+# that wants the maybe-1s. Build time roughly doubles under fat.
 lto = "thin"
 codegen-units = 1
 
