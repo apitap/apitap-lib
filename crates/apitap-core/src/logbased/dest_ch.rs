@@ -29,6 +29,8 @@ pub(crate) struct ChDest {
     /// table would resurface as a loud error on the next statement, which is
     /// the same failure the unconditional CREATE would have hidden.
     ensured: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Once-per-run verdict of `patch_ok` (None = not probed yet).
+    patch: std::sync::Mutex<Option<bool>>,
 }
 
 impl ChDest {
@@ -36,12 +38,44 @@ impl ChDest {
         Ok(Self {
             ch: ChConn::parse(url)?,
             ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
+            patch: std::sync::Mutex::new(None),
         })
     }
 
     /// True the FIRST time this connection is asked about `key`.
     fn first_time(&self, key: &str) -> bool {
         self.ensured.lock().unwrap().insert(key.to_string())
+    }
+
+    /// Patch-part deletes (`lightweight_delete_mode='lightweight_update'`)
+    /// turn the per-window DELETE from a part REWRITE into a patch-part
+    /// write. Probed once per run: server >= 25.7 required (the setting does
+    /// not exist below), and correctness of OUR predicate shape — including
+    /// parts born before the ALTER — was verified against 25.8.29 (see the
+    /// r3 ledger; the #87265 shape returns exact counts and MutatePart=0).
+    /// 24.8 LTS destinations keep today's rewrite path untouched.
+    /// `APITAP_PATCH_DELETE=0` is the kill switch (and the A/B lever).
+    async fn patch_ok(&self) -> bool {
+        if std::env::var("APITAP_PATCH_DELETE").as_deref() == Ok("0") {
+            return false;
+        }
+        {
+            let g = self.patch.lock().unwrap();
+            if let Some(v) = *g {
+                return v;
+            }
+        }
+        let ok = match self.ch.exec("SELECT version()").await {
+            Ok(body) => {
+                let mut it = body.trim().split('.');
+                let maj: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                let min: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                maj > 25 || (maj == 25 && min >= 7)
+            }
+            Err(_) => false,
+        };
+        *self.patch.lock().unwrap() = Some(ok);
+        ok
     }
 
     /// Default the created table's ORDER BY to the PK so the per-window
@@ -189,6 +223,7 @@ impl ChDest {
             // healed that on the next window; memoizing the DDL took the healing
             // away with it. One DROP per run restores it and still costs one
             // round trip per run instead of three per window.
+            let patch = self.patch_ok().await;
             if self.first_time(&del) {
                 self.ch.exec(&format!("DROP TABLE IF EXISTS {del}")).await?;
                 self.ch
@@ -197,6 +232,16 @@ impl ChDest {
                          ORDER BY tuple() AS SELECT {pklist} FROM {ft} WHERE 0"
                     ))
                     .await?;
+                if patch {
+                    // Materializes block columns for parts written from here
+                    // on; the probe showed pre-ALTER parts patch correctly too.
+                    self.ch
+                        .exec(&format!(
+                            "ALTER TABLE {ft} MODIFY SETTING \
+                             enable_block_number_column=1, enable_block_offset_column=1"
+                        ))
+                        .await?;
+                }
             }
             self.ch.exec(&format!("TRUNCATE TABLE {del}")).await?;
             let mut buf = Vec::with_capacity(1 << 20);
@@ -218,7 +263,14 @@ impl ChDest {
             } else {
                 format!("({pklist}) IN (SELECT {pklist} FROM {del})")
             };
-            self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
+            let mode = if patch {
+                " SETTINGS lightweight_delete_mode='lightweight_update'"
+            } else {
+                ""
+            };
+            self.ch
+                .exec(&format!("DELETE FROM {ft} WHERE {pred}{mode}"))
+                .await?;
         }
 
         if !c.upserts.is_empty() {
