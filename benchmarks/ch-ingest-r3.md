@@ -152,3 +152,28 @@ rewrote ZERO parts — merge debt and dest disk churn eliminated. Verification e
 on ≥25.7; pays wall only when the dest is the bottleneck (weak CH, bigger delete share,
 shared box). Not a 25s card at 0.5cpu — the wall is client CPU. Remaining 25s/150K
 paths: Arc B (pull-apply, needs sign-off), or accept the recorded plateau.
+
+## Addendum 4 — pull-apply (Arc B): REJECTED, with receipt
+
+Built behind env gates (`APITAP_PULL_APPLY=1` + `APITAP_PULL_SRC`), full A/B on CH
+25.8 dest, same wheel, 3 interleaved rounds, cdc-pg wide 1.5M:
+
+| side | r1 | r2 | r3 | median | client cpu |
+|---|---|---|---|---|---|
+| render (engine path) | 40.6s | 40.4s | 40.4s | 40.4s | 19.5s |
+| pull (CH pulls from pg) | 45.2s | 44.8s | 43.6s | 44.8s | ~8.0s |
+
+Fidelity was EXACT (count+sum 3 tables MATCH; full-row 15-col EXCEPT both
+directions vs live pg = 0|0). Client CPU −59%. Wall +11%: the 256MB cage yields
+~14.5MB windows → ~86 windows, and per-window fixed round trips ate the win.
+A keys-only collapse (rows 830B → 68B, ~7 windows, projected ~13-16s) was coded
+and NOT shipped.
+
+**Rejected on identity, per user directive: apitap must BE the engine.** In pull
+mode the row bodies move pg→CH between uncaged servers; the 0.5cpu/256MB headline
+would no longer describe the thing doing the work. Numbers additionally negative
+at step 1. Code reverted (never committed); receipts stay here.
+
+Standing physics from this A/B: wall 40.4s at avg 0.484 cores = the wall IS
+client CPU (19.5s / 0.5 core ≈ 39s). The 25s target = client cpu ≤12.5s (−36%);
+150K/s wide = ≤5.0s (−74%), with us as the engine.
