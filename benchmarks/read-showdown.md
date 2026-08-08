@@ -197,3 +197,35 @@ tier up to 24GB.
 Also measured, to_parquet compression @0.5cpu/256MB (10M): zstd 80.5s /
 0.44GB beats snappy 89.9s / 0.84GB — the encoder path, not the
 compressor, is the cost; the zstd default stands.
+
+## Round 3 research (2026-08-08): no speed gold, one silent-corruption bug
+
+Ten internet-wide sweeps (Arrow view/dictionary/REE layouts, polars ingest,
+connectorx/ADBC, DuckDB scanners, pg egress economics, SIMD parsing, columnar
+build, io_uring/socket syscalls, MySQL+ClickHouse lanes, streaming memory) →
+33 findings → top 6 adversarially verified → **1 kept, 5 refuted**. The one
+survivor was a CORRECTNESS fix, not a speed knife (shipped: i32 offset guard,
+`wire/arrowcol.rs::check_offsets`).
+
+The whole StringView / "German strings" family (4 independent proposals) died
+on three walls worth recording so nobody re-digs them:
+1. **The headline tier never touches polars.** The 52.8 s / 130 MB streaming
+   leg is a pure `RecordBatchReader.from_stream` loop, so every polars-boundary
+   idea can only land on a big box, by definition.
+2. **Polars' cast is already zero-copy on the data buffer** — it slices, it does
+   not memcpy — so the "save a memcpy" story is false; only a metadata pass
+   remains.
+3. **`ColB::bytes` is the seal gate**, so any layout that adds bytes/row shrinks
+   the batch inside a 256 MB cage — a layout tax paid exactly where we can least
+   afford it.
+
+Also corrected by the arithmetic: the 5.14 GB "materialization transient" is
+mostly the frame itself (~499 B/row × 10M ≈ 5.0 GB), not conversion overhead.
+The transient is therefore much smaller than it looked, and attacking it means
+attacking row width, not the conversion.
+
+Unverified near-misses, gated on a profiling run (do NOT build first): typed
+Arrow buffer pooling closed by the Arrow C release callback (kill the
+page-zeroing tax — `clear_page_erms` was 4.8% of samples in profiling.md);
+`SET max_parallel_workers_per_gather = 0` on read connections; bulk validity
+bitmaps via SSE2 compare+movemask; SIMD prefix-sum for varlen offsets.
