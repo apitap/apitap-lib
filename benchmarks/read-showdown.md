@@ -303,3 +303,26 @@ calls, fewer ACKs, less syscall entry cost. Honest estimate 3-7%, with a real
 risk to test rather than assume: setting `SO_RCVBUF` explicitly DISABLES Linux
 receive-buffer autotuning, which can lose on a real network even when it wins on
 loopback. A/B it in the cage against a remote-ish path, not only on loopback.
+
+### Regression check on the PUBLIC lazy-query workload (50M rows, column pushdown)
+
+The pipe re-calibration was fitted on the 15-column FULL-SCAN leg. The published
+lazy-query workload has a different shape — `filter` + `group_by` with column
+pushdown, so only 2 of 15 columns ever leave Postgres — so it needed its own
+check before the calibration could ship.
+
+`apitap.read(URI, table="bench_data_50m").lazy().filter(pl.col("regular_int") % 3 == 0)
+.group_by("bool_val").agg(pl.len()).collect(engine="streaming")` @0.5cpu/256MB,
+3 interleaved rounds, installs md5-verified, old calibration vs new:
+
+| round | old (36 MB/pipe) | new (22 MB/pipe) |
+|---|---|---|
+| r1 (cold page cache) | 21.1 s / 164 MB | 10.7 s / 169 MB |
+| r2 (warm) | 8.4 s / 135 MB | **6.8 s / 131 MB** |
+| r3 (warm) | 8.7 s / 146 MB | **6.6 s / 136 MB** |
+
+**No regression — a 21% win, at slightly LOWER peak RSS.** The group_by result is
+byte-identical on every leg and matches the published figure (false 8,332,935 /
+true 8,333,870). Warm, the leg is CPU-saturated (3.5 s CPU over a 6.6 s wall = 0.53 of the half
+core); the cold round is the source-bound one (4.8 s CPU over 21.1 s = 0.23),
+which is why r1 must never be compared across sides.
