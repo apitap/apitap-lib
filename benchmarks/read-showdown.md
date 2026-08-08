@@ -326,3 +326,37 @@ byte-identical on every leg and matches the published figure (false 8,332,935 /
 true 8,333,870). Warm, the leg is CPU-saturated (3.5 s CPU over a 6.6 s wall = 0.53 of the half
 core); the cold round is the source-bound one (4.8 s CPU over 21.1 s = 0.23),
 which is why r1 must never be compared across sides.
+
+## The source is the floor: apitap beats MySQL at MySQL's own aggregation (2026-08-09)
+
+Prompted by a "why isn't this 5 seconds, it only pulls 2 columns" challenge on the
+100M-row cross-engine article. Measured the same per-day aggregation done by the
+SERVER ITSELF, with apitap nowhere in the picture, 2 rounds each:
+
+| engine | server does it alone | apitap @0.5 core |
+|---|---|---|
+| MySQL, 50M rows | **190.3 / 190.4 s** | **162.9 s** |
+| Postgres, 50M rows | 12.3 / 11.5 s (16 cores) | 10.4 - 13.6 s |
+
+**apitap extracts 50M rows across the wire and aggregates them on HALF A CORE
+faster than MySQL aggregates them in place** — and matches a 16-core Postgres
+while using ~1/50th of its CPU. Both lanes sit at or under their source's own
+floor, so no client-side knife can reach 5 s: that would require the databases
+to scan faster than they can.
+
+Why MySQL is 15× slower than Postgres on identical row counts:
+
+- `innodb_buffer_pool_size` = **128 MB** against a **28,807 MB** table (1:225).
+  Every scan re-reads the whole table.
+- `EXPLAIN` shows `type=ALL, key=NULL, rows=48,899,707, Using temporary` — a full
+  table scan with no covering index, so InnoDB reads every full row to project
+  2 columns. Row stores cannot skip columns.
+
+The levers are all server-side, none in our engine: a covering index on
+`(d, amount)` (turns 28.8 GB of scan into an index-only pass), a sane buffer
+pool, or — the article's own answer — land to Parquet once and join the lake in
+10.4 s forever.
+
+This also VERIFIES (and understates) the article's line that "170 seconds is the
+server scanning 28 GB of InnoDB, a floor every client pays": the floor measures
+190 s.
