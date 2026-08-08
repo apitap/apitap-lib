@@ -275,3 +275,31 @@ predated it). Fix, now standard: keep each variant's wheel at its original PEP
 the .so inside the wheel before every leg, aborting on mismatch. Runtime levers
 (API args) are immune and stayed valid — which is why the worker-count sweep
 survived.
+
+### Kernel profile of the read leg (z15 re-read with `--kallsyms`, no `--symfs`)
+
+`--symfs` redirects kernel symbol lookup too, which is why the first pass showed
+only raw hex for kernel frames. Re-read of the SAME perf data with
+`--kallsyms=/proc/kallsyms`:
+
+| symbol | share |
+|---|---|
+| `entry_SYSCALL_64` (all syscalls, cumulative) | 34.7% |
+| `recvfrom` path (cumulative) | 27.7% |
+| `rep_movs_alternative` — socket→userspace copy | **12.8% self** |
+| `tcp_send_ack` + `tcp_cleanup_rbuf` | ~15% cumulative |
+| `clear_page_erms` | **0.75% self** |
+
+**Buffer pooling / page-zeroing: REFUTED by measurement.** `tune_allocator`'s
+comment cites `clear_page_erms` at ~13% of a 0.5-core run; on THIS path it is
+0.75%. The candidate is closed — an earlier claim that it was "refuted because
+the symbol is absent" was wrong for the right conclusion: the symbol was absent
+because kernel symbols were unresolved, not because the cost was zero.
+
+**Next knife, data-led:** we set NO socket options anywhere (no `SO_RCVBUF`, no
+`TCP_NODELAY`, no `TCP_QUICKACK`). 12,527 `recvfrom` calls per run, each drain
+triggering `tcp_cleanup_rbuf` → an ACK. A larger receive buffer means fewer
+calls, fewer ACKs, less syscall entry cost. Honest estimate 3-7%, with a real
+risk to test rather than assume: setting `SO_RCVBUF` explicitly DISABLES Linux
+receive-buffer autotuning, which can lose on a real network even when it wins on
+loopback. A/B it in the cage against a remote-ish path, not only on loopback.
