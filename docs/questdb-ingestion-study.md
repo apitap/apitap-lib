@@ -184,3 +184,45 @@ The two I'd fund a follow-up read on first: **#1 (Parquet dict/delta — same-la
   - where: crates/apitap-core/src/connectors/bigquery.rs (unescape_into:576, csv_quote_into:651, tsv_to_csv field/row split) | impact: BQ CSV/gzip transcode leg (c): faster pre-gzip TSV→CSV transcode + unescape on small cores; wider fields (text/json) benefit most. No effect on the binary rowbinary/pgcopy lanes (already optimal per-field). | effort: small | risk: Low — memchr is a mature dep; behavior-preserving. Win shrinks on numeric-heavy tables (short clean runs) where scalar was already fine.
 - **[medium] buffer-pool** — Maps directly onto chunk-buffer churn: every flush allocates a fresh Vec::with_capacity(chunk+64KiB) via mem::replace, the worker fills it, the loader (ChLoader HTTP body / PgCopier / BQ) consumes and drops it — a textbook producer-allocates/consumer-frees migration. Introduce a bounded free-list (crossbeam ArrayQueue, cap ~2x parallel) per route: worker pops a recycled buffer instead of allocating; the loader returns it after the send drains. Bounds steady-state RSS jitter and cuts allocator/page-fault pressure on 0.5 vCPU.
   - where: crates/apitap-core/src/connectors/postgres.rs:464, mysql.rs:740 (the Vec::with_capacity flush) + driver.rs Loader::send contract | impact: Memory ceiling + small-core throughput: fewer multi-MB allocations and page faults per span; steadier RSS under the 256MB cap. Modest wall win, real allocator-pressure win. | effort: medium | risk: The Loader::send(buf: Vec<u8>) contract consumes the buffer and it crosses into reqwest::Body / sqlx copy_in which own it until the write completes — returning it requires plumbing the drained Vec back (change send to hand back, or have the loader own an internal pool). Get the return timing wrong and you either leak or reuse-in-flight (corruption). Cap must be enforced or migration silently balloons footprint.
+
+---
+
+## Round 2 (2026-08-08): the CDC/wire lane — DRY, with receipts
+
+Eight parallel readers over QuestDB's numbers/datetime formatting, network I/O,
+symbol dictionaries, Arrow egress, PGWire encoders, their Rust crates,
+WAL/replication apply, and SIMD kernels. 27 raw findings → 5 strongest sent to
+adversarial verification → **5 of 5 refuted**. Three died on apitap's OWN
+receipts, not on taste:
+
+- **recv-into-parse-slab (zero-copy)** — already built and **lost 19-25%**
+  (`benchmarks/profiling.md:260-274`). MyWire's BufReader already coalesces at
+  1 MiB, so the removed copy was L1-hot while the synchronous walk stalled five
+  other TCP streams on half a core.
+- **Arena + key interning** — a smaller version of the frame-native knife that
+  already measured WALL FLAT at ~8× the allocation scale (`ch-ingest-r3.md`
+  addendum 2). Target `key_of_row` is 2.0% of samples.
+- **Multi-needle SIMD escape** — aimed at `WireFormat::MyTsv`, which
+  `sink/clickhouse.rs:776` declares `unreachable!()` for ClickHouse: my→ch bulk
+  is RowBinary, my→pg is PgCopyBinary. Wrong lane entirely.
+- **Binary pgoutput to cut wire bytes** — the arithmetic fails on our own
+  workload: 149 B → 140 B (**6%**, not 30-45%), because NUMERIC *grows* in
+  binary (8-byte header) and TEXT payloads are unchanged. Also stream-global,
+  not per-column: it would turn CDC from type-agnostic to type-exhaustive, where
+  one jsonb column poisons a whole publication.
+- **Sticky "nothing to collapse" bit** — the memory premise is false
+  (`drain.rs:93-98` counts row frames only; the collapse map never enters the
+  counter), and it trades a structural invariant for an assumption: silent
+  duplicates in MergeTree if it is ever wrong.
+
+**Structural reason the mine is empty:** our CDC profile is FLAT. Fresh-cage
+0.29.0 PGO: bytes-refcount 7.5%, `Reader::tuple`+drain 5.2%, `pump`+`read_frame`
+2.2%, `key_of_row` 2.0%, `copy_escape` 1.85%. No symbol is large enough to hold
+a micro-technique, and deleting every one of our own symbols perfectly still
+leaves ~32-33 s of a ~40 s wall — consistent with the physics floor measured the
+same day (`benchmarks/ch-ingest-r3.md` addendum 5: an empty C receiver needs 37 s).
+
+**Where a round 3 should aim instead:** the bulk read / Arrow-polars
+materialization path (`src/read_impl.rs`, `src/pipeline/`) and the destination
+side, which have never been profiled as hard as the CDC receive path. Do NOT
+re-mine QuestDB for CDC.
