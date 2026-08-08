@@ -207,7 +207,7 @@ fn main() {
         let t0 = std::time::Instant::now();
         for c in &chunks {
             b.push(c).unwrap();
-            while let Some(batch) = b.take_ready() {
+            while let Some(batch) = b.take_ready().unwrap() {
                 total_a += batch.rows as u64;
                 std::hint::black_box(&batch);
             }

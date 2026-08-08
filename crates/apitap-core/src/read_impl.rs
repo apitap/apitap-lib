@@ -341,7 +341,7 @@ impl Loader for ArrowLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         self.b.push(&buf)?;
         self.spare = Some(buf);
-        if let Some(batch) = self.b.take_ready() {
+        if let Some(batch) = self.b.take_ready()? {
             self.tx
                 .send(Ok(batch))
                 .await
@@ -360,7 +360,7 @@ impl Loader for ArrowLoader {
     ) -> Result<(usize, crate::wire::arrowcol::FramedPush)> {
         let r = self.b.push_framed(win)?;
         // One seal check per window fill — cheap at this cadence.
-        if let Some(batch) = self.b.take_ready() {
+        if let Some(batch) = self.b.take_ready()? {
             self.tx
                 .send(Ok(batch))
                 .await

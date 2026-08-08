@@ -1596,7 +1596,7 @@ async fn raw_arrow_worker(
             since_seal += 1;
             if since_seal >= 64 {
                 since_seal = 0;
-                if let Some(batch) = bb.take_ready() {
+                if let Some(batch) = bb.take_ready()? {
                     let ts = dbg.then(std::time::Instant::now);
                     tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
                     if let Some(ts) = ts {
@@ -1667,7 +1667,7 @@ async fn arrow_row_worker(
             since_seal += 1;
             if since_seal >= 64 {
                 since_seal = 0;
-                if let Some(batch) = bb.take_ready() {
+                if let Some(batch) = bb.take_ready()? {
                     let ts = dbg.then(std::time::Instant::now);
                     tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
                     if let Some(ts) = ts {

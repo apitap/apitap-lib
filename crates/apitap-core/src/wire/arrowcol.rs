@@ -964,23 +964,57 @@ impl BatchBuilder {
         self.cols.iter().map(ColB::bytes).sum()
     }
 
-    fn seal(&mut self) -> ArrowBatch {
+    /// Every varlen column must still address inside i32 offsets. The staged
+    /// path checks per push because it has a `Result` to hand back; the
+    /// direct-Arrow `append_cell` is `#[inline]` on the per-CELL hot path and
+    /// returns `()`, so its check lives here. Detection power is identical —
+    /// offsets are monotonic and the data buffer only grows, so if any push
+    /// wrapped, `d.len()` is past `i32::MAX` at seal too — and the hot path
+    /// pays nothing.
+    ///
+    /// Without it, `off.push(d.len() as i32)` wraps past 2 GiB in one column:
+    /// negative offsets (the consumer builds a slice from them UNCHECKED —
+    /// polars trusts FFI offsets) below 4 GiB, and silently WRONG strings
+    /// above it. Reachable on the default MySQL lane, because `to_polars()`
+    /// asks for one unbounded batch per worker.
+    fn check_offsets(&self) -> Result<()> {
+        self.check_offsets_to(i32::MAX as usize)
+    }
+
+    /// `check_offsets` with the ceiling injected, so a test can prove the
+    /// detection without allocating 2 GiB (the real-size proof is the
+    /// `#[ignore]`d test below).
+    fn check_offsets_to(&self, limit: usize) -> Result<()> {
+        for c in &self.cols {
+            let n = match c {
+                ColB::Utf8 { d, .. } | ColB::Bin { d, .. } => d.len(),
+                _ => continue,
+            };
+            if n > limit {
+                return Err(bad("varlen column past i32 offsets in one batch"));
+            }
+        }
+        Ok(())
+    }
+
+    fn seal(&mut self) -> Result<ArrowBatch> {
+        self.check_offsets()?;
         let rows = self.rows;
         self.rows = 0;
         self.rows_sealed += rows as u64;
-        ArrowBatch {
+        Ok(ArrowBatch {
             rows,
             cols: self.cols.iter_mut().map(ColB::seal).collect(),
-        }
+        })
     }
 
     /// A sealed batch, if the size threshold was crossed. Push decodes whole
     /// tuples only, so any moment between push calls is a tuple boundary.
-    pub fn take_ready(&mut self) -> Option<ArrowBatch> {
+    pub fn take_ready(&mut self) -> Result<Option<ArrowBatch>> {
         if self.rows == 0 || self.acc_bytes() < self.batch_bytes {
-            return None;
+            return Ok(None);
         }
-        Some(self.seal())
+        self.seal().map(Some)
     }
 
     /// Stream over (every span closed): the final partial batch, if any
@@ -991,7 +1025,10 @@ impl BatchBuilder {
                 "pg binary COPY: stream ended without the trailer".into(),
             ));
         }
-        Ok((self.rows > 0).then(|| self.seal()))
+        if self.rows == 0 {
+            return Ok(None);
+        }
+        self.seal().map(Some)
     }
 
     /// Rows decoded so far (for reporting).
@@ -1198,7 +1235,7 @@ mod tests {
         for byte in &s {
             b.push(std::slice::from_ref(byte)).unwrap();
         }
-        assert!(b.take_ready().is_none()); // threshold never crossed
+        assert!(b.take_ready().unwrap().is_none()); // threshold never crossed
         let batch = b.finish().unwrap().expect("rows pending");
         assert_eq!(batch.rows, 3);
         assert_eq!(b.rows_total(), 3);
@@ -1310,8 +1347,8 @@ mod tests {
             pgcopy::field(&i.to_be_bytes(), &mut t);
             pgcopy::field(b"12345678", &mut t);
             b.push(&t).unwrap();
-            if let Some(batch) = b.take_ready() {
-                assert!(b.take_ready().is_none()); // counter reset at seal
+            if let Some(batch) = b.take_ready().unwrap() {
+                assert!(b.take_ready().unwrap().is_none()); // counter reset at seal
                 sealed.push(batch);
             }
         }
@@ -1355,7 +1392,7 @@ mod tests {
             pgcopy::field(make(i).as_bytes(), &mut t);
             pgcopy::field(&i.to_be_bytes(), &mut t);
             b.push(&t).unwrap();
-            if let Some(batch) = b.take_ready() {
+            if let Some(batch) = b.take_ready().unwrap() {
                 sealed.push(batch);
             }
         }
@@ -1544,5 +1581,45 @@ mod tests {
                 _ => panic!("layout"),
             }
         }
+    }
+
+    /// A varlen column past i32 offsets must ERROR, never seal. The
+    /// direct-Arrow lane (the MySQL default) writes `d.len() as i32`
+    /// unchecked on the per-cell hot path, so without the seal-time guard a
+    /// 2 GiB text column wraps: negative offsets below 4 GiB (the consumer
+    /// builds its slice from them unchecked) and silently WRONG strings
+    /// above it. `to_polars()` asks for one unbounded batch per worker, so
+    /// nothing else caps it.
+    #[test]
+    fn varlen_past_i32_offsets_errors_instead_of_wrapping() {
+        let mut b = BatchBuilder::new(vec![ArrowKind::Int64, ArrowKind::Utf8], usize::MAX >> 1);
+        b.append_cell(0, CellVal::I64(1));
+        b.append_cell(1, CellVal::Str(b"0123456789"));
+        b.row_done();
+        // Under the ceiling: seals normally.
+        assert!(b.check_offsets_to(10).is_ok());
+        // Past it: loud, and the same message the staged pg path uses.
+        let e = b.check_offsets_to(9).expect_err("must reject");
+        assert!(
+            e.to_string().contains("past i32 offsets"),
+            "unexpected error: {e}"
+        );
+        // The real guard is not tripped by an ordinary batch.
+        assert!(b.finish().unwrap().is_some());
+    }
+
+    /// The real-size proof: 2 GiB in one Utf8 column. Allocates ~2 GiB, so it
+    /// is opt-in — run with `cargo test -- --ignored varlen_past_i32_real`.
+    #[test]
+    #[ignore]
+    fn varlen_past_i32_real_size_errors() {
+        let mut b = BatchBuilder::new(vec![ArrowKind::Utf8], usize::MAX >> 1);
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..2049 {
+            b.append_cell(0, CellVal::Str(&chunk));
+            b.row_done();
+        }
+        let e = b.finish().expect_err("2 GiB of text must not seal");
+        assert!(e.to_string().contains("past i32 offsets"), "{e}");
     }
 }
