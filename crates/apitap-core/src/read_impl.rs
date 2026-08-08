@@ -63,6 +63,14 @@ fn read_dialect(src_url: &str) -> Result<ReadDialect> {
     }
 }
 
+/// Read pipes for a cgroup budget. Split out so the calibration is unit
+/// tested — it is a measured constant, and a silent drift here costs every
+/// tier a large fraction of its speed (see the sweep receipts at the call
+/// site).
+fn auto_pipes(mem: u64) -> usize {
+    ((mem.saturating_sub(16 << 20)) / (22 << 20)).clamp(1, 8) as usize
+}
+
 /// Schema-only probe: what [`start`] would emit, WITHOUT starting workers.
 /// The lazy plugin registers this schema up front, then starts the real
 /// read later with the query's projection pushed down.
@@ -121,11 +129,29 @@ pub(crate) async fn start(
     if opts.parallel.is_none() {
         if let Some(m) = pipeline::mem_limit_bytes() {
             // Read pipes hold no sink-side buffers, so the transfer model's
-            // 10×chunk-per-pipe cap overshoots here. Measured on the 256 MB
-            // tier (10M rows, 0.5 core): 5 pipes 26.7s/194MB peak, 6 pipes
-            // 24.8s/211MB, 7 pipes 25.6s/238MB — 6 is the knee. ~36 MB per
-            // pipe reproduces that knee and scales down with the budget.
-            parallel = ((m.saturating_sub(40 << 20)) / (36 << 20)).clamp(1, 8) as usize;
+            // 10×chunk-per-pipe cap overshoots here.
+            //
+            // RE-CALIBRATED 2026-08-08. The previous model (40 MB reserve,
+            // 36 MB/pipe → 6 pipes at 256 MB) was fitted against an engine
+            // that no longer exists: it recorded 6 pipes peaking at 211 MB,
+            // and the same 6 pipes now peak at 133 MB. Buffer recycling and
+            // the frame-native rows freed that headroom, and nothing ever
+            // spent it — so every tier was running short of pipes.
+            //
+            // Re-swept on the 10M × 15-col read leg at 0.5 core, 2-3
+            // interleaved rounds per point, peak RSS from cgroup memory.peak:
+            //   256 MB:  2 → 38.6s/92MB   4 → 23.3s/107MB  6 → 13.5s/133MB
+            //            8 → 12.4s/190MB 12 → 12.4s/222MB 16 → 12.7s/252MB
+            //   128 MB:  2 → 37.5s/59MB   3 → 24.2s/68MB   4 → 22.9s/72MB
+            //            5 → 15.3s/85MB   6 → 13.4s/106MB
+            //    64 MB:  1 → 48.1s/31MB   2 → 41.2s/44MB
+            // 16 MB reserve + 22 MB/pipe lands on 8 / 5 / 2 — each one
+            // measured, none peaking past 74% of its cage, and the reserve
+            // keeps a sub-60 MB budget on the single pipe the 44 MB floor
+            // needs. The cap stays at 8 because past the knee memory buys
+            // nothing: at 256 MB, 12 pipes is no faster than 8 and 16 is
+            // SLOWER at 99% of the cage.
+            parallel = auto_pipes(m);
         }
     }
 
@@ -263,13 +289,25 @@ async fn plan_read<S: Source>(
             cap = 1;
             b
         }
-        None => match mem {
-            // 56 MiB reserve (was 40): the raw COPY plane carries ~8 MB of
-            // per-worker read buffers, and 250 MB peaks in a 256 MB cgroup
-            // were two pages from the OOM killer. Headroom is a feature.
-            Some(m) => ((m.saturating_sub(56 << 20) as usize) / (4 * (used + cap + 1)))
-                .clamp(1 << 20, 32 << 20),
-            None => 16 << 20,
+        // `APITAP_BATCH_BYTES` pins the batch size, bypassing the residency
+        // model — the A/B lever that separates "more workers" from "smaller
+        // batches", which the derivation below otherwise moves TOGETHER (it
+        // divides the budget by the worker count). Same escape-hatch pattern
+        // as APITAP_RAW_COPY / APITAP_MY_ARROW.
+        None => match std::env::var("APITAP_BATCH_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|b| *b > 0)
+        {
+            Some(b) => b,
+            None => match mem {
+                // 56 MiB reserve (was 40): the raw COPY plane carries ~8 MB of
+                // per-worker read buffers, and 250 MB peaks in a 256 MB cgroup
+                // were two pages from the OOM killer. Headroom is a feature.
+                Some(m) => ((m.saturating_sub(56 << 20) as usize) / (4 * (used + cap + 1)))
+                    .clamp(1 << 20, 32 << 20),
+                None => 16 << 20,
+            },
         },
     };
 
@@ -390,5 +428,26 @@ impl Loader for ArrowLoader {
 
     async fn abort(self, cause: Error) -> Error {
         cause
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_pipes;
+
+    /// The measured calibration, pinned. Each of these three was swept on the
+    /// 10M × 15-col read leg at 0.5 core and none peaked past 74% of its cage;
+    /// a change here without a fresh sweep is a regression, not a tweak.
+    #[test]
+    fn auto_pipes_matches_the_swept_calibration() {
+        assert_eq!(auto_pipes(64 << 20), 2, "64 MB tier");
+        assert_eq!(auto_pipes(128 << 20), 5, "128 MB tier");
+        assert_eq!(auto_pipes(256 << 20), 8, "256 MB tier");
+        // The 44 MB single-pipe floor must stay a single pipe.
+        assert_eq!(auto_pipes(44 << 20), 1);
+        assert_eq!(auto_pipes(16 << 20), 1, "never zero");
+        assert_eq!(auto_pipes(0), 1);
+        // Past the knee, memory buys nothing: the cap holds.
+        assert_eq!(auto_pipes(1024 << 20), 8);
     }
 }

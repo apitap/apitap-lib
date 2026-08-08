@@ -339,6 +339,13 @@ pub enum FramedPush {
 
 /// Tuples staged per micro-batch. 15 cols × 64 × 8 B ≈ 7.7 KB of staging —
 /// comfortably L1-resident next to the wire window it points into.
+///
+/// SWEPT 2026-08-08 and left alone: 64 vs 128 on the 10M × 15-col read leg
+/// @0.5cpu/256MB, 3 interleaved rounds with the installed binary md5-verified
+/// per leg, medians 13.6 s / 7.3 s CPU (64) vs 13.5 s / 7.2 s (128) — 0.7%,
+/// under the lane wall, and round 3 flipped sign. A first sweep did show a
+/// 3/3 win for 128; it was an artifact of a harness whose wheel swap silently
+/// no-op'd (pip rejects a renamed wheel), so all three legs ran ONE binary.
 const ST_K: usize = 64;
 
 /// Why the FRAMED staging stopped.

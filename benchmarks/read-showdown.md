@@ -229,3 +229,49 @@ Arrow buffer pooling closed by the Arrow C release callback (kill the
 page-zeroing tax — `clear_page_erms` was 4.8% of samples in profiling.md);
 `SET max_parallel_workers_per_gather = 0` on read connections; bulk validity
 bitmaps via SSE2 compare+movemask; SIMD prefix-sum for varlen offsets.
+
+## Auto-parallel re-calibration (2026-08-08): the small tiers were running at half speed
+
+The read path picks its pipe count from the cgroup budget. That model was fitted
+in 2026-07 against an engine that no longer exists — its own comment recorded
+6 pipes peaking at **211 MB**, and the same 6 pipes now peak at **133 MB**.
+Buffer recycling and the frame-native rows freed that headroom and nothing ever
+spent it, so every tier was running short of pipes.
+
+Re-swept on the 10M × 15-col read leg at 0.5 core, peak RSS from cgroup
+`memory.peak`, 2-3 interleaved rounds per point:
+
+| cage | pipes | wall | peak |
+|---|---|---|---|
+| 256 MB | 2 / 4 / 6 / **8** / 12 / 16 | 38.6 / 23.3 / 13.5 / **12.4** / 12.4 / 12.7 s | 92 / 107 / 133 / **190** / 222 / 252 MB |
+| 128 MB | 2 / 3 / 4 / **5** / 6 | 37.5 / 24.2 / 22.9 / **15.3** / 13.4 s | 59 / 68 / 72 / **85** / 106 MB |
+| 64 MB | 1 / **2** | 48.5 / **41.2** s | 31 / **44** MB |
+
+New model: 16 MB reserve + 22 MB/pipe, cap 8 → **8 / 5 / 2**, each measured,
+none past 74% of its cage. Past the knee memory buys nothing (256 MB: 12 pipes
+ties 8, 16 is slower at 99% of the cage). Pinned by a unit test
+(`read_impl::tests::auto_pipes_matches_the_swept_calibration`).
+
+End-to-end through the AUTO path, old binary vs new, installs md5-verified:
+
+| cage | before | after |
+|---|---|---|
+| 64 MB | 48.5 s / 31 MB | **41.7 s / 42 MB** (−14%) |
+| 128 MB | 37.5 s / 56 MB | **16.4 s / 82 MB** (−56%) |
+| 256 MB | 13.5 s / 133 MB | **12.4 s / 184 MB** (−8%) |
+
+### ST_K: swept, TIE, left at 64
+64 vs 128 with `parallel=8` pinned, 3 rounds, binary md5-verified per leg:
+medians 13.6 s / 7.3 s CPU vs 13.5 s / 7.2 s — 0.7%, under the lane wall, and
+round 3 flipped sign.
+
+### Harness bug that invalidated three conclusions (read this before benching)
+`pip install /w/wheel-<variant>.whl` fails with **"is not a valid wheel
+filename"** — pip enforces PEP 427 naming — and the harness sent pip's output to
+/dev/null. Every leg silently ran ONE binary installed hours earlier. It faked a
+"3/3 win" for ST_K=128 and made an env-var lever look inert (the running binary
+predated it). Fix, now standard: keep each variant's wheel at its original PEP
+427 name in its own directory, and md5 the installed `_apitap.abi3.so` against
+the .so inside the wheel before every leg, aborting on mismatch. Runtime levers
+(API args) are immune and stayed valid — which is why the worker-count sweep
+survived.
