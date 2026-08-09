@@ -360,3 +360,45 @@ pool, or — the article's own answer — land to Parquet once and join the lake
 This also VERIFIES (and understates) the article's line that "170 seconds is the
 server scanning 28 GB of InnoDB, a floor every client pays": the floor measures
 190 s.
+
+## MySQL read lane: where apitap's own time actually goes (2026-08-09)
+
+Asked directly — not "is the server slow" but "what can WE cut". Measured the
+MySQL lane alone in the cage, with container CPU from `cpu.stat`:
+
+**`bench_wide_50m` (48.9M rows, 28.8 GB, NO primary key)**
+
+| pipes | wall | our CPU | quota used | peak |
+|---|---|---|---|---|
+| auto | 159.3 s | 14.9 s | **19%** | 99 MB |
+| 1 | 156.3 s | 14.8 s | 19% | 96 MB |
+| 4 | 155.0 s | 14.7 s | 19% | 98 MB |
+
+Identical across pipe counts because `span_stmts` for MySQL range-splits ONLY
+when an explicit integer `cursor=` is given, else it emits one
+`SELECT … WHERE true`. And that is CORRECT here: the table has no primary key,
+so N ranges would be N full scans. We idle 81% of the wall waiting — our decode
+of 48.9M rows costs 14.9 s of CPU total.
+
+**`orders` (45.8M rows, 6.2 GB, PK `o_orderkey`)** — the table where splitting IS
+possible, warm round:
+
+| mode | wall | our CPU | quota used |
+|---|---|---|---|
+| single stream (today's default) | 39.1 s | 18.9 s | **97%** |
+| PK ranges × 4 | 38.2 s | 18.2 s | 95% |
+| PK ranges × 8 | 41.1 s | 19.1 s | 93% |
+
+**Splitting buys nothing warm** (38.2 vs 39.1 s is noise; 8 pipes is worse):
+one stream already saturates the half core. Our decode floor is ~19 s of CPU →
+38 s of wall at 0.5 core, and we land on 39.1 s. The 56.1 s cold first leg at
+69% quota is the only place ranges helped (56 → 36 s), i.e. exactly when we are
+WAIT-bound.
+
+**The gap, honestly scoped:** Postgres has a third span strategy MySQL lacks —
+CTID page ranges (PG 14+, no index needed), which is why pg parallelises with no
+cursor while MySQL never does. Auto-detecting an integer PK on the MySQL side
+would close it, but it would NOT have helped either case measured here (one
+table cannot be split, the other is already CPU-saturated). It is worth building
+for the case this rig cannot produce: a PK-bearing table on a remote or slow
+server, where the client waits.
