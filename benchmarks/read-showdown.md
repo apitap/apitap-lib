@@ -402,3 +402,21 @@ would close it, but it would NOT have helped either case measured here (one
 table cannot be split, the other is already CPU-saturated). It is worth building
 for the case this rig cannot produce: a PK-bearing table on a remote or slow
 server, where the client waits.
+
+### Splitting an UNINDEXED column: neutral, not catastrophic (prediction was wrong)
+
+`bench_wide_50m` has zero indexes; `EXPLAIN` on a slice predicate returns
+`type=ALL, key=NULL, rows=48,899,707, filtered=11.11`, i.e. every slice is a full
+table scan. Predicted 2-4× slowdown. Measured:
+
+| mode | wall | our CPU |
+|---|---|---|
+| single stream | 155-159 s | 14.7-14.9 s |
+| `cursor="id"`, 2 slices | 160.9 s | 16.2 s |
+| `cursor="id"`, 4 slices | 161.3 s | 15.1 s |
+
+**Flat.** N concurrent full scans share the OS page cache — the server does N×
+the logical work but pays one pass of physical I/O, and it has 16 cores to do the
+filtering. So the prediction of a 4× blowup was wrong; splitting an unindexed
+column is a no-op here, not a trap. It is also not a win: the wall is one pass
+over 28.8 GB no matter how the client asks for it.
