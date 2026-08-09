@@ -454,3 +454,29 @@ the read path pay here.
 Product idea this suggests, on our side of the line: when a read finishes having
 idled >70% of its wall, print what the source actually delivered (MB/s, rows/s)
 and the shape of the fix. Users cannot see any of this today.
+
+## Cross-engine join, end to end (re-measured 2026-08-09)
+
+Postgres 50M × MySQL 50M, joined on `id`, grouped per `bool_val`. Results match
+the published ground truth digit for digit (False 24,343,137 / 12,146,973,412;
+True 24,343,911 / 12,171,673,939).
+
+| stage | cage | wall | peak RSS |
+|---|---|---|---|
+| land pg (2 cols → zstd parquet) | 0.5 cpu / 256 MB | 18.2 s | ~250 MB (incl. verify) |
+| land my (2 cols → zstd parquet) | 0.5 cpu / 256 MB | 159.0 s | 120 MB |
+| **landing subtotal, once** | **small box** | **177 s** | 227 MB of files |
+| join from the lake | **4 cpu / 6 GB** | **11.4 s** | **3,089 MB** |
+
+Live (no lake), concurrent extraction + per-day pre-aggregate + join, 0.5cpu/256MB:
+160-165 s total, peak 223-244 MB — of which the Postgres leg (10.4-15.3 s) hides
+entirely inside the MySQL wait, and the join itself is 0.021 s.
+
+**Correction worth carrying into the article:** the lake join does NOT fit the
+small cage. Measured OOM (exit 137) at 256 MB, 512 MB, 1 GB **and 2 GB**; it needs
+~3.1 GB because a 50M × 50M hash join builds one side in polars' memory. The
+published "10.4 s" for Act 3 is reproducible (11.4 s here) but on the 4-core /
+6 GB box, not the 0.5cpu/256MB tier Act 2 runs in — and Act 3 never states its
+cage. The honest framing is stronger anyway: the HEAVY half — pulling 100M rows
+out of two live databases — fits half a core and 256 MB; only the final join
+wants an ordinary machine.
