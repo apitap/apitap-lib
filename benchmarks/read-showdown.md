@@ -480,3 +480,35 @@ published "10.4 s" for Act 3 is reproducible (11.4 s here) but on the 4-core /
 cage. The honest framing is stronger anyway: the HEAVY half — pulling 100M rows
 out of two live databases — fits half a core and 256 MB; only the final join
 wants an ordinary machine.
+
+## The covering index, measured (2026-08-09) — 3.3× and a 3.4× smaller lake
+
+Same apitap code, same cage (0.5 cpu / 256 MB), same table. Only the source
+schema changed: one covering index added, then dropped again (the seed table is
+byte-identical afterwards — `CREATE INDEX` / `DROP INDEX` is fully reversible).
+
+```sql
+CREATE INDEX idx_cover_id_amount ON bench_wide_50m (id, amount);  -- 128 s, once
+```
+
+| landing 50M × 2 cols to zstd parquet | wall | MySQL disk read | output |
+|---|---|---|---|
+| no index | 153.4 s | **25.40 GB** | 168 MB |
+| covering index | **45.8 / 46.1 s** | **0.00 GB** | **49 MB** |
+
+`EXPLAIN` tells the whole story: `type=ALL, key=NULL, Using where` became
+`type=index, key=idx_cover_id_amount, Using index` — an index-only scan that never
+touches the table.
+
+Three things fall out:
+- **3.3× faster** with apitap's code untouched, which is the proof that the 153 s
+  was never ours: we idled 86% of it.
+- **Zero disk reads** — the ~1 GB index stays in page cache, where 28.8 GB never
+  could. That is the real mechanism, not "indexes are fast".
+- **The lake file shrank 168 → 49 MB.** Unexpected bonus: an index-only scan
+  delivers rows ordered by `id`, and sorted data compresses far better (delta +
+  zstd). Verified identical content: 50,000,000 rows, `sum(amount)` =
+  24,975,000,000.
+
+For the article's shape this rewrites the landing budget: pg 18.2 s + my 45.8 s =
+**64 s once** (was 177 s), and the lake is 108 MB instead of 227 MB.
