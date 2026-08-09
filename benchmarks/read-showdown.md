@@ -563,3 +563,27 @@ a full hash table, which is exactly the difference that kills polars below 6 GB.
 
 Worth carrying into the docs: for small boxes recommend DuckDB over the parquet
 lake; for machines with RAM to spare, polars is 8× faster.
+
+## Cross-database join: every route we could measure (2026-08-09)
+
+Same question, same two live databases, same answer on every route
+(False 24,343,137 / 12,146,973,412; True 24,343,911 / 12,171,673,939), 0.5 core:
+
+| route | smallest cage that works | wall | peak |
+|---|---|---|---|
+| apitap → parquet lake → **DuckDB** | **256 MB** | 92.9 s (+64 s landing, once) | 256 MB |
+| apitap → parquet lake → DuckDB | 512 MB | 71.1 s | 512 MB |
+| apitap → parquet lake → DuckDB | 1 GB | 61.0 s | 1,024 MB |
+| apitap → parquet lake → polars | **6 GB** (OOM at 2 GB and below) | **11.4 s** | 3,089 MB |
+| **DuckDB's own postgres+mysql scanners** (no apitap) | **2 GB** (refuses at 256 MB) | **323.8 s** | 2,030 MB |
+
+The pattern that explains all of it: **a single-pass source forces the join to
+buffer.** DuckDB's own scanners, like an Arrow stream, cannot be re-read, so the
+build side must fit in memory — which is why the no-apitap route needs 2 GB and
+still takes 324 s. Parquet files CAN be re-read, so the engine is free to pick a
+memory-shaped plan; that, not the engine, is what lets the join finish in 256 MB.
+
+Head to head on the same box, DuckDB doing everything itself takes **323.8 s and
+2 GB**; apitap landing both sides (64 s, in 256 MB) and DuckDB answering from the
+lake takes **92.9 s in 256 MB** — and the lake is reusable, so the next question
+costs 92.9 s, not 324 s.
