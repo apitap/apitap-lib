@@ -512,3 +512,25 @@ Three things fall out:
 
 For the article's shape this rewrites the landing budget: pg 18.2 s + my 45.8 s =
 **64 s once** (was 177 s), and the lake is 108 MB instead of 227 MB.
+
+## apitap vs polars+connectorx on the identical landing (2026-08-09)
+
+50M rows × 2 columns out of MySQL `bench_wide_50m` (no index) into zstd parquet.
+Same box, same table, same output. connectorx via
+`pl.read_database_uri(..., engine="connectorx")`, connectorx 0.4.5 / polars 1.43.2.
+
+| cage | apitap | polars + connectorx |
+|---|---|---|
+| **0.5 cpu / 256 MB** | **153.4 s · peak 248 MB** | **OOM-killed** |
+| 0.5 cpu / 1 GB | — | **OOM-killed** |
+| 0.5 cpu / 4 GB | — | 161.4 s · **peak 1,780 MB** |
+
+Both produce the same answer (50,000,000 rows, `sum(amount)` = 24,975,000,000)
+and the same 168 MB file.
+
+The wall is nearly identical at 4 GB (161.4 s vs our 153.4 s) — expected, since
+both wait on the same disk-bound server. The difference is not speed, it is
+**where each one can live**: connectorx materialises the whole result before
+polars may touch a row, so it needs **7× our peak RSS** and dies at 1 GB, while
+apitap streams and finishes inside 256 MB. On this workload that is the whole
+story — 1,780 MB versus 248 MB for the identical answer.
