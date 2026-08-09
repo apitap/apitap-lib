@@ -420,3 +420,37 @@ the logical work but pays one pass of physical I/O, and it has 16 cores to do th
 filtering. So the prediction of a 4× blowup was wrong; splitting an unindexed
 column is a no-op here, not a trap. It is also not a win: the wall is one pass
 over 28.8 GB no matter how the client asks for it.
+
+### Where the 160 s actually goes, and every way out (measured, 2026-08-09)
+
+Block-I/O counters from the MySQL container's cgroup during a 2-column
+`COUNT(*), SUM(amount)` on `bench_wide_50m`:
+
+```
+26.61 GB read from disk   ·   145.8 s wall   ·   187 MB/s
+```
+
+It reads essentially the whole 28.8 GB table to return two columns, and there is
+no overflow-page escape: the three `longtext` columns average 32 / 32 / 180 bytes,
+all under InnoDB's 768-byte threshold, so they live INLINE in the clustered index.
+Every scan drags 244 bytes/row of unwanted payload past the disk.
+
+Our side is not the constraint there: 12.5 s of container CPU over a 163 s wall,
+idle 86%. Decode runs ~3.7M rows/s/core, measured twice (11.8M rows → 3.2 s CPU;
+50M rows → 12.5 s CPU).
+
+| lever | server-side | realistic total @0.5 core |
+|---|---|---|
+| today | 145 s (26.6 GB) | ~160 s |
+| InnoDB page compression (data is **5.6× zstd-compressible**; `filler` is literally `bbbb…`) | ~28 s (~5 GB, fits page cache) | **~30 s** |
+| covering index on `(d, amount)` | ~6 s (~1.2 GB) | **~27 s — apitap becomes the bottleneck** |
+| 5 s target | — | needs ~2.7 cores; our own decode floor for 50M rows at 0.5 core is ~27 s |
+
+Two conclusions worth keeping: (1) no client-side knife can move this workload —
+we idle 86% waiting on a disk-bound scan; (2) the moment the source is fixed
+(either lever), the wall lands on OUR decode floor, and only then does optimising
+the read path pay here.
+
+Product idea this suggests, on our side of the line: when a read finishes having
+idled >70% of its wall, print what the source actually delivered (MB/s, rows/s)
+and the shape of the fix. Users cannot see any of this today.
