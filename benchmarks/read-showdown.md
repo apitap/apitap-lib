@@ -587,3 +587,24 @@ Head to head on the same box, DuckDB doing everything itself takes **323.8 s and
 2 GB**; apitap landing both sides (64 s, in 256 MB) and DuckDB answering from the
 lake takes **92.9 s in 256 MB** — and the lake is reusable, so the next question
 costs 92.9 s, not 324 s.
+
+### OOM-regression check on the pipe re-calibration (2026-08-09)
+
+A 50M-row `group_by` with no filter sits exactly ON the 256 MB boundary — peak
+measures 256 MB on the runs that survive, so success depends on reclaim timing.
+Checked whether the 6→8 pipe change made it worse, installs md5-verified:
+
+| round | old (6 pipes) | new (8 pipes) |
+|---|---|---|
+| r1 | OOM | 10.5 s |
+| r2 | OOM | OOM |
+| r3 | OOM | OOM |
+
+**Not a regression** — the old calibration failed 3/3, the new one 2/3. If
+anything the new one is marginally more robust here, but neither is reliable:
+this workload does not fit 256 MB with either. It differs from the lazy query
+that DOES fit (6.6 s, 131 MB peak) by one thing — that one carries a
+`filter(...)` that pushes into SQL, so the server never sends the dropped rows.
+
+Lesson for the docs: at the 256 MB tier, an unfiltered full-table aggregate over
+50M rows is at the edge; add a pushed-down predicate, or land to parquet first.
