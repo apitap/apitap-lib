@@ -534,3 +534,32 @@ both wait on the same disk-bound server. The difference is not speed, it is
 polars may touch a row, so it needs **7× our peak RSS** and dies at 1 GB, while
 apitap streams and finishes inside 256 MB. On this workload that is the whole
 story — 1,780 MB versus 248 MB for the identical answer.
+
+## The join, through a different Arrow engine (2026-08-09)
+
+`.lazy()` already means "Rust + Arrow": apitap builds Arrow-layout buffers and
+hands them over the Arrow C stream to polars, itself a Rust/Arrow engine. What
+differs between engines is not the format — it is the MEMORY STRATEGY. polars
+builds the join hash table in RAM; DuckDB manages a budget and can spill.
+
+Same lake, same join (50M × 50M on `id`, group + sum), 0.5 core, results
+identical on every leg (False 24,343,137 / 12,146,973,412; True 24,343,911 /
+12,171,673,939):
+
+| engine | cage | wall | peak | spilled |
+|---|---|---|---|---|
+| polars | 256 MB / 512 MB / 1 GB / 2 GB | **OOM-killed** | — | — |
+| polars | 4 cpu / 6 GB | **11.4 s** | 3,089 MB | — |
+| **DuckDB** (budget 150 MB) | **256 MB** | **92.9 s** | 256 MB | 0 MB |
+| DuckDB (budget 350 MB) | 512 MB | 71.1 s | 512 MB | 0 MB |
+| DuckDB (budget 700 MB) | 1 GB | 61.0 s | 1,024 MB | 0 MB |
+| DuckDB (budget 100 MB) | 256 MB | refuses (own OOM error, not killed) | — | — |
+
+**The whole 100M-row cross-engine pipeline fits in 256 MB after all** — apitap
+lands both sides streaming, DuckDB answers the join inside the same cage. The
+price is 8× the wall against polars-on-6-GB (92.9 s vs 11.4 s) for 1/24th the
+memory. DuckDB never spilled: it picked a memory-shaped plan instead of building
+a full hash table, which is exactly the difference that kills polars below 6 GB.
+
+Worth carrying into the docs: for small boxes recommend DuckDB over the parquet
+lake; for machines with RAM to spare, polars is 8× faster.
