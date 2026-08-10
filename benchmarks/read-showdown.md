@@ -608,3 +608,32 @@ that DOES fit (6.6 s, 131 MB peak) by one thing — that one carries a
 
 Lesson for the docs: at the 256 MB tier, an unfiltered full-table aggregate over
 50M rows is at the edge; add a pushed-down predicate, or land to parquet first.
+
+## The fair fight: what happens when the DATABASE is small too (2026-08-10)
+
+Every read number in this file was taken against a Postgres with 16 cores and
+58 GB. Capping the SOURCE at **1 core / 4 GB** (table is 4.6 GB, so it no longer
+fits) changes the picture completely. apitap stayed in its usual 0.5 cpu / 256 MB
+cage; 10M rows × 15 columns; pg limits restored afterwards.
+
+| | source 16 cpu / 58 GB | source **1 cpu / 4 GB** |
+|---|---|---|
+| Postgres aggregating in place | 1.0-1.2 s | 2.9 s |
+| **apitap reading all 15 columns** | **12.4 s** (cpu 6.6 s, 53% of quota) | **220-233 s** (cpu 18.5-19.5 s, **8% of quota**) |
+
+Two things fall out, and both matter more than any knife in this file:
+
+**Extraction is paid mostly by the DATABASE.** Postgres summing in place at 1 core
+takes 2.9 s; Postgres *serialising* the same 10M × 15 columns for a client at 1
+core takes ~225 s. That 80× gap is COPY BINARY encoding 150 million field values
+— work the in-place aggregate never does. A one-core database cannot feed a fast
+client, no matter how good the client is: we idle 92% of that wall.
+
+**A slow source costs the CLIENT extra CPU too** — an effect I did not expect.
+Identical work, our own CPU went 6.6 s → 18.9 s (2.9×). The likely mechanism is
+syscall amplification: when the server dribbles bytes out, each `recvfrom`
+returns less, so the per-byte syscall overhead climbs. Worth a profile if the
+socket-option knife is ever built.
+
+Framing for anyone quoting apitap's read numbers: they describe a client against
+a healthy server. Against a starved one, the wall belongs to the database.
