@@ -637,3 +637,26 @@ socket-option knife is ever built.
 
 Framing for anyone quoting apitap's read numbers: they describe a client against
 a healthy server. Against a starved one, the wall belongs to the database.
+
+### The Postgres lane, head to head (2026-08-10)
+
+Same 10M × 15-column table, same 0.5-core cage, sum(id) verified identical
+(52,362,740,048,956). connectorx via `pl.read_database_uri(..., engine="connectorx")`.
+
+| cage | apitap | polars + connectorx |
+|---|---|---|
+| 256 MB | **19.5 s · peak 169 MB** | OOM-killed |
+| 1 GB | **16.1 s · peak 369 MB** | OOM-killed |
+| 4 GB | **17.2 s · peak 591 MB** | **OOM-killed** |
+
+connectorx cannot finish this at 4 GB — 16× the memory apitap needs — because it
+materialises the whole frame before polars sees a row, and this frame is ~5 GB.
+apitap's peak tracks the BATCH size, not the table size, so it holds at 169 MB.
+
+(ADBC was not installed in this venv, so that column is missing — an honest gap,
+not a win. Earlier campaigns found ADBC to be the one rival that genuinely
+streams.)
+
+apitap's own numbers here (19.5 s) are slower than the 12.4 s measured the day
+before because the caged-source experiment above had just evicted Postgres's page
+cache; the comparison inside this run is unaffected since both ran back to back.
