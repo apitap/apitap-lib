@@ -456,6 +456,7 @@ impl BatchBuilder {
     /// boundaries). The buffered-tail path is NOT used here: an element
     /// that runs past the window edge is left unconsumed and the caller
     /// refills (appending — see [`FramedPush::NeedMore`]).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn push_framed(&mut self, win: &[u8]) -> Result<(usize, FramedPush)> {
         debug_assert!(self.buf.is_empty(), "framed and buffered modes don't mix");
         let mut pos = 0usize;
@@ -679,6 +680,7 @@ impl BatchBuilder {
     /// a micro-batch still collects up to [`ST_K`] rows even though
     /// Postgres ships one row per message — bounding the batch by a single
     /// payload measured 15.4s vs 13.1s (per-column dispatch per ROW).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn stage_framed(&mut self, win: &[u8], start: usize) -> Result<(usize, StageStopF)> {
         let ncols = self.cols.len();
         let mut pos = start;
@@ -760,6 +762,7 @@ impl BatchBuilder {
     /// per column, then a tight loop over its staged values. The unchecked
     /// reads are justified exactly as the old two-pass was: `stage_tuples`
     /// proved every (offset, len) against `data.len()`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn decode_staged(&mut self, data: &[u8]) -> Result<()> {
         let n = self.st_rows;
         let row0 = self.rows;

@@ -392,6 +392,7 @@ impl Loader for ArrowLoader {
         true
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn send_framed(
         &mut self,
         win: &[u8],

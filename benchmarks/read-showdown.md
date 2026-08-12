@@ -660,3 +660,51 @@ streams.)
 apitap's own numbers here (19.5 s) are slower than the 12.4 s measured the day
 before because the caged-source experiment above had just evicted Postgres's page
 cache; the comparison inside this run is unaffected since both ran back to back.
+
+## hotpath on the framed read path, and a knife that died (2026-08-12)
+
+Open question from the caged-source run: identical work, but container CPU went
+6.6 s → 18.9 s when Postgres was capped at 1 core. perf could not answer it —
+`stage_framed`/`decode_staged` inline into one symbol. hotpath 0.22 names them;
+four new measure points now cover the FRAMED path (the pre-existing annotations
+covered the buffered path this lane never takes). They are `cfg_attr`-gated, so
+zero cost without `--features hotpath`.
+
+Reading the numbers: `send_framed` ⊃ `push_framed` ⊃ (`stage_framed` +
+`decode_staged`). Handing a sealed batch to the channel is nearly free (7.38 vs
+7.28 s); framing overhead itself is ~0.14 s; decode is 77% of the work, staging
+21%.
+
+### The premise that turned out to be an artifact
+
+A first pass measured ~8.5 KB windows and 142K–304K `push_framed` calls, which
+looked like a clear coalescing opportunity. **Those runs were UNCAGED.** With the
+client on 16 cores it drains the socket faster than the server fills it, so every
+read returns a scrap. Re-run with a VERIFIED cage (`cpu.max` printed from inside
+the container: `50000 100000`), the same workload gives **~12K calls — windows of
+~830 rows ≈ 100 KB.** When the client is the bottleneck — which IS the 0.5-core
+tier — the kernel already hands us big reads.
+
+### The knife: coalesce reads up to 128 KB — TIE, reverted
+
+Implemented in `co_refill` behind a RUNTIME lever (`APITAP_RECV_TARGET`, 0 =
+old behavior) so the A/B could not be faked by a stale install. 7 interleaved
+rounds, 10M × 15 cols, client caged at 0.5 core, healthy source:
+
+| side | rounds | median |
+|---|---|---|
+| old (one read per window) | 13.9 / 12.9 / 12.9 / 13.0 / 12.5 / 13.6 / 13.4 | **13.0 s** |
+| new (gather to 128 KB) | 13.1 / 12.7 / 12.8 / 12.3 / 13.8 / 13.4 / 14.0 | **13.1 s** |
+
+New won 5 rounds and lost 2, but lost bigger — medians tie, and same-side spread
+(12.5–13.9 s) exceeds every between-side gap. **Reverted.**
+
+Two conclusions worth keeping:
+- **Read coalescing cannot help a SLOW source.** A slow server means data is
+  scarce, not queued — `try_read_buf` returns WouldBlock immediately and there is
+  nothing to merge. Confirmed directly: against a 1-core Postgres the call count
+  did not move (257K → 265K).
+- **The 3× CPU inflation under a slow source is real but unexplained.** It is not
+  in decode or framing (those shrank), and it is not fixable by merging reads.
+  Whatever it is lives between the measure points — the socket wait and the tokio
+  wakeups around it. Annotating the read itself is the next honest step.
