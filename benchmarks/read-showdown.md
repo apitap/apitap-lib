@@ -766,3 +766,35 @@ Cold-cache caveat: the first leg of round 1 measured 24.2 s for the same lazy su
 in page cache the way the 4.6 GB one does, so a first-touch read pays the
 server's disk. Quote the warm number for steady state, the cold one for a
 first-ever run.
+
+## TPC-H Q1 — heavy aggregation, 0.5 cpu / 256 MB (2026-08-12)
+
+The canonical heavy-aggregation query over `lineitem` (49.5M rows × 16 columns,
+7.8 GB): date filter, two derived arithmetic columns, group by two keys, four
+sums and two averages. 48,791,772 rows pass the filter — nearly everything, so
+the filter cannot hide the work.
+
+| contender | wall | our CPU | peak | result |
+|---|---|---|---|---|
+| Postgres running it itself (16 cores) | 15.0 s cold / **7.9 s** warm | — | — | 4 groups |
+| **apitap + polars @ 0.5 cpu / 256 MB** | **54.8 s** | 27.6 s (**100% of quota**) | **214 MB** | 4 groups, 48,791,772 rows |
+| apitap + polars @ 0.5 cpu / 1 GB | 52.3 s | 27.0 s | 623 MB | identical |
+| polars + connectorx @ 256 MB | **OOM-killed** | — | — | — |
+| polars + connectorx @ 1 GB | **OOM-killed** | — | — | — |
+
+**apitap answers TPC-H Q1 inside 256 MB on half a core; connectorx cannot answer
+it at 1 GB** — its 7 projected columns × 48.8M rows materialise to ~2.7 GB before
+polars may touch a row. apitap's `.lazy()` pushes the date filter and the 7-column
+projection into the SQL, then streams: 9 of 16 columns never leave Postgres.
+
+This is also the first read workload in this file where we are genuinely
+CPU-bound — 100% of the 0.5-core quota, because Q1 does real arithmetic over 48.8M
+rows rather than just moving them.
+
+Two honest caveats: (1) `sum_charge` differs in the last digit between the 256 MB
+and 1 GB runs (…024.17 vs …024.19) — row and group counts are identical; the
+harness casts `numeric(15,2)` to Float64 and float addition is not associative, so
+different batch boundaries reorder the sum. Exact-decimal TPC-H would not do this;
+it is the harness's choice, not an engine defect. (2) Postgres's own CPU was not
+measured, so no per-core efficiency claim is made — only that it had 16 cores and
+apitap had half of one.
