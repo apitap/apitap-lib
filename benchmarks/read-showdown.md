@@ -742,3 +742,27 @@ Trap worth recording: `pl.col("id").sum()` on an `integer` column sums in Int32
 and silently overflows — the first run of this table returned negative totals,
 and `batches()` returned a DIFFERENT wrong total per round because the overflow
 lands on shifting batch boundaries. Cast first: `col("id").cast(pl.Int64).sum()`.
+
+### Same forms, 50M rows (22 GB table), 0.5 cpu / 256 MB
+
+| form | wall (warm) | our CPU | peak | columns on the wire |
+|---|---|---|---|---|
+| `.lazy().select(col("id").cast(Int64).sum())` | **6.8 s** | 4.1 s | 134 MB | 1 of 15 |
+| `.lazy().filter(...).group_by(...).agg(...)` | **5.9 / 6.0 s** | 3.6 s | 139 MB | 2 of 15, 1/3 of rows |
+| `.batches()` | 75.7 / 76.4 s | 38.3 s | **190 MB** | 15 of 15 |
+
+Sums verified exact on every leg (1,261,813,700,244,780 full; 420,608,888,162,715
+filtered). **50M rows summed in 6.8 s on half a core** — ~7.4M rows/s — from one
+expression.
+
+The property that matters for the small cage: `batches()` ships all 15 columns of
+a 22 GB table and still peaks at **190 MB, versus 186 MB on the 10 GB / 10M-row
+table**. Five times the data, the same memory — peak tracks the BATCH, never the
+table. That is why the tier holds; it is not a tuning result, it is the shape of
+the pipeline.
+
+Cold-cache caveat: the first leg of round 1 measured 24.2 s for the same lazy sum
+(our CPU only 6.9 s of it, 57% of quota — we idled). The 22 GB table does not stay
+in page cache the way the 4.6 GB one does, so a first-touch read pays the
+server's disk. Quote the warm number for steady state, the cold one for a
+first-ever run.
