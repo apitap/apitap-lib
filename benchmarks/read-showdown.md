@@ -708,3 +708,37 @@ Two conclusions worth keeping:
   in decode or framing (those shrank), and it is not fixable by merging reads.
   Whatever it is lives between the measure points — the socket wait and the tokio
   wakeups around it. Annotating the read itself is the next honest step.
+
+## The simple form IS the fast form (2026-08-12)
+
+Prompted by a fair complaint: the benchmark harness in this file reads through a
+raw `pa.RecordBatchReader` loop, which is neither how anyone uses apitap nor a
+flattering picture of it. Measured what the ACTUAL usage costs — same table
+(10M × 15 cols), same cage (0.5 cpu / 256 MB), 2 rounds, `sum(id)` verified
+exact (52,362,740,048,956) on every leg:
+
+| form | wall | our CPU | peak | columns crossing the wire |
+|---|---|---|---|---|
+| `.lazy().select(col("id").sum())` | **1.3 / 1.4 s** | 1.4-1.7 s | ~100 MB | **1 of 15** |
+| `.lazy().filter(...).group_by(...)` | **3.5 / 3.7 s** | 1.7-1.9 s | ~86 MB | 2 of 15 |
+| `.batches()` (per-chunk polars DataFrames) | 15.3 / 15.5 s | 8.2 s | ~186 MB | 15 of 15 |
+| raw `RecordBatchReader` loop (the harness) | 13.2 s | 7.3 s | ~205 MB | 15 of 15 |
+
+**The one-expression form is 11× faster than the loop**, and it is faster for the
+same reason it is simpler: `.lazy()` is the only shape where polars can tell
+apitap what NOT to fetch. Write `select(sum(id))` and the engine issues
+`SELECT id FROM …`; the other fourteen columns never leave Postgres.
+
+`batches()` is equally simple to write but cannot push anything down — it has no
+idea what the loop body will do — so it ships every column. Reach for it only
+when you genuinely need per-chunk control.
+
+Correction to the numbers quoted earlier in this session: the 12-13 s figures are
+the harness deliberately defeating pushdown so all 15 columns are measured. They
+are the right number for tuning the read path and the WRONG number to quote as
+"what apitap takes to answer a question".
+
+Trap worth recording: `pl.col("id").sum()` on an `integer` column sums in Int32
+and silently overflows — the first run of this table returned negative totals,
+and `batches()` returned a DIFFERENT wrong total per round because the overflow
+lands on shifting batch boundaries. Cast first: `col("id").cast(pl.Int64).sum()`.
