@@ -152,8 +152,22 @@ impl Dest {
     /// the shared `_apitap_state` row set. The SQL/CH/MySQL paths each buffer a
     /// staging body locally and are CPU-bound anyway, so they stay serial.
     fn apply_lanes(&self) -> usize {
+        // One lever for every destination: the per-table bodies are slices of
+        // the SAME window (each event belongs to one table), so N concurrent
+        // applies materialize ~one window's worth of bodies in total — not N
+        // windows. Safe concurrently: PgDest runs each apply in its own pooled
+        // connection/tx, ChDest is an HTTP client with Mutex'd memo state, and
+        // MySQL TEMPORARY tables are per-connection.
+        if let Ok(n) =
+            std::env::var("APITAP_CDC_APPLY_LANES").unwrap_or_default().parse::<usize>()
+        {
+            return n.clamp(1, 64);
+        }
         match self {
             Dest::Bq(_) => bq_apply_lanes(),
+            // CPU-bound paths default to serial until a measured win says
+            // otherwise — at 0.5 core, concurrent CPU work shares the same
+            // quota; only the round-trip waits can overlap.
             _ => 1,
         }
     }

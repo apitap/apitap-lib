@@ -54,3 +54,25 @@ needs one of: a bigger memory tier (much bigger windows → far fewer MERGEs), t
 BigQuery Storage Write API (gRPC streaming, skipping load jobs and the per-window
 MERGE floor), or batching a group's `_apitap_state` writes to remove the
 concurrent-update retries. Recorded here so the number is honest.
+
+## Addendum: apply lanes for the CPU-bound destinations (2026-08-14)
+
+`APITAP_CDC_APPLY_LANES` now overrides the per-window apply concurrency for
+EVERY destination (bounded pool + queue, `buffer_unordered`). Measured on the
+10-table heavy group into ClickHouse at 0.5 cpu / 256 MB, ~167K changes, both
+legs digest-verified 10/10:
+
+| | lanes=1 | lanes=4 |
+|---|---|---|
+| drain | **7.0 s** | 7.3 s |
+| CPU | 2.9 s (84% of quota) | 3.1 s (84%) |
+| bootstrap | 7.2 s | 6.2 s |
+
+**TIE.** The CH drain is 84% CPU-bound at half a core — four lanes just share
+the same quota, so overlap has nothing to hide. (BigQuery is the opposite: 94%
+waiting, which is why its lanes are worth 3.5×.) Serial stays the default for
+pg/CH/MySQL; the lever exists for the cases where the waits grow — a REMOTE
+destination over real network RTT (this rig is loopback), or a big-CPU box.
+The per-table bodies are slices of one window, so N lanes materialize ~one
+window's worth of bodies total, not N windows (bootstrap peak 50→122 MB is the
+full-load pipes, not the CDC bodies).
