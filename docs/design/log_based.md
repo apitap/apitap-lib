@@ -141,6 +141,14 @@ One destination transaction per run (pg/mysql), or one snapshot commit
   applies through the same path and needs no source pool. Unchanged-TOAST
   cells ride a per-row mask column resolved inside the MERGE
   (`IF(masked, T.c, S.c)`). Requires a billed project — CDC uses row-level DML.
+  BigQuery is LATENCY-bound (each window is a load + MERGE job round-trip, ~0
+  local CPU), so it diverges from the CPU-bound paths: it fills a bigger window
+  (lever `APITAP_CDC_WINDOW_BYTES`), applies a group's tables CONCURRENTLY,
+  bootstraps a group's tables with a bounded fan-out, and clusters a large
+  target on its PK at bootstrap so the MERGE prunes (lever `APITAP_BQ_CLUSTER=0`;
+  auto-skipped below ~1M rows where the MERGE floor dominates). Measured wins at
+  0.5 cpu / 256 MB: CDC 1.9× (single) / 3.5× (10-table group), full-load 3.6×
+  (10-table group). See `benchmarks/bq-cdc-optimize.md`.
 - **gcs / s3**: deferred loudly in v1 with a clear error (append-only object
   stores need a compaction design worth its own session).
 

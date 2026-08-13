@@ -474,7 +474,27 @@ impl BqConn {
     /// Run a standard-SQL script (the CDC MERGE + watermark transaction) as one
     /// job, polled to DONE. Unlike [`query`], this never reports a false failure
     /// on a slow DML statement — it polls the job's real terminal state.
+    ///
+    /// Retries transient failures: BigQuery serializes DML per table, so a
+    /// group's concurrent transactions racing on the shared `_apitap_state`
+    /// table can abort with "concurrent update"; rate/backend errors are
+    /// retryable too. A crashed retry is safe — the window replays idempotently.
     pub(crate) async fn cdc_script(&self, sql: &str) -> Result<()> {
+        let mut attempt = 0u32;
+        loop {
+            match self.cdc_script_once(sql).await {
+                Ok(()) => return Ok(()),
+                Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
+                    attempt += 1;
+                    let ms = 200u64 << attempt; // 400, 800, 1600, 3200, 6400
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn cdc_script_once(&self, sql: &str) -> Result<()> {
         let mut body = json!({
             "configuration": {"query": {"query": sql, "useLegacySql": false}}
         });
@@ -598,6 +618,22 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
 
 pub(crate) fn sql_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// A BigQuery error worth retrying with backoff: DML serialization conflicts
+/// (concurrent transactions on the shared state table), rate limits, and 5xx
+/// backend blips. Deliberately narrow — never retry a syntax/type error.
+fn retryable(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("concurrent update")
+        || m.contains("aborted")
+        || m.contains("ratelimitexceeded")
+        || m.contains("rate limit")
+        || m.contains("backenderror")
+        || m.contains("500 ")
+        || m.contains("502 ")
+        || m.contains("503 ")
+        || m.contains("504 ")
 }
 
 // ============================================================================

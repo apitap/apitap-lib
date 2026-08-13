@@ -130,6 +130,24 @@ impl Dest {
             }
         }
     }
+
+    /// Per-window buffered-bytes budget for THIS destination. BigQuery is
+    /// latency-bound (one job round-trip per window) so it fills a bigger
+    /// window; the CPU-bound paths stay on the small default.
+    fn cdc_window_bytes(&self) -> usize {
+        match self {
+            Dest::Bq(_) => cdc_bq_window_budget(),
+            _ => cdc_window_budget(),
+        }
+    }
+
+    /// Apply a group's tables CONCURRENTLY within a window? Only for BigQuery,
+    /// whose per-table apply is a job round-trip with ~0 local CPU/memory. The
+    /// SQL/CH/MySQL paths each buffer a staging body locally, so firing a whole
+    /// group at once would multiply their memory — they stay serial.
+    fn concurrent_group_apply(&self) -> bool {
+        matches!(self, Dest::Bq(_))
+    }
 }
 
 /// One member of the slot group.
@@ -162,6 +180,31 @@ fn window_budget() -> usize {
         Some(m) => ((m.saturating_sub(BASELINE) / 8) as usize).clamp(2 << 20, DEFAULT),
         None => DEFAULT,
     }
+}
+
+/// `APITAP_CDC_WINDOW_BYTES`, if set, forces the per-window buffered-bytes
+/// budget for every CDC drain (min 1 MiB).
+fn env_window_override() -> Option<usize> {
+    std::env::var("APITAP_CDC_WINDOW_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1 << 20))
+}
+
+/// Per-window buffered-bytes budget for the CPU-bound apply paths (SQL / CH /
+/// MySQL): keeps two overlapped windows resident under the memory cap, and a
+/// bigger window buys them nothing (their apply cost is per-row CPU, not a fixed
+/// per-window round-trip). 24 MiB ceiling.
+fn cdc_window_budget() -> usize {
+    env_window_override().unwrap_or_else(|| (window_budget() / 2).clamp(1 << 20, 24 << 20))
+}
+
+/// Per-window budget for the LATENCY-bound BigQuery apply: each window is one
+/// load + MERGE job round-trip, so a bigger window amortizes that fixed cost.
+/// Use the full per-window budget (no /2, no 24 MiB clamp) — measured to roughly
+/// halve wall time vs the CPU-path default, while staying inside the 256 MiB cap.
+fn cdc_bq_window_budget() -> usize {
+    env_window_override().unwrap_or_else(window_budget)
 }
 
 pub(crate) async fn run_task(
@@ -418,7 +461,7 @@ async fn run_group_mysql(
         .map(|c| c.source_id.as_str())
         .collect::<Vec<_>>()
         .join("\x1e");
-    let budget = (window_budget() / 2).clamp(1 << 20, 24 << 20);
+    let budget = dest.cdc_window_bytes();
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     // One counter PER TABLE. A single group-wide counter handed the same
     // total to every member, so a 10-table group reported 10× the changes it
@@ -514,36 +557,66 @@ async fn bootstrap_group(
     // session stays open for the whole load (idle; the slot retains WAL).
     let sep = if src_url.contains('?') { '&' } else { '?' };
     let pinned_url = format!("{src_url}{sep}__apitap_snapshot={snapshot}");
+    // BigQuery's per-table bootstrap is a chain of load/copy JOBS (I/O, ~0 local
+    // CPU) — running a group's tables serially made a 10-table load pay 10× the
+    // job latency. Fan them out (bounded, so N concurrent source COPYs stay
+    // inside the memory cap); the CPU-bound SQL/CH/MySQL loads stay serial. Each
+    // load is an independent replace from the ONE pinned snapshot, so gap-free
+    // and duplicate-free are unchanged.
+    use futures::stream::StreamExt as _;
+    let concurrency = if dest.concurrent_group_apply() { 4 } else { 1 };
+    let drop_slot = || async {
+        let _ = sqlx::query("SELECT pg_drop_replication_slot($1)").bind(slot).execute(src).await;
+    };
+    let loaded: Vec<Result<(u64, usize)>> = futures::stream::iter(ctxs.iter().map(|c| {
+        let pinned_url = &pinned_url;
+        let dest = &dest;
+        async move {
+            let mut o2 = opts.clone();
+            o2.mode = Mode::Replace;
+            o2.dest_table = Some(c.dest_table.clone());
+            dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
+            let r = Box::pin(crate::transfer(pinned_url, dst_url, &c.table_arg, &o2)).await?;
+            Ok((r.rows, r.parallel))
+        }
+    }))
+    .buffered(concurrency)
+    .collect()
+    .await;
     let mut out = Vec::with_capacity(ctxs.len());
-    for c in ctxs {
-        let mut o2 = opts.clone();
-        o2.mode = Mode::Replace;
-        o2.dest_table = Some(c.dest_table.clone());
-        dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
-        let report =
-            match Box::pin(crate::transfer(&pinned_url, dst_url, &c.table_arg, &o2)).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Failed bootstrap leaves no STATE behind: drop the slot;
-                    // already-loaded members are plain tables the re-run will
-                    // replace again.
-                    let _ = sqlx::query("SELECT pg_drop_replication_slot($1)")
-                        .bind(slot)
-                        .execute(src)
-                        .await;
-                    return Err(Error::Transfer(format!(
-                        "log_based: bootstrap of {} failed (group rolled back to \
-                         no-state; re-run re-bootstraps all): {e}",
-                        c.qualified
-                    )));
-                }
-            };
-        out.push((report.rows, report.parallel));
+    for (c, r) in ctxs.iter().zip(loaded) {
+        match r {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                // Failed bootstrap leaves no STATE behind: drop the slot;
+                // already-loaded members are plain tables the re-run replaces.
+                drop_slot().await;
+                return Err(Error::Transfer(format!(
+                    "log_based: bootstrap of {} failed (group rolled back to \
+                     no-state; re-run re-bootstraps all): {e}",
+                    c.qualified
+                )));
+            }
+        }
     }
     ws.stop_replication().await.ok();
 
-    for (c, (rows, _)) in ctxs.iter().zip(&out) {
-        dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows).await?;
+    // Finish (cluster large targets, write the watermark) — also job-bound on
+    // BigQuery, so the same bounded fan-out.
+    let fins: Vec<Result<()>> = futures::stream::iter(ctxs.iter().zip(&out).map(|(c, (rows, _))| {
+        let dest = &dest;
+        async move {
+            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows).await
+        }
+    }))
+    .buffered(concurrency)
+    .collect()
+    .await;
+    for r in fins {
+        if let Err(e) = r {
+            drop_slot().await;
+            return Err(e);
+        }
     }
     Ok(out)
 }
@@ -608,7 +681,7 @@ async fn drain_group(
     // The cap matters on BIG boxes too: overlap only pays while windows
     // rotate, so past ~24 MiB of buffered rows the marginal collapse-dedup
     // is worth less than hiding the apply under the next drain.
-    let budget = (window_budget() / 2).clamp(1 << 20, 24 << 20);
+    let budget = dest.cdc_window_bytes();
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
 
@@ -631,9 +704,26 @@ async fn drain_group(
         let mut rows_per = vec![0u64; actxs.len()];
         while let Some(o) = win_rx.recv().await {
             let t_apply = std::time::Instant::now();
-            for (i, (dest_table, qualified, pk_cols, source_id)) in actxs.iter().enumerate() {
-                rows_per[i] +=
-                    dest.apply(dest_table, qualified, pk_cols, &o, source_id, &apool).await?;
+            if dest.concurrent_group_apply() && actxs.len() > 1 {
+                // BigQuery apply is one job round-trip per table (I/O, ~0 local
+                // CPU) — applying a group's tables SERIALLY made a 10-table
+                // window pay 10× the round-trip. Fire them concurrently; the
+                // targets are distinct tables, and the shared _apitap_state
+                // INSERT is covered by cdc_script's concurrent-update retry.
+                let results = futures::future::try_join_all(
+                    actxs
+                        .iter()
+                        .map(|(dt, q, pk, sid)| dest.apply(dt, q, pk, &o, sid, &apool)),
+                )
+                .await?;
+                for (i, n) in results.into_iter().enumerate() {
+                    rows_per[i] += n;
+                }
+            } else {
+                for (i, (dest_table, qualified, pk_cols, source_id)) in actxs.iter().enumerate() {
+                    rows_per[i] +=
+                        dest.apply(dest_table, qualified, pk_cols, &o, source_id, &apool).await?;
+                }
             }
             if std::env::var("APITAP_DEBUG").is_ok() {
                 let events: u64 = o.tables.values().map(|c| c.events).sum();

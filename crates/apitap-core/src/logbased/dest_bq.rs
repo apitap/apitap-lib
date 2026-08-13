@@ -90,20 +90,61 @@ impl BqDest {
     }
 
     /// The bootstrap's replace just (re)created the target and wrote a `*`
-    /// barrier. Heal any stale staging, then stamp the slot's LSN as the CDC
-    /// watermark with a server-clock timestamp so it sorts AFTER that barrier.
+    /// barrier. CLUSTER the target on its PK (so every window's MERGE prunes to
+    /// the touched blocks instead of full-scanning — the MERGE is the dominant
+    /// per-window cost), heal any stale staging, then stamp the slot's LSN as
+    /// the CDC watermark with a server-clock timestamp so it sorts AFTER that
+    /// barrier.
     pub(crate) async fn bootstrap_finish(
         &self,
         dest_table: &str,
         source_id: &str,
-        _pk_cols: &[String],
+        pk_cols: &[String],
         lsn: u64,
         rows: u64,
     ) -> Result<()> {
         let table = bare(dest_table);
         self.conn.cdc_delete_table(&cdc_staging(table)).await?;
+        self.conn.cdc_delete_table(&format!("{table}__apitap_cl")).await?;
+        self.cluster_target(table, pk_cols, rows).await?;
         self.conn.cdc_ensure_state_table().await?;
         self.write_state(table, source_id, lsn, rows).await
+    }
+
+    /// Rewrite the freshly-bootstrapped target clustered on its PK (up to 4
+    /// columns — BigQuery's max). One full-table rewrite, once, so every later
+    /// MERGE prunes the target scan. Only worth it once the scan dominates the
+    /// MERGE's ~fixed BigQuery job floor — measured NEUTRAL below ~1M rows, so
+    /// small tables skip it (and skip its one-time rewrite cost). Kill switch
+    /// `APITAP_BQ_CLUSTER=0`; skips if already clustered on the same keys.
+    async fn cluster_target(&self, table: &str, pk_cols: &[String], rows: u64) -> Result<()> {
+        const CLUSTER_MIN_ROWS: u64 = 1_000_000;
+        if std::env::var("APITAP_BQ_CLUSTER").as_deref() == Ok("0") || rows < CLUSTER_MIN_ROWS {
+            return Ok(());
+        }
+        let keys: Vec<&String> = pk_cols.iter().take(4).collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        if let Some(meta) = self.conn.table_get(table).await? {
+            if let Some(cur) = meta["clustering"]["fields"].as_array() {
+                let cur: Vec<&str> = cur.iter().filter_map(|f| f.as_str()).collect();
+                let want: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+                if cur == want {
+                    return Ok(());
+                }
+            }
+        }
+        let cl = keys.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+        let tmp = format!("{table}__apitap_cl");
+        let sql = format!(
+            "CREATE OR REPLACE TABLE {tmp} CLUSTER BY {cl} AS SELECT * FROM {t};\n\
+             DROP TABLE {t};\n\
+             ALTER TABLE {tmp} RENAME TO `{table}`;",
+            tmp = self.conn.fq(&tmp),
+            t = self.conn.fq(table),
+        );
+        self.conn.cdc_script(&sql).await
     }
 
     pub(crate) async fn apply(
@@ -215,15 +256,28 @@ impl BqDest {
         }
 
         // Land the window in the staging table, then MERGE + watermark in one tx.
+        let dbg = std::env::var("APITAP_DEBUG").is_ok();
+        let nbytes = ndjson.len();
+        let t_load = std::time::Instant::now();
         self.conn
             .cdc_load_ndjson(&cdc_staging(table), &plan.staging_fields(), ndjson)
             .await?;
+        let load_s = t_load.elapsed().as_secs_f64();
         let sql = format!(
             "BEGIN TRANSACTION;\n{merge};\n{state};\nCOMMIT TRANSACTION;",
             merge = plan.merge_sql(&self.conn, table, c.truncate),
             state = state_sql,
         );
+        let t_merge = std::time::Instant::now();
         self.conn.cdc_script(&sql).await?;
+        if dbg {
+            eprintln!(
+                "[bq apply] {table}: {staged} staging rows / {:.1}MB, load={load_s:.1}s \
+                 merge={:.1}s",
+                nbytes as f64 / (1 << 20) as f64,
+                t_merge.elapsed().as_secs_f64(),
+            );
+        }
         Ok(c.events)
     }
 
