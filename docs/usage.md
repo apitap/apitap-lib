@@ -805,10 +805,12 @@ apitap.transfer(
   key columns outside the replica identity fail with the exact `ALTER
   TABLE` to run. The replication connection speaks plain TCP for now
   (`sslmode` beyond disable/prefer is refused, not ignored).
-- **Scope today**: Postgres sources → **Postgres, ClickHouse, MySQL and
-  Iceberg** destinations. Iceberg needs a single-column primary key
+- **Scope today**: Postgres and MySQL sources → **Postgres, ClickHouse, MySQL,
+  BigQuery and Iceberg** destinations. Iceberg needs a single-column primary key
   (equality-delete files are single-key), and the parquet lane's bytea
-  restriction applies there as everywhere else.
+  restriction applies there as everywhere else. BigQuery lands each window in a
+  staging table and applies one `MERGE` — it needs a project with billing
+  enabled (CDC uses row-level DML).
 - **Many tables, ONE slot**: a list of tables forms a slot GROUP — one
   publication, one drain pass per run, one snapshot-pinned bootstrap for
   every member, and the slot is confirmed only after the whole group
