@@ -621,8 +621,13 @@ pub(crate) fn sql_str(s: &str) -> String {
 }
 
 /// A BigQuery error worth retrying with backoff: DML serialization conflicts
-/// (concurrent transactions on the shared state table), rate limits, and 5xx
-/// backend blips. Deliberately narrow — never retry a syntax/type error.
+/// (concurrent transactions on the shared state table), rate limits, and the
+/// transient backend classes Google's own error text tells you to retry —
+/// `backendError` and `internalError` ("This is usually caused by a transient
+/// issue. Retrying the job with back-off … should solve the problem"). A
+/// concurrent group apply meets these far more often than a serial one did.
+/// Deliberately narrow — never retry a syntax/type/permission error, and never
+/// `resourcesExceeded` (the query itself is too big; retrying just burns time).
 fn retryable(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("concurrent update")
@@ -630,10 +635,33 @@ fn retryable(msg: &str) -> bool {
         || m.contains("ratelimitexceeded")
         || m.contains("rate limit")
         || m.contains("backenderror")
+        || m.contains("internalerror")
+        || m.contains("internal error")
         || m.contains("500 ")
         || m.contains("502 ")
         || m.contains("503 ")
         || m.contains("504 ")
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::retryable;
+
+    #[test]
+    fn classifies_transient_vs_permanent() {
+        // Google's own text for the class that broke a concurrent group apply.
+        assert!(retryable(
+            r#"bigquery job x failed: {"reason":"internalError","message":"An internal error occurred and the request could not be completed. This is usually caused by a transient issue."}"#
+        ));
+        assert!(retryable(r#"{"reason":"backendError"}"#));
+        assert!(retryable(r#"{"reason":"rateLimitExceeded"}"#));
+        assert!(retryable("Transaction is aborted due to concurrent update"));
+        // Permanent: retrying only wastes the window.
+        assert!(!retryable("Syntax error: Unexpected identifier at [1:8]"));
+        assert!(!retryable(r#"{"reason":"resourcesExceeded"}"#));
+        assert!(!retryable("Access Denied: Table apitap:ds.t"));
+        assert!(!retryable("Not found: Dataset apitap:missing"));
+    }
 }
 
 // ============================================================================

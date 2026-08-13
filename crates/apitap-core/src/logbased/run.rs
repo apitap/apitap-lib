@@ -141,12 +141,38 @@ impl Dest {
         }
     }
 
-    /// Apply a group's tables CONCURRENTLY within a window? Only for BigQuery,
-    /// whose per-table apply is a job round-trip with ~0 local CPU/memory. The
-    /// SQL/CH/MySQL paths each buffer a staging body locally, so firing a whole
-    /// group at once would multiply their memory — they stay serial.
-    fn concurrent_group_apply(&self) -> bool {
-        matches!(self, Dest::Bq(_))
+    /// How many of a group's tables may be applied AT ONCE within one window.
+    /// `1` = the serial loop.
+    ///
+    /// Only BigQuery goes above 1: its per-table apply is a job round-trip that
+    /// spends almost no local CPU, so a serial group pays the round-trip once
+    /// per table. It is a bounded pool, not an unbounded fan-out — a 100-table
+    /// group firing 100 load jobs and 100 MERGE transactions at once would trip
+    /// BigQuery's concurrent-job limits and make every transaction contend on
+    /// the shared `_apitap_state` row set. The SQL/CH/MySQL paths each buffer a
+    /// staging body locally and are CPU-bound anyway, so they stay serial.
+    fn apply_lanes(&self) -> usize {
+        match self {
+            Dest::Bq(_) => bq_apply_lanes(),
+            _ => 1,
+        }
+    }
+}
+
+/// Concurrent BigQuery applies per window (also the group bootstrap's fan-out).
+/// Bounded by memory — each in-flight apply materializes its slice of the window
+/// as an NDJSON body — and capped at 8, past which the wall is BigQuery's own
+/// job scheduling and the transactions start contending. Lever:
+/// `APITAP_BQ_APPLY_LANES`.
+fn bq_apply_lanes() -> usize {
+    const CAP: usize = 8;
+    if let Ok(n) = std::env::var("APITAP_BQ_APPLY_LANES").unwrap_or_default().parse::<usize>() {
+        return n.clamp(1, 64);
+    }
+    match crate::pipeline::mem_limit_bytes() {
+        // ~12 MiB of materialized body per lane over a ~96 MiB working base.
+        Some(m) => ((m.saturating_sub(96 << 20) / (12 << 20)) as usize).clamp(1, CAP),
+        None => CAP,
     }
 }
 
@@ -564,7 +590,7 @@ async fn bootstrap_group(
     // load is an independent replace from the ONE pinned snapshot, so gap-free
     // and duplicate-free are unchanged.
     use futures::stream::StreamExt as _;
-    let concurrency = if dest.concurrent_group_apply() { 4 } else { 1 };
+    let concurrency = dest.apply_lanes();
     let drop_slot = || async {
         let _ = sqlx::query("SELECT pg_drop_replication_slot($1)").bind(slot).execute(src).await;
     };
@@ -704,19 +730,31 @@ async fn drain_group(
         let mut rows_per = vec![0u64; actxs.len()];
         while let Some(o) = win_rx.recv().await {
             let t_apply = std::time::Instant::now();
-            if dest.concurrent_group_apply() && actxs.len() > 1 {
+            let lanes = dest.apply_lanes();
+            if lanes > 1 && actxs.len() > 1 {
                 // BigQuery apply is one job round-trip per table (I/O, ~0 local
                 // CPU) — applying a group's tables SERIALLY made a 10-table
-                // window pay 10× the round-trip. Fire them concurrently; the
-                // targets are distinct tables, and the shared _apitap_state
-                // INSERT is covered by cdc_script's concurrent-update retry.
-                let results = futures::future::try_join_all(
-                    actxs
-                        .iter()
-                        .map(|(dt, q, pk, sid)| dest.apply(dt, q, pk, &o, sid, &apool)),
-                )
-                .await?;
-                for (i, n) in results.into_iter().enumerate() {
+                // window pay 10× the round-trip. Run them through a BOUNDED
+                // pool: `lanes` applies in flight, the rest queued, each
+                // completion pulling the next. Unbounded would melt a 100-table
+                // group against BigQuery's job limits and make every
+                // transaction contend on the shared state rows. The targets are
+                // distinct tables; the shared `_apitap_state` INSERT is covered
+                // by cdc_script's concurrent-update retry.
+                use futures::stream::{StreamExt as _, TryStreamExt as _};
+                // Indices, not references: a closure taking `&(..)` and
+                // returning an async block trips higher-ranked lifetime
+                // inference ("FnOnce is not general enough").
+                let (dref, aref, oref, cref) = (&dest, &apool, &o, &actxs);
+                let applied: Vec<(usize, u64)> = futures::stream::iter(0..cref.len())
+                    .map(|i| async move {
+                        let (dt, q, pk, sid) = &cref[i];
+                        dref.apply(dt, q, pk, oref, sid, aref).await.map(|n| (i, n))
+                    })
+                    .buffer_unordered(lanes)
+                    .try_collect()
+                    .await?;
+                for (i, n) in applied {
                     rows_per[i] += n;
                 }
             } else {
