@@ -206,7 +206,7 @@ impl BqConn {
         )
     }
 
-    async fn table_get(&self, table: &str) -> Result<Option<Value>> {
+    pub(crate) async fn table_get(&self, table: &str) -> Result<Option<Value>> {
         self.api_opt(reqwest::Method::GET, self.table_url(table), None)
             .await
     }
@@ -422,6 +422,157 @@ impl BqConn {
             "bigquery job {job_id} still running after 30 minutes"
         )))
     }
+
+    // ── log_based (CDC) helpers ─────────────────────────────────────────────
+    // The CDC apply path (crate::logbased::dest_bq) needs DML, which the bulk
+    // sink deliberately avoids — so these live here, next to the auth/REST
+    // plumbing they reuse, and are the only BigQuery surface dest_bq touches.
+
+    /// `` `project.dataset.table` `` — a backtick-quoted fully-qualified name.
+    pub(crate) fn fq(&self, table: &str) -> String {
+        format!("`{}.{}.{table}`", self.project, self.dataset)
+    }
+
+    /// The state table, fully qualified.
+    pub(crate) fn state_fq(&self) -> String {
+        self.fq(STATE_TABLE)
+    }
+
+    pub(crate) async fn cdc_state_table_exists(&self) -> Result<bool> {
+        Ok(self.table_get(STATE_TABLE).await?.is_some())
+    }
+
+    pub(crate) async fn cdc_delete_table(&self, table: &str) -> Result<()> {
+        self.table_delete(table).await
+    }
+
+    /// A read query (small results only): the barrier-aware state SELECT.
+    pub(crate) async fn cdc_query(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        self.query(sql).await
+    }
+
+    pub(crate) async fn cdc_ensure_state_table(&self) -> Result<()> {
+        if self.table_get(STATE_TABLE).await?.is_some() {
+            return Ok(());
+        }
+        let fields = json!([
+            {"name": "dest_table", "type": "STRING", "mode": "REQUIRED"},
+            {"name": "source_id", "type": "STRING", "mode": "REQUIRED"},
+            {"name": "cursor_col", "type": "STRING", "mode": "NULLABLE"},
+            {"name": "watermark", "type": "STRING", "mode": "NULLABLE"},
+            {"name": "mode", "type": "STRING", "mode": "NULLABLE"},
+            {"name": "last_rows", "type": "INT64", "mode": "NULLABLE"},
+            {"name": "synced_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        ]);
+        match self.table_create(STATE_TABLE, &fields).await {
+            Ok(()) => Ok(()),
+            Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Run a standard-SQL script (the CDC MERGE + watermark transaction) as one
+    /// job, polled to DONE. Unlike [`query`], this never reports a false failure
+    /// on a slow DML statement — it polls the job's real terminal state.
+    pub(crate) async fn cdc_script(&self, sql: &str) -> Result<()> {
+        let mut body = json!({
+            "configuration": {"query": {"query": sql, "useLegacySql": false}}
+        });
+        if let Some(loc) = &self.location {
+            body["jobReference"] = json!({"projectId": self.project, "location": loc});
+        }
+        let v = self
+            .api(
+                reqwest::Method::POST,
+                format!("{BQ_BASE}/projects/{}/jobs", self.project),
+                Some(&body),
+            )
+            .await?;
+        let job_id = v["jobReference"]["jobId"]
+            .as_str()
+            .ok_or_else(|| Error::Transfer("bigquery CDC job missing jobId".into()))?
+            .to_string();
+        let loc = v["jobReference"]["location"].as_str().map(str::to_string);
+        self.poll_job(&job_id, loc.as_deref()).await.map(|_| ())
+    }
+
+    /// Load one CDC window's NDJSON into its staging table with WRITE_TRUNCATE
+    /// (idempotent on replay) and CREATE_IF_NEEDED (heals a schema drift), then
+    /// poll the load job. `fields` is the all-STRING staging schema.
+    pub(crate) async fn cdc_load_ndjson(
+        &self,
+        table: &str,
+        fields: &Value,
+        ndjson: Vec<u8>,
+    ) -> Result<()> {
+        let config = json!({
+            "configuration": { "load": {
+                "destinationTable": {
+                    "projectId": self.project, "datasetId": self.dataset, "tableId": table,
+                },
+                "schema": {"fields": fields},
+                "sourceFormat": "NEWLINE_DELIMITED_JSON",
+                "createDisposition": "CREATE_IF_NEEDED",
+                "writeDisposition": "WRITE_TRUNCATE",
+                "maxBadRecords": 0,
+            }}
+        });
+        let boundary = "apitap_cdc_boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
+        body.extend_from_slice(config.to_string().as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&ndjson);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let url = format!(
+            "{BQ_UPLOAD}/projects/{}/jobs?uploadType=multipart",
+            self.project
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(self.bearer().await?)
+            .header(
+                "Content-Type",
+                format!("multipart/related; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Transfer(format!("bigquery cdc staging load: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Transfer(format!(
+                "bigquery cdc staging load {status}: {}",
+                text.trim()
+            )));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Transfer(format!("bigquery cdc staging load response: {e}")))?;
+        let job_id = v["jobReference"]["jobId"]
+            .as_str()
+            .ok_or_else(|| Error::Transfer("bigquery cdc staging load missing jobId".into()))?
+            .to_string();
+        let loc = v["jobReference"]["location"].as_str().map(str::to_string);
+        self.poll_job(&job_id, loc.as_deref()).await.map(|_| ())
+    }
+
+    /// A credential-free connection for unit tests (SQL-shape assertions only —
+    /// any network call panics on the empty token).
+    #[cfg(test)]
+    pub(crate) fn fake(project: &str, dataset: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            credentials: Arc::new(String::new()),
+            auth: Arc::new(tokio::sync::Mutex::new((String::new(), std::time::Instant::now()))),
+            project: project.to_string(),
+            dataset: dataset.to_string(),
+            location: None,
+        }
+    }
 }
 
 fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
@@ -445,7 +596,7 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
         .unwrap_or_default()
 }
 
-fn sql_str(s: &str) -> String {
+pub(crate) fn sql_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
@@ -1434,10 +1585,12 @@ impl crate::sink::Sink for BqSink {
                 }
                 Ok(())
             }
-            Mode::LogBased => Err(Error::InvalidInput(
-                "log_based is not supported for BigQuery destinations yet — CDC \
-                 deltas need row-level deletes (MERGE DML); use a postgres, mysql \
-                 or iceberg destination"
+            // log_based is applied by crate::logbased::dest_bq, never the bulk
+            // sink — reaching here means the bootstrap's Mode::Replace was left
+            // as LogBased, which is a bug.
+            Mode::LogBased => Err(Error::Transfer(
+                "log_based reached the BigQuery bulk sink — the CDC path is \
+                 logbased::dest_bq (internal invariant broken)"
                     .into(),
             )),
             Mode::Merge => Err(Error::InvalidInput(

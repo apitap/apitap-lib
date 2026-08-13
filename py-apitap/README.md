@@ -81,8 +81,8 @@ Each pair negotiates the fastest wire format both sides speak — for example:
 | `postgres://` → `mysql://` | binary COPY rendered in-flight as `LOAD DATA` text |
 | `mysql://` → `postgres://` | wire decode → binary COPY (exact decimals to `DECIMAL(65,30)`) |
 | `clickhouse://` → `clickhouse://` | `RowBinary` relayed untouched — 10M rows server-to-server in 8.4 s, or 20.6 s in a 256 MB container |
-| `postgres://`/`mysql://` → `clickhouse://`, `mode="log_based"` | change streams: 40M+ changes verified per source at **34–132K changes/s** on **half a core** — v0.29.0: 132K/s on 5-column rows, 34K/s at 15 wide columns ([the stress ledger](https://apitap.dev/docs/cdc-stress)) |
-| any → `bigquery://` | Parquet or CSV load jobs — free path, sandbox-safe |
+| `postgres://`/`mysql://` → `clickhouse://`/`bigquery://`/…, `mode="log_based"` | change streams: 40M+ changes verified per source at **34–132K changes/s** on **half a core** — v0.29.0: 132K/s on 5-column rows, 34K/s at 15 wide columns ([the stress ledger](https://apitap.dev/docs/cdc-stress)) |
+| any → `bigquery://` (bulk) | Parquet or CSV load jobs — free path, sandbox-safe (CDC into BigQuery needs a billed project) |
 
 Every transfer stages and swaps in atomically — readers never see a partial table,
 an empty source never wipes a good one, and a mid-run failure leaves the previous
@@ -140,7 +140,9 @@ Every later run drains the log delta — inserts, updates
 set-based in one destination transaction that also advances the LSN
 watermark. Schedule the same call from cron/Airflow; no daemon. The watermark lives in **`_apitap_state`** — a
 plain, queryable table in the destination database, one row per (table, source),
-written **in the same transaction as the data** on Postgres. On Iceberg it lives
+written **in the same transaction as the data** on Postgres and BigQuery
+(BigQuery lands each window in a staging table and applies one `MERGE` — it
+needs a project with billing, since CDC uses row-level DML). On Iceberg it lives
 in the table's own properties, committed **in the same snapshot as the data**.
 No local state files, no opaque blobs, no extra columns in your rows. A 1M-row delta lands on a 10M-row
 table in ~10 s — cost is proportional to the delta, not the table.

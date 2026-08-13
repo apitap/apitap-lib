@@ -206,8 +206,9 @@ use it for rebuildable destinations.
 - [x] Batch CDC — `mode="log_based"`: Postgres logical replication on a
       schedule, no daemon. Everything the WAL saw (inserts, updates incl.
       PK changes, deletes, TRUNCATEs, TOAST handled) collapsed per key and
-      applied set-based to **Postgres, ClickHouse, MySQL or Iceberg**, with
-      the LSN watermark committed atomically with the data. Memory-bounded
+      applied set-based to **Postgres, ClickHouse, MySQL, BigQuery or
+      Iceberg** (BigQuery via a staging table + one `MERGE`, billed project
+      required), with the watermark committed atomically with the data. Memory-bounded
       drain windows fit the smallest tier: a 2.1M-event backlog replays in
       a 0.5 vCPU / 44 MB container (33 MB peak). Same 650K-event window,
       everyone capped at 0.5 vCPU / 256 MB: **apitap 12 s** vs ape-dts 22 s

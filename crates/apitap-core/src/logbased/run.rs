@@ -14,6 +14,7 @@
 //! that were already ahead converge.
 
 use crate::error::{Error, Result};
+use crate::logbased::dest_bq::BqDest;
 use crate::logbased::dest_ch::ChDest;
 use crate::logbased::dest_ice::IceDest;
 use crate::logbased::dest_my::MyDest;
@@ -33,6 +34,7 @@ enum Dest {
     Ch(ChDest),
     My(MyDest),
     Ice(IceDest),
+    Bq(BqDest),
 }
 
 impl Dest {
@@ -42,9 +44,10 @@ impl Dest {
             "clickhouse" => Ok(Dest::Ch(ChDest::connect(dst_url)?)),
             "mysql" => Ok(Dest::My(MyDest::connect(dst_url)?)),
             "iceberg" => Ok(Dest::Ice(IceDest::connect(dst_url).await?)),
+            "bigquery" => Ok(Dest::Bq(BqDest::connect(dst_url).await?)),
             other => Err(Error::InvalidInput(format!(
                 "log_based: unsupported destination scheme '{other}' — use \
-                 postgres, clickhouse, mysql or iceberg"
+                 postgres, clickhouse, mysql, bigquery or iceberg"
             ))),
         }
     }
@@ -55,13 +58,14 @@ impl Dest {
             Dest::Ch(d) => d.read_state(dest_table, source_id).await,
             Dest::My(d) => d.read_state(dest_table, source_id).await,
             Dest::Ice(d) => d.read_state(dest_table, source_id).await,
+            Dest::Bq(d) => d.read_state(dest_table, source_id).await,
         }
     }
 
     /// Destination-specific knobs for the bootstrap's full load.
     fn tweak_bootstrap_opts(&self, o2: &mut TransferOptions, pk_cols: &[String]) {
         match self {
-            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => {}
+            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) | Dest::Bq(_) => {}
             Dest::Ch(d) => d.tweak_bootstrap_opts(o2, pk_cols),
         }
     }
@@ -81,6 +85,7 @@ impl Dest {
             Dest::Ch(d) => d.write_state(dest_table, source_id, lsn, rows).await,
             Dest::My(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
             Dest::Ice(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
+            Dest::Bq(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
         }
     }
 
@@ -99,6 +104,7 @@ impl Dest {
             Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::My(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::Bq(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::Ice(_) => Err(Error::InvalidInput(
                 "log_based: iceberg needs a Postgres source in this release".into(),
             )),
@@ -118,6 +124,7 @@ impl Dest {
             Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::My(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
+            Dest::Bq(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::Ice(d) => {
                 d.apply(dest_table, qualified_src, pk_cols, outcome, source_id, src).await
             }
@@ -349,8 +356,8 @@ async fn run_group_mysql(
     let dest = Dest::connect(dst_url).await?;
     if matches!(dest, Dest::Ice(_)) {
         return Err(Error::InvalidInput(
-            "log_based: mysql → iceberg lands next — postgres, clickhouse and \
-             mysql destinations work today"
+            "log_based: mysql → iceberg needs a Postgres source — postgres, \
+             clickhouse, mysql and bigquery destinations work from MySQL today"
                 .into(),
         ));
     }

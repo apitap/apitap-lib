@@ -516,9 +516,9 @@ def transfer(
     tables, all-text, replace only), ``github://owner/repo[/dir]?ref=main``
     (CSV files are the tables, all-text, replace only),
     ``github+api://owner/repo`` (issues/PRs/commits/stars… as typed tables,
-    incremental where the API allows) sources — Postgres sources additionally
-    support ``mode="log_based"`` batch CDC (logical replication: every WAL
-    operation, drained per scheduled run, snapshot-pinned bootstrap) —
+    incremental where the API allows) sources — Postgres (logical replication)
+    and MySQL (binlog) sources additionally support ``mode="log_based"`` batch
+    CDC (every change, drained per scheduled run, snapshot-pinned bootstrap) —
     ``postgres://``,
     ``clickhouse://`` (``clickhouse+https://`` for TLS),
     ``bigquery://<project>/<dataset>?credentials=/path/key.json``,
@@ -578,12 +578,13 @@ def transfer(
             ``max(cursor)`` are loaded — stateless, the watermark lives in the data;
             bootstraps as replace when the table doesn't exist), ``"merge"``
             (Postgres destinations: incremental upsert by the destination's
-            PRIMARY KEY), or ``"log_based"`` (Postgres sources: batch CDC via
-            logical replication — every WAL operation incl. deletes and
-            TRUNCATEs, drained per scheduled run into Postgres, ClickHouse,
-            MySQL or Iceberg; first run bootstraps snapshot-pinned, the LSN
-            watermark commits atomically with the data, and a table list
-            shares ONE replication slot). Incremental modes require a cursor
+            PRIMARY KEY), or ``"log_based"`` (batch CDC from a Postgres
+            (logical replication) or MySQL (binlog) source — every change incl.
+            deletes and TRUNCATEs, drained per scheduled run into Postgres,
+            ClickHouse, MySQL, BigQuery or Iceberg; first run bootstraps
+            snapshot-pinned, the watermark commits atomically with the data, and
+            a table list shares ONE replication slot. BigQuery needs a billed
+            project — CDC applies row-level DML the free tier rejects). Incremental modes require a cursor
             (integer or timestamp column). Append assumes the cursor is
             monotonic with COMMIT order — for update-prone or
             concurrently-written tables use merge with an ``updated_at``

@@ -134,8 +134,15 @@ One destination transaction per run (pg/mysql), or one snapshot commit
   delete-set ∪ upsert-keys, data files = upsert rows, watermark = table
   property, **one atomic snapshot**. The machinery shipped in v0.16.0;
   log_based rides it unchanged.
-- **clickhouse / bigquery / gcs / s3**: deferred loudly in v1 with a clear
-  error (CH needs a ReplacingMergeTree/sign design worth its own session).
+- **bigquery**: each window lands in an all-STRING staging table
+  (WRITE_TRUNCATE → replay-idempotent) and applies with ONE `MERGE` inside a
+  multi-statement transaction that also advances the watermark. Column types
+  come from the destination's own DDL, so a MySQL binlog source (every OID 0)
+  applies through the same path and needs no source pool. Unchanged-TOAST
+  cells ride a per-row mask column resolved inside the MERGE
+  (`IF(masked, T.c, S.c)`). Requires a billed project — CDC uses row-level DML.
+- **gcs / s3**: deferred loudly in v1 with a clear error (append-only object
+  stores need a compaction design worth its own session).
 
 Expected apply rate is the existing merge path's (~450K rows/s into pg on
 the bench box) vs ape-dts's ~10K rows/s row-SQL sinker — the 45× wedge is
