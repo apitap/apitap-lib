@@ -798,3 +798,99 @@ different batch boundaries reorder the sum. Exact-decimal TPC-H would not do thi
 it is the harness's choice, not an engine defect. (2) Postgres's own CPU was not
 measured, so no per-core efficiency claim is made — only that it had 16 cores and
 apitap had half of one.
+
+> **Superseded.** The connectorx row above was measured against SQL with no
+> `WHERE` clause, and the section was drafted with an ADBC comparison that turned
+> out to be invalid. Read the audited re-measurement below instead.
+
+## The audit that killed a 5.2× claim (2026-08-12)
+
+Before publishing the Q1 table with an ADBC column, three adversarial reviewers
+were pointed at the harness with one instruction: prove it unfair. They raised 33
+objections, 6 of them fatal, and the headline did not survive.
+
+**The fatal one.** `adbc-driver-postgresql` 1.12.0 has **no NUMERIC→decimal read
+path**. All four `numeric(15,2)` measure columns arrive as
+`extension<arrow.opaque[storage_type=string, type_name=numeric]>`, which polars
+loads as `String`. So the "ADBC streaming" leg was not aggregating numbers — it
+was running `strtod` over ~195M ASCII decimals, while apitap delivered native
+`Decimal(15,2)`. The 285 s we measured was a driver type-mapping artifact.
+There is no read-side knob: `adbc.postgresql.disable_decimal_fast_path` exists in
+the `.so` but only feeds `writer.InitFieldWriters` — it is an ingest option. A
+server-side `::float8` cast is the only lever.
+
+Five more that changed the writeup:
+
+- **"5.2× wall AND 5.2× CPU" was one number reported twice.** In a `--cpus=0.5`
+  cage every saturated leg has `cpu == 0.5 × wall` by construction.
+- **polars silently drops `batch_size` for ADBC cursors.** `_arrow_registry.py`
+  declares the adbc family `exact_batch_size: False`, so `_fetch_arrow` calls
+  `cursor.fetch_record_batch()` with no argument. Our "200k vs 50k made no
+  difference" was four replicates of one configuration, not a sweep. ADBC's own
+  `adbc.postgresql.batch_size_hint_bytes` does work.
+- **The connectorx leg was a strawman** — its SQL carried no `WHERE` at all.
+- **apitap opens 8 ctid-partitioned COPY streams; ADBC opens 1.** Undisclosed.
+- **The row count was wrong** by 41,763: the table holds 49,487,825 rows
+  (TPC-H SF≈8.25, not SF10).
+
+### The re-measurement (z52)
+
+Every leg rebuilt: ADBC cast `::float8` server-side and wrapped in the *same*
+`polars.io.plugins.register_io_source` integration apitap uses, driving the same
+streaming engine over the same seven aggregates; connectorx given the same
+`WHERE`; three replicates **interleaved** rather than run in blocks an hour
+apart; page-cache and loadavg logged before each leg; and the cage printed from
+*inside* the container so a dropped `--cpus` can never again be mistaken for a
+result.
+
+Ground truth, computed server-side in exact `numeric`: 49,487,825 rows total,
+**48,791,772** after the filter, `sum_charge = 1843414910024.097456`.
+
+Median of 3, client capped at 0.5 cpu:
+
+| leg | wall @256 MB | client CPU | peak | wall @1 GB | peak |
+|---|---|---|---|---|---|
+| **apitap + polars** | **52.7 s** | 27.0 s | 198 MB | 52.7 s | 606 MB |
+| polars + ADBC (`::float8`, io-plugin, 7 aggs) | 138.1 s | 66.4 s | **130 MB** | 137.5 s | 129 MB |
+| polars + connectorx (same `WHERE`) | **OOM-killed** | — | — | **OOM-killed** | — |
+
+Spread across replicates was ≤2.5% on every cell. So the real gap is
+**2.62× wall / 2.46× CPU**, not 5.2×.
+
+### What the gap actually is
+
+A drain-only leg — pull every batch through the ADBC driver, touch nothing —
+costs **134.1 s / 60.5 s CPU** (median of 2), against 138.1 s / 66.4 s for the
+full query. **97% of the ADBC leg is the driver.** The entire seven-aggregate Q1
+over 48.8M rows costs ~4 s wall / ~6 s CPU.
+
+That is the honest claim, and it is a sharper one than the number we almost
+published: this is not polars-vs-apitap, because both legs run the identical
+polars streaming plan at the identical aggregation cost. It is one Arrow
+transport against another. ADBC spends 60.5 s of CPU delivering the rows;
+apitap spends 27.0 s delivering them **and** aggregating them.
+
+Isolating the type tax at full scale, same fair structure, numerics left as text:
+**300.8 s / 151.0 s CPU** — so the default mapping costs **2.18×**, and apitap is
+2.62× beyond that. (The original hand-rolled two-stage text version measured
+285.3 s; it was *faster* than the io-plugin form, because it computed 5 aggregates
+instead of 7. Our earlier disclosure had that backwards.)
+
+### Where we lose
+
+**ADBC is the memory-frugal engine here, not apitap.** It holds a flat
+129–138 MB across both cages while apitap peaks at 198 MB, rising to 606 MB when
+the cage is 1 GB — we size buffers to the budget. Of the three contenders apitap
+has the *largest* successful footprint. The OOM claim belongs to connectorx
+alone: `pl.read_database_uri` has no streaming path, so the whole result must
+land, and it dies at 256 MB and at 1 GB even with the filter and projection
+hand-written into its SQL.
+
+Three caveats that stay: the `::float8` cast moves work to the uncapped server
+(≈2× server COPY time, 14.4 s → 27.7 s per 10M rows, for a 16% smaller wire
+payload) — a bargain apitap makes too when it pushes a filter down; client and
+server share a host over loopback, so there is no network term; and the Postgres
+floor of 7.9 s warm was measured with `max_parallel_workers_per_gather=2` and
+`shared_buffers=128 MB`, i.e. untuned, summing exact `numeric` where both clients
+sum `float64`. If you can push the aggregation into the database, do that — this
+benchmark is about the case where you cannot.
