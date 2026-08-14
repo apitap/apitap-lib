@@ -123,6 +123,12 @@ where
         let mut o2 = opts.clone();
         o2.mode = Mode::Replace;
         o2.dest_table = Some(c.dest_table.clone());
+        // The changelog's clauses belong to the rebuild, not to the bulk load's
+        // table — see `run::strip_changelog_ddl`.
+        if o2.changelog {
+            o2.order_by = None;
+            o2.partition_by = None;
+        }
         let r = full_load(c.table_arg.clone(), o2).await.map_err(|e| {
             Error::Transfer(format!(
                 "log_based: bootstrap of {} failed (no state written; re-run \

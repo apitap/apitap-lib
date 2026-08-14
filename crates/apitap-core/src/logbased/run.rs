@@ -28,6 +28,21 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 
+/// `partition_by`/`order_by` describe the CHANGELOG, not the table the
+/// bootstrap's bulk load creates — and the changelog's meta columns
+/// (`_apitap_lsn`, `_apitap_seq`, `_apitap_at`) do not exist until the rebuild
+/// adds them. Passing the user's clauses through to the bulk DDL makes the
+/// bootstrap fail on its own future schema ("Missing columns: '_apitap_seq'").
+/// The bootstrap table is rebuilt seconds later anyway, so its own ORDER BY and
+/// PARTITION BY are throwaway: strip them here and let the rebuild apply the
+/// real ones.
+fn strip_changelog_ddl(o2: &mut TransferOptions) {
+    if o2.changelog {
+        o2.order_by = None;
+        o2.partition_by = None;
+    }
+}
+
 /// changelog=True needs a destination that is happy to be append-only and can
 /// partition the log by time. The row-store replicas can technically hold one,
 /// but a table that only ever grows is the wrong shape for them — they'd have
@@ -692,6 +707,7 @@ async fn bootstrap_group(
             let mut o2 = opts.clone();
             o2.mode = Mode::Replace;
             o2.dest_table = Some(c.dest_table.clone());
+            strip_changelog_ddl(&mut o2);
             dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
             let r = Box::pin(crate::transfer(pinned_url, dst_url, &c.table_arg, &o2)).await?;
             Ok((r.rows, r.parallel))
