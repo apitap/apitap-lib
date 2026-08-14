@@ -666,8 +666,7 @@ def transfer(
             order_by=order_by,
             on_cluster=on_cluster,
             partition_by=partition_by,
-            partition_by=partition_by,
-        changelog=changelog,
+            changelog=changelog,
         )
         return TransferReport(rows=rows, elapsed_ms=elapsed_ms, parallel=used)
 

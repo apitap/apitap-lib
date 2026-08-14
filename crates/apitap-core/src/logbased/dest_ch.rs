@@ -20,6 +20,21 @@ use crate::wire::pgoutput::Cell;
 
 const STATE_CURSOR: &str = "_lsn";
 
+// ── changelog mode (`changelog=true`) ───────────────────────────────────────
+// The destination stops being a replica and becomes an append-only audit trail:
+// every captured operation is INSERTed with the meta columns below, nothing is
+// ever updated or deleted, and `<table>__current` derives the current state.
+// ClickHouse is built for exactly this shape — no mutations, no part rewrites.
+pub(crate) const CL_OP: &str = "_apitap_op";
+pub(crate) const CL_LSN: &str = "_apitap_lsn";
+pub(crate) const CL_SEQ: &str = "_apitap_seq";
+pub(crate) const CL_AT: &str = "_apitap_at";
+/// The op stamped on rows the BOOTSTRAP loaded: they were never observed as
+/// change events, they are the baseline the log starts from. Explicit rather
+/// than NULL — `NULL != 'D'` is NULL in SQL, which would silently drop every
+/// baseline row out of the `__current` view.
+pub(crate) const CL_BASELINE: &str = "B";
+
 pub(crate) struct ChDest {
     ch: ChConn,
     /// DDL this connection has already issued. `CREATE TABLE IF NOT EXISTS` is
@@ -148,6 +163,148 @@ impl ChDest {
             .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{}'", f[0])))
     }
 
+    /// changelog=true, once, right after the bootstrap's bulk load: rebuild the
+    /// table as an append-only changelog and stamp the loaded rows `B`.
+    ///
+    /// It has to be a REBUILD, not an `ALTER … ADD COLUMN`: ClickHouse cannot
+    /// change a table's PARTITION BY after creation, and the changelog wants a
+    /// time partition it can drop for retention. Doing it here also fixes the
+    /// baseline rows properly — they get a real op, the slot's LSN and the
+    /// bootstrap time instead of NULLs, so nothing downstream has to reason
+    /// about NULL ops or NULL partitions.
+    ///
+    /// Data columns become Nullable on the way: a `D` record carries only the
+    /// key and a `T` carries no row at all, so partial rows are inherent to a
+    /// changelog.
+    pub(crate) async fn changelog_bootstrap_finish(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        pk_cols: &[String],
+        lsn: u64,
+        rows: u64,
+        partition_by: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<()> {
+        let ft = ch_ident(dest_table);
+        // Already a changelog (a re-bootstrap of a table we own)? Leave it.
+        let has = self
+            .ch
+            .exec(&format!(
+                "SELECT count() FROM system.columns WHERE database = currentDatabase() \
+                 AND table = '{t}' AND name = '{c}'",
+                t = ch_str(dest_table),
+                c = ch_str(CL_OP),
+            ))
+            .await?;
+        if has.trim() != "0" {
+            return self.write_state(dest_table, source_id, lsn, rows).await;
+        }
+
+        // Existing columns, in order, so the rebuild can widen them to Nullable.
+        let desc = self
+            .ch
+            .exec(&format!(
+                "SELECT name, type FROM system.columns WHERE database = currentDatabase() \
+                 AND table = '{t}' ORDER BY position FORMAT TabSeparated",
+                t = ch_str(dest_table),
+            ))
+            .await?;
+        let mut cols: Vec<(String, String)> = Vec::new();
+        for line in desc.lines().filter(|l| !l.is_empty()) {
+            let mut it = line.splitn(2, '\t');
+            let (Some(n), Some(ty)) = (it.next(), it.next()) else { continue };
+            cols.push((n.to_string(), ty.to_string()));
+        }
+        if cols.is_empty() {
+            return Err(Error::Transfer(format!(
+                "log_based changelog: ClickHouse table {dest_table} has no columns — \
+                 the bootstrap must run first"
+            )));
+        }
+
+        let part = partition_by.map(str::to_string).unwrap_or_else(|| format!("toYYYYMM({CL_AT})"));
+        let order = order_by.map(str::to_string).unwrap_or_else(|| {
+            let mut k: Vec<String> = pk_cols.iter().map(|c| ch_ident(c)).collect();
+            k.push(CL_LSN.to_string());
+            k.push(CL_SEQ.to_string());
+            k.join(", ")
+        });
+        let sel = cols
+            .iter()
+            .map(|(n, ty)| {
+                let q = ch_ident(n);
+                if ty.starts_with("Nullable(") {
+                    q
+                } else {
+                    format!("CAST({q} AS Nullable({ty})) AS {q}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tmp = ch_ident(&format!("{dest_table}__apitap_cl"));
+        self.ch.exec(&format!("DROP TABLE IF EXISTS {tmp}")).await?;
+        self.ch
+            .exec(&format!(
+                // allow_nullable_key: a changelog's rows are partial by nature —
+                // a TRUNCATE record carries no row at all, so even the key
+                // columns are Nullable. Without this ClickHouse refuses the
+                // sorting key outright (ILLEGAL_COLUMN 44).
+                "CREATE TABLE {tmp} ENGINE = MergeTree PARTITION BY {part} ORDER BY ({order}) \
+                 SETTINGS allow_nullable_key = 1 AS \
+                 SELECT {sel}, \
+                 CAST('{op}' AS String) AS {CL_OP}, \
+                 CAST({lsn} AS UInt64) AS {CL_LSN}, \
+                 CAST(0 AS UInt32) AS {CL_SEQ}, \
+                 now64(3) AS {CL_AT} \
+                 FROM {ft}",
+                op = ch_str(CL_BASELINE),
+            ))
+            .await?;
+        self.ch.exec(&format!("DROP TABLE {ft}")).await?;
+        self.ch
+            .exec(&format!("RENAME TABLE {tmp} TO {}", ch_ident(dest_table)))
+            .await?;
+        self.ensure_current_view(dest_table, pk_cols).await?;
+        self.write_state(dest_table, source_id, lsn, rows).await
+    }
+
+    /// `<table>__current`: the current state derived from the log.
+    ///
+    /// Three things it has to get right, in this order:
+    /// 1. **TRUNCATE.** A `T` record means everything logged before it is gone,
+    ///    so the view first drops every row at or below the newest `T`.
+    /// 2. **Latest version per key.** Ordering is the PAIR `(lsn, seq)`, never
+    ///    `lsn` alone: one window stamps its end-LSN on every row it lands, so
+    ///    `seq` is what orders events inside a window.
+    /// 3. **Deletes.** A key whose newest record is `D` is gone — filtered AFTER
+    ///    the pick, not before, or the delete would be skipped and the previous
+    ///    version would resurrect.
+    ///
+    /// Baseline (`B`) rows carry the slot's consistent-point LSN, so any later
+    /// change outranks them.
+    async fn ensure_current_view(&self, dest_table: &str, pk_cols: &[String]) -> Result<()> {
+        let keys = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+        let view = ch_ident(&format!("{dest_table}__current"));
+        let t = ch_ident(dest_table);
+        self.ch
+            .exec(&format!(
+                "CREATE OR REPLACE VIEW {view} AS SELECT * FROM ( \
+                   SELECT * FROM {t} \
+                   WHERE ({CL_LSN}, {CL_SEQ}) > ( \
+                     SELECT ifNull(max(({CL_LSN}, {CL_SEQ})), (toUInt64(0), toUInt32(0))) \
+                     FROM {t} WHERE {CL_OP} = '{tr}' \
+                   ) \
+                   ORDER BY {CL_LSN} DESC, {CL_SEQ} DESC \
+                   LIMIT 1 BY {keys} \
+                 ) WHERE {CL_OP} != '{del}'",
+                tr = ch_str("T"),
+                del = ch_str("D"),
+            ))
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn write_state(
         &self,
         dest_table: &str,
@@ -170,6 +327,96 @@ impl ChDest {
 
     /// Apply one collapsed window. State is written LAST — a re-run of the
     /// same window is idempotent (see module docs).
+    /// changelog=true apply: ONE plain INSERT of every captured operation.
+    ///
+    /// No delete-set, no key table, no DELETE, no TRUNCATE — ClickHouse never
+    /// writes a mutation, so the destination never rewrites parts. Replay is
+    /// safe because a re-drained window re-appends rows carrying the SAME
+    /// `(lsn, seq)`, and `__current` picks one of them; the duplicate is inert.
+    pub(crate) async fn apply_changelog(
+        &self,
+        dest_table: &str,
+        qualified_src: &str,
+        outcome: &DrainOutcome,
+        source_id: &str,
+    ) -> Result<u64> {
+        let Some(c) = outcome.changes.get(qualified_src) else {
+            self.write_state(dest_table, source_id, outcome.end_lsn, 0).await?;
+            return Ok(0);
+        };
+        let wal_cols = outcome
+            .wal_cols
+            .get(qualified_src)
+            .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+        let oids = outcome
+            .wal_oids
+            .get(qualified_src)
+            .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
+        for name in wal_cols {
+            if matches!(name.as_str(), CL_OP | CL_LSN | CL_SEQ | CL_AT) {
+                return Err(Error::InvalidInput(format!(
+                    "log_based changelog: source column '{name}' collides with a reserved \
+                     changelog column — rename it at the source or alias it in a view"
+                )));
+            }
+        }
+        if c.events.is_empty() {
+            self.write_state(dest_table, source_id, outcome.end_lsn, 0).await?;
+            return Ok(0);
+        }
+
+        let ft = ch_ident(dest_table);
+        let collist = wal_cols
+            .iter()
+            .map(|k| ch_ident(k))
+            .chain([CL_OP.to_string(), CL_LSN.to_string(), CL_SEQ.to_string(), CL_AT.to_string()])
+            .collect::<Vec<_>>()
+            .join(", ");
+        let lsn = outcome.end_lsn;
+        // ONE stamp for the window. It is the PARTITION/retention key, never an
+        // ordering key — `(lsn, seq)` orders. Sent explicitly rather than left
+        // to a default: the rebuild materialised `_apitap_at` as a plain column,
+        // so a NULL would land as the epoch and pile the whole log into a 1970
+        // partition.
+        let at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        let mut buf = Vec::with_capacity(4 << 20);
+        for (seq, ev) in c.events.iter().enumerate() {
+            match &ev.row {
+                Some(row) => {
+                    // A delete's old image carries the key and NULLs elsewhere —
+                    // that IS the delete record, so it renders like any row.
+                    render_ch_row_trim(row, oids, wal_cols.len(), &mut buf)?;
+                }
+                // TRUNCATE has no row: every data column is \N.
+                None => {
+                    for i in 0..wal_cols.len() {
+                        if i > 0 {
+                            buf.push(b'\t');
+                        }
+                        buf.extend_from_slice(b"\\N");
+                    }
+                }
+            }
+            buf.push(b'\t');
+            buf.extend_from_slice(ev.op.code().as_bytes());
+            buf.push(b'\t');
+            buf.extend_from_slice(lsn.to_string().as_bytes());
+            buf.push(b'\t');
+            buf.extend_from_slice(seq.to_string().as_bytes());
+            buf.push(b'\t');
+            buf.extend_from_slice(at.as_bytes());
+            buf.push(b'\n');
+        }
+        self.ch
+            .insert_stream(
+                &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
+                reqwest::Body::from(buf),
+            )
+            .await?;
+        self.write_state(dest_table, source_id, outcome.end_lsn, c.count).await?;
+        Ok(c.count)
+    }
+
     pub(crate) async fn apply(
         &self,
         dest_table: &str,
@@ -373,6 +620,32 @@ impl ChDest {
         self.write_state(dest_table, source_id, outcome.end_lsn, c.events).await?;
         Ok(c.events)
     }
+}
+
+/// One changelog row's DATA columns, TabSeparated, WITHOUT the trailing newline
+/// — the meta columns are appended after it. Padded to `ncols` with `\N` so a
+/// delete's key-only old image still lines up with the table's column list.
+fn render_ch_row_trim(
+    row: &crate::wire::pgoutput::Tuple,
+    oids: &[u32],
+    ncols: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    for i in 0..ncols {
+        if i > 0 {
+            out.push(b'\t');
+        }
+        match row.get(i) {
+            Some(crate::wire::pgoutput::Cellv::Text(t)) => render_ch_value(t, oids[i], out)?,
+            // Missing (short old image) and NULL render the same: absent.
+            Some(crate::wire::pgoutput::Cellv::Null) | None => out.extend_from_slice(b"\\N"),
+            // An unchanged-TOAST cell in a changelog is honest information:
+            // "this update did not carry that column". It lands NULL, and the
+            // `U` record's presence tells the reader the row changed.
+            Some(crate::wire::pgoutput::Cellv::UnchangedToast) => out.extend_from_slice(b"\\N"),
+        }
+    }
+    Ok(())
 }
 
 /// `col = lit AND …` for one replica-identity key, typed by OID.

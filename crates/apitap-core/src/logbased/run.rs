@@ -79,7 +79,24 @@ impl Dest {
         pk_cols: &[String],
         lsn: u64,
         rows: u64,
+        changelog: bool,
+        partition_by: Option<&str>,
+        order_by: Option<&str>,
     ) -> Result<()> {
+        if changelog {
+            return match self {
+                Dest::Ch(d) => {
+                    d.changelog_bootstrap_finish(
+                        dest_table, source_id, pk_cols, lsn, rows, partition_by, order_by,
+                    )
+                    .await
+                }
+                _ => Err(Error::InvalidInput(
+                    "log_based: changelog=True lands in ClickHouse today; BigQuery is next"
+                        .into(),
+                )),
+            };
+        }
         match self {
             Dest::Pg(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
             Dest::Ch(d) => d.write_state(dest_table, source_id, lsn, rows).await,
@@ -119,7 +136,20 @@ impl Dest {
         outcome: &DrainOutcome,
         source_id: &str,
         src: &PgPool,
+        changelog: bool,
     ) -> Result<u64> {
+        if changelog {
+            return match self {
+                Dest::Ch(d) => {
+                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                }
+                _ => Err(Error::InvalidInput(
+                    "log_based: changelog=True lands in ClickHouse today; BigQuery is next. \
+                     Postgres/MySQL/Iceberg destinations stay replicas (changelog=False)"
+                        .into(),
+                )),
+            };
+        }
         match self {
             Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
@@ -495,7 +525,8 @@ async fn run_group_mysql(
         })
         .await?;
         for (c, (rows, _)) in ctxs.iter().zip(&out) {
-            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows)
+            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
+                    opts.changelog, opts.partition_by.as_deref(), opts.order_by.as_deref())
                 .await?;
         }
         return Ok(out);
@@ -653,7 +684,8 @@ async fn bootstrap_group(
     let fins: Vec<Result<()>> = futures::stream::iter(ctxs.iter().zip(&out).map(|(c, (rows, _))| {
         let dest = &dest;
         async move {
-            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows).await
+            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows,
+                opts.changelog, opts.partition_by.as_deref(), opts.order_by.as_deref()).await
         }
     }))
     .buffered(concurrency)
@@ -748,6 +780,7 @@ async fn drain_group(
         })
         .collect();
     let apool = src.clone();
+    let clog = changelog;
     let apply_task: tokio::task::JoinHandle<Result<Vec<u64>>> = tokio::spawn(async move {
         let mut rows_per = vec![0u64; actxs.len()];
         while let Some(o) = win_rx.recv().await {
@@ -782,7 +815,7 @@ async fn drain_group(
                 let applied: Vec<(usize, u64)> = futures::stream::iter(0..cref.len())
                     .map(|i| async move {
                         let (dt, q, pk, sid) = &cref[i];
-                        dref.apply(dt, q, pk, oref, sid, aref).await.map(|n| (i, n))
+                        dref.apply(dt, q, pk, oref, sid, aref, clog).await.map(|n| (i, n))
                     })
                     .buffer_unordered(lanes)
                     .try_collect()
@@ -793,7 +826,7 @@ async fn drain_group(
             } else {
                 for (i, (dest_table, qualified, pk_cols, source_id)) in actxs.iter().enumerate() {
                     rows_per[i] +=
-                        dest.apply(dest_table, qualified, pk_cols, &o, source_id, &apool).await?;
+                        dest.apply(dest_table, qualified, pk_cols, &o, source_id, &apool, clog).await?;
                 }
             }
             if std::env::var("APITAP_DEBUG").is_ok() {
