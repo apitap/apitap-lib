@@ -71,7 +71,7 @@ architecture, not benchmarking:
 | sources | Postgres, MySQL | Postgres, MySQL, MongoDB, SQL Server, Oracle, Db2, Cassandra, Spanner, Vitess … | Debezium's breadth, plus Flink connectors |
 | fan-out / replay | point to point | an event bus many consumers share and replay by offset | via Kafka, or checkpointed state |
 | stream processing | none — compute lives downstream | none (transforms only) | the whole point |
-| scaling | vertical: **34–132K changes/s per half core** by row width (v0.29.0: 132K/s on 5-column rows, 34K/s at 15 wide columns) → **10M changes/min ≈ 0.7–2.5 cores** | partition by table across connectors | horizontal task slots |
+| scaling | vertical: **34–135K changes/s per half core** by row width AND capture plane (MySQL binlog 84K/s on 5-column update-only traffic, 113.8K/s with `changelog=True`, ~135K/s insert-heavy; Postgres WAL 51K/s on 5 columns, 34K/s at 15 wide columns) → **10M changes/min ≈ 0.7–2.5 cores** | partition by table across connectors | horizontal task slots |
 
 **What apitap is genuinely better at:** the cost and weight of keeping a
 warehouse copy fresh. There is no broker to run, no JVM to tune, no cluster

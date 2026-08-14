@@ -146,6 +146,7 @@ pub(crate) async fn drain_windows<F, Fut>(
     group_seed: &str,
     max_secs: u64,
     max_buf_bytes: usize,
+    changelog: bool,
     mut apply_window: F,
 ) -> Result<u64>
 where
@@ -191,11 +192,12 @@ where
             stop_line,
             max_secs,
             max_buf_bytes,
+            changelog,
         )
         .await?;
         let hit_budget = o.hit_budget;
         let end = o.end_lsn;
-        if end == watermark && o.tables.is_empty() {
+        if end == watermark && o.tables.is_empty() && o.changes.is_empty() {
             break;
         }
         watermark = apply_window(o).await?;

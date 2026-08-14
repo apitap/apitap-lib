@@ -124,10 +124,11 @@ pub struct TransferOptions {
     ///
     /// `None` = MONTHLY on the changelog's own `_apitap_at`
     /// (`toYYYYMM(_apitap_at)` on ClickHouse, `TIMESTAMP_TRUNC(_apitap_at,
-    /// MONTH)` on BigQuery). Monthly rather than daily because **BigQuery caps a
-    /// table at 4,000 partitions**: daily runs out after ~11 years, monthly
-    /// after 333. A changelog is meant to live a long time, so daily is a time
-    /// bomb on exactly the tables this mode is for. Partitioning does not speed
+    /// MONTH)` on BigQuery). Monthly rather than daily because **BigQuery caps
+    /// the number of partitions per table**: daily runs out in roughly a decade
+    /// or three depending on the cap in force, monthly in centuries. A
+    /// changelog is meant to live a long time, so daily is a time bomb on
+    /// exactly the tables this mode is for. Partitioning does not speed
     /// up the `__current` view (that scans every version per key by design) —
     /// it buys RETENTION (drop partitions older than N months) and time-range
     /// audit queries.
@@ -137,9 +138,11 @@ pub struct TransferOptions {
     /// partition on DATE/TIMESTAMP/DATETIME or an integer range — it CANNOT
     /// partition on a STRING, so `"_apitap_op"` is refused there (op belongs in
     /// the cluster key, where it prunes just as well). The emitted DDL adapts to
-    /// the column's declared type: a `DATE` column is used bare, a `TIMESTAMP`
-    /// is wrapped in `TIMESTAMP_TRUNC(…)`. Ignored when the table already
-    /// exists.
+    /// the column's declared type and always lands MONTHLY:
+    /// `DATE_TRUNC(c, MONTH)` / `TIMESTAMP_TRUNC(c, MONTH)` /
+    /// `DATETIME_TRUNC(c, MONTH)`. A `DATE` column is NOT used bare — bare is
+    /// daily, which is the time bomb monthly exists to defuse. Ignored when the
+    /// table already exists.
     pub partition_by: Option<String>,
     /// ClickHouse destinations only: run the final table's DDL `ON CLUSTER` this
     /// cluster. Requires a `Replicated*` engine (data reaches other replicas through
@@ -162,8 +165,10 @@ pub struct TransferOptions {
     /// carrying the SAME `(_apitap_lsn, _apitap_seq)`, so the view's dedup makes
     /// at-least-once delivery read as exactly-once.
     ///
-    /// Ignored by the row-store destinations (Postgres, MySQL) and by every bulk
-    /// mode.
+    /// Refused loudly by the row-store destinations (Postgres, MySQL, Iceberg) —
+    /// a table that only ever grows is the wrong shape for them, and silently
+    /// giving a user a replica when they asked for a changelog is worse than an
+    /// error. Ignored by every bulk mode.
     pub changelog: bool,
 }
 

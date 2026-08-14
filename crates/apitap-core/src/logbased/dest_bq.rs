@@ -30,6 +30,17 @@ use std::collections::HashSet;
 const OP_COL: &str = "_apitap_op";
 const MASK_COL: &str = "_apitap_mask";
 
+// ── changelog mode (`changelog=true`) ───────────────────────────────────────
+// Same shape and the same column names as the ClickHouse changelog, so one
+// downstream query works against either engine: every captured operation is
+// INSERTed, nothing is ever MERGEd, and `<table>__current` derives the current
+// state. On BigQuery this also sidesteps the MERGE's ~7.3 s fixed job cost —
+// the window becomes a load job plus one INSERT … SELECT.
+const CL_LSN: &str = "_apitap_lsn";
+const CL_SEQ: &str = "_apitap_seq";
+const CL_AT: &str = "_apitap_at";
+const CL_BASELINE: &str = "B";
+
 pub(crate) struct BqDest {
     conn: BqConn,
 }
@@ -109,6 +120,267 @@ impl BqDest {
         self.cluster_target(table, pk_cols, rows).await?;
         self.conn.cdc_ensure_state_table().await?;
         self.write_state(table, source_id, lsn, rows).await
+    }
+
+    /// The destination's SHAPE must match the mode — see the ClickHouse twin.
+    /// Checked at run start, because an empty drain never reaches the apply.
+    pub(crate) async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
+        let table = bare(dest_table);
+        let is_cl = match self.conn.table_get(table).await? {
+            Some(meta) => column_types(&meta)?.contains_key(OP_COL),
+            // No table at all: nothing to disagree with.
+            None => return Ok(()),
+        };
+        crate::logbased::dest_ch::is_shape_ok(is_cl, changelog, "BigQuery", table)
+    }
+
+    /// changelog=true, once, right after the bootstrap's bulk load: rebuild the
+    /// target as an append-only changelog and stamp the loaded rows `B`.
+    ///
+    /// A REBUILD for the same reason ClickHouse needs one — BigQuery cannot add
+    /// partitioning to an existing table — and the CTAS gives the baseline rows
+    /// a real op, the slot's LSN and a server timestamp instead of NULLs.
+    ///
+    /// The default partition is MONTHLY (`TIMESTAMP_TRUNC(_apitap_at, MONTH)`):
+    /// a changelog is written forever, and daily partitions would hit
+    /// BigQuery's per-table partition limit inside 30 years while monthly
+    /// leaves centuries of headroom. `partition_by`/`order_by` override it —
+    /// `order_by` maps to CLUSTER BY, BigQuery's only physical ordering.
+    pub(crate) async fn changelog_bootstrap_finish(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        pk_cols: &[String],
+        lsn: u64,
+        rows: u64,
+        partition_by: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<()> {
+        let table = bare(dest_table);
+        self.conn.cdc_delete_table(&cdc_staging(table)).await?;
+        self.conn.cdc_ensure_state_table().await?;
+        let meta = self.conn.table_get(table).await?.ok_or_else(|| {
+            Error::Transfer(format!(
+                "log_based changelog: BigQuery target {table} does not exist — the \
+                 bootstrap must run first"
+            ))
+        })?;
+        // Already a changelog (a re-bootstrap of a table we own)? Leave it.
+        if column_types(&meta)?.contains_key(OP_COL) {
+            return self.write_state(table, source_id, lsn, rows).await;
+        }
+
+        let sel = changelog_select_list(&meta)?;
+        let part = match partition_by {
+            None => format!("TIMESTAMP_TRUNC({CL_AT}, MONTH)"),
+            Some(col) => bq_partition_expr(col, &column_types(&meta)?)?,
+        };
+        // BigQuery clusters on at most 4 columns, and only on plain column
+        // references — hence the PK prefix rather than ClickHouse's key tuple.
+        let cluster = order_by.map(str::to_string).unwrap_or_else(|| {
+            pk_cols.iter().take(4).map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ")
+        });
+        let cluster_sql =
+            if cluster.trim().is_empty() { String::new() } else { format!("CLUSTER BY {cluster} ") };
+        let tmp = format!("{table}__apitap_cl");
+        let sql = format!(
+            "CREATE OR REPLACE TABLE {tmpfq} PARTITION BY {part} {cluster_sql}AS \
+             SELECT {sel}, \
+             '{b}' AS {OP_COL}, \
+             CAST({lsn} AS INT64) AS {CL_LSN}, \
+             CAST(0 AS INT64) AS {CL_SEQ}, \
+             CURRENT_TIMESTAMP() AS {CL_AT} \
+             FROM {t};\n\
+             DROP TABLE {t};\n\
+             ALTER TABLE {tmpfq} RENAME TO `{table}`;",
+            tmpfq = self.conn.fq(&tmp),
+            t = self.conn.fq(table),
+            b = sql_str(CL_BASELINE),
+        );
+        self.conn.cdc_script(&sql).await?;
+        self.ensure_current_view(table, pk_cols).await?;
+        self.write_state(table, source_id, lsn, rows).await
+    }
+
+    /// `<table>__current`: the current state derived from the log.
+    ///
+    /// The ClickHouse view's three rules, in BigQuery's dialect: drop everything
+    /// at or below the newest `T`; take the latest record per key by the PAIR
+    /// `(lsn, seq)` — one window stamps its end-LSN on every row it lands, so
+    /// `seq` is what orders events inside a window; then drop keys whose newest
+    /// record is `D`, AFTER the pick, or the delete would be skipped and the
+    /// previous version would resurrect. BigQuery has no row-value comparison,
+    /// so the pair test is spelled out.
+    async fn ensure_current_view(&self, table: &str, pk_cols: &[String]) -> Result<()> {
+        let t = self.conn.fq(table);
+        let keys = pk_cols.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "CREATE OR REPLACE VIEW {v} AS \
+             SELECT * EXCEPT(_apitap_tr_l, _apitap_tr_s) FROM ( \
+               SELECT s.*, tr.l AS _apitap_tr_l, tr.s AS _apitap_tr_s \
+               FROM {t} s CROSS JOIN ( \
+                 SELECT IFNULL(MAX({CL_LSN}), 0) AS l, IFNULL(MAX({CL_SEQ}), 0) AS s \
+                 FROM {t} WHERE {OP_COL} = 'T' \
+                   AND {CL_LSN} = (SELECT MAX({CL_LSN}) FROM {t} WHERE {OP_COL} = 'T') \
+               ) tr \
+               WHERE s.{CL_LSN} > tr.l OR (s.{CL_LSN} = tr.l AND s.{CL_SEQ} > tr.s) \
+               QUALIFY ROW_NUMBER() OVER ( \
+                 PARTITION BY {keys} ORDER BY s.{CL_LSN} DESC, s.{CL_SEQ} DESC) = 1 \
+             ) WHERE {OP_COL} != 'D'",
+            v = self.conn.fq(&format!("{table}__current")),
+        );
+        self.conn.cdc_script(&sql).await
+    }
+
+    /// Apply ONE table's changelog window.
+    pub(crate) async fn apply_changelog(
+        &self,
+        dest_table: &str,
+        qualified_src: &str,
+        outcome: &DrainOutcome,
+        source_id: &str,
+    ) -> Result<u64> {
+        let one = [(
+            dest_table.to_string(),
+            qualified_src.to_string(),
+            Vec::new(),
+            source_id.to_string(),
+        )];
+        Ok(self.apply_group_changelog(&one, outcome, 1).await?[0])
+    }
+
+    /// A whole group's changelog window: stage every table concurrently, then
+    /// commit every INSERT plus every watermark in as few script jobs as
+    /// possible — the same batching the MERGE path needs, for the same reason.
+    ///
+    /// Replay-safe without a dedup pass: the INSERT and the window's watermark
+    /// row commit inside ONE transaction, so a window either landed whole or
+    /// not at all, and a re-drained window re-lands from the same LSN.
+    pub(crate) async fn apply_group_changelog(
+        &self,
+        ctxs: &[(String, String, Vec<String>, String)],
+        outcome: &DrainOutcome,
+        lanes: usize,
+    ) -> Result<Vec<u64>> {
+        use futures::stream::{StreamExt as _, TryStreamExt as _};
+        let (me, cref, oref) = (self, ctxs, outcome);
+        let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
+            .map(|i| async move {
+                let (dt, q, _pk, sid) = &cref[i];
+                me.stage_changelog(dt, q, oref, sid).await.map(|(ev, sql)| (i, ev, sql))
+            })
+            .buffer_unordered(lanes.max(1))
+            .try_collect()
+            .await?;
+
+        let mut rows = vec![0u64; ctxs.len()];
+        let mut stmts: Vec<String> = Vec::new();
+        for (i, ev, sql) in staged {
+            rows[i] = ev;
+            stmts.extend(sql);
+        }
+        if stmts.is_empty() {
+            return Ok(rows);
+        }
+        const CHUNK_BYTES: usize = 256 << 10;
+        let (mut batch, mut len) = (Vec::new(), 0usize);
+        for s in stmts {
+            if len + s.len() > CHUNK_BYTES && !batch.is_empty() {
+                self.commit_batch(&batch).await?;
+                batch.clear();
+                len = 0;
+            }
+            len += s.len();
+            batch.push(s);
+        }
+        if !batch.is_empty() {
+            self.commit_batch(&batch).await?;
+        }
+        Ok(rows)
+    }
+
+    /// One table's changelog window: every captured event as a staging row,
+    /// loaded, then handed back as the INSERT + watermark the group commits.
+    async fn stage_changelog(
+        &self,
+        dest_table: &str,
+        qualified_src: &str,
+        outcome: &DrainOutcome,
+        source_id: &str,
+    ) -> Result<(u64, Vec<String>)> {
+        let table = bare(dest_table);
+        let state_sql = |ev| self.state_insert_sql(table, source_id, outcome.end_lsn, ev);
+        let Some(c) = outcome.changes.get(qualified_src) else {
+            return Ok((0, vec![format!("{};", state_sql(0))]));
+        };
+        if c.events.is_empty() {
+            return Ok((0, vec![format!("{};", state_sql(0))]));
+        }
+        let wal_cols = outcome
+            .wal_cols
+            .get(qualified_src)
+            .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+        for name in wal_cols {
+            if matches!(name.as_str(), OP_COL | MASK_COL | CL_LSN | CL_SEQ | CL_AT) {
+                return Err(Error::InvalidInput(format!(
+                    "log_based changelog: source column '{name}' collides with a reserved \
+                     changelog column — rename it at the source or alias it in a view"
+                )));
+            }
+        }
+        let oids = outcome
+            .wal_oids
+            .get(qualified_src)
+            .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
+        let meta = self.conn.table_get(table).await?.ok_or_else(|| {
+            Error::Transfer(format!(
+                "log_based changelog: BigQuery target {table} does not exist — the \
+                 bootstrap must run before a CDC window can apply"
+            ))
+        })?;
+        let types = column_types(&meta)?;
+        let plan = ApplyPlan::build(table, wal_cols, oids, &[], &types)?;
+
+        let mut ndjson: Vec<u8> = Vec::new();
+        for (seq, ev) in c.events.iter().enumerate() {
+            push_change(&mut ndjson, wal_cols, ev.row.as_ref(), ev.op.code(), seq)?;
+        }
+        self.conn
+            .cdc_load_ndjson(&cdc_staging(table), &plan.staging_fields_changelog(), ndjson)
+            .await?;
+
+        let bt = |c: &str| format!("`{c}`");
+        let into = wal_cols
+            .iter()
+            .map(|c| bt(c))
+            .chain([bt(OP_COL), bt(CL_LSN), bt(CL_SEQ), bt(CL_AT)])
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sel = plan
+            .cast
+            .iter()
+            .cloned()
+            .chain([
+                bt(OP_COL),
+                format!("CAST({} AS INT64)", outcome.end_lsn),
+                format!("CAST({} AS INT64)", bt(CL_SEQ)),
+                // One stamp for the whole window: it is the PARTITION and
+                // retention key, never an ordering key — `(lsn, seq)` orders.
+                "CURRENT_TIMESTAMP()".to_string(),
+            ])
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok((
+            c.count,
+            vec![
+                format!(
+                    "INSERT INTO {t} ({into}) SELECT {sel} FROM {s};",
+                    t = self.conn.fq(table),
+                    s = self.conn.fq(&cdc_staging(table)),
+                ),
+                format!("{};", state_sql(c.count)),
+            ],
+        ))
     }
 
     /// Rewrite the freshly-bootstrapped target clustered on its PK (up to 4
@@ -286,6 +558,17 @@ impl BqDest {
             ))
         })?;
         let types = column_types(&meta)?;
+        // A replica window must not land on a table apitap already made into a
+        // changelog: the MERGE would UPDATE historical records in place and
+        // DELETE past events, quietly destroying the log it found. Free to
+        // check — the target's schema is already in hand.
+        if types.contains_key(CL_LSN) {
+            return Err(Error::InvalidInput(format!(
+                "log_based: BigQuery target {table} is a CHANGELOG (it has an \
+                 {CL_LSN} column) but this run asked for a replica — pass \
+                 changelog=True, or point at a different dest_table"
+            )));
+        }
         let plan = ApplyPlan::build(table, wal_cols, oids, pk_cols, &types)?;
 
         // Fold the window to one final image per key.
@@ -428,6 +711,21 @@ impl ApplyPlan {
         let mut fields = vec![
             json!({"name": OP_COL, "type": "STRING", "mode": "REQUIRED"}),
             json!({"name": MASK_COL, "type": "STRING", "mode": "NULLABLE"}),
+        ];
+        for name in &self.cols {
+            fields.push(json!({"name": name, "type": "STRING", "mode": "NULLABLE"}));
+        }
+        Value::Array(fields)
+    }
+
+    /// Staging schema for a changelog window: the op and the in-window sequence
+    /// alongside the data columns. The window's LSN and timestamp are constant
+    /// for the whole window, so they go in the INSERT's SELECT list instead of
+    /// being repeated on every staged row.
+    fn staging_fields_changelog(&self) -> Value {
+        let mut fields = vec![
+            json!({"name": OP_COL, "type": "STRING", "mode": "REQUIRED"}),
+            json!({"name": CL_SEQ, "type": "STRING", "mode": "REQUIRED"}),
         ];
         for name in &self.cols {
             fields.push(json!({"name": name, "type": "STRING", "mode": "NULLABLE"}));
@@ -607,6 +905,111 @@ fn push_upsert(out: &mut Vec<u8>, cols: &[String], cells: &[Cell], mask: Option<
     Ok(())
 }
 
+/// One changelog record: the op, its in-window sequence, and whatever the
+/// event's row image carries. A delete's old image IS the delete record, so it
+/// renders like any other row; a TRUNCATE has no row at all and every data
+/// column is simply absent (BigQuery loads a missing NDJSON field as NULL).
+///
+/// An unchanged-TOAST cell also lands NULL — honest information in a log:
+/// "this update did not carry that column". The `U` record's presence is what
+/// tells the reader the row changed.
+fn push_change(
+    out: &mut Vec<u8>,
+    cols: &[String],
+    row: Option<&crate::wire::pgoutput::Tuple>,
+    op: &str,
+    seq: usize,
+) -> Result<()> {
+    use crate::wire::pgoutput::Cellv;
+    let mut obj = Map::new();
+    obj.insert(OP_COL.to_string(), json!(op));
+    obj.insert(CL_SEQ.to_string(), json!(seq.to_string()));
+    if let Some(row) = row {
+        for (i, name) in cols.iter().enumerate() {
+            match row.get(i) {
+                Some(Cellv::Text(t)) => {
+                    let s = std::str::from_utf8(t).map_err(|_| {
+                        Error::Transfer(format!(
+                            "log_based: column '{name}' is not valid UTF-8 — a SQL_ASCII \
+                             source can't land in BigQuery (which is UTF-8 only)"
+                        ))
+                    })?;
+                    obj.insert(name.clone(), json!(s));
+                }
+                Some(Cellv::Null) | Some(Cellv::UnchangedToast) | None => {}
+            }
+        }
+    }
+    serde_json::to_writer(&mut *out, &Value::Object(obj))
+        .map_err(|e| Error::Transfer(format!("log_based: NDJSON encode: {e}")))?;
+    out.push(b'\n');
+    Ok(())
+}
+
+/// `partition_by` for BigQuery is a COLUMN NAME, not an expression — BigQuery
+/// only partitions on a real column, and the DDL it needs depends on that
+/// column's declared type. Everything lands MONTHLY, the same granularity as
+/// the ClickHouse default and for the same reason: a changelog outlives daily
+/// partitioning long before it outlives monthly.
+///
+/// A `DATE` column gets `DATE_TRUNC(c, MONTH)` rather than being used bare —
+/// bare is DAILY, which is the time bomb monthly exists to defuse.
+fn bq_partition_expr(
+    col: &str,
+    types: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    let ty = types.get(col).map(String::as_str).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "log_based changelog: partition_by='{col}' is not a column of the BigQuery \
+             target — partition on one of its own columns, or leave it unset for \
+             monthly on {CL_AT}"
+        ))
+    })?;
+    match ty {
+        "DATE" => Ok(format!("DATE_TRUNC(`{col}`, MONTH)")),
+        "TIMESTAMP" => Ok(format!("TIMESTAMP_TRUNC(`{col}`, MONTH)")),
+        "DATETIME" => Ok(format!("DATETIME_TRUNC(`{col}`, MONTH)")),
+        other => Err(Error::InvalidInput(format!(
+            "log_based changelog: BigQuery cannot partition on column '{col}' of type \
+             {other} — partitioning must be by time (DATE/TIMESTAMP/DATETIME). Put \
+             '{col}' in order_by instead (it becomes the cluster key, which prunes \
+             just as well), or leave partition_by unset for monthly on {CL_AT}"
+        ))),
+    }
+}
+
+/// The SELECT list that carries a bootstrapped table's own columns into the
+/// changelog rebuild. Every data column must accept NULL — a delete carries
+/// only the key, a truncate carries nothing — and a CAST is what makes a
+/// REQUIRED column NULLABLE in the CTAS output. Columns apitap can't cast
+/// (RECORD/REPEATED) ride through as plain references: they are already
+/// NULLABLE unless a user declared otherwise, and a bad DDL fails loudly here
+/// rather than silently later.
+fn changelog_select_list(meta: &Value) -> Result<String> {
+    let fields = meta["schema"]["fields"]
+        .as_array()
+        .ok_or_else(|| Error::Transfer("log_based: BigQuery table has no schema".into()))?;
+    let mut out = Vec::with_capacity(fields.len());
+    for f in fields {
+        let Some(n) = f["name"].as_str() else { continue };
+        let ty = f["type"].as_str().unwrap_or("");
+        let required = f["mode"].as_str() == Some("REQUIRED");
+        let scalar = !matches!(ty, "RECORD" | "STRUCT") && f["mode"].as_str() != Some("REPEATED");
+        if required && scalar {
+            out.push(format!("CAST(`{n}` AS {}) AS `{n}`", canonical_type(ty)));
+        } else {
+            out.push(format!("`{n}`"));
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::Transfer(
+            "log_based changelog: BigQuery target has no columns — the bootstrap must run first"
+                .into(),
+        ));
+    }
+    Ok(out.join(", "))
+}
+
 fn push_delete(out: &mut Vec<u8>, pk_cols: &[String], key: &Key) -> Result<()> {
     let mut obj = Map::new();
     obj.insert(OP_COL.to_string(), json!("D"));
@@ -627,6 +1030,60 @@ mod tests {
 
     fn types(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect()
+    }
+
+    #[test]
+    fn partition_by_is_a_time_column_and_always_monthly() {
+        let t = types(&[
+            ("_apitap_at", "TIMESTAMP"),
+            ("d", "DATE"),
+            ("dt", "DATETIME"),
+            ("name", "STRING"),
+            ("n", "INT64"),
+        ]);
+        // A DATE column is NOT used bare — bare is daily.
+        assert_eq!(bq_partition_expr("d", &t).unwrap(), "DATE_TRUNC(`d`, MONTH)");
+        assert_eq!(bq_partition_expr("dt", &t).unwrap(), "DATETIME_TRUNC(`dt`, MONTH)");
+        assert_eq!(
+            bq_partition_expr("_apitap_at", &t).unwrap(),
+            "TIMESTAMP_TRUNC(`_apitap_at`, MONTH)"
+        );
+        // BigQuery cannot partition on a STRING — the op column belongs in
+        // the cluster key, and saying so beats a raw BigQuery DDL error.
+        assert!(bq_partition_expr("name", &t).is_err());
+        assert!(bq_partition_expr("n", &t).is_err());
+        assert!(bq_partition_expr("nope", &t).is_err());
+    }
+
+    #[test]
+    fn changelog_rebuild_forces_every_data_column_nullable() {
+        // A delete carries only the key and a truncate carries nothing, so a
+        // REQUIRED column would reject its own changelog.
+        let meta = json!({"schema": {"fields": [
+            {"name": "id", "type": "INTEGER", "mode": "REQUIRED"},
+            {"name": "note", "type": "STRING", "mode": "NULLABLE"},
+            {"name": "tags", "type": "STRING", "mode": "REPEATED"},
+        ]}});
+        assert_eq!(
+            changelog_select_list(&meta).unwrap(),
+            "CAST(`id` AS INT64) AS `id`, `note`, `tags`"
+        );
+    }
+
+    #[test]
+    fn changelog_staging_carries_the_op_and_the_sequence() {
+        let plan = ApplyPlan::build(
+            "t",
+            &["id".into(), "v".into()],
+            &[23, 25],
+            &["id".into()],
+            &types(&[("id", "INT64"), ("v", "STRING")]),
+        )
+        .unwrap();
+        let f = plan.staging_fields_changelog();
+        let names: Vec<&str> =
+            f.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["_apitap_op", "_apitap_seq", "id", "v"]);
     }
 
     #[test]

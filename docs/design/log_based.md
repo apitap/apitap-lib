@@ -117,6 +117,39 @@ Per table over the drained window, keyed by replica-identity columns:
 - Output per table: `deletes: Vec<Key>`, `upserts: Vec<Row>`,
   `residue: Vec<Event>` — sized by the window, not the table.
 
+## The bypass: `changelog=True` (analytical destinations)
+
+The collapse above is lossless about **state** and lossy about **history** —
+three updates to one key become one row. When the destination is an analytical
+engine and the user wants the history, `changelog=True` swaps the collapser
+for an accumulator (`logbased/changelog.rs`) that keeps every event in arrival
+order and emits it verbatim:
+
+- `Changes { events: Vec<Change>, count }`, `Change { op, row }`, with
+  `op ∈ {I, U, D, T}` plus `B` for rows the bootstrap loaded. There is no
+  key map and no per-key state — appending is O(1) per event, which is why the
+  mode is never slower than the replica path and is measurably faster wherever
+  the capture plane isn't already the wall
+  ([the ledger](../../benchmarks/changelog-cdc.md)).
+- A **PK-changing update emits two records** — `D` on the old identity, then
+  `U` on the new one — so the old key really leaves `__current`. This is the
+  one place the accumulator needs the key indices; everything else is opaque.
+- Both capture planes build it: `drain.rs` (Postgres WAL) and `mysource.rs`
+  (MySQL binlog). MySQL carries no TRUNCATE op, so `T` records are
+  Postgres-only.
+- Applying is one plain INSERT (ClickHouse) or one load job plus one
+  `INSERT … SELECT` inside the window transaction (BigQuery). Neither engine
+  mutates, so BigQuery needs no billing here and ClickHouse rewrites no parts.
+- `<table>__current` reconstructs the replica: drop everything at or below the
+  newest `T`, take the latest record per key by the PAIR `(lsn, seq)` — one
+  window stamps ONE end-LSN on every row it lands, so `seq` orders events
+  inside a window — then drop keys whose newest record is `D`, **after** the
+  pick, never before.
+- The log is partitioned by TIME (monthly default) for retention, not for
+  query speed: `__current` scans every version per key by design.
+  `partition_by` is a verbatim expression on ClickHouse and a COLUMN NAME on
+  BigQuery, which can only partition on DATE/TIMESTAMP/DATETIME.
+
 ## Apply per destination (where apitap earns its keep)
 
 One destination transaction per run (pg/mysql), or one snapshot commit

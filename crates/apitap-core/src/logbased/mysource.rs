@@ -15,6 +15,7 @@
 //! stream is — and `log_pos` is a u32 by protocol, so nothing is lost.
 
 use crate::error::{Error, Result};
+use crate::logbased::changelog::Changes;
 use crate::logbased::collapse::{Collapsed, Collapser};
 use crate::logbased::drain::DrainOutcome;
 use crate::wire::mybinlog::{self as bl, BinlogState, TableSchema};
@@ -190,9 +191,15 @@ pub(crate) async fn drain_binlog(
     stop_line: u64,
     max_secs: u64,
     max_buf_bytes: usize,
+    changelog: bool,
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
+    // changelog=true captures every operation verbatim instead of collapsing
+    // the window; `key_idx` is what lets a PK-changing update emit D-then-U
+    // exactly like the Postgres lane does.
+    let mut changelogs: HashMap<String, Changes> = HashMap::new();
+    let mut key_idx: HashMap<String, Vec<usize>> = HashMap::new();
     let mut wal_cols: HashMap<String, Vec<String>> = HashMap::new();
     let mut wal_oids: HashMap<String, Vec<u32>> = HashMap::new();
     let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
@@ -266,16 +273,17 @@ pub(crate) async fn drain_binlog(
                                 r.cols.iter().map(|c| c.name.clone()).collect();
                             wal_oids.insert(q.clone(), vec![0; names.len()]);
                             wal_cols.insert(q.clone(), names);
-                            collapsers.entry(q.clone()).or_insert_with(|| {
-                                let idx = r
-                                    .cols
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, c)| c.key)
-                                    .map(|(i, _)| i)
-                                    .collect();
-                                Collapser::new(idx)
-                            });
+                            let idx: Vec<usize> = r
+                                .cols
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.key)
+                                .map(|(i, _)| i)
+                                .collect();
+                            key_idx.entry(q.clone()).or_insert_with(|| idx.clone());
+                            collapsers
+                                .entry(q.clone())
+                                .or_insert_with(|| Collapser::new(idx));
                         }
                         PgoMessage::Insert { new, .. } => {
                             buf_bytes += cells_bytes(&new);
@@ -313,6 +321,16 @@ pub(crate) async fn drain_binlog(
                 // Commit boundary: the buffered ops become real, and the
                 // watermark advances to the position AFTER this event.
                 for (table, op) in tx_buf.drain(..) {
+                    if changelog {
+                        let Some(ki) = key_idx.get(table.as_ref()) else { continue };
+                        let c = changelogs.entry(table.to_string()).or_default();
+                        match op {
+                            TxOp::Insert(row) => c.insert(row),
+                            TxOp::Update(old, row) => c.update(old.as_ref(), row, ki),
+                            TxOp::Delete(old) => c.delete(old),
+                        }
+                        continue;
+                    }
                     let Some(c) = collapsers.get_mut(table.as_ref()) else {
                         continue;
                     };
@@ -354,10 +372,7 @@ pub(crate) async fn drain_binlog(
         .collect();
     Ok(DrainOutcome {
         tables,
-        // The binlog lane still collapses. `changelog=true` is refused up front
-        // for MySQL sources (see `run_group_mysql`), so an empty map here can
-        // never be mistaken for "captured nothing".
-        changes: HashMap::new(),
+        changes: changelogs,
         end_lsn: end_mark,
         wal_cols,
         wal_oids,

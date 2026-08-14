@@ -848,6 +848,59 @@ apitap.transfer(
   transaction measured a 307 MB peak (needs the 512 MB tier); normal-sized
   transactions fit the smallest containers.
 
+### `changelog=True` — the destination as an audit trail, not a replica
+
+By default the destination is a **replica**: apitap folds each window to one
+final image per key and updates the table in place. Pass `changelog=True` and it
+becomes an **append-only log** instead — every operation the WAL (or binlog) saw
+is INSERTed, nothing is ever updated or deleted, and a companion
+`<table>__current` view derives the current state.
+
+```python
+apitap.transfer(
+    "postgres://user:pass@src/db",
+    "clickhouse://user:pass@wh:8123/analytics",   # or bigquery://project/dataset
+    table="public.orders",
+    mode="log_based",
+    changelog=True,
+)
+```
+
+The destination table gains four columns:
+
+| column | meaning |
+|---|---|
+| `_apitap_op` | `I` insert · `U` update · `D` delete · `T` truncate · `B` the bootstrap baseline |
+| `_apitap_lsn` | the window's end LSN (binlog position for MySQL sources) |
+| `_apitap_seq` | order WITHIN the window — one window stamps one LSN on every row it lands, so `seq` is what orders events inside it |
+| `_apitap_at` | when the window landed (the partition/retention key) |
+
+- **Every operation is kept.** Three updates to one key land three rows, not
+  one. That is the whole point: the replica path's collapse is lossless about
+  *state* but throws away *history*.
+- **`<table>__current` = the replica.** Latest record per key by the pair
+  `(_apitap_lsn, _apitap_seq)`, keys whose newest record is `D` dropped, and
+  everything at or below the newest `T` dropped first. Query the view and you
+  get exactly what `changelog=False` would have written.
+- **A PK-changing update is two records** — a `D` on the old identity, then a
+  `U` on the new one — so the old key really disappears from `__current`.
+- **Partitioning is by TIME, monthly by default**
+  (`toYYYYMM(_apitap_at)` on ClickHouse, `TIMESTAMP_TRUNC(_apitap_at, MONTH)` on
+  BigQuery). Monthly, not daily, because BigQuery caps the number of partitions
+  per table: daily runs out in a decade or three, monthly in centuries, and a
+  changelog is meant to outlive both. Override with `partition_by` /
+  `order_by` — ClickHouse takes the expression verbatim, BigQuery takes a
+  **column name** and emits the right `*_TRUNC` for its declared type (a
+  non-time column is refused, not silently ignored; `order_by` maps to
+  `CLUSTER BY` there). Both apply to multi-table runs.
+- **Why it is cheaper.** ClickHouse never mutates, so no part rewrites.
+  BigQuery never MERGEs, so a window costs a load job plus one
+  `INSERT … SELECT` — and because append-only needs no row-level DML, the
+  BigQuery billing requirement above does not apply to this mode.
+- **Scope**: analytical destinations only — ClickHouse and BigQuery. Postgres,
+  MySQL and Iceberg destinations refuse `changelog=True` loudly rather than
+  quietly hand back a replica.
+
 ## Reading into DataFrames: `apitap.read()`
 
 One line from Postgres to Polars, at wire speed:

@@ -28,6 +28,14 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 
+/// changelog=True needs a destination that is happy to be append-only and can
+/// partition the log by time. The row-store replicas can technically hold one,
+/// but a table that only ever grows is the wrong shape for them — they'd have
+/// no partition to drop and no cheap latest-per-key.
+const CHANGELOG_DEST_MSG: &str =
+    "log_based: changelog=True lands in ClickHouse and BigQuery — Postgres, MySQL \
+     and Iceberg destinations stay replicas (changelog=False)";
+
 /// One destination engine for the log_based apply path.
 enum Dest {
     Pg(PgDest),
@@ -62,6 +70,18 @@ impl Dest {
         }
     }
 
+    /// Once per table at run start, on a table that ALREADY has state: the
+    /// destination's shape must match `changelog`. A fresh bootstrap builds the
+    /// right shape by construction, and the apply path is too late — an empty
+    /// drain never calls it. Only the analytical destinations have two shapes.
+    async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
+        match self {
+            Dest::Ch(d) => d.precheck_mode(dest_table, changelog).await,
+            Dest::Bq(d) => d.precheck_mode(dest_table, changelog).await,
+            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => Ok(()),
+        }
+    }
+
     /// Destination-specific knobs for the bootstrap's full load.
     fn tweak_bootstrap_opts(&self, o2: &mut TransferOptions, pk_cols: &[String]) {
         match self {
@@ -91,10 +111,13 @@ impl Dest {
                     )
                     .await
                 }
-                _ => Err(Error::InvalidInput(
-                    "log_based: changelog=True lands in ClickHouse today; BigQuery is next"
-                        .into(),
-                )),
+                Dest::Bq(d) => {
+                    d.changelog_bootstrap_finish(
+                        dest_table, source_id, pk_cols, lsn, rows, partition_by, order_by,
+                    )
+                    .await
+                }
+                _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             };
         }
         match self {
@@ -116,7 +139,19 @@ impl Dest {
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
+        changelog: bool,
     ) -> Result<u64> {
+        if changelog {
+            return match self {
+                Dest::Ch(d) => {
+                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                }
+                Dest::Bq(d) => {
+                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                }
+                _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
+            };
+        }
         match self {
             Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
             Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
@@ -143,11 +178,10 @@ impl Dest {
                 Dest::Ch(d) => {
                     d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
                 }
-                _ => Err(Error::InvalidInput(
-                    "log_based: changelog=True lands in ClickHouse today; BigQuery is next. \
-                     Postgres/MySQL/Iceberg destinations stay replicas (changelog=False)"
-                        .into(),
-                )),
+                Dest::Bq(d) => {
+                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                }
+                _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             };
         }
         match self {
@@ -422,7 +456,11 @@ async fn run_group(
     // from the group minimum; a mix is a torn group — refuse loudly.
     let mut wms = Vec::with_capacity(ctxs.len());
     for c in &ctxs {
-        wms.push(dest.read_state(&c.dest_table, &c.source_id).await?);
+        let wm = dest.read_state(&c.dest_table, &c.source_id).await?;
+        if wm.is_some() {
+            dest.precheck_mode(&c.dest_table, opts.changelog).await?;
+        }
+        wms.push(wm);
     }
     let have: Vec<&TableCtx> =
         ctxs.iter().zip(&wms).filter(|(_, w)| w.is_some()).map(|(c, _)| c).collect();
@@ -474,13 +512,6 @@ async fn run_group_mysql(
                 .into(),
         ));
     }
-    if opts.changelog {
-        return Err(Error::InvalidInput(
-            "log_based: changelog=True needs a Postgres source in this release — \
-             the MySQL binlog lane still collapses its window"
-                .into(),
-        ));
-    }
     let pool = myrun::control_pool(src_url).await?;
     let default_db = src_url
         .rsplit('/')
@@ -495,7 +526,11 @@ async fn run_group_mysql(
     // all-present drains, a mix is a torn group.
     let mut marks = Vec::with_capacity(ctxs.len());
     for c in &ctxs {
-        marks.push(dest.read_state(&c.dest_table, &c.source_id).await?);
+        let m = dest.read_state(&c.dest_table, &c.source_id).await?;
+        if m.is_some() {
+            dest.precheck_mode(&c.dest_table, opts.changelog).await?;
+        }
+        marks.push(m);
     }
     let present = marks.iter().filter(|m| m.is_some()).count();
     if present != 0 && present != marks.len() {
@@ -555,6 +590,7 @@ async fn run_group_mysql(
         &seed,
         30,
         budget,
+        opts.changelog,
         |outcome| {
             let dest = &dest;
             let ctxs = &ctxs;
@@ -565,7 +601,10 @@ async fn run_group_mysql(
                     // Every member applies — a table with no traffic in this
                     // window still advances its watermark.
                     let n = dest
-                        .apply_no_src(&c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id)
+                        .apply_no_src(
+                            &c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id,
+                            opts.changelog,
+                        )
                         .await?;
                     acc.set(acc.get() + n);
                 }
@@ -792,9 +831,12 @@ async fn drain_group(
                 // script jobs as possible. A MERGE carries ~7.3 s of fixed job
                 // overhead, so paying it once per GROUP instead of once per
                 // TABLE is the biggest lever the profile found.
-                for (i, n) in
-                    d.apply_group(&actxs, &o, lanes).await?.into_iter().enumerate()
-                {
+                let applied = if clog {
+                    d.apply_group_changelog(&actxs, &o, lanes).await?
+                } else {
+                    d.apply_group(&actxs, &o, lanes).await?
+                };
+                for (i, n) in applied.into_iter().enumerate() {
                     rows_per[i] += n;
                 }
             } else if lanes > 1 && actxs.len() > 1 {

@@ -205,8 +205,12 @@ impl ChDest {
         let desc = self
             .ch
             .exec(&format!(
+                // TabSeparatedRaw, not TabSeparated: TSV escapes single quotes,
+                // so a `DateTime64(6, 'UTC')` column comes back as
+                // `DateTime64(6, \'UTC\')` and lands verbatim inside the CAST
+                // below — a syntax error on every table with a tz-aware column.
                 "SELECT name, type FROM system.columns WHERE database = currentDatabase() \
-                 AND table = '{t}' ORDER BY position FORMAT TabSeparated",
+                 AND table = '{t}' ORDER BY position FORMAT TabSeparatedRaw",
                 t = ch_str(dest_table),
             ))
             .await?;
@@ -234,10 +238,9 @@ impl ChDest {
             .iter()
             .map(|(n, ty)| {
                 let q = ch_ident(n);
-                if ty.starts_with("Nullable(") {
-                    q
-                } else {
-                    format!("CAST({q} AS Nullable({ty})) AS {q}")
+                match cl_nullable(ty) {
+                    Some(w) => format!("CAST({q} AS {w}) AS {q}"),
+                    None => q,
                 }
             })
             .collect::<Vec<_>>()
@@ -303,6 +306,29 @@ impl ChDest {
             ))
             .await?;
         Ok(())
+    }
+
+    /// The destination's SHAPE must match the mode, checked ONCE at run start
+    /// on a table that already has state (a fresh bootstrap builds the right
+    /// shape by construction).
+    ///
+    /// Both directions are damage: a replica window landing on a changelog
+    /// deletes the window's keys and inserts current images ON TOP of the
+    /// history, destroying the log it found; a changelog window landing on a
+    /// replica has nowhere to put its meta columns. Neither can be caught in
+    /// the apply path — an empty drain never calls apply at all, and by the
+    /// time a non-empty one does, the run has already committed to the mode.
+    pub(crate) async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
+        let has = self
+            .ch
+            .exec(&format!(
+                "SELECT count() FROM system.columns WHERE database = currentDatabase() \
+                 AND table = '{t}' AND name = '{c}'",
+                t = ch_str(dest_table),
+                c = ch_str(CL_OP),
+            ))
+            .await?;
+        is_shape_ok(has.trim() != "0", changelog, "ClickHouse", dest_table)
     }
 
     pub(crate) async fn write_state(
@@ -622,6 +648,65 @@ impl ChDest {
     }
 }
 
+/// One verdict for "the destination's shape matches the mode", shared by both
+/// analytical destinations so the two engines say the same thing.
+pub(crate) fn is_shape_ok(
+    is_changelog: bool,
+    want_changelog: bool,
+    engine: &str,
+    dest_table: &str,
+) -> Result<()> {
+    match (is_changelog, want_changelog) {
+        (true, true) | (false, false) => Ok(()),
+        (true, false) => Err(Error::InvalidInput(format!(
+            "log_based: {engine} target {dest_table} is a CHANGELOG (it has an \
+             {CL_OP} column) but this run asked for a replica — pass changelog=True, \
+             or point at a different dest_table"
+        ))),
+        (false, true) => Err(Error::InvalidInput(format!(
+            "log_based: {engine} target {dest_table} is a REPLICA (no {CL_OP} column) \
+             but this run asked for changelog=True — a changelog cannot be grafted \
+             onto a replica's history. Use a different dest_table, or drop the table \
+             and its _apitap_state row to re-bootstrap as a changelog"
+        ))),
+    }
+}
+
+/// The Nullable form of an existing column type for the changelog rebuild, or
+/// `None` when the column must be left exactly as it is.
+///
+/// A changelog's rows are partial by nature — a delete carries only the key, a
+/// truncate carries nothing — so every data column has to accept NULL. Three
+/// cases the naive `Nullable({ty})` gets wrong:
+/// * already nullable, in either spelling — wrapping twice is an error;
+/// * `LowCardinality(T)` — ClickHouse spells it `LowCardinality(Nullable(T))`,
+///   with the Nullable INSIDE; the other order is rejected;
+/// * containers (Array/Map/Tuple/Nested) and aggregate states cannot be
+///   Nullable at all. Left alone: the log still works for I/U/D, and a
+///   TRUNCATE against such a table fails loudly instead of silently.
+fn cl_nullable(ty: &str) -> Option<String> {
+    let t = ty.trim();
+    let mut inner = t;
+    let mut lc = 0usize;
+    while let Some(r) = inner.strip_prefix("LowCardinality(").and_then(|r| r.strip_suffix(')')) {
+        inner = r.trim();
+        lc += 1;
+    }
+    if inner.starts_with("Nullable(") {
+        return None;
+    }
+    for c in ["Array(", "Map(", "Tuple(", "Nested(", "AggregateFunction(", "SimpleAggregateFunction("] {
+        if inner.starts_with(c) {
+            return None;
+        }
+    }
+    let mut w = format!("Nullable({inner})");
+    for _ in 0..lc {
+        w = format!("LowCardinality({w})");
+    }
+    Some(w)
+}
+
 /// One changelog row's DATA columns, TabSeparated, WITHOUT the trailing newline
 /// — the meta columns are appended after it. Padded to `ncols` with `\N` so a
 /// delete's key-only old image still lines up with the table's column list.
@@ -687,4 +772,35 @@ fn render_residue_row(
     }
     out.push(b'\n');
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cl_nullable;
+
+    #[test]
+    fn nullable_wrap_handles_every_shape() {
+        // The bug this file shipped with: a tz-aware timestamp column.
+        assert_eq!(
+            cl_nullable("DateTime64(6, 'UTC')").as_deref(),
+            Some("Nullable(DateTime64(6, 'UTC'))")
+        );
+        assert_eq!(cl_nullable("Int64").as_deref(), Some("Nullable(Int64)"));
+        assert_eq!(
+            cl_nullable("Decimal(12, 2)").as_deref(),
+            Some("Nullable(Decimal(12, 2))")
+        );
+        // Nullable INSIDE LowCardinality — the other order is rejected by CH.
+        assert_eq!(
+            cl_nullable("LowCardinality(String)").as_deref(),
+            Some("LowCardinality(Nullable(String))")
+        );
+        // Already nullable, in either spelling: leave it.
+        assert_eq!(cl_nullable("Nullable(String)"), None);
+        assert_eq!(cl_nullable("LowCardinality(Nullable(String))"), None);
+        // Containers cannot be Nullable at all.
+        assert_eq!(cl_nullable("Array(String)"), None);
+        assert_eq!(cl_nullable("Map(String, UInt64)"), None);
+        assert_eq!(cl_nullable("Tuple(UInt8, String)"), None);
+    }
 }

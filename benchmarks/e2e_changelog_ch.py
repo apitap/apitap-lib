@@ -92,5 +92,46 @@ print(f"   log rows {before} -> {after} (empty drain must not append)")
 ok &= before == after
 ok &= current_matches("window2-replay")
 
+print("== a REPLICA run onto a changelog table is refused ==")
+try:
+    apitap.transfer(PG, CH, table=T, mode="log_based")      # changelog=False
+    print("   ✗ a replica run was allowed to write onto the log")
+    ok = False
+except Exception as e:
+    good = "CHANGELOG" in str(e) and "changelog=True" in str(e)
+    print(f"   {'✓' if good else '✗'} refused: {str(e)[:140]}")
+    ok &= good
+
+print("== and the mirror: changelog onto a REPLICA table is refused ==")
+R = f"{T}_rep"
+pg(f"DROP TABLE IF EXISTS {R} CASCADE")
+pg(f"DROP PUBLICATION IF EXISTS apitap_pub_{R}")
+pg("SELECT pg_drop_replication_slot(s) FROM (SELECT slot_name s FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%') x")
+ch(f"DROP TABLE IF EXISTS {R}")
+if ch("SELECT count() FROM system.tables WHERE name='_apitap_state'") != "0":
+    ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{R}' SETTINGS mutations_sync=1")
+pg(f"CREATE TABLE {R} (id int PRIMARY KEY, v text)")
+pg(f"INSERT INTO {R} VALUES (1,'a')")
+apitap.transfer(PG, CH, table=R, mode="log_based")          # a plain replica
+try:
+    apitap.transfer(PG, CH, table=R, mode="log_based", changelog=True)
+    print("   ✗ changelog was grafted onto a replica")
+    ok = False
+except Exception as e:
+    good = "REPLICA" in str(e) and "changelog=True" in str(e)
+    print(f"   {'✓' if good else '✗'} refused: {str(e)[:140]}")
+    ok &= good
+pg(f"DROP TABLE IF EXISTS {R} CASCADE")
+pg(f"DROP PUBLICATION IF EXISTS apitap_pub_{R}")
+pg("SELECT pg_drop_replication_slot(s) FROM (SELECT slot_name s FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%') x")
+ch(f"DROP TABLE IF EXISTS {R}")
+
+print("== cleanup ==")
+pg(f"DROP TABLE IF EXISTS {T} CASCADE")
+pg(f"DROP PUBLICATION IF EXISTS apitap_pub_{T}")
+pg("SELECT pg_drop_replication_slot(s) FROM (SELECT slot_name s FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%') x")
+ch(f"DROP VIEW IF EXISTS {T}__current")
+ch(f"DROP TABLE IF EXISTS {T}")
+
 print("\n   ===== CH CHANGELOG E2E: " + ("ALL GREEN" if ok else "FAILED") + " =====")
 sys.exit(0 if ok else 1)

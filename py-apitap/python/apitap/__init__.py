@@ -617,16 +617,20 @@ def transfer(
             the destination is rebuildable scratch data. Other destinations ignore it.
         partition_by: Analytical destinations (ClickHouse, BigQuery). PARTITION
             BY of the table apitap creates. Default = MONTHLY on the changelog's
-            own ``_apitap_at``, because **BigQuery caps a table at 4,000
-            partitions**: daily partitions run out after ~11 years, monthly
-            after 333 — and a changelog is meant to live a long time.
+            own ``_apitap_at``, because **BigQuery caps the number of partitions
+            per table**: daily partitions run out in roughly a decade or three
+            depending on the cap in force, monthly in centuries — and a
+            changelog is meant to live a long time.
             Partitioning does not speed up the ``__current`` view (it scans
             every version per key by design); it buys RETENTION (drop partitions
             older than N months) and time-range audit queries. ClickHouse takes
             the expression verbatim; BigQuery takes a COLUMN and can only
-            partition on DATE/TIMESTAMP/DATETIME or an integer range — never a
-            STRING, so ``_apitap_op`` is refused there and belongs in the
-            cluster key instead. Ignored when the table already exists.
+            partition on DATE/TIMESTAMP/DATETIME — never a STRING, so
+            ``_apitap_op`` is refused there and belongs in the cluster key
+            instead. The emitted DDL always lands MONTHLY
+            (``DATE_TRUNC``/``TIMESTAMP_TRUNC``/``DATETIME_TRUNC``); a DATE
+            column is not used bare, because bare is daily. Ignored when the
+            table already exists.
         changelog: ``mode="log_based"`` into an ANALYTICAL destination
             (ClickHouse, BigQuery). ``False`` (default) keeps the destination a
             REPLICA of the source — the window is applied with delete+insert or
@@ -642,7 +646,8 @@ def transfer(
             replayed window re-appends rows carrying the SAME
             ``(_apitap_lsn, _apitap_seq)``, so the view's dedup makes
             at-least-once delivery read as exactly-once. Row stores (Postgres,
-            MySQL) and every bulk mode ignore it.
+            MySQL) and Iceberg REFUSE it loudly rather than quietly hand back a
+            replica; every bulk mode ignores it.
     """
     picked = sum(x is not None for x in (table, tables, schema))
     if picked != 1:

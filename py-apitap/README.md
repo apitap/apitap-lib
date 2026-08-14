@@ -81,7 +81,7 @@ Each pair negotiates the fastest wire format both sides speak — for example:
 | `postgres://` → `mysql://` | binary COPY rendered in-flight as `LOAD DATA` text |
 | `mysql://` → `postgres://` | wire decode → binary COPY (exact decimals to `DECIMAL(65,30)`) |
 | `clickhouse://` → `clickhouse://` | `RowBinary` relayed untouched — 10M rows server-to-server in 8.4 s, or 20.6 s in a 256 MB container |
-| `postgres://`/`mysql://` → `clickhouse://`/`bigquery://`/…, `mode="log_based"` | change streams: 40M+ changes verified per source at **34–132K changes/s** on **half a core** — v0.29.0: 132K/s on 5-column rows, 34K/s at 15 wide columns ([the stress ledger](https://apitap.dev/docs/cdc-stress)) |
+| `postgres://`/`mysql://` → `clickhouse://`/`bigquery://`/…, `mode="log_based"` | change streams: 40M+ changes verified per source at **34–135K changes/s** on **half a core**, by row width AND capture plane — MySQL binlog 84K/s (5 cols, update-only) to 135K/s (insert-heavy), Postgres WAL 51K/s (5 cols) to 34K/s (15 wide cols); `changelog=True` lifts the MySQL lane to **113.8K/s** ([stress ledger](https://apitap.dev/docs/cdc-stress), [changelog ledger](https://github.com/apitap/apitap-lib/blob/main/benchmarks/changelog-cdc.md)) |
 | any → `bigquery://` (bulk) | Parquet or CSV load jobs — free path, sandbox-safe (CDC into BigQuery needs a billed project) |
 
 Every transfer stages and swaps in atomically — readers never see a partial table,
@@ -146,6 +146,17 @@ needs a project with billing, since CDC uses row-level DML). On Iceberg it lives
 in the table's own properties, committed **in the same snapshot as the data**.
 No local state files, no opaque blobs, no extra columns in your rows. A 1M-row delta lands on a 10M-row
 table in ~10 s — cost is proportional to the delta, not the table.
+
+Into an analytical destination you can also ask for `changelog=True`: instead of
+keeping ClickHouse or BigQuery a *replica*, apitap appends **every** operation
+with an `_apitap_op` column (`I`/`U`/`D`/`T`, plus `B` for the bootstrap
+baseline) and a `<table>__current` view that derives the current state. Nothing
+is ever updated or deleted — so ClickHouse never mutates a part, BigQuery never
+runs a `MERGE` (and needs no billing, since append-only is not DML), the log is
+partitioned by time (monthly by default; `partition_by`/`order_by` override it),
+and you keep the history a replica throws away. Measured **free on the Postgres
+lane and 34% faster on the MySQL one**
+([ledger](https://github.com/apitap/apitap-lib/blob/main/benchmarks/changelog-cdc.md)).
 
 Multi-table runs share one pipe budget, so peak memory is a single table's ceiling
 no matter how many tables you pass. Each table lands atomically and independently:
