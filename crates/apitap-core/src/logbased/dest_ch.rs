@@ -244,7 +244,7 @@ impl ChDest {
             )));
         }
 
-        let part = partition_by.map(str::to_string).unwrap_or_else(|| format!("toYYYYMM({CL_AT})"));
+        let part = ch_partition_expr(partition_by);
         let order = order_by.map(str::to_string).unwrap_or_else(|| {
             let mut k: Vec<String> = pk_cols.iter().map(|c| ch_ident(c)).collect();
             k.push(CL_LSN.to_string());
@@ -300,7 +300,10 @@ impl ChDest {
         order_by: Option<&str>,
     ) -> Result<()> {
         let ft = ch_ident(dest_table);
-        for (what, expr) in [("partition_by", partition_by), ("order_by", order_by)] {
+        // partition_by is checked in its EXPANDED form — a bare column name is a
+        // month, not a raw key — so validation and DDL can never disagree.
+        let pb = partition_by.map(|_| ch_partition_expr(partition_by));
+        for (what, expr) in [("partition_by", pb.as_deref()), ("order_by", order_by)] {
             let Some(expr) = expr else { continue };
             // The meta columns exist only after the rebuild, so a clause that
             // uses them is checked against them explicitly.
@@ -784,6 +787,33 @@ impl ChDest {
     }
 }
 
+/// The changelog's `PARTITION BY` for ClickHouse.
+///
+/// A BARE COLUMN NAME means MONTHLY on that column — `"created_at"` becomes
+/// `toYYYYMM(created_at)` — so the same `partition_by="created_at"` means the
+/// same thing here as it does on BigQuery. Users should not have to remember
+/// which engine wants which dialect, and the old literal reading of a bare name
+/// was a footgun besides: `PARTITION BY created_at` on a DateTime column is ONE
+/// PARTITION PER SECOND, which nobody wants and nothing warns about.
+///
+/// Anything that is not a plain identifier is passed through untouched, so the
+/// full expression escape hatch (`toStartOfWeek(ts)`, `(toYYYYMM(ts), region)`)
+/// still works for people who want it.
+fn ch_partition_expr(spec: Option<&str>) -> String {
+    let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return format!("toYYYYMM({CL_AT})");
+    };
+    let bare = spec.trim_matches('`');
+    let is_ident = !bare.is_empty()
+        && !bare.starts_with(|c: char| c.is_ascii_digit())
+        && bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_ident {
+        format!("toYYYYMM({})", ch_ident(bare))
+    } else {
+        spec.to_string()
+    }
+}
+
 /// One verdict for "the destination's shape matches the mode", shared by both
 /// analytical destinations so the two engines say the same thing.
 pub(crate) fn is_shape_ok(
@@ -912,7 +942,27 @@ fn render_residue_row(
 
 #[cfg(test)]
 mod tests {
-    use super::cl_nullable;
+    use super::{ch_partition_expr, cl_nullable};
+
+    #[test]
+    fn a_bare_column_name_means_monthly_on_clickhouse_too() {
+        // The whole point: this is the spelling BigQuery already takes, and it
+        // must mean the same thing here — a MONTH, never one partition per
+        // timestamp, which is what the literal reading used to produce.
+        assert_eq!(ch_partition_expr(Some("created_at")), "toYYYYMM(`created_at`)");
+        assert_eq!(ch_partition_expr(Some("  occurred_at  ")), "toYYYYMM(`occurred_at`)");
+        assert_eq!(ch_partition_expr(Some("`logged_at`")), "toYYYYMM(`logged_at`)");
+        assert_eq!(ch_partition_expr(Some("_apitap_at")), "toYYYYMM(`_apitap_at`)");
+        // Nothing given, or blank: the monthly default.
+        assert_eq!(ch_partition_expr(None), "toYYYYMM(_apitap_at)");
+        assert_eq!(ch_partition_expr(Some("   ")), "toYYYYMM(_apitap_at)");
+        // Anything that is not a plain identifier stays the caller's own
+        // expression — the escape hatch survives.
+        assert_eq!(ch_partition_expr(Some("toYYYYMM(ts)")), "toYYYYMM(ts)");
+        assert_eq!(ch_partition_expr(Some("toStartOfWeek(ts)")), "toStartOfWeek(ts)");
+        assert_eq!(ch_partition_expr(Some("(toYYYYMM(ts), region)")), "(toYYYYMM(ts), region)");
+        assert_eq!(ch_partition_expr(Some("tuple()")), "tuple()");
+    }
 
     #[test]
     fn nullable_wrap_handles_every_shape() {

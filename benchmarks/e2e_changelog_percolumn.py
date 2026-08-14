@@ -115,7 +115,7 @@ for t in T:
 print("== a clause naming a column only ONE table owns: refused, nothing written ==")
 try:
     apitap.transfer(PG, DST, tables=T, mode="log_based", changelog=True,
-                    partition_by=("toYYYYMM(created_at)" if DEST == "ch" else "created_at"))
+                    partition_by="created_at")
     print("   ✗ accepted a clause two members cannot satisfy")
     ok = False
 except Exception as e:
@@ -131,10 +131,10 @@ for t in T:
        f"{COL[t]} timestamptz NOT NULL DEFAULT now())")
     pg(f"INSERT INTO {t} (id, v) VALUES (1,'a'),(2,'b')")
 
-if DEST == "ch":
-    pb = {t: f"toYYYYMM({COL[t]})" for t in T[:2]}      # audit left to the default
-else:
-    pb = {t: COL[t] for t in T[:2]}
+# The SAME dict for both engines: plain column names. ClickHouse used to need
+# toYYYYMM(...) here and BigQuery a bare name; now a bare name means MONTHLY on
+# both, and only an expression is engine-specific.
+pb = {t: COL[t] for t in T[:2]}                        # audit left to the default
 r = apitap.transfer(PG, DST, tables=T, mode="log_based", changelog=True, partition_by=pb)
 print(f"   group bootstrap rows={r.rows}")
 

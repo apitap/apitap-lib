@@ -660,23 +660,32 @@ def transfer(
             column is not used bare, because bare is daily. Ignored when the
             table already exists.
 
-            For a MULTI-TABLE run, pass a **dict** when each table needs its own
-            time column::
+            Give it a COLUMN NAME and it means monthly on that column, the
+            same way on both engines::
+
+                partition_by="created_at"
+
+            For a MULTI-TABLE run where each table has its own time column,
+            pass a dict — same spelling, one entry per table::
 
                 apitap.transfer(src, dst,
                     tables=["orders", "events", "audit"],
                     mode="log_based", changelog=True,
-                    partition_by={"orders": "toYYYYMM(created_at)",
-                                  "events": "toYYYYMM(occurred_at)"})
+                    partition_by={"orders": "created_at",
+                                  "events": "occurred_at"})
                     # "audit" is not listed -> monthly on _apitap_at
 
-            A plain string still applies to EVERY table, which is what you want
-            when they share the column. Keys are matched against the name you
-            passed, the resolved ``schema.table``, and the bare name, so
-            ``"orders"`` and ``"public.orders"`` both work. Before anything is
-            written, every member's clause is checked against that table's real
-            columns — a clause naming a column only some tables own is refused
-            with nothing bootstrapped, rather than tearing the group.
+            Keys are matched against the name you passed, the resolved
+            ``schema.table``, and the bare name, so ``"orders"`` and
+            ``"public.orders"`` both work. Before anything is written, every
+            member's clause is checked against that table's real columns — a
+            column only some tables own is refused with nothing bootstrapped,
+            rather than tearing the group.
+
+            Anything that is NOT a plain column name is treated as a verbatim
+            ClickHouse expression (``"toStartOfWeek(ts)"``,
+            ``"(toYYYYMM(ts), region)"``) — the escape hatch for a granularity
+            other than a month. BigQuery takes column names only.
         changelog: ``mode="log_based"`` into an ANALYTICAL destination
             (ClickHouse, BigQuery). ``False`` (default) keeps the destination a
             REPLICA of the source — the window is applied with delete+insert or

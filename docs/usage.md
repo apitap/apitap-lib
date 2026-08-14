@@ -884,26 +884,35 @@ The destination table gains four columns:
   get exactly what `changelog=False` would have written.
 - **A PK-changing update is two records** — a `D` on the old identity, then a
   `U` on the new one — so the old key really disappears from `__current`.
-- **A column per table, when they differ.** `partition_by` and `order_by` take
-  either one clause for the whole run, or a **dict keyed by table** when each
-  table has its own time column:
+- **Name the column, and that's it.** `partition_by` takes a column name and
+  means MONTHLY on that column, identically on both engines:
+
+  ```python
+  apitap.transfer(src, dst, table="orders", mode="log_based", changelog=True,
+                  partition_by="created_at")
+  ```
+
+  When each table in a group has its own time column, pass a **dict** — same
+  spelling, one entry per table:
 
   ```python
   apitap.transfer(src, dst,
       tables=["orders", "events", "audit"],
       mode="log_based", changelog=True,
-      partition_by={"orders": "toYYYYMM(created_at)",     # ClickHouse: expression
-                    "events": "toYYYYMM(occurred_at)"})
+      partition_by={"orders": "created_at", "events": "occurred_at"})
       # "audit" isn't listed → monthly on _apitap_at, the default
   ```
 
-  On BigQuery the same dict carries column NAMES (`{"orders": "created_at"}`) and
-  apitap emits the monthly `TRUNC` itself. Keys match the name you passed, the
-  resolved `schema.table`, or the bare name — `"orders"` and `"public.orders"`
-  are interchangeable. Every member's clause is checked against that table's real
-  columns **before anything is bootstrapped**, so a clause naming a column only
-  some tables own is refused with nothing written, instead of half-building the
-  group.
+  Keys match the name you passed, the resolved `schema.table`, or the bare name —
+  `"orders"` and `"public.orders"` are interchangeable. Every member's clause is
+  checked against that table's real columns **before anything is bootstrapped**,
+  so a column only some tables own is refused with nothing written instead of
+  half-building the group.
+
+  Need something other than a month? On ClickHouse any value that isn't a plain
+  column name is used as a **verbatim expression** — `"toStartOfWeek(ts)"`,
+  `"(toYYYYMM(ts), region)"`. BigQuery partitions on a column, so it takes column
+  names only.
 - **Partitioning is by TIME, monthly by default**
   (`toYYYYMM(_apitap_at)` on ClickHouse, `TIMESTAMP_TRUNC(_apitap_at, MONTH)` on
   BigQuery). Monthly, not daily, because BigQuery caps the number of partitions

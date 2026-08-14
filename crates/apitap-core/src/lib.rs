@@ -133,8 +133,14 @@ pub struct TransferOptions {
     /// it buys RETENTION (drop partitions older than N months) and time-range
     /// audit queries.
     ///
-    /// Set it to override the granularity or the column. ClickHouse takes the
-    /// expression verbatim. BigQuery takes a partitioning COLUMN and can only
+    /// Set it to override the column: a plain COLUMN NAME means MONTHLY on that
+    /// column on BOTH engines, so `partition_by="created_at"` needs no dialect
+    /// knowledge (and cannot accidentally mean ClickHouse's literal
+    /// `PARTITION BY created_at`, which is one partition per timestamp).
+    ///
+    /// ClickHouse takes anything that is not a plain identifier as a verbatim
+    /// expression — the escape hatch for another granularity. BigQuery takes a
+    /// partitioning COLUMN and can only
     /// partition on DATE/TIMESTAMP/DATETIME or an integer range — it CANNOT
     /// partition on a STRING, so `"_apitap_op"` is refused there (op belongs in
     /// the cluster key, where it prunes just as well). The emitted DDL adapts to
