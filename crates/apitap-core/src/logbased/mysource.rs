@@ -354,6 +354,10 @@ pub(crate) async fn drain_binlog(
         .collect();
     Ok(DrainOutcome {
         tables,
+        // The binlog lane still collapses. `changelog=true` is refused up front
+        // for MySQL sources (see `run_group_mysql`), so an empty map here can
+        // never be mistaken for "captured nothing".
+        changes: HashMap::new(),
         end_lsn: end_mark,
         wal_cols,
         wal_oids,

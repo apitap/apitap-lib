@@ -120,10 +120,51 @@ pub struct TransferOptions {
     /// ClickHouse destinations only: ORDER BY clause of the created table
     /// (e.g. `"id"` or `"client_id, id"`). `None` = the cursor column, else `tuple()`.
     pub order_by: Option<String>,
+    /// Analytical destinations: PARTITION BY of the table apitap creates.
+    ///
+    /// `None` = MONTHLY on the changelog's own `_apitap_at`
+    /// (`toYYYYMM(_apitap_at)` on ClickHouse, `TIMESTAMP_TRUNC(_apitap_at,
+    /// MONTH)` on BigQuery). Monthly rather than daily because **BigQuery caps a
+    /// table at 4,000 partitions**: daily runs out after ~11 years, monthly
+    /// after 333. A changelog is meant to live a long time, so daily is a time
+    /// bomb on exactly the tables this mode is for. Partitioning does not speed
+    /// up the `__current` view (that scans every version per key by design) —
+    /// it buys RETENTION (drop partitions older than N months) and time-range
+    /// audit queries.
+    ///
+    /// Set it to override the granularity or the column. ClickHouse takes the
+    /// expression verbatim. BigQuery takes a partitioning COLUMN and can only
+    /// partition on DATE/TIMESTAMP/DATETIME or an integer range — it CANNOT
+    /// partition on a STRING, so `"_apitap_op"` is refused there (op belongs in
+    /// the cluster key, where it prunes just as well). The emitted DDL adapts to
+    /// the column's declared type: a `DATE` column is used bare, a `TIMESTAMP`
+    /// is wrapped in `TIMESTAMP_TRUNC(…)`. Ignored when the table already
+    /// exists.
+    pub partition_by: Option<String>,
     /// ClickHouse destinations only: run the final table's DDL `ON CLUSTER` this
     /// cluster. Requires a `Replicated*` engine (data reaches other replicas through
     /// replication, not through the insert).
     pub on_cluster: Option<String>,
+    /// `mode="log_based"` into an ANALYTICAL destination (ClickHouse, BigQuery):
+    /// apply the change stream as pure INSERTs instead of updating rows in place.
+    ///
+    /// `false` (default) keeps the destination a REPLICA of the source: the window
+    /// is applied with delete+insert (ClickHouse) or one MERGE (BigQuery), so the
+    /// table holds current state only.
+    ///
+    /// `true` makes the destination a CHANGELOG: every change is appended with
+    /// `_apitap_op` (`I`/`U`/`D`), `_apitap_lsn`, `_apitap_seq` and `_apitap_at`,
+    /// and a companion `<table>__current` view derives the current state. Nothing
+    /// is ever updated or deleted, which (a) removes BigQuery's per-window MERGE
+    /// job floor AND its billing requirement — append-only needs no DML, so it
+    /// runs on a sandbox project — and (b) removes ClickHouse mutations entirely,
+    /// so the destination never rewrites parts. A replayed window re-appends rows
+    /// carrying the SAME `(_apitap_lsn, _apitap_seq)`, so the view's dedup makes
+    /// at-least-once delivery read as exactly-once.
+    ///
+    /// Ignored by the row-store destinations (Postgres, MySQL) and by every bulk
+    /// mode.
+    pub changelog: bool,
 }
 
 impl Default for TransferOptions {
@@ -138,6 +179,8 @@ impl Default for TransferOptions {
             engine: None,
             order_by: None,
             on_cluster: None,
+            partition_by: None,
+            changelog: false,
         }
     }
 }

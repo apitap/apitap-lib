@@ -507,6 +507,8 @@ def transfer(
     engine: str | None = None,
     order_by: str | None = None,
     on_cluster: str | None = None,
+    partition_by: str | None = None,
+    changelog: bool = False,
 ) -> TransferReport:
     """Copy one table, a list of tables, or a whole schema from ``src`` to ``dst``.
 
@@ -613,6 +615,34 @@ def transfer(
             swapped-in table REMAINS unlogged: Postgres truncates it during crash
             recovery until you run ``ALTER TABLE … SET LOGGED``. Leave ``True`` unless
             the destination is rebuildable scratch data. Other destinations ignore it.
+        partition_by: Analytical destinations (ClickHouse, BigQuery). PARTITION
+            BY of the table apitap creates. Default = MONTHLY on the changelog's
+            own ``_apitap_at``, because **BigQuery caps a table at 4,000
+            partitions**: daily partitions run out after ~11 years, monthly
+            after 333 — and a changelog is meant to live a long time.
+            Partitioning does not speed up the ``__current`` view (it scans
+            every version per key by design); it buys RETENTION (drop partitions
+            older than N months) and time-range audit queries. ClickHouse takes
+            the expression verbatim; BigQuery takes a COLUMN and can only
+            partition on DATE/TIMESTAMP/DATETIME or an integer range — never a
+            STRING, so ``_apitap_op`` is refused there and belongs in the
+            cluster key instead. Ignored when the table already exists.
+        changelog: ``mode="log_based"`` into an ANALYTICAL destination
+            (ClickHouse, BigQuery). ``False`` (default) keeps the destination a
+            REPLICA of the source — the window is applied with delete+insert or
+            one MERGE, so the table holds current state only. ``True`` makes it a
+            CHANGELOG: every change is APPENDED with ``_apitap_op``
+            (``I``/``U``/``D``), ``_apitap_lsn``, ``_apitap_seq`` and
+            ``_apitap_at``, nothing is ever updated or deleted, and a companion
+            ``<table>__current`` view derives the current state. Analytical
+            stores are built for appends, so this is both faster and gentler:
+            BigQuery loses its per-window MERGE job floor **and its billing
+            requirement** (append-only needs no DML, so it runs on a sandbox
+            project), and ClickHouse stops writing mutations entirely. A
+            replayed window re-appends rows carrying the SAME
+            ``(_apitap_lsn, _apitap_seq)``, so the view's dedup makes
+            at-least-once delivery read as exactly-once. Row stores (Postgres,
+            MySQL) and every bulk mode ignore it.
     """
     picked = sum(x is not None for x in (table, tables, schema))
     if picked != 1:
@@ -635,6 +665,9 @@ def transfer(
             engine=engine,
             order_by=order_by,
             on_cluster=on_cluster,
+            partition_by=partition_by,
+            partition_by=partition_by,
+        changelog=changelog,
         )
         return TransferReport(rows=rows, elapsed_ms=elapsed_ms, parallel=used)
 
@@ -660,6 +693,8 @@ def transfer(
         engine=engine,
         order_by=order_by,
         on_cluster=on_cluster,
+        partition_by=partition_by,
+        changelog=changelog,
     )
     results = tuple(
         TableResult(table=t, rows=r, elapsed_ms=e, parallel=p, error=err)

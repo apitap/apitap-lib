@@ -2,6 +2,7 @@
 //! replication slot, collapse the window per key, apply set-based.
 //! Design: docs/design/log_based.md.
 
+pub(crate) mod changelog;
 pub(crate) mod collapse;
 pub(crate) mod dest_bq;
 pub(crate) mod dest_ch;

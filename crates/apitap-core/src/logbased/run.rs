@@ -417,7 +417,7 @@ async fn run_group(
         bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
     } else {
         let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
-        drain_group(src_url, &src, dest, &slot, &publication, &ctxs, wm).await
+        drain_group(src_url, &src, dest, &slot, &publication, &ctxs, wm, opts.changelog).await
     }
 }
 
@@ -441,6 +441,13 @@ async fn run_group_mysql(
         return Err(Error::InvalidInput(
             "log_based: mysql → iceberg needs a Postgres source — postgres, \
              clickhouse, mysql and bigquery destinations work from MySQL today"
+                .into(),
+        ));
+    }
+    if opts.changelog {
+        return Err(Error::InvalidInput(
+            "log_based: changelog=True needs a Postgres source in this release — \
+             the MySQL binlog lane still collapses its window"
                 .into(),
         ));
     }
@@ -671,6 +678,7 @@ async fn drain_group(
     publication: &str,
     ctxs: &[TableCtx],
     wm: u64,
+    changelog: bool,
 ) -> Result<Vec<(u64, usize)>> {
     // Reconcile against the slot before doing anything.
     let slot_row: Option<(Option<String>, bool)> = sqlx::query_as(
@@ -745,7 +753,18 @@ async fn drain_group(
         while let Some(o) = win_rx.recv().await {
             let t_apply = std::time::Instant::now();
             let lanes = dest.apply_lanes();
-            if lanes > 1 && actxs.len() > 1 {
+            if let Dest::Bq(d) = &dest {
+                // BigQuery: stage every table concurrently (one load job each),
+                // then commit the whole group's MERGEs + watermarks in as few
+                // script jobs as possible. A MERGE carries ~7.3 s of fixed job
+                // overhead, so paying it once per GROUP instead of once per
+                // TABLE is the biggest lever the profile found.
+                for (i, n) in
+                    d.apply_group(&actxs, &o, lanes).await?.into_iter().enumerate()
+                {
+                    rows_per[i] += n;
+                }
+            } else if lanes > 1 && actxs.len() > 1 {
                 // BigQuery apply is one job round-trip per table (I/O, ~0 local
                 // CPU) — applying a group's tables SERIALLY made a 10-table
                 // window pay 10× the round-trip. Run them through a BOUNDED
@@ -800,7 +819,7 @@ async fn drain_group(
     loop {
         let t_drain = std::time::Instant::now();
         let outcome = match drain(
-            &mut ws, &mut sess, cur, stop_line, &key_cols, 3600, budget, &applied_rx,
+            &mut ws, &mut sess, cur, stop_line, &key_cols, 3600, budget, &applied_rx, changelog,
         )
         .await
         {

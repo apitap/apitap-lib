@@ -147,6 +147,8 @@ impl BqDest {
         self.conn.cdc_script(&sql).await
     }
 
+    /// Apply ONE table's window. Kept for the single-table paths; it is
+    /// `apply_group` over a one-element group.
     pub(crate) async fn apply(
         &self,
         dest_table: &str,
@@ -155,11 +157,108 @@ impl BqDest {
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
+        let one = [(
+            dest_table.to_string(),
+            qualified_src.to_string(),
+            pk_cols.to_vec(),
+            source_id.to_string(),
+        )];
+        Ok(self.apply_group(&one, outcome, 1).await?[0])
+    }
+
+    /// Apply a whole group's window: STAGE every table concurrently (each is a
+    /// load job), then COMMIT them all in as few script jobs as possible.
+    ///
+    /// This is the shape that matters on BigQuery. A MERGE costs ~7.3 s of pure
+    /// job overhead plus ~0.08 s per 1000 staged rows (measured: 2K rows →
+    /// 7.8 s, 52K rows → 11.5 s), so a 10-table group applied as 10 separate
+    /// scripts paid that 7.3 s floor TEN times. Batched into one
+    /// `BEGIN … COMMIT` the floor is paid once, the group's watermark rows go in
+    /// with it, and the concurrent-update contention on `_apitap_state`
+    /// disappears because there is only one transaction.
+    pub(crate) async fn apply_group(
+        &self,
+        ctxs: &[(String, String, Vec<String>, String)],
+        outcome: &DrainOutcome,
+        lanes: usize,
+    ) -> Result<Vec<u64>> {
+        use futures::stream::{StreamExt as _, TryStreamExt as _};
+        let (me, cref, oref) = (self, ctxs, outcome);
+        let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
+            .map(|i| async move {
+                let (dt, q, pk, sid) = &cref[i];
+                me.stage(dt, q, pk, oref, sid).await.map(|(ev, sql)| (i, ev, sql))
+            })
+            .buffer_unordered(lanes.max(1))
+            .try_collect()
+            .await?;
+
+        let mut rows = vec![0u64; ctxs.len()];
+        let mut stmts: Vec<String> = Vec::new();
+        for (i, ev, sql) in staged {
+            rows[i] = ev;
+            stmts.extend(sql);
+        }
+        if stmts.is_empty() {
+            return Ok(rows);
+        }
+        // Chunk by size: BigQuery caps a query at ~1 MB, and a 100-table group's
+        // MERGEs would approach it. Each chunk is its own transaction — the
+        // window is replay-idempotent, so a crash between chunks converges.
+        const CHUNK_BYTES: usize = 256 << 10;
+        let dbg = std::env::var("APITAP_DEBUG").is_ok();
+        let t_merge = std::time::Instant::now();
+        let (mut batch, mut len, mut jobs) = (Vec::new(), 0usize, 0u32);
+        for s in stmts {
+            if len + s.len() > CHUNK_BYTES && !batch.is_empty() {
+                self.commit_batch(&batch).await?;
+                jobs += 1;
+                batch.clear();
+                len = 0;
+            }
+            len += s.len();
+            batch.push(s);
+        }
+        if !batch.is_empty() {
+            self.commit_batch(&batch).await?;
+            jobs += 1;
+        }
+        if dbg {
+            eprintln!(
+                "[bq apply] group of {} table(s) committed in {jobs} script job(s), {:.1}s",
+                ctxs.len(),
+                t_merge.elapsed().as_secs_f64()
+            );
+        }
+        Ok(rows)
+    }
+
+    async fn commit_batch(&self, stmts: &[String]) -> Result<()> {
+        self.conn
+            .cdc_script(&format!(
+                "BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;",
+                stmts.join("\n")
+            ))
+            .await
+    }
+
+    /// Build one table's window body, load it into the staging table, and
+    /// return the statements it contributes to the group's commit script.
+    async fn stage(
+        &self,
+        dest_table: &str,
+        qualified_src: &str,
+        pk_cols: &[String],
+        outcome: &DrainOutcome,
+        source_id: &str,
+    ) -> Result<(u64, Vec<String>)> {
         let table = bare(dest_table);
         let Some(c) = outcome.tables.get(qualified_src) else {
             // Foreign-table traffic only: nothing for our table, still advance.
-            self.write_state(table, source_id, outcome.end_lsn, 0).await?;
-            return Ok(0);
+            return Ok((
+                0,
+                vec![self.state_insert_sql(table, source_id, outcome.end_lsn, 0)],
+            ));
         };
         let wal_cols = outcome
             .wal_cols
@@ -242,43 +341,36 @@ impl BqDest {
 
         if staged == 0 {
             // Nothing to merge. A TRUNCATE window still empties the target.
+            let mut out = Vec::new();
             if c.truncate {
-                let sql = format!(
-                    "BEGIN TRANSACTION;\nDELETE FROM {t} WHERE TRUE;\n{state};\nCOMMIT TRANSACTION;",
-                    t = self.conn.fq(table),
-                    state = state_sql,
-                );
-                self.conn.cdc_script(&sql).await?;
-            } else {
-                self.conn.cdc_script(&format!("{state_sql};")).await?;
+                out.push(format!("DELETE FROM {} WHERE TRUE;", self.conn.fq(table)));
             }
-            return Ok(c.events);
+            out.push(format!("{state_sql};"));
+            return Ok((c.events, out));
         }
 
-        // Land the window in the staging table, then MERGE + watermark in one tx.
+        // Land the window in this table's staging table (its own load job), then
+        // hand the MERGE + watermark back so the GROUP commits them in one job.
         let dbg = std::env::var("APITAP_DEBUG").is_ok();
         let nbytes = ndjson.len();
         let t_load = std::time::Instant::now();
         self.conn
             .cdc_load_ndjson(&cdc_staging(table), &plan.staging_fields(), ndjson)
             .await?;
-        let load_s = t_load.elapsed().as_secs_f64();
-        let sql = format!(
-            "BEGIN TRANSACTION;\n{merge};\n{state};\nCOMMIT TRANSACTION;",
-            merge = plan.merge_sql(&self.conn, table, c.truncate),
-            state = state_sql,
-        );
-        let t_merge = std::time::Instant::now();
-        self.conn.cdc_script(&sql).await?;
         if dbg {
             eprintln!(
-                "[bq apply] {table}: {staged} staging rows / {:.1}MB, load={load_s:.1}s \
-                 merge={:.1}s",
+                "[bq stage] {table}: {staged} staging rows / {:.1}MB, load={:.1}s",
                 nbytes as f64 / (1 << 20) as f64,
-                t_merge.elapsed().as_secs_f64(),
+                t_load.elapsed().as_secs_f64(),
             );
         }
-        Ok(c.events)
+        Ok((
+            c.events,
+            vec![
+                format!("{};", plan.merge_sql(&self.conn, table, c.truncate)),
+                format!("{state_sql};"),
+            ],
+        ))
     }
 
     async fn write_state(&self, table: &str, source_id: &str, lsn: u64, rows: u64) -> Result<()> {

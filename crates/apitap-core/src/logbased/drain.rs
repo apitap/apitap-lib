@@ -4,6 +4,7 @@
 //! commit boundaries, and `end_lsn` is always a `Commit.end_lsn`).
 
 use crate::error::{Error, Result};
+use crate::logbased::changelog::Changes;
 use crate::logbased::collapse::{Collapsed, Collapser};
 use crate::wire::pgoutput::{self, PgoMessage, Relation, Tuple};
 use crate::wire::walsender::{WalEvent, Walsender};
@@ -11,8 +12,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) struct DrainOutcome {
-    /// Collapsed window per "schema.table".
+    /// Collapsed window per "schema.table". Empty in changelog mode.
     pub tables: HashMap<String, Collapsed>,
+    /// RAW captured window per "schema.table" — every operation in WAL order,
+    /// populated instead of `tables` when the run is `changelog=true`. See
+    /// [`crate::logbased::changelog`].
+    pub changes: HashMap<String, Changes>,
     /// The last collapsed transaction's `Commit.end_lsn` — the ONLY valid
     /// new watermark. Equal to the start watermark when nothing arrived.
     pub end_lsn: u64,
@@ -78,9 +83,11 @@ pub(crate) async fn drain(
     max_secs: u64,
     max_buf_bytes: usize,
     applied: &tokio::sync::watch::Receiver<u64>,
+    changelog: bool,
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
+    let mut changelogs: HashMap<String, Changes> = HashMap::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
     // if the drain aborts mid-transaction.
     let mut tx_buf: Vec<(Arc<str>, StreamOp)> = Vec::new();
@@ -129,7 +136,7 @@ pub(crate) async fn drain(
             Some(WalEvent::XLogData { payload, .. }) => match pgoutput::decode(&payload, in_stream.is_some())? {
                 PgoMessage::Begin { .. } => tx_buf.clear(),
                 PgoMessage::Commit { end_lsn: e, .. } => {
-                    flush_ops(tx_buf.drain(..), &mut collapsers, &sess.key_idx)?;
+                    flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
                     end_lsn = e;
                     if e >= stop_line {
                         break;
@@ -146,7 +153,7 @@ pub(crate) async fn drain(
                 PgoMessage::StreamStop => in_stream = None,
                 PgoMessage::StreamCommit { xid, end_lsn: e } => {
                     let ops = sess.streams.remove(&xid).unwrap_or_default();
-                    flush_ops(ops, &mut collapsers, &sess.key_idx)?;
+                    flush_ops(ops, &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
                     end_lsn = e;
                     if e >= stop_line {
                         break;
@@ -227,6 +234,7 @@ pub(crate) async fn drain(
             .into_iter()
             .map(|(t, c)| (t, c.finish()))
             .collect(),
+        changes: changelogs,
         end_lsn,
         wal_cols: sess.wal_cols.clone(),
         wal_oids: sess.wal_oids.clone(),
@@ -240,9 +248,27 @@ pub(crate) async fn drain(
 fn flush_ops(
     ops: impl IntoIterator<Item = (Arc<str>, StreamOp)>,
     collapsers: &mut HashMap<String, Collapser>,
+    changelogs: &mut HashMap<String, Changes>,
     key_idx: &HashMap<String, Vec<usize>>,
+    changelog: bool,
 ) -> Result<()> {
     for (table, op) in ops {
+        // changelog=true captures every operation verbatim; the collapser is
+        // bypassed entirely (it exists to reduce a window to one image per key,
+        // which is the opposite of an audit trail).
+        if changelog {
+            let ki = key_idx
+                .get(table.as_ref())
+                .expect("session key_idx exists for tracked table");
+            let c = changelogs.entry(table.to_string()).or_default();
+            match op {
+                StreamOp::Insert(row) => c.insert(row),
+                StreamOp::Update(old, row) => c.update(old.as_ref(), row, ki),
+                StreamOp::Delete(old) => c.delete(old),
+                StreamOp::Truncate => c.truncate(),
+            }
+            continue;
+        }
         if !collapsers.contains_key(table.as_ref()) {
             let ki = key_idx
                 .get(table.as_ref())
