@@ -491,6 +491,34 @@ def read(
     return Reader(src, table, cursor, parallel, query, columns)
 
 
+def _split_ddl(value, name):
+    """`partition_by`/`order_by` as either one clause for every table, or a dict
+    keyed by table name for a group where each table wants its own.
+
+    Returns (global_clause, per_table_map). A dict is NOT collapsed into a
+    global value: a table missing from the dict falls back to the engine
+    default, which is what "give me a custom column for these three tables"
+    should mean.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, str):
+        return value, None
+    if isinstance(value, dict):
+        if not value:
+            return None, None
+        bad = [k for k, v in value.items() if not isinstance(k, str) or not isinstance(v, str)]
+        if bad:
+            raise ValueError(
+                f"{name}={value!r}: a dict must map table name -> clause, both strings"
+            )
+        return None, dict(value)
+    raise ValueError(
+        f"{name}={value!r}: pass a string for every table, or a dict "
+        f"{{table: clause}} for per-table clauses"
+    )
+
+
 def transfer(
     src: str,
     dst: str,
@@ -505,9 +533,9 @@ def transfer(
     durable: bool = True,
     mode: str = "replace",
     engine: str | None = None,
-    order_by: str | None = None,
+    order_by: str | dict[str, str] | None = None,
     on_cluster: str | None = None,
-    partition_by: str | None = None,
+    partition_by: str | dict[str, str] | None = None,
     changelog: bool = False,
 ) -> TransferReport:
     """Copy one table, a list of tables, or a whole schema from ``src`` to ``dst``.
@@ -631,6 +659,24 @@ def transfer(
             (``DATE_TRUNC``/``TIMESTAMP_TRUNC``/``DATETIME_TRUNC``); a DATE
             column is not used bare, because bare is daily. Ignored when the
             table already exists.
+
+            For a MULTI-TABLE run, pass a **dict** when each table needs its own
+            time column::
+
+                apitap.transfer(src, dst,
+                    tables=["orders", "events", "audit"],
+                    mode="log_based", changelog=True,
+                    partition_by={"orders": "toYYYYMM(created_at)",
+                                  "events": "toYYYYMM(occurred_at)"})
+                    # "audit" is not listed -> monthly on _apitap_at
+
+            A plain string still applies to EVERY table, which is what you want
+            when they share the column. Keys are matched against the name you
+            passed, the resolved ``schema.table``, and the bare name, so
+            ``"orders"`` and ``"public.orders"`` both work. Before anything is
+            written, every member's clause is checked against that table's real
+            columns — a clause naming a column only some tables own is refused
+            with nothing bootstrapped, rather than tearing the group.
         changelog: ``mode="log_based"`` into an ANALYTICAL destination
             (ClickHouse, BigQuery). ``False`` (default) keeps the destination a
             REPLICA of the source — the window is applied with delete+insert or
@@ -652,6 +698,13 @@ def transfer(
             MySQL) and Iceberg REFUSE it loudly rather than quietly hand back a
             replica; every bulk mode ignores it.
     """
+    _pb_global, _pb_map = _split_ddl(partition_by, "partition_by")
+    _ob_global, _ob_map = _split_ddl(order_by, "order_by")
+    if (_pb_map or _ob_map) and table is not None:
+        raise ValueError(
+            "partition_by/order_by as a dict is for multi-table runs — a "
+            "single table=… run takes a plain string"
+        )
     picked = sum(x is not None for x in (table, tables, schema))
     if picked != 1:
         raise ValueError(
@@ -671,9 +724,11 @@ def transfer(
             durable=durable,
             mode=mode,
             engine=engine,
-            order_by=order_by,
+            order_by=_ob_global,
             on_cluster=on_cluster,
-            partition_by=partition_by,
+            partition_by=_pb_global,
+            partition_by_per_table=_pb_map,
+            order_by_per_table=_ob_map,
             changelog=changelog,
         )
         return TransferReport(rows=rows, elapsed_ms=elapsed_ms, parallel=used)
@@ -698,9 +753,11 @@ def transfer(
         durable=durable,
         mode=mode,
         engine=engine,
-        order_by=order_by,
+        order_by=_ob_global,
         on_cluster=on_cluster,
-        partition_by=partition_by,
+        partition_by=_pb_global,
+        partition_by_per_table=_pb_map,
+        order_by_per_table=_ob_map,
         changelog=changelog,
     )
     results = tuple(

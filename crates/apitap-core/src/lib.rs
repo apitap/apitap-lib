@@ -144,6 +144,16 @@ pub struct TransferOptions {
     /// daily, which is the time bomb monthly exists to defuse. Ignored when the
     /// table already exists.
     pub partition_by: Option<String>,
+    /// PER-TABLE `partition_by`, for multi-table runs where each table wants a
+    /// different time column. Keyed by the table name as it was passed in
+    /// `tables`, and also matched against the resolved `schema.table` and the
+    /// bare name, so `"orders"` finds `public.orders` and vice versa.
+    ///
+    /// A table with no entry falls back to `partition_by`, then to the monthly
+    /// default. Empty = nothing per-table.
+    pub partition_by_per_table: std::collections::HashMap<String, String>,
+    /// PER-TABLE `order_by`, resolved exactly like `partition_by_per_table`.
+    pub order_by_per_table: std::collections::HashMap<String, String>,
     /// ClickHouse destinations only: run the final table's DDL `ON CLUSTER` this
     /// cluster. Requires a `Replicated*` engine (data reaches other replicas through
     /// replication, not through the insert).
@@ -193,6 +203,8 @@ impl Default for TransferOptions {
             order_by: None,
             on_cluster: None,
             partition_by: None,
+            partition_by_per_table: std::collections::HashMap::new(),
+            order_by_per_table: std::collections::HashMap::new(),
             changelog: false,
         }
     }

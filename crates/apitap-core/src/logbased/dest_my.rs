@@ -119,6 +119,28 @@ impl MyDest {
         .map_err(|e| Error::Transfer(format!("log_based: mysql state write: {e}")))
     }
 
+    /// Remove this table's watermark row — a failed group bootstrap must leave
+    /// no state, or the next run refuses the group as torn.
+    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
+        use mysql_async::prelude::Queryable as _;
+        let mut conn = self.shared.conn().await?;
+        match conn
+            .exec_drop(
+                format!(
+                    "DELETE FROM {} WHERE dest_table = ? AND source_id = ?",
+                    self.fq("_apitap_state")
+                ),
+                (dest_table, source_id),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            // No state table at all: nothing to clear.
+            Err(mysql_async::Error::Server(e)) if e.code == 1146 => Ok(()),
+            Err(e) => Err(Error::Transfer(format!("log_based: clear state: {e}"))),
+        }
+    }
+
     async fn ensure_state_table(&self, conn: &mut mysql_async::Conn) -> Result<()> {
         conn.query_drop(format!(
             "CREATE TABLE IF NOT EXISTS {} (\

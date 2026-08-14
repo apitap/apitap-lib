@@ -289,6 +289,52 @@ impl ChDest {
         self.write_state(dest_table, source_id, lsn, rows).await
     }
 
+    /// Ask ClickHouse itself whether these clauses resolve against the table's
+    /// real columns. `SELECT <expr> FROM t LIMIT 0` reads no data and returns
+    /// the same `UNKNOWN_IDENTIFIER` the CREATE would, so a typo or a column
+    /// only some members of a group own is caught before anything is written.
+    pub(crate) async fn validate_changelog_ddl(
+        &self,
+        dest_table: &str,
+        partition_by: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<()> {
+        let ft = ch_ident(dest_table);
+        for (what, expr) in [("partition_by", partition_by), ("order_by", order_by)] {
+            let Some(expr) = expr else { continue };
+            // The meta columns exist only after the rebuild, so a clause that
+            // uses them is checked against them explicitly.
+            let probe = format!(
+                "SELECT {expr} FROM (SELECT *, CAST('B' AS String) AS {CL_OP}, \
+                 CAST(0 AS UInt64) AS {CL_LSN}, CAST(0 AS UInt32) AS {CL_SEQ}, \
+                 now64(3) AS {CL_AT} FROM {ft} LIMIT 0) LIMIT 0 FORMAT TabSeparatedRaw"
+            );
+            if let Err(e) = self.ch.exec(&probe).await {
+                return Err(Error::InvalidInput(format!(
+                    "log_based changelog: {what}={expr:?} does not resolve against \
+                     {dest_table}. In a multi-table run every table gets this same \
+                     clause unless you pass a dict — give {what} per table, e.g. \
+                     {what}={{\"orders\": \"…\", \"events\": \"…\"}}. ClickHouse said: {e}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove this table's watermark row (a failed group bootstrap must leave
+    /// nothing behind, or the next run refuses the group as torn).
+    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
+        self.ch
+            .exec(&format!(
+                "ALTER TABLE `_apitap_state` DELETE WHERE dest_table = '{t}' \
+                 AND source_id = '{s}' SETTINGS mutations_sync = 1",
+                t = ch_str(dest_table),
+                s = ch_str(source_id),
+            ))
+            .await
+            .map(|_| ())
+    }
+
     /// `<table>__current`: the current state derived from the log.
     ///
     /// Three things it has to get right, in this order:

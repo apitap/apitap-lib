@@ -43,6 +43,31 @@ fn strip_changelog_ddl(o2: &mut TransferOptions) {
     }
 }
 
+/// The `partition_by` / `order_by` that apply to ONE table of a group.
+///
+/// Looked up by the argument the caller used, then by the resolved
+/// `schema.table`, then by the bare name — so a group written as
+/// `tables=["orders"]` and one written as `tables=["public.orders"]` accept the
+/// same keys. Falls back to the run-wide value, then to the engine default.
+fn ddl_for<'a>(
+    opts: &'a TransferOptions,
+    table_arg: &str,
+    qualified: &str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let bare = qualified.rsplit_once('.').map_or(qualified, |(_, t)| t);
+    let pick = |m: &'a std::collections::HashMap<String, String>, fallback: Option<&'a String>| {
+        m.get(table_arg)
+            .or_else(|| m.get(qualified))
+            .or_else(|| m.get(bare))
+            .or(fallback)
+            .map(String::as_str)
+    };
+    (
+        pick(&opts.partition_by_per_table, opts.partition_by.as_ref()),
+        pick(&opts.order_by_per_table, opts.order_by.as_ref()),
+    )
+}
+
 /// changelog=True needs a destination that is happy to be append-only and can
 /// partition the log by time. The row-store replicas can technically hold one,
 /// but a table that only ever grows is the wrong shape for them — they'd have
@@ -125,6 +150,35 @@ impl Dest {
             Dest::Ch(d) => d.precheck_mode(dest_table, changelog).await,
             Dest::Bq(d) => d.precheck_mode(dest_table, changelog).await,
             Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => Ok(()),
+        }
+    }
+
+    /// Can this table's changelog DDL actually be built? Asked for EVERY member
+    /// of a group before ANY of them is rebuilt, so a bad expression costs
+    /// nothing instead of tearing the group.
+    async fn validate_changelog_ddl(
+        &self,
+        dest_table: &str,
+        partition_by: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            Dest::Ch(d) => d.validate_changelog_ddl(dest_table, partition_by, order_by).await,
+            Dest::Bq(d) => d.validate_changelog_ddl(dest_table, partition_by, order_by).await,
+            // The row stores refuse changelog=True outright, upstream of this.
+            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => Ok(()),
+        }
+    }
+
+    /// Remove this table's watermark, so a failed group bootstrap really does
+    /// leave "no state" the way its error message says it does.
+    async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.clear_state(dest_table, source_id).await,
+            Dest::Ch(d) => d.clear_state(dest_table, source_id).await,
+            Dest::My(d) => d.clear_state(dest_table, source_id).await,
+            Dest::Bq(d) => d.clear_state(dest_table, source_id).await,
+            Dest::Ice(d) => d.clear_state(dest_table, source_id).await,
         }
     }
 
@@ -610,10 +664,26 @@ async fn run_group_mysql(
             }
         })
         .await?;
+        if opts.changelog {
+            for c in ctxs.iter() {
+                let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
+                dest.validate_changelog_ddl(&c.dest_table, pb, ob).await?;
+            }
+        }
         for (c, (rows, _)) in ctxs.iter().zip(&out) {
-            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
-                    opts.changelog, opts.partition_by.as_deref(), opts.order_by.as_deref())
-                .await?;
+            let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
+            if let Err(e) = dest
+                .bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
+                    opts.changelog, pb, ob)
+                .await
+            {
+                // Same rollback as the Postgres group: a half-written group is
+                // worse than no group, because the next run refuses it.
+                for c in ctxs.iter() {
+                    let _ = dest.clear_state(&c.dest_table, &c.source_id).await;
+                }
+                return Err(e);
+            }
         }
         return Ok(out);
     }
@@ -772,21 +842,41 @@ async fn bootstrap_group(
 
     // Finish (cluster large targets, write the watermark) — also job-bound on
     // BigQuery, so the same bounded fan-out.
+    // Validate EVERY member's changelog DDL before rebuilding ANY of them. The
+    // rebuild writes a state row, so a member whose expression is wrong used to
+    // fail after its siblings had already committed theirs — a torn group the
+    // next run refuses, contradicting the promise made above. Validation is a
+    // parse against the real, just-loaded columns, so a typo or a column only
+    // some members own is refused with nothing written.
+    if opts.changelog {
+        for c in ctxs.iter() {
+            let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
+            if let Err(e) = dest.validate_changelog_ddl(&c.dest_table, pb, ob).await {
+                drop_slot().await;
+                return Err(e);
+            }
+        }
+    }
+
     let fins: Vec<Result<()>> = futures::stream::iter(ctxs.iter().zip(&out).map(|(c, (rows, _))| {
         let dest = &dest;
         async move {
+            let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
             dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows,
-                opts.changelog, opts.partition_by.as_deref(), opts.order_by.as_deref()).await
+                opts.changelog, pb, ob).await
         }
     }))
     .buffered(concurrency)
     .collect()
     .await;
-    for r in fins {
-        if let Err(e) = r {
-            drop_slot().await;
-            return Err(e);
+    if let Some(e) = fins.into_iter().find_map(Result::err) {
+        // Make the rollback the message promises real: a member that DID write
+        // its watermark must lose it, or the group is torn.
+        for c in ctxs.iter() {
+            let _ = dest.clear_state(&c.dest_table, &c.source_id).await;
         }
+        drop_slot().await;
+        return Err(e);
     }
     Ok(out)
 }

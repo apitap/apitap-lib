@@ -18,7 +18,9 @@ use crate::logbased::drain::DrainOutcome;
 use crate::logbased::resolve::{resolve_window, Fin};
 use crate::logbased::rowtext::{decode_bytea, pk_indices, strip_utc_offset, BYTEA_OID};
 use crate::plan::Delivered;
-use crate::sink::iceberg::{cdc_bind, cdc_read_state, cdc_set_watermark, CdcWindow, IcebergConn};
+use crate::sink::iceberg::{
+    cdc_bind, cdc_clear_watermark, cdc_read_state, cdc_set_watermark, CdcWindow, IcebergConn,
+};
 use crate::wire::bqparquet::ParquetEncoder;
 use crate::wire::pgcopy as pgc;
 use crate::wire::pgoutput::Cell;
@@ -62,6 +64,12 @@ impl IceDest {
     /// The bootstrap's replace just created the table (and cleared every
     /// apitap watermark property) — stamp the slot's LSN as state. No
     /// snapshot: the data is already committed.
+    /// Remove this table's watermark properties — a failed group bootstrap must
+    /// leave no state, or the next run refuses the group as torn.
+    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
+        cdc_clear_watermark(&self.conn, bare(dest_table), source_id).await
+    }
+
     pub(crate) async fn bootstrap_finish(
         &self,
         dest_table: &str,

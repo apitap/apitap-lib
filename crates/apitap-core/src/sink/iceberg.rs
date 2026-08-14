@@ -1334,6 +1334,27 @@ pub(crate) async fn cdc_read_state(
 
 /// Props-only watermark write (bootstrap finish, and windows with no traffic
 /// for the table). No snapshot: the data did not change.
+/// Remove one source's CDC watermark properties. A failed group bootstrap must
+/// leave no state, and on Iceberg the state IS a pair of table properties.
+pub(crate) async fn cdc_clear_watermark(
+    conn: &IcebergConn,
+    table: &str,
+    source_id: &str,
+) -> Result<()> {
+    let Some(meta) = conn.load_table(table).await? else { return Ok(()) };
+    let removals: Vec<String> = [wm_prop_for(source_id), cur_prop_for(source_id)]
+        .into_iter()
+        .filter(|k| meta.properties().contains_key(k))
+        .collect();
+    if removals.is_empty() {
+        return Ok(());
+    }
+    let requirements = vec![TableRequirement::UuidMatch { uuid: meta.uuid() }];
+    conn.commit_table(table, &requirements, &[TableUpdate::RemoveProperties { removals }])
+        .await
+        .map(|_| ())
+}
+
 pub(crate) async fn cdc_set_watermark(
     conn: &IcebergConn,
     table: &str,

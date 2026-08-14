@@ -134,6 +134,50 @@ impl BqDest {
         crate::logbased::dest_ch::is_shape_ok(is_cl, changelog, "BigQuery", table)
     }
 
+    /// Same pre-flight as the ClickHouse twin, through the validators the
+    /// rebuild would use anyway — so a wrong column is refused for the WHOLE
+    /// group before any member commits a watermark.
+    pub(crate) async fn validate_changelog_ddl(
+        &self,
+        dest_table: &str,
+        partition_by: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<()> {
+        if partition_by.is_none() && order_by.is_none() {
+            return Ok(());
+        }
+        let table = bare(dest_table);
+        let Some(meta) = self.conn.table_get(table).await? else { return Ok(()) };
+        let mut types = column_types(&meta)?;
+        types.insert(OP_COL.to_string(), "STRING".into());
+        types.insert(CL_LSN.to_string(), "INT64".into());
+        types.insert(CL_SEQ.to_string(), "INT64".into());
+        types.insert(CL_AT.to_string(), "TIMESTAMP".into());
+        if let Some(col) = partition_by {
+            bq_partition_expr(col, &types)?;
+        }
+        if let Some(spec) = order_by {
+            bq_cluster_list(spec, &types)?;
+        }
+        Ok(())
+    }
+
+    /// Remove this table's watermark rows — the state table is append-only with
+    /// a `synced_at` tiebreak, so every row for the pair has to go.
+    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
+        if !self.conn.cdc_state_table_exists().await? {
+            return Ok(());
+        }
+        self.conn
+            .cdc_script(&format!(
+                "DELETE FROM {state} WHERE dest_table = '{t}' AND source_id = '{s}';",
+                state = self.conn.state_fq(),
+                t = sql_str(bare(dest_table)),
+                s = sql_str(source_id),
+            ))
+            .await
+    }
+
     /// changelog=true, once, right after the bootstrap's bulk load: rebuild the
     /// target as an append-only changelog and stamp the loaded rows `B`.
     ///

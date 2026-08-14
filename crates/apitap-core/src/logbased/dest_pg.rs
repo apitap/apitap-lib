@@ -28,6 +28,18 @@ impl PgDest {
 
     /// The bootstrap's replace path lands data without constraints; the
     /// drain's apply needs the identity — add it, then write the state row.
+    /// Remove this table's watermark row — a failed group bootstrap must leave
+    /// no state, or the next run refuses the group as torn.
+    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM _apitap_state WHERE dest_table = $1 AND source_id = $2")
+            .bind(dest_table)
+            .bind(source_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Transfer(format!("log_based: clear state: {e}")))
+    }
+
     pub(crate) async fn bootstrap_finish(
         &self,
         dest_table: &str,
