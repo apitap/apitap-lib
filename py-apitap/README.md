@@ -151,10 +151,11 @@ Into an analytical destination you can also ask for `changelog=True`: instead of
 keeping ClickHouse or BigQuery a *replica*, apitap appends **every** operation
 with an `_apitap_op` column (`I`/`U`/`D`/`T`, plus `B` for the bootstrap
 baseline) and a `<table>__current` view that derives the current state. Nothing
-is ever updated or deleted — so ClickHouse never mutates a part, BigQuery never
-runs a `MERGE` (and needs no billing, since append-only is not DML), the log is
-partitioned by time (monthly by default; `partition_by`/`order_by` override it),
-and you keep the history a replica throws away. Measured **free on the Postgres
+is ever updated or deleted — so ClickHouse never mutates a part and BigQuery
+never runs a `MERGE` (a window becomes a load job plus one `INSERT … SELECT`;
+it still needs a billed project, since `INSERT` is DML). The log is partitioned
+by time (monthly by default; `partition_by`/`order_by` override it), and you
+keep the history a replica throws away. Measured **free on the Postgres
 lane and 34% faster on the MySQL one**
 ([ledger](https://github.com/apitap/apitap-lib/blob/main/benchmarks/changelog-cdc.md)).
 

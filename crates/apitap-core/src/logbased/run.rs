@@ -51,6 +51,37 @@ const CHANGELOG_DEST_MSG: &str =
     "log_based: changelog=True lands in ClickHouse and BigQuery — Postgres, MySQL \
      and Iceberg destinations stay replicas (changelog=False)";
 
+/// Everything about `changelog=True` that can be judged BEFORE any work: the
+/// destination engine, and the DDL options the rebuild cannot carry.
+///
+/// It has to be here rather than in `bootstrap_finish`, which is where the
+/// destination refusal used to live — that runs only after every table's full
+/// load has already completed, so "refused loudly" meant "refused loudly, an
+/// hour and a full table copy later".
+pub(crate) fn precheck_changelog(dst_url: &str, opts: &TransferOptions) -> Result<()> {
+    if !opts.changelog {
+        return Ok(());
+    }
+    let engine = crate::pipeline::norm(scheme(dst_url));
+    if !matches!(engine, "clickhouse" | "bigquery") {
+        return Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into()));
+    }
+    // The ClickHouse rebuild issues its own CREATE/DROP/RENAME and cannot yet
+    // reproduce a Replicated engine or an ON CLUSTER DDL. Silently demoting a
+    // replicated table to a local MergeTree is the kind of thing nobody
+    // notices until a replica is missing data, so refuse instead.
+    if engine == "clickhouse" && (opts.engine.is_some() || opts.on_cluster.is_some()) {
+        return Err(Error::InvalidInput(
+            "log_based: changelog=True rebuilds the ClickHouse table itself and cannot \
+             carry engine= or on_cluster= through that rebuild yet — a Replicated table \
+             would come back as a local MergeTree. Drop those options, or use \
+             changelog=False"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// One destination engine for the log_based apply path.
 enum Dest {
     Pg(PgDest),
@@ -159,10 +190,12 @@ impl Dest {
         if changelog {
             return match self {
                 Dest::Ch(d) => {
-                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
+                        .await
                 }
                 Dest::Bq(d) => {
-                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
+                        .await
                 }
                 _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             };
@@ -191,10 +224,12 @@ impl Dest {
         if changelog {
             return match self {
                 Dest::Ch(d) => {
-                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
+                        .await
                 }
                 Dest::Bq(d) => {
-                    d.apply_changelog(dest_table, qualified_src, outcome, source_id).await
+                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
+                        .await
                 }
                 _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             };
@@ -391,6 +426,7 @@ async fn run_group(
     if tables.is_empty() {
         return Err(Error::InvalidInput("tables list is empty".into()));
     }
+    precheck_changelog(dst_url, opts)?;
     if scheme(src_url) == "mysql" {
         return run_group_mysql(src_url, dst_url, tables, opts).await;
     }

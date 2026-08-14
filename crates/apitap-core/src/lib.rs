@@ -159,11 +159,19 @@ pub struct TransferOptions {
     /// `_apitap_op` (`I`/`U`/`D`), `_apitap_lsn`, `_apitap_seq` and `_apitap_at`,
     /// and a companion `<table>__current` view derives the current state. Nothing
     /// is ever updated or deleted, which (a) removes BigQuery's per-window MERGE
-    /// job floor AND its billing requirement — append-only needs no DML, so it
-    /// runs on a sandbox project — and (b) removes ClickHouse mutations entirely,
-    /// so the destination never rewrites parts. A replayed window re-appends rows
-    /// carrying the SAME `(_apitap_lsn, _apitap_seq)`, so the view's dedup makes
-    /// at-least-once delivery read as exactly-once.
+    /// job floor — a window becomes a load job plus one `INSERT … SELECT` — and
+    /// (b) removes ClickHouse mutations entirely, so the destination never
+    /// rewrites parts. BigQuery still needs a billed project either way: an
+    /// `INSERT` is row-level DML, which sandbox projects reject.
+    ///
+    /// On replay, `<table>__current` stays correct — the newest record per key
+    /// wins and a re-applied event carries the same values. The LOG is the part
+    /// that is at-least-once: on ClickHouse the append and the watermark are two
+    /// statements, so a crash between them leaves rows that the re-drain appends
+    /// again, under a NEW `_apitap_lsn` (window boundaries are cut by a byte
+    /// budget and a wall clock, so they are not reproducible). Deduplicate an
+    /// audit query with the view, or by `(key, _apitap_op, payload)` — not by
+    /// assuming `(lsn, seq)` repeats.
     ///
     /// Refused loudly by the row-store destinations (Postgres, MySQL, Iceberg) —
     /// a table that only ever grows is the wrong shape for them, and silently

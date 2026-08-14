@@ -43,8 +43,19 @@ decodes a binlog that carries only row images, leaves ~8% of the quota unused in
 replica mode, and converts the saved apply work straight into wall time —
 113,801 vs 84,630 changes/s, at **46 MB instead of 66 MB**.
 
-So the honest rule: **changelog never costs throughput, and it pays where the
-capture plane isn't the bottleneck.**
+**What this rig can and cannot say.** 500,000 UPDATEs over 500,000 rows is ONE
+update per key — the distribution in which the replica path's collapser folds
+N events to N rows and therefore saves nothing. That is the fair worst case for
+changelog (the rival mode's main optimization has nothing to work with) and the
+fair worst case for the replica too, so the tie is real; but it is NOT evidence
+about a skewed window. Where many events hit the SAME key inside one window, the
+replica collapses them to one row and the changelog writes all of them, so the
+changelog does more destination work by design — that is what "keeps the
+history" costs. The rule this rig supports is the narrower one:
+
+> **On one-update-per-key traffic changelog is free, and it pays wherever the
+> capture plane is not already the wall.** A skewed window trades throughput for
+> the history it keeps; that shape has not been measured here.
 
 ## Where "132K changes/s" came from
 
@@ -79,6 +90,19 @@ IMG=apitap-narrow:<tag> bash znarrow.sh      # 4 legs, each verified
 ```
 
 Both capture planes' correctness (every op captured, PK-changing update as
-`D`-then-`U`, `__current` == source, empty drain appends nothing) is covered by
-`e2e_changelog_ch.py` (Postgres), `e2e_changelog_my.py` (MySQL binlog) and
-`e2e_changelog_bq.py` (BigQuery).
+`D`-then-`U`, `__current` == source, empty drain appends nothing, both shape
+guards) is covered by `e2e_changelog_ch.py` (Postgres), `e2e_changelog_my.py`
+(MySQL binlog) and `e2e_changelog_bq.py` (BigQuery);
+`e2e_changelog_group.py` covers a multi-table group on one slot for both
+analytical destinations.
+
+## What these numbers do NOT include
+
+The measured rig has no TOASTed columns. An UPDATE that leaves an out-of-line
+column untouched omits it from the WAL, and a changelog cannot store that hole
+as NULL without blanking the column for every reader of `__current` — so the
+apply reconstructs the value, from the window itself where possible and
+otherwise from one readback per window against `__current`. Windows that
+actually carry such a column therefore pay one extra destination query; windows
+that do not (every leg above) pay nothing, which is why the flag that triggers
+it is set during capture rather than probed at apply time.

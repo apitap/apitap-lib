@@ -58,9 +58,13 @@ def dst(sql):
         if r.status_code >= 400 or j.get("jobComplete") is False:
             raise RuntimeError(f"BQ query failed: {j.get('error', j)}")
         return [[c.get("v") for c in row.get("f", [])] for row in j.get("rows", [])]
+    # FORMAT belongs to SELECTs only — appending it to a DROP/ALTER makes the
+    # statement a syntax error, which a try/except around a reset turns into a
+    # silent no-op. That is how a "clean" rig ends up dirty.
+    q = sql + (" FORMAT TabSeparated" if sql.lstrip().upper().startswith("SELECT") else "")
     o = subprocess.run(
         ["docker", "exec", "-i", "apitap-bench-ch", "clickhouse-client",
-         "--user", "default", "--password", "bench", "-q", sql + " FORMAT TabSeparated"],
+         "--user", "default", "--password", "bench", "-q", q],
         capture_output=True, text=True)
     if o.returncode:
         raise RuntimeError(o.stderr)
@@ -111,14 +115,11 @@ for t in TABLES:
 pg("DROP PUBLICATION IF EXISTS apitap_pub_grp")
 pg("SELECT pg_drop_replication_slot(s) FROM (SELECT slot_name s FROM "
    "pg_replication_slots WHERE slot_name LIKE 'apitap_%') x")
-try:
-    if DEST == "bq":
-        dst(f"DELETE FROM `{DATASET}._apitap_state` WHERE dest_table LIKE 'clg_%'")
-    else:
-        dst("ALTER TABLE _apitap_state DELETE WHERE dest_table LIKE 'clg_%' "
-            "SETTINGS mutations_sync=1")
-except Exception:
-    pass
+if DEST == "bq":
+    dst(f"DELETE FROM `{DATASET}._apitap_state` WHERE dest_table LIKE 'clg_%'")
+else:
+    dst("ALTER TABLE _apitap_state DELETE WHERE dest_table LIKE 'clg_%' "
+        "SETTINGS mutations_sync=1")
 
 for t in TABLES:
     pg(f"CREATE TABLE {t} (id int PRIMARY KEY, v text, ts timestamptz NOT NULL DEFAULT now())")

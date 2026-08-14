@@ -895,8 +895,18 @@ The destination table gains four columns:
   `CLUSTER BY` there). Both apply to multi-table runs.
 - **Why it is cheaper.** ClickHouse never mutates, so no part rewrites.
   BigQuery never MERGEs, so a window costs a load job plus one
-  `INSERT … SELECT` — and because append-only needs no row-level DML, the
-  BigQuery billing requirement above does not apply to this mode.
+  `INSERT … SELECT` instead of a ~7.3 s MERGE job. BigQuery still needs a
+  **billed** project either way — an `INSERT` is row-level DML, which sandbox
+  projects reject.
+- **On replay, the VIEW is exact and the LOG is at-least-once.**
+  `<table>__current` always shows the right current state: the newest record
+  per key wins, and a re-applied event carries the same values. The log itself
+  can gain duplicate history — on ClickHouse the append and the watermark are
+  two statements, and a window's boundary is cut by a byte budget and a wall
+  clock, so a re-drain does NOT reproduce the same `_apitap_lsn`. Audit
+  queries that must not double-count should go through the view, or
+  deduplicate on the row's own content. On BigQuery the append and the
+  watermark commit in one transaction, so a window lands whole or not at all.
 - **Scope**: analytical destinations only — ClickHouse and BigQuery. Postgres,
   MySQL and Iceberg destinations refuse `changelog=True` loudly rather than
   quietly hand back a replica.

@@ -640,12 +640,15 @@ def transfer(
             ``_apitap_at``, nothing is ever updated or deleted, and a companion
             ``<table>__current`` view derives the current state. Analytical
             stores are built for appends, so this is both faster and gentler:
-            BigQuery loses its per-window MERGE job floor **and its billing
-            requirement** (append-only needs no DML, so it runs on a sandbox
-            project), and ClickHouse stops writing mutations entirely. A
-            replayed window re-appends rows carrying the SAME
-            ``(_apitap_lsn, _apitap_seq)``, so the view's dedup makes
-            at-least-once delivery read as exactly-once. Row stores (Postgres,
+            BigQuery loses its per-window MERGE job floor (a window becomes a
+            load job plus one ``INSERT … SELECT``) and ClickHouse stops writing
+            mutations entirely. BigQuery still needs a **billed** project — an
+            ``INSERT`` is row-level DML, which sandbox projects reject. On
+            replay ``<table>__current`` stays correct, but the LOG is
+            at-least-once: on ClickHouse the append and the watermark are two
+            statements, and window boundaries are not reproducible, so a crash
+            between them leaves duplicate history under a NEW ``_apitap_lsn``.
+            Row stores (Postgres,
             MySQL) and Iceberg REFUSE it loudly rather than quietly hand back a
             replica; every bulk mode ignores it.
     """

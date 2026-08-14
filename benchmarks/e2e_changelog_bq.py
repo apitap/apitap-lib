@@ -97,7 +97,7 @@ try:
 except Exception:
     pass
 
-pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text)")
+pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text, body text)")  # body TOASTs later
 pg(f"INSERT INTO {T} VALUES (1,'a'),(2,'b'),(3,'c')")
 
 print("== bootstrap (baseline rows get op B) ==")
@@ -138,6 +138,21 @@ after = count("TRUE")
 print(f"   log rows {before} -> {after}")
 ok &= before == after
 ok &= current_matches("window2-empty")
+
+print("== unchanged-TOAST: an UPDATE that skips a big column must not blank it ==")
+BIG = 40000
+pg(f"UPDATE {T} SET body = repeat('x', {BIG}) WHERE id = 1")
+drain()                                                 # window carrying body
+pg(f"UPDATE {T} SET v = 'toast-probe' WHERE id = 1")    # body NOT touched
+drain()                                                 # the WAL omits body
+got = int(bq(f"SELECT LENGTH(IFNULL(body,'')) FROM `{DS}.{T}__current` WHERE id=1")[0][0])
+print(f"   body length in __current after a body-less UPDATE: {got} (want {BIG})")
+ok &= got == BIG
+newest = int(bq(f"SELECT LENGTH(IFNULL(body,'')) FROM `{DS}.{T}` WHERE id=1 AND "
+                f"_apitap_op='U' ORDER BY _apitap_lsn DESC, _apitap_seq DESC LIMIT 1")[0][0])
+print(f"   …and the newest U record itself carries it: {newest}")
+ok &= newest == BIG
+ok &= current_matches("after-toast")
 
 print("== partition_by on a non-time column is refused ==")
 pg(f"DROP TABLE IF EXISTS {T}_p CASCADE")

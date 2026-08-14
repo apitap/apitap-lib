@@ -188,17 +188,34 @@ impl ChDest {
     ) -> Result<()> {
         let ft = ch_ident(dest_table);
         // Already a changelog (a re-bootstrap of a table we own)? Leave it.
+        //
+        // "Already" means ALL FOUR meta columns, never just `_apitap_op`: a
+        // source table that legitimately owns a column by that name would
+        // otherwise skip the rebuild here and then fail on every window
+        // forever, with the slot pinning WAL the whole time.
         let has = self
             .ch
             .exec(&format!(
                 "SELECT count() FROM system.columns WHERE database = currentDatabase() \
-                 AND table = '{t}' AND name = '{c}'",
+                 AND table = '{t}' AND name IN ('{a}', '{b}', '{c}', '{d}')",
                 t = ch_str(dest_table),
-                c = ch_str(CL_OP),
+                a = ch_str(CL_OP),
+                b = ch_str(CL_LSN),
+                c = ch_str(CL_SEQ),
+                d = ch_str(CL_AT),
             ))
             .await?;
-        if has.trim() != "0" {
-            return self.write_state(dest_table, source_id, lsn, rows).await;
+        match has.trim() {
+            "0" => {}
+            "4" => return self.write_state(dest_table, source_id, lsn, rows).await,
+            n => {
+                return Err(Error::InvalidInput(format!(
+                    "log_based changelog: ClickHouse target {dest_table} already has {n} of \
+                     the four reserved changelog columns ({CL_OP}, {CL_LSN}, {CL_SEQ}, \
+                     {CL_AT}) — a source column is colliding with them. Rename it at the \
+                     source or alias it in a view"
+                )))
+            }
         }
 
         // Existing columns, in order, so the rebuild can widen them to Nullable.
@@ -359,10 +376,65 @@ impl ChDest {
     /// writes a mutation, so the destination never rewrites parts. Replay is
     /// safe because a re-drained window re-appends rows carrying the SAME
     /// `(lsn, seq)`, and `__current` picks one of them; the duplicate is inert.
+    /// One readback per window: the current value of every masked column, for
+    /// every key that needs one, from `<table>__current`. The view filters the
+    /// base table by key first, so this probes the sorting key rather than
+    /// scanning the log.
+    async fn read_current(
+        &self,
+        dest_table: &str,
+        pk_cols: &[String],
+        pk_oids: &[u32],
+        keys: &[crate::logbased::changelog::CKey],
+        cols: &[usize],
+        wal_cols: &[String],
+    ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>>
+    {
+        let view = ch_ident(&format!("{dest_table}__current"));
+        let sel = pk_cols
+            .iter()
+            .map(|c| ch_ident(c))
+            .chain(cols.iter().map(|&i| ch_ident(&wal_cols[i])))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut preds = Vec::with_capacity(keys.len());
+        for k in keys {
+            preds.push(format!("({})", key_pred(pk_cols, k, pk_oids)?));
+        }
+        let body = self
+            .ch
+            .exec(&format!(
+                "SELECT {sel} FROM {view} WHERE {} FORMAT TabSeparated",
+                preds.join(" OR ")
+            ))
+            .await?;
+        let np = pk_cols.len();
+        let mut out = std::collections::HashMap::with_capacity(keys.len());
+        for line in body.lines().filter(|l| !l.is_empty()) {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() != np + cols.len() {
+                return Err(Error::Transfer(
+                    "log_based changelog: masked readback column count mismatch".into(),
+                ));
+            }
+            let key: crate::logbased::changelog::CKey = f[..np]
+                .iter()
+                .map(|x| tsv_unescape(x).unwrap_or_default())
+                .collect();
+            let vals = f[np..]
+                .iter()
+                .map(|x| tsv_unescape(x).map(bytes::Bytes::from))
+                .collect();
+            out.insert(key, vals);
+        }
+        Ok(out)
+    }
+
     pub(crate) async fn apply_changelog(
         &self,
         dest_table: &str,
         qualified_src: &str,
+        pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
@@ -391,6 +463,24 @@ impl ChDest {
             return Ok(0);
         }
 
+        // Unchanged-TOAST cells must be rebuilt before anything is written —
+        // writing them as NULL would silently blank the column for every reader
+        // of `__current`. Costs one extra query per window, and only when the
+        // window actually carries a masked cell.
+        let patched = if c.masked {
+            let pk_idx = pk_indices(pk_cols, wal_cols)?;
+            let (keys, cols) = c.mask_plan(&pk_idx);
+            let base = if keys.is_empty() || cols.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
+                self.read_current(dest_table, pk_cols, &pk_oids, &keys, &cols, wal_cols).await?
+            };
+            c.resolve_masked(&pk_idx, &cols, &base, wal_cols)?
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let ft = ch_ident(dest_table);
         let collist = wal_cols
             .iter()
@@ -407,7 +497,7 @@ impl ChDest {
         let at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let mut buf = Vec::with_capacity(4 << 20);
         for (seq, ev) in c.events.iter().enumerate() {
-            match &ev.row {
+            match patched.get(&seq).or(ev.row.as_ref()) {
                 Some(row) => {
                     // A delete's old image carries the key and NULLs elsewhere —
                     // that IS the delete record, so it renders like any row.

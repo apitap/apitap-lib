@@ -88,6 +88,19 @@ pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
     let want = [
         ("log_bin", "ON", "binary logging is off — set log_bin=ON"),
         ("binlog_format", "ROW", "binlog_format must be ROW"),
+        // MINIMAL/NOBLOB ship a PARTIAL after-image: the unchanged primary key
+        // is omitted, so the row an UPDATE refers to cannot be identified from
+        // the event alone, and unchanged columns arrive as holes rather than
+        // values. Both modes silently produce wrong rows rather than an error,
+        // which is exactly the failure a CDC tool must never have.
+        (
+            "binlog_row_image",
+            "FULL",
+            "binlog_row_image must be FULL — MINIMAL and NOBLOB omit the primary key \
+             and unchanged columns from the after-image, which cannot be replicated \
+             faithfully. SET GLOBAL binlog_row_image = 'FULL' (and restart writers so \
+             their sessions pick it up)",
+        ),
     ];
     for (var, expect, hint) in want {
         let (_, val): (String, String) =
@@ -290,7 +303,12 @@ pub(crate) async fn drain_binlog(
                             tx_buf.push((Arc::from(q.as_str()), TxOp::Insert(new)));
                         }
                         PgoMessage::Update { old, new, .. } => {
-                            buf_bytes += cells_bytes(&new);
+                            // BOTH images: a changelog keeps the old one too (a
+                            // PK change emits a D carrying it), so charging only
+                            // the new image let the window run to roughly twice
+                            // the budget before `hit_budget` noticed.
+                            buf_bytes += cells_bytes(&new)
+                                + old.as_ref().map_or(0, |o| cells_bytes(&o.tuple));
                             tx_buf.push((
                                 Arc::from(q.as_str()),
                                 TxOp::Update(old.map(|o| o.tuple), new),

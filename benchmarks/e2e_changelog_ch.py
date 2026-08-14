@@ -57,7 +57,7 @@ ch(f"DROP VIEW IF EXISTS {T}__current")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1") if ch(
     "SELECT count() FROM system.tables WHERE name='_apitap_state'") != "0" else None
 
-pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text)")
+pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text, body text)")  # body TOASTs later
 pg(f"INSERT INTO {T} VALUES (1,'a'),(2,'b'),(3,'c')")
 
 print("== bootstrap (baseline rows get op B) ==")
@@ -91,6 +91,24 @@ after = ch(f"SELECT count() FROM {T}")
 print(f"   log rows {before} -> {after} (empty drain must not append)")
 ok &= before == after
 ok &= current_matches("window2-replay")
+
+print("== unchanged-TOAST: an UPDATE that skips a big column must not blank it ==")
+# A >2 KB value is stored out of line, and an UPDATE that does not touch it
+# omits it from the WAL entirely. Written as NULL, it would vanish from
+# __current — the single worst thing this mode could do.
+BIG = "x" * 40000
+pg(f"UPDATE {T} SET body = repeat('x', 40000) WHERE id = 1")
+drain()                                   # window carrying the full body
+pg(f"UPDATE {T} SET v = 'toast-probe' WHERE id = 1")   # body NOT touched
+drain()                                   # the WAL omits body here
+got = ch(f"SELECT length(ifNull(body,'')) FROM {T}__current WHERE id=1")
+print(f"   body length in __current after a body-less UPDATE: {got} (want {len(BIG)})")
+ok &= got == str(len(BIG))
+newest = ch(f"SELECT length(ifNull(body,'')) FROM {T} WHERE id=1 AND _apitap_op='U' "
+            f"ORDER BY _apitap_lsn DESC, _apitap_seq DESC LIMIT 1")
+print(f"   …and the newest U record itself carries it: {newest}")
+ok &= newest == str(len(BIG))
+ok &= current_matches("after-toast")
 
 print("== a REPLICA run onto a changelog table is refused ==")
 try:

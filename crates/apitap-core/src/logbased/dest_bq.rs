@@ -159,45 +159,100 @@ impl BqDest {
         let table = bare(dest_table);
         self.conn.cdc_delete_table(&cdc_staging(table)).await?;
         self.conn.cdc_ensure_state_table().await?;
-        let meta = self.conn.table_get(table).await?.ok_or_else(|| {
-            Error::Transfer(format!(
-                "log_based changelog: BigQuery target {table} does not exist — the \
-                 bootstrap must run first"
-            ))
-        })?;
+        let meta = match self.conn.table_get(table).await? {
+            Some(m) => m,
+            // A previous attempt died between the DROP and the RENAME: the
+            // rebuilt table is sitting there under its temp name, complete.
+            // Finish the move rather than declaring the destination lost.
+            None => {
+                let tmp = format!("{table}__apitap_cl");
+                if self.conn.table_get(&tmp).await?.is_some() {
+                    self.conn
+                        .cdc_script(&format!(
+                            "ALTER TABLE {} RENAME TO `{table}`",
+                            self.conn.fq(&tmp)
+                        ))
+                        .await?;
+                    self.ensure_current_view(table, pk_cols).await?;
+                    return self.write_state(table, source_id, lsn, rows).await;
+                }
+                return Err(Error::Transfer(format!(
+                    "log_based changelog: BigQuery target {table} does not exist — the \
+                     bootstrap must run first"
+                )));
+            }
+        };
         // Already a changelog (a re-bootstrap of a table we own)? Leave it.
-        if column_types(&meta)?.contains_key(OP_COL) {
-            return self.write_state(table, source_id, lsn, rows).await;
+        // ALL FOUR meta columns, never just `_apitap_op` — a source column that
+        // legitimately owns that name would otherwise skip the rebuild and then
+        // fail on every window forever, with the slot pinning WAL throughout.
+        let types0 = column_types(&meta)?;
+        let meta_cols = [OP_COL, CL_LSN, CL_SEQ, CL_AT];
+        let n = meta_cols.iter().filter(|c| types0.contains_key(**c)).count();
+        match n {
+            0 => {}
+            4 => return self.write_state(table, source_id, lsn, rows).await,
+            n => {
+                return Err(Error::InvalidInput(format!(
+                    "log_based changelog: BigQuery target {table} already has {n} of the \
+                     four reserved changelog columns ({OP_COL}, {CL_LSN}, {CL_SEQ}, \
+                     {CL_AT}) — a source column is colliding with them. Rename it at the \
+                     source or alias it in a view"
+                )))
+            }
         }
 
         let sel = changelog_select_list(&meta)?;
         let part = match partition_by {
             None => format!("TIMESTAMP_TRUNC({CL_AT}, MONTH)"),
-            Some(col) => bq_partition_expr(col, &column_types(&meta)?)?,
+            // The rebuild's own meta columns are legal partition targets — and
+            // `_apitap_at` is the DOCUMENTED default — but they do not exist on
+            // the pre-rebuild table this schema was read from, so they are
+            // added before the lookup.
+            Some(col) => {
+                let mut t = types0.clone();
+                t.insert(OP_COL.to_string(), "STRING".into());
+                t.insert(CL_LSN.to_string(), "INT64".into());
+                t.insert(CL_SEQ.to_string(), "INT64".into());
+                t.insert(CL_AT.to_string(), "TIMESTAMP".into());
+                bq_partition_expr(col, &t)?
+            }
         };
         // BigQuery clusters on at most 4 columns, and only on plain column
         // references — hence the PK prefix rather than ClickHouse's key tuple.
-        let cluster = order_by.map(str::to_string).unwrap_or_else(|| {
-            pk_cols.iter().take(4).map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ")
-        });
+        let cluster = match order_by {
+            Some(spec) => bq_cluster_list(spec, &types0)?,
+            None => pk_cols.iter().take(4).map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "),
+        };
         let cluster_sql =
             if cluster.trim().is_empty() { String::new() } else { format!("CLUSTER BY {cluster} ") };
+        // THREE separate jobs, never one script.
+        //
+        // BigQuery DDL is not transactional, and `cdc_script` retries the whole
+        // script text on a transient error. As one script, a blip on the RENAME
+        // would re-run a CREATE … AS SELECT FROM <t> whose source the DROP had
+        // already removed — the destination table simply gone. Split, each step
+        // is separately retryable and the worst case is a loud failure with the
+        // data intact under one name or the other.
         let tmp = format!("{table}__apitap_cl");
-        let sql = format!(
-            "CREATE OR REPLACE TABLE {tmpfq} PARTITION BY {part} {cluster_sql}AS \
-             SELECT {sel}, \
-             '{b}' AS {OP_COL}, \
-             CAST({lsn} AS INT64) AS {CL_LSN}, \
-             CAST(0 AS INT64) AS {CL_SEQ}, \
-             CURRENT_TIMESTAMP() AS {CL_AT} \
-             FROM {t};\n\
-             DROP TABLE {t};\n\
-             ALTER TABLE {tmpfq} RENAME TO `{table}`;",
-            tmpfq = self.conn.fq(&tmp),
-            t = self.conn.fq(table),
-            b = sql_str(CL_BASELINE),
-        );
-        self.conn.cdc_script(&sql).await?;
+        let tmpfq = self.conn.fq(&tmp);
+        let t = self.conn.fq(table);
+        self.conn
+            .cdc_script(&format!(
+                "CREATE OR REPLACE TABLE {tmpfq} PARTITION BY {part} {cluster_sql}AS \
+                 SELECT {sel}, \
+                 '{b}' AS {OP_COL}, \
+                 CAST({lsn} AS INT64) AS {CL_LSN}, \
+                 CAST(0 AS INT64) AS {CL_SEQ}, \
+                 CURRENT_TIMESTAMP() AS {CL_AT} \
+                 FROM {t}",
+                b = sql_str(CL_BASELINE),
+            ))
+            .await?;
+        self.conn.cdc_script(&format!("DROP TABLE IF EXISTS {t}")).await?;
+        self.conn
+            .cdc_script(&format!("ALTER TABLE {tmpfq} RENAME TO `{table}`"))
+            .await?;
         self.ensure_current_view(table, pk_cols).await?;
         self.write_state(table, source_id, lsn, rows).await
     }
@@ -214,18 +269,29 @@ impl BqDest {
     async fn ensure_current_view(&self, table: &str, pk_cols: &[String]) -> Result<()> {
         let t = self.conn.fq(table);
         let keys = pk_cols.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+        // Every alias is `_apitap_`-prefixed and the PARTITION BY is qualified:
+        // a table whose PK is called `s` or `l` would otherwise make the range
+        // variables ambiguous and the view refuse to create.
+        let keys_q = pk_cols
+            .iter()
+            .map(|c| format!("_apitap_s.`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = &keys;
         let sql = format!(
             "CREATE OR REPLACE VIEW {v} AS \
              SELECT * EXCEPT(_apitap_tr_l, _apitap_tr_s) FROM ( \
-               SELECT s.*, tr.l AS _apitap_tr_l, tr.s AS _apitap_tr_s \
-               FROM {t} s CROSS JOIN ( \
+               SELECT _apitap_s.*, _apitap_tr.l AS _apitap_tr_l, _apitap_tr.s AS _apitap_tr_s \
+               FROM {t} _apitap_s CROSS JOIN ( \
                  SELECT IFNULL(MAX({CL_LSN}), 0) AS l, IFNULL(MAX({CL_SEQ}), 0) AS s \
                  FROM {t} WHERE {OP_COL} = 'T' \
                    AND {CL_LSN} = (SELECT MAX({CL_LSN}) FROM {t} WHERE {OP_COL} = 'T') \
-               ) tr \
-               WHERE s.{CL_LSN} > tr.l OR (s.{CL_LSN} = tr.l AND s.{CL_SEQ} > tr.s) \
+               ) _apitap_tr \
+               WHERE _apitap_s.{CL_LSN} > _apitap_tr.l \
+                  OR (_apitap_s.{CL_LSN} = _apitap_tr.l AND _apitap_s.{CL_SEQ} > _apitap_tr.s) \
                QUALIFY ROW_NUMBER() OVER ( \
-                 PARTITION BY {keys} ORDER BY s.{CL_LSN} DESC, s.{CL_SEQ} DESC) = 1 \
+                 PARTITION BY {keys_q} \
+                 ORDER BY _apitap_s.{CL_LSN} DESC, _apitap_s.{CL_SEQ} DESC) = 1 \
              ) WHERE {OP_COL} != 'D'",
             v = self.conn.fq(&format!("{table}__current")),
         );
@@ -237,13 +303,14 @@ impl BqDest {
         &self,
         dest_table: &str,
         qualified_src: &str,
+        pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
         let one = [(
             dest_table.to_string(),
             qualified_src.to_string(),
-            Vec::new(),
+            pk_cols.to_vec(),
             source_id.to_string(),
         )];
         Ok(self.apply_group_changelog(&one, outcome, 1).await?[0])
@@ -266,8 +333,8 @@ impl BqDest {
         let (me, cref, oref) = (self, ctxs, outcome);
         let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
             .map(|i| async move {
-                let (dt, q, _pk, sid) = &cref[i];
-                me.stage_changelog(dt, q, oref, sid).await.map(|(ev, sql)| (i, ev, sql))
+                let (dt, q, pk, sid) = &cref[i];
+                me.stage_changelog(dt, q, pk, oref, sid).await.map(|(ev, sql)| (i, ev, sql))
             })
             .buffer_unordered(lanes.max(1))
             .try_collect()
@@ -299,12 +366,71 @@ impl BqDest {
         Ok(rows)
     }
 
+    /// One readback per window: the current value of every masked column for
+    /// every key that needs one. `__current` filters the log by key first and
+    /// the table is CLUSTERed on the PK, so this prunes rather than scans.
+    async fn read_current(
+        &self,
+        table: &str,
+        pk_cols: &[String],
+        keys: &[crate::logbased::changelog::CKey],
+        cols: &[usize],
+        wal_cols: &[String],
+    ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>>
+    {
+        let bt = |c: &str| format!("`{c}`");
+        let sel = pk_cols
+            .iter()
+            .map(|c| format!("CAST({} AS STRING)", bt(c)))
+            .chain(cols.iter().map(|&i| format!("CAST({} AS STRING)", bt(&wal_cols[i]))))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut preds = Vec::with_capacity(keys.len());
+        for k in keys {
+            let mut parts = Vec::with_capacity(pk_cols.len());
+            for (c, v) in pk_cols.iter().zip(k.iter()) {
+                let txt = std::str::from_utf8(v)
+                    .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+                parts.push(format!("CAST({} AS STRING) = '{}'", bt(c), sql_str(txt)));
+            }
+            preds.push(format!("({})", parts.join(" AND ")));
+        }
+        let rows = self
+            .conn
+            .cdc_query(&format!(
+                "SELECT {sel} FROM {v} WHERE {p}",
+                v = self.conn.fq(&format!("{table}__current")),
+                p = preds.join(" OR "),
+            ))
+            .await?;
+        let np = pk_cols.len();
+        let mut out = std::collections::HashMap::with_capacity(keys.len());
+        for row in rows {
+            if row.len() != np + cols.len() {
+                return Err(Error::Transfer(
+                    "log_based changelog: masked readback column count mismatch".into(),
+                ));
+            }
+            let key: crate::logbased::changelog::CKey = row[..np]
+                .iter()
+                .map(|x| x.clone().unwrap_or_default().into_bytes())
+                .collect();
+            let vals = row[np..]
+                .iter()
+                .map(|x| x.clone().map(bytes::Bytes::from))
+                .collect();
+            out.insert(key, vals);
+        }
+        Ok(out)
+    }
+
     /// One table's changelog window: every captured event as a staging row,
     /// loaded, then handed back as the INSERT + watermark the group commits.
     async fn stage_changelog(
         &self,
         dest_table: &str,
         qualified_src: &str,
+        pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<(u64, Vec<String>)> {
@@ -341,9 +467,26 @@ impl BqDest {
         let types = column_types(&meta)?;
         let plan = ApplyPlan::build(table, wal_cols, oids, &[], &types)?;
 
+        // Rebuild unchanged-TOAST cells before anything is staged: writing them
+        // as NULL would silently blank the column for every reader of
+        // `__current`. One extra query per window, only when a mask is present.
+        let patched = if c.masked {
+            let pk_idx = pk_indices(pk_cols, wal_cols)?;
+            let (keys, cols) = c.mask_plan(&pk_idx);
+            let base = if keys.is_empty() || cols.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                self.read_current(table, pk_cols, &keys, &cols, wal_cols).await?
+            };
+            c.resolve_masked(&pk_idx, &cols, &base, wal_cols)?
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let mut ndjson: Vec<u8> = Vec::new();
         for (seq, ev) in c.events.iter().enumerate() {
-            push_change(&mut ndjson, wal_cols, ev.row.as_ref(), ev.op.code(), seq)?;
+            let row = patched.get(&seq).or(ev.row.as_ref());
+            push_change(&mut ndjson, wal_cols, row, ev.op.code(), seq)?;
         }
         self.conn
             .cdc_load_ndjson(&cdc_staging(table), &plan.staging_fields_changelog(), ndjson)
@@ -946,6 +1089,44 @@ fn push_change(
     Ok(())
 }
 
+/// `order_by` becomes BigQuery's CLUSTER BY, which takes COLUMN NAMES — never
+/// an expression. Validated against the target's real columns and re-quoted
+/// here rather than interpolated: `cdc_script` runs a multi-statement script,
+/// so a `;` in this value would chain statements of the caller's choosing.
+fn bq_cluster_list(
+    spec: &str,
+    types: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    let mut out = Vec::new();
+    for raw in spec.split(',') {
+        let name = raw.trim().trim_matches('`').trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !types.contains_key(name) {
+            return Err(Error::InvalidInput(format!(
+                "log_based changelog: order_by='{spec}' — BigQuery clusters on COLUMN \
+                 NAMES, and '{name}' is not a column of the target. Give up to four of \
+                 its own columns, comma-separated (expressions are ClickHouse-only)"
+            )));
+        }
+        out.push(format!("`{name}`"));
+    }
+    if out.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "log_based changelog: order_by='{spec}' names no columns"
+        )));
+    }
+    if out.len() > 4 {
+        return Err(Error::InvalidInput(format!(
+            "log_based changelog: order_by names {} columns — BigQuery clusters on at \
+             most 4",
+            out.len()
+        )));
+    }
+    Ok(out.join(", "))
+}
+
 /// `partition_by` for BigQuery is a COLUMN NAME, not an expression — BigQuery
 /// only partitions on a real column, and the DDL it needs depends on that
 /// column's declared type. Everything lands MONTHLY, the same granularity as
@@ -1030,6 +1211,21 @@ mod tests {
 
     fn types(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect()
+    }
+
+    #[test]
+    fn cluster_list_takes_column_names_and_refuses_sql() {
+        let t = types(&[("id", "INT64"), ("cust", "STRING"), ("v", "STRING"), ("w", "STRING"), ("x", "STRING")]);
+        assert_eq!(bq_cluster_list("id, cust", &t).unwrap(), "`id`, `cust`");
+        assert_eq!(bq_cluster_list("`id`", &t).unwrap(), "`id`");
+        // A `;` would otherwise chain statements inside the rebuild script.
+        assert!(bq_cluster_list("id; DROP TABLE x", &t).is_err());
+        // ClickHouse-style expressions are not BigQuery cluster keys.
+        assert!(bq_cluster_list("toYYYYMM(ts)", &t).is_err());
+        assert!(bq_cluster_list("nope", &t).is_err());
+        assert!(bq_cluster_list("", &t).is_err());
+        // BigQuery clusters on at most four columns.
+        assert!(bq_cluster_list("id, cust, v, w, x", &t).is_err());
     }
 
     #[test]
