@@ -79,7 +79,7 @@ fn cpu_quota_cores() -> Option<f64> {
 
 /// Returns `(rows, elapsed_ms, parallel)`; the Python wrapper turns it into a report.
 #[pyfunction]
-#[pyo3(signature = (src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None, partition_by=None, partition_by_per_table=None, order_by_per_table=None, changelog=false))]
+#[pyo3(signature = (src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None, partition_by=None, partition_by_per_table=None, order_by_per_table=None, changelog=false, slots=None))]
 #[allow(clippy::too_many_arguments)]
 fn transfer(
     py: Python<'_>,
@@ -99,6 +99,7 @@ fn transfer(
     partition_by_per_table: Option<std::collections::HashMap<String, String>>,
     order_by_per_table: Option<std::collections::HashMap<String, String>>,
     changelog: bool,
+    slots: Option<usize>,
 ) -> PyResult<(u64, u64, usize)> {
     let mode: apitap_core::Mode = mode
         .parse()
@@ -117,6 +118,7 @@ fn transfer(
         partition_by_per_table: partition_by_per_table.unwrap_or_default(),
         order_by_per_table: order_by_per_table.unwrap_or_default(),
         changelog,
+        slots,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
     let out = py.allow_threads(|| {
@@ -138,7 +140,7 @@ fn transfer(
 /// error), …])` — per-table failures ride in the rows, not as an exception, so the
 /// wrapper can report which tables landed.
 #[pyfunction]
-#[pyo3(signature = (src, dst, *, tables=None, schema=None, specs=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None, partition_by=None, partition_by_per_table=None, order_by_per_table=None, changelog=false))]
+#[pyo3(signature = (src, dst, *, tables=None, schema=None, specs=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None, partition_by=None, partition_by_per_table=None, order_by_per_table=None, changelog=false, slots=None))]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 fn transfer_many(
@@ -160,6 +162,7 @@ fn transfer_many(
     partition_by_per_table: Option<std::collections::HashMap<String, String>>,
     order_by_per_table: Option<std::collections::HashMap<String, String>>,
     changelog: bool,
+    slots: Option<usize>,
 ) -> PyResult<(u64, usize, Vec<(String, u64, u64, usize, Option<String>)>)> {
     let mode: apitap_core::Mode = mode
         .parse()
@@ -192,6 +195,7 @@ fn transfer_many(
         partition_by_per_table: partition_by_per_table.unwrap_or_default(),
         order_by_per_table: order_by_per_table.unwrap_or_default(),
         changelog,
+        slots,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
     let out = py.allow_threads(|| {

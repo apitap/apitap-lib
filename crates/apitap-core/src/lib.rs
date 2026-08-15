@@ -194,6 +194,43 @@ pub struct TransferOptions {
     /// giving a user a replica when they asked for a changelog is worse than an
     /// error. Ignored by every bulk mode.
     pub changelog: bool,
+    /// `mode="log_based"`, multi-table, Postgres sources only: split the table
+    /// list across N replication slots and run the N pipelines CONCURRENTLY.
+    /// `None` = 1 (one slot for the whole group, the historical behavior).
+    ///
+    /// Why this exists: Postgres decodes each logical slot in ONE walsender
+    /// process, and that process saturates a core long before apitap does —
+    /// measured on an 88-core box with everything idle: the walsender pegged at
+    /// 99.9% of one core while apitap used 0.41 of its own. Splitting 100
+    /// tables across 4 slots took the same 100M-change drain from 121,789 to
+    /// 278,947 changes/s (2.29×, verified 100/100). It is not 4×, because
+    /// every slot decodes the ENTIRE WAL and discards other groups' tables —
+    /// publications filter at output, not at decode — so the gain flattens as
+    /// N grows: fitted on the two measured points, ~74% of walsender cost
+    /// shards and ~26% repeats per slot. The useful range is roughly 4-16.
+    ///
+    /// Costs, so nobody discovers them in production: the SOURCE pays one
+    /// pegged core per slot; each slot holds WAL independently (the slowest
+    /// group gates WAL removal, and `max_replication_slots` must cover N);
+    /// and during a BOOTSTRAP each group carries a full bulk-pipeline budget,
+    /// so peak memory is ~N× a single group's (an explicit `parallel=P` gives
+    /// EACH group P pipes — N×P total). The steady-state drain divides its
+    /// per-window byte budget by N, so the recorded ceiling (memory bounded by
+    /// the largest transaction) becomes N × largest transaction per process.
+    /// Budget ~0.5 CPU core per slot for apitap itself.
+    ///
+    /// Group assignment is deterministic: the sorted table list is cut into N
+    /// contiguous chunks, and each chunk's slot name hashes its membership —
+    /// the same list with the same `slots` resumes the same slots. CHANGING
+    /// `slots` re-groups the tables, which renames every slot; the existing
+    /// per-table state then trips the torn-group / slot-is-GONE guards loudly
+    /// instead of silently losing the WAL between old and new slots. Clear the
+    /// group state (and drop the old slots) to re-bootstrap under the new N.
+    ///
+    /// Rejected loudly for: bulk modes, single-table runs, MySQL sources (one
+    /// binlog stream — N groups would each decode the full binlog for zero
+    /// shared gain), and `slots=0`.
+    pub slots: Option<usize>,
 }
 
 impl Default for TransferOptions {
@@ -209,6 +246,7 @@ impl Default for TransferOptions {
             order_by: None,
             on_cluster: None,
             partition_by: None,
+            slots: None,
             partition_by_per_table: std::collections::HashMap::new(),
             order_by_per_table: std::collections::HashMap::new(),
             changelog: false,
@@ -287,7 +325,21 @@ pub async fn transfer(
     opts: &TransferOptions,
 ) -> Result<TransferReport> {
     if opts.mode == Mode::LogBased {
+        if opts.slots.unwrap_or(1) != 1 {
+            return Err(Error::InvalidInput(
+                "slots needs a multi-table log_based run — one table cannot be \
+                 split across replication slots"
+                    .into(),
+            ));
+        }
         return logbased::run::run_task(src_url, dst_url, table, opts).await;
+    }
+    if opts.slots.is_some() {
+        return Err(Error::InvalidInput(
+            "slots applies to mode=\"log_based\" only — bulk modes already \
+             parallelize through `parallel`"
+                .into(),
+        ));
     }
     pipeline::dispatch::single(src_url, dst_url, table, opts).await
 }
@@ -312,10 +364,18 @@ pub async fn transfer_many(
     opts: &TransferOptions,
 ) -> Result<MultiReport> {
     if opts.mode == Mode::LogBased {
-        // The whole list is ONE slot group: one publication, one drain pass,
-        // one shared watermark — never the bulk pipeline (which would run a
-        // cursor merge and silently drop deletes).
+        // The list is ONE slot group (one publication, one drain pass, one
+        // shared watermark) — or, with `slots=N`, N such groups running
+        // concurrently. Never the bulk pipeline (which would run a cursor
+        // merge and silently drop deletes).
         return logbased::run::run_many(src_url, dst_url, tables, opts).await;
+    }
+    if opts.slots.is_some() {
+        return Err(Error::InvalidInput(
+            "slots applies to mode=\"log_based\" only — bulk modes already \
+             parallelize through `parallel`"
+                .into(),
+        ));
     }
     pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::List(tables), opts).await
 }

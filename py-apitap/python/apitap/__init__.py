@@ -537,6 +537,7 @@ def transfer(
     on_cluster: str | None = None,
     partition_by: str | dict[str, str] | None = None,
     changelog: bool = False,
+    slots: int | None = None,
 ) -> TransferReport:
     """Copy one table, a list of tables, or a whole schema from ``src`` to ``dst``.
 
@@ -706,6 +707,20 @@ def transfer(
             Row stores (Postgres,
             MySQL) and Iceberg REFUSE it loudly rather than quietly hand back a
             replica; every bulk mode ignores it.
+        slots: ``mode="log_based"``, multi-table, Postgres sources only —
+            split the tables across N replication slots and drain them
+            CONCURRENTLY. Postgres decodes each slot in ONE walsender process
+            that saturates a core long before apitap does; on the measured
+            100-table / 100M-change rig, ``slots=4`` took the drain from
+            121,789 to 278,947 changes/s (2.29x, verified per table). Not
+            linear: every slot decodes the whole WAL and keeps only its own
+            tables, so gains flatten past ~4-16 slots. The source pays one
+            busy core per slot, each slot holds WAL independently, and
+            ``max_replication_slots`` must cover N. Groups are cut
+            deterministically from the sorted table list, so re-runs resume
+            the same slots; CHANGING ``slots`` renames them all, which is
+            refused loudly until the old state is cleared. Rejected for bulk
+            modes, single-table runs, and MySQL sources (one binlog stream).
     """
     _pb_global, _pb_map = _split_ddl(partition_by, "partition_by")
     _ob_global, _ob_map = _split_ddl(order_by, "order_by")
@@ -739,6 +754,7 @@ def transfer(
             partition_by_per_table=_pb_map,
             order_by_per_table=_ob_map,
             changelog=changelog,
+            slots=slots,
         )
         return TransferReport(rows=rows, elapsed_ms=elapsed_ms, parallel=used)
 
@@ -768,6 +784,7 @@ def transfer(
         partition_by_per_table=_pb_map,
         order_by_per_table=_ob_map,
         changelog=changelog,
+        slots=slots,
     )
     results = tuple(
         TableResult(table=t, rows=r, elapsed_ms=e, parallel=p, error=err)

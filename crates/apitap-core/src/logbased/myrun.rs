@@ -123,6 +123,9 @@ where
         let mut o2 = opts.clone();
         o2.mode = Mode::Replace;
         o2.dest_table = Some(c.dest_table.clone());
+        // `slots` belongs to the CDC group, never to the bulk full-load leg
+        // (which rejects it loudly if it leaks through).
+        o2.slots = None;
         // The changelog's clauses belong to the rebuild, not to the bulk load's
         // table — see `run::strip_changelog_ddl`.
         if o2.changelog {

@@ -423,7 +423,7 @@ pub(crate) async fn run_task(
 ) -> Result<TransferReport> {
     let started = std::time::Instant::now();
     let (rows, parallel) =
-        run_group(src_url, dst_url, std::slice::from_ref(&table.to_string()), opts).await
+        run_group(src_url, dst_url, std::slice::from_ref(&table.to_string()), opts, 1).await
             .map(|mut v| v.pop().expect("one result per table"))?;
     Ok(TransferReport {
         rows,
@@ -446,8 +446,17 @@ pub(crate) async fn run_many(
                 .into(),
         ));
     }
+    match opts.slots.unwrap_or(1) {
+        0 => {
+            return Err(Error::InvalidInput(
+                "slots must be at least 1 (or omitted for the single-slot default)".into(),
+            ))
+        }
+        1 => {}
+        n => return run_sloted(src_url, dst_url, tables, opts, n, started).await,
+    }
     let per_table_started = std::time::Instant::now();
-    let results = run_group(src_url, dst_url, tables, opts).await?;
+    let results = run_group(src_url, dst_url, tables, opts, 1).await?;
     let elapsed = per_table_started.elapsed().as_millis() as u64;
     let budget = results.iter().map(|(_, p)| *p).max().unwrap_or(1);
     Ok(MultiReport {
@@ -468,14 +477,155 @@ pub(crate) async fn run_many(
     })
 }
 
+/// `slots=N`: split the tables into N groups, each with its OWN replication
+/// slot, and run the N pipelines CONCURRENTLY — one OS thread per group, each
+/// with its own current_thread runtime.
+///
+/// The thread-per-group shape is not incidental: it reproduces the measured
+/// receipt (4 separate 1-slot processes → 278,947 changes/s where 1 slot did
+/// 121,789) and keeps each pipeline's Bytes refcounts on one thread — the
+/// uncontended-atomics design the CDC path already relies on (see the shim's
+/// `run_cdc` rationale). What it buys is the SOURCE's parallelism: Postgres
+/// decodes each slot in one walsender process, so N slots put N cores of
+/// decoding to work where one slot pegs a single core.
+///
+/// Group assignment is a pure function of (sorted table list, N), so re-runs
+/// resume the same slots. A failed group does not roll back the others: every
+/// group owns an independent slot and watermark, its committed progress is
+/// durable, and the retry resumes all groups from their own state.
+async fn run_sloted(
+    src_url: &str,
+    dst_url: &str,
+    tables: &[String],
+    opts: &TransferOptions,
+    slots: usize,
+    started: std::time::Instant,
+) -> Result<MultiReport> {
+    if scheme(src_url) == "mysql" {
+        return Err(Error::InvalidInput(
+            "slots applies to Postgres sources — MySQL has ONE binlog stream, \
+             so N groups would each decode the full binlog for no shared gain"
+                .into(),
+        ));
+    }
+    if !matches!(scheme(src_url), "postgres" | "postgresql") {
+        return Err(Error::InvalidInput(format!(
+            "log_based needs a Postgres source (logical replication) or a \
+             MySQL source (binlog) — got '{}'",
+            scheme(src_url)
+        )));
+    }
+    // Duplicates across groups would give one table two slots that both
+    // decode and both apply it; the single-group path catches duplicates via
+    // colliding destination names, so mirror that here on the raw list.
+    {
+        let mut seen = tables.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() != tables.len() {
+            return Err(Error::InvalidInput(
+                "log_based: the tables list has duplicates".into(),
+            ));
+        }
+    }
+    let n = slots.min(tables.len());
+
+    // Deterministic membership: sort, then cut into N contiguous chunks. Same
+    // list + same `slots` → same groups → same hashed slot names → resume.
+    let mut sorted = tables.to_vec();
+    sorted.sort_unstable();
+    let per = sorted.len().div_ceil(n);
+    let groups: Vec<Vec<String>> = sorted.chunks(per).map(|c| c.to_vec()).collect();
+    let n = groups.len(); // chunking can produce fewer groups than asked
+
+    let mut handles = Vec::with_capacity(n);
+    let mut rxs = Vec::with_capacity(n);
+    for g in &groups {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (su, du, o2, g) = (src_url.to_string(), dst_url.to_string(), opts.clone(), g.clone());
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio current_thread runtime");
+            let _ = tx.send(rt.block_on(run_group(&su, &du, &g, &o2, n)));
+        }));
+        rxs.push(rx);
+    }
+    // Collect every group before judging any: the others keep draining to
+    // their own watermarks even when one fails, so their work is never wasted.
+    let mut outcomes: Vec<Result<Vec<(u64, usize)>>> = Vec::with_capacity(n);
+    for rx in rxs {
+        outcomes.push(match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(Error::Transfer(
+                "slot group thread died before reporting".into(),
+            )),
+        });
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let elapsed_all = started.elapsed().as_millis() as u64;
+
+    let mut by_table = std::collections::HashMap::new();
+    let mut first_err = None;
+    for (gi, out) in outcomes.into_iter().enumerate() {
+        match out {
+            Ok(v) => {
+                for (t, r) in groups[gi].iter().zip(v) {
+                    by_table.insert(t.clone(), r);
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(Error::Transfer(format!(
+                        "slot group {}/{n} ({} tables) failed: {e} — the other \
+                         groups own independent slots and watermarks, their \
+                         committed progress is durable, and a retry resumes \
+                         every group from its own state",
+                        gi + 1,
+                        groups[gi].len(),
+                    )));
+                }
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(MultiReport {
+        rows: by_table.values().map(|(r, _)| *r).sum(),
+        elapsed_ms: elapsed_all,
+        budget: by_table.values().map(|(_, p)| *p).max().unwrap_or(1),
+        tables: tables
+            .iter()
+            .map(|t| {
+                let (rows, parallel) = by_table[t];
+                TableResult {
+                    table: t.clone(),
+                    rows,
+                    elapsed_ms: elapsed_all,
+                    parallel,
+                    error: None,
+                }
+            })
+            .collect(),
+    })
+}
+
 /// Run one slot group. Returns (rows, parallel) per table, caller order.
 /// A failure anywhere fails the WHOLE group — the slot is only confirmed
 /// past windows every member committed, so nothing is ever lost.
+/// `budget_denom` divides the drain's per-window byte budget: with `slots=N`
+/// there are N of these pipelines in ONE process, and the recorded memory
+/// ceiling (bounded by the largest transaction) must hold for their SUM.
 async fn run_group(
     src_url: &str,
     dst_url: &str,
     tables: &[String],
     opts: &TransferOptions,
+    budget_denom: usize,
 ) -> Result<Vec<(u64, usize)>> {
     if tables.is_empty() {
         return Err(Error::InvalidInput("tables list is empty".into()));
@@ -590,7 +740,18 @@ async fn run_group(
         bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
     } else {
         let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
-        drain_group(src_url, &src, dest, &slot, &publication, &ctxs, wm, opts.changelog).await
+        drain_group(
+            src_url,
+            &src,
+            dest,
+            &slot,
+            &publication,
+            &ctxs,
+            wm,
+            opts.changelog,
+            budget_denom,
+        )
+        .await
     }
 }
 
@@ -813,6 +974,10 @@ async fn bootstrap_group(
             let mut o2 = opts.clone();
             o2.mode = Mode::Replace;
             o2.dest_table = Some(c.dest_table.clone());
+            // `slots` belongs to the CDC group that spawned this bootstrap;
+            // the per-table full-load leg is a bulk transfer, which rejects
+            // it loudly if it leaks through.
+            o2.slots = None;
             strip_changelog_ddl(&mut o2);
             dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
             let r = Box::pin(crate::transfer(pinned_url, dst_url, &c.table_arg, &o2)).await?;
@@ -883,6 +1048,7 @@ async fn bootstrap_group(
 
 // ── every later run: ONE windowed drain, applies fan out per table ──────────
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_group(
     src_url: &str,
     src: &PgPool,
@@ -892,6 +1058,7 @@ async fn drain_group(
     ctxs: &[TableCtx],
     wm: u64,
     changelog: bool,
+    budget_denom: usize,
 ) -> Result<Vec<(u64, usize)>> {
     // Reconcile against the slot before doing anything.
     let slot_row: Option<(Option<String>, bool)> = sqlx::query_as(
@@ -942,7 +1109,10 @@ async fn drain_group(
     // The cap matters on BIG boxes too: overlap only pays while windows
     // rotate, so past ~24 MiB of buffered rows the marginal collapse-dedup
     // is worth less than hiding the apply under the next drain.
-    let budget = dest.cdc_window_bytes();
+    // With `slots=N` this pipeline is one of N in the SAME process/cgroup, so
+    // the per-window budget shards by N (floor 1 MiB) to keep the process's
+    // recorded memory ceiling intact.
+    let budget = (dest.cdc_window_bytes() / budget_denom.max(1)).max(1 << 20);
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
 
