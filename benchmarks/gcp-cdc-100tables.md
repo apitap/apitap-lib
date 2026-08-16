@@ -610,7 +610,33 @@ bar for syndication, and a PeerDB-optimization research pass (worker
 replicas, concurrency envs) is in flight so the next rerun can give them
 even more than their docs know how to ask for.
 
-## What this rig does NOT say
+## Part 12 — the cage ladder: two refutations for the price of one rig
+
+Part 11's 197 s (vs Part 9's looser-caged 1.23M/s) had three candidate
+explanations: CPU peak-throttling, memory pressure at 90% of the 2 GB cap,
+and clock composition. The ladder isolates them — identical rig shape,
+identical protocol (every leg from an empty world: fresh slots, fresh
+destinations, re-seeded sources, its own 100M), one variable per rung, the
+cage value printed into the log each time:
+
+| apitap cage (TOTAL, slice-enforced) | wall incl. full 400-table verify | verify |
+|---|---|---|
+| 6 CPU / 2 GB (Part 11) | 197 s | 400/400 |
+| 6 CPU / 4 GB | 201 s | 400/400 |
+| 8 CPU / 4 GB | 205 s | 400/400 |
+
+**Both remaining theories are refuted.** Doubling memory: no effect (the
+user called this one before the measurement — the engine's ~1.8 GB usage was
+simply comfortable at either cap). Adding two cores: no effect. Within this
+range the cage is IRRELEVANT: the engine applied its 90.44M rows in ~110 s
+of drain (~820K/s) on every rung, because the pace is set by the
+walsender + ClickHouse rhythm outside it. The rest of the ~200 s wall is
+fixed overhead the clock deliberately includes: the 28 s writer overlap, the
+zero-row proving pass, and ~60-70 s of 400-table verification.
+
+The one-line version of twelve parts: try to starve this engine and it does
+not slow down; feed it more and it does not speed up — its wall has been
+outside the process in every configuration this campaign could buy.
 
 - **100M changes/minute was not reached, and Part 7 says it is not reachable
   from a single Postgres.** The best verified figure is **16.7M/min** (Part 7,
