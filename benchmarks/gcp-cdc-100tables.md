@@ -483,6 +483,15 @@ resolves it. The engine should derate bootstrap fan-out from the pool size.
 
 ## Part 10 — apitap vs PeerDB, same grid, same track, CDC only
 
+> **STATUS: NOT FOR PUBLICATION — superseded pending a fair rerun.** apitap
+> consumed through 32 replication slots (8/shard); PeerDB ran its default 4
+> (one mirror per shard). Our own analysis says the asymmetry did not decide
+> the outcome (PeerDB's walsenders sat ~93% idle while its mover was pegged),
+> but the house rule is the rival gets its best configuration, and PeerDB CAN
+> be split into 8 mirrors per shard. Until the 32-vs-32, n≥3 interleaved rerun
+> is measured, this part is a record of what happened, not a comparison we
+> publish. A drafted article was withdrawn from apitap.dev on this basis.
+
 Head-to-head on the Part 9 shape: 4 Postgres shards (`c3-standard-22-lssd`),
 one ClickHouse (`e2-standard-32` + pd-ssd — C3 was again refused for
 capacity/quota), runner `e2-highcpu-16`. 400 tables (100×15-col per shard),
