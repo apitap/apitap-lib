@@ -35,6 +35,24 @@ const EV_HEARTBEAT: u8 = 27;
 const EV_HEARTBEAT_V2: u8 = 41;
 const EV_TRANSACTION_PAYLOAD: u8 = 40;
 
+// MariaDB never adopted MySQL 5.6's v2 rows events: 10.x still writes the v1
+// codes, whose body is identical except that it has no extra-data header.
+// Verified on mariadb:10.6.28 — a 4-statement session produced Gtid,
+// Annotate_rows, Table_map, Write_rows_v1/Update_rows_v1/Delete_rows_v1, Xid.
+const EV_WRITE_ROWS_V1: u8 = 23;
+const EV_UPDATE_ROWS_V1: u8 = 24;
+const EV_DELETE_ROWS_V1: u8 = 25;
+
+// MariaDB-only frame events. ANNOTATE_ROWS carries the originating SQL text
+// (informational), BINLOG_CHECKPOINT/GTID_LIST are recovery bookkeeping, and
+// GTID *replaces* the `BEGIN` QUERY event that MySQL writes — so it, not a
+// query, is what opens a MariaDB transaction.
+const EV_MA_ANNOTATE_ROWS: u8 = 160;
+const EV_MA_BINLOG_CHECKPOINT: u8 = 161;
+const EV_MA_GTID: u8 = 162;
+const EV_MA_GTID_LIST: u8 = 163;
+const EV_MA_START_ENCRYPTION: u8 = 164;
+
 // The MYSQL_TYPE_* codes TABLE_MAP reports.
 const MT_DECIMAL: u8 = 0x00;
 const MT_TINY: u8 = 0x01;
@@ -737,19 +755,41 @@ pub(crate) struct RowsEvent {
     pub rows: Vec<(Option<Tuple>, Option<Tuple>)>,
 }
 
-/// WRITE/UPDATE/DELETE_ROWS_v2 (30/31/32).
+/// What a rows event does, with its dialect folded away: MySQL's v2 codes
+/// (30/31/32) and MariaDB's v1 codes (23/24/25) mean the same three things.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+fn row_op(kind: u8) -> Result<RowOp> {
+    match kind {
+        EV_WRITE_ROWS | EV_WRITE_ROWS_V1 => Ok(RowOp::Insert),
+        EV_UPDATE_ROWS | EV_UPDATE_ROWS_V1 => Ok(RowOp::Update),
+        EV_DELETE_ROWS | EV_DELETE_ROWS_V1 => Ok(RowOp::Delete),
+        _ => Err(bad("not a rows event")),
+    }
+}
+
+/// WRITE/UPDATE/DELETE_ROWS — v2 (30/31/32, MySQL) and v1 (23/24/25, MariaDB).
+/// The two bodies are identical apart from v2's extra-data header.
 pub(crate) fn parse_rows(body: &[u8], kind: u8, map: &TableMap) -> Result<RowsEvent> {
+    let op = row_op(kind)?;
     let mut r = R::new(body);
     let table_id = r.u48le()?;
     r.take(2)?; // flags
-    let extra = r.u16le()? as usize; // v2 header: extra-data length (incl. itself)
-    if extra >= 2 {
-        r.take(extra - 2)?;
+    if matches!(kind, EV_WRITE_ROWS | EV_UPDATE_ROWS | EV_DELETE_ROWS) {
+        let extra = r.u16le()? as usize; // v2 header: extra-data length (incl. itself)
+        if extra >= 2 {
+            r.take(extra - 2)?;
+        }
     }
     let ncols = r.lenenc()? as usize;
     let bmlen = (ncols + 7) / 8;
     let present1 = r.take(bmlen)?.to_vec();
-    let present2 = if kind == EV_UPDATE_ROWS {
+    let present2 = if op == RowOp::Update {
         r.take(bmlen)?.to_vec()
     } else {
         Vec::new()
@@ -757,21 +797,20 @@ pub(crate) fn parse_rows(body: &[u8], kind: u8, map: &TableMap) -> Result<RowsEv
 
     let mut rows = Vec::new();
     while r.left() > 0 {
-        match kind {
-            EV_WRITE_ROWS => {
+        match op {
+            RowOp::Insert => {
                 let t = read_row(&mut r, &map.cols, &present1, ncols)?;
                 rows.push((None, Some(t)));
             }
-            EV_DELETE_ROWS => {
+            RowOp::Delete => {
                 let t = read_row(&mut r, &map.cols, &present1, ncols)?;
                 rows.push((Some(t), None));
             }
-            EV_UPDATE_ROWS => {
+            RowOp::Update => {
                 let before = read_row(&mut r, &map.cols, &present1, ncols)?;
                 let after = read_row(&mut r, &map.cols, &present2, ncols)?;
                 rows.push((Some(before), Some(after)));
             }
-            _ => return Err(bad("not a rows event")),
         }
     }
     Ok(RowsEvent { table_id, rows })
@@ -841,34 +880,93 @@ pub(crate) fn to_messages(
             })
             .collect(),
     }));
+    let op = row_op(kind)?;
     for (before, after) in ev.rows {
-        match kind {
-            EV_WRITE_ROWS => out.push(PgoMessage::Insert {
+        match op {
+            RowOp::Insert => out.push(PgoMessage::Insert {
                 rel_id,
                 new: after.ok_or_else(|| bad("insert without image"))?,
             }),
-            EV_DELETE_ROWS => out.push(PgoMessage::Delete {
+            RowOp::Delete => out.push(PgoMessage::Delete {
                 rel_id,
                 old: OldImage { full: true, tuple: before.ok_or_else(|| bad("delete without image"))? },
             }),
-            EV_UPDATE_ROWS => out.push(PgoMessage::Update {
+            RowOp::Update => out.push(PgoMessage::Update {
                 rel_id,
                 old: before.map(|t| OldImage { full: true, tuple: t }),
                 new: after.ok_or_else(|| bad("update without after-image"))?,
             }),
-            _ => return Err(bad("not a rows event")),
         }
     }
     Ok(out)
 }
 
-/// Event codes the reader may skip without losing data.
+/// Event codes the reader may skip without losing data: heartbeats, GTID
+/// bookkeeping (both dialects), the session-context events that only matter
+/// to statement-based replay, and MariaDB's informational frame events.
 pub(crate) fn skippable(t: u8) -> bool {
-    matches!(t, EV_HEARTBEAT | EV_HEARTBEAT_V2 | 33 | 34 | 35 | 3 | 5 | 9)
+    matches!(
+        t,
+        EV_HEARTBEAT
+            | EV_HEARTBEAT_V2
+            | 33 | 34 | 35 // MySQL GTID / ANONYMOUS_GTID / PREVIOUS_GTIDS
+            | 3 | 5 | 9    // STOP / INTVAR / APPEND_BLOCK
+            | 1            // START_EVENT_V3
+            | 13 | 14      // RAND / USER_VAR (statement-based context)
+            | 28 | 29      // IGNORABLE / ROWS_QUERY (informational)
+            | 36 | 37      // TRANSACTION_CONTEXT / VIEW_CHANGE
+            | EV_MA_ANNOTATE_ROWS
+            | EV_MA_BINLOG_CHECKPOINT
+            | EV_MA_GTID_LIST
+            | EV_MA_START_ENCRYPTION
+    )
 }
 
+/// MySQL v2 (30/31/32) and MariaDB v1 (23/24/25) rows events alike.
 pub(crate) fn is_rows(t: u8) -> bool {
-    matches!(t, EV_WRITE_ROWS | EV_UPDATE_ROWS | EV_DELETE_ROWS)
+    matches!(
+        t,
+        EV_WRITE_ROWS
+            | EV_UPDATE_ROWS
+            | EV_DELETE_ROWS
+            | EV_WRITE_ROWS_V1
+            | EV_UPDATE_ROWS_V1
+            | EV_DELETE_ROWS_V1
+    )
+}
+
+/// MariaDB opens a transaction with a GTID event instead of the `BEGIN`
+/// QUERY event MySQL writes — same meaning, different code.
+pub(crate) fn is_tx_start(t: u8) -> bool {
+    t == EV_MA_GTID
+}
+
+/// Every event code that is neither handled above nor safely skippable lands
+/// here, and it must be LOUD. Silence is the one thing CDC can never do: an
+/// unknown code may carry row changes (MySQL 8's partial JSON updates,
+/// MariaDB's compressed rows) or announce that the master itself lost events
+/// (INCIDENT) — dropping either diverges the destination without a word.
+/// The reader's old catch-all did exactly that for anything it had not been
+/// taught, MySQL 8's partial-JSON rows included.
+pub(crate) fn unhandled(t: u8) -> Error {
+    let hint = match t {
+        39 => "partial JSON update rows (MySQL 8) — set binlog_row_value_options=''",
+        26 => "INCIDENT: the master reports it LOST events — this stream has a hole",
+        165..=171 => {
+            "compressed query/rows events (MariaDB) — set log_bin_compress=OFF"
+        }
+        6 | 8 | 10 | 11 | 12 | 17 | 18 => {
+            "LOAD DATA statement-based events — set binlog_format=ROW"
+        }
+        20..=22 => "pre-GA rows events from a pre-5.1.16 master",
+        38 => "XA PREPARE — XA transactions are not decoded yet",
+        _ => "unknown event type",
+    };
+    bad(&format!(
+        "log_based: binlog event type {t} not handled ({hint}). Refusing rather \
+         than skipping it — a skipped event is silent data loss. Please report \
+         this event code."
+    ))
 }
 
 pub(crate) const TYPE_QUERY: u8 = EV_QUERY;
@@ -1070,6 +1168,91 @@ mod tests {
         enc.extend_from_slice(&[b'x'; 260]);
         let mut r = R::new(&enc);
         assert_eq!(decode_cell(&mut r, &c).unwrap().len(), 260);
+    }
+
+    #[test]
+    fn mariadb_v1_rows_events_decode_without_the_v2_extra_header() {
+        // Same body as the v2 case below, minus the 2-byte extra-data header.
+        // MariaDB 10.x writes these codes; before this they fell through the
+        // reader's catch-all and every change vanished silently.
+        let map = TableMap {
+            table_id: 42,
+            db: "bench".into(),
+            table: "t".into(),
+            cols: vec![
+                ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false },
+                ColDef { kind: MT_VARCHAR, meta: 100, nullable: true, unsigned: false },
+            ],
+        };
+        let head = |b: &mut Vec<u8>| {
+            b.extend_from_slice(&[0x2a, 0, 0, 0, 0, 0]); // table id
+            b.extend_from_slice(&[0, 0]); // flags — NO extra-data length in v1
+            b.push(2); // ncols
+        };
+        // WRITE_ROWS_V1
+        let mut b = Vec::new();
+        head(&mut b);
+        b.push(0b0000_0011); // present: both
+        b.push(0); // no nulls
+        b.extend_from_slice(&7i32.to_le_bytes());
+        b.push(2);
+        b.extend_from_slice(b"hi");
+        let ev = parse_rows(&b, EV_WRITE_ROWS_V1, &map).unwrap();
+        assert_eq!(ev.table_id, 42);
+        let after = ev.rows[0].1.clone().unwrap();
+        assert_eq!(after.view(0), Cellv::Text(b"7"));
+        assert_eq!(after.view(1), Cellv::Text(b"hi"));
+        assert!(ev.rows[0].0.is_none());
+
+        // UPDATE_ROWS_V1 carries both images, so both bitmaps must be read.
+        let mut b = Vec::new();
+        head(&mut b);
+        b.push(0b0000_0011); // present (before)
+        b.push(0b0000_0011); // present (after)
+        b.push(0); // before nulls
+        b.extend_from_slice(&7i32.to_le_bytes());
+        b.push(2);
+        b.extend_from_slice(b"hi");
+        b.push(0); // after nulls
+        b.extend_from_slice(&8i32.to_le_bytes());
+        b.push(2);
+        b.extend_from_slice(b"yo");
+        let ev = parse_rows(&b, EV_UPDATE_ROWS_V1, &map).unwrap();
+        assert_eq!(ev.rows.len(), 1);
+        assert_eq!(ev.rows[0].0.clone().unwrap().view(0), Cellv::Text(b"7"));
+        assert_eq!(ev.rows[0].1.clone().unwrap().view(0), Cellv::Text(b"8"));
+
+        // DELETE_ROWS_V1 lands as a before-image only.
+        let mut b = Vec::new();
+        head(&mut b);
+        b.push(0b0000_0011);
+        b.push(0);
+        b.extend_from_slice(&7i32.to_le_bytes());
+        b.push(2);
+        b.extend_from_slice(b"hi");
+        let ev = parse_rows(&b, EV_DELETE_ROWS_V1, &map).unwrap();
+        assert!(ev.rows[0].1.is_none());
+        assert_eq!(ev.rows[0].0.clone().unwrap().view(0), Cellv::Text(b"7"));
+    }
+
+    #[test]
+    fn event_codes_are_classified_not_silently_dropped() {
+        // Both dialects' rows events decode.
+        for t in [30u8, 31, 32, 23, 24, 25] {
+            assert!(is_rows(t), "type {t} must be a rows event");
+        }
+        // MariaDB frame events are safe to skip; its GTID opens a transaction.
+        for t in [EV_MA_ANNOTATE_ROWS, EV_MA_BINLOG_CHECKPOINT, EV_MA_GTID_LIST] {
+            assert!(skippable(t), "type {t} must be skippable");
+        }
+        assert!(is_tx_start(EV_MA_GTID));
+        assert!(!skippable(EV_MA_GTID));
+        // Events that can carry data (or announce loss) are never skippable —
+        // the reader refuses on them instead.
+        for t in [39u8, 26, 166, 0, 200] {
+            assert!(!skippable(t) && !is_rows(t), "type {t} must reach the refusal");
+            assert!(unhandled(t).to_string().contains(&t.to_string()));
+        }
     }
 
     #[test]

@@ -548,7 +548,7 @@ def transfer(
     (CSV files are the tables, all-text, replace only),
     ``github+api://owner/repo`` (issues/PRs/commits/stars… as typed tables,
     incremental where the API allows) sources — Postgres (logical replication)
-    and MySQL (binlog) sources additionally support ``mode="log_based"`` batch
+    and MySQL/MariaDB (binlog) sources additionally support ``mode="log_based"`` batch
     CDC (every change, drained per scheduled run, snapshot-pinned bootstrap) —
     ``postgres://``,
     ``clickhouse://`` (``clickhouse+https://`` for TLS),
@@ -610,7 +610,7 @@ def transfer(
             bootstraps as replace when the table doesn't exist), ``"merge"``
             (Postgres destinations: incremental upsert by the destination's
             PRIMARY KEY), or ``"log_based"`` (batch CDC from a Postgres
-            (logical replication) or MySQL (binlog) source — every change incl.
+            (logical replication) or MySQL/MariaDB (binlog) source — every change incl.
             deletes and TRUNCATEs, drained per scheduled run into Postgres,
             ClickHouse, MySQL, BigQuery or Iceberg; first run bootstraps
             snapshot-pinned, the watermark commits atomically with the data, and

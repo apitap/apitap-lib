@@ -52,7 +52,11 @@ pub(crate) async fn master_position(
     // 8.4 renamed the statement; try the modern spelling first so the
     // 8.4 path never hits the removed one (see the known-hang note).
     for sql in ["SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"] {
-        match sqlx::query_as::<_, (String, u64, String, String, String)>(sql)
+        // Only the first two columns (File, Position) are ours. The rest of
+        // the row differs per server — MySQL 5.6+ appends Executed_Gtid_Set,
+        // MariaDB stops at Binlog_Ignore_DB — and binding all five turned a
+        // MariaDB source into "column index out of bounds".
+        match sqlx::query_as::<_, (String, u64)>(sql)
             .fetch_one(pool)
             .await
         {
@@ -73,17 +77,30 @@ pub(crate) async fn master_position(
 /// Refuse loudly the server settings that would silently corrupt a CDC
 /// stream, instead of decoding garbage.
 pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
-    // MariaDB's binlog dialect diverges (its own GTID events, capability
-    // vars) — refuse loudly instead of desyncing mid-stream.
     let (ver,): (String,) = sqlx::query_as("SELECT VERSION()")
         .fetch_one(pool)
         .await
         .map_err(|e| Error::Transfer(format!("probe version: {e}")))?;
-    if ver.to_lowercase().contains("mariadb") {
-        return Err(Error::InvalidInput(format!(
-            "log_based: {ver} is MariaDB — its binlog dialect differs from \
-             MySQL's and is not supported yet (MySQL 5.7/8.x works)"
-        )));
+    let is_mariadb = ver.to_lowercase().contains("mariadb");
+    if is_mariadb {
+        // MariaDB's dialect (v1 rows events, GTID-as-transaction-start,
+        // ANNOTATE_ROWS frames) is decoded by the same reader — but its
+        // event compression is a separate binlog encoding we do not speak,
+        // and it is a MariaDB-only variable, so probe it here.
+        if let Ok((_, v)) = sqlx::query_as::<_, (String, String)>(
+            "SHOW VARIABLES LIKE 'log_bin_compress'",
+        )
+        .fetch_one(pool)
+        .await
+        {
+            if v.eq_ignore_ascii_case("ON") {
+                return Err(Error::InvalidInput(
+                    "log_based: log_bin_compress=ON writes compressed binlog \
+                     events — set it OFF for this source"
+                        .into(),
+                ));
+            }
+        }
     }
     let want = [
         ("log_bin", "ON", "binary logging is off — set log_bin=ON"),
@@ -367,6 +384,11 @@ pub(crate) async fn drain_binlog(
                     break;
                 }
             }
+            t if bl::is_tx_start(t) => {
+                // MariaDB opens a transaction with a GTID event — there is no
+                // `BEGIN` QUERY event to clear a torn attempt's leftovers.
+                tx_buf.clear();
+            }
             t if bl::skippable(t) => {
                 // Heartbeats carry the live position: they let an idle
                 // stream reach the stop-line (and the deadline check above).
@@ -380,7 +402,9 @@ pub(crate) async fn drain_binlog(
                     }
                 }
             }
-            _ => {}
+            // Anything left is REFUSED, never skipped: the old silent arm is
+            // what made MariaDB sources apply zero changes without an error.
+            t => return Err(bl::unhandled(t)),
         }
     }
 
