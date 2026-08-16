@@ -369,7 +369,55 @@ the moment they drift out of page-cache lockstep, which the model does not
 capture and which would make it *slower* than N=4.
 
 The sweep N = 1, 2, 4, 8, 16 has not been run. Until it is, only the N=1 and
-N=4 rows above are receipts.
+N=4 rows above are receipts. (It has now — see Part 8.)
+
+## Part 8 — the slot sweep, on the shipped `slots=N` (v0.36.0 from PyPI)
+
+The direct test of "can one Postgres reach 100M changes/minute": sweep
+`slots=N` over the same 100 tables × 100M changes, all on one rig —
+`apitap-s-pg` and `apitap-s-ch` both `c3-standard-44-lssd` (44 vCPU, local
+NVMe; the 88-core shape was refused for capacity, and C3 is the top
+compute-optimized family this project has quota for — C3D/H3/C4 are all 0),
+runner `c3-highcpu-22`. This is the RELEASED wheel doing the whole thing in
+one process — `apitap.transfer(..., changelog=True, slots=N)` — in a fixed
+8-core / 8 GB cage for every point, so the points compare. Every point:
+fresh reset, bootstrap, 100M changes, timed drain, untimed catch-up (0 rows
+everywhere), verify 100/100.
+
+| slots | applied | wall | changes/s | per minute | gain | apitap CPU | RSS | pegged walsenders |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 90,100,000 | 505.7 s | 178,166 | 10.7M | — | 0.33 | 174 MB | 1 |
+| 4 | 90,100,000 | 230.4 s | 391,031 | 23.5M | +120% | 0.83 | 287 MB | 4 |
+| 8 | 90,100,000 | 203.4 s | 443,051 | 26.6M | +13% | 0.94 | 445 MB | 8 |
+| 16 | 90,100,000 | 189.2 s | **476,181** | **28.6M** | +7.5% | 1.08 | 667 MB | 15-16 |
+| 32 | — | — | — | — | — | — | — | fd limit, below |
+
+**The knee is at N=4–8, and the answer to 100M/minute is NO — not from one
+Postgres.** 476,181 changes/s is 3.5× short of the 1,666,667 needed, and the
+curve's shape says the rest of the distance is not purchasable with more
+slots: doubling 8→16 walsenders bought 7.5%. The Part 7 model (fitted at
+~74% shardable) proved optimistic — actuals came in 9% under it at N=8 and
+15% under at N=16; the non-shared fraction grows with N.
+
+**apitap's cost stays flat at ~2.1 µs/change across the whole sweep** (0.33 →
+1.08 cores while throughput grew 2.7×). The per-slot bill is Postgres's: one
+pegged core per walsender, 16 cores of decode at N=16 against apitap's 1.
+
+**N=32 failed honestly: `Too many open files` (errno 24)** during the
+parallel bootstrap — 25 concurrent groups (100/⌈100/32⌉) × bulk-load pipes
+blew the runner's default 1024-fd ulimit. That is a real operational cost of
+large N: file descriptors scale with N × parallel. Raise `LimitNOFILE` (or
+cap group concurrency in the engine — open follow-up) before running slots
+past ~16. The predicted gain there was ~3-5%, which the knee already made
+moot.
+
+**Recommendation this sweep buys:** `slots=4` is the value engine defaults
+should eventually pick — it captures 82% of the N=16 rate at a quarter of
+the source's CPU bill. `slots=8-16` only for burn-down races where the
+source box is disposable. The empirical ceiling of one Postgres source on
+the best rig this project can place is **~28.6M changes/minute**; past that,
+the architecture answer is multiple sources (shard the database), not more
+slots.
 
 ### Two harness bugs this part exposed
 
