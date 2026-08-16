@@ -668,3 +668,41 @@ outside the process in every configuration this campaign could buy.
   ClickHouse patch-part deletes) on a different CPU. A sizing estimate built on
   the old figure predicted ~2 cores would be needed for 10M/min. The real answer
   is under half of one.
+
+## Part 13 — the final apples-to-apples: both tools at their researched best
+
+The definitive pairing, every earlier objection answered. Same physical rig
+for both legs, same 200M-nominal workload (50M/shard), identical empty worlds
+(destinations rebuilt, sources re-seeded 100×100, fresh slots), movers caged
+at 6 CPU / 2 GB with the cage value printed from container/slice inspection
+on both sides, and **each tool in its own best configuration**: apitap with 8
+slots/shard; PeerDB with the config assembled from its own source code and
+official docs (PARALLEL_NORMALIZE=4, GROUP_NORMALIZE=10, 500K batches, insert
+threads, GOMEMLIMIT, tuned pg sources) — better than its documentation knows
+how to ask for.
+
+| | apitap (v0.36.0, PyPI) | PeerDB (fd61c0f, best config) |
+|---|---|---|
+| 200M nominal outcome | **complete + verified 400/400** | **DNF at 30 min — frozen at ~89%** |
+| apply work | **125 s** (180.44M applied) | 1,800 s cap, ~160M ops, counter frozen the last 3.5 min |
+| full leg incl. proving + verify | 279 s | verification never reached |
+| rate | **1.44M changes/s** (647K/s all-in) | ~125K ops/s at peak, degrading |
+| mover CPU | ~4.5 of 6 — never saturated | **5.9 of 6 — pegged the entire leg** |
+| mover RAM | ~1.1 GB | ~1.0 GB |
+| µs of CPU per change | **~3** | ~47 |
+| deployment | `pip install apitap`, one process | 7-service compose: worker, Temporal, catalog-pg, nexus, api, admin-tools + external S3/minio |
+
+Their own `flow_errors`/log ledger provides the epitaph: late batches slowed
+from 12-14 s to 60 s each before the counter stopped moving entirely — the
+same tail-degradation their stock run showed, surviving their best tuning.
+The improvement was real (53.5K → ~125K ops/s, and all four shards balanced
+for the first time), and it still left them **~12× behind on the same track,
+with the finish line uncrossed**.
+
+Disclosures that ride with this table wherever it goes: n=1 per leg (apitap's
+five runs across Parts 9-13 sat between 0.95-1.44M/s under varying clocks —
+consistent, but the interleaved n≥3 pass remains the syndication bar); slot
+counts differ (32 vs 4) because each is its side's measured-best shape — the
+32-mirror equal-slot variant was measured for PeerDB and wedged (Part 11);
+PeerDB's control plane ran uncapped as a gift; its S3 stage sat on the rig's
+fastest disk.
