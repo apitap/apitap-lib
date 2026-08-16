@@ -551,16 +551,35 @@ sequential legs, never concurrent; PeerDB tuned beyond its own docs
 (sync_interval 5 s where their default is 60 and their cost guidance says
 3600+).
 
-**PeerDB, equal-slot shape: integrity failure, not slowness.** After ~5.4M
-rows landed (one shard, early), every sync flow went idle logging
-`records: 0` / "standby deadline reached, no records accumulated" while
-Postgres reported **all slots confirmed, 0 bytes behind** — and the missing
-~93M ops were nowhere: ~5% in ClickHouse (raw+final), 139 MiB in the minio
-stage, the rest unaccounted. A confirmed slot means Postgres may discard that
-WAL. Their own blog and docs were checked first (no multi-mirror guidance, no
-slot-advance semantics, no idle-mirror troubleshooting exists to have been
-misapplied). The leg was terminated by the operator after ~10 frozen minutes.
-Receipts: worker logs, `pg_replication_slots` deltas, minio `du`.
+**PeerDB, equal-slot shape: the apply lane wedged while the slots kept
+advancing.** After ~5.4M rows landed (one shard, early), every sync flow went
+idle logging `records: 0` while Postgres reported **all slots confirmed,
+0 bytes behind** — and the missing ~93M ops were nowhere visible: ~5% in
+ClickHouse (raw+final), 139 MiB in the minio stage. The leg was terminated by
+the operator after ~10 frozen minutes. A source-code read at the exact commit
+(fd61c0f) later explained the mechanism, and it softens the charge from
+"integrity failure" to what the receipts actually support: for ClickHouse,
+PeerDB's sync stages Avro and **confirms the slot immediately**; the real
+insert happens in a separate normalize lane that, on error, **retries
+silently forever while sync keeps confirming** (their comment: "never return
+error"). Issue #4152 documents the matching failure shape (minio reachability
+from ClickHouse never validated; data "confirmed", apply wedged). The actual
+error text lives in their catalog's `flow_errors` table — which died with the
+rig before we captured it, so the root cause of THIS wedge is unproven. What
+stands regardless: slots advanced past ~93M ops that were neither applied nor
+(mostly) staged, which means Postgres was free to discard WAL the pipeline
+had not delivered. The rerun protocol adds a `flow_errors` dump to the
+teardown path. Receipts: worker logs, `pg_replication_slots` deltas, minio
+`du`, code refs (avro_sync.go:57-90, flowable_core.go:799-865, cdc.go:677).
+
+**Their best config, researched for the next rerun** (all official sources):
+`PEERDB_CLICKHOUSE_PARALLEL_NORMALIZE=4-8` (the collapsed lane is SERIAL by
+default), `PEERDB_GROUP_NORMALIZE=10`, `max_batch_size` 500K-1M per their own
+guidance, flow-worker replicas (their enterprise Helm topology; compose needs
+one `container_name` line removed), `GOMEMLIMIT` in the cage,
+`wal_sender_timeout=0` + bigger `logical_decoding_work_mem` on sources. One
+limit no flag moves: their zstd+Avro staging encode is hardcoded, so the
+caged mover's per-record CPU tax stays.
 
 **apitap, the same shape, the strictest cage of the whole campaign** (6 CPU /
 2 GB total for all four processes — Part 9 ran effectively uncaged):
