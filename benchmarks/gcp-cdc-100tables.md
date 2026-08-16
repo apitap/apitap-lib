@@ -536,6 +536,61 @@ The night's harness failures are recorded in Part 9's postscript and cost
 standalone-minio bucket, ghost-rig IP poisoning, watcher-vs-retry) are now all
 encoded in the scripts.
 
+## Part 11 — the fair rerun: equal slots, equal cage, identical fresh worlds
+
+The rematch built to answer every objection to Part 10, on a fresh rig of the
+same shape. Rules: **32 replication slots per side** (PeerDB split into 8
+mirrors per shard, mirroring apitap's 8 groups); **movers capped at 6 CPU /
+2 GB — as a TOTAL, enforced and printed**: PeerDB's workers via docker
+(`NanoCpus=6000000000, Memory=2147483648`, inspected), apitap's four
+processes via one systemd slice (`apitap-race.slice`, the cage value echoed
+into the run log); **each leg starts from an identical empty world** — fresh
+destination databases, sources re-seeded to 100 rows × 100 tables, slots
+created only after the reset, each leg writing its own 100M nominal changes;
+sequential legs, never concurrent; PeerDB tuned beyond its own docs
+(sync_interval 5 s where their default is 60 and their cost guidance says
+3600+).
+
+**PeerDB, equal-slot shape: integrity failure, not slowness.** After ~5.4M
+rows landed (one shard, early), every sync flow went idle logging
+`records: 0` / "standby deadline reached, no records accumulated" while
+Postgres reported **all slots confirmed, 0 bytes behind** — and the missing
+~93M ops were nowhere: ~5% in ClickHouse (raw+final), 139 MiB in the minio
+stage, the rest unaccounted. A confirmed slot means Postgres may discard that
+WAL. Their own blog and docs were checked first (no multi-mirror guidance, no
+slot-advance semantics, no idle-mirror troubleshooting exists to have been
+misapplied). The leg was terminated by the operator after ~10 frozen minutes.
+Receipts: worker logs, `pg_replication_slots` deltas, minio `du`.
+
+**apitap, the same shape, the strictest cage of the whole campaign** (6 CPU /
+2 GB total for all four processes — Part 9 ran effectively uncaged):
+
+| | |
+|---|---|
+| applied | 90,440,401 (its own single-leg backlog — fresh slots this time) |
+| wall | **197 s including the full 400-table verification** (~120 s to applied-complete) |
+| verification | **400/400** count + sum(id) + sum(qty) |
+| rate | **459K/s incl. verify (27.5M/min) — ~750K/s to applied-complete** |
+| balance | all 4 shards within ±11% of each other, all 32 slots active |
+
+At +72 s apitap had landed 51.4M rows across all four shards evenly; at the
+same age PeerDB's default-shape leg had 4.97M on one shard.
+
+**The fair-race scoreboard, most conservative accounting available:**
+
+| configuration | outcome |
+|---|---|
+| PeerDB, its default shape (Part 10 leg P) | 53.5K ops/s, DNF at 25 min, never verified |
+| PeerDB, equal slots (this part) | ~5% delivered, WAL confirmed regardless — disqualified on integrity |
+| apitap, equal slots, 6c/2GB total | **459K/s verified 400/400** |
+
+**8.6× against PeerDB's best surviving number, using apitap's worst
+accounting** (full wall incl. verification, tightest cage). Every other
+choice widens it. Still n=1 per leg; the interleaved n≥3 pass remains the
+bar for syndication, and a PeerDB-optimization research pass (worker
+replicas, concurrency envs) is in flight so the next rerun can give them
+even more than their docs know how to ask for.
+
 ## What this rig does NOT say
 
 - **100M changes/minute was not reached, and Part 7 says it is not reachable
