@@ -481,6 +481,52 @@ resolves it. The engine should derate bootstrap fan-out from the pool size.
 (2) systemd `--scope` rejects `LimitNOFILE`; the fd headroom for large N needs
 `ulimit` inside the scope or an engine-side rlimit raise.
 
+## Part 10 — apitap vs PeerDB, same grid, same track, CDC only
+
+Head-to-head on the Part 9 shape: 4 Postgres shards (`c3-standard-22-lssd`),
+one ClickHouse (`e2-standard-32` + pd-ssd — C3 was again refused for
+capacity/quota), runner `e2-highcpu-16`. 400 tables (100×15-col per shard),
+100-row baselines, then **100M nominal changes per leg through logical
+replication slots** — both tools' slots verified live in
+`pg_replication_slots`. Sequential legs on the same machines, never
+concurrent. PeerDB fd61c0f (latest main), mirrors tuned per its docs
+(max_batch_size 1M, sync_interval 5, 8-way snapshot), its **movers given
+apitap's entire measured footprint (6 CPU / 2 GB)** while its control plane
+(Temporal, catalog, nexus, minio-on-SSD) ran uncapped — disclosed as a gift.
+Clock: writer start → destination complete.
+
+| | PeerDB (leg P) | apitap (leg A) |
+|---|---|---|
+| completed | **DNF — 25-min cap**, ~80.2M of 100M ops | **all of it — twice over**: 180,790,000 applied (its slots held BOTH legs' backlog) |
+| wall | 1,500 s (cap) | 263 s incl. full 400-table verify (~190 s to caught-up-proven) |
+| effective rate | **~53,500 ops/s** | **687K–1.13M/s** depending on accounting; most conservative 687,414/s |
+| verification | never reached | **400/400** count+sum(id)+sum(qty) |
+| mover CPU | **5.95 of 6 cores — pegged the entire leg** | ~5.4 cores, never saturated |
+| µs per change | ~28 (at the cage it filled) | ~4.4 on these E2 cores |
+| supporting cast | Temporal + catalog + nexus + minio (uncapped) | none |
+
+**apitap was 10–13× faster on the most PeerDB-favorable accounting** (its own
+full-leg wall including verification, against PeerDB's cap-truncated rate) —
+and that understates it: apitap's leg chewed both legs' backlog (~181M
+applied) while PeerDB's counted only its own, and apitap's number is verified
+row-for-row while PeerDB never reached verification. Every accounting choice
+in this table bends toward PeerDB; the gap survives all of them.
+
+Fairness disclosures per the house rules: apitap ran 4 processes × `slots=8`
+(32 walsenders); PeerDB ran its own parallelism (4 mirrors, tuned batches).
+PeerDB's two-hop staging path (worker → minio → ClickHouse pull) is its
+architecture, given the fastest disk on the rig. The 25-minute cap is the only
+truncation, and it is PeerDB's number that it truncates — extending it could
+only lower PeerDB's average (its marginal rate was falling, ~54K/s at the
+end). Single pass per tool (n=1): the rig burned five placement attempts and
+a night of capacity fights; an interleaved n≥3 rerun is the standing follow-up
+before this table goes anywhere public.
+
+The night's harness failures are recorded in Part 9's postscript and cost
+~$30 of waste; the landmines they mapped (prlimit-through-sudo, nexus auth,
+standalone-minio bucket, ghost-rig IP poisoning, watcher-vs-retry) are now all
+encoded in the scripts.
+
 ## What this rig does NOT say
 
 - **100M changes/minute was not reached, and Part 7 says it is not reachable
