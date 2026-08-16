@@ -18,6 +18,33 @@ pub(crate) struct ChConn {
     client: reqwest::Client,
 }
 
+/// `Url` hands back userinfo still percent-encoded (the crate never decodes
+/// it) — forgetting this ships `p%2Fw` as the literal password, so auth fails
+/// on exactly the passwords that needed encoding to fit in a URL at all. Same
+/// helper as the pg/my wire planes (walsender.rs / mywire.rs).
+fn pct(s: &str) -> Result<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| {
+                    Error::InvalidInput("bad percent-escape in clickhouse url userinfo".into())
+                })?;
+            out.push(h);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|_| Error::InvalidInput("clickhouse url userinfo is not valid utf-8".into()))
+}
+
 impl ChConn {
     pub(crate) fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
@@ -33,9 +60,9 @@ impl ChConn {
             user: if u.username().is_empty() {
                 "default".into()
             } else {
-                u.username().into()
+                pct(u.username())?
             },
-            password: u.password().unwrap_or("").to_string(),
+            password: pct(u.password().unwrap_or(""))?,
             database: if database.is_empty() {
                 "default".into()
             } else {
@@ -1346,6 +1373,24 @@ impl Loader for ChLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ch_url_userinfo_is_percent_decoded() {
+        // The real-world shape that found this: a password containing '/'
+        // must be sent to the server decoded, not as the %2F the URL needs.
+        let c = ChConn::parse("clickhouse+https://ch_p:H%2Fabc%40x@ch.example:443/gw").unwrap();
+        assert_eq!(c.user, "ch_p");
+        assert_eq!(c.password, "H/abc@x");
+        assert_eq!(c.base, "https://ch.example:443/");
+        assert_eq!(c.database, "gw");
+        // Encoded username too.
+        let c = ChConn::parse("clickhouse://u%40corp:p@ch.example/d").unwrap();
+        assert_eq!(c.user, "u@corp");
+        // A malformed escape mid-string refuses loudly instead of shipping
+        // garbage auth (trailing lone '%' passes through literally, same as
+        // the pg/my planes).
+        assert!(ChConn::parse("clickhouse://u:p%zzq@ch.example/d").is_err());
+    }
 
     #[test]
     fn ch_url_parses_scheme_port_and_database() {
