@@ -7,6 +7,7 @@ pub(crate) mod csvout;
 pub(crate) mod mytsv;
 pub(crate) mod mybinlog;
 pub(crate) mod mywire;
+pub(crate) mod pgbindec;
 pub(crate) mod pgcopy;
 pub(crate) mod pgoutput;
 pub(crate) mod walsender;

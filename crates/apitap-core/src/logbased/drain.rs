@@ -45,6 +45,10 @@ struct RelState {
 #[derive(Default)]
 pub(crate) struct DrainSession {
     rels: HashMap<u32, RelState>,
+    /// Column type OIDs by rel_id (every Relation seen, tracked or not) —
+    /// the schema `pgoutput::decode` needs to render `binary 'true'` tuples
+    /// back to text. Unused (empty lookups) on text-mode streams.
+    rel_oids: pgoutput::RelOids,
     /// Key-column indices by "schema.table" — later windows build their
     /// collapsers from this (no Relation message re-arrives for them).
     key_idx: HashMap<String, Vec<usize>>,
@@ -133,7 +137,7 @@ pub(crate) async fn drain(
                     break;
                 }
             }
-            Some(WalEvent::XLogData { payload, .. }) => match pgoutput::decode(&payload, in_stream.is_some())? {
+            Some(WalEvent::XLogData { payload, .. }) => match pgoutput::decode(&payload, in_stream.is_some(), &sess.rel_oids)? {
                 PgoMessage::Begin { .. } => tx_buf.clear(),
                 PgoMessage::Commit { end_lsn: e, .. } => {
                     flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
@@ -167,6 +171,10 @@ pub(crate) async fn drain(
                     sess.streams.remove(&xid);
                 }
                 PgoMessage::Relation(r) => {
+                    sess.rel_oids.insert(
+                        r.rel_id,
+                        Arc::new(r.cols.iter().map(|c| c.type_oid).collect()),
+                    );
                     let st = rel_state(&r, key_cols)?;
                     if st.tracked {
                         sess.key_idx.insert(st.table.to_string(), st.key_idx.clone());

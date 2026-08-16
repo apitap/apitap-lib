@@ -704,26 +704,53 @@ impl Walsender {
     /// decode. The threshold is deliberately kept LOW on this path (stream
     /// early = pipeline long). If the server refuses v2 (pre-14), fall back
     /// to v1 with a big work_mem so nothing spills to pg_replslot files.
+    ///
+    /// `APITAP_PG_BINARY=1` adds `binary 'true'` (PG14+) to the first
+    /// attempt: the walsender then ships `send`-format tuples instead of
+    /// running every column through its text output function. Those output
+    /// functions execute inside the ONE pegged walsender process that is the
+    /// measured per-slot ceiling (benchmarks/gcp-cdc-100tables.md Part 7);
+    /// with binary on, apitap renders the text itself (wire::pgbindec) on a
+    /// core that idles 60%+ in every receipt. Opt-in while the renderer's
+    /// type coverage is the common scalar set — an unsupported OID fails the
+    /// drain loudly, before anything is applied or confirmed.
     pub(crate) async fn start_replication(
         &mut self,
         slot: &str,
         start_lsn: u64,
         publication: &str,
     ) -> Result<()> {
-        self.simple_query("SET logical_decoding_work_mem = '64MB'").await.ok();
-        let v2 = format!(
-            "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '2', \
-             \"publication_names\" '{publication}', \"streaming\" 'true')",
-            lsn_to_string(start_lsn)
+        let binary = matches!(
+            std::env::var("APITAP_PG_BINARY").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
         );
-        if self.simple_query(&v2).await.is_err() || !self.copying {
-            self.simple_query("SET logical_decoding_work_mem = '1GB'").await.ok();
-            let v1 = format!(
-                "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '1', \
-                 \"publication_names\" '{publication}')",
+        self.simple_query("SET logical_decoding_work_mem = '64MB'").await.ok();
+        if binary {
+            let v2b = format!(
+                "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '2', \
+                 \"publication_names\" '{publication}', \"streaming\" 'true', \
+                 \"binary\" 'true')",
                 lsn_to_string(start_lsn)
             );
-            self.simple_query(&v1).await?;
+            // A refusal (pre-14 server) falls through to the text attempts —
+            // simple_query drains to ReadyForQuery, the session stays usable.
+            let _ = self.simple_query(&v2b).await;
+        }
+        if !self.copying {
+            let v2 = format!(
+                "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '2', \
+                 \"publication_names\" '{publication}', \"streaming\" 'true')",
+                lsn_to_string(start_lsn)
+            );
+            if self.simple_query(&v2).await.is_err() || !self.copying {
+                self.simple_query("SET logical_decoding_work_mem = '1GB'").await.ok();
+                let v1 = format!(
+                    "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '1', \
+                     \"publication_names\" '{publication}')",
+                    lsn_to_string(start_lsn)
+                );
+                self.simple_query(&v1).await?;
+            }
         }
         if !self.copying {
             return Err(Error::Transfer(
@@ -1129,7 +1156,9 @@ mod tests {
                 while commits < 2 {
                     match ws.next_event().await.expect("event") {
                         Some(WalEvent::XLogData { payload, .. }) => {
-                            match pgoutput::decode(&payload, false).expect("decode") {
+                            match pgoutput::decode(&payload, false, &Default::default())
+                                .expect("decode")
+                            {
                                 PgoMessage::Insert { new, .. } => {
                                     ins += 1;
                                     if new.views().any(|c| {

@@ -1,10 +1,17 @@
 //! pgoutput logical-replication message decoding (protocol version 1).
 //!
 //! The walsender delivers XLogData payloads; each payload is ONE pgoutput
-//! message. Text-mode tuples (we never pass the `binary` option): every
-//! value arrives exactly as `SELECT col::text` renders it under the
-//! session's `extra_float_digits=3` / UTC settings, which feeds apitap's
-//! existing text→typed encoders unchanged.
+//! message. Text-mode tuples by default: every value arrives exactly as
+//! `SELECT col::text` renders it under the session's UTC settings, which
+//! feeds apitap's existing text→typed encoders unchanged.
+//!
+//! With `APITAP_PG_BINARY=1` the walsender ships `binary 'true'` tuples
+//! (PG14+) and the `'b'` cells are rendered BACK to those exact text bytes
+//! here (wire::pgbindec), at decode time, using the Relation's type OIDs.
+//! Nothing downstream can tell the difference — the point is WHERE the text
+//! rendering runs: the type output functions otherwise execute inside the
+//! single pegged walsender process that is the per-slot ceiling
+//! (benchmarks/gcp-cdc-100tables.md Part 7), while apitap's core idles.
 //!
 //! Correctness contracts baked in here (learned from ape-dts and
 //! PipelineWise, see docs/design/log_based.md):
@@ -19,6 +26,14 @@
 //!   restart replays whole transactions.
 
 use crate::error::{Error, Result};
+use crate::wire::pgbindec;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Column type OIDs per relation id, harvested from Relation messages by the
+/// drain layer — the schema needed to render `binary 'true'` tuples back to
+/// text. Text-mode drains pass an empty map (nothing is ever looked up).
+pub(crate) type RelOids = HashMap<u32, Arc<Vec<u32>>>;
 
 /// One decoded pgoutput message.
 #[derive(Debug, Clone, PartialEq)]
@@ -263,10 +278,14 @@ impl<'a> Reader<'a> {
         self.pos += nul + 1;
         Ok(s)
     }
-    fn tuple(&mut self) -> Result<Tuple> {
+    fn tuple(&mut self, oids: Option<&[u32]>) -> Result<Tuple> {
         let n = self.u16()? as usize;
         let mut cells = Vec::with_capacity(n);
-        for _ in 0..n {
+        // Indices of `'b'` cells (their CellR ranges point at BINARY bytes
+        // until the rebuild below). Vec::new() never allocates until the
+        // first push, so the text-mode fast path pays nothing for this.
+        let mut bin_idx: Vec<usize> = Vec::new();
+        for i in 0..n {
             cells.push(match self.u8()? {
                 b'n' => CellR::Null,
                 b'u' => CellR::UnchangedToast,
@@ -280,7 +299,14 @@ impl<'a> Reader<'a> {
                     self.take(len)?;
                     CellR::Text(start, len as u32)
                 }
-                // 'b' (binary) can only appear if we asked for it — we don't.
+                // 'b': send-format bytes (the session passed `binary 'true'`).
+                b'b' => {
+                    let len = self.u32()? as usize;
+                    let start = self.pos as u32;
+                    self.take(len)?;
+                    bin_idx.push(i);
+                    CellR::Text(start, len as u32)
+                }
                 other => {
                     return Err(Error::Transfer(format!(
                         "pgoutput: unexpected tuple-cell kind {:?}",
@@ -289,7 +315,48 @@ impl<'a> Reader<'a> {
                 }
             });
         }
-        Ok(Tuple { frame: self.src.clone(), cells })
+        if bin_idx.is_empty() {
+            return Ok(Tuple { frame: self.src.clone(), cells });
+        }
+        // Binary tuple: rebuild an OWNED frame with every `'b'` cell rendered
+        // to its PG-text form and every `'t'` cell copied through. One
+        // allocation per row — the deliberate trade: this rendering otherwise
+        // runs inside the pegged walsender.
+        let oids = oids.ok_or_else(|| {
+            Error::Transfer(
+                "pgoutput: binary tuple for a relation whose Relation message \
+                 was never seen — protocol desync?"
+                    .into(),
+            )
+        })?;
+        if oids.len() != n {
+            return Err(Error::Transfer(format!(
+                "pgoutput: binary tuple has {n} cells but the relation \
+                 declared {} columns",
+                oids.len()
+            )));
+        }
+        let mut frame = Vec::with_capacity(self.pos);
+        let mut out_cells = Vec::with_capacity(n);
+        let mut bi = 0usize;
+        for (i, c) in cells.iter().enumerate() {
+            match *c {
+                CellR::Null => out_cells.push(CellR::Null),
+                CellR::UnchangedToast => out_cells.push(CellR::UnchangedToast),
+                CellR::Text(o, l) => {
+                    let start = frame.len() as u32;
+                    let raw = &self.src[o as usize..(o + l) as usize];
+                    if bin_idx.get(bi) == Some(&i) {
+                        bi += 1;
+                        pgbindec::render(oids[i], raw, &mut frame)?;
+                    } else {
+                        frame.extend_from_slice(raw);
+                    }
+                    out_cells.push(CellR::Text(start, frame.len() as u32 - start));
+                }
+            }
+        }
+        Ok(Tuple::from_rendered(frame, out_cells))
     }
 }
 
@@ -301,7 +368,13 @@ fn short() -> Error {
 /// `in_stream`: between StreamStart and StreamStop, DML/Relation/Type
 /// messages carry a leading Int32 xid (proto v2) — strip it before the
 /// v1-shaped body.
-pub(crate) fn decode(payload: &bytes::Bytes, in_stream: bool) -> Result<PgoMessage> {
+/// `rel_oids`: per-relation column type OIDs, consulted ONLY when a tuple
+/// carries `'b'` (binary) cells — pass an empty map for text-mode streams.
+pub(crate) fn decode(
+    payload: &bytes::Bytes,
+    in_stream: bool,
+    rel_oids: &RelOids,
+) -> Result<PgoMessage> {
     let mut r = Reader::new(payload);
     let tag = r.u8()?;
     if in_stream && matches!(tag, b'R' | b'Y' | b'I' | b'U' | b'D' | b'T') {
@@ -359,6 +432,7 @@ pub(crate) fn decode(payload: &bytes::Bytes, in_stream: bool) -> Result<PgoMessa
         }
         b'I' => {
             let rel_id = r.u32()?;
+            let oids = rel_oids.get(&rel_id).map(|a| a.as_slice());
             match r.u8()? {
                 b'N' => {}
                 other => {
@@ -368,14 +442,15 @@ pub(crate) fn decode(payload: &bytes::Bytes, in_stream: bool) -> Result<PgoMessa
                     )))
                 }
             }
-            PgoMessage::Insert { rel_id, new: r.tuple()? }
+            PgoMessage::Insert { rel_id, new: r.tuple(oids)? }
         }
         b'U' => {
             let rel_id = r.u32()?;
+            let oids = rel_oids.get(&rel_id).map(|a| a.as_slice());
             let mut old = None;
             let mut kind = r.u8()?;
             if kind == b'K' || kind == b'O' {
-                old = Some(OldImage { full: kind == b'O', tuple: r.tuple()? });
+                old = Some(OldImage { full: kind == b'O', tuple: r.tuple(oids)? });
                 kind = r.u8()?;
             }
             if kind != b'N' {
@@ -384,10 +459,11 @@ pub(crate) fn decode(payload: &bytes::Bytes, in_stream: bool) -> Result<PgoMessa
                     kind as char
                 )));
             }
-            PgoMessage::Update { rel_id, old, new: r.tuple()? }
+            PgoMessage::Update { rel_id, old, new: r.tuple(oids)? }
         }
         b'D' => {
             let rel_id = r.u32()?;
+            let oids = rel_oids.get(&rel_id).map(|a| a.as_slice());
             let kind = r.u8()?;
             if kind != b'K' && kind != b'O' {
                 return Err(Error::Transfer(format!(
@@ -397,7 +473,7 @@ pub(crate) fn decode(payload: &bytes::Bytes, in_stream: bool) -> Result<PgoMessa
             }
             PgoMessage::Delete {
                 rel_id,
-                old: OldImage { full: kind == b'O', tuple: r.tuple()? },
+                old: OldImage { full: kind == b'O', tuple: r.tuple(oids)? },
             }
         }
         b'T' => {
@@ -450,7 +526,7 @@ mod tests {
     fn begin_commit_roundtrip() {
         let b = frame(&[b"B", &7u64.to_be_bytes(), &99i64.to_be_bytes(), &5u32.to_be_bytes()]);
         assert_eq!(
-            decode(&b, false).unwrap(),
+            decode(&b, false, &RelOids::new()).unwrap(),
             PgoMessage::Begin { final_lsn: 7, commit_ts_us: 99, xid: 5 }
         );
         let c = frame(&[
@@ -461,7 +537,7 @@ mod tests {
             &99i64.to_be_bytes(),
         ]);
         assert_eq!(
-            decode(&c, false).unwrap(),
+            decode(&c, false, &RelOids::new()).unwrap(),
             PgoMessage::Commit { commit_lsn: 7, end_lsn: 8, commit_ts_us: 99 }
         );
     }
@@ -484,7 +560,7 @@ mod tests {
             &25u32.to_be_bytes(),
             &(-1i32).to_be_bytes(),
         ]);
-        let PgoMessage::Relation(r) = decode(&rel, false).unwrap() else { panic!() };
+        let PgoMessage::Relation(r) = decode(&rel, false, &RelOids::new()).unwrap() else { panic!() };
         assert_eq!(r.rel_id, 42);
         assert_eq!(r.replica_identity, b'd');
         assert!(r.cols[0].key && !r.cols[1].key);
@@ -500,7 +576,7 @@ mod tests {
             b"9",
             b"n",
         ]);
-        let PgoMessage::Insert { rel_id, new } = decode(&ins, false).unwrap() else { panic!() };
+        let PgoMessage::Insert { rel_id, new } = decode(&ins, false, &RelOids::new()).unwrap() else { panic!() };
         assert_eq!(rel_id, 42);
         assert_eq!(new.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9")), Cell::Null]);
     }
@@ -523,7 +599,7 @@ mod tests {
             b"9",
             b"u",
         ]);
-        let PgoMessage::Update { old, new, .. } = decode(&upd, false).unwrap() else { panic!() };
+        let PgoMessage::Update { old, new, .. } = decode(&upd, false, &RelOids::new()).unwrap() else { panic!() };
         let old = old.unwrap();
         assert!(!old.full);
         assert_eq!(old.tuple.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9"))]);
@@ -537,7 +613,7 @@ mod tests {
             b"t",
             &0u32.to_be_bytes(),
         ]);
-        let PgoMessage::Insert { new, .. } = decode(&ins, false).unwrap() else { panic!() };
+        let PgoMessage::Insert { new, .. } = decode(&ins, false, &RelOids::new()).unwrap() else { panic!() };
         assert_eq!(new.view(0), Cellv::Text(b""));
         assert_ne!(new.view(0), Cellv::Null);
     }
@@ -552,9 +628,46 @@ mod tests {
             &43u32.to_be_bytes(),
         ]);
         assert_eq!(
-            decode(&t, false).unwrap(),
+            decode(&t, false, &RelOids::new()).unwrap(),
             PgoMessage::Truncate { rel_ids: vec![42, 43], cascade: true, restart_identity: true }
         );
+    }
+
+    #[test]
+    fn binary_cells_render_to_the_exact_text_plane() {
+        // Insert for rel 42 (int8, text, numeric): b(int8 7), t("x"), b(numeric 1234.50).
+        let mut numeric = Vec::new();
+        numeric.extend(2u16.to_be_bytes()); // ndigits
+        numeric.extend(0i16.to_be_bytes()); // weight
+        numeric.extend(0u16.to_be_bytes()); // sign +
+        numeric.extend(2u16.to_be_bytes()); // dscale
+        numeric.extend(1234u16.to_be_bytes());
+        numeric.extend(5000u16.to_be_bytes());
+        let ins = frame(&[
+            b"I",
+            &42u32.to_be_bytes(),
+            b"N",
+            &3u16.to_be_bytes(),
+            b"b",
+            &8u32.to_be_bytes(),
+            &7i64.to_be_bytes(),
+            b"t",
+            &1u32.to_be_bytes(),
+            b"x",
+            b"b",
+            &(numeric.len() as u32).to_be_bytes(),
+            &numeric,
+        ]);
+        let mut oids = RelOids::new();
+        oids.insert(42, Arc::new(vec![20, 25, 1700]));
+        let PgoMessage::Insert { new, .. } = decode(&ins, false, &oids).unwrap() else {
+            panic!()
+        };
+        assert_eq!(new.view(0), Cellv::Text(b"7"));
+        assert_eq!(new.view(1), Cellv::Text(b"x"));
+        assert_eq!(new.view(2), Cellv::Text(b"1234.50"));
+        // Without the relation's OIDs the same payload fails loudly.
+        assert!(decode(&ins, false, &RelOids::new()).is_err());
     }
 
     #[test]
