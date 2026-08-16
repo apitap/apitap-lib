@@ -433,6 +433,54 @@ name* — the bootstrap snapshot loaded 5.2M rows where 10,000 were expected. Th
 reset now runs `pg_terminate_backend` on stray writers first and prints the
 count it killed.
 
+## Part 9 — the 100M/minute attempt: 4 sharded sources, one destination
+
+The direct assault on 100M changes/minute (1,666,667/s), built from Part 8's
+physics: one Postgres caps at ~476K/s, so the load was split across **four**
+Postgres shards (`c3-standard-22-lssd` each), drained by four apitap processes
+(`slots=8` each — 32 walsenders total) into **one** ClickHouse, 400 tables in
+four per-shard databases. The runner was `e2-highcpu-16`. Placement fought a
+region-wide Saturday-evening capacity event for hours; the destination had to
+downgrade from the planned `c3-standard-44-lssd` to `e2-standard-32` + pd-ssd —
+which turned out to decide the verdict.
+
+| | |
+|---|---|
+| applied | **180,400,000** (200M nominal, generator shortfall as always) |
+| wall (first process start → last exit) | 147 s |
+| **aggregate** | **1,227,210 changes/s = 73.6M/minute** |
+| catch-up audits | 0 rows on all four shards |
+| verification | **400/400 tables** match via `__current` |
+| apitap | ~5.4 cores, ~2 GB (4 processes; ~4.4 µs/change on E2 cores) |
+| ClickHouse | **79% of 32 E2 cores — the wall** |
+| per shard | ~307K/s vs the 443K/s the same slots=8 did against a C3 CH |
+
+**Verdict: below the 100M/min bar — and the miss belongs to the destination,
+not the architecture.** Sharding scaled exactly as designed: 2.6× the best any
+single Postgres ever did, with every row accounted for. But one E2-core
+ClickHouse absorbing ~1 GB/s of appends ran at 79% and throttled every shard
+to ~70% of its known rate. The receipt math says a C3-44 ClickHouse (the
+machine GCP refused to place that night) puts the same rig at 4 × 443K ≈
+1.77M/s — over the bar. That run awaits a night when the capacity exists;
+until it is MEASURED, 100M/min remains unproven.
+
+**What it cost to learn this** — recorded because the failures were half the
+lesson: the rig burned ~2.2 idle hours on a harness `wait`-vs-`tee` deadlock
+(the same bug fixed in Part 7's script and reintroduced in a fresh one), and
+placement was blocked for hours by, in sequence: zonal C3 exhaustion, regional
+local-SSD exhaustion, the regional `SSD_TOTAL_GB=500` quota silently counting
+pd-balanced BOOT disks, C3's refusal of pd-standard boots, and same-name
+creates racing async deletes. Every one of those now has a guard in the rig
+scripts.
+
+**Engine findings this run surfaced (both real, both filed):** (1) `slots=8`
+with `APITAP_CDC_APPLY_LANES=8` fans the BOOTSTRAP out to 64 concurrent bulk
+loads and exhausts the pinned source pool — deterministic
+`pin acquire: pool timed out` on a 16-core runner; bootstrapping with lanes=2
+resolves it. The engine should derate bootstrap fan-out from the pool size.
+(2) systemd `--scope` rejects `LimitNOFILE`; the fd headroom for large N needs
+`ulimit` inside the scope or an engine-side rlimit raise.
+
 ## What this rig does NOT say
 
 - **100M changes/minute was not reached, and Part 7 says it is not reachable
