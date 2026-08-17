@@ -85,8 +85,8 @@ No mystery: row-SQL INSERTs versus the wire format the databases
 themselves would use.
 
 **The scale race, and what it costs** (same 2.5M-event window, both
-row-verified): ape-dts catches up into pg in **45 s** to apitap's 60 s —
-an honest loss at this shape — but the resource ledger reframes it:
+row-verified): ape-dts catches up into pg in **45 s** to apitap's 60 s,
+an honest loss at this shape. The resource ledger reframes it:
 apitap's run averages **1.00 core** (measured via cgroup cpu.stat under a
 4-cpu cap; wall identical to uncapped) while ape-dts spends 8 apply
 workers. At EQUAL cpu (the 0.5-core race above) the order inverts hard
@@ -109,8 +109,8 @@ at **51-56K changes/s** with peak RSS **87-91 MB** — while the replication
 slot held up to **2,322 MB of WAL**. Falling behind costs disk in Postgres,
 not memory in the worker. All 40,000,000 rows matched per table.
 
-The MySQL binlog lane ran the identical rig **~1.5× faster on less memory** —
-82–86K changes/s at 66–67 MB peak, bootstrap 10M rows in 9.1 s — and its
+The MySQL binlog lane ran the identical rig **~1.5× faster on less memory**:
+82–86K changes/s at 66–67 MB peak, bootstrap 10M rows in 9.1 s. Its
 source-side log is about a third the size (a ROW binlog event carries the row
 image; WAL also carries full-page images).
 
@@ -250,7 +250,7 @@ the rendering (two extra scans ≈ 4 s here). The structural wins are what
 you can't buy back with separate slots: every member lands at the SAME
 LSN each window (separate slots leave each table at its own moment), one
 slot to manage instead of N retention risks, and per-run fixed cost ×1
-instead of ×N — with many small tables the ~0.3–0.5 s per-call overhead
+instead of ×N. With many small tables the ~0.3–0.5 s per-call overhead
 is the dominant term. Reproduce: `bench-cdc-multitable.sh`.
 
 ## Head-to-head 4: ingestr CDC (2026-08-02, v1.1.15)

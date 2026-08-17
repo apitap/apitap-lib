@@ -1,5 +1,18 @@
 # `apitap.read()` → Polars — the DataFrame race
 
+
+> **Update — v0.31.0 (2026-08-13).** Two read-path fixes ship in this release.
+> An **i32 offset guard** on the direct-Arrow lane: a varlen column past 2 GiB
+> in a single batch used to wrap silently to *wrong strings*; it now errors.
+> And the **auto-parallel formula was re-calibrated** — it had been tuned
+> against an engine that no longer exists, so the small tiers were running at
+> half speed (128 MB −56%, 64 MB −14%, 256 MB −8%).
+>
+> This release also carries an **audit that retracted one of our own numbers**.
+> A draft comparison had apitap 5.2× faster than polars+ADBC; the honest figure
+> is **2.6×**, and the last section on this page explains exactly why we were
+> wrong.
+
 One line against the two ways people load Postgres into DataFrames today:
 connectorx (the Rust→Arrow incumbent behind `pl.read_database_uri`) and
 `pandas.read_sql` (the default everyone suffers). Same box, same 15-column
@@ -40,7 +53,7 @@ passes it. With the RAM honest and the CPU capped instead:
 
 The streaming leg is the structural difference, not a tuning delta:
 connectorx materializes the whole result by design, so a 10M-row table
-simply does not fit a 256 MB container no matter how long you wait. apitap
+does not fit a 256 MB container no matter how long you wait. apitap
 exports a PULL-based Arrow C stream — batches decode when the consumer
 asks, memory holds the batches in flight (sized off the cgroup limit), and
 a plain `pyarrow.RecordBatchReader.from_stream(reader)` loop analyzes ten
@@ -539,7 +552,7 @@ story — 1,780 MB versus 248 MB for the identical answer.
 
 `.lazy()` already means "Rust + Arrow": apitap builds Arrow-layout buffers and
 hands them over the Arrow C stream to polars, itself a Rust/Arrow engine. What
-differs between engines is not the format — it is the MEMORY STRATEGY. polars
+differs between engines is not the format but the MEMORY STRATEGY. polars
 builds the join hash table in RAM; DuckDB manages a budget and can spill.
 
 Same lake, same join (50M × 50M on `id`, group + sum), 0.5 core, results
@@ -601,7 +614,7 @@ Checked whether the 6→8 pipe change made it worse, installs md5-verified:
 | r3 | OOM | OOM |
 
 **Not a regression** — the old calibration failed 3/3, the new one 2/3. If
-anything the new one is marginally more robust here, but neither is reliable:
+anything the new one fails a little less often, but neither is reliable:
 this workload does not fit 256 MB with either. It differs from the lazy query
 that DOES fit (6.6 s, 131 MB peak) by one thing — that one carries a
 `filter(...)` that pushes into SQL, so the server never sends the dropped rows.
@@ -758,8 +771,8 @@ expression.
 The property that matters for the small cage: `batches()` ships all 15 columns of
 a 22 GB table and still peaks at **190 MB, versus 186 MB on the 10 GB / 10M-row
 table**. Five times the data, the same memory — peak tracks the BATCH, never the
-table. That is why the tier holds; it is not a tuning result, it is the shape of
-the pipeline.
+table. That is why the tier holds. Nothing here was tuned to fit; the pipeline
+is shaped that way.
 
 Cold-cache caveat: the first leg of round 1 measured 24.2 s for the same lazy sum
 (our CPU only 6.9 s of it, 57% of quota — we idled). The 22 GB table does not stay

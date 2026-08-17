@@ -1,8 +1,8 @@
 # apitap — Google Cloud dedicated-instance benchmark
 
-A clean-room benchmark on Google Cloud: **separate machines** for the source
+A clean-room benchmark on Google Cloud: separate machines for the source
 database, the ingestion tool, and the destination database, connected over
-**private/internal IPs** (no public-internet hop in the data path). Every tool
+private/internal IPs — no public-internet hop in the data path. Every tool
 runs **uncapped** on the ingestion machine; we record wall time, average CPU,
 and peak memory for each. Every result is checksum-validated.
 
@@ -120,7 +120,7 @@ MySQL and Postgres round the `/` differently). Same 5-minute hard cap per run.
 apitap here is a **non-PGO release build of the `feat/mysql-sink` branch**
 (MySQL→MySQL isn't in the 0.5.0 PyPI wheel yet). apitap's own PGO recipe notes
 PGO is *neutral* on this 16-core class of hardware "where the databases are the
-wall", so the non-PGO build is a fair — if slightly conservative — stand-in.
+wall", so the non-PGO build is a fair, if slightly conservative, stand-in.
 
 The destination MySQL was started with `local_infile=1` (MySQL's bulk-load
 switch, off by default); `LOAD DATA LOCAL INFILE` is the only bulk path into
@@ -219,9 +219,9 @@ Round-B notes:
 
 ## Round C — 100 GB, the fast-rig question (2026-07-31)
 
-Round A asked "who is faster on equal machines"; Round C asks the follow-up the
-100 GB OVH ladder raised: **when every external wall is removed, how fast is the
-engine itself — and do the alternatives benefit from better hardware at all?**
+Round A asked who is faster on equal machines. Round C asks the follow-up the
+100 GB OVH ladder raised: strip every external wall, see how fast the engine
+itself is, and see whether the alternatives benefit from better hardware at all.
 Raw log: [gcp-round-c-raw.log](gcp-round-c-raw.log).
 
 **Rig** (same zone `us-central1-a`, internal VPC, MTU 8896, gVNIC):
@@ -246,7 +246,7 @@ source before any run counted.
 
 **~3.3 GB/s sustained** (7.7M rows/s), ~6.3 cores of the 88 busy, peak RSS
 614-736 MB. Forcing more pipes than auto's 32 made it *slower* (64 pipes:
-35.2 s; 96: 34.4 s, 1.24 GB RSS) — the clamp is calibration, not timidity; at
+35.2 s; 96: 34.4 s, 1.24 GB RSS). The clamp is calibration, not timidity; at
 3.3 GB/s the wall is the databases, not the engine.
 
 **The competitors, same rig, caps shortened at the operator's request:**
@@ -291,7 +291,7 @@ Readings:
   101 GB ÷ 2.9 GB/s ≈ 35 s + overhead lands exactly on the measured
   38.8-38.9 s (reproduced to within 0.1 s).
 - Net: in a 100 GB / half-minute pipeline, **the data mover is the cheapest
-  machine in the rack** — the databases are what you pay for. This is the
+  machine in the rack**. The databases are what you pay for. This is the
   inverse of the gigabyte-worker ELT norm.
 
 Round cost ≈ $9; all resources deleted immediately after.

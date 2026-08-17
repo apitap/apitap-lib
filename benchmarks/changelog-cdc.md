@@ -35,23 +35,23 @@ All four legs verified `500000|25000250000` against their source.
 ## What the numbers say
 
 **Changelog is free on Postgres and a 34% win on MySQL.** The mode removes real
-work — no collapse pass, no per-window key delete, one plain INSERT — but that
+work: no collapse pass, no per-window key delete, one plain INSERT. But that
 work only shows up as speed when something else isn't already the wall. The
-Postgres lane sits at **98% of its CPU quota** in both modes: it is saturated
-decoding WAL, so an apply-side saving has nowhere to land. The MySQL lane
-decodes a binlog that carries only row images, leaves ~8% of the quota unused in
-replica mode, and converts the saved apply work straight into wall time —
-113,801 vs 84,630 changes/s, at **46 MB instead of 66 MB**.
+Postgres lane sits at 98% of its CPU quota in both modes — saturated decoding
+WAL, so an apply-side saving has nowhere to land. The MySQL lane decodes a
+binlog that carries only row images, leaves ~8% of the quota unused in replica
+mode, and converts the saved apply work straight into wall time: 113,801 vs
+84,630 changes/s, at 46 MB instead of 66 MB.
 
 **What this rig can and cannot say.** 500,000 UPDATEs over 500,000 rows is ONE
-update per key — the distribution in which the replica path's collapser folds
-N events to N rows and therefore saves nothing. That is the fair worst case for
-changelog (the rival mode's main optimization has nothing to work with) and the
-fair worst case for the replica too, so the tie is real; but it is NOT evidence
-about a skewed window. Where many events hit the SAME key inside one window, the
-replica collapses them to one row and the changelog writes all of them, so the
-changelog does more destination work by design — that is what "keeps the
-history" costs. The rule this rig supports is the narrower one:
+update per key: the distribution where the replica path's collapser folds N
+events to N rows and saves nothing. That is the fair worst case for changelog
+(the rival mode's main optimization has nothing to work with) and for the
+replica too, so the tie is real. It is NOT evidence about a skewed window.
+Where many events hit the SAME key inside one window, the replica collapses
+them to one row and the changelog writes all of them — more destination work
+by design; that is what "keeps the history" costs. The rule this rig supports
+is the narrower one:
 
 > **On one-update-per-key traffic changelog is free, and it pays wherever the
 > capture plane is not already the wall.** A skewed window trades throughput for
@@ -61,10 +61,10 @@ history" costs. The rule this rig supports is the narrower one:
 
 The README and `docs/vs.md` headline **34–132K changes/s** and attribute the
 top of the range to "5-column rows". The receipt behind it is round 3
-(`ch-ingest-r3.md`): **cdc-my 11.9 s → ~7.4 s for 1M changes ≈ 135K
-changes/s** — the **MySQL** lane, on a mix that round-3's own notes describe as
-having *no update-heavy my workload*. The Postgres number in that same round is
-**~36K changes/s** on wide 15-column rows.
+(`ch-ingest-r3.md`): cdc-my 11.9 s → ~7.4 s for 1M changes ≈ 135K changes/s.
+That is the MySQL lane, on a mix that round-3's own notes describe as having
+*no update-heavy my workload*. The Postgres number in that same round is
+~36K changes/s on wide 15-column rows.
 
 Set against the two ledgers with full receipts, the range is consistent and the
 attribution was not:
@@ -100,9 +100,9 @@ analytical destinations.
 
 The measured rig has no TOASTed columns. An UPDATE that leaves an out-of-line
 column untouched omits it from the WAL, and a changelog cannot store that hole
-as NULL without blanking the column for every reader of `__current` — so the
-apply reconstructs the value, from the window itself where possible and
-otherwise from one readback per window against `__current`. Windows that
+as NULL without blanking the column for every reader of `__current`. So the
+apply reconstructs the value: from the window itself where possible, otherwise
+from one readback per window against `__current`. Windows that
 actually carry such a column therefore pay one extra destination query; windows
 that do not (every leg above) pay nothing, which is why the flag that triggers
 it is set during capture rather than probed at apply time.

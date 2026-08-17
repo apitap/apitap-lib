@@ -1,14 +1,14 @@
 # 100 tables, 15 columns, 10M and 100M changes — apitap on 1 core (2026-08-15)
 
-> **How to read this.** It is a working ledger, written round by round while
-> the campaign ran, and it keeps the rounds that failed, the theories this rig
-> refuted (two of them ours), and the money we burned on our own harness bugs.
-> If you want the result rather than the journey, jump to **Part 13** — the
-> apples-to-apples finish, both data movers caged at 6 CPU / 2 GB, PeerDB on a
-> configuration assembled from its own source. **Part 7** is where parallel
-> replication slots get their sweep, and **Part 9** is the first sharded-source
-> record. Rounds marked SUPERSEDED are kept deliberately: a ledger that only
-> shows the wins is marketing, not a measurement.
+> **How to read this.** A working ledger, written round by round while the
+> campaign ran. It keeps the failed rounds, the theories this rig refuted (two
+> of them ours), and the money we burned on our own harness bugs. If you want
+> the result rather than the journey, jump to Part 13: the apples-to-apples
+> finish, both data movers caged at 6 CPU / 2 GB, PeerDB on a configuration
+> assembled from its own source. Part 7 is where parallel replication slots
+> get their sweep; Part 9 is the first sharded-source record. Rounds marked
+> SUPERSEDED are kept on purpose. A ledger that only shows the wins is
+> marketing, not a measurement.
 
 Rig on Google Cloud, Debian 12, apitap **0.35.0 installed from PyPI**,
 ClickHouse **25.8.29.51**, PostgreSQL **16.15**. 100 tables of 15 columns
@@ -106,7 +106,7 @@ running out of room, not a property of the engine.
 **The 8-core box really was the wall.** Same workload, same cage, same code:
 94,257/s with the databases on 8 shared cores, 119,817/s with 32. And apitap's
 own CPU went UP, 0.25 → 0.55 cores, when the databases stopped starving it. A
-tool that uses more CPU while going faster was previously waiting.
+tool that uses more CPU while going faster had been waiting.
 
 **Nothing in the rig is the wall any more, and apitap still is not saturated.**
 Host 88% idle, apitap at 0.55 of the one core it was given, 169 MB of a 1 GB
@@ -199,8 +199,8 @@ which is what Part 6 was built to test.
 
 ## Part 6 — query-optimized databases: C3 compute-optimized on local NVMe
 
-The question this part exists to answer: **does buying bigger, faster databases
-buy more CDC throughput?** Every earlier part ended with apitap idle and the
+The question this part exists to answer: does buying bigger, faster databases
+buy more CDC throughput? Every earlier part ended with apitap idle and the
 databases half-used, which is an argument, not a measurement.
 
 Machine choice came from the quota API rather than from taste: C4 quota is 0 in
@@ -493,15 +493,15 @@ resolves it. The engine should derate bootstrap fan-out from the pool size.
 
 ## Part 10 — apitap vs PeerDB, same grid, same track, CDC only
 
-> **STATUS: SUPERSEDED — do not cite this round.** It is published as a record
-> of what happened, not as a result: apitap consumed through 32 replication
-> slots (8/shard) while PeerDB ran its default 4 (one mirror per shard). Our
-> own analysis says the asymmetry did not decide the outcome — PeerDB's
-> walsenders sat ~93% idle while its mover was pegged — but the house rule is
-> that the rival gets its best configuration, and PeerDB CAN be split into 8
-> mirrors per shard. An article drafted on this round was taken down for that
-> reason. The comparison that stands is **Part 13**, where both movers got the
-> same 6-CPU / 2 GB cage and PeerDB ran a configuration assembled from its own
+> **STATUS: SUPERSEDED — do not cite this round.** Published as a record of
+> what happened, not as a result. apitap consumed through 32 replication
+> slots (8/shard); PeerDB ran its default 4 (one mirror per shard). Our own
+> analysis says the asymmetry did not decide the outcome (PeerDB's walsenders
+> sat ~93% idle while its mover was pegged), but the house rule is that the
+> rival gets its best configuration, and PeerDB CAN be split into 8 mirrors
+> per shard. An article drafted on this round was taken down for that reason.
+> The comparison that stands is Part 13, where both movers got the same
+> 6-CPU / 2 GB cage and PeerDB ran a configuration assembled from its own
 > source; Part 11 records the equal-slot variant we also measured.
 
 Head-to-head on the Part 9 shape: 4 Postgres shards (`c3-standard-22-lssd`),
@@ -639,7 +639,7 @@ cage value printed into the log each time:
 
 **Both remaining theories are refuted.** Doubling memory: no effect (the
 user called this one before the measurement — the engine's ~1.8 GB usage was
-simply comfortable at either cap). Adding two cores: no effect. Within this
+comfortable at either cap). Adding two cores: no effect. Within this
 range the cage is IRRELEVANT: the engine applied its 90.44M rows in ~110 s
 of drain (~820K/s) on every rung, because the pace is set by the
 walsender + ClickHouse rhythm outside it. The rest of the ~200 s wall is
@@ -647,7 +647,7 @@ fixed overhead the clock deliberately includes: the 28 s writer overlap, the
 zero-row proving pass, and ~60-70 s of 400-table verification.
 
 The one-line version of twelve parts: try to starve this engine and it does
-not slow down; feed it more and it does not speed up — its wall has been
+not slow down; feed it more and it does not speed up. Its wall has been
 outside the process in every configuration this campaign could buy.
 
 - **100M changes/minute was not reached, and Part 7 says it is not reachable

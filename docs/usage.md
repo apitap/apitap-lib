@@ -1,6 +1,6 @@
 # apitap — usage guide
 
-apitap copies whole tables between databases, fast: one function, no config files, no
+apitap copies whole tables between databases, fast. One function, no config files, no
 pipeline DAGs. This guide covers everything the library does today. For benchmark
 methodology see [benchmarks/README.md](../benchmarks/README.md); for the architecture
 see the [README](../README.md#architecture-adding-a-database).
@@ -65,9 +65,9 @@ Table names may be schema-qualified (`public.events`, `mydb.events`); unqualifie
 Postgres names resolve through the connection's `search_path`. Materialized views
 work as Postgres sources.
 
-**Percent-encode credentials.** A URL is not a config file: a password containing
-`/`, `@`, `:`, `?` or `#` ends the userinfo early and the URL silently means
-something else — a leading `/` in a password reads as the start of the path, and
+**Percent-encode credentials.** A URL is not a config file. A password containing
+`/`, `@`, `:`, `?` or `#` ends the userinfo early and the URL quietly means
+something else: a leading `/` in a password reads as the start of the path, and
 the parser then reports a nonsense port. Build the URL with the encoder your
 language already ships:
 
@@ -132,14 +132,14 @@ never touches the existing destination table.
 
 Auto `parallel` is route-specific (measured, not guessed): Postgres→Postgres uses up
 to 8 pipes (destination COPY is writer-bound), ClickHouse destinations up to 32,
-MySQL→Postgres up to 16. The auto value is then **capped by the cgroup memory
-limit** — each pipe budgets ~10 × `chunk_bytes` plus a 40 MiB reserve, numbers
-fitted to measured whole-container peaks (benchmarks/profiling.md) — so the same
+MySQL→Postgres up to 16. The auto value is then capped by the cgroup memory
+limit. Each pipe budgets ~10 × `chunk_bytes` plus a 40 MiB reserve, numbers
+fitted to measured whole-container peaks (benchmarks/profiling.md), so the same
 code that uses 32 pipes on a big host uses 5 in a 256 MB container instead of
-getting OOM-killed. When memory (not CPU) is what limits the pipe count and
-`chunk_bytes` wasn't set explicitly, the engine also **thins the chunk to 2 MiB
-if that buys extra pipes** — measured 1.3-1.8× faster on 80-128 MB boxes. Memory
-use is `parallel × chunk_bytes`-scale regardless of table size; bytes stream with
+getting OOM-killed. When memory, not CPU, is what limits the pipe count and
+`chunk_bytes` wasn't set explicitly, the engine also thins the chunk to 2 MiB
+when that buys extra pipes — measured **1.3-1.8× faster** on 80-128 MB boxes. Memory
+use scales with `parallel × chunk_bytes`, never with table size; bytes stream with
 TCP backpressure.
 
 ### Cursor and PK-less tables
@@ -169,10 +169,10 @@ apitap.transfer("clickhouse://user:pass@src-host:8123/db",
                 table="events")
 ```
 
-ClickHouse-to-ClickHouse relays `RowBinary` untouched — the source asks for
+ClickHouse-to-ClickHouse relays `RowBinary` untouched. The source asks for
 the format the destination already eats, so no encoder runs in between:
 **10M rows server-to-server in 8.4 s, or 20.6 s at peak 125 MB inside a
-0.5 CPU / 256 MB container**, checksum-exact. Two details worth knowing:
+0.5 CPU / 256 MB container**, checksum-exact. Two details matter:
 
 - Every column is `CAST` to the type the destination will declare, because
   the widths do not round-trip (`Date` is 2 bytes on the wire but lands as
@@ -213,8 +213,8 @@ reach BigQuery/GCS until cast in a source view — the error says so.
 
 ## Multi-table transfers
 
-One call moves a list of tables — or a whole schema — through **one resource
-budget**:
+One call moves a list of tables, or a whole schema, through one resource
+budget:
 
 ```python
 apitap.transfer(src, dst, tables=["public.orders", "public.users"])
@@ -226,14 +226,14 @@ Exactly one of `table`, `tables`, `schema` picks the scope; destination tables
 keep their source names (`dest_table` is single-table only).
 
 **The budget.** A multi-table run gets exactly the pipe budget a single-table run
-would (route CPU heuristic, capped by the cgroup memory model — or your explicit
-`parallel`). Tables draw pipes from that one pool: they start **largest first**,
+would (route CPU heuristic, capped by the cgroup memory model, or your explicit
+`parallel`). Tables draw pipes from that one pool. They start largest first,
 each atomically acquires its ask (sized from the planner's row estimates), and
-the grant is **re-fitted the moment the real span count is known** — a table
+the grant is re-fitted the moment the real span count is known: a table
 that can't split (say, no integer PK on a MySQL source) hands its pipes straight
-back to the siblings, one whose stats under-estimated tops back up from whatever
-is free. Peak memory stays at the single-table ceiling — `budget × ~8×chunk +
-reserve` — whether you move 1 table or 500. Small tables take one pipe each and
+back to the siblings; one whose stats under-estimated tops back up from whatever
+is free. Peak memory stays at the single-table ceiling, `budget × ~8×chunk +
+reserve`, whether you move 1 table or 500. Small tables take one pipe each and
 overlap the big ones, so N small tables cost far less than N separate calls
 (shared connection pools, shared auth, one catalog probe).
 
@@ -259,7 +259,7 @@ actually ran with.
   relation under two spellings).
 
 **Mixing full and incremental tables.** `mode=` applies to the whole call, so
-group your tables by how they should land — one call per group, each group
+group your tables by how they should land. One call per group, each group
 moving through its own budget:
 
 ```python
@@ -311,8 +311,8 @@ apitap.transfer(src, dst, table="public.events", mode="append")
 apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_at")
 ```
 
-- **The watermark lives in `_apitap_state`, a small table in the destination
-  database** — one row per (destination table, source), holding the exact
+- **The watermark lives in `_apitap_state`**, a small table in the destination
+  database: one row per (destination table, source), holding the exact
   `max(cursor)` value of the last successful load, the mode, row count, and sync
   time. On Postgres it is written **in the same transaction** as the data, so state
   and data can never drift apart; because it lives in the destination DB it is also
@@ -398,7 +398,7 @@ apitap.transfer(
 ```
 
 How it works: data still streams into a local `MergeTree` staging table at full
-speed; apitap then creates the final table with **your** engine and moves the parts
+speed; apitap then creates the final table with your engine and moves the parts
 in with a metadata-only `ATTACH` before the atomic name swap. A `Replicated*` engine
 fans those parts out to the other replicas from there.
 
@@ -507,7 +507,7 @@ apitap.transfer("gsheets://<id>?credentials=…", dst, schema="*")
 apitap.transfer("gsheets://<id>?credentials=…", dst, tables=["Sheet1", "Q3 data"])
 ```
 
-- **Model**: the spreadsheet is the database, its **tabs are the tables**. Row 1
+- **Model**: the spreadsheet is the database; its tabs are the tables. Row 1
   is the header row and becomes the column names (blank header cells become
   `col_N`; duplicate headers fail loudly — rename them in the sheet).
 - **Auth**: the same service-account key flow as BigQuery (`?credentials=` or
@@ -868,7 +868,7 @@ apitap.transfer(
 
 ### MySQL and MariaDB sources (binlog)
 
-The same call, the same guarantees — the capture plane underneath is the binary
+Same call, same guarantees. The capture plane underneath is the binary
 log instead of the WAL, and the watermark is a `file:position` instead of an LSN:
 
 ```python
@@ -908,8 +908,8 @@ apitap.transfer(
 
 ### Parallel slots: `slots=N`
 
-Postgres decodes each replication slot inside **one** walsender process, and
-that process pegs a single core: past a certain rate the bottleneck is not
+Postgres decodes each replication slot inside one walsender process, and
+that process pegs a single core. Past a certain rate the bottleneck is not
 apitap but the server's own decoder. `slots=N` splits a multi-table group into
 N deterministic sub-groups, each with its own slot, drained concurrently:
 
@@ -936,9 +936,9 @@ apitap.transfer(src, dst, tables=tables, mode="log_based", slots=8)
 
 ### `changelog=True` — the destination as an audit trail, not a replica
 
-By default the destination is a **replica**: apitap folds each window to one
+By default the destination is a replica: apitap folds each window to one
 final image per key and updates the table in place. Pass `changelog=True` and it
-becomes an **append-only log** instead — every operation the WAL (or binlog) saw
+becomes an append-only log. Every operation the WAL (or binlog) saw
 is INSERTed, nothing is ever updated or deleted, and a companion
 `<table>__current` view derives the current state.
 
@@ -1085,7 +1085,7 @@ cap request bodies — nginx's `client_max_body_size` defaults to **1 MB**. apit
 streams each pipe's data as ONE chunked request, so the whole table part counts
 as a single body and the proxy answers `413` no matter how small the chunks are.
 When you cannot raise the limit (staging you do not own, a shared ingress), cap
-the body instead — and match `chunk_bytes` to it, because a request may only end
+the body instead, and match `chunk_bytes` to it, because a request may only end
 between whole rows:
 
 ```python
@@ -1112,7 +1112,7 @@ Postgres text-encodes every tuple *inside* the walsender — the process that is
 the per-slot ceiling. With this set, apitap asks for the binary form and renders
 the Postgres text itself, moving that work off the server: **−8.9% walsender CPU
 per million changes** measured on the same WAL drained twice. Off by default
-while the type coverage widens — arrays, `interval`, `inet` and enums are not
+while the type coverage widens: arrays, `interval`, `inet` and enums are not
 decoded yet, and rather than guess, the connection falls back to text. Nothing
 downstream changes either way; the digests matched 10/10 tables across 12.5M
 rows before this shipped.
@@ -1173,9 +1173,9 @@ Unsupported source types fail **at probe time** with the type named — never mi
 
 ## Schema changes
 
-There is nothing to configure: **every transfer re-derives the schema from the
-source**. The staging table is built from a fresh catalog probe, so added columns,
-dropped columns, renames, and type changes all propagate on the next run — the
+There is nothing to configure: every transfer re-derives the schema from the
+source. The staging table is built from a fresh catalog probe, so added columns,
+dropped columns, renames, and type changes all propagate on the next run. The
 destination is always an exact mirror of the source's current schema. (Tools that
 append into existing tables need "schema evolution" machinery; replace semantics
 make the problem disappear.)

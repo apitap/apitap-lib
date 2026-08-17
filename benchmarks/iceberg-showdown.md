@@ -1,8 +1,8 @@
 # pg → Apache Iceberg: the three-phase showdown
 
-The `iceberg://` destination's birth certificate. Not just "how fast is a full
-load" — Iceberg's whole point is incremental — so every tool ran **three
-phases against the same live Postgres**: a full load, then a 1M-row append
+The `iceberg://` destination's birth certificate. Iceberg's whole point is
+incremental, so a full-load race alone would miss it. Every tool ran three
+phases against the same live Postgres: a full load, then a 1M-row append
 delta, then a 1M-row merge delta (500k updates + 500k inserts). Every phase
 capped at **16 vCPU / 4 GB**, every result validated by reading the Iceberg
 table back and checksumming against the source.
@@ -44,8 +44,8 @@ Read-back count after merge: 11,800,000 — exactly the source.
   was OOM-killed in about a minute — and because its watermark state lived in
   a local JSON file that never got written, both incremental phases died on a
   `KeyError` before moving a byte. That contrast is the design point: apitap
-  keeps the watermark **in the Iceberg table's own properties, in the same
-  snapshot commit as the data** — there is no local state to lose.
+  keeps the watermark in the Iceberg table's own properties, in the same
+  snapshot commit as the data. There is no local state to lose.
 - **ingestr** (v1.1.15) has no Iceberg destination at all — verified by
   grepping the installed package: zero mentions.
 
@@ -72,5 +72,5 @@ Same reason as every other route: the engine never materializes the table.
 Postgres binary COPY streams through the parquet encoder into S3 multipart
 parts, ~8 MiB in flight per pipe; the Iceberg commit at the end is a few KB
 of Avro manifests plus one REST POST. Peak memory is pipes × chunk, not table
-size — the 100 GB ladder in [profiling.md](profiling.md) is the same story
+size. The 100 GB ladder in [profiling.md](profiling.md) is the same story
 with three more zeros.

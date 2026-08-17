@@ -2,7 +2,7 @@
 
 A real pipeline, not a micro-benchmark: **TPC-H SF 33.34** generated with
 DuckDB's `dbgen`, `lineitem` loaded into Postgres and `orders` into MySQL,
-then landed as a Parquet lake and joined — every stage inside a
+then landed as a Parquet lake and joined. Every stage runs inside a
 **0.5 CPU / 256 MB** container.
 
 | where | table | rows | columns |
@@ -10,9 +10,9 @@ then landed as a Parquet lake and joined — every stage inside a
 | Postgres | `lineitem` | 49,487,825 | 16 |
 | MySQL | `orders` | 49,500,000 | 9 |
 
-The question is TPC-H Q3's, minus the customer join: **revenue by order
+The question is TPC-H Q3's, minus the customer join: revenue by order
 priority, for orders placed before 1995-03-15 whose line items shipped after
-it.** Both filters are dates — which is why the lazy plane learned to
+it. Both filters are dates, which is why the lazy plane learned to
 translate date literals into SQL for this (0.26.x).
 
 ## The pipeline
@@ -74,24 +74,24 @@ the fair scoreboard, same question, identical answer on every row:
 | DuckDB, ATTACH both live databases | 16 | unlimited | 77.1 s |
 | DuckDB, raw local CSVs (no databases) | 16 | unlimited | 20.3 s |
 
-Three honest readings. **(1)** In the same cage we are ~2× faster, and the
-difference is all in the extraction path — the filters run in the servers
-and the wire carries only survivors. **(2)** DuckDB on 16 cores (77.1 s)
-ties our half core (74.5 s): the wall is the wire and the source servers,
-not compute, so 32× the CPU buys almost nothing. **(3)** The 20.3 s row is
+Three honest readings. (1) In the same cage we are ~2× faster, and the
+difference is all in the extraction path: the filters run in the servers
+and the wire carries only survivors. (2) DuckDB on 16 cores (77.1 s)
+ties our half core (74.5 s). The wall is the wire and the source servers,
+not compute, so 32× the CPU buys almost nothing. (3) The 20.3 s row is
 a different game — the data is already local files; that is the floor once
 extraction is somebody else's problem. Credit where it is due: DuckDB's
 join survives 256 MB where polars' needs 1.4 GB, which is why the lake here
 is bucketed.
 
 And the pipeline leaves something behind: a reusable 224 MB bucketed lake.
-The second question costs stage 2 only — **19.5 s** — where the direct join
+The second question costs stage 2 only, **19.5 s**, where the direct join
 pulls all 100M rows across the wire again.
 
 Filter selectivity, for scale: 49.5M lineitem rows → 26,678,288 survive the
 ship-date filter; 49.5M orders → 24,049,698 survive the order-date filter;
 only 1,237,578 line items belong to an order on both sides of the cutoff.
-The server does that arithmetic — the wire never carries the rest.
+The server does that arithmetic; the wire never carries the rest.
 
 ## Four walls, and what they teach
 
@@ -100,9 +100,9 @@ The server does that arithmetic — the wire never carries the rest.
    client-side filter and the pushdown never fired.
 2. **A 24M-key hash join costs polars ~1.4 GB** (~60 B per build row): it is
    OOM-killed in a 1 GB container, never mind 256 MB. The fix is not more
-   RAM, it is **bucketing the lake on the join key** — `CLUSTERED BY (key)
+   RAM. It is bucketing the lake on the join key — `CLUSTERED BY (key)
    INTO 16 BUCKETS`, the oldest trick in the warehouse. Each bucket pair is
-   a complete join, so the partial aggregates simply add up.
+   a complete join, so the partial aggregates just add up.
 3. **TPC-H order keys are sparse** (`(i/8)*32 + i%8`), so an arithmetic
    `% 16` collapses into 4-8 residues and the buckets come out lopsided.
    Hash the key instead — both sides hash identically, so matching rows

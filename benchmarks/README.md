@@ -1,8 +1,8 @@
 # Benchmark methodology
 
 Every number apitap publishes comes from the harness in this directory. This page
-records exactly what runs, where the numbers came from, and what they do — and do
-not — show. If anything here looks unfair, open an issue; the harness is small enough
+records what runs, where the numbers came from, and what the results do and do not
+show. If anything here looks unfair, open an issue; the harness is small enough
 to audit in one sitting.
 
 Companion write-ups in this directory:
@@ -208,8 +208,8 @@ for both tools until bumped):
 | MySQL → ClickHouse | **10.7 s** (16 pipes) | 95.0 s | 8.9× |
 | MySQL → Postgres | **19.5 s** (12 pipes) | 505.6 s | **25.9×** |
 
-Two observations: apitap's PG→PG dropped from 40.7 s (2 pipes under the 2-vCPU cap) to
-21.2 s at 8 auto pipes — the routes scale with cores; ingestr's times barely moved
+Two observations. apitap's PG→PG dropped from 40.7 s (2 pipes under the 2-vCPU cap) to
+21.2 s at 8 auto pipes: the routes scale with cores. ingestr's times barely moved
 from the 2-vCPU runs (564.8→509.2, 134.7→110.1, 107.1→95.0, 504.7→505.6) — extra
 cores don't help a mostly serial pipeline.
 
@@ -226,9 +226,9 @@ uncapped). apitap counts validated on every route:
 | MySQL → ClickHouse | **14 s** (16 pipes) | 100 s | 7.1× |
 | MySQL → Postgres | **27 s** (12 pipes) | 520 s | 19.3× |
 
-(An ops footnote in the spirit of full disclosure: the first attempt at the ingestr
-legs died because a NEIGHBORING container on the host — unrelated to either tool —
-was in a logging loop that filled the disk; the legs were re-run after cleanup.)
+(Ops footnote: the first attempt at the ingestr legs died because a NEIGHBORING
+container on the host, unrelated to either tool, was in a logging loop that filled
+the disk. The legs were re-run after cleanup.)
 
 ### Tiny box — 0.5 vCPU / 256 MB each (2026-07-11)
 
@@ -498,7 +498,7 @@ uncapped. Latest released versions; per-tool cap 40 min; per-table checksums
 | dlt 1.29.0 (default) | native `table_names=[…]` | OOM-killed at 13 s (rc 137) | >256 MB | 0/10 — nothing landed |
 | ingestr 1.1.0 | none for SQL copies — looped 10 invocations | 327 s | 194 MB | 10/10 |
 
-Can the others run tables in parallel? **dlt: yes, natively** —
+Whether the others can run tables in parallel: **dlt: yes, natively** —
 `sql_database(table_names=[…])` extracts tables through worker pools; on this
 box that same fan-out is what pushes it past 256 MB before a single row lands
 (both backends, within seconds). **ingestr: no** — `--source-table` takes one
@@ -663,8 +663,8 @@ single-object `format=csv`) — counts and `sum(id)` exact.
 The other tables here cap *everything* — tool and databases alike. This one caps
 only the **tool**: source Postgres and destination ClickHouse are ordinary
 servers, and the transfer process runs inside a container held to a fixed
-memory and CPU ceiling. That isolates the question a bounded-memory claim
-actually turns on: *how much RAM does the mover itself need?*
+memory and CPU ceiling. That isolates what a bounded-memory claim
+actually turns on: how much RAM the mover itself needs.
 
 Same protocol as everything else: one run at a time (concurrent runs distort
 each other's timings), each in a fresh container, and **the destination row
