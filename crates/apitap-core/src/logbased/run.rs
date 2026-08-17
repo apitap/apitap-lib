@@ -1065,6 +1065,20 @@ async fn drain_group(
     changelog: bool,
     budget_denom: usize,
 ) -> Result<Vec<(u64, usize)>> {
+    // How much WAL is this slot holding on the SOURCE, and is that safe?
+    //
+    // A logical slot keeps every WAL segment its consumer has not confirmed.
+    // That is the guarantee CDC is built on, and also the way apitap can hurt
+    // a production database: if the schedule stops — paused DAG, disabled cron,
+    // a table nobody drains any more — the slot keeps holding WAL until the
+    // source's disk is full. Postgres will not choose your availability over
+    // the slot's promise unless you tell it to (`max_slot_wal_keep_size`).
+    //
+    // So every run reports the number, and says something when it is large.
+    // Refusing would be wrong: a big backlog is exactly when the drain MUST
+    // run. Silence would also be wrong, which is what this used to be.
+    slot_wal_report(src, slot).await;
+
     // Reconcile against the slot before doing anything.
     let slot_row: Option<(Option<String>, bool)> = sqlx::query_as(
         "SELECT confirmed_flush_lsn::text, active FROM pg_replication_slots \
@@ -1385,4 +1399,86 @@ async fn ensure_publication(
         }
     }
     Ok(())
+}
+
+/// Print (and warn about) the WAL a slot is retaining. Best-effort: a source
+/// without permission to read `pg_replication_slots` must not fail a transfer
+/// over a diagnostic.
+async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
+    let row: Option<(Option<i64>, bool)> = sqlx::query_as(
+        "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, active \
+         FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(slot)
+    .fetch_optional(src)
+    .await
+    .ok()
+    .flatten();
+    let Some((Some(bytes), _active)) = row else {
+        return;
+    };
+    let bytes = bytes.max(0) as u64;
+    let warn_at: u64 = std::env::var("APITAP_SLOT_WAL_WARN")
+        .ok()
+        .and_then(|v| parse_size(&v))
+        .unwrap_or(4 << 30); // 4 GiB
+    if bytes >= warn_at {
+        // The cap is what turns "the disk filled up" into "the slot was
+        // invalidated" — a bounded, recoverable failure. Name it, because most
+        // servers ship with it unset.
+        let cap: Option<(String, String)> =
+            sqlx::query_as("SHOW max_slot_wal_keep_size")
+                .fetch_optional(src)
+                .await
+                .ok()
+                .flatten();
+        let cap = cap
+            .map(|(v, _)| v)
+            .or(Some("-1".into()))
+            .unwrap_or_default();
+        let unbounded = cap.trim() == "-1" || cap.trim().is_empty();
+        eprintln!(
+            "apitap ▸ WARNING slot {slot} is holding {} of WAL on the source{}. \
+             That WAL cannot be freed until this drain confirms it, so a schedule \
+             that stops holds the source's disk hostage.{}",
+            human_bytes(bytes),
+            if bytes >= warn_at * 4 { " and growing past four times the warning threshold" } else { "" },
+            if unbounded {
+                " max_slot_wal_keep_size is unlimited on this server: set it to \
+                 bound the damage (an over-cap slot is invalidated instead, which \
+                 apitap reports as slot-is-GONE and recovers from with a fresh \
+                 bootstrap)."
+            } else {
+                ""
+            }
+        );
+    } else {
+        crate::progress::note(&format!(
+            "slot {slot} retains {} of WAL",
+            human_bytes(bytes)
+        ));
+    }
+}
+
+fn parse_size(v: &str) -> Option<u64> {
+    let v = v.trim();
+    let (num, mult) = match v.chars().last() {
+        Some('K') | Some('k') => (&v[..v.len() - 1], 1u64 << 10),
+        Some('M') | Some('m') => (&v[..v.len() - 1], 1u64 << 20),
+        Some('G') | Some('g') => (&v[..v.len() - 1], 1u64 << 30),
+        _ => (v, 1),
+    };
+    num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+}
+
+fn human_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if f < K * K {
+        format!("{:.0} KB", f / K)
+    } else if f < K * K * K {
+        format!("{:.0} MB", f / (K * K))
+    } else {
+        format!("{:.1} GB", f / (K * K * K))
+    }
 }

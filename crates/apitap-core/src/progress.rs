@@ -151,6 +151,27 @@ pub(crate) fn table_done() {
     TABLES_DONE.fetch_add(1, Relaxed);
 }
 
+/// A one-off line the engine wants an operator to see, in whatever shape the
+/// environment reads: a terminal gets it on its own row above the live line, a
+/// captured pipe gets it as a timestamped `note=` record. Silent when progress
+/// is off, because a user who asked for silence meant it.
+pub(crate) fn note(msg: &str) {
+    let Some(fmt) = env_choice() else { return };
+    let mut err = std::io::stderr().lock();
+    let _ = match fmt {
+        Format::Json => writeln!(
+            err,
+            "{{\"ts\":\"{}\",\"event\":\"transfer.note\",\"note\":\"{}\"}}",
+            stamp(),
+            msg.replace('"', "'")
+        ),
+        Format::Plain => writeln!(err, "{} apitap note={msg}", stamp()),
+        // \r first so the note does not land on top of a half-written live line.
+        Format::Live => writeln!(err, "\r\x1b[Kapitap ▸ {msg}"),
+    };
+    let _ = err.flush();
+}
+
 /// CDC drains in windows; the window number says where a long catch-up is.
 pub(crate) fn next_window() {
     WINDOW.fetch_add(1, Relaxed);

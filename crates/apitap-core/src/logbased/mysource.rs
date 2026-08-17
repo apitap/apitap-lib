@@ -74,6 +74,40 @@ pub(crate) async fn master_position(
     ))
 }
 
+/// Is the binlog file our watermark points at still on the server?
+///
+/// MySQL and MariaDB purge binlogs on their own schedule
+/// (`binlog_expire_logs_seconds`, `expire_logs_days`, `PURGE BINARY LOGS`), and
+/// they do not care that a consumer still needs one. If a scheduled drain is
+/// paused longer than that retention — a paused DAG, a long weekend, a broken
+/// cron — the position we stored is simply gone. The server then answers
+/// COM_BINLOG_DUMP with error 1236, whose text ("Could not find first log file
+/// name in binary log index file") says nothing about what a user should do,
+/// and the honest answer is that the change stream has a HOLE: the only correct
+/// recovery is a fresh bootstrap, not a resume.
+///
+/// This is the mirror image of the Postgres risk. A Postgres slot keeps WAL
+/// until it is consumed, so an abandoned consumer threatens the source's DISK.
+/// MySQL keeps nothing, so an abandoned consumer threatens the DATA.
+pub(crate) async fn binlog_file_present(pool: &sqlx::MySqlPool, file: &str) -> Result<bool> {
+    // SHOW BINARY LOGS lists Log_name plus File_size (and Encrypted on newer
+    // servers), so bind by name and read the first column only.
+    use sqlx::Row;
+    let rows = sqlx::query("SHOW BINARY LOGS")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("SHOW BINARY LOGS: {e}")))?;
+    // An empty listing means the privilege is missing rather than that no logs
+    // exist (log_bin=ON is already checked); do not turn that into a refusal.
+    if rows.is_empty() {
+        return Ok(true);
+    }
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>(0).ok())
+        .any(|name| name == file))
+}
+
 /// Refuse loudly the server settings that would silently corrupt a CDC
 /// stream, instead of decoding garbage.
 pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {

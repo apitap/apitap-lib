@@ -178,6 +178,15 @@ where
     // Position 4 is the first event after a file's magic header.
     let start_pos = pos.max(4);
 
+    // Resuming into a purged binlog is a HOLE, not a hiccup: check before
+    // asking the server, so the user gets the reason and the remedy instead of
+    // MySQL's error 1236.
+    if start > 0 && !mysource::binlog_file_present(pool, &start_file).await? {
+        return Err(Error::InvalidInput(format!(
+            "log_based: the binlog this run must resume from ({start_file},              position {start_pos}) is no longer on the server — it was purged              by the server's own retention (binlog_expire_logs_seconds /              expire_logs_days / PURGE BINARY LOGS) while this table was not              being drained. Every change between that position and now is gone              from the log, so resuming would skip them silently. Recovery is a              fresh bootstrap: clear this table's apitap state on the              destination and re-run. To prevent it, keep binlog retention              longer than the longest gap between runs."
+        )));
+    }
+
     let mut w = MyWire::connect(src_url).await?;
     w.binlog_dump(replica_id(group_seed), &start_file, start_pos, 5)
         .await?;
