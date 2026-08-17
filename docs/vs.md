@@ -46,6 +46,28 @@ ape-dts's 8 apply workers take the pg-destination cell (45 s vs 60 s) —
 while apitap averages **1.00 measured core**. Parallel apply is on the
 roadmap; the per-core efficiency gap (~8×) is the durable part.
 
+## CDC at fleet scale: apitap vs PeerDB, same cage, same workload
+
+A 180.44-million-change workload out of four sharded Postgres into one
+ClickHouse, both movers hard-capped at **6 CPUs / 2 GB total** (cgroup receipts
+in the logs), both running their own best configuration — PeerDB's assembled by
+reading its source at the commit under test, not just its docs.
+
+| | apitap | PeerDB (best config) |
+|---|---|---|
+| outcome | **complete, 400/400 tables verified** | **DNF** — frozen at ~89% when the 30-minute cap fell |
+| apply work | **125 s** (1.44M changes/s) | 1,800 s and counting, ~125K ops/s at peak |
+| mover CPU | ~4.5 of 6 — never saturated | 5.9 of 6 — pegged the whole run |
+| CPU per change | **~3 µs** | ~47 µs |
+| deployment | `pip install apitap`, one process | 7 services + an S3/MinIO stage |
+
+The efficiency gap is the durable claim: to match 125 seconds, PeerDB's mover
+would need roughly 68 cores. Disclosures — n=1 per leg, slot counts differ (32
+vs 4, each side's measured-best shape; the equal-slot variant was measured too
+and did worse), PeerDB's control plane ran uncapped and free. Every round,
+including the ones that refuted our own theories, is in
+[the 13-part ledger](../benchmarks/gcp-cdc-100tables.md).
+
 ## apitap vs Debezium vs Flink CDC — different leagues, honestly
 
 The comparison above is against tools that do the same job. Debezium and

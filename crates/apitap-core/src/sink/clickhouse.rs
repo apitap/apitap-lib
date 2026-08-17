@@ -174,6 +174,21 @@ impl ChConn {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            // 413 is never ClickHouse itself — it is a reverse proxy in front of
+            // it (nginx `client_max_body_size`, an ALB/ingress body limit).
+            // apitap streams one chunked request per worker, so the whole table
+            // part counts as one body; the fix is to cap the body, not the chunk.
+            if status.as_u16() == 413 {
+                return Err(Error::Transfer(format!(
+                    "clickhouse {status}: a proxy in front of ClickHouse refused the \
+                     request body. apitap streams each worker's data as ONE chunked \
+                     request, so a body limit (nginx client_max_body_size, ingress/ALB \
+                     caps) rejects it regardless of chunk size. Either raise that limit, \
+                     or set APITAP_CH_MAX_BODY=<size below the limit, e.g. 512K> plus a \
+                     matching chunk_bytes= to split the load across requests. Proxy said: {}",
+                    body.trim()
+                )));
+            }
             return Err(Error::Transfer(format!(
                 "clickhouse {status}: {}",
                 body.trim()
@@ -181,6 +196,32 @@ impl ChConn {
         }
         Ok(())
     }
+}
+
+/// Per-request body cap in bytes, from `APITAP_CH_MAX_BODY` (0 = unlimited, the
+/// default). Accepts plain bytes or a `K`/`M`/`G` suffix — `512K`, `8M`. Set it
+/// when ClickHouse sits behind a proxy that limits request bodies; the loader
+/// then finishes the current INSERT and opens another once the cap is reached.
+/// Splitting is safe because every format the CH sink accepts (RowBinary,
+/// TabSeparated) is record-aligned per the `Loader` contract, so a request only
+/// ever ends between whole rows — never inside one.
+fn max_body_bytes() -> u64 {
+    let Ok(raw) = std::env::var("APITAP_CH_MAX_BODY") else {
+        return 0;
+    };
+    let raw = raw.trim();
+    let (digits, mult) = match raw.chars().last() {
+        Some('K') | Some('k') => (&raw[..raw.len() - 1], 1u64 << 10),
+        Some('M') | Some('m') => (&raw[..raw.len() - 1], 1u64 << 20),
+        Some('G') | Some('g') => (&raw[..raw.len() - 1], 1u64 << 30),
+        _ => (raw, 1),
+    };
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(mult))
+        .unwrap_or(0)
 }
 
 /// `` ` ``-quote a ClickHouse identifier.
@@ -1315,16 +1356,53 @@ impl crate::sink::Sink for ChSink {
 pub(crate) struct ChLoader {
     tx: futures::channel::mpsc::Sender<std::io::Result<bytes::Bytes>>,
     join: tokio::task::JoinHandle<Result<()>>,
+    /// Kept so the loader can open a SECOND request when a body cap is set.
+    ch: ChConn,
+    insert_sql: String,
+    cap: u64,
+    sent: u64,
 }
 
 impl ChLoader {
     fn open(ch: ChConn, insert_sql: String) -> Self {
+        let (tx, join) = Self::spawn_request(ch.clone(), insert_sql.clone());
+        Self { tx, join, ch, insert_sql, cap: max_body_bytes(), sent: 0 }
+    }
+
+    fn spawn_request(
+        ch: ChConn,
+        insert_sql: String,
+    ) -> (
+        futures::channel::mpsc::Sender<std::io::Result<bytes::Bytes>>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
         let (tx, rx) = futures::channel::mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
         let join = tokio::spawn(async move {
             let body = reqwest::Body::wrap_stream(rx);
             ch.insert_stream(&insert_sql, body).await
         });
-        Self { tx, join }
+        (tx, join)
+    }
+
+    /// Close the in-flight request cleanly (ClickHouse commits what it received)
+    /// and open a fresh one for the rest of the stream. Only reached when
+    /// `APITAP_CH_MAX_BODY_MB` is set — see [`max_body_bytes`]. The split is
+    /// invisible downstream: bulk loads stream into a staging table that is
+    /// swapped in atomically, and a CDC window re-deletes its keys before
+    /// re-inserting, so a failure between requests replays cleanly.
+    async fn roll(&mut self) -> Result<()> {
+        let (tx, join) = Self::spawn_request(self.ch.clone(), self.insert_sql.clone());
+        let old_tx = std::mem::replace(&mut self.tx, tx);
+        let old_join = std::mem::replace(&mut self.join, join);
+        drop(old_tx); // clean end-of-body: this request commits
+        match old_join.await {
+            Ok(Ok(())) => {
+                self.sent = 0;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(Error::Transfer(format!("join: {e}"))),
+        }
     }
 
     async fn real_error(join: &mut tokio::task::JoinHandle<Result<()>>) -> Error {
@@ -1340,6 +1418,29 @@ impl Loader for ChLoader {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         use futures::SinkExt;
+        // Roll BEFORE the buffer that would cross the cap, never inside one: the
+        // Loader contract guarantees these buffers end on a row boundary, and a
+        // request that ended mid-row would be silent corruption.
+        if self.cap > 0 {
+            if buf.len() as u64 > self.cap {
+                // One buffer alone exceeds the cap. Sending it would blow the
+                // proxy limit the cap exists to respect, and splitting it would
+                // cut a row in half — so refuse, and name the other knob.
+                return Err(Error::InvalidInput(format!(
+                    "APITAP_CH_MAX_BODY is {} bytes but one pipeline buffer is {} \
+                     bytes, and a request can only end between whole rows. Pass \
+                     chunk_bytes={} (or smaller) to transfer() so each buffer fits \
+                     the cap.",
+                    self.cap,
+                    buf.len(),
+                    self.cap
+                )));
+            }
+            if self.sent > 0 && self.sent + buf.len() as u64 > self.cap {
+                self.roll().await?;
+            }
+        }
+        self.sent += buf.len() as u64;
         if self.tx.send(Ok(bytes::Bytes::from(buf))).await.is_err() {
             // The insert died — its task holds the real error.
             return Err(Self::real_error(&mut self.join).await);
@@ -1348,7 +1449,7 @@ impl Loader for ChLoader {
     }
 
     async fn finish(self) -> Result<u64> {
-        let Self { tx, mut join } = self;
+        let Self { tx, mut join, .. } = self;
         drop(tx); // clean end-of-body: ClickHouse commits the insert
         match (&mut join).await {
             Ok(r) => r.map(|_| 0), // rows counted server-side by the sink
@@ -1358,9 +1459,11 @@ impl Loader for ChLoader {
 
     async fn abort(self, cause: Error) -> Error {
         use futures::SinkExt;
-        let Self { mut tx, join } = self;
+        let Self { mut tx, join, .. } = self;
         // Erroring the body aborts the HTTP request, so ClickHouse DISCARDS the
-        // partial stream instead of committing it.
+        // partial stream instead of committing it. With a body cap set, earlier
+        // requests have already committed — the staging table they filled is
+        // dropped by the caller's cleanup, and a CDC window replays its delete.
         let _ = tx
             .send(Err(std::io::Error::other("apitap: source failed")))
             .await;

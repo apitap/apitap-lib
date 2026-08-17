@@ -284,12 +284,36 @@ existing publication must be checked for *membership*, not existence — a
 dropped-and-recreated source table silently empties it. Both fixed, both
 now covered by `e2e_logbased_capped.sh`.
 
+## Since this ledger was written
+
+This page is the founding record — one slot, one box, the daemon races. Three
+things have changed the shape of the lane since, each with its own receipts:
+
+- **Parallel slots (`slots=N`, v0.36.0).** One Postgres slot is decoded by one
+  walsender process on one core, and that is the ceiling this ledger's numbers
+  eventually hit. Splitting a table group across N slots took 100 tables ×
+  100M changes from 178K to 476K changes/s (N=1 → 16, knee at 4–8) and a
+  four-shard rig to **1.44M changes/s — 180.44M changes applied in 125 s,
+  400/400 tables verified**. Full campaign, misses included:
+  [gcp-cdc-100tables.md](gcp-cdc-100tables.md).
+- **MariaDB sources (v0.38.0).** MariaDB 10.x is not MySQL on this wire — v1
+  rows events, GTID-as-transaction-start, `ANNOTATE_ROWS` frames, a four-column
+  `SHOW MASTER STATUS` — and all four are handled now. Correctness receipts:
+  `e2e_mariadb_cdc.py` (every operation class, PK-changing update, multi-
+  statement transaction, changelog mode, 20,000 changes in one drain, counts
+  and summed cents identical).
+- **Unknown binlog events are refused, not skipped (v0.38.0).** The reader used
+  to silently drop any event code it had not been taught. It now stops and
+  names the code — a skipped event is data that never arrives and never
+  reports.
+
 ## Reproduce
 
 ```bash
 # correctness (pg | ch | my | ice)
 APITAP_DEBUG=1 python e2e_logbased.py
 APITAP_DEBUG=1 python e2e_logbased_dests.py ch
+python e2e_mariadb_cdc.py         # MariaDB 10.6 binlog → ClickHouse
 
 # the races
 bash bench-cdc-showdown.sh        # vs ape-dts

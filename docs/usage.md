@@ -52,7 +52,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | database | scheme | notes |
 |---|---|---|
 | Postgres | `postgres://` or `postgresql://` | standard DSN: `postgres://user:pass@host:5432/db` |
-| MySQL | `mysql://` | `mysql://user:pass@host:3306/db` — MySQL 8 negotiates TLS by default; on a trusted network add `?ssl-mode=disabled` (measured: −20% wall on a 10M-row transfer — the whole stream otherwise pays AES-GCM). |
+| MySQL / MariaDB | `mysql://` | `mysql://user:pass@host:3306/db` — MySQL 8 negotiates TLS by default; on a trusted network add `?ssl-mode=disabled` (measured: −20% wall on a 10M-row transfer — the whole stream otherwise pays AES-GCM). MariaDB 10.x is a first-class source, CDC included (see [Batch CDC](#batch-cdc-modelog_based)). |
 | ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. Also works as a **source** into ClickHouse — see [ClickHouse source](#clickhouse-source-ch--ch). |
 | Google Sheets (source) | `gsheets://` | `gsheets://<spreadsheet_id>?credentials=/path/key.json` — the id from the sheet's URL. See [Google Sheets source](#google-sheets-source). |
 | GitHub (source) | `github://` | `github://<owner>/<repo>[/dir]?ref=main` — CSV files as tables. See [GitHub source](#github-source-csv-files-as-tables). |
@@ -65,9 +65,24 @@ Table names may be schema-qualified (`public.events`, `mydb.events`); unqualifie
 Postgres names resolve through the connection's `search_path`. Materialized views
 work as Postgres sources.
 
+**Percent-encode credentials.** A URL is not a config file: a password containing
+`/`, `@`, `:`, `?` or `#` ends the userinfo early and the URL silently means
+something else — a leading `/` in a password reads as the start of the path, and
+the parser then reports a nonsense port. Build the URL with the encoder your
+language already ships:
+
+```python
+from urllib.parse import quote
+pw = quote(os.environ["DB_PASS"], safe="")     # safe="" — the default leaves '/' raw
+url = f"clickhouse+https://user:{pw}@ch.example:443/analytics"
+```
+
+apitap decodes the userinfo back before authenticating, so the server sees the
+real password on every route.
+
 ## API
 
-### `apitap.transfer(src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=True, mode="replace", engine=None, order_by=None, on_cluster=None) -> TransferReport`
+### `apitap.transfer(src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=True, mode="replace", engine=None, order_by=None, on_cluster=None, partition_by=None, changelog=False, slots=None) -> TransferReport`
 
 | parameter | default | meaning |
 |---|---|---|
@@ -82,6 +97,9 @@ work as Postgres sources.
 | `engine` | `MergeTree` | ClickHouse destinations only — see [ClickHouse table engines](#clickhouse-table-engines) |
 | `order_by` | cursor | ClickHouse destinations only — `ORDER BY` of the created table |
 | `on_cluster` | — | ClickHouse destinations only — run the table DDL `ON CLUSTER` |
+| `partition_by` | auto | ClickHouse/BigQuery changelog tables — the column to partition on, or a `{table: column}` map. See [`changelog=True`](#changelogtrue--the-destination-as-an-audit-trail-not-a-replica) |
+| `changelog` | `False` | `mode="log_based"` only — keep every operation instead of collapsing to the final image. See [`changelog=True`](#changelogtrue--the-destination-as-an-audit-trail-not-a-replica) |
+| `slots` | `1` | `mode="log_based"` multi-table groups only — split the group across N replication slots drained in parallel. See [Parallel slots](#parallel-slots-slotsn) |
 
 ### `TransferReport`
 
@@ -753,7 +771,7 @@ SELECT count(*) FROM iceberg_scan('s3://lake/wh/analytics/events/metadata/<lates
 `metadata-location`.) For production, point the same URL at Lakekeeper,
 Polaris, Nessie, Glue or R2 — only `warehouse=`/`base=`/`token=` change.
 
-## Batch CDC: `mode="log_based"` (Postgres sources)
+## Batch CDC: `mode="log_based"`
 
 Everything the WAL saw — inserts, updates (primary-key changes included),
 deletes, TRUNCATEs — delivered to the destination in scheduled batch runs,
@@ -805,8 +823,8 @@ apitap.transfer(
   key columns outside the replica identity fail with the exact `ALTER
   TABLE` to run. The replication connection speaks plain TCP for now
   (`sslmode` beyond disable/prefer is refused, not ignored).
-- **Scope today**: Postgres and MySQL sources → **Postgres, ClickHouse, MySQL,
-  BigQuery and Iceberg** destinations. Iceberg needs a single-column primary key
+- **Scope today**: Postgres, MySQL and MariaDB sources → **Postgres,
+  ClickHouse, MySQL, BigQuery and Iceberg** destinations. Iceberg needs a single-column primary key
   (equality-delete files are single-key), and the parquet lane's bytea
   restriction applies there as everywhere else. BigQuery lands each window in a
   staging table and applies one `MERGE` — it needs a project with billing
@@ -847,6 +865,74 @@ apitap.transfer(
   Budget one transaction's whole row data in RAM: a single 500K-row
   transaction measured a 307 MB peak (needs the 512 MB tier); normal-sized
   transactions fit the smallest containers.
+
+### MySQL and MariaDB sources (binlog)
+
+The same call, the same guarantees — the capture plane underneath is the binary
+log instead of the WAL, and the watermark is a `file:position` instead of an LSN:
+
+```python
+apitap.transfer(
+    "mysql://user:pass@src:3306/shop",      # MySQL 5.7/8.0 or MariaDB 10.x
+    "clickhouse+https://user:pass@wh:443/analytics",
+    table="bank_transfer",
+    mode="log_based",
+)
+```
+
+- **Server settings, checked before anything moves**: `log_bin=ON`,
+  `binlog_format=ROW`, and `binlog_row_image=FULL`. The last one matters more
+  than it looks: `MINIMAL`/`NOBLOB` omit the primary key and unchanged columns
+  from the after-image, so an UPDATE cannot be tied back to a row — that is
+  wrong data rather than an error, which is why apitap refuses instead of
+  guessing. MySQL's `binlog_transaction_compression` and MariaDB's
+  `log_bin_compress` are refused for the same reason: those are binlog
+  encodings apitap does not decode.
+- **Reading from a replica** (the usual case — you do not point CDC at the
+  primary): the replica needs `log_slave_updates=ON`, or its binlog never
+  contains the primary's changes.
+- **Grants**: the connecting user needs `REPLICATION SLAVE`, `REPLICATION
+  CLIENT` and `SELECT` — `SELECT` because the first run bootstraps a full load,
+  the replication grants because every later run attaches as a replica.
+- **MariaDB is not "MySQL-compatible" on this wire, and apitap speaks its
+  dialect**: 10.x still writes the v1 rows events MySQL retired in 5.6, opens
+  each transaction with a GTID event instead of a `BEGIN` statement,
+  interleaves `ANNOTATE_ROWS` frames, and answers `SHOW MASTER STATUS` with
+  four columns instead of five. All four are handled; nothing about the call
+  changes.
+- **An event apitap does not understand stops the run — it is never skipped.**
+  A skipped binlog event is data that silently never arrives, so the reader
+  refuses and names the event code (MySQL 8's partial-JSON row events,
+  compressed rows, and `INCIDENT` — the master's own admission that it lost
+  events — all land here). Please report any code you hit.
+
+### Parallel slots: `slots=N`
+
+Postgres decodes each replication slot inside **one** walsender process, and
+that process pegs a single core: past a certain rate the bottleneck is not
+apitap but the server's own decoder. `slots=N` splits a multi-table group into
+N deterministic sub-groups, each with its own slot, drained concurrently:
+
+```python
+apitap.transfer(src, dst, tables=tables, mode="log_based", slots=8)
+```
+
+- The split is by sorted table name into contiguous chunks, so the same
+  argument always produces the same grouping. **Changing `N` renames the slots**
+  — the run refuses loudly rather than silently starting fresh slots and losing
+  the WAL the old ones were holding.
+- Each group keeps every guarantee a single group has: snapshot-pinned
+  bootstrap, atomic apply-with-watermark, group-wide confirmation. Tables in
+  *different* groups are no longer at the same instant as each other — that is
+  the trade you are making for the throughput.
+- The memory budget is divided by `N`, so peak RSS does not scale with slots.
+- Measured on a 44-core Postgres, 100 tables, 100M changes per round:
+  178K/391K/443K/476K changes per second at `N=1/4/8/16`. The knee is at 4–8;
+  going 8→16 bought 7.5% for twice the source CPU. One Postgres tops out around
+  **28.6M changes/minute** no matter the slot count — past that you shard the
+  source, not the slots ([the ledger](https://github.com/apitap/apitap-lib/blob/main/benchmarks/gcp-cdc-100tables.md)).
+- Single-table transfers and the bulk modes reject `slots` — it is a
+  group-drain knob, and silently ignoring it would be a lie.
 
 ### `changelog=True` — the destination as an audit trail, not a replica
 
@@ -981,6 +1067,55 @@ recovery. Use it for rebuildable data, then optionally:
 ```sql
 ALTER TABLE public.events SET LOGGED;   -- restore crash-durability after the load
 ```
+
+## Environment knobs
+
+Every default is chosen from measurement; these exist for environments the
+defaults cannot see. None of them change what lands — only how it gets there.
+
+| variable | default | what it is for |
+|---|---|---|
+| `APITAP_CH_MAX_BODY` | unset (one request per pipe) | **ClickHouse behind a proxy.** Caps each HTTP request body; accepts bytes or a `K`/`M`/`G` suffix. |
+| `APITAP_PG_BINARY` | `0` | **Postgres CDC.** Asks the walsender for binary `pgoutput` and renders the text in apitap instead. |
+
+### ClickHouse behind a reverse proxy (`413 Payload Too Large`)
+
+A corporate ClickHouse is usually reached through nginx or an ingress, and those
+cap request bodies — nginx's `client_max_body_size` defaults to **1 MB**. apitap
+streams each pipe's data as ONE chunked request, so the whole table part counts
+as a single body and the proxy answers `413` no matter how small the chunks are.
+When you cannot raise the limit (staging you do not own, a shared ingress), cap
+the body instead — and match `chunk_bytes` to it, because a request may only end
+between whole rows:
+
+```python
+import os, apitap
+os.environ["APITAP_CH_MAX_BODY"] = "512K"          # stay under the proxy's limit
+
+apitap.transfer(SRC, "clickhouse+https://user:pass@ch.example:443/analytics",
+                table="bank_transfer", mode="replace",
+                chunk_bytes=256 * 1024)            # ≤ the cap
+```
+
+The loader then ends the current INSERT and opens another each time the cap is
+reached. Correctness is unchanged (bulk loads still stage and swap atomically;
+a CDC window still re-deletes its keys before re-inserting, so a failure between
+requests replays cleanly), but you are paying one HTTP round-trip per cap's
+worth of data — raising the proxy limit is still the faster answer when the
+people who own it will do it. Set the cap smaller than the limit but larger than
+`chunk_bytes`; if a single buffer cannot fit, apitap refuses and prints the
+exact `chunk_bytes` to pass rather than sending an oversized body.
+
+### Binary `pgoutput` (`APITAP_PG_BINARY=1`)
+
+Postgres text-encodes every tuple *inside* the walsender — the process that is
+the per-slot ceiling. With this set, apitap asks for the binary form and renders
+the Postgres text itself, moving that work off the server: **−8.9% walsender CPU
+per million changes** measured on the same WAL drained twice. Off by default
+while the type coverage widens — arrays, `interval`, `inet` and enums are not
+decoded yet, and rather than guess, the connection falls back to text. Nothing
+downstream changes either way; the digests matched 10/10 tables across 12.5M
+rows before this shipped.
 
 ## Type mappings
 
