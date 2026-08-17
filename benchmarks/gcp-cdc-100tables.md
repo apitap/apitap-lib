@@ -1,5 +1,15 @@
 # 100 tables, 15 columns, 10M and 100M changes — apitap on 1 core (2026-08-15)
 
+> **How to read this.** It is a working ledger, written round by round while
+> the campaign ran, and it keeps the rounds that failed, the theories this rig
+> refuted (two of them ours), and the money we burned on our own harness bugs.
+> If you want the result rather than the journey, jump to **Part 13** — the
+> apples-to-apples finish, both data movers caged at 6 CPU / 2 GB, PeerDB on a
+> configuration assembled from its own source. **Part 7** is where parallel
+> replication slots get their sweep, and **Part 9** is the first sharded-source
+> record. Rounds marked SUPERSEDED are kept deliberately: a ledger that only
+> shows the wins is marketing, not a measurement.
+
 Rig on Google Cloud, Debian 12, apitap **0.35.0 installed from PyPI**,
 ClickHouse **25.8.29.51**, PostgreSQL **16.15**. 100 tables of 15 columns
 (~600 B/row: bigint PK, varchar, smallint/int/bigint, numeric(12,2),
@@ -483,14 +493,16 @@ resolves it. The engine should derate bootstrap fan-out from the pool size.
 
 ## Part 10 — apitap vs PeerDB, same grid, same track, CDC only
 
-> **STATUS: NOT FOR PUBLICATION — superseded pending a fair rerun.** apitap
-> consumed through 32 replication slots (8/shard); PeerDB ran its default 4
-> (one mirror per shard). Our own analysis says the asymmetry did not decide
-> the outcome (PeerDB's walsenders sat ~93% idle while its mover was pegged),
-> but the house rule is the rival gets its best configuration, and PeerDB CAN
-> be split into 8 mirrors per shard. Until the 32-vs-32, n≥3 interleaved rerun
-> is measured, this part is a record of what happened, not a comparison we
-> publish. A drafted article was withdrawn from apitap.dev on this basis.
+> **STATUS: SUPERSEDED — do not cite this round.** It is published as a record
+> of what happened, not as a result: apitap consumed through 32 replication
+> slots (8/shard) while PeerDB ran its default 4 (one mirror per shard). Our
+> own analysis says the asymmetry did not decide the outcome — PeerDB's
+> walsenders sat ~93% idle while its mover was pegged — but the house rule is
+> that the rival gets its best configuration, and PeerDB CAN be split into 8
+> mirrors per shard. An article drafted on this round was taken down for that
+> reason. The comparison that stands is **Part 13**, where both movers got the
+> same 6-CPU / 2 GB cage and PeerDB ran a configuration assembled from its own
+> source; Part 11 records the equal-slot variant we also measured.
 
 Head-to-head on the Part 9 shape: 4 Postgres shards (`c3-standard-22-lssd`),
 one ClickHouse (`e2-standard-32` + pd-ssd — C3 was again refused for
