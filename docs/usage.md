@@ -1106,6 +1106,39 @@ people who own it will do it. Set the cap smaller than the limit but larger than
 `chunk_bytes`; if a single buffer cannot fit, apitap refuses and prints the
 exact `chunk_bytes` to pass rather than sending an oversized body.
 
+### ClickHouse clusters behind a load balancer (`on_cluster=`)
+
+If the URL points at a balancer in front of several nodes, every request may
+land on a different one. That breaks any multi-statement plan: apitap creates a
+staging table, streams into it, then swaps it in. Node-local staging means the
+`CREATE` and the `INSERT` can reach different servers, which surfaces as
+`TABLE_ALREADY_EXISTS` or `UNKNOWN_TABLE` from a table you never touched. If
+your database engine is `Atomic` (the default), DDL does not replicate on its
+own.
+
+Name the cluster and apitap makes every step cluster-wide:
+
+```python
+apitap.transfer(SRC, "clickhouse+https://user:pass@lb.example:443/analytics",
+                table="bank_transfer", dest_table="bank_transfer_apitap",
+                mode="replace",
+                engine="ReplicatedMergeTree", on_cluster="my_cluster")
+```
+
+Staging DDL runs `ON CLUSTER` with your Replicated engine, so any node accepts
+any insert; the swap is an `ON CLUSTER` exchange rather than a part attach; and
+`_apitap_state` becomes `ReplicatedReplacingMergeTree` so the watermark is one
+truth rather than one per node. Before reading or swapping, apitap waits for
+every replica to have every part (`SYSTEM SYNC REPLICA ON CLUSTER`) — without
+that wait, dropping the staging name cancels in-flight fetches and a replica
+silently keeps a subset.
+
+Two limits worth knowing: `mode="append"` with `on_cluster` is refused (its
+finalize attaches parts on whichever node answers, which may be a replica
+missing some), and an engine spelled with an explicit ZooKeeper path is refused
+for staging — use the path-less spelling so ClickHouse mints a unique path per
+table. Both refusals happen before any data moves.
+
 ### Binary `pgoutput` (`APITAP_PG_BINARY=1`)
 
 Postgres text-encodes every tuple *inside* the walsender — the process that is
