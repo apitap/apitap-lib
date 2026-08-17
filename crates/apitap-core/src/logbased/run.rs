@@ -889,7 +889,12 @@ async fn run_group_mysql(
                         )
                         .await?;
                     acc.set(acc.get() + n);
+                    crate::progress::add_rows(n);
                 }
+                // A long catch-up drains window after window; the number says
+                // which one is running, so a stalled run is distinguishable
+                // from a slow one.
+                crate::progress::next_window();
                 if dbg {
                     eprintln!("[my cdc] window applied → watermark {end}");
                 }

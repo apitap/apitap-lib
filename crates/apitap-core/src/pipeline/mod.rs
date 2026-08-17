@@ -302,8 +302,11 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     let used = resolve(stmts.len()).min(stmts.len()).max(1);
     let mut loaders = Vec::with_capacity(used);
     for _ in 0..used {
-        loaders.push(sink.loader().await?);
+        // Counted: one wrapper here instruments every source × destination
+        // pair at once — see `sink::Counted`.
+        loaders.push(crate::sink::Counted(sink.loader().await?));
     }
+    crate::progress::set_pipes(used);
 
     let loaded = src.run_workers(&plan, &lane, stmts, loaders, chunk).await?;
     let rows = sink.rows_staged(loaded).await?;
@@ -454,6 +457,11 @@ where
 
             let started = std::time::Instant::now();
             let source_id = source_identity(src_url, &job.table);
+            // Name the table the readout is currently about, and hand over the
+            // planner's own estimate — the only denominator honest enough to
+            // put a percentage on (labelled "est", because that is what a
+            // catalog row-count is).
+            crate::progress::set_table(&job.table, job.est_rows);
             let out = async {
                 let sink = make_sink(job.table.clone()).await?;
                 run(
@@ -472,6 +480,7 @@ where
             }
             .await;
 
+            crate::progress::table_done();
             match out {
                 Ok(r) => TableResult {
                     table: job.table,

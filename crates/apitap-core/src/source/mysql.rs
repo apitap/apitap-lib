@@ -1183,6 +1183,7 @@ async fn row_worker<L: Loader>(
         std::time::Duration::ZERO,
     );
     let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
+    let mut pending_rows = 0u64;
     if let MyEnc::PgCopy(_) = &enc {
         pgc::header(&mut out);
     }
@@ -1258,6 +1259,7 @@ async fn row_worker<L: Loader>(
             if let Err(e) = step {
                 return Err(loader.abort(e).await);
             }
+            pending_rows += 1;
             // mem::replace (not take): take leaves capacity 0 and the next chunk pays
             // ~1 extra full copy in geometric regrowth. Recycled buffers from the
             // sink's back-channel replace fresh allocations — the same churn fix
@@ -1271,6 +1273,10 @@ async fn row_worker<L: Loader>(
                         .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024)),
                 );
                 let ts = std::time::Instant::now();
+                // Publish the tally per CHUNK, not per row: this lane decodes
+                // every row anyway, so the count is exact, and one relaxed add
+                // per few MB costs nothing.
+                crate::progress::add_rows(std::mem::take(&mut pending_rows));
                 loader.send(full).await?;
                 if dbg {
                     t_send += ts.elapsed();
@@ -1282,6 +1288,7 @@ async fn row_worker<L: Loader>(
         pgc::trailer(&mut out);
     }
     if !out.is_empty() {
+        crate::progress::add_rows(std::mem::take(&mut pending_rows));
         loader.send(out).await?;
     }
     if dbg {
@@ -1316,6 +1323,7 @@ async fn raw_transfer_worker<L: Loader>(
         std::time::Duration::ZERO,
     );
     let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
+    let mut pending_rows = 0u64;
     if let MyEnc::PgCopy(_) = &enc {
         pgc::header(&mut out);
     }
@@ -1383,6 +1391,7 @@ async fn raw_transfer_worker<L: Loader>(
             if let Err(e) = step {
                 return Err(loader.abort(e).await);
             }
+            pending_rows += 1;
             if out.len() >= chunk {
                 let full = std::mem::replace(
                     &mut out,
@@ -1391,6 +1400,10 @@ async fn raw_transfer_worker<L: Loader>(
                         .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024)),
                 );
                 let ts = std::time::Instant::now();
+                // Publish the tally per CHUNK, not per row: this lane decodes
+                // every row anyway, so the count is exact, and one relaxed add
+                // per few MB costs nothing.
+                crate::progress::add_rows(std::mem::take(&mut pending_rows));
                 loader.send(full).await?;
                 if dbg {
                     t_send += ts.elapsed();
@@ -1405,6 +1418,7 @@ async fn raw_transfer_worker<L: Loader>(
         pgc::trailer(&mut out);
     }
     if !out.is_empty() {
+        crate::progress::add_rows(std::mem::take(&mut pending_rows));
         loader.send(out).await?;
     }
     if dbg {

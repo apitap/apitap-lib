@@ -32,6 +32,7 @@ mod logbased;
 mod gcp;
 mod pipeline;
 mod plan;
+mod progress;
 mod sink;
 mod source;
 mod wire;
@@ -318,6 +319,28 @@ pub struct MultiReport {
 /// - **0-row guard**: an empty source never wipes an existing destination table.
 /// - **Bounded memory**: bytes stream with TCP backpressure; memory use is
 ///   `parallel × chunk_bytes` plus socket buffers, regardless of table size.
+/// Report progress around a running transfer. The closing line takes the row
+/// count the caller is about to return, so the summary and `TransferReport`
+/// can never disagree; an error path drops the reporter instead, which stops
+/// it without printing a completion that did not happen.
+async fn reported<T, F>(
+    label: &str,
+    unit: progress::Unit,
+    tables: usize,
+    rows_of: impl Fn(&T) -> u64,
+    fut: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let rep = progress::Reporter::start(label, unit, -1, tables);
+    let out = fut.await;
+    if let (Some(r), Ok(v)) = (rep, &out) {
+        r.finish(rows_of(v));
+    }
+    out
+}
+
 pub async fn transfer(
     src_url: &str,
     dst_url: &str,
@@ -332,7 +355,14 @@ pub async fn transfer(
                     .into(),
             ));
         }
-        return logbased::run::run_task(src_url, dst_url, table, opts).await;
+        return reported(
+            table,
+            progress::Unit::Changes,
+            0,
+            |r: &TransferReport| r.rows,
+            logbased::run::run_task(src_url, dst_url, table, opts),
+        )
+        .await;
     }
     if opts.slots.is_some() {
         return Err(Error::InvalidInput(
@@ -341,7 +371,14 @@ pub async fn transfer(
                 .into(),
         ));
     }
-    pipeline::dispatch::single(src_url, dst_url, table, opts).await
+    reported(
+        table,
+        progress::Unit::Rows,
+        0,
+        |r: &TransferReport| r.rows,
+        pipeline::dispatch::single(src_url, dst_url, table, opts),
+    )
+    .await
 }
 
 /// Copy MANY tables in one call, through ONE resource budget.
@@ -368,7 +405,14 @@ pub async fn transfer_many(
         // shared watermark) — or, with `slots=N`, N such groups running
         // concurrently. Never the bulk pipeline (which would run a cursor
         // merge and silently drop deletes).
-        return logbased::run::run_many(src_url, dst_url, tables, opts).await;
+        return reported(
+            tables.first().map(String::as_str).unwrap_or("(none)"),
+            progress::Unit::Changes,
+            tables.len(),
+            |r: &MultiReport| r.tables.iter().map(|t| t.rows).sum(),
+            logbased::run::run_many(src_url, dst_url, tables, opts),
+        )
+        .await;
     }
     if opts.slots.is_some() {
         return Err(Error::InvalidInput(
@@ -377,7 +421,14 @@ pub async fn transfer_many(
                 .into(),
         ));
     }
-    pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::List(tables), opts).await
+    reported(
+        tables.first().map(String::as_str).unwrap_or("(none)"),
+        progress::Unit::Rows,
+        tables.len(),
+        |r: &MultiReport| r.tables.iter().map(|t| t.rows).sum(),
+        pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::List(tables), opts),
+    )
+    .await
 }
 
 /// Copy MANY tables where EACH table names its own [`Mode`]. The call is

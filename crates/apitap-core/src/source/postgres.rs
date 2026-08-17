@@ -586,8 +586,15 @@ enum SpanState {
 impl SpanState {
     fn push(&mut self, piece: &[u8], out: &mut Vec<u8>) -> Result<()> {
         match self {
+            // Strip and Raw relay bytes without decoding a tuple — that is
+            // exactly what makes them the fastest lanes, so they report no
+            // rows and the readout shows bytes instead of a false zero.
             SpanState::Strip(s) => s.push(piece, out),
-            SpanState::Rb(t) => t.push(piece, out),
+            SpanState::Rb(t) => {
+                let r = t.push(piece, out);
+                crate::progress::add_rows(t.take_rows());
+                r
+            }
             SpanState::My(t) => t.push(piece, out),
             SpanState::Raw => {
                 out.extend_from_slice(piece);

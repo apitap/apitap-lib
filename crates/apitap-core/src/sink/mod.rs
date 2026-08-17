@@ -64,6 +64,48 @@ pub(crate) trait Loader: Send + 'static {
     fn abort(self, cause: Error) -> impl Future<Output = Error> + Send;
 }
 
+/// Wraps any loader to count what passes through it. Every byte of every
+/// source→destination pair goes through a `Loader`, which makes this the one
+/// place progress can measure the whole matrix without each sink or source
+/// having to remember to report. Delegation is total: a lane's fast paths
+/// (`reclaim`, `send_framed`) stay exactly as fast, minus one relaxed atomic
+/// add per buffer — and nothing at all when progress is off.
+pub(crate) struct Counted<L: Loader>(pub(crate) L);
+
+impl<L: Loader> Loader for Counted<L> {
+    async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
+        crate::progress::add_bytes(buf.len() as u64);
+        self.0.send(buf).await
+    }
+
+    fn reclaim(&mut self) -> Option<Vec<u8>> {
+        self.0.reclaim()
+    }
+
+    fn framed_capable(&self) -> bool {
+        self.0.framed_capable()
+    }
+
+    async fn send_framed(
+        &mut self,
+        win: &[u8],
+    ) -> Result<(usize, crate::wire::arrowcol::FramedPush)> {
+        let r = self.0.send_framed(win).await;
+        if let Ok((consumed, _)) = &r {
+            crate::progress::add_bytes(*consumed as u64);
+        }
+        r
+    }
+
+    async fn finish(self) -> Result<u64> {
+        self.0.finish().await
+    }
+
+    async fn abort(self, cause: Error) -> Error {
+        self.0.abort(cause).await
+    }
+}
+
 pub(crate) trait Sink: Sized + Send + Sync {
     type Loader: Loader;
     /// Ingest formats this sink accepts, best first. Negotiation picks the first one

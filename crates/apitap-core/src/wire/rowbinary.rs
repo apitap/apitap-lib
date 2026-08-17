@@ -85,6 +85,9 @@ pub(crate) struct Transcoder {
     pos: usize,
     header_done: bool,
     finished: bool,
+    /// Tuples emitted since the last harvest — the honest live row count for
+    /// this lane, free because the tuple loop already knows each boundary.
+    rows: u64,
 }
 
 impl Transcoder {
@@ -98,6 +101,7 @@ impl Transcoder {
             pos: 0,
             header_done: false,
             finished: false,
+            rows: 0,
         }
     }
 
@@ -144,6 +148,9 @@ impl Transcoder {
                 match try_tuple_at(&self.cols, &self.buf[self.pos..], out)? {
                     Some((consumed, finished)) => {
                         self.pos += consumed;
+                        if !finished {
+                            self.rows += 1;
+                        }
                         self.finished = finished;
                     }
                     None => break,
@@ -170,6 +177,9 @@ impl Transcoder {
             match try_tuple_at(&self.cols, &inp[off..], out)? {
                 Some((consumed, finished)) => {
                     off += consumed;
+                    if !finished {
+                        self.rows += 1;
+                    }
                     self.finished = finished;
                 }
                 None => break,
@@ -183,6 +193,11 @@ impl Transcoder {
 
     pub(crate) fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Take the tuples counted since the last call, for progress reporting.
+    pub(crate) fn take_rows(&mut self) -> u64 {
+        std::mem::take(&mut self.rows)
     }
 }
 
