@@ -1272,13 +1272,18 @@ make the problem disappear.)
 Three honest caveats:
 
 - **Dependent views (Postgres destinations)**: the atomic swap `DROP`s the old
-  table, which Postgres refuses if views depend on it. The transfer fails *safely*
-  (old table and staging both intact) — drop/recreate dependent views around the
-  load for now.
-- **Indexes, constraints, and grants on the destination are not carried over** —
-  staging is created bare, so the swapped-in table has none of the old table's
-  indexes or permissions. Recreate them after the load (loading bare + building
-  indexes afterwards is also faster than loading into an indexed table).
+  table, which Postgres refuses while a view depends on it. apitap checks for
+  this **before copying anything** and refuses with the view's name, so a
+  ten-minute load no longer dies at the last second. Drop and recreate the
+  view(s) around the transfer, or use `mode="append"`/`"merge"`, which never
+  drop the table.
+- **Indexes, constraints and grants ARE carried over** (Postgres destinations).
+  Staging is created bare — loading into a bare table and building indexes
+  afterwards is faster — and the swap re-applies what the old table had:
+  secondary indexes, `PRIMARY KEY`/`UNIQUE`/`FOREIGN KEY`/`CHECK`/exclusion
+  constraints, and grants. Verified after every change: create an index and a
+  `GRANT` on the destination, run `mode="replace"`, and both are still there.
+  What is NOT preserved: column `DEFAULT`s and identity/serial ownership.
 - Incremental sync (on the roadmap) will need real drift handling; today's
   replace-based behavior is documented here precisely so that design can be honest
   about the difference.

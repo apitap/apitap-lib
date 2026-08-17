@@ -113,7 +113,7 @@ impl PgSink {
 
 impl PgSink {
     async fn final_exists(&self) -> Result<bool> {
-        sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass($1::text) IS NOT NULL")
             .bind(&self.final_t)
             .fetch_one(&self.pool)
             .await
@@ -135,6 +135,48 @@ impl PgSink {
 }
 
 impl PgSink {
+    /// Views on the destination make a replace fail at the very END: the swap
+    /// `DROP`s the old table and Postgres refuses while a view depends on it.
+    /// The data was already copied by then. Refusing at probe time costs the
+    /// user nothing they had before — the run failed either way — and saves the
+    /// entire transfer's work.
+    async fn refuse_dependent_views(&self) -> Result<()> {
+        let views: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT quote_ident(n.nspname) || '.' || quote_ident(c.relname) \
+             FROM pg_depend d \
+             JOIN pg_rewrite r ON r.oid = d.objid \
+             JOIN pg_class c ON c.oid = r.ev_class \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE d.refobjid = to_regclass($1::text) \
+               AND d.classid = 'pg_rewrite'::regclass \
+               AND c.relkind IN ('v', 'm') \
+               AND c.oid <> to_regclass($1::text)",
+        )
+        .bind(&self.final_t)
+        .fetch_all(&self.pool)
+        .await
+        // NOT unwrap_or_default: swallowing this query's error would turn
+        // "I could not check" into "there is nothing to worry about", and the
+        // user would meet the problem at the end of the load instead — which
+        // is exactly the failure this check exists to move earlier.
+        .map_err(|e| Error::Transfer(format!("probe dependent views: {e}")))?;
+        if views.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = views.into_iter().map(|(v,)| v).collect();
+        Err(Error::InvalidInput(format!(
+            "mode='replace' into {} cannot swap the table: {} depend{} on it, and \
+             Postgres refuses to drop a table a view needs. Nothing has been \
+             copied yet — this is checked before the load, not after it. Drop and \
+             recreate the view(s) around the transfer, or use mode='append'/'merge', \
+             which never drop the table.",
+            self.final_t,
+            names.join(", "),
+            if names.len() == 1 { "s" } else { "" }
+        )))
+    }
+
+
     fn state_table(&self) -> String {
         format!("{}.\"_apitap_state\"", quote_ident(&self.schema))
     }
@@ -285,13 +327,19 @@ impl crate::sink::Sink for PgSink {
         // capture them now so finalize can re-apply after the swap. (Column DEFAULTs
         // and identity/serial ownership are NOT preserved; documented.)
         if mode == Mode::Replace && self.final_exists().await? {
+            // Before anything is copied: a view on this table makes the final
+            // swap impossible, and finding that out after the load is a whole
+            // transfer wasted. dest_state would have been the natural home for
+            // this check, except dest_state only runs for the incremental
+            // modes — replace never reaches it.
+            self.refuse_dependent_views().await?;
             // Resolve the table's ACTUAL namespace — an unqualified dest name follows
             // search_path everywhere else; hardcoding 'public' here would silently
             // skip the index/grant capture for such tables.
             let schema: String = sqlx::query_scalar(
                 "SELECT n.nspname FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE c.oid = to_regclass($1)",
+                 WHERE c.oid = to_regclass($1::text)",
             )
             .bind(&self.final_t)
             .fetch_one(&self.pool)
@@ -417,7 +465,7 @@ impl crate::sink::Sink for PgSink {
                 sqlx::query_scalar(
                     "SELECT n.nspname FROM pg_class c \
                      JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE c.oid = to_regclass($1)",
+                     WHERE c.oid = to_regclass($1::text)",
                 )
                 .bind(&self.final_t)
                 .fetch_one(&self.pool)
@@ -583,7 +631,7 @@ impl crate::sink::Sink for PgSink {
                 // Replace destroyed every source's rows — stale state rows would
                 // make the next incremental run skip data. Clear them all; the
                 // bootstrap (if any) re-inserts its own row below.
-                let has_state: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                let has_state: bool = sqlx::query_scalar("SELECT to_regclass($1::text) IS NOT NULL")
                     .bind(self.state_table())
                     .fetch_one(&mut *tx)
                     .await
