@@ -303,15 +303,60 @@ pub(crate) fn ch_str(s: &str) -> String {
 }
 
 impl ChSink {
+    /// Reading a Replicated table through a load balancer means an arbitrary
+    /// replica answers, and it may not have fetched the parts another node
+    /// just committed. `select_sequential_consistency` makes the SELECT wait
+    /// for them. It matters twice: an under-counted staging table reports a
+    /// row count lower than what landed, and — the dangerous one — a stale
+    /// `max(cursor)` writes a watermark BEHIND the data, which makes the next
+    /// incremental run skip rows silently.
+    fn consistent_read(&self) -> &'static str {
+        if self.ddl.on_cluster.is_some() {
+            " SETTINGS select_sequential_consistency = 1"
+        } else {
+            ""
+        }
+    }
+
+    /// Wait until EVERY replica has fetched every part of the staging table.
+    /// The balancer spread the INSERTs across nodes, so until this returns no
+    /// single node holds the whole load — and both reading it and swapping it
+    /// depend on that being true. No-op off a cluster.
+    async fn sync_cluster_replicas(&self) -> Result<()> {
+        if let Some(cl) = &self.ddl.on_cluster {
+            self.ch
+                .exec(&format!(
+                    "SYSTEM SYNC REPLICA ON CLUSTER {} {}",
+                    ch_ident(cl),
+                    self.staging_t
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_state_table(&self) -> Result<()> {
+        // Cluster mode: the watermark must be one truth across every node a
+        // balancer can answer from. A node-local state table would let run N
+        // write its watermark on node A and run N+1 read node B's stale copy —
+        // a silent incremental skip, the one failure this table exists to
+        // prevent. So on a cluster it is Replicated and created ON CLUSTER.
+        let (oc, eng) = if self.ddl.on_cluster.is_some() {
+            (
+                self.ddl.on_cluster_clause(),
+                "ReplicatedReplacingMergeTree(synced_at)",
+            )
+        } else {
+            (String::new(), "ReplacingMergeTree(synced_at)")
+        };
         self.ch
-            .exec(
-                "CREATE TABLE IF NOT EXISTS `_apitap_state` (\
+            .exec(&format!(
+                "CREATE TABLE IF NOT EXISTS `_apitap_state`{oc} (\
                    dest_table String, source_id String, cursor_col String, \
                    watermark String, mode String, last_rows UInt64, \
                    synced_at DateTime64(6, 'UTC') DEFAULT now64(6)) \
-                 ENGINE = ReplacingMergeTree(synced_at) ORDER BY (dest_table, source_id)",
-            )
+                 ENGINE = {eng} ORDER BY (dest_table, source_id)"
+            ))
             .await?;
         Ok(())
     }
@@ -405,6 +450,22 @@ impl ChDdl {
         {
             return Err(Error::InvalidInput(
                 "engine/order_by/on_cluster only apply to ClickHouse destinations".into(),
+            ));
+        }
+        // Refused HERE, on the user's own mode argument, before the pipeline
+        // can rewrite it: an append into a table that does not exist yet runs
+        // as a replace internally, which would slip past a check made further
+        // in. The append finalize is a node-local part attach; behind a load
+        // balancer it can attach from a replica that has not fetched every
+        // part and land a silent subset.
+        if opts.mode == crate::Mode::Append && opts.on_cluster.is_some() {
+            return Err(Error::InvalidInput(
+                "mode='append' with on_cluster is not supported yet — its \
+                 finalize attaches parts on whichever node answers, which \
+                 behind a load balancer may be a replica missing some of them. \
+                 Use mode='replace', or point apitap at one node instead of \
+                 the balancer."
+                    .into(),
             ));
         }
         Ok(Self {
@@ -829,16 +890,51 @@ impl crate::sink::Sink for ChSink {
         }
         self.plan_ddl = ddl_list.clone();
         self.staging_order_by = order_by.clone();
-        self.ch
-            .exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
-            .await?;
-        self.ch
-            .exec(&format!(
-                "CREATE TABLE {} ({ddl_list}) ENGINE = MergeTree{primary_key} \
-                 ORDER BY {order_by}",
-                self.staging_t
-            ))
-            .await?;
+        if self.ddl.on_cluster.is_some() {
+            // Behind a load balancer every HTTP request may reach a DIFFERENT
+            // node (seen live: DROP landed on node A, CREATE on node B →
+            // "already exists"; then CREATE on A, INSERT on B → "does not
+            // exist"). So in cluster mode nothing about staging may be
+            // node-local: the DDL goes ON CLUSTER and the staging table is
+            // created with the USER's Replicated engine from the start —
+            // any node then accepts any INSERT and replicates it. Finalize
+            // becomes a pure ON CLUSTER exchange, no cross-node part moves.
+            if self.ddl.has_explicit_zk_path() {
+                return Err(Error::InvalidInput(
+                    "on_cluster with an explicit ZooKeeper path cannot stage: \
+                     staging and final would collide on the same path — use the \
+                     path-less engine spelling (ClickHouse derives a unique \
+                     {uuid} path per table for ON CLUSTER DDL)"
+                        .into(),
+                ));
+            }
+            let oc = self.ddl.on_cluster_clause();
+            let eng = self.ddl.engine.as_deref().unwrap_or("ReplicatedMergeTree");
+            self.ch
+                .exec(&format!(
+                    "DROP TABLE IF EXISTS {}{oc} SYNC",
+                    self.staging_t
+                ))
+                .await?;
+            self.ch
+                .exec(&format!(
+                    "CREATE TABLE {} {oc} ({ddl_list}) ENGINE = {eng}{primary_key} \
+                     ORDER BY {order_by}",
+                    self.staging_t
+                ))
+                .await?;
+        } else {
+            self.ch
+                .exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
+                .await?;
+            self.ch
+                .exec(&format!(
+                    "CREATE TABLE {} ({ddl_list}) ENGINE = MergeTree{primary_key} \
+                     ORDER BY {order_by}",
+                    self.staging_t
+                ))
+                .await?;
+        }
         let fmt = match lane.format {
             WireFormat::TabSeparated => "TabSeparated",
             WireFormat::MyTsv => unreachable!("accepts() never offers MyTsv to ClickHouse"),
@@ -855,9 +951,17 @@ impl crate::sink::Sink for ChSink {
     }
 
     async fn rows_staged(&self, _loaded: u64) -> Result<u64> {
+        // The reported row count is a claim about the data; on a cluster it is
+        // only true once every replica is current (a run without this barrier
+        // reported 913,341 of 1,000,000).
+        self.sync_cluster_replicas().await?;
         Ok(self
             .ch
-            .exec(&format!("SELECT count() FROM {}", self.staging_t))
+            .exec(&format!(
+                "SELECT count() FROM {}{}",
+                self.staging_t,
+                self.consistent_read()
+            ))
             .await?
             .trim()
             .parse()
@@ -1161,20 +1265,35 @@ impl crate::sink::Sink for ChSink {
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
         // 0-row guard, every mode.
         if rows == 0 {
+            let oc = self.ddl.on_cluster_clause();
             let _ = self
                 .ch
-                .exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
+                .exec(&format!("DROP TABLE IF EXISTS {}{oc}", self.staging_t))
                 .await;
             return Ok(());
         }
-        // Watermark of what THIS run staged (session is UTC-pinned).
+        // CLUSTER BARRIER, and it is load-bearing. The INSERTs were spread
+        // across replicas by the balancer, so at this moment each node has
+        // only the parts it accepted plus whatever it has fetched so far.
+        // EXCHANGE renames on every node and the follow-up DROP then deletes
+        // the staging name — cancelling any fetch still in flight. A run that
+        // skipped this wait left one replica holding 978,452 of 1,000,000
+        // rows, silently. Waiting for every replica to be current first is
+        // what makes the swap safe; ON CLUSTER makes it every replica, not
+        // just whichever one this request reached.
+        self.sync_cluster_replicas().await?;
+        // Watermark of what THIS run staged (session is UTC-pinned). On a
+        // cluster this read MUST be sequentially consistent — a max() from a
+        // lagging replica writes a watermark behind the data, and the next
+        // incremental run then skips everything in between without a word.
         let staged_wm = match &self.cursor_col {
             Some(c) => Some(
                 self.ch
                     .exec(&format!(
-                        "SELECT toString(max({})) FROM {}",
+                        "SELECT toString(max({})) FROM {}{}",
                         ch_ident(c),
-                        self.staging_t
+                        self.staging_t,
+                        self.consistent_read()
                     ))
                     .await?
                     .trim()
@@ -1184,7 +1303,41 @@ impl crate::sink::Sink for ChSink {
         };
         match mode {
             Mode::Replace => {
-                if self.ddl.engine.is_some() || self.ddl.on_cluster.is_some() {
+                if self.ddl.on_cluster.is_some() {
+                    // Cluster mode: staging was already created ON CLUSTER with
+                    // the user's Replicated engine (see prepare), so the data is
+                    // on every replica and no parts ever need to move between
+                    // nodes. The swap is three coordinated DDL statements, each
+                    // valid from ANY node the load balancer picks: an empty
+                    // final shell if none exists, one EXCHANGE, and a
+                    // best-effort drop of the old data riding in the staging
+                    // name afterwards (a leftover never blocks the next run —
+                    // prepare starts with DROP IF EXISTS ON CLUSTER).
+                    let oc = self.ddl.on_cluster_clause();
+                    let eng = self.ddl.engine.as_deref().unwrap_or("ReplicatedMergeTree");
+                    let create_cols = &self.plan_ddl;
+                    let order_by = &self.staging_order_by;
+                    self.ch
+                        .exec(&format!(
+                            "CREATE TABLE IF NOT EXISTS {}{oc} ({create_cols}) \
+                             ENGINE = {eng} ORDER BY {order_by}",
+                            self.final_t
+                        ))
+                        .await?;
+                    self.ch
+                        .exec(&format!(
+                            "EXCHANGE TABLES {} AND {}{oc}",
+                            self.staging_t, self.final_t
+                        ))
+                        .await?;
+                    let _ = self
+                        .ch
+                        .exec(&format!(
+                            "DROP TABLE IF EXISTS {}{oc}",
+                            self.staging_t
+                        ))
+                        .await;
+                } else if self.ddl.engine.is_some() {
                     // The final table needs the USER's engine, so a name swap with
                     // the MergeTree staging won't do: create the final with that
                     // engine and move the parts in with a metadata-only ATTACH (a
@@ -1317,6 +1470,8 @@ impl crate::sink::Sink for ChSink {
                 Ok(())
             }
             Mode::Append => {
+                // on_cluster + append is refused in prepare, before any data
+                // moves — see the note there.
                 // Metadata-only part attach — the append-mode sibling of EXCHANGE:
                 // near-instant and atomic per partition (our tables are unpartitioned,
                 // so 'all' is the single partition). Requires identical structure and
