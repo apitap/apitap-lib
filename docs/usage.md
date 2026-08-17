@@ -1068,6 +1068,52 @@ recovery. Use it for rebuildable data, then optionally:
 ALTER TABLE public.events SET LOGGED;   -- restore crash-durability after the load
 ```
 
+## Progress while it runs
+
+A transfer that moves half a billion rows used to say nothing until it finished
+or died. Now the engine reports what has actually moved, and it picks its shape
+from where it is running — no flag needed.
+
+**On a terminal**, one line, rewritten every 2 seconds:
+
+```
+apitap ▸ bank_transfer · 6,261,134 rows · 2.37 GB · ≈63% (est) · 844K/s · 0:08 · 32 pipes
+```
+
+**Everywhere else** — Airflow, Kubernetes, docker logs, cron — a plain
+`key=value` line every 30 seconds, with no ANSI and no carriage returns, and
+flushed per line so the log shows it *while* the job runs instead of at the end:
+
+```
+2026-08-17T06:48:41Z apitap progress table=bank_transfer rows=206656 bytes=8495323 rows_per_s=497554 bytes_per_s=20453727 elapsed_s=0.4 pipes=32
+2026-08-17T06:48:42Z apitap done table=bank_transfer rows=1000000 bytes=413190127 rows_per_s=608954 bytes_per_s=251614149 elapsed_s=1.8 pipes=32
+```
+
+A multi-table run counts tables as well (`3/100 tables`), and a CDC run counts
+changes and windows instead of rows (`cdc window 3 · 1,240,000 changes`).
+
+| variable | default | effect |
+|---|---|---|
+| `APITAP_PROGRESS` | unset | `0`/`off` silences it; `json` emits one JSON object per line for Loki/Fluentd; anything else forces reporting on |
+| `APITAP_PROGRESS_INTERVAL` | 2 s on a terminal, 30 s otherwise | seconds between lines — raise it for a DAG that runs for hours |
+
+Three things the readout will not do, because a number that reads as fact has
+to be one:
+
+- **The closing line is the transfer's own count.** It is the same number
+  `TransferReport.rows` carries, not a second tally that could disagree.
+- **The percentage is marked `(est)`** because its denominator is the planner's
+  row estimate (`reltuples`, `TABLE_ROWS`). A table that has never been analyzed
+  has no estimate, and then there is no percentage — rather than a made-up one.
+  It also never reads 100% before the run is over.
+- **Live row counts exist where rows are actually decoded**: MySQL and MariaDB
+  sources, the Postgres→ClickHouse binary transcode, the text lanes, and CDC.
+  The raw binary COPY relay (Postgres→Postgres) deliberately does not parse
+  tuples — that is exactly what makes it the fastest lane — so it reports bytes
+  while running and the exact row count at the end. Bytes are always live,
+  every route, because they are counted where every route meets its
+  destination.
+
 ## Environment knobs
 
 Every default is chosen from measurement; these exist for environments the
@@ -1077,6 +1123,7 @@ defaults cannot see. None of them change what lands — only how it gets there.
 |---|---|---|
 | `APITAP_CH_MAX_BODY` | unset (one request per pipe) | **ClickHouse behind a proxy.** Caps each HTTP request body; accepts bytes or a `K`/`M`/`G` suffix. |
 | `APITAP_PG_BINARY` | `0` | **Postgres CDC.** Asks the walsender for binary `pgoutput` and renders the text in apitap instead. |
+| `APITAP_PROGRESS`, `APITAP_PROGRESS_INTERVAL` | auto | **Live reporting** — see [Progress while it runs](#progress-while-it-runs). |
 
 ### ClickHouse behind a reverse proxy (`413 Payload Too Large`)
 
