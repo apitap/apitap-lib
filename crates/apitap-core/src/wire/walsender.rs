@@ -900,7 +900,18 @@ impl Walsender {
 }
 
 fn io_err(e: std::io::Error) -> Error {
-    Error::Transfer(format!("walsender io: {e}"))
+    // This socket serves BOTH the replication connection and the bulk raw-COPY
+    // plane (connect_sql), so the message must not name a subsystem the caller
+    // may not be using: a bulk transfer that died here used to report
+    // "walsender io: early eof", sending users to read up on replication
+    // settings that had nothing to do with it.
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        return Error::Transfer(
+            "postgres closed the connection mid-stream — a server restart, a              pg_terminate_backend, an idle/statement timeout, or a dropped              network path. Nothing was committed at the destination (bulk loads              swap only at the end, and a CDC watermark advances only with its              data), so re-running is safe and is the recovery."
+                .into(),
+        );
+    }
+    Error::Transfer(format!("postgres wire io: {e}"))
 }
 
 fn bad_scram() -> Error {

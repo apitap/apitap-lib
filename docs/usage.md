@@ -1068,6 +1068,15 @@ recovery. Use it for rebuildable data, then optionally:
 ALTER TABLE public.events SET LOGGED;   -- restore crash-durability after the load
 ```
 
+## When a run does not finish
+
+Every failure mode — process killed mid-transfer, connection cut, DDL during a
+run, a schedule paused past the source's retention — has a measured answer in
+[failure-modes.md](failure-modes.md): what state is left behind, and what to do.
+The short version: re-running is the recovery, a killed run costs disk rather
+than correctness, and the readers of your destination table never see a partial
+load.
+
 ## Progress while it runs
 
 A transfer that moves half a billion rows used to say nothing until it finished
