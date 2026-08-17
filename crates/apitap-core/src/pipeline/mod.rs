@@ -289,6 +289,18 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         })?;
     let lane = src.plan_lane(&plan, format);
 
+    // A single-table run has no denominator yet (the multi-table path sets the
+    // run-wide sum before any table starts, and first-writer-wins keeps this
+    // from overwriting it). One catalog query buys the percent readout, and
+    // only when someone is watching.
+    if crate::progress::is_on() {
+        if let Ok(cat) = src.catalog(None, Some(&[table.to_string()])).await {
+            crate::progress::set_total_estimate(
+                cat.first().map(|(_, est)| *est).unwrap_or(-1),
+            );
+        }
+    }
+
     sink.prepare(&plan, &lane, opts.durable, mode).await?;
 
     let want = if parallel > 1 {
@@ -441,6 +453,15 @@ where
 
     // Largest first; unknown (-1) sorts largest of all.
     jobs.sort_by_key(|j| std::cmp::Reverse(if j.est_rows < 0 { i64::MAX } else { j.est_rows }));
+    // The progress row counter spans the whole run, so its denominator must
+    // too: the sum of every table's catalog estimate, and nothing at all if
+    // even one table has no estimate (a partial sum would read as a lead the
+    // run does not have).
+    crate::progress::set_total_estimate(if jobs.iter().any(|j| j.est_rows < 0) {
+        -1
+    } else {
+        jobs.iter().map(|j| j.est_rows).sum()
+    });
 
     let sem = tokio::sync::Semaphore::new(budget);
     let mut futs = FuturesUnordered::new();
@@ -457,11 +478,7 @@ where
 
             let started = std::time::Instant::now();
             let source_id = source_identity(src_url, &job.table);
-            // Name the table the readout is currently about, and hand over the
-            // planner's own estimate — the only denominator honest enough to
-            // put a percentage on (labelled "est", because that is what a
-            // catalog row-count is).
-            crate::progress::set_table(&job.table, job.est_rows);
+            crate::progress::set_label(&job.table);
             let out = async {
                 let sink = make_sink(job.table.clone()).await?;
                 run(

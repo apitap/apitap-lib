@@ -38,7 +38,9 @@ static ROWS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static TABLES_DONE: AtomicU64 = AtomicU64::new(0);
 static TABLES_TOTAL: AtomicU64 = AtomicU64::new(0);
-static EST_ROWS: AtomicI64 = AtomicI64::new(-1);
+/// `-2` = nobody has set a denominator yet, `-1` = set but unknown.
+static EST_ROWS: AtomicI64 = AtomicI64::new(UNSET_EST);
+const UNSET_EST: i64 = -2;
 static PIPES: AtomicU64 = AtomicU64::new(0);
 static WINDOW: AtomicU64 = AtomicU64::new(0);
 /// Set once per run: cheap enough that the counters cost nothing when off.
@@ -154,14 +156,31 @@ pub(crate) fn next_window() {
     WINDOW.fetch_add(1, Relaxed);
 }
 
-pub(crate) fn set_table(name: &str, est_rows: i64) {
+/// Name the table the readout is currently about. Deliberately does NOT touch
+/// the estimate: in a multi-table run the row counter is CUMULATIVE across
+/// tables, so pairing it with one table's estimate produced "≈100%" while the
+/// first table was still streaming. The numerator and the denominator have to
+/// describe the same thing.
+pub(crate) fn set_label(name: &str) {
     if !ON.load(Relaxed) {
         return;
     }
     if let Ok(mut l) = label().lock() {
         name.clone_into(&mut l);
     }
-    EST_ROWS.store(est_rows, Relaxed);
+}
+
+/// The denominator for the whole run. FIRST WRITER WINS, deliberately: a
+/// multi-table run sets the sum of every table's estimate before any table
+/// starts, and the shared single-table path would otherwise overwrite it with
+/// one table's estimate — which is the bug that printed "≈100%" while the
+/// first of five tables was still streaming. `-1` = known-unknown.
+pub(crate) fn set_total_estimate(est_rows: i64) {
+    let _ = EST_ROWS.compare_exchange(UNSET_EST, est_rows, Relaxed, Relaxed);
+}
+
+pub(crate) fn is_on() -> bool {
+    ON.load(Relaxed)
 }
 
 /// Stops the reporter and prints the closing line when the transfer returns —
@@ -184,7 +203,7 @@ impl Reporter {
         TABLES_TOTAL.store(tables as u64, Relaxed);
         WINDOW.store(0, Relaxed);
         PIPES.store(0, Relaxed);
-        EST_ROWS.store(est_rows, Relaxed);
+        EST_ROWS.store(if est_rows == -1 { UNSET_EST } else { est_rows }, Relaxed);
         ROWS_EXACT.store(false, Relaxed);
         ON.store(true, Relaxed);
         if let Ok(mut l) = label().lock() {
@@ -490,6 +509,11 @@ mod tests {
     /// in parallel corrupt each other. They found this themselves: the JSON
     /// test passed alone and failed in the suite. Anything reading or writing
     /// the globals takes this lock first.
+    fn reset_est(v: i64) {
+        EST_ROWS.store(UNSET_EST, Relaxed);
+        set_total_estimate(v);
+    }
+
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
         L.lock().unwrap_or_else(|e| e.into_inner())
@@ -551,7 +575,12 @@ mod tests {
     fn a_json_line_is_one_object_and_carries_the_unit() {
         let _g = exclusive();
         ON.store(true, Relaxed);
-        set_table("bank_transfer", 500_000_000);
+        set_label("bank_transfer");
+        reset_est(500_000_000);
+        // A percentage needs a lane that actually counts rows, and exactness is
+        // claimed by add_rows — so stand in for one, exactly as the MySQL
+        // workers and the pg transcoder do.
+        add_rows(0);
         let line = render(
             Format::Json,
             Unit::Rows,
@@ -575,7 +604,8 @@ mod tests {
     fn cdc_counts_changes_not_rows() {
         let _g = exclusive();
         ON.store(true, Relaxed);
-        set_table("orders", -1);
+        set_label("orders");
+        reset_est(-1);
         let line = render(
             Format::Plain,
             Unit::Changes,
