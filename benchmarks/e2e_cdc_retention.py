@@ -18,8 +18,9 @@ This file proves both against live servers: it purges a MariaDB binlog on
 purpose to make the dangerous state, and reads the slot's retained WAL from
 Postgres itself.
 """
-import re
 import subprocess
+import sys
+
 import apitap
 
 PG = "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src"
@@ -55,13 +56,19 @@ def ch(sql):
 
 
 def transfer(src, table, stderr_wanted=False):
-    """Run a CDC drain in a child so the engine's stderr can be inspected."""
+    """Run a CDC drain in a child so the engine's stderr can be inspected.
+
+    sys.executable, never a bare "python3": inside the release gate this file
+    runs from a virtualenv, and the bare name resolves to the system Python,
+    which has no apitap. That cost a red gate leg — the engine was fine and the
+    harness could not import it.
+    """
     code = (
         "import apitap\n"
         f"r = apitap.transfer({src!r}, {CH!r}, table={table!r}, mode='log_based')\n"
         "print('ROWS', r.rows)\n"
     )
-    return sh(["python3", "-c", code])
+    return sh([sys.executable, "-c", code])
 
 
 ok = True
