@@ -36,6 +36,16 @@ print("REPORT_ROWS=%d" % r.rows)
 """.format(pg=PG, ch=CH, t=T)
 
 
+def pg(sql):
+    o = subprocess.run(
+        ["docker", "exec", "-i", "apitap-bench-pg-src", "psql", "-U", "postgres",
+         "-d", "apitap_bench_src", "-Atc", sql],
+        capture_output=True, text=True)
+    if o.returncode:
+        raise RuntimeError(o.stderr)
+    return o.stdout.strip()
+
+
 def ch(sql):
     return subprocess.run(
         ["docker", "exec", "-i", "apitap-bench-ch", "clickhouse-client",
@@ -115,6 +125,64 @@ if objs and all(well_formed(o) for o in objs) and progress_objs:
 else:
     ok = False
     print(f"   ✗ JSON output missing or malformed ({len(objs)} objects)")
+
+print("== operational gauges are NUMBERS, not prose ==")
+# The WAL a replication slot holds on the SOURCE is the one number an
+# unattended pipeline must be able to alert on — it is the difference between
+# "a schedule paused" and "the source's disk filled up". It used to exist only
+# inside an English sentence, and its warning form bypassed this channel
+# entirely with a raw eprintln!, so in JSON mode the most important line was
+# the only one that was not JSON.
+# The gauge only exists on a CDC run, and `run()` above drives a bulk one —
+# so this leg brings its own child rather than bending that helper.
+GT = "prog_gauge"
+pg(f"DROP TABLE IF EXISTS {GT}")
+pg(f"CREATE TABLE {GT} (id int primary key, v text)")
+pg(f"INSERT INTO {GT} SELECT g, 'v'||g FROM generate_series(1,200) g")
+ch(f"DROP TABLE IF EXISTS {GT}")
+ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{GT}' "
+   "SETTINGS mutations_sync=1")
+gp = subprocess.run(
+    [sys.executable, "-c",
+     "import apitap\n"
+     f"apitap.transfer({PG!r}, {CH!r}, table={GT!r}, mode='log_based')\n"
+     f"apitap.transfer({PG!r}, {CH!r}, table={GT!r}, mode='log_based')\n"],
+    capture_output=True, text=True,
+    env=dict(os.environ, APITAP_PROGRESS="json"))
+gerr = gp.stderr
+gauges = []
+for line in gerr.splitlines():
+    line = line.strip()
+    if line.startswith("{"):
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if o.get("event") == "slot.wal":
+            gauges.append(o)
+if not gauges:
+    ok = False
+    print("   ✗ no slot.wal gauge in the JSON stream")
+else:
+    g = gauges[-1]
+    numeric = isinstance(g.get("retained_bytes"), (int, float))
+    print(f"   ✓ slot.wal gauge present: retained_bytes={g.get('retained_bytes')} "
+          f"warn_at_bytes={g.get('warn_at_bytes')}")
+    if not numeric:
+        ok = False
+        print("   ✗ retained_bytes is not a number — nothing can alert on it")
+    # And every line is still JSON: the warning must not slip out beside it.
+    stray = [l for l in gerr.splitlines()
+             if l.strip() and not l.strip().startswith("{")]
+    if stray:
+        ok = False
+        print(f"   ✗ {len(stray)} non-JSON line(s) in JSON mode: {stray[0][:100]}")
+    else:
+        print("   ✓ every line in JSON mode is JSON, warnings included")
+
+pg(f"DROP TABLE IF EXISTS {GT}")
+pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
+ch(f"DROP TABLE IF EXISTS {GT}")
 
 print("== APITAP_PROGRESS=0 restores silence ==")
 _, err, _ = run({"APITAP_PROGRESS": "0"})

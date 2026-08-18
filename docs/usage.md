@@ -1203,6 +1203,7 @@ defaults cannot see. None of them change what lands — only how it gets there.
 | `APITAP_CH_MAX_BODY` | unset (one request per pipe) | **ClickHouse behind a proxy.** Caps each HTTP request body; accepts bytes or a `K`/`M`/`G` suffix. |
 | `APITAP_PG_BINARY` | `0` | **Postgres CDC.** Asks the walsender for binary `pgoutput` and renders the text in apitap instead. |
 | `APITAP_PROGRESS`, `APITAP_PROGRESS_INTERVAL` | auto | **Live reporting** — see [Progress while it runs](#progress-while-it-runs). |
+| `APITAP_SLOT_WAL_WARN` | `4G` | **CDC.** How much retained WAL on the source turns the `slot.wal` gauge's warning on. The gauge itself is emitted every run regardless. |
 | `APITAP_HTTP_CONNECT_TIMEOUT` | `15` (seconds) | How long a connection to an HTTP service (ClickHouse, BigQuery, GCS, S3, Iceberg, the GitHub/Sheets sources) may take to establish. |
 | `APITAP_HTTP_READ_TIMEOUT` | `120` (seconds) | The longest gap allowed BETWEEN bytes of a response before the peer is treated as gone. Not a limit on how long a transfer may take — a load job that keeps streaming is never cut off, however long it runs. Raise it for a warehouse that legitimately pauses under load. |
 | `APITAP_MEM_BUDGET` | the cgroup limit | **Shared containers.** The auto-sizing spends the whole limit on batches and pipes, so when something else in the container needs memory too, say what apitap may have. Plain bytes, or an `M`/`G` suffix. |
@@ -1212,6 +1213,27 @@ accepts the connection and then stops reading leaves the request parked, and a
 scheduled task that never fails and never finishes is worse than one that
 errors. Zero and junk values fall back to the default rather than disabling the
 deadline.
+
+### Alerting on a CDC run
+
+Every `log_based` run emits a `slot.wal` gauge carrying the bytes of WAL the
+replication slot is holding **on the source**. That number is the difference
+between "a schedule paused" and "the source's disk filled up", so it is
+emitted as a number rather than described in a sentence:
+
+```json
+{"ts":"…","event":"slot.wal","slot":"apitap_39578b09dc31","retained_bytes":56,
+ "warn_at_bytes":4294967296,"over_threshold":false}
+```
+
+Alert on `retained_bytes`. Past `APITAP_SLOT_WAL_WARN` apitap also emits a
+`transfer.note` explaining what to do about it — but the note is prose for a
+human, and prose gets reworded; the gauge is the contract.
+
+In `APITAP_PROGRESS=json` mode **every** line is a JSON object, warnings
+included. That was not always true: the WAL warning used to be printed
+directly to stderr, so the single most operationally important line was the
+only one a log parser could not read.
 
 ### ClickHouse behind a reverse proxy (`413 Payload Too Large`)
 

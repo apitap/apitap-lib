@@ -151,6 +151,60 @@ pub(crate) fn table_done() {
     TABLES_DONE.fetch_add(1, Relaxed);
 }
 
+/// A named measurement, in whatever shape the environment reads.
+///
+/// Notes are prose: fine for a human, useless to an alert. A gauge is the
+/// number itself — `retained_bytes=4294967296` — so a log pipeline can graph
+/// it or page on it without parsing an English sentence that may be reworded
+/// next release.
+///
+/// It exists because the one operational number apitap had (the WAL a
+/// replication slot is holding on the SOURCE, which is the difference between
+/// a paused schedule and a full disk) was emitted two ways, both unusable: a
+/// prose note under the threshold, and a raw `eprintln!` above it that
+/// bypassed this module entirely — so in JSON mode the single most important
+/// line was the only one that was not JSON.
+///
+/// `fields` are pre-rendered `key=value` pairs; numbers stay unquoted in JSON
+/// so they arrive as numbers.
+pub(crate) fn gauge(event: &str, fields: &[(&str, String)]) {
+    let Some(fmt) = env_choice() else { return };
+    let mut err = std::io::stderr().lock();
+    let _ = match fmt {
+        Format::Json => {
+            let body: Vec<String> = fields
+                .iter()
+                .map(|(k, v)| {
+                    // A value that parses as a number is written as one; only
+                    // the rest are quoted.
+                    if v.parse::<f64>().is_ok() {
+                        format!("\"{k}\":{v}")
+                    } else {
+                        format!("\"{k}\":\"{}\"", v.replace('"', "'"))
+                    }
+                })
+                .collect();
+            writeln!(
+                err,
+                "{{\"ts\":\"{}\",\"event\":\"{event}\",{}}}",
+                stamp(),
+                body.join(",")
+            )
+        }
+        Format::Plain => {
+            let body: Vec<String> =
+                fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            writeln!(err, "{} apitap {event} {}", stamp(), body.join(" "))
+        }
+        Format::Live => {
+            let body: Vec<String> =
+                fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            writeln!(err, "\r\x1b[Kapitap ▸ {event} {}", body.join(" "))
+        }
+    };
+    let _ = err.flush();
+}
+
 /// A one-off line the engine wants an operator to see, in whatever shape the
 /// environment reads: a terminal gets it on its own row above the live line, a
 /// captured pipe gets it as a timestamped `note=` record. Silent when progress

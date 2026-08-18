@@ -1528,6 +1528,20 @@ async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
         .ok()
         .and_then(|v| parse_size(&v))
         .unwrap_or(4 << 30); // 4 GiB
+    // The number itself, always, in the machine's shape — before deciding
+    // whether a human also needs a sentence about it. This is the gauge an
+    // unattended pipeline alerts on: WAL a slot is holding on the SOURCE is
+    // the difference between "a schedule paused" and "the source's disk
+    // filled up".
+    crate::progress::gauge(
+        "slot.wal",
+        &[
+            ("slot", slot.to_string()),
+            ("retained_bytes", bytes.to_string()),
+            ("warn_at_bytes", warn_at.to_string()),
+            ("over_threshold", (bytes >= warn_at).to_string()),
+        ],
+    );
     if bytes >= warn_at {
         // The cap is what turns "the disk filled up" into "the slot was
         // invalidated" — a bounded, recoverable failure. Name it, because most
@@ -1543,8 +1557,11 @@ async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
             .or(Some("-1".into()))
             .unwrap_or_default();
         let unbounded = cap.trim() == "-1" || cap.trim().is_empty();
-        eprintln!(
-            "apitap ▸ WARNING slot {slot} is holding {} of WAL on the source{}. \
+        // Through the progress channel, not `eprintln!` — that bypassed it
+        // entirely, so a JSON consumer got one stray unstructured line and it
+        // was the most important one.
+        crate::progress::warn(&format!(
+            "slot {slot} is holding {} of WAL on the source{}. \
              That WAL cannot be freed until this drain confirms it, so a schedule \
              that stops holds the source's disk hostage.{}",
             human_bytes(bytes),
@@ -1557,7 +1574,7 @@ async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
             } else {
                 ""
             }
-        );
+        ));
     } else {
         crate::progress::note(&format!(
             "slot {slot} retains {} of WAL",
