@@ -68,7 +68,7 @@ impl ChConn {
             } else {
                 database
             },
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
         })
     }
 
@@ -128,25 +128,71 @@ impl ChConn {
     /// Run a statement with no input data (DDL, small SELECTs); returns the body.
     /// The SQL travels as the POST body — a body-less POST has no Content-Length and
     /// ClickHouse rejects it with 411.
+    ///
+    /// Retries exactly the failures where the statement provably did not run:
+    /// a connection that was never established, and a 5xx that came from
+    /// something in FRONT of ClickHouse (a load balancer draining a node, a
+    /// proxy restarting). Both are common in the cluster deployments this
+    /// lane is aimed at, and both used to fail an entire scheduled run.
+    ///
+    /// It deliberately does NOT retry a ClickHouse exception, including
+    /// TOO_MANY_PARTS. An INSERT that throws mid-way has already committed
+    /// the blocks it wrote — ClickHouse has no statement-level rollback — so
+    /// repeating it would append those rows a second time. On a
+    /// ReplacingMergeTree the duplicates eventually collapse; in `changelog`
+    /// mode they never do, and a silently doubled change history is worse
+    /// than a failed run that the next schedule repeats safely.
     pub(crate) async fn exec(&self, query: &str) -> Result<String> {
-        let resp = self
-            .client
-            .post(&self.base)
-            .basic_auth(&self.user, Some(&self.password))
-            .query(&self.params("")[..4])
-            .body(query.to_string())
-            .send()
-            .await
-            .map_err(|e| Error::Connect(format!("clickhouse: {e}")))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Error::Transfer(format!(
-                "clickhouse {status}: {}",
-                body.trim()
-            )));
+        // Four attempts over ~7s of backoff: long enough for a rolling
+        // restart or a failover to finish, short enough that a genuinely
+        // down cluster still fails the run rather than hanging the schedule.
+        const BACKOFF_MS: [u64; 3] = [500, 2000, 4500];
+        let mut attempt = 0usize;
+        loop {
+            let sent = self
+                .client
+                .post(&self.base)
+                .basic_auth(&self.user, Some(&self.password))
+                .query(&self.params("")[..4])
+                .body(query.to_string())
+                .send()
+                .await;
+            let retryable = match &sent {
+                // Never reached a server: nothing ran, so repeating is free.
+                Err(e) => e.is_connect() || e.is_timeout(),
+                Ok(r) => {
+                    r.status().is_server_error() && r.status().as_u16() != 500
+                }
+            };
+            if retryable && attempt < BACKOFF_MS.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]))
+                    .await;
+                attempt += 1;
+                continue;
+            }
+            let resp = sent.map_err(|e| Error::Connect(format!("clickhouse: {e}")))?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                // A 5xx with no ClickHouse exception in it did not come from
+                // ClickHouse; say so, because "clickhouse 503" sends people
+                // reading the wrong logs.
+                let from_proxy =
+                    status.is_server_error() && !body.contains("DB::Exception");
+                return Err(Error::Transfer(format!(
+                    "clickhouse {status}: {}{}",
+                    body.trim(),
+                    if from_proxy {
+                        " — this is not a ClickHouse exception, so it came from a \
+                         proxy or load balancer in front of it (apitap already \
+                         retried this statement)"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            return Ok(body);
         }
-        Ok(body)
     }
 
     /// Stream `body` into `query` (an `INSERT … FORMAT …`): query in the URL, data as

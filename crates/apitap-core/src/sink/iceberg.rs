@@ -183,7 +183,7 @@ impl IcebergConn {
             .unwrap_or_else(|| "us-east-1".into());
         let creds = read_credentials(key_id, secret, session)?;
         let mut conn = Self {
-            http: reqwest::Client::new(),
+            http: crate::http::client(),
             base,
             prefix: String::new(),
             warehouse,

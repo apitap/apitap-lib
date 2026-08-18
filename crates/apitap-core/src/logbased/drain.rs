@@ -30,6 +30,18 @@ pub(crate) struct DrainOutcome {
     /// The drain stopped at the memory budget, not the stop-line: the caller
     /// applies this window, confirms the LSN, and drains again.
     pub hit_budget: bool,
+    /// The server's WAL end at the moment this drain saw it had shipped
+    /// everything — 0 if the drain stopped for any other reason.
+    ///
+    /// This exists because a published table with NO changes produces no
+    /// window, and a slot that is never told about progress never releases
+    /// WAL. On a busy instance that is the source's disk filling up while
+    /// every hourly run reports success: the table is idle, so `end_lsn`
+    /// never moves, so nothing is ever confirmed. Reaching this point means
+    /// the server has shipped every change up to the stop-line and none of
+    /// them were ours, so once the window (if any) is durable at the
+    /// destination, this LSN is genuinely applied and safe to confirm.
+    pub caught_up_lsn: u64,
 }
 
 struct RelState {
@@ -59,6 +71,32 @@ pub(crate) struct DrainSession {
     /// Commit makes them real (Abort drops them). May span windows — a
     /// budget break can only land between blocks, never inside one.
     streams: HashMap<u32, Vec<(Arc<str>, StreamOp)>>,
+    /// Bytes held by `streams`. It lives on the SESSION and not in `drain`'s
+    /// locals because the buffers do: a streamed transaction survives a
+    /// window boundary, and a per-call counter forgets it the moment the next
+    /// drain starts. The memory it holds does not go anywhere, so the budget
+    /// that is supposed to bound this process's RSS has to keep counting it.
+    stream_bytes: usize,
+}
+
+/// Truthful residency: a buffered row pins its WHOLE frame plus the range
+/// vec. (Old accounting summed cell lengths, which under-counted exactly when
+/// Bytes cells began pinning frames.) At module scope so the session's
+/// streamed-transaction accounting measures the same thing the window's does.
+fn cells_bytes(row: &Tuple) -> usize {
+    row.frame.len() + row.cells.len() * 12 + 48
+}
+
+/// Bytes a buffered streamed op holds — the same measure `cells_bytes` takes
+/// of a tuple, so the budget adds like with like.
+fn op_bytes(op: &StreamOp) -> usize {
+    match op {
+        StreamOp::Insert(t) | StreamOp::Delete(t) => cells_bytes(t),
+        StreamOp::Update(old, new) => {
+            cells_bytes(new) + old.as_ref().map_or(0, cells_bytes)
+        }
+        StreamOp::Truncate => 0,
+    }
 }
 
 /// Buffered op of a streamed (not-yet-committed) transaction.
@@ -100,13 +138,7 @@ pub(crate) async fn drain(
     // (last-write-wins) makes true memory smaller — the count is conservative.
     let mut buf_bytes = 0usize;
     let mut hit_budget = false;
-
-    fn cells_bytes(row: &Tuple) -> usize {
-        // Truthful residency: a buffered row pins its WHOLE frame plus the
-        // range vec. (Old accounting summed cell lengths, which under-counted
-        // exactly when Bytes cells began pinning frames.)
-        row.frame.len() + row.cells.len() * 12 + 48
-    }
+    let mut caught_up_lsn = 0u64;
 
     let mut in_stream: Option<u32> = None;
 
@@ -133,7 +165,11 @@ pub(crate) async fn drain(
                 }
                 if wal_end >= stop_line && tx_buf.is_empty() && sess.streams.is_empty() {
                     // Server has shipped everything up to the stop-line and
-                    // we're at a boundary: caught up.
+                    // we're at a boundary: caught up. Record where that was —
+                    // the caller confirms it once the destination is durable,
+                    // which is the only thing that lets an idle table's slot
+                    // release WAL.
+                    caught_up_lsn = wal_end;
                     break;
                 }
             }
@@ -145,7 +181,7 @@ pub(crate) async fn drain(
                     if e >= stop_line {
                         break;
                     }
-                    if buf_bytes >= max_buf_bytes {
+                    if buf_bytes + sess.stream_bytes >= max_buf_bytes {
                         hit_budget = true;
                         break;
                     }
@@ -157,18 +193,26 @@ pub(crate) async fn drain(
                 PgoMessage::StreamStop => in_stream = None,
                 PgoMessage::StreamCommit { xid, end_lsn: e } => {
                     let ops = sess.streams.remove(&xid).unwrap_or_default();
+                    // The ops leave the session's buffer and land in this
+                    // window's collapsers, so the charge moves with them.
+                    let n: usize = ops.iter().map(|(_, o)| op_bytes(o)).sum();
+                    sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                    buf_bytes += n;
                     flush_ops(ops, &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
                     end_lsn = e;
                     if e >= stop_line {
                         break;
                     }
-                    if buf_bytes >= max_buf_bytes {
+                    if buf_bytes + sess.stream_bytes >= max_buf_bytes {
                         hit_budget = true;
                         break;
                     }
                 }
                 PgoMessage::StreamAbort { xid } => {
-                    sess.streams.remove(&xid);
+                    if let Some(ops) = sess.streams.remove(&xid) {
+                        let n: usize = ops.iter().map(|(_, o)| op_bytes(o)).sum();
+                        sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                    }
                 }
                 PgoMessage::Relation(r) => {
                     sess.rel_oids.insert(
@@ -191,33 +235,50 @@ pub(crate) async fn drain(
                 }
                 PgoMessage::Insert { rel_id, new } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
-                        buf_bytes += cells_bytes(&new);
+                        let n = cells_bytes(&new);
                         let op = StreamOp::Insert(new);
                         match in_stream {
-                            Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
-                            None => tx_buf.push((t, op)),
+                            Some(x) => {
+                                sess.stream_bytes += n;
+                                sess.streams.get_mut(&x).expect("stream open").push((t, op));
+                            }
+                            None => {
+                                buf_bytes += n;
+                                tx_buf.push((t, op));
+                            }
                         }
                     }
                 }
                 PgoMessage::Update { rel_id, old, new } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
                         let old = old.map(|o| o.tuple);
-                        buf_bytes += cells_bytes(&new)
-                            + old.as_ref().map_or(0, cells_bytes);
+                        let n = cells_bytes(&new) + old.as_ref().map_or(0, cells_bytes);
                         let op = StreamOp::Update(old, new);
                         match in_stream {
-                            Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
-                            None => tx_buf.push((t, op)),
+                            Some(x) => {
+                                sess.stream_bytes += n;
+                                sess.streams.get_mut(&x).expect("stream open").push((t, op));
+                            }
+                            None => {
+                                buf_bytes += n;
+                                tx_buf.push((t, op));
+                            }
                         }
                     }
                 }
                 PgoMessage::Delete { rel_id, old } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
-                        buf_bytes += cells_bytes(&old.tuple);
+                        let n = cells_bytes(&old.tuple);
                         let op = StreamOp::Delete(old.tuple);
                         match in_stream {
-                            Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
-                            None => tx_buf.push((t, op)),
+                            Some(x) => {
+                                sess.stream_bytes += n;
+                                sess.streams.get_mut(&x).expect("stream open").push((t, op));
+                            }
+                            None => {
+                                buf_bytes += n;
+                                tx_buf.push((t, op));
+                            }
                         }
                     }
                 }
@@ -247,6 +308,7 @@ pub(crate) async fn drain(
         wal_cols: sess.wal_cols.clone(),
         wal_oids: sess.wal_oids.clone(),
         hit_budget,
+        caught_up_lsn,
     })
 }
 

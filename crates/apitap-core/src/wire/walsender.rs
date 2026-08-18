@@ -93,6 +93,20 @@ async fn read_frame(rd: &mut BufReader<OwnedReadHalf>) -> Result<(u8, bytes::Byt
     if len < 4 {
         return Err(Error::Transfer("walsender: bad message length".into()));
     }
+    // The length is four bytes off the wire and this line allocates it, so a
+    // peer that is not the server it claims to be — a hijacked port, a proxy
+    // answering with its own protocol, a corrupted frame — could ask for 4 GB
+    // before anything downstream has a chance to reject the message. Postgres
+    // itself caps a protocol message at 1 GB (PQ_LARGE_MESSAGE_LIMIT), so
+    // anything past that is not a message this side should try to hold.
+    const MAX_FRAME: usize = 1 << 30;
+    if len > MAX_FRAME {
+        return Err(Error::Transfer(format!(
+            "walsender: message announces {len} bytes, past the 1 GB protocol \
+             limit — the peer on this socket is not answering the Postgres \
+             frontend protocol"
+        )));
+    }
     // BytesMut, so every text cell downstream is a refcounted slice of this
     // one allocation instead of getting its own malloc (see pgoutput::Cell).
     let mut body = bytes::BytesMut::zeroed(len - 4);
@@ -371,19 +385,29 @@ impl Walsender {
             match tag {
                 b'T' => {} // RowDescription — text rows, we index positionally
                 b'D' => {
-                    let n = u16::from_be_bytes(msg[0..2].try_into().unwrap()) as usize;
-                    let mut row = Vec::with_capacity(n);
+                    // Field count and every field length are the peer's
+                    // numbers. Slicing on them directly panics on a truncated
+                    // frame, which in a library means the caller's process
+                    // dies instead of seeing an error it could handle.
+                    let short = || Error::Transfer("walsender: truncated DataRow".into());
+                    let n = u16::from_be_bytes(
+                        msg.get(0..2).ok_or_else(short)?.try_into().unwrap(),
+                    ) as usize;
+                    // Capacity is bounded by what the frame could possibly
+                    // hold: two bytes per field at the absolute minimum.
+                    let mut row = Vec::with_capacity(n.min(msg.len() / 2 + 1));
                     let mut o = 2usize;
                     for _ in 0..n {
-                        let l = i32::from_be_bytes(msg[o..o + 4].try_into().unwrap());
+                        let l = i32::from_be_bytes(
+                            msg.get(o..o + 4).ok_or_else(short)?.try_into().unwrap(),
+                        );
                         o += 4;
                         if l < 0 {
                             row.push(None);
                         } else {
                             let l = l as usize;
-                            row.push(Some(
-                                String::from_utf8_lossy(&msg[o..o + l]).into_owned(),
-                            ));
+                            let cell = msg.get(o..o + l).ok_or_else(short)?;
+                            row.push(Some(String::from_utf8_lossy(cell).into_owned()));
                             o += l;
                         }
                     }
@@ -798,8 +822,15 @@ impl Walsender {
             };
             match tag {
                 b'd' => {
+                    // XLogData carries a 25-byte header; a keepalive 18. A
+                    // frame shorter than the header it claims is a protocol
+                    // error, not a reason to panic on a slice.
+                    let short = || Error::Transfer("walsender: truncated CopyData frame".into());
                     match msg.first() {
                         Some(b'w') => {
+                            if msg.len() < 25 {
+                                return Err(short());
+                            }
                             let wal_start =
                                 u64::from_be_bytes(msg[1..9].try_into().unwrap());
                             // bytes 9..17 wal_end, 17..25 server clock — unused.
@@ -810,6 +841,9 @@ impl Walsender {
                             return Ok(Some(WalEvent::XLogData { wal_start, payload }));
                         }
                         Some(b'k') => {
+                            if msg.len() < 9 {
+                                return Err(short());
+                            }
                             let wal_end = u64::from_be_bytes(msg[1..9].try_into().unwrap());
                             let reply_requested = msg.get(17).copied().unwrap_or(0) == 1;
                             return Ok(Some(WalEvent::Keepalive { wal_end, reply_requested }));

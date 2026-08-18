@@ -260,6 +260,11 @@ impl<'a> Reader<'a> {
     fn i64(&mut self) -> Result<i64> {
         Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
+    /// Bytes still unread — used to bound a wire-supplied count before it
+    /// becomes an allocation.
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.pos)
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(n).ok_or_else(short)?;
         let s = self.b.get(self.pos..end).ok_or_else(short)?;
@@ -479,7 +484,11 @@ pub(crate) fn decode(
         b'T' => {
             let n = r.u32()? as usize;
             let opts = r.u8()?;
-            let mut rel_ids = Vec::with_capacity(n);
+            // `n` is a wire u32, and reserving on it would let a truncated or
+            // hostile frame ask for 16 GB before the first read fails. Four
+            // bytes per id is the floor, so the remaining buffer bounds how
+            // many there can actually be.
+            let mut rel_ids = Vec::with_capacity(n.min(r.remaining() / 4 + 1));
             for _ in 0..n {
                 rel_ids.push(r.u32()?);
             }

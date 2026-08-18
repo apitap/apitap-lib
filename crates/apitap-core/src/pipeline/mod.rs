@@ -90,6 +90,17 @@ pub(crate) fn mem_limit_bytes() -> Option<u64> {
             }
         }
     }
+    // The root of the cgroup filesystem is the right answer only when this
+    // process is in its own cgroup NAMESPACE — Docker's default, and k8s. It
+    // is the WRONG answer for `--cgroupns=host`, for
+    // `systemd-run --property=MemoryMax=`, for a nested cgroup, and for many
+    // CI runners: there `/sys/fs/cgroup/memory.max` is the HOST's limit (or
+    // "max"), the real limit sits further down the tree, and auto-sizing then
+    // plans for a machine it does not have. Which is why the walk below
+    // happens first, and the root files stay as the fallback.
+    if let Some(n) = cgroup_limit_from_proc() {
+        return Some(n);
+    }
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
         let s = s.trim();
         if s != "max" {
@@ -106,6 +117,101 @@ pub(crate) fn mem_limit_bytes() -> Option<u64> {
         }
     }
     None
+}
+
+/// Resolve this process's OWN memory cgroup through `/proc/self/cgroup` and
+/// `/proc/self/mountinfo`, then take the SMALLEST limit on the path from that
+/// cgroup up to the root.
+///
+/// The smallest wins because that is what the kernel enforces: a container
+/// with 8 GB inside a slice capped at 512 MB gets 512 MB, and planning for
+/// 8 GB there is how a process ends up OOM-killed by a limit it never read.
+///
+/// Returns `None` when nothing on the path sets a limit — an unconstrained
+/// process, which is not the same as a limit of zero.
+fn cgroup_limit_from_proc() -> Option<u64> {
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+
+    // v2: a single "0::<path>" line, one unified hierarchy.
+    let v2_path = own
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string()));
+    if let Some(rel) = v2_path {
+        // The mount whose filesystem type is cgroup2 gives the root on disk,
+        // and its ROOT field says which part of `rel` is already included in
+        // that mount point (the namespace case, where rel is just "/").
+        if let Some((mount_point, mount_root)) = mounts.lines().find_map(|l| {
+            let (pre, post) = l.split_once(" - ")?;
+            let mut post_f = post.split_whitespace();
+            if post_f.next()? != "cgroup2" {
+                return None;
+            }
+            let mut pre_f = pre.split_whitespace().skip(3);
+            let root = pre_f.next()?.to_string();
+            let point = pre_f.next()?.to_string();
+            Some((point, root))
+        }) {
+            let rel = rel.strip_prefix(&mount_root).unwrap_or(&rel);
+            return smallest_limit_up(&mount_point, rel, "memory.max", |v| {
+                (v != "max").then(|| v.parse::<u64>().ok()).flatten()
+            });
+        }
+    }
+
+    // v1: find the line for the memory controller, then the matching mount.
+    let rel = own.lines().find_map(|l| {
+        let mut f = l.splitn(3, ':');
+        f.next()?;
+        let ctrls = f.next()?;
+        if !ctrls.split(',').any(|c| c == "memory") {
+            return None;
+        }
+        Some(f.next()?.trim().to_string())
+    })?;
+    let (point, root) = mounts.lines().find_map(|l| {
+        let (pre, post) = l.split_once(" - ")?;
+        let mut post_f = post.split_whitespace();
+        if post_f.next()? != "cgroup" {
+            return None;
+        }
+        // Super-options carry the controller list for v1 mounts.
+        if !post_f.nth(1)?.split(',').any(|o| o == "memory") {
+            return None;
+        }
+        let mut pre_f = pre.split_whitespace().skip(3);
+        let root = pre_f.next()?.to_string();
+        let point = pre_f.next()?.to_string();
+        Some((point, root))
+    })?;
+    let rel = rel.strip_prefix(&root).unwrap_or(&rel);
+    smallest_limit_up(&point, rel, "memory.limit_in_bytes", |v| {
+        v.parse::<u64>().ok().filter(|n| *n < (1 << 60))
+    })
+}
+
+/// Read `file` at every level from `<mount><rel>` up to `<mount>`, and return
+/// the smallest value `parse` accepts.
+fn smallest_limit_up(
+    mount: &str,
+    rel: &str,
+    file: &str,
+    parse: impl Fn(&str) -> Option<u64>,
+) -> Option<u64> {
+    let mut dir = std::path::PathBuf::from(mount);
+    dir.push(rel.trim_start_matches('/'));
+    let mut best: Option<u64> = None;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join(file)) {
+            if let Some(n) = parse(s.trim()) {
+                best = Some(best.map_or(n, |b: u64| b.min(n)));
+            }
+        }
+        if dir.as_os_str().len() <= mount.len() || !dir.pop() {
+            break;
+        }
+    }
+    best
 }
 
 /// Cap an AUTO-derived pipe count by the memory budget: each pipe holds a few
@@ -225,7 +331,9 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
             mode = Mode::Replace; // first run: bootstrap the table with a full load
         } else if let Some(wm) = st.watermark {
             let literal = if quoted {
-                format!("'{}'", wm.replace('\'', "''"))
+                // Per-dialect: the source's own parser decides what has to be
+                // escaped, and it is the source this clause is sent to.
+                src.cursor_literal(&wm)
             } else {
                 // The watermark comes from destination DATA — never embed it raw
                 // without proving it is the number it claims to be.
@@ -527,6 +635,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nested-cgroup case this walker exists for: a container that says
+    /// 8 GB, inside a slice capped at 512 MB. The kernel enforces the 512 MB,
+    /// and reading only the leaf — or only the root — plans for a machine the
+    /// process does not have.
+    #[test]
+    fn the_smallest_limit_on_the_path_is_the_one_that_applies() {
+        let base = std::env::temp_dir().join(format!(
+            "apitap-cg-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let leaf = base.join("system.slice/app.service/container");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(base.join("system.slice/memory.max"), "536870912\n").unwrap();
+        std::fs::write(leaf.join("memory.max"), "8589934592\n").unwrap();
+        // Root and the intermediate level are uncapped.
+        std::fs::write(base.join("memory.max"), "max\n").unwrap();
+
+        let got = smallest_limit_up(
+            base.to_str().unwrap(),
+            "/system.slice/app.service/container",
+            "memory.max",
+            |v| (v != "max").then(|| v.parse::<u64>().ok()).flatten(),
+        );
+        assert_eq!(got, Some(536_870_912));
+
+        // Nothing capped anywhere is not a limit of zero — it is no limit.
+        std::fs::remove_file(base.join("system.slice/memory.max")).unwrap();
+        std::fs::remove_file(leaf.join("memory.max")).unwrap();
+        let none = smallest_limit_up(
+            base.to_str().unwrap(),
+            "/system.slice/app.service/container",
+            "memory.max",
+            |v| (v != "max").then(|| v.parse::<u64>().ok()).flatten(),
+        );
+        assert_eq!(none, None);
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     /// Locks the memory→pipes budget to the MEASURED 100 GB ladder
     /// (benchmarks/profiling.md): peaks were 44.1 MB @1 pipe, 72.4 @2, 113.6 @3,

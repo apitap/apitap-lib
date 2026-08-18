@@ -37,6 +37,22 @@ pub(crate) trait Source: Sized + Send + Sync {
     /// incremental cursor, and does its literal need quoting? (Delegates to the
     /// dialect — the per-DB lists live in `crate::dialect`.)
     fn cursor_quoted(&self, udt: &str) -> Result<bool>;
+    /// Render a watermark as a quoted literal for THIS source's parser.
+    ///
+    /// The value is destination DATA — it was written by an earlier run, but
+    /// what it contains is whatever the cursor column held, and it is about to
+    /// be embedded in a WHERE clause sent to the source. Doubling `'` is the
+    /// whole story only for a parser that treats backslash as an ordinary
+    /// character (Postgres with `standard_conforming_strings=on`, its default
+    /// since 9.1). MySQL and ClickHouse read `\` as an escape, so a value
+    /// ending in a backslash escapes the closing quote there and the rest of
+    /// the clause becomes SQL.
+    ///
+    /// The default is the standard-conforming rule; the two dialects that need
+    /// more override it.
+    fn cursor_literal(&self, raw: &str) -> String {
+        format!("'{}'", raw.replace('\'', "''"))
+    }
     /// Can this source produce `format` for this plan? (e.g. Postgres → RowBinary only
     /// when every column has a binary transcoding.)
     fn can_produce(&self, plan: &TablePlan, format: WireFormat) -> bool;

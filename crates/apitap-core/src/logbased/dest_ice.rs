@@ -82,6 +82,17 @@ impl IceDest {
         cdc_set_watermark(&self.conn, bare(dest_table), source_id, lsn).await
     }
 
+    /// The source-identity marker: the same watermark row machinery under a
+    /// reserved `source_id`.
+    pub(crate) async fn write_marker(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        value: u64,
+    ) -> Result<()> {
+        cdc_set_watermark(&self.conn, bare(dest_table), source_id, value).await
+    }
+
     pub(crate) async fn apply(
         &self,
         dest_table: &str,

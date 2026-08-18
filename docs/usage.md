@@ -915,6 +915,15 @@ apitap.transfer(
   where a document belongs. Use `mode="replace"`/`"append"` for those tables,
   or store the document in a text column. MariaDB is unaffected — there `JSON`
   is an alias for `LONGTEXT` and arrives as text.
+- **A watermark belongs to ONE server, and apitap checks that it still is.**
+  A binlog `(file, position)` is only meaningful on the server that wrote it,
+  and nothing in a connection URL says which server answered — a promoted
+  replica, a restored backup and a DNS record moved during a failover all look
+  identical from the client side. apitap records the source server's identity
+  (`@@server_uuid`, or `@@server_id` on MariaDB) next to the watermark on the
+  first run and refuses to resume against a different one. If the source really
+  did move, clear that table's state rows on the destination and re-run, which
+  bootstraps it against the new server.
 - **An event apitap does not understand stops the run — it is never skipped.**
   A skipped binlog event is data that silently never arrives, so the reader
   refuses and names the event code (MySQL 8's partial-JSON row events,
@@ -1148,6 +1157,15 @@ defaults cannot see. None of them change what lands — only how it gets there.
 | `APITAP_CH_MAX_BODY` | unset (one request per pipe) | **ClickHouse behind a proxy.** Caps each HTTP request body; accepts bytes or a `K`/`M`/`G` suffix. |
 | `APITAP_PG_BINARY` | `0` | **Postgres CDC.** Asks the walsender for binary `pgoutput` and renders the text in apitap instead. |
 | `APITAP_PROGRESS`, `APITAP_PROGRESS_INTERVAL` | auto | **Live reporting** — see [Progress while it runs](#progress-while-it-runs). |
+| `APITAP_HTTP_CONNECT_TIMEOUT` | `15` (seconds) | How long a connection to an HTTP service (ClickHouse, BigQuery, GCS, S3, Iceberg, the GitHub/Sheets sources) may take to establish. |
+| `APITAP_HTTP_READ_TIMEOUT` | `120` (seconds) | The longest gap allowed BETWEEN bytes of a response before the peer is treated as gone. Not a limit on how long a transfer may take — a load job that keeps streaming is never cut off, however long it runs. Raise it for a warehouse that legitimately pauses under load. |
+| `APITAP_MEM_BUDGET` | the cgroup limit | **Shared containers.** The auto-sizing spends the whole limit on batches and pipes, so when something else in the container needs memory too, say what apitap may have. Plain bytes, or an `M`/`G` suffix. |
+
+Both HTTP deadlines exist because a client with none waits forever: a peer that
+accepts the connection and then stops reading leaves the request parked, and a
+scheduled task that never fails and never finishes is worse than one that
+errors. Zero and junk values fall back to the default rather than disabling the
+deadline.
 
 ### ClickHouse behind a reverse proxy (`413 Payload Too Large`)
 

@@ -380,7 +380,7 @@ impl GithubApiSource {
             )));
         }
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             owner,
             repo,
             token: env_nonempty("GITHUB_TOKEN").or_else(|| env_nonempty("GH_TOKEN")),
@@ -509,7 +509,19 @@ fn link_next(link: &str) -> Option<String> {
         if !rest.contains("rel=\"next\"") {
             return None;
         }
-        Some(url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+        let url = url.trim().trim_start_matches('<').trim_end_matches('>');
+        // This URL comes out of a RESPONSE HEADER, and the next request to it
+        // carries the user's GitHub token. A Link header naming another host
+        // — a compromised or self-hosted endpoint, a proxy rewriting
+        // responses — would hand that token to whoever answers there. The
+        // header is followed only while it stays on the API host it was
+        // addressed to.
+        let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
+        let api_host = reqwest::Url::parse(API).ok()?.host_str()?.to_string();
+        if host != api_host {
+            return None;
+        }
+        Some(url.to_string())
     })
 }
 
@@ -1012,6 +1024,13 @@ mod tests {
             Some("https://api.github.com/repositories/1/issues?after=Y3Vyc29y&per_page=100")
         );
         assert_eq!(link_next("<https://x>; rel=\"prev\""), None);
+        // A next link that walks off the API host would take the token with
+        // it, so it is not followed at all.
+        assert_eq!(
+            link_next("<https://evil.example/repositories/1/issues>; rel=\"next\""),
+            None
+        );
+        assert_eq!(link_next("<not a url>; rel=\"next\""), None);
     }
 
     #[test]

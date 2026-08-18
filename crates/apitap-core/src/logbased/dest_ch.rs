@@ -397,6 +397,17 @@ impl ChDest {
         is_shape_ok(has.trim() != "0", changelog, "ClickHouse", dest_table)
     }
 
+    /// The source-identity marker: an ordinary state row under a reserved
+    /// `source_id`, so nothing about the state table has to change.
+    pub(crate) async fn write_marker(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        value: u64,
+    ) -> Result<()> {
+        self.write_state(dest_table, source_id, value, 0).await
+    }
+
     pub(crate) async fn write_state(
         &self,
         dest_table: &str,

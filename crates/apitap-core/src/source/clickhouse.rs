@@ -416,6 +416,12 @@ impl crate::source::Source for ChSource {
         }
     }
 
+    /// Backslash is an escape character in this dialect, so it has to be
+    /// doubled as well — see the trait's note.
+    fn cursor_literal(&self, raw: &str) -> String {
+        format!("'{}'", raw.replace('\\', "\\\\").replace('\'', "''"))
+    }
+
     fn cursor_quoted(&self, udt: &str) -> Result<bool> {
         let (inner, _) = peel(udt);
         let head = inner.split('(').next().unwrap_or(&inner);

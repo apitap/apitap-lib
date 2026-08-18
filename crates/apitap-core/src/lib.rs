@@ -23,6 +23,12 @@
 //! # Ok(()) }
 //! ```
 
+
+// Every `unsafe` operation states its own justification, even inside a
+// function that is already unsafe to call — an unsafe fn's signature says
+// what the CALLER must guarantee, not that its body may do anything.
+#![deny(unsafe_op_in_unsafe_fn)]
+
 mod dialect;
 mod read;
 mod read_impl;
@@ -30,6 +36,7 @@ mod error;
 mod aws;
 mod logbased;
 mod gcp;
+mod http;
 mod pipeline;
 mod plan;
 mod progress;

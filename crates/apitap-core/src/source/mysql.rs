@@ -861,6 +861,12 @@ impl Source for MySqlSource {
             .collect())
     }
 
+    /// Backslash is an escape character in this dialect, so it has to be
+    /// doubled as well — see the trait's note.
+    fn cursor_literal(&self, raw: &str) -> String {
+        format!("'{}'", raw.replace('\\', "\\\\").replace('\'', "''"))
+    }
+
     fn cursor_quoted(&self, udt: &str) -> Result<bool> {
         crate::dialect::mysql::cursor_quoted(udt)
     }

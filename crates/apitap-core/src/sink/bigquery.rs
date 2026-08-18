@@ -71,6 +71,46 @@ pub(crate) struct BqConn {
     location: Option<String>,
 }
 
+/// Vet one BigQuery identifier before it is pasted between backticks.
+///
+/// Every DDL and DML statement in this lane is assembled as text, and the
+/// only thing standing between a column name and the rest of the script is a
+/// pair of backticks. BigQuery has no escape for a backtick INSIDE a quoted
+/// identifier — unlike Postgres or MySQL, doubling it does not work — so a
+/// name containing one cannot be rendered at all, and pretending otherwise
+/// would produce a statement that means something different from the name it
+/// came from. Control characters are refused for the same reason: a newline
+/// inside an identifier turns one statement into two on a screen, which is a
+/// review hazard even when the parser copes.
+///
+/// The names normally come from a source catalog, so this fires on a genuinely
+/// strange table rather than on hostile input — but the cost of being wrong is
+/// a statement that does something other than what it reads, so it is checked
+/// rather than assumed.
+pub(crate) fn bq_ident(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "bigquery: empty {kind} name"
+        )));
+    }
+    // BigQuery's own ceiling is 300 characters for a table and 1024 for a
+    // column; one bound covers both without inventing a limit of its own.
+    if name.len() > 1024 {
+        return Err(Error::InvalidInput(format!(
+            "bigquery: {kind} name is {} characters, past BigQuery's limit",
+            name.len()
+        )));
+    }
+    if let Some(bad) = name.chars().find(|c| *c == '`' || *c == '\\' || c.is_control()) {
+        return Err(Error::InvalidInput(format!(
+            "bigquery: {kind} name {name:?} contains {bad:?}, which cannot be \
+             written inside a BigQuery quoted identifier — BigQuery has no \
+             escape for it. Rename the {kind} at the source, or exclude it."
+        )));
+    }
+    Ok(())
+}
+
 impl BqConn {
     /// `bigquery://<project>/<dataset>?credentials=/path/key.json[&location=EU]`;
     /// without `credentials` the `GOOGLE_APPLICATION_CREDENTIALS` env var is used.
@@ -103,6 +143,10 @@ impl BqConn {
                     .into(),
             ));
         }
+        // Both halves are pasted into every fully-qualified name this
+        // connection builds; vet them where they enter, once.
+        bq_ident("project", &project)?;
+        bq_ident("dataset", &dataset)?;
         let mut credentials_path = None;
         let mut location = None;
         for (k, v) in u.query_pairs() {
@@ -130,7 +174,7 @@ impl BqConn {
                 "can't read bigquery credentials {credentials_path}: {e}"
             ))
         })?;
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let token = fetch_access_token(&client, &credentials, BQ_SCOPE).await?;
         Ok(Self {
             client,
@@ -429,6 +473,10 @@ impl BqConn {
     // plumbing they reuse, and are the only BigQuery surface dest_bq touches.
 
     /// `` `project.dataset.table` `` — a backtick-quoted fully-qualified name.
+    ///
+    /// Callers reach here only after [`bq_ident`] has vetted the parts (the
+    /// URL parse checks project and dataset, the CDC builder checks table and
+    /// column names), so the quoting below cannot be walked out of.
     pub(crate) fn fq(&self, table: &str) -> String {
         format!("`{}.{}.{table}`", self.project, self.dataset)
     }
@@ -585,7 +633,7 @@ impl BqConn {
     #[cfg(test)]
     pub(crate) fn fake(project: &str, dataset: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             credentials: Arc::new(String::new()),
             auth: Arc::new(tokio::sync::Mutex::new((String::new(), std::time::Instant::now()))),
             project: project.to_string(),
@@ -1955,5 +2003,27 @@ mod tests {
         ] {
             assert!(rt.block_on(BqConn::parse(bad)).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ident_tests {
+    use super::bq_ident;
+
+    #[test]
+    fn identifiers_that_cannot_be_quoted_are_refused() {
+        assert!(bq_ident("column", "order_id").is_ok());
+        assert!(bq_ident("column", "_apitap_at").is_ok());
+        // Unicode names are legal in BigQuery and must not be refused.
+        assert!(bq_ident("column", "pelanggan_terlambat").is_ok());
+        // A backtick would close the quoting and hand the rest of the name to
+        // the parser as SQL. BigQuery cannot escape it, so it cannot be used.
+        assert!(bq_ident("column", "id` , (SELECT 1) AS `x").is_err());
+        // A newline splits one statement across two lines on a reviewer's
+        // screen while the parser reads it as one.
+        assert!(bq_ident("table", "orders\nDROP").is_err());
+        assert!(bq_ident("column", "back\\slash").is_err());
+        assert!(bq_ident("dataset", "").is_err());
+        assert!(bq_ident("column", &"x".repeat(1025)).is_err());
     }
 }

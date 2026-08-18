@@ -63,26 +63,39 @@ struct SchemaPrivate {
     child_ptrs: Vec<*mut ArrowSchema>,
 }
 
+/// # Safety
+/// The C Data Interface contract: `s` is either null or a schema THIS module
+/// exported, still owning the `SchemaPrivate` and child boxes it was built
+/// with, and no other thread is touching it. Called at most once per schema —
+/// the `release = None` at the end is what makes a second call a no-op.
 unsafe extern "C" fn release_schema(s: *mut ArrowSchema) {
-    if s.is_null() || (*s).release.is_none() {
-        return;
-    }
-    let n = (*s).n_children;
-    if !(*s).children.is_null() {
-        for i in 0..n {
-            let child = *(*s).children.add(i as usize);
-            if !child.is_null() {
-                if let Some(rel) = (*child).release {
-                    rel(child);
+    // SAFETY: `s` is a live exported schema per the contract above; the null
+    // check comes first, and `release.is_none()` means it was already freed.
+    unsafe {
+        if s.is_null() || (*s).release.is_none() {
+            return;
+        }
+        let n = (*s).n_children;
+        if !(*s).children.is_null() {
+            for i in 0..n {
+                // SAFETY: `children` is the array of exactly `n_children`
+                // pointers this module allocated in `child_ptrs`.
+                let child = *(*s).children.add(i as usize);
+                if !child.is_null() {
+                    if let Some(rel) = (*child).release {
+                        rel(child);
+                    }
+                    // SAFETY: every child was created with Box::into_raw here.
+                    drop(Box::from_raw(child));
                 }
-                drop(Box::from_raw(child));
             }
         }
+        if !(*s).private_data.is_null() {
+            // SAFETY: private_data is the SchemaPrivate this module boxed.
+            drop(Box::from_raw((*s).private_data as *mut SchemaPrivate));
+        }
+        (*s).release = None;
     }
-    if !(*s).private_data.is_null() {
-        drop(Box::from_raw((*s).private_data as *mut SchemaPrivate));
-    }
-    (*s).release = None;
 }
 
 /// The static format string for a kind, or None when it needs runtime build.
@@ -152,9 +165,16 @@ pub fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
     }
 }
 
+/// # Safety
+/// `s` is null or a child schema exported by this module. Owns nothing of its
+/// own — the parent's release frees the whole tree — so this only marks it
+/// released.
 unsafe extern "C" fn release_schema_child_noop(s: *mut ArrowSchema) {
-    if !s.is_null() {
-        (*s).release = None;
+    // SAFETY: null-checked; the pointer is a child of a live exported schema.
+    unsafe {
+        if !s.is_null() {
+            (*s).release = None;
+        }
     }
 }
 
@@ -167,25 +187,37 @@ struct ArrayPrivate {
     _keep: Vec<Box<dyn std::any::Any + Send>>,
 }
 
+/// # Safety
+/// Mirror of [`release_schema`] for arrays: `a` is null or an array this
+/// module exported, still owning its `ArrayPrivate` (which owns the buffer
+/// memory) and its child boxes, called at most once.
 unsafe extern "C" fn release_array(a: *mut ArrowArray) {
-    if a.is_null() || (*a).release.is_none() {
-        return;
-    }
-    if !(*a).children.is_null() {
-        for i in 0..(*a).n_children {
-            let child = *(*a).children.add(i as usize);
-            if !child.is_null() {
-                if let Some(rel) = (*child).release {
-                    rel(child);
+    // SAFETY: `a` is a live exported array per the contract above.
+    unsafe {
+        if a.is_null() || (*a).release.is_none() {
+            return;
+        }
+        if !(*a).children.is_null() {
+            for i in 0..(*a).n_children {
+                // SAFETY: exactly `n_children` pointers, allocated here.
+                let child = *(*a).children.add(i as usize);
+                if !child.is_null() {
+                    if let Some(rel) = (*child).release {
+                        rel(child);
+                    }
+                    // SAFETY: every child came from Box::into_raw here.
+                    drop(Box::from_raw(child));
                 }
-                drop(Box::from_raw(child));
             }
         }
+        if !(*a).private_data.is_null() {
+            // SAFETY: private_data is the ArrayPrivate this module boxed; it
+            // owns the Vecs the buffer pointers point into, so dropping it
+            // last frees the buffers exactly once.
+            drop(Box::from_raw((*a).private_data as *mut ArrayPrivate));
+        }
+        (*a).release = None;
     }
-    if !(*a).private_data.is_null() {
-        drop(Box::from_raw((*a).private_data as *mut ArrayPrivate));
-    }
-    (*a).release = None;
 }
 
 fn export_col(col: FinishedCol, rows: usize) -> *mut ArrowArray {
@@ -303,26 +335,42 @@ pub struct StreamState {
     pub last_error: Option<CString>,
 }
 
+/// # Safety
+/// C Data Interface stream contract: `s` is a live stream this module
+/// exported (so `private_data` is its `StreamState`), `out` points at
+/// writable, uninitialised `ArrowSchema` storage, and the consumer does not
+/// call stream methods concurrently.
 unsafe extern "C" fn stream_get_schema(
     s: *mut ArrowArrayStream,
     out: *mut ArrowSchema,
 ) -> c_int {
-    let st = &mut *((*s).private_data as *mut StreamState);
-    export_schema(&st.schema, out);
+    // SAFETY: per the contract above.
+    unsafe {
+        let st = &mut *((*s).private_data as *mut StreamState);
+        export_schema(&st.schema, out);
+    }
     0
 }
 
+/// # Safety
+/// As [`stream_get_schema`], with `out` pointing at writable, uninitialised
+/// `ArrowArray` storage.
 unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowArray) -> c_int {
-    let st = &mut *((*s).private_data as *mut StreamState);
+    // SAFETY: per the contract above.
+    let st = unsafe { &mut *((*s).private_data as *mut StreamState) };
     match st.handle.next_batch() {
         Ok(Some(batch)) => {
-            export_batch(batch, out);
+            // SAFETY: `out` is writable, uninitialised array storage.
+            unsafe { export_batch(batch, out) };
             0
         }
         Ok(None) => {
             // End of stream: a released (empty) array.
-            std::ptr::write(
-                out,
+            // SAFETY: `out` is writable storage; `write` does not read the
+            // old value, which is what uninitialised memory requires.
+            unsafe {
+                std::ptr::write(
+                    out,
                 ArrowArray {
                     length: 0,
                     null_count: 0,
@@ -332,10 +380,11 @@ unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowAr
                     buffers: null_mut(),
                     children: null_mut(),
                     dictionary: null_mut(),
-                    release: None,
-                    private_data: null_mut(),
-                },
-            );
+                        release: None,
+                        private_data: null_mut(),
+                    },
+                )
+            };
             0
         }
         Err(e) => {
@@ -345,21 +394,33 @@ unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowAr
     }
 }
 
+/// # Safety
+/// As [`stream_get_schema`]. The returned pointer borrows the stream's own
+/// `CString` and stays valid until the next call or the stream's release.
 unsafe extern "C" fn stream_get_last_error(s: *mut ArrowArrayStream) -> *const c_char {
-    let st = &mut *((*s).private_data as *mut StreamState);
+    // SAFETY: per the contract above.
+    let st = unsafe { &mut *((*s).private_data as *mut StreamState) };
     st.last_error.as_ref().map_or(null(), |c| c.as_ptr())
 }
 
+/// # Safety
+/// `s` is null or a stream this module exported, called at most once, with no
+/// other thread inside another stream method.
 unsafe extern "C" fn stream_release(s: *mut ArrowArrayStream) {
-    if s.is_null() || (*s).release.is_none() {
-        return;
+    // SAFETY: per the contract above; `release = None` makes a second call a
+    // no-op rather than a double free.
+    unsafe {
+        if s.is_null() || (*s).release.is_none() {
+            return;
+        }
+        if !(*s).private_data.is_null() {
+            // SAFETY: private_data is the StreamState this module boxed.
+            let mut st = Box::from_raw((*s).private_data as *mut StreamState);
+            st.handle.cancel();
+            drop(st);
+        }
+        (*s).release = None;
     }
-    if !(*s).private_data.is_null() {
-        let mut st = Box::from_raw((*s).private_data as *mut StreamState);
-        st.handle.cancel();
-        drop(st);
-    }
-    (*s).release = None;
 }
 
 /// Heap-allocate the C stream over a finished [`ReadHandle`].
