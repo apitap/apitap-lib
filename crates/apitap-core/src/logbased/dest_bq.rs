@@ -696,6 +696,18 @@ impl BqDest {
     }
 
     async fn commit_batch(&self, stmts: &[String]) -> Result<()> {
+        // Every statement must carry its own terminator, because they are
+        // concatenated. One that does not absorbs the next line — and the next
+        // line is COMMIT, so the whole transaction fails to parse with an
+        // error that names neither the statement nor the caller. Caught here,
+        // where the offender is still identifiable.
+        if let Some(bad) = stmts.iter().find(|s| !s.trim_end().ends_with(';')) {
+            return Err(Error::Transfer(format!(
+                "log_based: a BigQuery statement is missing its ';' and would \
+                 swallow the COMMIT that follows it: {}",
+                &bad[..bad.len().min(120)]
+            )));
+        }
         self.conn
             .cdc_script(&format!(
                 "BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;",
@@ -717,9 +729,18 @@ impl BqDest {
         let table = bare(dest_table);
         let Some(c) = outcome.tables.get(qualified_src) else {
             // Foreign-table traffic only: nothing for our table, still advance.
+            //
+            // The `;` is not decoration: these statements are joined into one
+            // BEGIN/COMMIT script, and an unterminated one swallows the COMMIT
+            // that follows it ("Expected end of input but got keyword COMMIT").
+            // This branch was unreachable in a batched script until a caught-up
+            // drain started producing windows with nothing in them.
             return Ok((
                 0,
-                vec![self.state_insert_sql(table, source_id, outcome.end_lsn, 0)],
+                vec![format!(
+                    "{};",
+                    self.state_insert_sql(table, source_id, outcome.end_lsn, 0)
+                )],
             ));
         };
         let wal_cols = outcome

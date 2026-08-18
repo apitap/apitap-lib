@@ -130,7 +130,7 @@ if r.returncode:
     ok = False
     print(f"   ✗ bootstrap failed: {r.stderr[-400:]}")
 else:
-    wm = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{MT}'")
+    wm = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{MT}' " "AND source_id NOT LIKE 'server-identity:%'")
     # The watermark packs file_index << 32 | position.
     idx = int(wm) >> 32 if wm.isdigit() else 0
     logs = [l.split()[0] for l in ma("SHOW BINARY LOGS").splitlines() if l.strip()]

@@ -122,7 +122,7 @@ apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
 if boot.returncode:
     case("cdc bootstrap", False, boot.stderr[-300:])
 else:
-    wm0 = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{CT}'")
+    wm0 = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{CT}' AND source_id NOT LIKE 'server-identity:%'")
     # A window big enough that a kill lands inside the apply.
     pg(f"UPDATE {CT} SET v = v || '-x'")
     pg(f"INSERT INTO {CT} SELECT g, 'n'||g FROM generate_series(1001,4000) g")
@@ -131,7 +131,7 @@ import apitap
 apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
 """)
     killed = kill_after(p, 1.2)
-    wm1 = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{CT}'")
+    wm1 = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{CT}' AND source_id NOT LIKE 'server-identity:%'")
     if not killed:
         case("mid-window kill", True, "window completed before the kill — watermark advanced legitimately")
     else:

@@ -148,8 +148,8 @@ def state_mode():
         cur = [v for k, v in props.items() if k.startswith("apitap.watermark-cursor.")]
         return "log_based" if cur == ["_lsn"] else f"bad-props:{props}"
     if which == "ch":
-        return ch(f"SELECT mode FROM `_apitap_state` FINAL WHERE dest_table = '{T}'")
-    return my(f"SELECT mode FROM _apitap_state WHERE dest_table = '{T}'")
+        return ch(f"SELECT mode FROM `_apitap_state` FINAL WHERE dest_table = '{T}' AND source_id NOT LIKE 'server-identity:%'")
+    return my(f"SELECT mode FROM _apitap_state WHERE dest_table = '{T}' AND source_id NOT LIKE 'server-identity:%'")
 
 
 # ── fresh start ─────────────────────────────────────────────────────────────
