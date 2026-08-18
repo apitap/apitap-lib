@@ -117,7 +117,11 @@ fn static_format(kind: ArrowKind) -> Option<&'static std::ffi::CStr> {
 }
 
 /// Write a fresh deep copy of the struct-of-columns schema into `out`.
-pub fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
+/// # Safety
+/// `out` must point at writable storage for one `ArrowSchema`. The value there
+/// is overwritten without being read, so uninitialised memory is fine and a
+/// live schema is not — it would be leaked, not released.
+pub unsafe fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
     let mut strings: Vec<CString> = Vec::new();
     let mut child_ptrs: Vec<*mut ArrowSchema> = Vec::with_capacity(fields.len());
     for f in fields {
@@ -305,7 +309,15 @@ fn export_col(col: FinishedCol, rows: usize) -> *mut ArrowArray {
 }
 
 /// Export one batch as a top-level struct array (children = columns).
-pub fn export_batch(batch: ArrowBatch, out: *mut ArrowArray) {
+/// # Safety
+/// As [`export_schema`], for one `ArrowArray`.
+///
+/// Both of these write through a pointer the caller supplies, which is the
+/// definition of an unsafe function — being callable from safe code with a
+/// dangling `out` was a hole that the `unsafe_op_in_unsafe_fn` lint surfaced
+/// the moment it was switched on (it flagged the caller's now-"unnecessary"
+/// unsafe block, which is how the missing signature showed up).
+pub unsafe fn export_batch(batch: ArrowBatch, out: *mut ArrowArray) {
     let rows = batch.rows;
     let child_ptrs: Vec<*mut ArrowArray> =
         batch.cols.into_iter().map(|c| export_col(c, rows)).collect();
