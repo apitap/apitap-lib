@@ -93,6 +93,10 @@ pub(crate) async fn resolve(
 /// Open the control pool a MySQL CDC run needs (coordinates, schemas,
 /// prechecks) — separate from the terminal binlog connection.
 pub(crate) async fn control_pool(src_url: &str) -> Result<MySqlPool> {
+    // Same reason as the read path: the binlog connection is the raw plane,
+    // and it must not be the last thing to discover the URL asks for a mode
+    // it cannot speak.
+    crate::wire::mywire::check_ssl_mode(src_url)?;
     MySqlPoolOptions::new()
         .max_connections(2)
         .connect(src_url)

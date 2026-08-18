@@ -739,6 +739,9 @@ pub(crate) struct MySqlSource {
 
 impl MySqlSource {
     pub(crate) async fn connect(url: &str, max_conns: usize) -> Result<Self> {
+        // Before the pool: sqlx would accept `ssl-mode=verify_ca`, the raw
+        // plane cannot express it, and the read path uses both.
+        crate::wire::mywire::check_ssl_mode(url)?;
         let pool = MySqlPoolOptions::new()
             .max_connections(max_conns as u32)
             .after_connect(|conn, _| {

@@ -52,11 +52,30 @@ trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
 type IoBox = Box<dyn Io>;
 
-#[derive(Clone, Copy, PartialEq)]
+/// MySQL's own `ssl-mode` vocabulary, and its own meanings — a URL that works
+/// in the `mysql` client should mean the same thing here.
+///
+/// `REQUIRED` encrypts WITHOUT verifying, which is what MySQL means by it and
+/// why every default install (self-signed, auto-generated certificate) works
+/// with it. `VERIFY_CA` checks the chain; `VERIFY_IDENTITY` checks the chain
+/// AND that the hostname matches the certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SslPref {
     Disabled,
-    Preferred,
+    /// The bool records whether the URL SAID so, which decides whether a
+    /// cleartext fallback is worth telling the operator about — see the
+    /// walsender's note for the same reasoning.
+    Preferred { explicit: bool },
     Required,
+    VerifyCa,
+    VerifyIdentity,
+}
+
+impl SslPref {
+    /// Does this mode check the certificate at all?
+    fn verifies(self) -> bool {
+        matches!(self, SslPref::VerifyCa | SslPref::VerifyIdentity)
+    }
 }
 
 pub(crate) struct MyWire {
@@ -78,6 +97,17 @@ pub(crate) struct MyConnInfo {
     ssl: SslPref,
 }
 
+/// Reject an ssl mode this client cannot honour, before any socket is opened.
+///
+/// Every MySQL entry point calls this — the bulk source pool and the CDC
+/// control pool as well as the raw plane — because sqlx accepts a mode the
+/// raw plane does not, and a URL that works for `mode="replace"` and fails
+/// for `mode="log_based"` is a trap laid for whoever reads the URL later.
+/// One answer for one string.
+pub(crate) fn check_ssl_mode(url: &str) -> Result<()> {
+    parse_my_url(url).map(|_| ())
+}
+
 pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
     let u = reqwest::Url::parse(url)
         .map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?;
@@ -85,20 +115,33 @@ pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
         .host_str()
         .ok_or_else(|| Error::InvalidInput("mysql url needs a host".into()))?
         .to_string();
-    // MySQL ssl-mode semantics: required = encrypt WITHOUT verifying the
-    // certificate (that's what the server tooling does too). verify_ca /
-    // verify_identity want real verification — the sqlx lane provides it.
-    let mut ssl = SslPref::Preferred;
+    let mut ssl = SslPref::Preferred { explicit: false };
     for (k, v) in u.query_pairs() {
         if k == "ssl-mode" || k == "sslmode" {
-            ssl = match v.to_lowercase().as_str() {
+            ssl = match v.to_lowercase().replace('-', "_").as_str() {
                 "disabled" => SslPref::Disabled,
-                "preferred" => SslPref::Preferred,
+                "preferred" => SslPref::Preferred { explicit: true },
                 "required" => SslPref::Required,
+                // rustls's standard verifier checks chain AND hostname
+                // together; a chain-only verifier is a custom implementation
+                // with its own failure modes. Refused by name rather than
+                // silently upgraded to verify_identity (stricter than asked)
+                // or downgraded to required (weaker than asked).
+                "verify_ca" => {
+                    return Err(Error::InvalidInput(
+                        "ssl-mode=verify_ca is not implemented on the fast MySQL \
+                         plane — it checks the certificate chain while skipping the \
+                         hostname, which this client cannot express. Use \
+                         verify_identity (chain AND hostname) or required (encrypt \
+                         without verifying)."
+                            .into(),
+                    ))
+                }
+                "verify_identity" => SslPref::VerifyIdentity,
                 other => {
                     return Err(Error::InvalidInput(format!(
-                        "raw mysql plane: ssl-mode={other} verifies \
-                         certificates — riding the sqlx lane instead"
+                        "ssl-mode={other} is not a MySQL ssl mode — use disabled, \
+                         preferred, required, verify_ca or verify_identity"
                     )))
                 }
             };
@@ -325,14 +368,24 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
-async fn tls_upgrade(tcp: TcpStream, host: &str) -> Result<IoBox> {
+async fn tls_upgrade(tcp: TcpStream, host: &str, ssl: SslPref) -> Result<IoBox> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Transfer(format!("mysql tls: {e}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-        .with_no_client_auth();
+        .map_err(|e| Error::Transfer(format!("mysql tls: {e}")))?;
+    let cfg = if ssl.verifies() {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        // MySQL's `required` means encrypt, do not verify — the same as
+        // libpq's, and the reason a default install with its auto-generated
+        // self-signed certificate connects at all.
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+            .with_no_client_auth()
+    };
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| Error::Transfer(format!("mysql tls servername: {e}")))?;
     let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
@@ -375,11 +428,31 @@ impl MyWire {
 
         let use_tls = match info.ssl {
             SslPref::Disabled => false,
-            SslPref::Preferred => hs.caps & CLIENT_SSL != 0,
-            SslPref::Required => {
+            SslPref::Preferred { explicit } => {
+                let up = hs.caps & CLIENT_SSL != 0;
+                if !up && explicit {
+                    // Said once per process: a URL that asked for TLS and did
+                    // not get it is worth one line; a URL that never mentioned
+                    // ssl has no belief to correct, and a security note on
+                    // every run teaches people to skip security notes.
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    let (h, p) = (info.host.clone(), info.port);
+                    SAID.call_once(|| {
+                        crate::progress::note(&format!(
+                            "mysql {h}:{p} offers no TLS and ssl-mode=preferred permits \
+                             cleartext — this connection is NOT encrypted. \
+                             ssl-mode=required makes that a failure instead."
+                        ));
+                    });
+                }
+                up
+            }
+            SslPref::Required | SslPref::VerifyCa | SslPref::VerifyIdentity => {
                 if hs.caps & CLIENT_SSL == 0 {
                     return Err(Error::Connect(
-                        "mysql wire: ssl-mode=required but the server offers no TLS".into(),
+                        "mysql wire: ssl-mode requires TLS but the server offers none \
+                         — check have_ssl/require_secure_transport on the server"
+                            .into(),
                     ));
                 }
                 true
@@ -409,7 +482,7 @@ impl MyWire {
             req.push(CHARSET_UTF8MB4);
             req.extend_from_slice(&[0u8; 23]);
             tcp.write_all(&req).await.map_err(io_err)?;
-            tls_upgrade(tcp, &info.host).await?
+            tls_upgrade(tcp, &info.host, info.ssl).await?
         } else {
             Box::new(tcp)
         };
@@ -480,10 +553,28 @@ impl MyWire {
                     // channel (what mainline clients do). Over plaintext the
                     // RSA exchange is out of scope — sqlx lane.
                     Some(0x04) => {
-                        if use_tls {
+                        // caching_sha2 FULL auth sends the password itself. On
+                        // an UNVERIFIED channel that is a password handed to
+                        // whoever answered — encryption without verification
+                        // stops a passive listener, not an active one. So the
+                        // channel has to have been checked, not merely
+                        // encrypted.
+                        if use_tls && info.ssl.verifies() {
                             let mut pw = info.password.as_bytes().to_vec();
                             pw.push(0);
                             self.write_packet(&pw).await?;
+                        } else if use_tls {
+                            return Err(Error::Transfer(
+                                "raw mysql plane: this server wants FULL \
+                                 caching_sha2 authentication, which sends the \
+                                 password itself, and ssl-mode=required encrypts \
+                                 WITHOUT verifying the certificate — so there is no \
+                                 evidence the peer is the server. Use \
+                                 ssl-mode=verify_identity, or let the connection \
+                                 ride the sqlx lane (its RSA exchange does not send \
+                                 the password in the clear)."
+                                    .into(),
+                            ));
                         } else {
                             return Err(Error::Transfer(
                                 "raw mysql plane: full sha2 auth needs TLS \
@@ -942,11 +1033,26 @@ mod tests {
         // required is now spoken natively (encrypt, no verification)…
         let i = parse_my_url("mysql://u:p@h/db?ssl-mode=required").unwrap();
         assert!(matches!(i.ssl, SslPref::Required));
-        // …and no ssl-mode means preferred, like the mainline client.
+        // …and no ssl-mode means preferred, like the mainline client — but
+        // the client knows nobody ASKED, so a cleartext fallback stays quiet.
         let i = parse_my_url("mysql://u:p@h/db").unwrap();
-        assert!(matches!(i.ssl, SslPref::Preferred));
-        // verification modes ride the sqlx lane.
+        assert_eq!(i.ssl, SslPref::Preferred { explicit: false });
+        let i = parse_my_url("mysql://u:p@h/db?ssl-mode=preferred").unwrap();
+        assert_eq!(i.ssl, SslPref::Preferred { explicit: true });
+        // verify_identity is spoken natively now: chain AND hostname.
+        let i = parse_my_url("mysql://u:p@h/db?ssl-mode=verify_identity").unwrap();
+        assert_eq!(i.ssl, SslPref::VerifyIdentity);
+        assert!(i.ssl.verifies());
+        assert!(!SslPref::Required.verifies());
+        // MySQL writes it with an underscore; a hyphen is the same mode.
+        assert_eq!(
+            parse_my_url("mysql://u:p@h/db?ssl-mode=VERIFY-IDENTITY").unwrap().ssl,
+            SslPref::VerifyIdentity
+        );
+        // verify_ca checks the chain but NOT the hostname, which rustls cannot
+        // express — refused by name rather than silently moved either way.
         assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=verify_ca").is_err());
+        assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=whatever").is_err());
     }
 
     #[test]

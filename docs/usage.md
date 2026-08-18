@@ -902,6 +902,24 @@ apitap.transfer(
 - **Reading from a replica** (the usual case — you do not point CDC at the
   primary): the replica needs `log_slave_updates=ON`, or its binlog never
   contains the primary's changes.
+- **TLS**, with MySQL's own `ssl-mode` meanings — a URL that works in the
+  `mysql` client means the same here:
+
+  | `ssl-mode` | what happens |
+  |---|---|
+  | `disabled` | never encrypted |
+  | `preferred` (default) | TLS if the server offers it; if not, the run continues in cleartext, and **says so** when the URL asked for `preferred` explicitly |
+  | `required` | TLS mandatory, certificate **not** verified — MySQL means the same, and every default install presents its own auto-generated self-signed certificate |
+  | `verify_identity` | TLS mandatory, chain checked against the bundled trust anchors, hostname checked against the certificate |
+
+  `verify_ca` is refused by name (chain without hostname is not something this
+  client can express), and it is refused at EVERY entry point — so a URL
+  cannot work for `mode="replace"` and fail for `mode="log_based"`.
+
+  One thing worth knowing: if the server wants **full** `caching_sha2_password`
+  authentication — which sends the password itself — apitap refuses to do that
+  over `required`, because encryption without verification stops a listener but
+  not an impostor. Use `verify_identity` there.
 - **Grants**: the connecting user needs `REPLICATION SLAVE`, `REPLICATION
   CLIENT` and `SELECT` — `SELECT` because the first run bootstraps a full load,
   the replication grants because every later run attaches as a replica.
