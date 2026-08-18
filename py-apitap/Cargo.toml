@@ -3,6 +3,7 @@ name = "apitap-python"
 description = "Python bindings for the apitap transfer engine"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

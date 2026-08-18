@@ -2,6 +2,12 @@
 //! The GIL is released for the whole transfer (`allow_threads`), so other Python
 //! threads keep running while bytes move.
 
+
+// Every `unsafe` operation states its own justification, even inside a
+// function that is already unsafe to call — an unsafe fn's signature says
+// what the CALLER must guarantee, not that its body may do anything.
+#![deny(unsafe_op_in_unsafe_fn)]
+
 mod capsule;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -230,17 +236,30 @@ fn transfer_many(
 
 static STREAM_NAME: &CStr = c"arrow_array_stream";
 
+/// # Safety
+/// CPython calls this exactly once, with the GIL held, when the capsule this
+/// module created is collected. `cap` is that capsule; its pointer is the
+/// boxed `ArrowArrayStream` handed to `PyCapsule_New`, and nothing else holds
+/// it by then.
 unsafe extern "C" fn stream_capsule_destructor(cap: *mut pyo3::ffi::PyObject) {
-    let p = pyo3::ffi::PyCapsule_GetPointer(cap, STREAM_NAME.as_ptr());
+    // SAFETY: `cap` is a live capsule and the GIL is held, per the contract
+    // above. A name mismatch returns null and sets an error, which is not
+    // ours to raise from a destructor — hence the clear.
+    let p = unsafe { pyo3::ffi::PyCapsule_GetPointer(cap, STREAM_NAME.as_ptr()) };
     if p.is_null() {
-        pyo3::ffi::PyErr_Clear();
+        // SAFETY: GIL held.
+        unsafe { pyo3::ffi::PyErr_Clear() };
         return;
     }
     let stream = p as *mut capsule::ArrowArrayStream;
-    if let Some(rel) = (*stream).release {
-        rel(stream);
+    // SAFETY: the capsule owns this stream and this runs once, so nothing
+    // else can be releasing it concurrently.
+    unsafe {
+        if let Some(rel) = (*stream).release {
+            rel(stream);
+        }
+        drop(Box::from_raw(stream));
     }
-    drop(Box::from_raw(stream));
 }
 
 /// The native read stream: hand it to any Arrow consumer via
