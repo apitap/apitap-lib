@@ -839,7 +839,15 @@ async fn run_group_mysql(
     // every table bootstrapped before this check existed, and pretending to
     // know what they were reading last month would be a lie. From the first
     // run onward, a switch is refused.
+    //
+    // The CHECK is here — before anything moves — but the WRITE is at the end
+    // of a successful run. A bootstrap's full load runs in Replace mode, and
+    // Replace clears every state row for its destination table (it has to:
+    // the rows those watermarks described are gone). A marker written up here
+    // would be deleted by the bootstrap that follows it, and the next run
+    // would adopt whatever server it found — measured exactly that way.
     let server = mysource::server_identity(&pool).await?;
+    let mut adopt: Vec<(String, String)> = Vec::new();
     for c in &ctxs {
         let marker_id = format!("server-identity:{}", c.source_id);
         match dest.read_state(&c.dest_table, &marker_id).await? {
@@ -858,8 +866,18 @@ async fn run_group_mysql(
                 )));
             }
             Some(_) => {}
-            None => dest.write_marker(&c.dest_table, &marker_id, server).await?,
+            None => adopt.push((c.dest_table.clone(), marker_id)),
         }
+    }
+
+    /// Record the source server for every table that did not have one yet.
+    /// Called only after the run's own state is durable, so nothing that
+    /// clears state rows can run after it.
+    async fn stamp(dest: &Dest, adopt: &[(String, String)], server: u64) -> Result<()> {
+        for (table, marker) in adopt {
+            dest.write_marker(table, marker, server).await?;
+        }
+        Ok(())
     }
 
     // State arbitration mirrors the Postgres path: all-absent bootstraps,
@@ -920,6 +938,7 @@ async fn run_group_mysql(
                 return Err(e);
             }
         }
+        stamp(&dest, &adopt, server).await?;
         return Ok(out);
     }
 
@@ -978,6 +997,7 @@ async fn run_group_mysql(
     )
     .await?;
 
+    stamp(&dest, &adopt, server).await?;
     Ok(rows_applied.iter().map(|a| (a.get(), 1)).collect())
 }
 

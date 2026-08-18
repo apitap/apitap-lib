@@ -130,7 +130,11 @@ pub(crate) async fn server_identity(pool: &sqlx::MySqlPool) -> Result<u64> {
     {
         Ok((v,)) => format!("uuid:{v}"),
         Err(_) => {
-            let (id,): (i64,) = sqlx::query_as("SELECT @@server_id")
+            // Read it as text: `@@server_id` is BIGINT UNSIGNED on MariaDB and
+            // BIGINT on MySQL, and binding the wrong one is a decode error, not
+            // a number. The value is only ever hashed, so its spelling is all
+            // this needs.
+            let (id,): (String,) = sqlx::query_as("SELECT CAST(@@server_id AS CHAR)")
                 .fetch_one(pool)
                 .await
                 .map_err(|e| Error::Transfer(format!("probe server identity: {e}")))?;

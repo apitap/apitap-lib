@@ -25,6 +25,48 @@ pub(crate) struct MyDest {
     shared: MySqlShared,
 }
 
+/// Fail if the statement just run raised warnings.
+///
+/// `LOAD DATA LOCAL INFILE` is the exception to strict mode, by design and by
+/// documentation: with LOCAL the server cannot stop the client mid-file, so it
+/// behaves "as if IGNORE were specified" and downgrades every data error to a
+/// warning — including "Data too long for column". Strict mode does not change
+/// that. So a CDC apply into a destination column narrower than the value can
+/// TRUNCATE and still report success, which is precisely the silent corruption
+/// the strict session was set for.
+///
+/// Reading the warning count costs one round-trip per load and turns that back
+/// into an error, quoting what the server said.
+async fn no_warnings<'a, T>(q: &mut T, what: &str) -> Result<()>
+where
+    T: mysql_async::prelude::Queryable,
+{
+    let n: Option<u32> = q
+        .query_first("SELECT @@warning_count")
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based: mysql warning probe: {e}")))?;
+    if n.unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let rows: Vec<(String, u32, String)> = q
+        .query("SHOW WARNINGS")
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based: mysql SHOW WARNINGS: {e}")))?;
+    let said = rows
+        .iter()
+        .take(3)
+        .map(|(lvl, code, msg)| format!("{lvl} {code}: {msg}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(Error::Transfer(format!(
+        "log_based: the {what} raised {} warning(s), and a warning here means a \
+         value was CHANGED to fit — LOAD DATA LOCAL cannot refuse a row, it can \
+         only report afterwards. Refusing the window rather than leaving a \
+         value the source never had. MySQL said: {said}",
+        n.unwrap_or(0)
+    )))
+}
+
 impl MyDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
         Ok(Self { shared: MySqlSink::shared_pool(url)? })
@@ -307,6 +349,7 @@ impl MyDest {
                 self.shared.forget_infile(id);
                 return Err(my_err("load keys")(e));
             }
+            no_warnings(&mut tx, "key load").await?;
             let join = pk_cols
                 .iter()
                 .map(|k| format!("t.{k} = d.{k}", k = my_ident(k)))
@@ -328,6 +371,7 @@ impl MyDest {
                 self.shared.forget_infile(id);
                 return Err(my_err("load rows")(e));
             }
+            no_warnings(&mut tx, "row load").await?;
             let collist =
                 wal_cols.iter().map(|c| my_ident(c)).collect::<Vec<_>>().join(", ");
             // No ON DUPLICATE KEY: the delete phase already cleared every key.

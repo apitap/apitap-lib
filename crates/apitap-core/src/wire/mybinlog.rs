@@ -505,16 +505,19 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             // five bytes for a BIT(12) and died on "truncated u8".
             let leftover = (c.meta >> 8) as usize;
             let n = (c.meta & 0xFF) as usize + usize::from(leftover > 0);
-            let b = r.take(n.max(1))?;
-            // Match the bulk lane, which renders binary as \x-prefixed hex.
-            // Writing the decimal value instead put the ASCII of "5" (0x35)
-            // where the bootstrap had put the byte 0x05.
-            let mut out = Vec::with_capacity(2 + b.len() * 2);
-            out.extend_from_slice(b"\\x");
-            for byte in b {
-                out.extend_from_slice(format!("{byte:02x}").as_bytes());
-            }
-            Ok(out)
+            // BIT is a binary string, so it travels as its BYTES — the same as
+            // BLOB and VARBINARY two arms down, and the same as what the bulk
+            // load writes (measured: a BIT(8) of b'00000101' lands as the
+            // single byte 0x05, length 1).
+            //
+            // Two spellings were tried and both were wrong. The decimal value
+            // put the ASCII "5" (0x35) where the byte 0x05 belonged. Then
+            // `\x`-hex — the Postgres bytea convention — looked right in
+            // isolation but is TEXT: the destination writer escapes the
+            // backslash, so the column ended up holding the four characters
+            // \x05 (hex 5C783035, length 4) on rows CDC touched and the byte
+            // 0x05 on rows it did not.
+            Ok(r.take(n.max(1))?.to_vec())
         }
         MT_STRING => {
             // meta packs (real_type << 8 | length) with the high bits of the
@@ -1104,15 +1107,17 @@ mod tests {
 
         // BIT(8) = 0x05. Rendering the decimal put the ASCII "5" (0x35) where
         // the bootstrap had put the byte 0x05.
-        // Metadata is (bits % 8) << 8 | whole bytes: BIT(8) = (0, 1).
+        // Metadata is (bits % 8) << 8 | whole bytes: BIT(8) = (0, 1). The
+        // value is the BYTE, not a rendering of it — the bulk load writes
+        // 0x05, so anything printable here would be a second spelling.
         let bit = ColDef { kind: MT_BIT, meta: 0x0001, nullable: false, unsigned: false, labels: None };
         let mut r = R::new(&[0x05]);
-        assert_eq!(decode_cell(&mut r, &bit).unwrap(), b"\\x05");
+        assert_eq!(decode_cell(&mut r, &bit).unwrap(), vec![0x05]);
         // BIT(12) = (4, 1) — two bytes, not the five the swapped halves asked
         // for. The trailing byte proves the reader stopped where it should.
         let wide = ColDef { kind: MT_BIT, meta: 0x0401, nullable: false, unsigned: false, labels: None };
         let mut r = R::new(&[0x0A, 0xAA, 0x7F]);
-        assert_eq!(decode_cell(&mut r, &wide).unwrap(), b"\\x0aaa");
+        assert_eq!(decode_cell(&mut r, &wide).unwrap(), vec![0x0A, 0xAA]);
 
         // TIME2 is biased by 0x800000 with negatives stored as the complement;
         // masking the sign away turned -01:00:00 into 1023:00:00.

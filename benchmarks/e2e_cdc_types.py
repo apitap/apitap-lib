@@ -13,11 +13,18 @@ server:
     ✗ DIFFERS  flags:  bootstrap='05' cdc='35'
     ✗ DIFFERS  neg:    bootstrap='-01:00:00' cdc='1023:00:00'
 
-The method is the only one worth trusting for this class of bug: seed two
-identical rows, bootstrap them both, then UPDATE the second row to the exact
-values the first one already holds. If the two paths agree the rows are now
-byte-identical; any divergence is the decoder writing something the source
-never contained. Row 1 is the bulk lane's answer, row 2 is CDC's.
+The method: seed two identical rows, bootstrap them both, then UPDATE ONE
+UNRELATED COLUMN of the second row. The type-bearing columns keep the values
+they already have, but the row now rides the binlog — so row 1 is the bulk
+lane's answer to those values and row 2 is CDC's answer to the same values.
+Any divergence is the decoder writing something the source never contained.
+
+The unrelated column is the part that took a second attempt to get right. An
+earlier version rewrote the type-bearing columns to the values they already
+held, which MySQL optimises away entirely: an UPDATE that modifies nothing
+produces no row event, the drain applies nothing, and the comparison quietly
+becomes bootstrap-against-bootstrap. It passed while proving nothing — and a
+BIT divergence hid behind it for a whole release.
 
 Runs against BOTH dialects, because they differ here: MariaDB stores JSON as
 LONGTEXT (it comes through as text), MySQL 8 stores a binary envelope apitap
@@ -94,21 +101,24 @@ for label, container, client, port, json_is_binary in SERVERS:
       dur TIME NULL,
       neg TIME NULL,
       zero TIME NULL,
-      maybe ENUM('a','b') NULL)""")
+      maybe ENUM('a','b') NULL,
+      -- The ONLY column that changes. MySQL does not write a row event for
+      -- an UPDATE that modifies nothing, so rewriting the type-bearing
+      -- columns to the values they already hold logs NOTHING at all and the
+      -- comparison below silently becomes bootstrap-against-bootstrap. This
+      -- column makes the row event real while the values under test stay put.
+      touched INT NOT NULL DEFAULT 0)""")
     # Both rows carry the SAME values, so the two write paths have nowhere
     # to hide: row 1 is written by the bootstrap, row 2 by a CDC update.
     vals = ("'shipped','read,write',b'00000101',b'101010101010',"
-            "'10:20:30','-01:00:00','00:00:00',NULL")
+            "'10:20:30','-01:00:00','00:00:00',NULL,0")
     sh(container, client, f"INSERT INTO {T} VALUES (1,{vals}),(2,{vals})")
     clean(src, T)
 
     apitap.transfer(src, CH, table=T, mode="log_based")
     # Rewrite row 2 to what it already holds — the values arrive through the
     # binlog this time.
-    sh(container, client, f"""UPDATE {T} SET
-      status='shipped', perms='read,write', flags=b'00000101',
-      wide=b'101010101010', dur='10:20:30', neg='-01:00:00',
-      zero='00:00:00', maybe=NULL WHERE id=2""")
+    sh(container, client, f"UPDATE {T} SET touched = 1 WHERE id = 2")
     apitap.transfer(src, CH, table=T, mode="log_based")
 
     cols = ["status", "perms", "flags", "wide", "dur", "neg", "zero", "maybe"]

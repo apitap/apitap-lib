@@ -58,6 +58,14 @@ The two properties everything else rests on:
 - **Destination-side crash mid-apply** (ClickHouse or BigQuery restarting under
   us). The apply is idempotent by design and the watermark is written last, so
   the expectation is a clean replay — again, expectation, not receipt.
+- **A single very wide value.** `chunk_bytes` bounds a chunk, not one row, and
+  Postgres ships one protocol message per row — so a table with 32 MB values
+  drives peak RSS by row width instead of by the budget. Measured: three 32 MB
+  rows peak at ~440 MB. It does not corrupt anything and it is not silent (the
+  container OOMs, loudly), but a memory model that holds at 170 MB for 100 GB
+  does not hold for a table with a PDF in it. `benchmarks/e2e_review_gate.py`
+  leg 3 measures it on every run and reports it as a KNOWN GAP rather than
+  passing — the number in that output is the current state of this line.
 
 ## Rules of thumb
 
@@ -72,14 +80,23 @@ The two properties everything else rests on:
    Postgres disk or outruns a MySQL binlog — the two cases apitap now reports
    and refuses on, respectively.
 
-## The hole that is still open
+## The hole that was open, and how it closed
 
 A binlog coordinate is `(file name, position)`, and after a server's log is
-reset the names start again at `000001`. apitap now refuses the two shapes it
-can see — the file is gone, or the stored position is ahead of the server's —
-but there is a third it cannot: **a reset log that has since grown past the old
-position**. The name matches, the position exists, and the bytes there belong
-to different history. A drain would resume into it and report success.
+reset the names start again at `000001`. Two shapes were already refused — the
+file is gone, or the stored position is ahead of the server's — but a third was
+not: **a reset log that has since grown past the old position**. The name
+matches, the position exists, and the bytes there belong to different history.
+A drain resumed into it and reported success.
+
+That is closed. apitap now records the source server's identity next to the
+watermark (`@@server_uuid`, or `@@server_id` where MariaDB offers no uuid) and
+refuses to resume against a different one — which covers the reset log, a
+promoted replica, a restored backup, and a DNS record moved during a failover,
+all of which look identical from a connection string. A table with no recorded
+identity adopts what it is reading now; from the run after that, a switch is
+refused. Proven in `benchmarks/e2e_review_gate.py` leg 4, which bootstraps
+against one server and then points the same table at another.
 
 Closing this needs the watermark to carry the server's identity (`server_uuid`
 on MySQL, the GTID domain on MariaDB) so a changed identity refuses on sight.
