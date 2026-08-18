@@ -108,11 +108,32 @@ pub(crate) fn check_ssl_mode(url: &str) -> Result<()> {
     parse_my_url(url).map(|_| ())
 }
 
+/// The host as a CONNECTABLE string.
+///
+/// `url::Url::host_str()` returns an IPv6 literal in its bracketed URL form —
+/// `[2001:db8::1]` — which is right for a URL and wrong for everything else:
+/// `TcpStream::connect(("[2001:db8::1]", 5432))` is a DNS lookup of that
+/// literal string, and it fails. It also fails as a rustls `ServerName`.
+///
+/// The brackets come off here, once, so the address that is dialled and the
+/// name that TLS verifies are the same thing.
+///
+/// Note for `verify-full`/`verify_identity` against an IP: rustls turns a bare
+/// address into `ServerName::IpAddress`, which requires an iPAddress SAN in
+/// the certificate. Most server certificates only carry DNS names, so that
+/// combination fails on purpose — connect by hostname, or use a mode that
+/// does not verify.
+fn connectable_host(h: &str) -> &str {
+    h.strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or(h)
+}
 pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
     let u = reqwest::Url::parse(url)
         .map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?;
     let host = u
         .host_str()
+        .map(connectable_host)
         .ok_or_else(|| Error::InvalidInput("mysql url needs a host".into()))?
         .to_string();
     let mut ssl = SslPref::Preferred { explicit: false };
@@ -1030,6 +1051,11 @@ mod tests {
         assert_eq!(i.port, 3307);
         assert_eq!(i.db, "bench");
         assert!(matches!(i.ssl, SslPref::Disabled));
+        // Same for the MySQL client: brackets off, or the connect is a DNS
+        // lookup of a literal "[…]" string.
+        let i6 = parse_my_url("mysql://u:p@[2001:db8::1]:3307/bench").unwrap();
+        assert_eq!((i6.host.as_str(), i6.port), ("2001:db8::1", 3307));
+        assert_eq!(parse_my_url("mysql://u:p@h/bench").unwrap().host, "h");
         // required is now spoken natively (encrypt, no verification)…
         let i = parse_my_url("mysql://u:p@h/db?ssl-mode=required").unwrap();
         assert!(matches!(i.ssl, SslPref::Required));

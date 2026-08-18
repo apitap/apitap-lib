@@ -221,6 +221,7 @@ async fn tls_upgrade(
     mut stream: TcpStream,
     host: &str,
     verify: bool,
+    root_cert: Option<&str>,
 ) -> Result<std::result::Result<tokio_rustls::client::TlsStream<TcpStream>, TcpStream>> {
     let mut req = [0u8; 8];
     req[..4].copy_from_slice(&8u32.to_be_bytes());
@@ -238,7 +239,31 @@ async fn tls_upgrade(
         .map_err(|e| Error::Transfer(format!("postgres tls: {e}")))?;
     let cfg = if verify {
         let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        match root_cert {
+            // libpq's meaning: naming a root REPLACES the trust store rather
+            // than adding to it. A private CA is the whole point of the
+            // option, and quietly keeping the public anchors alongside it
+            // would verify against a wider set than the user asked for.
+            Some(path) => {
+                let pem = std::fs::read_to_string(path).map_err(|e| {
+                    Error::InvalidInput(format!("sslrootcert {path}: {e}"))
+                })?;
+                let certs = pem_certs(&pem);
+                if certs.is_empty() {
+                    return Err(Error::InvalidInput(format!(
+                        "sslrootcert {path} contains no CERTIFICATE block — an empty \
+                         trust store would verify nothing, so this is refused rather \
+                         than accepted"
+                    )));
+                }
+                for c in certs {
+                    roots.add(c).map_err(|e| {
+                        Error::InvalidInput(format!("sslrootcert {path}: {e}"))
+                    })?;
+                }
+            }
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
         builder.with_root_certificates(roots).with_no_client_auth()
     } else {
         builder
@@ -254,13 +279,20 @@ async fn tls_upgrade(
         .map_err(|e| {
             Error::Transfer(format!(
                 "postgres tls handshake: {e}{}",
-                if verify {
-                    " — sslmode=verify-full checks the chain against the system \
-                     roots and the hostname against the certificate. A private CA \
-                     or a self-signed server certificate will fail here; use \
-                     sslmode=require if you want encryption without verification."
-                } else {
-                    ""
+                match (verify, root_cert) {
+                    (true, Some(p)) => format!(
+                        " — sslmode=verify-full checked the chain against {p} and the \
+                         hostname against the certificate. If the CA is right, the \
+                         name you connected to is probably not one the certificate \
+                         carries."
+                    ),
+                    (true, None) => " — sslmode=verify-full checks the chain against \
+                         the bundled trust anchors and the hostname against the \
+                         certificate. For a PRIVATE CA, point sslrootcert= at its \
+                         PEM file; sslmode=require encrypts without verifying, which \
+                         is a different thing and worth choosing deliberately."
+                        .to_string(),
+                    _ => String::new(),
                 }
             ))
         })?;
@@ -339,6 +371,60 @@ struct ConnInfo {
     password: String,
     db: String,
     ssl: SslMode,
+    /// `sslrootcert=` — the CA to verify against INSTEAD of the bundled trust
+    /// anchors, which is libpq's meaning: naming a root replaces the store,
+    /// it does not add to it.
+    root_cert: Option<String>,
+}
+
+/// Certificates out of a PEM file, without a parser crate.
+///
+/// A PEM file is base64 between `-----BEGIN CERTIFICATE-----` markers and
+/// nothing else, and this reads exactly that. It is deliberately strict: a
+/// file that contains something else (a key, a mangled block) yields no
+/// certificates and the caller refuses, rather than quietly verifying against
+/// an empty store — which would accept everything.
+fn pem_certs(pem: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut out = Vec::new();
+    let mut rest = pem;
+    while let Some(i) = rest.find(BEGIN) {
+        let after = &rest[i + BEGIN.len()..];
+        let Some(j) = after.find(END) else { break };
+        let b64: String = after[..j].chars().filter(|c| !c.is_whitespace()).collect();
+        if let Some(der) = b64_decode(&b64) {
+            out.push(rustls::pki_types::CertificateDer::from(der));
+        }
+        rest = &after[j + END.len()..];
+    }
+    out
+}
+
+/// Standard base64, no padding assumptions beyond `=`.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut idx = [255u8; 256];
+    for (i, c) in T.iter().enumerate() {
+        idx[*c as usize] = i as u8;
+    }
+    let (mut acc, mut bits, mut out) = (0u32, 0u32, Vec::with_capacity(s.len() * 3 / 4));
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = idx[c as usize];
+        if v == 255 {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Reject an ssl mode this client cannot honour, before any socket is opened.
@@ -350,15 +436,40 @@ pub(crate) fn check_ssl_mode(url: &str) -> Result<()> {
     parse_url(url).map(|_| ())
 }
 
+/// The host as a CONNECTABLE string.
+///
+/// `url::Url::host_str()` returns an IPv6 literal in its bracketed URL form —
+/// `[2001:db8::1]` — which is right for a URL and wrong for everything else:
+/// `TcpStream::connect(("[2001:db8::1]", 5432))` is a DNS lookup of that
+/// literal string, and it fails. It also fails as a rustls `ServerName`.
+///
+/// The brackets come off here, once, so the address that is dialled and the
+/// name that TLS verifies are the same thing.
+///
+/// Note for `verify-full`/`verify_identity` against an IP: rustls turns a bare
+/// address into `ServerName::IpAddress`, which requires an iPAddress SAN in
+/// the certificate. Most server certificates only carry DNS names, so that
+/// combination fails on purpose — connect by hostname, or use a mode that
+/// does not verify.
+fn connectable_host(h: &str) -> &str {
+    h.strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or(h)
+}
 fn parse_url(url: &str) -> Result<ConnInfo> {
     let u = reqwest::Url::parse(url)
         .map_err(|e| Error::InvalidInput(format!("postgres url: {e}")))?;
     let host = u
         .host_str()
+        .map(connectable_host)
         .ok_or_else(|| Error::InvalidInput("postgres url needs a host".into()))?
         .to_string();
     let mut ssl = SslMode::Prefer { explicit: false };
+    let mut root_cert = None;
     for (k, v) in u.query_pairs() {
+        if k == "sslrootcert" {
+            root_cert = Some(v.to_string());
+        }
         // BOTH spellings. libpq writes `sslmode`, sqlx accepts `sslmode` and
         // `ssl-mode`, and this project's own MySQL parser accepts both — so a
         // URL written with the hyphen encrypted its sqlx pool and silently
@@ -398,6 +509,19 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
             };
         }
     }
+    // Client certificates are a different feature (the server must also be
+    // configured for them), and silently dropping them means a confusing
+    // authentication failure later. Named now.
+    for (k, _) in u.query_pairs() {
+        if k == "sslcert" || k == "sslkey" {
+            return Err(Error::InvalidInput(format!(
+                "{k} is not supported on the replication connection — apitap does \
+                 not do client-certificate authentication there yet. Remove it and \
+                 authenticate with a password, or use mode='replace'/'append', \
+                 whose lane does support it."
+            )));
+        }
+    }
     Ok(ConnInfo {
         host,
         port: u.port().unwrap_or(5432),
@@ -405,6 +529,7 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
         password: percent_decode(u.password().unwrap_or(""))?,
         db: u.path().trim_matches('/').to_string(),
         ssl,
+        root_cert,
     })
 }
 
@@ -478,7 +603,7 @@ impl Walsender {
                 let (r, w) = stream.into_split();
                 (PgRead::Tcp(r), PgWrite::Tcp(w))
             }
-            SslMode::Prefer { explicit } => match tls_upgrade(stream, &ci.host, false).await? {
+            SslMode::Prefer { explicit } => match tls_upgrade(stream, &ci.host, false, ci.root_cert.as_deref()).await? {
                 Ok(tls) => {
                     let (r, w) = tokio::io::split(tls);
                     (PgRead::Tls(r), PgWrite::Tls(w))
@@ -506,7 +631,7 @@ impl Walsender {
             },
             SslMode::Require | SslMode::VerifyFull => {
                 let verify = ci.ssl == SslMode::VerifyFull;
-                match tls_upgrade(stream, &ci.host, verify).await? {
+                match tls_upgrade(stream, &ci.host, verify, ci.root_cert.as_deref()).await? {
                     Ok(tls) => {
                         let (r, w) = tokio::io::split(tls);
                         (PgRead::Tls(r), PgWrite::Tls(w))
@@ -1486,6 +1611,13 @@ mod tests {
         assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
         // libpq's default, and so this client's.
         assert_eq!(ci.ssl, SslMode::Prefer { explicit: false });
+        // An IPv6 literal must come out DIALLABLE, not URL-shaped: with the
+        // brackets left on, connect() looks up "[::1]" in DNS.
+        let ci6 = parse_url("postgres://u:p@[2001:db8::1]:5433/db").unwrap();
+        assert_eq!((ci6.host.as_str(), ci6.port), ("2001:db8::1", 5433));
+        assert_eq!(parse_url("postgres://u:p@[::1]/db").unwrap().host, "::1");
+        // A name is left exactly as it was.
+        assert_eq!(parse_url("postgres://u:p@db.example/x").unwrap().host, "db.example");
         // Both spellings, because a URL that works for the pool must not
         // mean something weaker for the replication socket.
         assert_eq!(

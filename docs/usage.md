@@ -834,6 +834,16 @@ apitap.transfer(
   `verify-ca` is refused by name: it verifies the chain while skipping the
   hostname, which this client cannot express, and silently mapping it to
   either neighbour would be weaker or stricter than what was asked for.
+
+  **A private CA**: point `sslrootcert=` at its PEM file. libpq's meaning
+  applies — naming a root REPLACES the bundled trust anchors rather than
+  adding to them, because a private CA is the whole reason to name one. A file
+  with no `CERTIFICATE` block is refused rather than accepted as an empty
+  trust store, which would verify nothing while looking like it verified.
+
+  `sslcert`/`sslkey` (client-certificate authentication) are **not** supported
+  on the replication connection and are refused by name rather than dropped —
+  the bulk modes' lane does support them.
 - **Scope today**: Postgres, MySQL and MariaDB sources → **Postgres,
   ClickHouse, MySQL, BigQuery and Iceberg** destinations. Iceberg needs a single-column primary key
   (equality-delete files are single-key), and the parquet lane's bytea
