@@ -92,8 +92,21 @@ for line in err.splitlines():
         except json.JSONDecodeError:
             ok = False
             print(f"   ✗ a line starting with {{ is not valid JSON: {line[:120]}")
-if objs and all("event" in o and "rows" in o and "elapsed_s" in o for o in objs):
-    last = objs[-1]
+# Shapes differ BY EVENT, which is what `event` is for: a progress record
+# carries rows/elapsed_s, a note carries the note. Requiring every object to
+# look like a progress record would forbid the engine from ever saying
+# anything else — and did, the first time it had something to say.
+def well_formed(o):
+    if "event" not in o:
+        return False
+    if o["event"] == "transfer.note":
+        return "note" in o
+    return "rows" in o and "elapsed_s" in o
+
+
+progress_objs = [o for o in objs if o.get("event") != "transfer.note"]
+if objs and all(well_formed(o) for o in objs) and progress_objs:
+    last = progress_objs[-1]
     print(f"   ✓ {len(objs)} JSON objects, one per line; last event={last['event']} "
           f"rows={last['rows']} bytes={last['bytes']}")
     if last["event"] != "transfer.done":

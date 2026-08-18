@@ -317,8 +317,15 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 enum SslMode {
     /// No TLS at all.
     Disable,
-    /// Try TLS; if the server says no, continue in cleartext. libpq's default.
-    Prefer,
+    /// Try TLS; if the server says no, continue in cleartext. libpq's default,
+    /// and apitap's — the bool says whether the URL ASKED for it or simply did
+    /// not mention ssl, which decides whether a cleartext fallback is worth
+    /// telling the operator about. Someone who wrote `sslmode=prefer` wrote
+    /// something that reads like "please encrypt" and deserves to know it did
+    /// not; someone who wrote nothing at all holds no belief to correct, and a
+    /// security note on every run against a local database is noise that
+    /// teaches people to ignore security notes.
+    Prefer { explicit: bool },
     /// TLS required. Certificate NOT verified (libpq semantics).
     Require,
     /// TLS required, chain verified against the system roots, hostname checked.
@@ -350,7 +357,7 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
         .host_str()
         .ok_or_else(|| Error::InvalidInput("postgres url needs a host".into()))?
         .to_string();
-    let mut ssl = SslMode::Prefer;
+    let mut ssl = SslMode::Prefer { explicit: false };
     for (k, v) in u.query_pairs() {
         if k == "sslmode" {
             ssl = match v.as_ref() {
@@ -359,7 +366,7 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
                 // fails". Nobody deploys it deliberately and the distinction
                 // buys nothing here, so it maps to the same attempt order as
                 // `prefer` rather than to an unsupported-value error.
-                "prefer" | "allow" => SslMode::Prefer,
+                "prefer" | "allow" => SslMode::Prefer { explicit: true },
                 "require" => SslMode::Require,
                 "verify-full" => SslMode::VerifyFull,
                 // verify-ca means "check the chain but not the hostname".
@@ -465,7 +472,7 @@ impl Walsender {
                 let (r, w) = stream.into_split();
                 (PgRead::Tcp(r), PgWrite::Tcp(w))
             }
-            SslMode::Prefer => match tls_upgrade(stream, &ci.host, false).await? {
+            SslMode::Prefer { explicit } => match tls_upgrade(stream, &ci.host, false).await? {
                 Ok(tls) => {
                     let (r, w) = tokio::io::split(tls);
                     (PgRead::Tls(r), PgWrite::Tls(w))
@@ -476,15 +483,17 @@ impl Walsender {
                 // process, not once per connection: a `slots=8` run opens
                 // nine of these and the ninth copy tells nobody anything.
                 Err(plain) => {
-                    static SAID: std::sync::Once = std::sync::Once::new();
-                    let (h, p) = (ci.host.clone(), ci.port);
-                    SAID.call_once(|| {
-                        crate::progress::note(&format!(
-                            "postgres {h}:{p} refused TLS and sslmode=prefer permits \
-                             cleartext — this replication connection is NOT \
-                             encrypted. sslmode=require makes that a failure instead."
-                        ));
-                    });
+                    if explicit {
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        let (h, p) = (ci.host.clone(), ci.port);
+                        SAID.call_once(|| {
+                            crate::progress::note(&format!(
+                                "postgres {h}:{p} refused TLS and sslmode=prefer permits \
+                                 cleartext — this connection is NOT encrypted. \
+                                 sslmode=require makes that a failure instead."
+                            ));
+                        });
+                    }
                     let (r, w) = plain.into_split();
                     (PgRead::Tcp(r), PgWrite::Tcp(w))
                 }
@@ -1451,11 +1460,11 @@ mod tests {
         assert_eq!((ci.user.as_str(), ci.password.as_str()), ("u@x", "p:w"));
         assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
         // libpq's default, and so this client's.
-        assert_eq!(ci.ssl, SslMode::Prefer);
+        assert_eq!(ci.ssl, SslMode::Prefer { explicit: false });
         for (q, want) in [
             ("disable", SslMode::Disable),
-            ("prefer", SslMode::Prefer),
-            ("allow", SslMode::Prefer),
+            ("prefer", SslMode::Prefer { explicit: true }),
+            ("allow", SslMode::Prefer { explicit: true }),
             ("require", SslMode::Require),
             ("verify-full", SslMode::VerifyFull),
         ] {
