@@ -371,21 +371,25 @@ fn short() -> Error {
 
 /// Decode one pgoutput message (one XLogData payload).
 /// `in_stream`: between StreamStart and StreamStop, DML/Relation/Type
-/// messages carry a leading Int32 xid (proto v2) — strip it before the
-/// v1-shaped body.
+/// messages carry a leading Int32 xid (proto v2) — that is the xid of the
+/// (SUB)transaction the change belongs to, and it is REPORTED rather than
+/// discarded: it is the only thing that makes a `ROLLBACK TO SAVEPOINT`
+/// inside a streamed transaction undoable, because the caller can then drop
+/// exactly the aborted subtransaction's rows instead of all of them or none.
 /// `rel_oids`: per-relation column type OIDs, consulted ONLY when a tuple
 /// carries `'b'` (binary) cells — pass an empty map for text-mode streams.
 pub(crate) fn decode(
     payload: &bytes::Bytes,
     in_stream: bool,
     rel_oids: &RelOids,
-) -> Result<PgoMessage> {
+) -> Result<(PgoMessage, Option<u32>)> {
     let mut r = Reader::new(payload);
     let tag = r.u8()?;
+    let mut change_xid = None;
     if in_stream && matches!(tag, b'R' | b'Y' | b'I' | b'U' | b'D' | b'T') {
-        let _xid = r.u32()?;
+        change_xid = Some(r.u32()?);
     }
-    Ok(match tag {
+    let msg = match tag {
         b'S' => {
             let xid = r.u32()?;
             let _first_segment = r.u8()?;
@@ -412,7 +416,15 @@ pub(crate) fn decode(
             // it is reported for what it is and the caller refuses. Rare and
             // loud beats common and silent.
             let xid = r.u32()?;
-            let sub_xid = r.u32().unwrap_or(xid);
+            // NOT `unwrap_or(xid)`. Defaulting the subtransaction to the
+            // top-level one makes a truncated message look like a TOP-LEVEL
+            // abort, and the drain then discards the whole transaction —
+            // which is exactly the silent, permanent loss the two-xid decode
+            // exists to prevent, re-opened for any relay or proxy that
+            // truncates a frame. Streaming only exists in proto v2 and up,
+            // and every version of it writes both xids, so a message without
+            // the second one is malformed and says so.
+            let sub_xid = r.u32()?;
             PgoMessage::StreamAbort { xid, sub_xid }
         }
         b'B' => PgoMessage::Begin {
@@ -517,7 +529,8 @@ pub(crate) fn decode(
                 other as char
             )))
         }
-    })
+    };
+    Ok((msg, change_xid))
 }
 
 /// Render an LSN the way Postgres prints `pg_lsn` (`X/Y`).
@@ -539,6 +552,17 @@ pub(crate) fn lsn_from_string(s: &str) -> Result<u64> {
 mod tests {
     use super::*;
 
+    /// The message only. `decode` also reports which (sub)transaction a
+    /// streamed change came from, which every test below predates and none of
+    /// them are about.
+    fn dec(
+        payload: &bytes::Bytes,
+        in_stream: bool,
+        oids: &RelOids,
+    ) -> Result<PgoMessage> {
+        decode(payload, in_stream, oids).map(|(m, _)| m)
+    }
+
     fn frame(parts: &[&[u8]]) -> bytes::Bytes {
         bytes::Bytes::from(parts.concat())
     }
@@ -547,7 +571,7 @@ mod tests {
     fn begin_commit_roundtrip() {
         let b = frame(&[b"B", &7u64.to_be_bytes(), &99i64.to_be_bytes(), &5u32.to_be_bytes()]);
         assert_eq!(
-            decode(&b, false, &RelOids::new()).unwrap(),
+            dec(&b, false, &RelOids::new()).unwrap(),
             PgoMessage::Begin { final_lsn: 7, commit_ts_us: 99, xid: 5 }
         );
         let c = frame(&[
@@ -558,7 +582,7 @@ mod tests {
             &99i64.to_be_bytes(),
         ]);
         assert_eq!(
-            decode(&c, false, &RelOids::new()).unwrap(),
+            dec(&c, false, &RelOids::new()).unwrap(),
             PgoMessage::Commit { commit_lsn: 7, end_lsn: 8, commit_ts_us: 99 }
         );
     }
@@ -581,7 +605,7 @@ mod tests {
             &25u32.to_be_bytes(),
             &(-1i32).to_be_bytes(),
         ]);
-        let PgoMessage::Relation(r) = decode(&rel, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Relation(r) = dec(&rel, false, &RelOids::new()).unwrap() else { panic!() };
         assert_eq!(r.rel_id, 42);
         assert_eq!(r.replica_identity, b'd');
         assert!(r.cols[0].key && !r.cols[1].key);
@@ -597,7 +621,7 @@ mod tests {
             b"9",
             b"n",
         ]);
-        let PgoMessage::Insert { rel_id, new } = decode(&ins, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Insert { rel_id, new } = dec(&ins, false, &RelOids::new()).unwrap() else { panic!() };
         assert_eq!(rel_id, 42);
         assert_eq!(new.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9")), Cell::Null]);
     }
@@ -620,7 +644,7 @@ mod tests {
             b"9",
             b"u",
         ]);
-        let PgoMessage::Update { old, new, .. } = decode(&upd, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Update { old, new, .. } = dec(&upd, false, &RelOids::new()).unwrap() else { panic!() };
         let old = old.unwrap();
         assert!(!old.full);
         assert_eq!(old.tuple.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9"))]);
@@ -634,7 +658,7 @@ mod tests {
             b"t",
             &0u32.to_be_bytes(),
         ]);
-        let PgoMessage::Insert { new, .. } = decode(&ins, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Insert { new, .. } = dec(&ins, false, &RelOids::new()).unwrap() else { panic!() };
         assert_eq!(new.view(0), Cellv::Text(b""));
         assert_ne!(new.view(0), Cellv::Null);
     }
@@ -649,7 +673,7 @@ mod tests {
             &43u32.to_be_bytes(),
         ]);
         assert_eq!(
-            decode(&t, false, &RelOids::new()).unwrap(),
+            dec(&t, false, &RelOids::new()).unwrap(),
             PgoMessage::Truncate { rel_ids: vec![42, 43], cascade: true, restart_identity: true }
         );
     }
@@ -681,14 +705,14 @@ mod tests {
         ]);
         let mut oids = RelOids::new();
         oids.insert(42, Arc::new(vec![20, 25, 1700]));
-        let PgoMessage::Insert { new, .. } = decode(&ins, false, &oids).unwrap() else {
+        let PgoMessage::Insert { new, .. } = dec(&ins, false, &oids).unwrap() else {
             panic!()
         };
         assert_eq!(new.view(0), Cellv::Text(b"7"));
         assert_eq!(new.view(1), Cellv::Text(b"x"));
         assert_eq!(new.view(2), Cellv::Text(b"1234.50"));
         // Without the relation's OIDs the same payload fails loudly.
-        assert!(decode(&ins, false, &RelOids::new()).is_err());
+        assert!(dec(&ins, false, &RelOids::new()).is_err());
     }
 
     #[test]

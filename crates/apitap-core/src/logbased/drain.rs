@@ -66,7 +66,11 @@ pub(crate) struct DrainSession {
     /// big transaction WHILE decoding it; its ops buffer here until Stream
     /// Commit makes them real (Abort drops them). May span windows — a
     /// budget break can only land between blocks, never inside one.
-    streams: HashMap<u32, Vec<(Arc<str>, StreamOp)>>,
+    /// Ops buffered per TOP-LEVEL xid, each tagged with the xid of the
+    /// (sub)transaction that produced it — pgoutput prefixes every streamed
+    /// change with that, and it is the only way to undo a savepoint rollback
+    /// instead of refusing it.
+    streams: HashMap<u32, Vec<(Arc<str>, StreamOp, u32)>>,
     /// Bytes held by `streams`. It lives on the SESSION and not in `drain`'s
     /// locals because the buffers do: a streamed transaction survives a
     /// window boundary, and a per-call counter forgets it the moment the next
@@ -135,6 +139,7 @@ pub(crate) async fn drain(
     let mut buf_bytes = 0usize;
     let mut hit_budget = false;
     let mut caught_up_lsn = 0u64;
+    let dbg_stream = std::env::var("APITAP_DEBUG").is_ok();
 
     let mut in_stream: Option<u32> = None;
 
@@ -187,7 +192,13 @@ pub(crate) async fn drain(
                     break;
                 }
             }
-            Some(WalEvent::XLogData { payload, .. }) => match pgoutput::decode(&payload, in_stream.is_some(), &sess.rel_oids)? {
+            Some(WalEvent::XLogData { payload, .. }) => {
+                let (msg, change_xid) =
+                    pgoutput::decode(&payload, in_stream.is_some(), &sess.rel_oids)?;
+                // Inside a stream block every change names its own
+                // (sub)transaction; outside one there is nothing to name.
+                let sub = change_xid.or(in_stream);
+                match msg {
                 PgoMessage::Begin { .. } => tx_buf.clear(),
                 PgoMessage::Commit { end_lsn: e, .. } => {
                     flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
@@ -209,9 +220,10 @@ pub(crate) async fn drain(
                     let ops = sess.streams.remove(&xid).unwrap_or_default();
                     // The ops leave the session's buffer and land in this
                     // window's collapsers, so the charge moves with them.
-                    let n: usize = ops.iter().map(|(_, o)| op_bytes(o)).sum();
+                    let n: usize = ops.iter().map(|(_, o, _)| op_bytes(o)).sum();
                     sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
                     buf_bytes += n;
+                    let ops = ops.into_iter().map(|(t, o, _)| (t, o));
                     flush_ops(ops, &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
                     end_lsn = e;
                     if e >= stop_line {
@@ -223,61 +235,43 @@ pub(crate) async fn drain(
                     }
                 }
                 PgoMessage::StreamAbort { xid, sub_xid } => {
-                    // A TOP-LEVEL abort really does discard the whole
-                    // transaction: nothing in it ever committed.
-                    if sub_xid == xid {
-                        if let Some(ops) = sess.streams.remove(&xid) {
-                            let n: usize = ops.iter().map(|(_, o)| op_bytes(o)).sum();
-                            sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                    // Stream Abort names the top-level transaction and the
+                    // (sub)transaction that aborted. Both cases are now
+                    // handled by removing exactly what that xid produced:
+                    // when they are equal the whole transaction goes, and
+                    // when they differ only the rolled-back subtransaction's
+                    // rows do.
+                    //
+                    // This is possible because every streamed change carries
+                    // the xid that produced it and the buffer keeps it. The
+                    // first version of this code read only the first xid and
+                    // discarded the WHOLE transaction on any savepoint
+                    // rollback — silently, watermark and all; the second
+                    // refused the window, which was safe but stopped runs for
+                    // rollbacks in traffic apitap does not even replicate.
+                    if let Some(ops) = sess.streams.get_mut(&xid) {
+                        let before = ops.len();
+                        let freed: usize = ops
+                            .iter()
+                            .filter(|(_, _, sx)| *sx == sub_xid || sub_xid == xid)
+                            .map(|(_, o, _)| op_bytes(o))
+                            .sum();
+                        if sub_xid == xid {
+                            ops.clear();
+                        } else {
+                            ops.retain(|(_, _, sx)| *sx != sub_xid);
                         }
-                    } else if sess.streams.get(&xid).is_none_or(|v| v.is_empty()) {
-                        // The streamed transaction touched nothing we
-                        // replicate. Postgres streams by SIZE, not by
-                        // publication, so an unrelated batch job on the same
-                        // database — big enough to stream, with a savepoint in
-                        // it — produces exactly this message. Refusing there
-                        // would stop every CDC run on the slot for traffic
-                        // apitap does not even read, permanently, with
-                        // recovery advice about a transaction the operator
-                        // cannot find. Nothing was buffered, so nothing can be
-                        // lost: drop the empty entry and carry on.
-                        sess.streams.remove(&xid);
-                    } else {
-                        // A SUBtransaction aborted — a `ROLLBACK TO SAVEPOINT`
-                        // inside a streamed transaction. Only that
-                        // subtransaction's ops should disappear, and this
-                        // buffer does not tag ops by subxid, so there is no
-                        // way to remove the right ones.
-                        //
-                        // Dropping the whole transaction (what this arm used to
-                        // do, because the decoder read only the first xid) lost
-                        // every change in it and still advanced the watermark.
-                        // Keeping everything would apply changes the source
-                        // rolled back. Both are wrong and both are silent, so
-                        // the run stops and says which one it is.
-                        return Err(Error::Transfer(format!(
-                            "log_based: transaction {xid} rolled back to a savepoint \
-                             (subtransaction {sub_xid} aborted) while Postgres was \
-                             STREAMING it — sending its rows before it committed. \
-                             apitap buffers a streamed transaction's rows without \
-                             tagging them by subtransaction, so it cannot drop only \
-                             the rolled-back ones, and applying or discarding all of \
-                             them would both be wrong.\n\
-                             \n\
-                             Recovery: give the decoder room to buffer that \
-                             transaction instead of streaming it, then re-run. apitap \
-                             asks the session for 1GB and APITAP_DECODE_WORKMEM \
-                             changes that; the server's own logical_decoding_work_mem \
-                             and max_slot_wal_keep_size can still bind first, and a \
-                             transaction larger than whichever is smallest will \
-                             stream regardless. Postgres streams a transaction only \
-                             when decoding it would exceed that budget, so with room \
-                             to buffer it the whole transaction arrives at COMMIT with \
-                             the rollback already resolved and applies normally.\n\
-                             \n\
-                             Re-running WITHOUT changing that will replay the same \
-                             WAL, stream the same transaction, and stop here again."
-                        )));
+                        sess.stream_bytes = sess.stream_bytes.saturating_sub(freed);
+                        if dbg_stream && before != ops.len() {
+                            eprintln!(
+                                "[log_based] stream {xid}: subtransaction {sub_xid} \
+                                 rolled back, dropped {} of {before} buffered rows",
+                                before - ops.len()
+                            );
+                        }
+                        if sub_xid == xid {
+                            sess.streams.remove(&xid);
+                        }
                     }
                 }
                 PgoMessage::Relation(r) => {
@@ -306,7 +300,10 @@ pub(crate) async fn drain(
                         match in_stream {
                             Some(x) => {
                                 sess.stream_bytes += n;
-                                sess.streams.get_mut(&x).expect("stream open").push((t, op));
+                                sess.streams
+                                    .get_mut(&x)
+                                    .expect("stream open")
+                                    .push((t, op, sub.unwrap_or(x)));
                             }
                             None => {
                                 buf_bytes += n;
@@ -323,7 +320,10 @@ pub(crate) async fn drain(
                         match in_stream {
                             Some(x) => {
                                 sess.stream_bytes += n;
-                                sess.streams.get_mut(&x).expect("stream open").push((t, op));
+                                sess.streams
+                                    .get_mut(&x)
+                                    .expect("stream open")
+                                    .push((t, op, sub.unwrap_or(x)));
                             }
                             None => {
                                 buf_bytes += n;
@@ -339,7 +339,10 @@ pub(crate) async fn drain(
                         match in_stream {
                             Some(x) => {
                                 sess.stream_bytes += n;
-                                sess.streams.get_mut(&x).expect("stream open").push((t, op));
+                                sess.streams
+                                    .get_mut(&x)
+                                    .expect("stream open")
+                                    .push((t, op, sub.unwrap_or(x)));
                             }
                             None => {
                                 buf_bytes += n;
@@ -353,14 +356,19 @@ pub(crate) async fn drain(
                         if let Some(t) = tracked(&sess.rels, rid)? {
                             let op = StreamOp::Truncate;
                             match in_stream {
-                                Some(x) => sess.streams.get_mut(&x).expect("stream open").push((t, op)),
+                                Some(x) => sess.streams.get_mut(&x).expect("stream open").push((
+                                    t,
+                                    op,
+                                    sub.unwrap_or(x),
+                                )),
                                 None => tx_buf.push((t, op)),
                             }
                         }
                     }
                 }
                 PgoMessage::Origin | PgoMessage::Type => {}
-            },
+                }
+            }
         }
     }
 

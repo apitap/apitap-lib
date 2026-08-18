@@ -7,6 +7,13 @@ transaction discarded EVERY row the transaction had buffered, applied nothing,
 and advanced the watermark anyway. Silent, permanent, and invisible in every
 count the run reports.
 
+It is handled now rather than refused: every streamed change carries the xid of
+the (sub)transaction that produced it, so the abort drops exactly those rows and
+the rest of the transaction applies. This leg went through three versions —
+proving nothing, then proving a refusal, then proving the refusal was too
+broad — which is why it now checks the rows on BOTH sides of the savepoint,
+not just the absence of the rolled-back ones.
+
 Reproducing it needs the transaction to be STREAMED, which Postgres only does
 once it exceeds `logical_decoding_work_mem` before committing. apitap raises
 that GUC to 1 GB on purpose (it keeps big transactions off pg_replslot spill
@@ -15,7 +22,7 @@ transaction commits before it is ever streamed and the whole file passes while
 testing nothing.
 
   leg 1  the stream really happens   — the run must see Stream messages at all
-  leg 2  a savepoint rollback        — refused loudly, not applied silently
+  leg 2  a savepoint rollback        — APPLIED, minus exactly the rolled-back rows
   leg 3  the recovery is real        — the message says re-run; re-running must
                                        land exactly the rows the source kept
 
@@ -160,12 +167,23 @@ r = drain()
 dst = ch(f"SELECT count()||'|'||sum(id) FROM {T}")
 
 if r.returncode == 0:
-    # Accepting it is only correct if the data actually matches — the old bug
-    # accepted it AND lost every row of the transaction.
-    case("if it applied, it applied the right rows", src == dst,
+    # The point of the fix: the window APPLIES, and applies exactly what the
+    # source kept. Three earlier versions of this code each got one of these
+    # wrong — the first discarded the whole transaction silently, the second
+    # refused the window, the third refused it even for transactions apitap
+    # does not replicate.
+    case("the window applied, and applied exactly the source's rows", src == dst,
          f"src {src} / dst {dst}")
     if src != dst:
         print("      ^ this is the silent loss the leg exists to catch")
+    rolled = ch(f"SELECT count() FROM {T} WHERE id BETWEEN 60000 AND 60100")
+    case("the rolled-back subtransaction's rows are NOT there", rolled == "0",
+         f"{rolled} found")
+    kept_before = ch(f"SELECT count() FROM {T} WHERE id BETWEEN 30000 AND 50000")
+    kept_after = ch(f"SELECT count() FROM {T} WHERE id BETWEEN 70000 AND 70100")
+    case("the rows before AND after the savepoint survived",
+         kept_before == "20001" and kept_after == "101",
+         f"before={kept_before} after={kept_after}")
 else:
     # The whole message, not its last line — it is deliberately multi-line
     # (what happened, then the lever, then what re-running alone will do). The

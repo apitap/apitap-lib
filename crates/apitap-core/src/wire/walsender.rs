@@ -1762,7 +1762,7 @@ mod tests {
                 while commits < 2 {
                     match ws.next_event().await.expect("event") {
                         Some(WalEvent::XLogData { payload, .. }) => {
-                            match pgoutput::decode(&payload, false, &Default::default())
+                            match pgoutput::decode(&payload, false, &Default::default()).map(|(m, _)| m)
                                 .expect("decode")
                             {
                                 PgoMessage::Insert { new, .. } => {
