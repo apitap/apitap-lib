@@ -27,7 +27,7 @@ use futures::channel::mpsc;
 use futures::SinkExt;
 use mysql_async::prelude::Queryable;
 use mysql_async::InfileData;
-use mysql_async::{Opts, OptsBuilder, Pool};
+use mysql_async::{Opts, OptsBuilder, Pool, SslOpts};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -110,6 +110,68 @@ impl MySqlShared {
     }
 }
 
+/// Pull apitap's `ssl-mode=` out of a MySQL URL and translate it.
+///
+/// mysql_async carries TLS settings in `SslOpts`, not in the URL, and rejects
+/// any query parameter it does not recognise — so the mode has to come out of
+/// the string before it is parsed, and go back in as options.
+///
+/// The vocabulary is MySQL's own, matching the source side exactly:
+/// `disabled` no TLS; `preferred` is the default and mysql_async has no
+/// "encrypt if offered" setting, so it means the same as disabled here and
+/// says so; `required` encrypts without verifying; `verify_ca` checks the
+/// chain; `verify_identity` checks the chain and the hostname.
+fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>)> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?;
+    let mut mode: Option<String> = None;
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter_map(|(k, v)| {
+            if k == "ssl-mode" || k == "sslmode" {
+                mode = Some(v.to_lowercase().replace('-', "_"));
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect();
+    let Some(mode) = mode else {
+        return Ok((url.to_string(), None));
+    };
+    let mut clean = parsed.clone();
+    clean.set_query(None);
+    if !kept.is_empty() {
+        clean.query_pairs_mut().extend_pairs(kept);
+    }
+    let ssl = match mode.as_str() {
+        "disabled" => None,
+        // mysql_async connects with TLS or without; there is no "try it".
+        // Saying so beats silently choosing one of the two.
+        "preferred" => {
+            return Err(Error::InvalidInput(
+                "ssl-mode=preferred is not available for a MySQL DESTINATION — the \
+                 client here connects with TLS or without it, with no attempt-and-\
+                 fall-back. Choose disabled, required, verify_ca or verify_identity."
+                    .into(),
+            ))
+        }
+        "required" => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
+        // Chain only: skip the hostname check, keep the chain check.
+        "verify_ca" => Some(
+            SslOpts::default().with_danger_skip_domain_validation(true),
+        ),
+        "verify_identity" => Some(SslOpts::default()),
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "ssl-mode={other} is not a MySQL ssl mode — use disabled, required, \
+                 verify_ca or verify_identity"
+            )))
+        }
+    };
+    Ok((clean.to_string(), ssl))
+}
+
 impl MySqlSink {
     pub(crate) async fn connect(url: &str, dest_table: &str) -> Result<Self> {
         Ok(Self::bind(Self::shared_pool(url)?, dest_table))
@@ -117,8 +179,21 @@ impl MySqlSink {
 
     /// Pool + INFILE registry + id counter, built once per destination.
     pub(crate) fn shared_pool(url: &str) -> Result<MySqlShared> {
-        let opts =
-            Opts::from_url(url).map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?;
+        // mysql_async does not know the token `ssl-mode` — it wants its own
+        // `require_ssl`/`verify_ca`/`verify_identity` — so a URL written the
+        // way apitap documents it for SOURCES failed here with "unknown
+        // parameter ssl-mode", which reads like a typo rather than a missing
+        // feature. The mode is translated instead, so one vocabulary works on
+        // both sides of a transfer.
+        let (stripped, ssl) = split_ssl_mode(url)?;
+        let mut opts_builder = OptsBuilder::from_opts(
+            Opts::from_url(&stripped)
+                .map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?,
+        );
+        if let Some(s) = ssl {
+            opts_builder = opts_builder.ssl_opts(Some(s));
+        }
+        let opts: Opts = opts_builder.into();
         let db = opts
             .db_name()
             .filter(|s| !s.is_empty())

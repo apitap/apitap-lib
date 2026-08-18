@@ -17,6 +17,7 @@ reject. A server that merely tolerates TLS could not tell these cases apart.
   leg 2  ssl-mode=disabled        — refused, because the SERVER will not take it
   leg 3  ssl-mode=verify_identity — must FAIL against a self-signed certificate
   leg 4  ssl-mode=verify_ca       — refused by apitap, by name
+  leg 4c a DESTINATION over TLS   — until now, no spelling encrypted a mysql:// sink
   leg 5  binlog CDC over TLS      — the encrypted socket carries a real drain
 
 Leg 3 is the one that decides whether any of this is real: a verification mode
@@ -31,6 +32,8 @@ import sys
 MY = os.environ.get("MY_TLS_URL", "mysql://root:bench@127.0.0.1:3312/tlsdb")
 CH = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default")
 MY_C = os.environ.get("MY_TLS_CONTAINER", "apitap-tls-my")
+# A small Postgres table to push INTO the TLS MySQL for leg 4c.
+PG_SRC = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
 T = "tls_my"
 
 ok = True
@@ -105,6 +108,39 @@ r = transfer("verify_ca", dest=T + "_c")
 last = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
 case("verify_ca refused by apitap, naming the alternatives",
      r.returncode != 0 and "verify_ca is not implemented" in last, last[:170])
+
+print("== leg 4c: a MySQL DESTINATION can be encrypted at all ==")
+# Until v0.47.0 there was no spelling that encrypted a mysql:// DESTINATION:
+# mysql_async was built without a TLS backend, and `?ssl-mode=required` failed
+# with "unknown parameter ssl-mode" — which reads like a typo rather than a
+# missing feature. The rig refuses cleartext, so a load that lands is a load
+# that encrypted.
+DT = "tls_my_dest"
+my(f"DROP TABLE IF EXISTS {DT}", check=False)
+dest_url = f"{MY}?ssl-mode=required"
+code = (
+    "import apitap\n"
+    f"r = apitap.transfer({PG_SRC!r}, {dest_url!r}, table='tls_src_seed', "
+    f"dest_table={DT!r}, mode='replace')\n"
+    "print('ROWS', r.rows)\n"
+)
+r = sh([sys.executable, "-c", code])
+if r.returncode:
+    case("a transfer INTO MySQL over TLS", False, r.stderr.strip().splitlines()[-1][:200])
+else:
+    landed = my(f"SELECT count(*) FROM {DT}", check=False)
+    case("a transfer INTO MySQL over TLS lands its rows", landed.isdigit() and int(landed) > 0,
+         f"{landed} rows")
+# And the mode that cannot be expressed says so, instead of failing as a typo.
+bad = f"{MY}?ssl-mode=preferred"
+r = sh([sys.executable, "-c",
+        "import apitap\n"
+        f"apitap.transfer({PG_SRC!r}, {bad!r}, table='tls_src_seed', "
+        f"dest_table={DT!r}, mode='replace')\n"])
+last = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
+case("ssl-mode=preferred on a destination is refused by name, not as a typo",
+     r.returncode != 0 and "not available for a MySQL DESTINATION" in last, last[:160])
+my(f"DROP TABLE IF EXISTS {DT}", check=False)
 
 print("== leg 5: binlog CDC over the encrypted socket ==")
 CT = "tls_my_cdc"

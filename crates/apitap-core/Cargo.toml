@@ -52,7 +52,17 @@ webpki-roots = "1"
 hmac = "0.12"
 hex = "0.4"
 # LOAD DATA LOCAL INFILE streaming for the MySQL sink — sqlx can't do it.
-mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
+# `rustls-tls` + `ring` so a mysql:// DESTINATION can be encrypted at all —
+# without a TLS backend compiled in there was no spelling that worked, and the
+# failure read like a typo ("unknown parameter ssl-mode"). `ring` matches the
+# provider tokio-rustls already uses here, so one crypto backend is linked,
+# not two.
+mysql_async = { version = "0.37", default-features = false, features = [
+    "minimal-rust",
+    "rustls-tls",
+    "ring",
+    "tls12",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonwebtoken = "9"

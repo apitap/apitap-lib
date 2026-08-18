@@ -930,6 +930,13 @@ apitap.transfer(
   authentication — which sends the password itself — apitap refuses to do that
   over `required`, because encryption without verification stops a listener but
   not an impostor. Use `verify_identity` there.
+
+  A MySQL **destination** takes the same `ssl-mode=` spellings, with one
+  difference: `preferred` is refused, because the destination client connects
+  with TLS or without it and has no attempt-and-fall-back to offer — a mode
+  that cannot be honoured is said out loud rather than silently resolved to
+  one of its neighbours. `verify_ca` IS available there (the destination client
+  can check a chain without the hostname; the fast source plane cannot).
 - **Grants**: the connecting user needs `REPLICATION SLAVE`, `REPLICATION
   CLIENT` and `SELECT` — `SELECT` because the first run bootstraps a full load,
   the replication grants because every later run attaches as a replica.
