@@ -165,6 +165,27 @@ where
     mysource::precheck(pool).await?;
     let (live_file, live_pos) = master_position(pool).await?;
     let stop_line = pack_pos(&live_file, live_pos);
+    // A watermark AHEAD of the server's own position is not "up to date" — it
+    // is impossible on a log that only grows. Either the binlog was reset or
+    // rebuilt (RESET MASTER, a restored dump, a rebuilt replica), or this URL
+    // now points at a DIFFERENT server whose numbering is its own. Both mean
+    // the changes between the two positions are unreachable, and both used to
+    // exit through the "nothing to do" path below: a silent hole, reported as
+    // success with zero changes. Found by a release smoke doing exactly that.
+    if start > stop_line {
+        let (want_idx, want_pos) = mysource::unpack(start);
+        return Err(Error::InvalidInput(format!(
+            "log_based: the stored position ({}, {want_pos}) is AHEAD of the \
+             server's current one ({live_file}, {live_pos}). A binlog only \
+             grows, so this server's log was reset or rebuilt (RESET MASTER, a \
+             restored backup, a re-created replica), or this URL now points at \
+             a different server. Either way the changes in between are not on \
+             this server and cannot be drained — resuming would report success \
+             while skipping them. Recovery is a fresh bootstrap: clear this \
+             table's apitap state on the destination and re-run.",
+            mysource::file_name(&prefix_of(&live_file), want_idx)
+        )));
+    }
     if start >= stop_line {
         return Ok(start);
     }
@@ -246,4 +267,11 @@ mod tests {
             assert_ne!(id, 0, "0 gets disconnected at end-of-log");
         }
     }
+}
+
+/// The `binlog`/`mariadb-bin` part of a binlog file name.
+fn prefix_of(file: &str) -> String {
+    file.rsplit_once('.')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_else(|| "binlog".into())
 }

@@ -113,6 +113,13 @@ print("== MariaDB: resuming from a vanished binlog must refuse, not skip ==")
 # binlog checkpoint), so the drain resumed correctly and the test called that a
 # bug. Now: try PURGE, verify, and fall back to RESET MASTER, which cannot
 # fail to destroy the position because it restarts the numbering.
+# Start from a known, HIGH file number. Binlog names recycle after a reset
+# (numbering restarts at 000001), so a watermark sitting in 000001 cannot be
+# destroyed by name — a fresh 000001 immediately takes its place. Pushing the
+# bootstrap up to 000006 first makes the later destruction unambiguous.
+ma("RESET MASTER")
+for _ in range(5):
+    ma("FLUSH BINARY LOGS")
 ma(f"DROP TABLE IF EXISTS {MT}")
 ma(f"CREATE TABLE {MT} (id INT PRIMARY KEY, v VARCHAR(20))")
 ma(f"INSERT INTO {MT} VALUES (1,'a'),(2,'b')")
@@ -141,11 +148,13 @@ else:
     except RuntimeError as e:
         print(f"   PURGE refused ({str(e).splitlines()[0][:60]}…)")
     present = [l.split()[0] for l in ma("SHOW BINARY LOGS").splitlines() if l.strip()]
+    method = "purge"
     if needed in present:
         # Attempt 2: the server-reset shape. RESET MASTER deletes every binlog
         # and restarts numbering, so the stored coordinate cannot survive.
         print(f"   {needed} survived PURGE (checkpoint held it) — using RESET MASTER")
         ma("RESET MASTER")
+        method = "reset"
         present = [l.split()[0] for l in ma("SHOW BINARY LOGS").splitlines() if l.strip()]
     if needed in present:
         ok = False
@@ -159,13 +168,59 @@ else:
             ok = False
             print("   ✗ the drain SUCCEEDED after its position vanished — that is a "
                   "silent hole in the change stream")
-        elif "no longer on the server" in msg and "fresh bootstrap" in msg:
-            print("   ✓ refused, and the message names the cause and the recovery")
-            line = [l for l in msg.splitlines() if "no longer on the server" in l]
-            print(f"     {line[0].strip()[:140]}…")
         else:
-            ok = False
-            print(f"   ✗ refused with the wrong message:\n{msg[-600:]}")
+            # Which refusal is correct depends on HOW the position was
+            # destroyed, and both messages are true statements about their own
+            # cause: PURGE leaves the server's position ahead of the watermark
+            # (the file is simply gone), while RESET MASTER also rewinds the
+            # server behind it. Asserting the purge wording after a reset was
+            # the test being stricter than reality.
+            want = ("no longer on the server" if method == "purge"
+                    else "AHEAD of the server")
+            if want in msg and "fresh bootstrap" in msg:
+                print(f"   ✓ refused via {method}, and the message names the cause "
+                      f"and the recovery")
+                line = [l for l in msg.splitlines() if want in l]
+                print(f"     {line[0].strip()[:140]}…")
+            else:
+                ok = False
+                print(f"   ✗ {method} should have produced '{want}':\n{msg[-600:]}")
+
+print("== MariaDB: a watermark AHEAD of the server must refuse, not report success ==")
+# The nastier sibling of the purge case, and completely silent until now: after
+# RESET MASTER the server restarts numbering, so the stored position is higher
+# than anything the server has. The drain used to take the "already up to date"
+# path and report success with zero changes — no error, no data. A release
+# smoke caught it.
+ma(f"DROP TABLE IF EXISTS {MT}2")
+ma(f"CREATE TABLE {MT}2 (id INT PRIMARY KEY, v VARCHAR(20))")
+ma(f"INSERT INTO {MT}2 VALUES (1,'a')")
+ch(f"DROP TABLE IF EXISTS {MT}2")
+ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{MT}2' SETTINGS mutations_sync=1")
+r = transfer(MA, f"{MT}2")
+if r.returncode:
+    ok = False
+    print(f"   ✗ bootstrap failed: {r.stderr[-300:]}")
+else:
+    ma(f"INSERT INTO {MT}2 VALUES (2,'b')")     # a change only the old log holds
+    for _ in range(3):
+        ma("FLUSH BINARY LOGS")                 # push the watermark's file well up
+    ma("RESET MASTER")                          # numbering restarts at 000001
+    r = transfer(MA, f"{MT}2")
+    msg = r.stderr
+    if r.returncode == 0:
+        ok = False
+        print("   ✗ reported success after the log was reset — the changes in "
+              "between are gone and nothing said so")
+    elif "AHEAD of the server" in msg and "fresh bootstrap" in msg:
+        print("   ✓ refused, and the message explains a reset log vs a different server")
+        line = [l for l in msg.splitlines() if "AHEAD of the server" in l]
+        print(f"     {line[0].strip()[:140]}…")
+    else:
+        ok = False
+        print(f"   ✗ refused with the wrong message:\n{msg[-500:]}")
+ma(f"DROP TABLE IF EXISTS {MT}2")
+ch(f"DROP TABLE IF EXISTS {MT}2")
 
 print("== cleanup ==")
 pg(f"DROP TABLE IF EXISTS {PT}")

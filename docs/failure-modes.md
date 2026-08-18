@@ -60,3 +60,21 @@ The two properties everything else rests on:
    is loud and idempotent. A schedule that quietly stops is what fills a
    Postgres disk or outruns a MySQL binlog — the two cases apitap now reports
    and refuses on, respectively.
+
+## The hole that is still open
+
+A binlog coordinate is `(file name, position)`, and after a server's log is
+reset the names start again at `000001`. apitap now refuses the two shapes it
+can see — the file is gone, or the stored position is ahead of the server's —
+but there is a third it cannot: **a reset log that has since grown past the old
+position**. The name matches, the position exists, and the bytes there belong
+to different history. A drain would resume into it and report success.
+
+Closing this needs the watermark to carry the server's identity (`server_uuid`
+on MySQL, the GTID domain on MariaDB) so a changed identity refuses on sight.
+That is a change to the destination's state schema and is not in this release —
+recorded here rather than left for someone to discover.
+
+Until then, treat these as bootstrap-again events: restoring a source from a
+backup, rebuilding a replica, `RESET MASTER`, or repointing a URL at a
+different server.
