@@ -70,6 +70,27 @@ struct PumpHandle {
     task: tokio::task::JoinHandle<(BufReader<PgRead>, Result<()>)>,
 }
 
+/// Close the socket when this type is dropped, whatever path got us here.
+///
+/// The plaintext transport did this for free: `TcpStream::into_split` gives
+/// an `OwnedWriteHalf` that shuts the write side down on drop. The TLS
+/// transport does NOT — `tokio::io::split` halves have no `Drop` and share
+/// one lock, so the fd survives until BOTH halves go, and the read half lives
+/// in the pump task, parked in `read_frame` waiting for a frame that is never
+/// coming.
+///
+/// The visible cost was a replication slot left `active` after an aborted TLS
+/// run, so the NEXT run refused it as in use — a failure the plaintext path
+/// did not have, which appeared the moment TLS did. Aborting the pump drops
+/// the read half; the write half goes with `self`.
+impl Drop for Walsender {
+    fn drop(&mut self) {
+        if let Some(pump) = self.pump.take() {
+            pump.task.abort();
+        }
+    }
+}
+
 /// The pump: forward every frame until the consumer hangs up, an error
 /// lands, or ReadyForQuery ends the replication conversation. No select!
 /// over the read — a frame read is never cancelled mid-way (protocol
@@ -1376,13 +1397,44 @@ impl Walsender {
                 self.send_msg(b'c', &[]).await?;
                 self.copying = false;
             }
+            // Bounded. This waits for the server to finish the CopyBoth
+            // conversation, and a path that is half-dead — a NAT or load
+            // balancer that reaped the flow without sending an RST — never
+            // sends the ReadyForQuery this loop is waiting for. Unbounded, a
+            // run that had already failed then parked here indefinitely
+            // instead of returning the error it was carrying. The drain is
+            // over either way; the only question is how long to be polite
+            // about it.
+            const DRAIN_SECS: u64 = 30;
             let mut err: Option<Error> = None;
-            loop {
-                match pump.frames.recv().await {
-                    Some((b'Z', _)) | None => break,
-                    Some((b'E', msg)) => err = Some(parse_error(&msg)),
-                    Some(_) => {} // drain in-flight frames
-                }
+            let drained = tokio::time::timeout(
+                std::time::Duration::from_secs(DRAIN_SECS),
+                async {
+                    loop {
+                        match pump.frames.recv().await {
+                            Some((b'Z', _)) | None => break,
+                            Some((b'E', msg)) => err = Some(parse_error(&msg)),
+                            Some(_) => {} // drain in-flight frames
+                        }
+                    }
+                },
+            )
+            .await;
+            if drained.is_err() {
+                // Nothing left to salvage from this connection: abort the
+                // pump, which drops the read half, and let the socket close.
+                pump.task.abort();
+                self.copying = false;
+                return match err {
+                    Some(e) => Err(e),
+                    None => Err(Error::Transfer(format!(
+                        "walsender: the server did not finish the replication \
+                         conversation within {DRAIN_SECS}s — the connection is \
+                         half-open (a firewall or load balancer reaped it). The \
+                         window's data is unaffected; re-run to continue from the \
+                         watermark."
+                    ))),
+                };
             }
             let res = self.join_pump(pump).await;
             return match err {
