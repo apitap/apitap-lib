@@ -1,0 +1,101 @@
+# Every push and every pull request.
+#
+# The full release gate — 25 legs against live Postgres, MySQL, MariaDB,
+# ClickHouse, BigQuery, Iceberg and a two-node ClickHouse cluster — still runs
+# on the bench box before a tag, because it needs machines and credentials a
+# hosted runner does not have. What CI owes is everything that does NOT need
+# them, enforced by machinery rather than by someone remembering to run it.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:      # so `publish` can require this before it uploads
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  lint:
+    name: clippy (advisory for now)
+    runs-on: ubuntu-latest
+    # NOT a gate yet, and saying so beats pretending. The crate carries ~25
+    # clippy warnings (div_ceil, is_multiple_of, argument counts) and is not
+    # rustfmt-formatted; turning either into a gate today would either fail
+    # every build or bury the history under a whole-tree reformat. This job
+    # makes the number visible so it can go down, and becomes blocking when it
+    # reaches zero — see docs/stability.md.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p apitap-core -p apitap-python --all-targets 2>&1 | tee clippy.txt
+      - name: count what is left
+        run: |
+          n=$(grep -c '^warning' clippy.txt || true)
+          echo "clippy warnings: $n"
+
+  transfers:
+    name: real transfers, real servers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Containers are started by hand rather than through `services:` because
+      # CDC needs `wal_level=logical`, and a service block can set environment
+      # and health checks but cannot pass a command to the server.
+      - name: start Postgres, MySQL and ClickHouse
+        run: |
+          docker run -d --name ci-pg -p 5432:5432 \
+            -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=apitap_ci postgres:16 \
+            -c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8
+          docker run -d --name ci-my -p 3306:3306 \
+            -e MYSQL_ROOT_PASSWORD=bench -e MYSQL_DATABASE=apitap_ci mysql:8.0 \
+            --log-bin=binlog --binlog-format=ROW --binlog-row-image=FULL --server-id=1
+          docker run -d --name ci-ch -p 8123:8123 \
+            -e CLICKHOUSE_PASSWORD=bench clickhouse/clickhouse-server:24.8
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client mysql-client
+          for i in $(seq 1 60); do
+            pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break; sleep 2
+          done
+          for i in $(seq 1 60); do
+            mysqladmin ping -h 127.0.0.1 -pbench >/dev/null 2>&1 && break; sleep 2
+          done
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8123/ping >/dev/null && break; sleep 2
+          done
+
+      - name: build and install the wheel under test
+        run: |
+          pip install maturin
+          maturin build --release -m py-apitap/Cargo.toml -o dist-ci
+          pip install dist-ci/*.whl
+
+      - name: seed
+        run: python benchmarks/ci_seed.py
+
+      - name: every row, exactly, on every lane
+        run: python benchmarks/ci_transfers.py
+
+      - name: server logs on failure
+        if: failure()
+        run: |
+          for c in ci-pg ci-my ci-ch; do echo "──── $c"; docker logs --tail 40 $c; done

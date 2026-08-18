@@ -8,6 +8,13 @@ on:
     tags: ["v*"]
 
 jobs:
+  # Publishing used to depend on nothing at all: the tag pushed, the wheel went
+  # out, and the only thing standing between a broken build and PyPI was a human
+  # remembering to run the bench box's gate. The tests now run here too, and the
+  # upload waits for them.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   # The wheel is abi3 built once on a NEW Python — nothing else ever imports it
   # on 3.9, so the floor claim must be proven here before anything publishes.
   smoke-py39:
@@ -41,7 +48,7 @@ jobs:
           echo "PyPI README covers every route scheme:"; echo "$schemes" | tr '\n' ' '; echo
 
   pypi:
-    needs: smoke-py39
+    needs: [ci, smoke-py39]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

@@ -1,0 +1,74 @@
+# Wheels for the platforms people actually evaluate on.
+#
+# Until now PyPI carried exactly one file: manylinux_2_17_x86_64. Two costs
+# came with that. An evaluator opens a laptop, types `pip install apitap`, gets
+# nothing, and leaves — before seeing a single number. And Graviton/ARM is the
+# cheapest box there is, which is precisely the "does more on a small machine"
+# story apitap tells, on a platform it did not ship for.
+#
+# Runs on a tag (so a release carries every wheel) and on demand.
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            args: --release -m py-apitap/Cargo.toml
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            args: --release -m py-apitap/Cargo.toml
+          - os: macos-14          # Apple silicon
+            target: aarch64-apple-darwin
+            args: --release -m py-apitap/Cargo.toml
+          - os: macos-13          # Intel
+            target: x86_64-apple-darwin
+            args: --release -m py-apitap/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: ${{ matrix.args }}
+          # manylinux for the Linux legs; ignored elsewhere.
+          manylinux: auto
+      - name: the wheel must import where it was built
+        # A wheel that builds and does not load is worse than no wheel: it
+        # reaches PyPI and fails in someone else's terminal.
+        run: |
+          pip install --find-links target/wheels apitap
+          python -c "import apitap; print(apitap.__version__, 'imports on ${{ matrix.target }}')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: target/wheels/*.whl
+
+  sdist:
+    name: source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: -m py-apitap/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: target/wheels/*.tar.gz
