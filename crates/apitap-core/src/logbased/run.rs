@@ -1316,9 +1316,6 @@ async fn drain_group(
     // The previous window's end_lsn: sent to the applier, not yet confirmed.
     let mut pending: Option<u64> = None;
     let mut drain_err: Option<Error> = None;
-    // Where the last drain saw the server had shipped everything (0 if none
-    // did) — confirmed after the final window lands.
-    let mut caught_up_at = 0u64;
     loop {
         let t_drain = std::time::Instant::now();
         let outcome = match drain(
@@ -1345,7 +1342,6 @@ async fn drain_group(
         }
         let end = outcome.end_lsn;
         let hit = outcome.hit_budget;
-        let caught_up = outcome.caught_up_lsn;
         if end > cur {
             if win_tx.send(outcome).await.is_err() {
                 // Apply task died — its JoinHandle carries the real error.
@@ -1364,9 +1360,6 @@ async fn drain_group(
             pending = Some(end);
             cur = end;
         }
-        if caught_up > caught_up_at {
-            caught_up_at = caught_up;
-        }
         if !hit {
             break;
         }
@@ -1379,16 +1372,10 @@ async fn drain_group(
                 ws.standby_status(p, false).await?;
             }
         }
-        // A drain that caught up saw the server ship EVERYTHING to the
-        // stop-line and found nothing of ours past `cur`. Confirming that
-        // point is what lets the slot release WAL for a table nobody is
-        // writing to — without it, an idle published table pins WAL forever
-        // while every run reports success, and on a busy instance that is the
-        // source's disk, not the pipeline's. Sent only after the last window
-        // is durable at the destination, so it never confirms unapplied work.
-        if caught_up_at > cur {
-            ws.standby_status(caught_up_at, false).await?;
-        }
+        // A caught-up drain now reports its end_lsn AT the caught-up point, so
+        // the window above already carried it to the destination and confirmed
+        // it. Nothing extra to send here — see the note in `drain`, and the
+        // seven gate legs that went red when this was a bare confirmation.
     }
     let joined = apply_task.await;
     ws.stop_replication().await.ok();

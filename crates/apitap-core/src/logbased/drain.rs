@@ -33,14 +33,10 @@ pub(crate) struct DrainOutcome {
     /// The server's WAL end at the moment this drain saw it had shipped
     /// everything — 0 if the drain stopped for any other reason.
     ///
-    /// This exists because a published table with NO changes produces no
-    /// window, and a slot that is never told about progress never releases
-    /// WAL. On a busy instance that is the source's disk filling up while
-    /// every hourly run reports success: the table is idle, so `end_lsn`
-    /// never moves, so nothing is ever confirmed. Reaching this point means
-    /// the server has shipped every change up to the stop-line and none of
-    /// them were ours, so once the window (if any) is durable at the
-    /// destination, this LSN is genuinely applied and safe to confirm.
+    /// `end_lsn` already carries this point (see the caught-up branch), so
+    /// nothing needs to act on it; it is reported because "the drain caught
+    /// up" and "the drain hit its budget" are different states and a caller
+    /// that has to tell them apart should not have to infer it.
     pub caught_up_lsn: u64,
 }
 
@@ -165,10 +161,28 @@ pub(crate) async fn drain(
                 }
                 if wal_end >= stop_line && tx_buf.is_empty() && sess.streams.is_empty() {
                     // Server has shipped everything up to the stop-line and
-                    // we're at a boundary: caught up. Record where that was —
-                    // the caller confirms it once the destination is durable,
-                    // which is the only thing that lets an idle table's slot
-                    // release WAL.
+                    // we're at a boundary: caught up.
+                    //
+                    // The window's end is that point, not the last commit that
+                    // happened to be ours. Everything between them was traffic
+                    // for tables we do not track, so "applied up to here" is
+                    // true of `wal_end` — and saying so is what lets an idle
+                    // published table release WAL. Without it the watermark
+                    // never moves, the slot is never told about progress, and
+                    // a busy instance fills its disk while every scheduled run
+                    // reports success.
+                    //
+                    // It has to be the WATERMARK that moves, not just the
+                    // confirmation. Confirming a point the destination has not
+                    // recorded makes the slot's confirmed LSN overtake the
+                    // stored watermark, which the next run correctly reads as
+                    // tampered state and refuses. Measured: 7 gate legs went
+                    // red that way. The end_lsn below travels through the
+                    // ordinary window path, so every destination writes it the
+                    // same way it writes any other watermark.
+                    if wal_end > end_lsn {
+                        end_lsn = wal_end;
+                    }
                     caught_up_lsn = wal_end;
                     break;
                 }

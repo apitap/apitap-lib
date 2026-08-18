@@ -387,6 +387,26 @@ impl BqConn {
     /// Free-tier safe: the state machinery must never need DML (sandbox projects
     /// reject it), so state rows are APPENDED and readers take the newest.
     async fn load_rows(&self, table: &str, ndjson: Vec<u8>) -> Result<()> {
+        // BigQuery rate-limits table update operations (5 per 10 s per table),
+        // and its own guidance for that class is to retry with backoff. This
+        // path keeps its payload, so a failed job is simply run again — no
+        // partial state to reason about, because a load job that fails writes
+        // nothing.
+        let mut attempt = 0u32;
+        loop {
+            match self.load_rows_once(table, &ndjson).await {
+                Ok(()) => return Ok(()),
+                Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn load_rows_once(&self, table: &str, ndjson: &[u8]) -> Result<()> {
         let config = json!({
             "configuration": { "load": {
                 "destinationTable": {
@@ -405,7 +425,7 @@ impl BqConn {
         body.extend_from_slice(config.to_string().as_bytes());
         body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
         body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
-        body.extend_from_slice(&ndjson);
+        body.extend_from_slice(ndjson);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let url = format!(
             "{BQ_UPLOAD}/projects/{}/jobs?uploadType=multipart",
@@ -573,6 +593,28 @@ impl BqConn {
         fields: &Value,
         ndjson: Vec<u8>,
     ) -> Result<()> {
+        // As `load_rows`: the payload is here, a failed load job wrote
+        // nothing, and WRITE_TRUNCATE makes a repeat identical to a first try.
+        let mut attempt = 0u32;
+        loop {
+            match self.cdc_load_ndjson_once(table, fields, &ndjson).await {
+                Ok(()) => return Ok(()),
+                Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn cdc_load_ndjson_once(
+        &self,
+        table: &str,
+        fields: &Value,
+        ndjson: &[u8],
+    ) -> Result<()> {
         let config = json!({
             "configuration": { "load": {
                 "destinationTable": {
@@ -592,7 +634,7 @@ impl BqConn {
         body.extend_from_slice(config.to_string().as_bytes());
         body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
         body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
-        body.extend_from_slice(&ndjson);
+        body.extend_from_slice(ndjson);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let url = format!(
             "{BQ_UPLOAD}/projects/{}/jobs?uploadType=multipart",
