@@ -136,6 +136,12 @@ pub(crate) struct ColDef {
     /// Unsigned integer column (from the optional SIGNEDNESS metadata, or
     /// resolved from information_schema when the server sends MINIMAL).
     pub unsigned: bool,
+    /// ENUM/SET member labels in declaration order, from the catalog's
+    /// COLUMN_TYPE. The binlog carries only an INDEX for an ENUM and a BITMASK
+    /// for a SET, so without these the lane wrote "3" where the bulk load had
+    /// written "shipped" — the same column holding two different values
+    /// depending on which path last touched it, with no error anywhere.
+    pub labels: Option<std::sync::Arc<Vec<String>>>,
 }
 
 /// A live TABLE_MAP entry: what the numeric table id currently means.
@@ -157,6 +163,10 @@ pub(crate) struct TableSchema {
     pub key: Vec<bool>,
     /// Unsigned flags, positional (binlog MINIMAL omits signedness).
     pub unsigned: Vec<bool>,
+    /// ENUM/SET member labels per column, parsed from COLUMN_TYPE. Empty for
+    /// every other type. The binlog sends an index or a bitmask, so these are
+    /// the only way to write the value the bulk load would have written.
+    pub labels: Vec<Option<std::sync::Arc<Vec<String>>>>,
 }
 
 /// Decoder state across one replication session: the table-id map plus the
@@ -291,7 +301,7 @@ pub(crate) fn parse_table_map(body: &[u8]) -> Result<TableMap> {
             }
             _ => 0,
         };
-        cols.push(ColDef { kind, meta, nullable: false, unsigned: false });
+        cols.push(ColDef { kind, meta, nullable: false, unsigned: false, labels: None });
     }
     // Null bitmap (LSB-first, one bit per column).
     let bmlen = (ncols + 7) / 8;
@@ -345,7 +355,6 @@ fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Res
 
 /// Decode one non-NULL packed binlog value into destination-ready TEXT.
 fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
-    let s = |v: String| Ok(v.into_bytes());
     match c.kind {
         MT_TINY => {
             let v = r.u8()?;
@@ -444,12 +453,27 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
         MT_TIME2 => {
             let b = r.take(3)?;
             let packed = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-            let v = packed & 0x7F_FFFF;
+            // TIME2 is stored biased by 0x800000: the top bit is the SIGN, and
+            // a negative value is the complement of its magnitude. Masking the
+            // bit away and stopping there turned -01:00:00 into 1023:00:00 and
+            // -00:00:01 into 1023:63:63 — values that are not even valid
+            // clock readings, which is how obvious the bug was once measured.
+            let negative = packed & 0x80_0000 == 0;
+            let v = if negative {
+                (0x80_0000u32.wrapping_sub(packed)) & 0x7F_FFFF
+            } else {
+                packed & 0x7F_FFFF
+            };
             let h = (v >> 12) & 0x3FF;
             let mi = (v >> 6) & 0x3F;
             let sec = v & 0x3F;
             let frac = read_frac(r, c.meta as u8)?;
             let mut out = Vec::with_capacity(18);
+            // A TIME is a signed interval, not a clock time: MySQL's range is
+            // -838:59:59 to 838:59:59, and the sign is part of the value.
+            if negative && (h | mi | sec | frac as u32) != 0 {
+                out.push(b'-');
+            }
             if h < 100 {
                 push2(&mut out, h);
             } else {
@@ -473,17 +497,48 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             let n = if c.meta < 256 { r.u8()? as usize } else { r.u16le()? as usize };
             Ok(r.take(n)?.to_vec())
         }
+        MT_BIT => {
+            // The table map writes BIT metadata as (bits % 8, whole bytes) —
+            // high byte first. A BIT(8) is (0, 1) and a BIT(12) is (4, 1), so
+            // the width is the whole bytes plus one more when any bits are
+            // left over. Reading the two halves the other way round asked for
+            // five bytes for a BIT(12) and died on "truncated u8".
+            let leftover = (c.meta >> 8) as usize;
+            let n = (c.meta & 0xFF) as usize + usize::from(leftover > 0);
+            let b = r.take(n.max(1))?;
+            // Match the bulk lane, which renders binary as \x-prefixed hex.
+            // Writing the decimal value instead put the ASCII of "5" (0x35)
+            // where the bootstrap had put the byte 0x05.
+            let mut out = Vec::with_capacity(2 + b.len() * 2);
+            out.extend_from_slice(b"\\x");
+            for byte in b {
+                out.extend_from_slice(format!("{byte:02x}").as_bytes());
+            }
+            Ok(out)
+        }
         MT_STRING => {
             // meta packs (real_type << 8 | length) with the high bits of the
             // length folded into the type byte for lengths > 255.
             let (rt, len) = string_meta(c.meta);
             match rt {
-                MT_ENUM | MT_SET => {
+                // MySQL folds ENUM and SET into type 254 with the real type
+                // in the metadata, so this — not the MT_ENUM/MT_SET arms
+                // below — is the path a live server takes. It rendered the
+                // raw index/bitmask, which is the corruption we measured.
+                MT_ENUM => {
                     let v = match len {
                         1 => r.u8()? as u64,
                         _ => r.u16le()? as u64,
                     };
-                    s(v.to_string())
+                    render_enum(&c.labels, v)
+                }
+                MT_SET => {
+                    let b = r.take((len as usize).max(1))?;
+                    let mut v = 0u64;
+                    for (i, byte) in b.iter().take(8).enumerate() {
+                        v |= (*byte as u64) << (8 * i);
+                    }
+                    render_set(&c.labels, v)
                 }
                 _ => {
                     let n = if len < 256 { r.u8()? as usize } else { r.u16le()? as usize };
@@ -493,16 +548,15 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
         }
         MT_ENUM => {
             let v = if c.meta & 0xFF == 1 { r.u8()? as u64 } else { r.u16le()? as u64 };
-            s(v.to_string())
+            render_enum(&c.labels, v)
         }
         MT_SET => {
-            let n = (c.meta & 0xFF).max(1) as usize;
-            let b = r.take(n)?;
+            let b = r.take((c.meta & 0xFF).max(1) as usize)?;
             let mut v = 0u64;
-            for (i, byte) in b.iter().enumerate() {
+            for (i, byte) in b.iter().take(8).enumerate() {
                 v |= (*byte as u64) << (8 * i);
             }
-            s(v.to_string())
+            render_set(&c.labels, v)
         }
         MT_BLOB | MT_TINY_BLOB | MT_MEDIUM_BLOB | MT_LONG_BLOB | MT_GEOMETRY => {
             let n = match c.meta {
@@ -530,19 +584,57 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             // keeps this decoder pure (see gotchas: PARTIAL_JSON refused).
             Ok(r.take(n)?.to_vec())
         }
-        MT_BIT => {
-            let bits = ((c.meta >> 8) * 8 + (c.meta & 0xFF)).max(1) as usize;
-            let n = (bits + 7) / 8;
-            let b = r.take(n)?;
-            let mut v = 0u64;
-            for byte in b {
-                v = (v << 8) | *byte as u64;
-            }
-            s(v.to_string())
-        }
         MT_NULL => Ok(Vec::new()),
         other => Err(bad(&format!("unsupported column type {other:#04x}"))),
     }
+}
+
+/// An ENUM cell is a 1-based INDEX into the members declared in the catalog.
+/// Writing that number is what turned 'shipped' into "3" on a CDC update while
+/// the bulk load had written the label — same column, two different values.
+fn render_enum(labels: &Option<std::sync::Arc<Vec<String>>>, v: u64) -> Result<Vec<u8>> {
+    match (labels, v) {
+        // 0 is MySQL's "invalid value" slot; a SELECT shows it as ''.
+        (_, 0) => Ok(Vec::new()),
+        (Some(l), v) if (v as usize) <= l.len() => Ok(l[v as usize - 1].clone().into_bytes()),
+        // No labels, or an index past them because the column was ALTERed
+        // under the stream: refuse rather than write a number that reads
+        // like data.
+        _ => Err(bad(&format!(
+            "ENUM index {v} has no matching label in the source catalog — the \
+             column definition changed while the stream was running, or the \
+             schema could not be read. Refusing to write the raw index."
+        ))),
+    }
+}
+
+/// A SET cell is a BITMASK over the declared members. "3" is not a compact way
+/// of writing 'read,write'; it is a different value.
+fn render_set(labels: &Option<std::sync::Arc<Vec<String>>>, v: u64) -> Result<Vec<u8>> {
+    let l = labels.as_ref().ok_or_else(|| {
+        bad("SET column has no members in the source catalog — refusing to write \
+             the raw bitmask, which is not what the bulk load writes")
+    })?;
+    // Bits outside the declared members mean the definition moved under us.
+    // Dropping them quietly would lose data the source still has.
+    let declared = if l.len() >= 64 { u64::MAX } else { (1u64 << l.len()) - 1 };
+    if v & !declared != 0 {
+        return Err(bad(&format!(
+            "SET bitmask {v} carries bits outside the {} declared members — the \
+             column definition changed while the stream was running",
+            l.len()
+        )));
+    }
+    let mut out = String::new();
+    for (i, label) in l.iter().enumerate() {
+        if v & (1 << i) != 0 {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(label);
+        }
+    }
+    Ok(out.into_bytes())
 }
 
 /// STRING metadata: MySQL folds the high length bits into the type byte.
@@ -978,6 +1070,60 @@ pub(crate) const TYPE_TX_PAYLOAD: u8 = EV_TRANSACTION_PAYLOAD;
 
 #[cfg(test)]
 mod tests {
+
+    /// Every case here was first observed as a DIFFERS line on a live server:
+    /// the bootstrap wrote one value, a CDC update of the same row wrote
+    /// another. The numbers on the left are what the binlog actually carries.
+    #[test]
+    fn enum_set_bit_and_negative_time_match_the_bulk_load() {
+        let labels = Some(std::sync::Arc::new(vec![
+            "new".to_string(),
+            "paid".to_string(),
+            "shipped".to_string(),
+        ]));
+        // ENUM ships the 1-based index; 'shipped' had been written as "3".
+        assert_eq!(render_enum(&labels, 3).unwrap(), b"shipped");
+        assert_eq!(render_enum(&labels, 1).unwrap(), b"new");
+        // 0 is the invalid-value slot and reads as '' through a SELECT.
+        assert_eq!(render_enum(&labels, 0).unwrap(), b"");
+        // Past the declared members means the column was ALTERed mid-stream.
+        assert!(render_enum(&labels, 4).is_err());
+        assert!(render_enum(&None, 2).is_err());
+
+        // SET ships a bitmask; 'read,write' had been written as "3".
+        let perms = Some(std::sync::Arc::new(vec![
+            "read".to_string(),
+            "write".to_string(),
+            "admin".to_string(),
+        ]));
+        assert_eq!(render_set(&perms, 0b011).unwrap(), b"read,write");
+        assert_eq!(render_set(&perms, 0b101).unwrap(), b"read,admin");
+        assert_eq!(render_set(&perms, 0).unwrap(), b"");
+        assert!(render_set(&perms, 0b1000).is_err());
+        assert!(render_set(&None, 1).is_err());
+
+        // BIT(8) = 0x05. Rendering the decimal put the ASCII "5" (0x35) where
+        // the bootstrap had put the byte 0x05.
+        // Metadata is (bits % 8) << 8 | whole bytes: BIT(8) = (0, 1).
+        let bit = ColDef { kind: MT_BIT, meta: 0x0001, nullable: false, unsigned: false, labels: None };
+        let mut r = R::new(&[0x05]);
+        assert_eq!(decode_cell(&mut r, &bit).unwrap(), b"\\x05");
+        // BIT(12) = (4, 1) — two bytes, not the five the swapped halves asked
+        // for. The trailing byte proves the reader stopped where it should.
+        let wide = ColDef { kind: MT_BIT, meta: 0x0401, nullable: false, unsigned: false, labels: None };
+        let mut r = R::new(&[0x0A, 0xAA, 0x7F]);
+        assert_eq!(decode_cell(&mut r, &wide).unwrap(), b"\\x0aaa");
+
+        // TIME2 is biased by 0x800000 with negatives stored as the complement;
+        // masking the sign away turned -01:00:00 into 1023:00:00.
+        let t = ColDef { kind: MT_TIME2, meta: 0, nullable: false, unsigned: false, labels: None };
+        let packed: u32 = 0x80_0000 - (1 << 12);
+        let b = [(packed >> 16) as u8, (packed >> 8) as u8, packed as u8];
+        let mut r = R::new(&b);
+        assert_eq!(decode_cell(&mut r, &t).unwrap(), b"-01:00:00");
+        let mut r = R::new(&[0x80, 0x10, 0x00]);
+        assert_eq!(decode_cell(&mut r, &t).unwrap(), b"01:00:00");
+    }
     #[test]
     fn digit_renderers_match_the_fmt_oracle() {
         // fmt_epoch vs the format! it replaced.
@@ -1086,7 +1232,7 @@ mod tests {
         enc.extend_from_slice(&1234u32.to_be_bytes());
         enc.extend_from_slice(&(5678u16).to_be_bytes());
         enc[0] |= 0x80; // positive
-        let c = ColDef { kind: MT_NEWDECIMAL, meta: (12 << 8) | 4, nullable: false, unsigned: false };
+        let c = ColDef { kind: MT_NEWDECIMAL, meta: (12 << 8) | 4, nullable: false, unsigned: false, labels: None };
         let mut r = R::new(&enc);
         assert_eq!(decode_cell(&mut r, &c).unwrap(), b"1234.5678");
 
@@ -1112,7 +1258,7 @@ mod tests {
             packed as u8,
         ];
         enc.extend_from_slice(&[0, 0, 4]); // 4 micros, 3-byte tail
-        let c = ColDef { kind: MT_DATETIME2, meta: 6, nullable: false, unsigned: false };
+        let c = ColDef { kind: MT_DATETIME2, meta: 6, nullable: false, unsigned: false, labels: None };
         let mut r = R::new(&enc);
         assert_eq!(
             String::from_utf8(decode_cell(&mut r, &c).unwrap()).unwrap(),
@@ -1123,14 +1269,14 @@ mod tests {
         let secs: i32 = 1_785_882_723;
         let mut enc = secs.to_be_bytes().to_vec();
         enc.push(0); // fsp=1 tail
-        let c = ColDef { kind: MT_TIMESTAMP2, meta: 1, nullable: false, unsigned: false };
+        let c = ColDef { kind: MT_TIMESTAMP2, meta: 1, nullable: false, unsigned: false, labels: None };
         let mut r = R::new(&enc);
         let got = String::from_utf8(decode_cell(&mut r, &c).unwrap()).unwrap();
         assert!(got.ends_with("+00"), "{got}");
         assert!(got.starts_with("2026-"), "{got}");
 
         // DATE
-        let c = ColDef { kind: MT_DATE, meta: 0, nullable: false, unsigned: false };
+        let c = ColDef { kind: MT_DATE, meta: 0, nullable: false, unsigned: false, labels: None };
         let v: u32 = (2026 << 9) | (8 << 5) | 5;
         let enc = v.to_le_bytes();
         let mut r = R::new(&enc[..3]);
@@ -1140,12 +1286,12 @@ mod tests {
     #[test]
     fn ints_honour_signedness_and_widths() {
         let cases: Vec<(ColDef, Vec<u8>, &str)> = vec![
-            (ColDef { kind: MT_TINY, meta: 0, nullable: false, unsigned: false }, vec![0xFF], "-1"),
-            (ColDef { kind: MT_TINY, meta: 0, nullable: false, unsigned: true }, vec![0xFF], "255"),
-            (ColDef { kind: MT_INT24, meta: 0, nullable: false, unsigned: false }, vec![0xFF, 0xFF, 0xFF], "-1"),
-            (ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false }, (-42i32).to_le_bytes().to_vec(), "-42"),
-            (ColDef { kind: MT_LONGLONG, meta: 0, nullable: false, unsigned: true }, u64::MAX.to_le_bytes().to_vec(), "18446744073709551615"),
-            (ColDef { kind: MT_YEAR, meta: 0, nullable: false, unsigned: false }, vec![126], "2026"),
+            (ColDef { kind: MT_TINY, meta: 0, nullable: false, unsigned: false, labels: None }, vec![0xFF], "-1"),
+            (ColDef { kind: MT_TINY, meta: 0, nullable: false, unsigned: true, labels: None }, vec![0xFF], "255"),
+            (ColDef { kind: MT_INT24, meta: 0, nullable: false, unsigned: false, labels: None }, vec![0xFF, 0xFF, 0xFF], "-1"),
+            (ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, labels: None }, (-42i32).to_le_bytes().to_vec(), "-42"),
+            (ColDef { kind: MT_LONGLONG, meta: 0, nullable: false, unsigned: true, labels: None }, u64::MAX.to_le_bytes().to_vec(), "18446744073709551615"),
+            (ColDef { kind: MT_YEAR, meta: 0, nullable: false, unsigned: false, labels: None }, vec![126], "2026"),
         ];
         for (c, bytes, want) in cases {
             let mut r = R::new(&bytes);
@@ -1157,13 +1303,13 @@ mod tests {
     #[test]
     fn varchar_prefix_width_follows_the_declared_byte_length() {
         // meta < 256 -> 1-byte prefix
-        let c = ColDef { kind: MT_VARCHAR, meta: 100, nullable: false, unsigned: false };
+        let c = ColDef { kind: MT_VARCHAR, meta: 100, nullable: false, unsigned: false, labels: None };
         let mut enc = vec![2u8];
         enc.extend_from_slice(b"hi");
         let mut r = R::new(&enc);
         assert_eq!(decode_cell(&mut r, &c).unwrap(), b"hi");
         // meta >= 256 (utf8mb4 VARCHAR(64) = 256 bytes) -> 2-byte prefix
-        let c = ColDef { kind: MT_VARCHAR, meta: 300, nullable: false, unsigned: false };
+        let c = ColDef { kind: MT_VARCHAR, meta: 300, nullable: false, unsigned: false, labels: None };
         let mut enc = 260u16.to_le_bytes().to_vec();
         enc.extend_from_slice(&[b'x'; 260]);
         let mut r = R::new(&enc);
@@ -1180,8 +1326,8 @@ mod tests {
             db: "bench".into(),
             table: "t".into(),
             cols: vec![
-                ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false },
-                ColDef { kind: MT_VARCHAR, meta: 100, nullable: true, unsigned: false },
+                ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, labels: None },
+                ColDef { kind: MT_VARCHAR, meta: 100, nullable: true, unsigned: false, labels: None },
             ],
         };
         let head = |b: &mut Vec<u8>| {
@@ -1262,9 +1408,9 @@ mod tests {
             db: "bench".into(),
             table: "t".into(),
             cols: vec![
-                ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false },
-                ColDef { kind: MT_VARCHAR, meta: 100, nullable: true, unsigned: false },
-                ColDef { kind: MT_LONG, meta: 0, nullable: true, unsigned: false },
+                ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, labels: None },
+                ColDef { kind: MT_VARCHAR, meta: 100, nullable: true, unsigned: false, labels: None },
+                ColDef { kind: MT_LONG, meta: 0, nullable: true, unsigned: false, labels: None },
             ],
         };
         // WRITE_ROWS: all three present, third NULL.
@@ -1310,12 +1456,12 @@ mod tests {
                 table_id: 42,
                 db: "bench".into(),
                 table: "t".into(),
-                cols: vec![ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false }],
+                cols: vec![ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, labels: None }],
             },
         );
         st.schemas.insert(
             "bench.t".into(),
-            TableSchema { names: vec!["id".into()], key: vec![true], unsigned: vec![false] },
+            TableSchema { names: vec!["id".into()], key: vec![true], unsigned: vec![false], labels: vec![None] },
         );
         let ev = RowsEvent { table_id: 42, rows: vec![(None, Some(Tuple::from_cells(&[Cell::Text(bytes::Bytes::from_static(b"1"))])))] };
         let msgs = to_messages(&mut st, EV_WRITE_ROWS, ev).unwrap();

@@ -900,6 +900,21 @@ apitap.transfer(
   interleaves `ANNOTATE_ROWS` frames, and answers `SHOW MASTER STATUS` with
   four columns instead of five. All four are handled; nothing about the call
   changes.
+- **Types the binlog does not send as text**: `ENUM` arrives as a member
+  index, `SET` as a bitmask, `BIT` as raw bytes, `TIME` as a sign-biased
+  integer. A full load reads the same columns through a `SELECT` and gets the
+  text you would see in a client, so a decoder that wrote the number would
+  leave one column holding `3` on rows CDC touched and `shipped` on rows it
+  did not — no error anywhere. apitap resolves the labels from the source
+  catalog on every drain, so a member added mid-stream lands as its label, and
+  a value with no label stops the run instead of writing the index.
+- **MySQL `JSON` columns are refused in `log_based`, MariaDB's are not.**
+  MySQL stores JSON as a binary envelope and ships that envelope in the
+  binlog, while the bootstrap writes the document as text; apitap cannot yet
+  render the envelope, so it refuses the table by name rather than write bytes
+  where a document belongs. Use `mode="replace"`/`"append"` for those tables,
+  or store the document in a text column. MariaDB is unaffected — there `JSON`
+  is an alias for `LONGTEXT` and arrives as text.
 - **An event apitap does not understand stops the run — it is never skipped.**
   A skipped binlog event is data that silently never arrives, so the reader
   refuses and names the event code (MySQL 8's partial-JSON row events,

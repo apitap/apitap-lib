@@ -204,8 +204,9 @@ pub(crate) async fn fetch_schema(
     db: &str,
     table: &str,
 ) -> Result<TableSchema> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_KEY AS CHAR), CAST(COLUMN_TYPE AS CHAR) \
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_KEY AS CHAR), \
+         CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR) \
          FROM information_schema.columns \
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
     )
@@ -217,6 +218,31 @@ pub(crate) async fn fetch_schema(
     if rows.is_empty() {
         return Err(Error::InvalidInput(format!("{db}.{table} not found")));
     }
+    // MySQL stores JSON as a BINARY envelope and the binlog ships that
+    // envelope verbatim, while a bootstrap SELECT returns the document as
+    // text. The same column would then read {"a": 1} after a full load and a
+    // run of control bytes after a CDC update — measured on MySQL 8.0. Until
+    // that encoding is rendered, the table is refused instead.
+    //
+    // The test is the catalog's own DATA_TYPE, which needs no version probe:
+    // MariaDB's JSON is an alias for LONGTEXT and reports `longtext`, so only
+    // a server with real binary JSON answers `json` here.
+    let json_cols: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.3.eq_ignore_ascii_case("json"))
+        .map(|r| r.0.as_str())
+        .collect();
+    if !json_cols.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "log_based: {db}.{table} has JSON column(s) {} and apitap cannot yet \
+             render MySQL's binary JSON encoding from the binlog. A CDC update \
+             would write the raw envelope where the full load wrote the document, \
+             so the run refuses instead of corrupting the column. Use mode='replace' \
+             or 'append' for this table, or store the document in a text column. \
+             (MariaDB is unaffected — its JSON is LONGTEXT.)",
+            json_cols.join(", ")
+        )));
+    }
     // COLUMN_KEY='PRI' marks primary-key members.
     Ok(TableSchema {
         names: rows.iter().map(|r| r.0.clone()).collect(),
@@ -225,7 +251,46 @@ pub(crate) async fn fetch_schema(
             .iter()
             .map(|r| r.2.to_lowercase().contains("unsigned"))
             .collect(),
+        // COLUMN_TYPE already carried these; the old code read the column and
+        // threw the labels away, which is why a CDC update wrote "3" where the
+        // bulk load had written 'shipped'.
+        labels: rows.iter().map(|r| enum_set_labels(&r.2)).collect(),
     })
+}
+
+/// Pull the member list out of a catalog COLUMN_TYPE like
+/// `enum('new','paid','shipped')` or `set('read','write')`. MySQL escapes an
+/// embedded quote by doubling it, and the labels may contain commas, so this
+/// walks the string rather than splitting on punctuation.
+fn enum_set_labels(column_type: &str) -> Option<std::sync::Arc<Vec<String>>> {
+    let lower = column_type.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("enum(") || lower.starts_with("set(")) {
+        return None;
+    }
+    let body = column_type
+        .find('(')
+        .and_then(|i| column_type.rfind(')').map(|j| &column_type[i + 1..j]))?;
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if in_quote && chars.peek() == Some(&'\'') => {
+                chars.next();
+                cur.push('\'');
+            }
+            '\'' => {
+                if in_quote {
+                    out.push(std::mem::take(&mut cur));
+                }
+                in_quote = !in_quote;
+            }
+            c if in_quote => cur.push(c),
+            _ => {}
+        }
+    }
+    Some(std::sync::Arc::new(out))
 }
 
 /// Per-session decode state that outlives one window (TABLE_MAP ids and
@@ -312,6 +377,7 @@ pub(crate) async fn drain_binlog(
                     if let Some(sc) = sess.st.schemas.get(&q) {
                         for (i, c) in map.cols.iter_mut().enumerate() {
                             c.unsigned = sc.unsigned.get(i).copied().unwrap_or(false);
+                            c.labels = sc.labels.get(i).cloned().flatten();
                         }
                     }
                     sess.st.maps.insert(map.table_id, map);
