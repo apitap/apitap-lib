@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/apitap-core", "py-apitap"]
 
 [workspace.package]
-version = "0.47.0"
+version = "0.48.0"
 edition = "2021"
 # Declared so `cargo build` says which toolchain is too old instead of failing
 # somewhere in the middle of a dependency. 1.75 is what the async-fn-in-trait
