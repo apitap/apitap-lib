@@ -359,7 +359,13 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
         .to_string();
     let mut ssl = SslMode::Prefer { explicit: false };
     for (k, v) in u.query_pairs() {
-        if k == "sslmode" {
+        // BOTH spellings. libpq writes `sslmode`, sqlx accepts `sslmode` and
+        // `ssl-mode`, and this project's own MySQL parser accepts both — so a
+        // URL written with the hyphen encrypted its sqlx pool and silently
+        // ran the replication socket in cleartext, with the "you asked for
+        // TLS and did not get it" note suppressed because, as far as this
+        // parser could tell, nobody had asked.
+        if k == "sslmode" || k == "ssl-mode" {
             ssl = match v.as_ref() {
                 "disable" => SslMode::Disable,
                 // libpq treats `allow` as "plaintext first, TLS only if that
@@ -487,7 +493,7 @@ impl Walsender {
                         static SAID: std::sync::Once = std::sync::Once::new();
                         let (h, p) = (ci.host.clone(), ci.port);
                         SAID.call_once(|| {
-                            crate::progress::note(&format!(
+                            crate::progress::warn(&format!(
                                 "postgres {h}:{p} refused TLS and sslmode=prefer permits \
                                  cleartext — this connection is NOT encrypted. \
                                  sslmode=require makes that a failure instead."
@@ -1079,7 +1085,26 @@ impl Walsender {
             std::env::var("APITAP_PG_BINARY").as_deref(),
             Ok("1") | Ok("true") | Ok("on")
         );
-        self.simple_query("SET logical_decoding_work_mem = '64MB'").await.ok();
+        // The connection already carries this as a startup option, and this
+        // SET used to overwrite it with a hard-coded 64MB — so
+        // APITAP_DECODE_WORKMEM was inert on the streaming path, while the
+        // savepoint refusal told operators to reach for it. Same source of
+        // truth in both places now.
+        //
+        // It is re-issued rather than trusted because the startup `options`
+        // attempt falls back to a plain connection when the server rejects
+        // it, and a run that quietly lost the setting is how a large
+        // transaction starts spilling to pg_replslot.
+        let workmem =
+            std::env::var("APITAP_DECODE_WORKMEM").unwrap_or_else(|_| "1GB".to_string());
+        if !matches!(workmem.as_str(), "" | "0" | "off") {
+            self.simple_query(&format!(
+                "SET logical_decoding_work_mem = '{}'",
+                workmem.replace('\'', "")
+            ))
+            .await
+            .ok();
+        }
         if binary {
             let v2b = format!(
                 "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '2', \
@@ -1098,7 +1123,7 @@ impl Walsender {
                 lsn_to_string(start_lsn)
             );
             if self.simple_query(&v2).await.is_err() || !self.copying {
-                self.simple_query("SET logical_decoding_work_mem = '1GB'").await.ok();
+                // (already set above from APITAP_DECODE_WORKMEM)
                 let v1 = format!(
                     "START_REPLICATION SLOT \"{slot}\" LOGICAL {} (\"proto_version\" '1', \
                      \"publication_names\" '{publication}')",
@@ -1461,6 +1486,12 @@ mod tests {
         assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
         // libpq's default, and so this client's.
         assert_eq!(ci.ssl, SslMode::Prefer { explicit: false });
+        // Both spellings, because a URL that works for the pool must not
+        // mean something weaker for the replication socket.
+        assert_eq!(
+            parse_url("postgres://u:p@h/db?ssl-mode=require").unwrap().ssl,
+            SslMode::Require
+        );
         for (q, want) in [
             ("disable", SslMode::Disable),
             ("prefer", SslMode::Prefer { explicit: true }),

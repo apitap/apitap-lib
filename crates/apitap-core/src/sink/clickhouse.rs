@@ -173,7 +173,12 @@ impl ChConn {
             }
             let resp = sent.map_err(|e| Error::Connect(format!("clickhouse: {e}")))?;
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            // A body that could not be READ is not a body without an
+            // exception in it. Defaulting to "" made an unreadable 5xx score
+            // as "this came from a proxy, so ClickHouse never saw it" — and
+            // retried a mutation on that basis. The distinction is kept.
+            let body_read = resp.text().await;
+            let body = body_read.as_deref().unwrap_or("");
             // A 5xx is retryable only when it demonstrably did NOT come from
             // ClickHouse's executor. ClickHouse answers some of its own
             // exceptions with 5xx (SOCKET_TIMEOUT and CANNOT_OPEN_FILE map to
@@ -181,6 +186,7 @@ impl ChConn {
             // status alone is not evidence. The body is: a ClickHouse error
             // always carries `DB::Exception`, a proxy's error page never does.
             let from_proxy_5xx = matches!(status.as_u16(), 502 | 503 | 504)
+                && body_read.is_ok()
                 && !body.contains("DB::Exception");
             if from_proxy_5xx && attempt < BACKOFF_MS.len() {
                 tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]))
@@ -206,7 +212,7 @@ impl ChConn {
                     }
                 )));
             }
-            return Ok(body);
+            return Ok(body.to_string());
         }
     }
 

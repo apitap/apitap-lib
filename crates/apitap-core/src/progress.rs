@@ -156,7 +156,25 @@ pub(crate) fn table_done() {
 /// captured pipe gets it as a timestamped `note=` record. Silent when progress
 /// is off, because a user who asked for silence meant it.
 pub(crate) fn note(msg: &str) {
-    let Some(fmt) = env_choice() else { return };
+    warn_or_note(msg, false)
+}
+
+/// A note the operator must not be able to silence by accident.
+///
+/// `APITAP_PROGRESS=0` means "stop telling me about throughput". It has been
+/// taken to also mean "stop telling me this connection is unencrypted", which
+/// is not a trade anyone would make deliberately. Security-relevant notes go
+/// to stderr whatever the progress setting says.
+pub(crate) fn warn(msg: &str) {
+    warn_or_note(msg, true)
+}
+
+fn warn_or_note(msg: &str, always: bool) {
+    let fmt = match env_choice() {
+        Some(f) => f,
+        None if always => Format::Plain,
+        None => return,
+    };
     let mut err = std::io::stderr().lock();
     let _ = match fmt {
         Format::Json => writeln!(

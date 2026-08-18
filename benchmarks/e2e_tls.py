@@ -21,15 +21,19 @@ opens the hand-rolled replication socket.
   leg 2  sslmode=disable       — the run refuses; the SERVER is the one saying no
   leg 3  sslmode=verify-full   — must FAIL on a self-signed certificate
   leg 4  sslmode=verify-ca     — refused by apitap ITSELF, by name, before any socket
+  leg 4b ssl-mode=… (hyphen)   — the other spelling sqlx accepts must mean the same
+  leg 5  a full CDC round trip — bootstrap + drain, digest-checked, over TLS
 
 Legs 2 and 3 are product-level: a `log_based` run opens sqlx's control pool
 before the replication socket, so whichever layer refuses first is the one
 that speaks. That is the right behaviour to assert — the run must not proceed
 — but it is not evidence about the walsender specifically. Leg 1 is.
-  leg 5  a full CDC round trip — bootstrap + drain, digest-checked, over TLS
 
 Leg 3 is the one worth reading twice: a verification mode that passes against a
 certificate no public root signed would mean the verification is not happening.
+Leg 4b is the one that would have caught a real hole: the parser knew only one
+of the two spellings, so the hyphen form ran the replication socket in
+cleartext while the pool beside it was encrypted.
 
 Rig: `apitap-tls-pg` on :5546 (built by ~/tls_rig.sh), ClickHouse on :8124.
 """
@@ -63,6 +67,7 @@ def ch(sql):
 
 
 def transfer(url, mode="replace", table=T, dest=None):
+    """`url` is passed whole — some legs need a spelling, not a mode name."""
     code = (
         "import apitap\n"
         f"r = apitap.transfer({url!r}, {CH!r}, table={table!r}, "
@@ -148,6 +153,31 @@ case("verify-ca refused by apitap, naming the mode and the alternatives",
      last[:190] or "(no message)")
 
 # ───────────────────────────────────────────────────────────────────────────
+print("== leg 4b: the hyphen spelling means the same thing ==")
+# sqlx accepts `sslmode` AND `ssl-mode`; so does this project's own MySQL
+# parser. The walsender accepted only the first — so a URL written with the
+# hyphen encrypted its sqlx pool and ran the replication socket in CLEARTEXT,
+# with the "you asked for TLS and did not get it" note suppressed, because as
+# far as that parser could tell nobody had asked.
+#
+# `verify-full` is the discriminator: against this self-signed certificate it
+# MUST fail. A parser that ignores the hyphen falls back to `prefer`, which
+# connects happily — so here a passing connection is the bug.
+r = transfer(f"{PG_TLS}?ssl-mode=verify-full", mode="log_based", table=T,
+             dest=T + "_h")
+case("ssl-mode=verify-full (hyphen) is honoured, not ignored",
+     r.returncode != 0,
+     (r.stderr.strip().splitlines()[-1][:150] if r.returncode
+      else "it CONNECTED — the hyphen spelling fell back to prefer"))
+r = transfer(f"{PG_TLS}?ssl-mode=verify-ca", mode="log_based", table=T,
+             dest=T + "_h2")
+last = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
+case("ssl-mode=verify-ca (hyphen) reaches apitap's own refusal",
+     "verify-ca is not implemented" in last, last[:150])
+ch(f"DROP TABLE IF EXISTS {T}_h")
+ch(f"DROP TABLE IF EXISTS {T}_h2")
+
+
 print("== leg 5: a real CDC drain over the encrypted socket ==")
 CT = "tls_cdc"
 pg(f"DROP TABLE IF EXISTS {CT}")

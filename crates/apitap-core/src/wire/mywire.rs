@@ -438,7 +438,7 @@ impl MyWire {
                     static SAID: std::sync::Once = std::sync::Once::new();
                     let (h, p) = (info.host.clone(), info.port);
                     SAID.call_once(|| {
-                        crate::progress::note(&format!(
+                        crate::progress::warn(&format!(
                             "mysql {h}:{p} offers no TLS and ssl-mode=preferred permits \
                              cleartext — this connection is NOT encrypted. \
                              ssl-mode=required makes that a failure instead."

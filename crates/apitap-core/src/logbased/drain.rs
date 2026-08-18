@@ -230,6 +230,18 @@ pub(crate) async fn drain(
                             let n: usize = ops.iter().map(|(_, o)| op_bytes(o)).sum();
                             sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
                         }
+                    } else if sess.streams.get(&xid).is_none_or(|v| v.is_empty()) {
+                        // The streamed transaction touched nothing we
+                        // replicate. Postgres streams by SIZE, not by
+                        // publication, so an unrelated batch job on the same
+                        // database — big enough to stream, with a savepoint in
+                        // it — produces exactly this message. Refusing there
+                        // would stop every CDC run on the slot for traffic
+                        // apitap does not even read, permanently, with
+                        // recovery advice about a transaction the operator
+                        // cannot find. Nothing was buffered, so nothing can be
+                        // lost: drop the empty entry and carry on.
+                        sess.streams.remove(&xid);
                     } else {
                         // A SUBtransaction aborted — a `ROLLBACK TO SAVEPOINT`
                         // inside a streamed transaction. Only that
@@ -252,11 +264,13 @@ pub(crate) async fn drain(
                              the rolled-back ones, and applying or discarding all of \
                              them would both be wrong.\n\
                              \n\
-                             Recovery: raise logical_decoding_work_mem on the SOURCE \
-                             above the size of that transaction (apitap already asks \
-                             for 1GB — see APITAP_DECODE_WORKMEM — so the server's own \
-                             setting or a larger transaction is what brought it \
-                             below), then re-run. Postgres streams a transaction only \
+                             Recovery: give the decoder room to buffer that \
+                             transaction instead of streaming it, then re-run. apitap \
+                             asks the session for 1GB and APITAP_DECODE_WORKMEM \
+                             changes that; the server's own logical_decoding_work_mem \
+                             and max_slot_wal_keep_size can still bind first, and a \
+                             transaction larger than whichever is smallest will \
+                             stream regardless. Postgres streams a transaction only \
                              when decoding it would exceed that budget, so with room \
                              to buffer it the whole transaction arrives at COMMIT with \
                              the rollback already resolved and applies normally.\n\
