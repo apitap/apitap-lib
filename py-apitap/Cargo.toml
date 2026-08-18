@@ -13,5 +13,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 apitap-core = { path = "../crates/apitap-core" }
-pyo3 = { version = "0.24", features = ["abi3-py39", "extension-module"] }
+# 0.29 is the first release without RUSTSEC-2026-0176 (out-of-bounds read in
+# PyList/PyTuple `nth`/`nth_back`) and RUSTSEC-2026-0177 (missing `Sync` bound
+# on `PyCFunction::new_closure`). Neither is reachable from this shim — it
+# calls neither — but a library that ships a compiled artifact to PyPI should
+# not carry a known out-of-bounds read in its FFI layer, reachable or not.
+pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

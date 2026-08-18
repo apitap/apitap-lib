@@ -127,7 +127,7 @@ fn transfer(
         slots,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
-    let out = py.allow_threads(|| {
+    let out = py.detach(|| {
         if cdc {
             run_cdc(apitap_core::transfer(&src, &dst, &table, &opts))
         } else {
@@ -204,7 +204,7 @@ fn transfer_many(
         slots,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
-    let out = py.allow_threads(|| {
+    let out = py.detach(|| {
         let fut = async {
             if let Some(sp) = &parsed_specs {
                 return apitap_core::transfer_tables(&src, &dst, sp, &opts).await;
@@ -277,8 +277,8 @@ impl PgRead {
     fn __arrow_c_stream__(
         &mut self,
         py: Python<'_>,
-        requested_schema: Option<PyObject>,
-    ) -> PyResult<PyObject> {
+        requested_schema: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         let _ = requested_schema;
         let ptr = self
             .stream
@@ -294,7 +294,7 @@ impl PgRead {
             if cap.is_null() {
                 return Err(PyErr::fetch(py));
             }
-            Ok(PyObject::from_owned_ptr(py, cap))
+            Ok(unsafe { pyo3::Bound::from_owned_ptr(py, cap) }.unbind())
         }
     }
 
@@ -345,7 +345,7 @@ fn read(
         push_where,
     };
     let handle = py
-        .allow_threads(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
+        .detach(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
         .map_err(|e| match e {
             apitap_core::Error::InvalidInput(m) => PyValueError::new_err(m),
             e => PyRuntimeError::new_err(e.to_string()),
@@ -366,7 +366,7 @@ fn read_schema(
     table: String,
 ) -> PyResult<Vec<(String, String, bool)>> {
     let fields = py
-        .allow_threads(|| rt().block_on(apitap_core::read_schema(&src, &table)))
+        .detach(|| rt().block_on(apitap_core::read_schema(&src, &table)))
         .map_err(|e| match e {
             apitap_core::Error::InvalidInput(m) => PyValueError::new_err(m),
             e => PyRuntimeError::new_err(e.to_string()),

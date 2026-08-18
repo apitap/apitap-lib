@@ -606,10 +606,6 @@ pub(crate) async fn drain_binlog(
         wal_cols,
         wal_oids,
         hit_budget,
-        // MySQL has no equivalent hazard: a binlog is retained by the
-        // server's own clock, not by a consumer's confirmation, so there is
-        // nothing here for a drain to release.
-        caught_up_lsn: 0,
     })
 }
 

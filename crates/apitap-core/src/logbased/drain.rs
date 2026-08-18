@@ -30,14 +30,6 @@ pub(crate) struct DrainOutcome {
     /// The drain stopped at the memory budget, not the stop-line: the caller
     /// applies this window, confirms the LSN, and drains again.
     pub hit_budget: bool,
-    /// The server's WAL end at the moment this drain saw it had shipped
-    /// everything — 0 if the drain stopped for any other reason.
-    ///
-    /// `end_lsn` already carries this point (see the caught-up branch), so
-    /// nothing needs to act on it; it is reported because "the drain caught
-    /// up" and "the drain hit its budget" are different states and a caller
-    /// that has to tell them apart should not have to infer it.
-    pub caught_up_lsn: u64,
 }
 
 struct RelState {
@@ -138,7 +130,6 @@ pub(crate) async fn drain(
     // (last-write-wins) makes true memory smaller — the count is conservative.
     let mut buf_bytes = 0usize;
     let mut hit_budget = false;
-    let mut caught_up_lsn = 0u64;
     let dbg_stream = std::env::var("APITAP_DEBUG").is_ok();
 
     let mut in_stream: Option<u32> = None;
@@ -188,7 +179,6 @@ pub(crate) async fn drain(
                     if wal_end > end_lsn {
                         end_lsn = wal_end;
                     }
-                    caught_up_lsn = wal_end;
                     break;
                 }
             }
@@ -382,7 +372,6 @@ pub(crate) async fn drain(
         wal_cols: sess.wal_cols.clone(),
         wal_oids: sess.wal_oids.clone(),
         hit_budget,
-        caught_up_lsn,
     })
 }
 
