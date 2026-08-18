@@ -192,7 +192,7 @@ impl S3Conn {
             }
         };
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             creds,
             bucket,
             prefix,
@@ -231,7 +231,7 @@ impl S3Conn {
             }
         };
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             creds,
             bucket,
             prefix: String::new(),

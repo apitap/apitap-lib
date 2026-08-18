@@ -16,10 +16,21 @@ The two properties everything else rests on:
   the destination is replaced by an atomic swap (`EXCHANGE TABLES`, `RENAME`).
   Until that swap, readers see the previous table, whole. There is no window in
   which a query returns half a load.
-- **A CDC watermark advances only with its data, in the same transaction.** So a
-  window either landed and was recorded, or neither. Replay is idempotent by
-  construction: the apply clears the keys it is about to write before writing
-  them.
+- **A CDC watermark is written last, and replay is idempotent by
+  construction** — the apply clears the keys it is about to write before it
+  writes them. What that buys you depends on what the destination can promise,
+  and the promise is not the same everywhere:
+
+  | destination | window + watermark | what a crash mid-window leaves |
+  |---|---|---|
+  | Postgres, MySQL, Iceberg | **one transaction** | either the whole window and its watermark, or neither |
+  | ClickHouse | several statements, watermark last | some of the window may be applied; the watermark is not, so the next run re-applies it — the same keys, cleared and rewritten |
+  | BigQuery | one transaction per chunk, watermark last | as ClickHouse: partial apply, unmoved watermark, re-applied on the next run |
+
+  In every case a crash costs a repeat, never a gap: no window is ever
+  recorded as applied unless it was. ClickHouse and BigQuery reach that
+  through repetition instead of rollback, because neither offers a
+  transaction that spans the statements this apply needs.
 
 ## The table
 

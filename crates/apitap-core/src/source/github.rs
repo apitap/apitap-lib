@@ -152,7 +152,7 @@ impl GithubSource {
             }
         }
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             owner,
             repo,
             prefix,

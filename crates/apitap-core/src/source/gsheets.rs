@@ -71,7 +71,7 @@ impl GsheetsSource {
             }
         }
         let credentials = crate::gcp::read_credentials(credentials_path, "gsheets")?;
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let token = crate::gcp::fetch_access_token(&client, &credentials, SHEETS_SCOPE).await?;
         Ok(Self {
             client,

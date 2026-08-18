@@ -20,6 +20,7 @@ use crate::logbased::dest_ice::IceDest;
 use crate::logbased::dest_my::MyDest;
 use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest};
 use crate::logbased::drain::{drain, DrainOutcome, DrainSession};
+use crate::logbased::mysource;
 use crate::wire::pgoutput::lsn_from_string;
 use crate::wire::walsender::Walsender;
 use crate::{Mode, MultiReport, TableResult, TransferOptions, TransferReport};
@@ -167,6 +168,19 @@ impl Dest {
             Dest::Bq(d) => d.validate_changelog_ddl(dest_table, partition_by, order_by).await,
             // The row stores refuse changelog=True outright, upstream of this.
             Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => Ok(()),
+        }
+    }
+
+    /// Record which SOURCE SERVER a table's watermark belongs to. Stored as
+    /// an ordinary state row under a reserved `source_id`, so no destination's
+    /// state table has to grow a column and no deployment has to migrate.
+    async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.write_marker(dest_table, source_id, value).await,
+            Dest::Ch(d) => d.write_marker(dest_table, source_id, value).await,
+            Dest::My(d) => d.write_marker(dest_table, source_id, value).await,
+            Dest::Ice(d) => d.write_marker(dest_table, source_id, value).await,
+            Dest::Bq(d) => d.write_marker(dest_table, source_id, value).await,
         }
     }
 
@@ -663,6 +677,29 @@ async fn run_group(
                  support)"
             )));
         }
+        // REPLICA IDENTITY NOTHING is refused here rather than when the
+        // first Relation message arrives. By then the bootstrap has already
+        // run a full load and written a watermark, so the run fails AFTER
+        // moving data — and on a group, after some members committed. The
+        // catalog answers this question before anything is touched.
+        let ident: Option<String> = sqlx::query_scalar(
+            "SELECT relreplident::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+        )
+        .bind(&schema_name)
+        .bind(&bare)
+        .fetch_optional(&src)
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based: replica identity probe: {e}")))?;
+        if ident.as_deref() == Some("n") {
+            return Err(Error::InvalidInput(format!(
+                "log_based: {qualified} has REPLICA IDENTITY NOTHING — its updates \
+                 and deletes reach the WAL with no key, so there is no way to say \
+                 WHICH row changed. Run: ALTER TABLE {qualified} REPLICA IDENTITY \
+                 DEFAULT (or FULL), then re-run."
+            )));
+        }
         let dest_table = if single {
             opts.dest_table.clone().unwrap_or_else(|| bare.clone())
         } else {
@@ -787,6 +824,43 @@ async fn run_group_mysql(
         .to_string();
     let single = tables.len() == 1;
     let ctxs = myrun::resolve(&pool, &default_db, tables, single, opts).await?;
+
+    // Which server do the stored coordinates belong to?
+    //
+    // A binlog position means nothing outside the server that issued it, and
+    // nothing in a connection URL says which server answered it: a promoted
+    // replica, a restored backup, or a DNS record moved during a failover all
+    // answer the same address. The "position is AHEAD of the server" guard
+    // catches a new server that happens to be BEHIND the stored mark; this
+    // catches the other half, where the new server is ahead and the resume
+    // looks perfectly ordinary while reading someone else's changes.
+    //
+    // A table with no marker adopts the server it is reading now — that is
+    // every table bootstrapped before this check existed, and pretending to
+    // know what they were reading last month would be a lie. From the first
+    // run onward, a switch is refused.
+    let server = mysource::server_identity(&pool).await?;
+    for c in &ctxs {
+        let marker_id = format!("server-identity:{}", c.source_id);
+        match dest.read_state(&c.dest_table, &marker_id).await? {
+            Some(prev) if prev != server => {
+                return Err(Error::InvalidInput(format!(
+                    "log_based: {} was last drained from a DIFFERENT MySQL server than \
+                     the one this URL now reaches. A binlog (file, position) is only \
+                     meaningful on the server that wrote it, so resuming here would \
+                     read unrelated changes at the stored coordinate and report \
+                     success. If the source really did move — a promoted replica, a \
+                     restored backup, a failover — clear this table's apitap state on \
+                     the destination and re-run, which bootstraps it against the new \
+                     server. If it did not, check that the URL still points where you \
+                     think it does.",
+                    c.qualified
+                )));
+            }
+            Some(_) => {}
+            None => dest.write_marker(&c.dest_table, &marker_id, server).await?,
+        }
+    }
 
     // State arbitration mirrors the Postgres path: all-absent bootstraps,
     // all-present drains, a mix is a torn group.
@@ -1222,6 +1296,9 @@ async fn drain_group(
     // The previous window's end_lsn: sent to the applier, not yet confirmed.
     let mut pending: Option<u64> = None;
     let mut drain_err: Option<Error> = None;
+    // Where the last drain saw the server had shipped everything (0 if none
+    // did) — confirmed after the final window lands.
+    let mut caught_up_at = 0u64;
     loop {
         let t_drain = std::time::Instant::now();
         let outcome = match drain(
@@ -1248,6 +1325,7 @@ async fn drain_group(
         }
         let end = outcome.end_lsn;
         let hit = outcome.hit_budget;
+        let caught_up = outcome.caught_up_lsn;
         if end > cur {
             if win_tx.send(outcome).await.is_err() {
                 // Apply task died — its JoinHandle carries the real error.
@@ -1266,6 +1344,9 @@ async fn drain_group(
             pending = Some(end);
             cur = end;
         }
+        if caught_up > caught_up_at {
+            caught_up_at = caught_up;
+        }
         if !hit {
             break;
         }
@@ -1277,6 +1358,16 @@ async fn drain_group(
             if applied_rx.wait_for(|&a| a >= p).await.is_ok() {
                 ws.standby_status(p, false).await?;
             }
+        }
+        // A drain that caught up saw the server ship EVERYTHING to the
+        // stop-line and found nothing of ours past `cur`. Confirming that
+        // point is what lets the slot release WAL for a table nobody is
+        // writing to — without it, an idle published table pins WAL forever
+        // while every run reports success, and on a busy instance that is the
+        // source's disk, not the pipeline's. Sent only after the last window
+        // is durable at the destination, so it never confirms unapplied work.
+        if caught_up_at > cur {
+            ws.standby_status(caught_up_at, false).await?;
         }
     }
     let joined = apply_task.await;

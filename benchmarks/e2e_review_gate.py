@@ -15,6 +15,9 @@ be argued with.
   leg 1  MariaDB/MySQL CDC type fidelity   — ENUM, SET, BIT, TIME(neg), JSON
   leg 2  Postgres idle-table WAL retention — does an idle publication confirm?
   leg 3  One wide row                      — is peak RSS bounded by the budget?
+  leg 4  MySQL watermark vs server identity — is a repointed URL refused?
+  leg 5  CDC apply into a narrower column   — does it error, or silently shorten?
+  leg 6  REPLICA IDENTITY NOTHING           — refused before the load, or after?
 
 A NOTE ON leg 1 AND MariaDB: MariaDB implements JSON as an alias for LONGTEXT,
 so its binlog carries JSON as ordinary text and the JSON sub-leg will PASS on
@@ -232,6 +235,148 @@ else:
 
 pg(f"DROP TABLE IF EXISTS {WT}")
 ch(f"DROP TABLE IF EXISTS {WT}")
+
+# ───────────────────────────────────────────────────────────────────────────
+print("== leg 4: a watermark must not be resumed against a DIFFERENT server ==")
+# A binlog (file, position) means nothing outside the server that issued it.
+# Repoint the same table at a second MySQL — a promoted replica, a restored
+# backup, a DNS record moved during a failover all look exactly like this — and
+# a resume there reads unrelated changes at the stored coordinate and reports
+# success. The refusal is the whole feature; a run that "works" is the failure.
+
+MY2 = os.environ.get("MY2_URL", "mysql://root:bench@127.0.0.1:3307/bench")
+MY2_C = os.environ.get("MY2_CONTAINER", "apitap-bench-my")
+ST = "rev_switch"
+
+
+def my2(sql):
+    o = sh(["docker", "exec", "-i", MY2_C, "mysql", "-uroot", "-pbench",
+            "-N", "-D", "bench", "-e", sql])
+    if o.returncode:
+        raise RuntimeError(o.stderr)
+    return o.stdout.strip()
+
+
+ids = (my("SELECT @@server_id"), my2("SELECT @@server_id"))
+if ids[0] == ids[1]:
+    print(f"   ! both servers report server_id={ids[0]} — cannot tell them apart, "
+          "leg SKIPPED (set distinct server_id to run it)")
+else:
+    for run, tbl in ((my, MY_CLI), (my2, "mysql")):
+        run(f"DROP TABLE IF EXISTS {ST}")
+        run(f"CREATE TABLE {ST} (id INT PRIMARY KEY, v VARCHAR(32))")
+        run(f"INSERT INTO {ST} VALUES (1,'a'),(2,'b')")
+    ch(f"DROP TABLE IF EXISTS {ST}")
+    ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{ST}' SETTINGS mutations_sync=1")
+
+    r = transfer(MY, ST)
+    if r.returncode:
+        ok = False
+        print(f"   ✗ bootstrap against server A failed: {r.stderr[-300:]}")
+    else:
+        # Same table name, same credentials, different server.
+        r2 = transfer(MY2, ST)
+        if r2.returncode == 0:
+            ok = False
+            print("   ✗ resumed against a different server and reported success — "
+                  "the stored coordinate was read as if it belonged there")
+        elif "DIFFERENT MySQL server" in r2.stderr:
+            print("   ✓ refused, and the message says which failure this is")
+        else:
+            ok = False
+            print(f"   ✗ failed, but not with the identity refusal: {r2.stderr[-300:]}")
+    for run in (my, my2):
+        run(f"DROP TABLE IF EXISTS {ST}")
+    ch(f"DROP TABLE IF EXISTS {ST}")
+
+# ───────────────────────────────────────────────────────────────────────────
+print("== leg 5: a CDC apply must not silently truncate a value ==")
+# The apply session used to run sql_mode='', where a value too long for its
+# column is written SHORTENED with a warning nobody reads. The destination then
+# holds a value the source never had, and every later comparison agrees with
+# itself. An error is the only acceptable outcome.
+
+MYD = os.environ.get("MYD_URL", "mysql://root:bench@127.0.0.1:3308/bench")
+MYD_C = os.environ.get("MYD_CONTAINER", "apitap-bench-my-dst")
+LT = "rev_longval"
+
+
+def myd(sql, check=True):
+    o = sh(["docker", "exec", "-i", MYD_C, "mysql", "-uroot", "-pbench",
+            "-N", "-D", "bench", "-e", sql])
+    if check and o.returncode:
+        raise RuntimeError(o.stderr)
+    return o.stdout.strip()
+
+
+if sh(["docker", "inspect", MYD_C]).returncode != 0:
+    print(f"   ! no {MYD_C} container — leg SKIPPED")
+else:
+    pg(f"DROP TABLE IF EXISTS {LT}")
+    pg(f"CREATE TABLE {LT} (id int primary key, v text)")
+    pg(f"INSERT INTO {LT} VALUES (1, 'short')")
+    myd(f"DROP TABLE IF EXISTS {LT}", check=False)
+    myd(f"DELETE FROM _apitap_state WHERE dest_table='{LT}'", check=False)
+
+    # Not `transfer()` — that helper always lands in ClickHouse, and this leg
+    # is about the MySQL apply session specifically.
+    def to_mysql():
+        return sh([
+            sys.executable, "-c",
+            "import apitap\n"
+            f"apitap.transfer({PG!r}, {MYD!r}, table={LT!r}, mode='log_based')\n",
+        ])
+
+    r = to_mysql()
+    if r.returncode:
+        print(f"   ! bootstrap into MySQL failed, leg SKIPPED: {r.stderr[-300:]}")
+    else:
+        # Narrow the destination column, then send a value that no longer fits.
+        myd(f"ALTER TABLE {LT} MODIFY v VARCHAR(8)")
+        pg(f"UPDATE {LT} SET v = repeat('x', 64) WHERE id = 1")
+        r2 = to_mysql()
+        landed = myd(f"SELECT v FROM {LT} WHERE id=1", check=False)
+        if r2.returncode == 0 and len(landed) < 64:
+            ok = False
+            print(f"   ✗ reported success while writing {len(landed)} characters of "
+                  f"a 64-character value: {landed!r}")
+        elif r2.returncode != 0:
+            print("   ✓ refused rather than shortening the value")
+        else:
+            print(f"   ✓ the whole value landed ({len(landed)} chars)")
+    pg(f"DROP TABLE IF EXISTS {LT}")
+    myd(f"DROP TABLE IF EXISTS {LT}", check=False)
+
+# ───────────────────────────────────────────────────────────────────────────
+print("== leg 6: REPLICA IDENTITY NOTHING must be refused BEFORE the load ==")
+# Its updates and deletes reach the WAL with no key at all, so there is no way
+# to say which row changed. That used to surface when the first Relation
+# message arrived — after a full load had already run and a watermark had been
+# written. Catching it in the catalog costs one query and moves nothing.
+
+RT = "rev_noident"
+pg(f"DROP TABLE IF EXISTS {RT}")
+pg(f"CREATE TABLE {RT} (id int primary key, v text)")
+pg(f"ALTER TABLE {RT} REPLICA IDENTITY NOTHING")
+pg(f"INSERT INTO {RT} SELECT g, 'v'||g FROM generate_series(1,1000) g")
+ch(f"DROP TABLE IF EXISTS {RT}")
+ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{RT}' SETTINGS mutations_sync=1")
+
+r = transfer(PG, RT)
+landed = ch(f"SELECT count() FROM {RT}") or "0"
+if r.returncode == 0:
+    ok = False
+    print("   ✗ accepted a table whose updates carry no key")
+elif "REPLICA IDENTITY NOTHING" not in r.stderr:
+    ok = False
+    print(f"   ✗ refused, but not for this reason: {r.stderr[-300:]}")
+elif landed not in ("0", ""):
+    ok = False
+    print(f"   ✗ refused only AFTER moving {landed} rows — the refusal is too late")
+else:
+    print("   ✓ refused before anything moved, and the message names the fix")
+pg(f"DROP TABLE IF EXISTS {RT}")
+ch(f"DROP TABLE IF EXISTS {RT}")
 
 print("== cleanup ==")
 print("   dropped test tables")

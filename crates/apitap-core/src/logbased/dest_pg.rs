@@ -62,6 +62,21 @@ impl PgDest {
         tx.commit().await.map_err(db_err)
     }
 
+    /// Write a bare state row — used for the source-identity marker, which
+    /// is an ordinary row under a reserved `source_id` rather than a column
+    /// the state table would have to grow.
+    pub(crate) async fn write_marker(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        value: u64,
+    ) -> Result<()> {
+        self.ensure_state_table().await?;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        upsert_state_tx(&mut tx, dest_table, source_id, value, 0).await?;
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn ensure_state_table(&self) -> Result<()> {
         self.pool
             .execute(

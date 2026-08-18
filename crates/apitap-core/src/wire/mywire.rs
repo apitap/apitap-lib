@@ -24,6 +24,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, B
 use tokio::net::TcpStream;
 use tokio_rustls::rustls;
 
+/// Ceiling on one logical MySQL payload, matching the server's own maximum
+/// `max_allowed_packet` (1 GB). A single packet is capped by the protocol at
+/// 16 MB, but a payload larger than that is sent as a CHAIN of full packets
+/// with no count in front of it, so the assembly loop below has no bound of
+/// its own: a peer that keeps sending 16 MB continuations grows the buffer
+/// until the process dies. This is the bound.
+const MAX_PAYLOAD: usize = 1 << 30;
+
+
 // Capability flags (the subset we speak).
 const CLIENT_LONG_PASSWORD: u32 = 0x1;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x8;
@@ -505,6 +514,9 @@ impl MyWire {
             }
             self.seq = self.seq.wrapping_add(1);
             let start = self.buf.len();
+            if start + len > MAX_PAYLOAD {
+                return Err(desync("payload past max_allowed_packet"));
+            }
             self.buf.resize(start + len, 0);
             self.rd
                 .read_exact(&mut self.buf[start..])
@@ -689,6 +701,9 @@ impl MyWire {
             }
             self.seq = self.seq.wrapping_add(1);
             let need = out.len() + len;
+            if need > MAX_PAYLOAD {
+                return Err(desync("payload past max_allowed_packet"));
+            }
             out.reserve(len);
             while out.len() < need {
                 let want = need - out.len();

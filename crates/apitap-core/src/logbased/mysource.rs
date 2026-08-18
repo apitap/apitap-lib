@@ -108,6 +108,57 @@ pub(crate) async fn binlog_file_present(pool: &sqlx::MySqlPool, file: &str) -> R
         .any(|name| name == file))
 }
 
+/// A stable 64-bit fingerprint of the server this pool is connected to.
+///
+/// The watermark is a `(file, position)` pair, and those numbers mean nothing
+/// outside the server that issued them. Point the same URL at a different
+/// server — a promoted replica, a restored backup, a DNS record moved during
+/// a failover — and `binlog.000042 @ 1500` is a perfectly valid coordinate on
+/// the new one, pointing at completely different changes. The existing
+/// "position is AHEAD of the server" guard catches the case where the new
+/// server happens to be behind; this catches the rest, which is the more
+/// dangerous half because it resumes quietly.
+///
+/// MySQL has `@@server_uuid`, which survives restarts and is unique per
+/// server. MariaDB does not, so `@@server_id` is used there — weaker (an
+/// operator can set two servers to the same id) but it is what the dialect
+/// offers, and a distinct id still catches the common failover.
+pub(crate) async fn server_identity(pool: &sqlx::MySqlPool) -> Result<u64> {
+    let raw = match sqlx::query_as::<_, (String,)>("SELECT @@server_uuid")
+        .fetch_one(pool)
+        .await
+    {
+        Ok((v,)) => format!("uuid:{v}"),
+        Err(_) => {
+            let (id,): (i64,) = sqlx::query_as("SELECT @@server_id")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| Error::Transfer(format!("probe server identity: {e}")))?;
+            format!("id:{id}")
+        }
+    };
+    Ok(fnv1a(raw.as_bytes()))
+}
+
+/// FNV-1a. Explicitly written out rather than reached for from `std`, because
+/// this value is WRITTEN to a destination and compared on later runs: it has
+/// to mean the same thing next month, on another machine, under another
+/// compiler. `DefaultHasher` promises none of that.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    // 0 is the "no marker stored" sentinel on the destination side, so the
+    // one input that would collide with it is nudged.
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
 /// Refuse loudly the server settings that would silently corrupt a CDC
 /// stream, instead of decoding garbage.
 pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
@@ -371,10 +422,42 @@ pub(crate) async fn drain_binlog(
                         let sc = fetch_schema(pool, &map.db, &map.table).await?;
                         sess.st.schemas.insert(q.clone(), sc);
                     }
-                    // Signedness comes from information_schema (MINIMAL
-                    // metadata omits it) — stamp it onto the column defs.
+                    // Signedness and ENUM/SET members come from
+                    // information_schema (binlog metadata omits both) — stamp
+                    // them onto the column defs by POSITION.
                     let mut map = map;
                     if let Some(sc) = sess.st.schemas.get(&q) {
+                        // Position is the ONLY link between the two lists, so
+                        // a length mismatch means they describe different
+                        // shapes of the same table: the catalog is read now,
+                        // the event describes the table as it was when the
+                        // change happened, and a DDL landed between them. A
+                        // column dropped from the middle shifts every position
+                        // after it, so stamping one column's signedness or
+                        // members onto another is silent, wrong, and limited
+                        // to the columns past the change — the hardest kind of
+                        // corruption to notice.
+                        //
+                        // Re-running does NOT help: the same events replay
+                        // against the same catalog. The only correct recovery
+                        // is to bootstrap this table again from the schema it
+                        // has now, which is why the message says so.
+                        if sc.names.len() != map.cols.len() {
+                            return Err(Error::InvalidInput(format!(
+                                "log_based: {q} has {} columns in the source catalog \
+                                 but the binlog events in this window describe {} — \
+                                 the table's definition changed while these changes \
+                                 were being written, and column positions are the only \
+                                 way the two are matched. apitap will not guess which \
+                                 column is which. Recovery: clear this table's apitap \
+                                 state on the destination and re-run, which bootstraps \
+                                 it from the schema it has now. Re-running as-is \
+                                 replays the same events against the same catalog and \
+                                 stops here again.",
+                                sc.names.len(),
+                                map.cols.len()
+                            )));
+                        }
                         for (i, c) in map.cols.iter_mut().enumerate() {
                             c.unsigned = sc.unsigned.get(i).copied().unwrap_or(false);
                             c.labels = sc.labels.get(i).cloned().flatten();
@@ -519,6 +602,10 @@ pub(crate) async fn drain_binlog(
         wal_cols,
         wal_oids,
         hit_budget,
+        // MySQL has no equivalent hazard: a binlog is retained by the
+        // server's own clock, not by a consumer's confirmation, so there is
+        // nothing here for a drain to release.
+        caught_up_lsn: 0,
     })
 }
 

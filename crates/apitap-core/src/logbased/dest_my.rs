@@ -141,6 +141,23 @@ impl MyDest {
         }
     }
 
+    /// Write a bare state row — the source-identity marker rides in an
+    /// ordinary row under a reserved `source_id`, so the state table needs no
+    /// new column and older deployments need no migration.
+    pub(crate) async fn write_marker(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        value: u64,
+    ) -> Result<()> {
+        let mut conn = self.shared.conn().await?;
+        self.ensure_state_table(&mut conn).await?;
+        let sql = state_upsert_sql(&self.fq("_apitap_state"), dest_table, source_id, value, 0);
+        conn.query_drop(sql)
+            .await
+            .map_err(|e| Error::Transfer(format!("log_based: mysql marker: {e}")))
+    }
+
     async fn ensure_state_table(&self, conn: &mut mysql_async::Conn) -> Result<()> {
         conn.query_drop(format!(
             "CREATE TABLE IF NOT EXISTS {} (\
@@ -196,10 +213,27 @@ impl MyDest {
             move |e: mysql_async::Error| Error::Transfer(format!("log_based: mysql {what}: {e}"))
         };
 
-        // Same relaxed session the bulk loader runs (UTC frame, no per-row
-        // constraint churn on the staging twins).
+        // The bulk loader writes into a staging table it created itself, so
+        // it can afford a relaxed session. This one writes into the USER's
+        // table, and the two settings that were copied across from it are the
+        // wrong ones here:
+        //
+        // * `sql_mode=''` makes an over-long or out-of-range value TRUNCATE
+        //   with a warning nobody reads. A CDC apply that silently shortens a
+        //   value is exactly the failure this lane exists to avoid, so it runs
+        //   STRICT_ALL_TABLES and lets the error surface. (STRICT alone does
+        //   not add NO_ZERO_DATE, so a MySQL source's '0000-00-00' still
+        //   applies as it always did.)
+        // * `unique_checks=0` tells InnoDB it may skip uniqueness enforcement
+        //   on secondary indexes — on a destination that HAS unique keys, a
+        //   duplicate then lands instead of raising. The bulk staging table
+        //   has no keys to check, so it lost nothing; here it did.
+        //
+        // `foreign_key_checks=0` stays: a window applies each table
+        // independently, and enforcing FKs would refuse an order that is
+        // perfectly valid once the whole window has landed.
         conn.query_drop(
-            "SET time_zone='+00:00', unique_checks=0, foreign_key_checks=0, sql_mode=''",
+            "SET time_zone='+00:00', foreign_key_checks=0, sql_mode='STRICT_ALL_TABLES'",
         )
         .await
         .map_err(my_err("session"))?;

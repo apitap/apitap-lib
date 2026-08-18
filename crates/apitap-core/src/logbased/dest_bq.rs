@@ -126,6 +126,9 @@ impl BqDest {
     /// Checked at run start, because an empty drain never reaches the apply.
     pub(crate) async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
         let table = bare(dest_table);
+        // Runs once per member table before anything is written, so the
+        // destination name is vetted before any statement quotes it.
+        crate::sink::bigquery::bq_ident("table", table)?;
         let is_cl = match self.conn.table_get(table).await? {
             Some(meta) => column_types(&meta)?.contains_key(OP_COL),
             // No table at all: nothing to disagree with.
@@ -843,6 +846,17 @@ impl BqDest {
         ))
     }
 
+    /// The source-identity marker: an ordinary state row under a reserved
+    /// `source_id`, so nothing about the state table has to change.
+    pub(crate) async fn write_marker(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+        value: u64,
+    ) -> Result<()> {
+        self.write_state(bare(dest_table), source_id, value, 0).await
+    }
+
     async fn write_state(&self, table: &str, source_id: &str, lsn: u64, rows: u64) -> Result<()> {
         self.conn
             .cdc_script(&format!("{};", self.state_insert_sql(table, source_id, lsn, rows)))
@@ -879,6 +893,13 @@ impl ApplyPlan {
         pk_cols: &[String],
         types: &std::collections::HashMap<String, String>,
     ) -> Result<Self> {
+        // Every statement this struct produces pastes these names between
+        // backticks, so they are vetted once here rather than at each of the
+        // dozen sites that format them.
+        crate::sink::bigquery::bq_ident("table", table)?;
+        for name in wal_cols.iter().chain(pk_cols.iter()) {
+            crate::sink::bigquery::bq_ident("column", name)?;
+        }
         let mut cast = Vec::with_capacity(wal_cols.len());
         for (i, name) in wal_cols.iter().enumerate() {
             let ty = types.get(name).ok_or_else(|| {
