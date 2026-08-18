@@ -245,15 +245,24 @@ pub(crate) async fn drain(
                         // the run stops and says which one it is.
                         return Err(Error::Transfer(format!(
                             "log_based: transaction {xid} rolled back to a savepoint \
-                             (subtransaction {sub_xid} aborted) while being streamed. \
+                             (subtransaction {sub_xid} aborted) while Postgres was \
+                             STREAMING it — sending its rows before it committed. \
                              apitap buffers a streamed transaction's rows without \
                              tagging them by subtransaction, so it cannot drop only \
-                             the rolled-back ones — and applying or discarding all of \
-                             them would both be wrong. Re-run: the window replays \
-                             from the last watermark, and the transaction will have \
-                             committed or aborted by then. To avoid it entirely, set \
-                             logical_decoding_work_mem high enough that transactions \
-                             are not streamed before they commit."
+                             the rolled-back ones, and applying or discarding all of \
+                             them would both be wrong.\n\
+                             \n\
+                             Recovery: raise logical_decoding_work_mem on the SOURCE \
+                             above the size of that transaction (apitap already asks \
+                             for 1GB — see APITAP_DECODE_WORKMEM — so the server's own \
+                             setting or a larger transaction is what brought it \
+                             below), then re-run. Postgres streams a transaction only \
+                             when decoding it would exceed that budget, so with room \
+                             to buffer it the whole transaction arrives at COMMIT with \
+                             the rollback already resolved and applies normally.\n\
+                             \n\
+                             Re-running WITHOUT changing that will replay the same \
+                             WAL, stream the same transaction, and stop here again."
                         )));
                     }
                 }
