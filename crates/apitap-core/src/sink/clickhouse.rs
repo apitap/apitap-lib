@@ -157,14 +157,15 @@ impl ChConn {
                 .body(query.to_string())
                 .send()
                 .await;
-            let retryable = match &sent {
-                // Never reached a server: nothing ran, so repeating is free.
-                Err(e) => e.is_connect() || e.is_timeout(),
-                Ok(r) => {
-                    r.status().is_server_error() && r.status().as_u16() != 500
-                }
-            };
-            if retryable && attempt < BACKOFF_MS.len() {
+            // A connect error is the only transport failure that PROVES the
+            // statement did not run. A timeout does not: `exec` carries
+            // mutations — EXCHANGE TABLES, ATTACH PARTITION, DELETE, the
+            // state INSERT — and ClickHouse is asked for
+            // `wait_end_of_query=1`, so a slow statement and a lost one look
+            // identical from here. Repeating an EXCHANGE that actually
+            // succeeded swaps the tables BACK; repeating an ATTACH duplicates
+            // every row. Neither would raise anything.
+            if matches!(&sent, Err(e) if e.is_connect()) && attempt < BACKOFF_MS.len() {
                 tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]))
                     .await;
                 attempt += 1;
@@ -173,6 +174,20 @@ impl ChConn {
             let resp = sent.map_err(|e| Error::Connect(format!("clickhouse: {e}")))?;
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            // A 5xx is retryable only when it demonstrably did NOT come from
+            // ClickHouse's executor. ClickHouse answers some of its own
+            // exceptions with 5xx (SOCKET_TIMEOUT and CANNOT_OPEN_FILE map to
+            // 503, NOT_IMPLEMENTED to 501), and those DID reach it — so the
+            // status alone is not evidence. The body is: a ClickHouse error
+            // always carries `DB::Exception`, a proxy's error page never does.
+            let from_proxy_5xx = matches!(status.as_u16(), 502 | 503 | 504)
+                && !body.contains("DB::Exception");
+            if from_proxy_5xx && attempt < BACKOFF_MS.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]))
+                    .await;
+                attempt += 1;
+                continue;
+            }
             if !status.is_success() {
                 // A 5xx with no ClickHouse exception in it did not come from
                 // ClickHouse; say so, because "clickhouse 503" sends people

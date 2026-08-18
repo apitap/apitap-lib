@@ -114,6 +114,13 @@ impl BqDest {
         lsn: u64,
         rows: u64,
     ) -> Result<()> {
+        // The PK columns go straight into DDL from here — the clustering
+        // list, the current-view, the changelog rebuild — all of which run
+        // BEFORE the first window, and so before `ApplyPlan::build` (which
+        // vets them for the apply) has ever seen them.
+        for k in pk_cols {
+            crate::sink::bigquery::bq_ident("primary key column", k)?;
+        }
         let table = bare(dest_table);
         self.conn.cdc_delete_table(&cdc_staging(table)).await?;
         self.conn.cdc_delete_table(&format!("{table}__apitap_cl")).await?;
@@ -203,6 +210,14 @@ impl BqDest {
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
+        // The PK columns go straight into DDL from here — the clustering
+        // list, the current-view, the changelog rebuild — all of which run
+        // BEFORE the first window, and so before `ApplyPlan::build` (which
+        // vets them for the apply) has ever seen them.
+        for k in pk_cols {
+            crate::sink::bigquery::bq_ident("primary key column", k)?;
+        }
+
         let table = bare(dest_table);
         self.conn.cdc_delete_table(&cdc_staging(table)).await?;
         self.conn.cdc_ensure_state_table().await?;

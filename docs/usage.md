@@ -821,8 +821,19 @@ apitap.transfer(
 - **Requirements, checked loudly**: `wal_level=logical`; the table needs a
   primary key (its replica identity); `REPLICA IDENTITY NOTHING` and
   key columns outside the replica identity fail with the exact `ALTER
-  TABLE` to run. The replication connection speaks plain TCP for now
-  (`sslmode` beyond disable/prefer is refused, not ignored).
+  TABLE` to run.
+- **TLS on the replication connection**, with libpq's own `sslmode` meanings:
+
+  | `sslmode` | what happens |
+  |---|---|
+  | `disable` | never encrypted |
+  | `prefer` (default) | TLS attempted; if the server refuses, the run continues in cleartext **and says so** in its progress output |
+  | `require` | TLS mandatory, certificate **not** verified — libpq means the same, and most managed Postgres presents a self-signed certificate |
+  | `verify-full` | TLS mandatory, chain checked against the bundled trust anchors, hostname checked against the certificate |
+
+  `verify-ca` is refused by name: it verifies the chain while skipping the
+  hostname, which this client cannot express, and silently mapping it to
+  either neighbour would be weaker or stricter than what was asked for.
 - **Scope today**: Postgres, MySQL and MariaDB sources → **Postgres,
   ClickHouse, MySQL, BigQuery and Iceberg** destinations. Iceberg needs a single-column primary key
   (equality-delete files are single-key), and the parquet lane's bytea

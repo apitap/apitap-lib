@@ -153,9 +153,19 @@ fn cgroup_limit_from_proc() -> Option<u64> {
             Some((point, root))
         }) {
             let rel = rel.strip_prefix(&mount_root).unwrap_or(&rel);
-            return smallest_limit_up(&mount_point, rel, "memory.max", |v| {
+            // Fall THROUGH on None rather than returning it. A hybrid host
+            // (RHEL/CentOS 8, Amazon Linux 2 — systemd's hybrid mode) mounts
+            // cgroup2 at /sys/fs/cgroup/unified with no controllers attached,
+            // so `memory.max` does not exist anywhere on that path and this
+            // walk finds nothing — while the real limit sits in the v1
+            // hierarchy the code below reads. Returning here skipped it, and
+            // the caller then planned for the whole machine inside a 256 MB
+            // cap: exactly the failure this function was written to prevent.
+            if let Some(n) = smallest_limit_up(&mount_point, rel, "memory.max", |v| {
                 (v != "max").then(|| v.parse::<u64>().ok()).flatten()
-            });
+            }) {
+                return Some(n);
+            }
         }
     }
 

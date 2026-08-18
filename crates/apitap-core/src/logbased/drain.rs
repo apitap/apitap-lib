@@ -222,10 +222,39 @@ pub(crate) async fn drain(
                         break;
                     }
                 }
-                PgoMessage::StreamAbort { xid } => {
-                    if let Some(ops) = sess.streams.remove(&xid) {
-                        let n: usize = ops.iter().map(|(_, o)| op_bytes(o)).sum();
-                        sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                PgoMessage::StreamAbort { xid, sub_xid } => {
+                    // A TOP-LEVEL abort really does discard the whole
+                    // transaction: nothing in it ever committed.
+                    if sub_xid == xid {
+                        if let Some(ops) = sess.streams.remove(&xid) {
+                            let n: usize = ops.iter().map(|(_, o)| op_bytes(o)).sum();
+                            sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                        }
+                    } else {
+                        // A SUBtransaction aborted — a `ROLLBACK TO SAVEPOINT`
+                        // inside a streamed transaction. Only that
+                        // subtransaction's ops should disappear, and this
+                        // buffer does not tag ops by subxid, so there is no
+                        // way to remove the right ones.
+                        //
+                        // Dropping the whole transaction (what this arm used to
+                        // do, because the decoder read only the first xid) lost
+                        // every change in it and still advanced the watermark.
+                        // Keeping everything would apply changes the source
+                        // rolled back. Both are wrong and both are silent, so
+                        // the run stops and says which one it is.
+                        return Err(Error::Transfer(format!(
+                            "log_based: transaction {xid} rolled back to a savepoint \
+                             (subtransaction {sub_xid} aborted) while being streamed. \
+                             apitap buffers a streamed transaction's rows without \
+                             tagging them by subtransaction, so it cannot drop only \
+                             the rolled-back ones — and applying or discarding all of \
+                             them would both be wrong. Re-run: the window replays \
+                             from the last watermark, and the transaction will have \
+                             committed or aborted by then. To avoid it entirely, set \
+                             logical_decoding_work_mem high enough that transactions \
+                             are not streamed before they commit."
+                        )));
                     }
                 }
                 PgoMessage::Relation(r) => {

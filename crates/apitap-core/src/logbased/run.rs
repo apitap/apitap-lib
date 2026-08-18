@@ -655,6 +655,14 @@ async fn run_group(
             scheme(src_url)
         )));
     }
+    // Vet the URL's ssl mode BEFORE anything opens a socket. The control pool
+    // below is sqlx's, and sqlx supports a mode this client does not
+    // (`verify-ca`) — without this, a URL asking for it would open a pool
+    // fine and then fail deep in the replication connection, or worse, fail
+    // with sqlx's certificate error and leave the user reading about
+    // certificates when the real answer is "that mode is not implemented
+    // here". One parse, up front, so the message is the right one.
+    crate::wire::walsender::check_ssl_mode(src_url)?;
     let dest = Dest::connect(dst_url).await?;
 
     let src = PgPoolOptions::new()

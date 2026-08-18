@@ -80,7 +80,7 @@ pub(crate) enum PgoMessage {
     /// The streamed transaction committed — its buffered ops are real now.
     StreamCommit { xid: u32, end_lsn: u64 },
     /// The streamed transaction rolled back — drop everything buffered.
-    StreamAbort { xid: u32 },
+    StreamAbort { xid: u32, sub_xid: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -400,8 +400,20 @@ pub(crate) fn decode(
             PgoMessage::StreamCommit { xid, end_lsn }
         }
         b'A' => {
+            // Stream Abort carries TWO xids: the top-level transaction and the
+            // SUBtransaction that aborted. Reading only the first and dropping
+            // that buffer discards the whole transaction whenever a
+            // `ROLLBACK TO SAVEPOINT` happens inside a streamed one — the
+            // later Stream Commit then finds nothing, applies nothing, and
+            // still advances the watermark. Silent, permanent loss.
+            //
+            // A subtransaction abort is not something this decoder can undo
+            // selectively (the ops it buffered are not tagged by subxid), so
+            // it is reported for what it is and the caller refuses. Rare and
+            // loud beats common and silent.
             let xid = r.u32()?;
-            PgoMessage::StreamAbort { xid }
+            let sub_xid = r.u32().unwrap_or(xid);
+            PgoMessage::StreamAbort { xid, sub_xid }
         }
         b'B' => PgoMessage::Begin {
             final_lsn: r.u64()?,

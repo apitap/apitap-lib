@@ -516,9 +516,16 @@ fn link_next(link: &str) -> Option<String> {
         // responses — would hand that token to whoever answers there. The
         // header is followed only while it stays on the API host it was
         // addressed to.
-        let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
-        let api_host = reqwest::Url::parse(API).ok()?.host_str()?.to_string();
-        if host != api_host {
+        let next = reqwest::Url::parse(url).ok()?;
+        let api = reqwest::Url::parse(API).ok()?;
+        if next.host_str()? != api.host_str()? {
+            return None;
+        }
+        // …and the SCHEME, which the host check alone does not cover. A
+        // rewriting proxy answering with `http://api.github.com/...` passes on
+        // hostname and would put `Authorization: Bearer <token>` on the wire
+        // in cleartext before GitHub's redirect to https could save it.
+        if next.scheme() != api.scheme() {
             return None;
         }
         Some(url.to_string())
@@ -1031,6 +1038,11 @@ mod tests {
             None
         );
         assert_eq!(link_next("<not a url>; rel=\"next\""), None);
+        // Right host, wrong scheme: the token would ride in cleartext.
+        assert_eq!(
+            link_next("<http://api.github.com/repositories/1/issues>; rel=\"next\""),
+            None
+        );
     }
 
     #[test]

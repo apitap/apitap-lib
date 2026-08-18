@@ -1252,6 +1252,10 @@ impl BqSink {
     /// authenticates ONCE (`BqConn::parse` signs a JWT and fetches an OAuth token;
     /// per-table auth would burst the token endpoint) and binds per table.
     pub(crate) fn bind(conn: BqConn, dest_table: &str, parallel: usize) -> Result<Self> {
+        // The bulk sink builds its DDL and its cursor probe as text too — the
+        // CDC lane's vetting never covered it, so a table name with a backtick
+        // in it reached BigQuery raw from here.
+        bq_ident("table", dest_table)?;
         let lane_order = if parallel >= 4 {
             [WireFormat::PgCopyBinary, WireFormat::TabSeparated]
         } else {
@@ -1410,9 +1414,11 @@ impl BqSink {
     /// source's rendering, and mixed formats would misorder lexicographic
     /// watermark comparisons (a re-read means DUPLICATES here; BigQuery
     /// tables don't dedup).
-    fn cursor_max_expr(engine: &str, udt: &str, cursor: &str) -> String {
+    fn cursor_max_expr(engine: &str, udt: &str, cursor: &str) -> Result<String> {
+        // `cursor=` is a user option that lands between backticks in a query.
+        bq_ident("cursor column", cursor)?;
         let q = format!("`{cursor}`");
-        match (engine, udt) {
+        Ok(match (engine, udt) {
             // tz-carrying types → BQ TIMESTAMP. NOTE the vocabularies invert:
             // PG "timestamp" is tz-LESS, MySQL "timestamp" is UTC-normalized.
             ("mysql", "timestamp") | (_, "timestamptz") => {
@@ -1423,7 +1429,7 @@ impl BqSink {
                 format!("FORMAT_DATETIME('%Y-%m-%d %H:%M:%E*S', MAX({q}))")
             }
             _ => format!("CAST(MAX({q}) AS STRING)"),
-        }
+        })
     }
 
     async fn copy_stagings_into_final(&self, sources: &[String], disposition: &str) -> Result<()> {
@@ -1626,7 +1632,7 @@ impl crate::sink::Sink for BqSink {
                 .map(|c| c.udt.as_str())
                 .unwrap_or(""),
             cursor,
-        );
+        )?;
         let data_wm = self.max_cursor(&self.final_table, &max_expr).await?;
         if data_wm.is_none() {
             return Ok(DestState {
@@ -1980,13 +1986,13 @@ mod tests {
 
     #[test]
     fn cursor_max_renders_in_source_style() {
-        assert!(BqSink::cursor_max_expr("postgres", "timestamptz", "ts").contains("FORMAT_TIMESTAMP"));
+        assert!(BqSink::cursor_max_expr("postgres", "timestamptz", "ts").unwrap().contains("FORMAT_TIMESTAMP"));
         // MySQL inverts the spellings: "timestamp"=UTC → TIMESTAMP,
         // "datetime"=tz-less → DATETIME.
-        assert!(BqSink::cursor_max_expr("mysql", "timestamp", "ts").contains("FORMAT_TIMESTAMP"));
-        assert!(BqSink::cursor_max_expr("mysql", "datetime", "ts").contains("FORMAT_DATETIME"));
-        assert!(BqSink::cursor_max_expr("postgres", "timestamp", "ts").contains("FORMAT_DATETIME"));
-        assert!(BqSink::cursor_max_expr("postgres", "int8", "id").starts_with("CAST(MAX"));
+        assert!(BqSink::cursor_max_expr("mysql", "timestamp", "ts").unwrap().contains("FORMAT_TIMESTAMP"));
+        assert!(BqSink::cursor_max_expr("mysql", "datetime", "ts").unwrap().contains("FORMAT_DATETIME"));
+        assert!(BqSink::cursor_max_expr("postgres", "timestamp", "ts").unwrap().contains("FORMAT_DATETIME"));
+        assert!(BqSink::cursor_max_expr("postgres", "int8", "id").unwrap().starts_with("CAST(MAX"));
     }
 
     #[test]

@@ -45,6 +45,10 @@ sha1 = "0.10"
 # TLS for the raw MySQL read plane — mysql ssl-mode=required semantics
 # (encrypt, no cert verification; verify_* rides the sqlx lane).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# The trust anchors `sslmode=verify-full` and MySQL's verify_identity check
+# against. Bundled rather than read from the host so a slim container without
+# ca-certificates still verifies instead of silently falling back.
+webpki-roots = "1"
 hmac = "0.12"
 hex = "0.4"
 # LOAD DATA LOCAL INFILE streaming for the MySQL sink — sqlx can't do it.

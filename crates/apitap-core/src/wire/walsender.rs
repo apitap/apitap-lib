@@ -9,9 +9,15 @@
 //! Regular SQL (state reads, prechecks) stays on sqlx over normal
 //! connections; this type is used ONLY for the walsender session.
 //!
-//! v1 scope: TCP without TLS (`sslmode=disable` semantics). A TLS-required
-//! server fails loudly at startup with a clear message — terminating TLS is
-//! on the roadmap, not silently skipped.
+//! TLS is terminated here, before the startup message, through the Postgres
+//! SSLRequest handshake. `sslmode` means what it means in libpq: `disable`
+//! never encrypts, `prefer` tries and says so out loud if the server refuses,
+//! `require` encrypts WITHOUT verifying the certificate (libpq's own meaning
+//! — most managed instances present a self-signed one), and `verify-full`
+//! checks the chain against the bundled trust anchors and the hostname
+//! against the certificate. The transport is an enum rather than a boxed
+//! trait object so the cleartext read path keeps the concrete call this whole
+//! module exists to preserve.
 
 use crate::error::{Error, Result};
 use crate::wire::pgoutput::lsn_to_string;
@@ -21,6 +27,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+// rustls comes through tokio-rustls so the two can never disagree on version.
+use tokio_rustls::rustls;
 use tokio::sync::mpsc;
 
 /// Microseconds between the Unix and Postgres (2000-01-01) epochs.
@@ -33,8 +41,8 @@ const PG_EPOCH_OFFSET_US: i64 = 946_684_800_000_000;
 /// on their own core while decode+collapse consume from a channel.
 pub(crate) struct Walsender {
     /// Read half — `None` while the pump task owns it (CopyBoth mode).
-    rd: Option<BufReader<OwnedReadHalf>>,
-    wr: BufWriter<OwnedWriteHalf>,
+    rd: Option<BufReader<PgRead>>,
+    wr: BufWriter<PgWrite>,
     /// Set once START_REPLICATION enters CopyBoth mode.
     copying: bool,
     /// COPY OUT reached ReadyForQuery (`copy_out_next` state).
@@ -59,7 +67,7 @@ pub(crate) struct Walsender {
 
 struct PumpHandle {
     frames: mpsc::Receiver<(u8, bytes::Bytes)>,
-    task: tokio::task::JoinHandle<(BufReader<OwnedReadHalf>, Result<()>)>,
+    task: tokio::task::JoinHandle<(BufReader<PgRead>, Result<()>)>,
 }
 
 /// The pump: forward every frame until the consumer hangs up, an error
@@ -67,9 +75,9 @@ struct PumpHandle {
 /// over the read — a frame read is never cancelled mid-way (protocol
 /// desync is the documented trap).
 async fn pump_frames(
-    mut rd: BufReader<OwnedReadHalf>,
+    mut rd: BufReader<PgRead>,
     tx: mpsc::Sender<(u8, bytes::Bytes)>,
-) -> (BufReader<OwnedReadHalf>, Result<()>) {
+) -> (BufReader<PgRead>, Result<()>) {
     loop {
         match read_frame(&mut rd).await {
             Ok((tag, body)) => {
@@ -86,7 +94,12 @@ async fn pump_frames(
     }
 }
 
-async fn read_frame(rd: &mut BufReader<OwnedReadHalf>) -> Result<(u8, bytes::Bytes)> {
+/// Postgres caps a protocol message at 1 GB (PQ_LARGE_MESSAGE_LIMIT), so any
+/// length past it is not a message this side should try to hold. Every place
+/// that allocates from a wire-supplied length checks against this.
+const MAX_FRAME: usize = 1 << 30;
+
+async fn read_frame(rd: &mut BufReader<PgRead>) -> Result<(u8, bytes::Bytes)> {
     let mut head = [0u8; 5];
     rd.read_exact(&mut head).await.map_err(io_err)?;
     let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
@@ -99,7 +112,6 @@ async fn read_frame(rd: &mut BufReader<OwnedReadHalf>) -> Result<(u8, bytes::Byt
     // before anything downstream has a chance to reject the message. Postgres
     // itself caps a protocol message at 1 GB (PQ_LARGE_MESSAGE_LIMIT), so
     // anything past that is not a message this side should try to hold.
-    const MAX_FRAME: usize = 1 << 30;
     if len > MAX_FRAME {
         return Err(Error::Transfer(format!(
             "walsender: message announces {len} bytes, past the 1 GB protocol \
@@ -127,12 +139,208 @@ pub(crate) enum WalEvent {
 /// A parsed simple-query result: rows of text-format columns.
 pub(crate) type Rows = Vec<Vec<Option<String>>>;
 
+// ── the transport ───────────────────────────────────────────────────────────
+//
+// An ENUM, not a boxed trait object. This whole module exists because the
+// generic path was too slow — `copy_out_raw` through four future layers
+// profiled at ~30% of a 0.5-core budget — so the plaintext read path stays a
+// direct call on a concrete `OwnedReadHalf` with one predictable branch in
+// front of it. A `Box<dyn AsyncRead>` would put a vtable dispatch on every
+// one of ten million reads to buy nothing on the connections that do not use
+// TLS, which is most of them.
+
+/// Read half of either transport.
+enum PgRead {
+    Tcp(OwnedReadHalf),
+    Tls(tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// Write half of either transport.
+enum PgWrite {
+    Tcp(OwnedWriteHalf),
+    Tls(tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl tokio::io::AsyncRead for PgRead {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            PgRead::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            PgRead::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for PgWrite {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            PgWrite::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            PgWrite::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            PgWrite::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            PgWrite::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            PgWrite::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            PgWrite::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Ask the server to switch the connection to TLS, and do it.
+///
+/// The Postgres SSLRequest is not part of the message protocol: it is eight
+/// raw bytes sent before anything else — a length of 8 and the magic 80877103
+/// — answered by ONE byte, `S` (proceed) or `N` (refused). There is no error
+/// response and no way to negotiate; a server that answers `N` will never
+/// speak TLS on this connection.
+/// Returns the upgraded stream, or the ORIGINAL stream back when the server
+/// answered `N`. Handing the socket back matters: after a refusal the
+/// connection is still perfectly usable for a cleartext startup, which is what
+/// `sslmode=prefer` means and what libpq does — opening a second connection
+/// would be a wasted round trip and a second entry in the server's log.
+async fn tls_upgrade(
+    mut stream: TcpStream,
+    host: &str,
+    verify: bool,
+) -> Result<std::result::Result<tokio_rustls::client::TlsStream<TcpStream>, TcpStream>> {
+    let mut req = [0u8; 8];
+    req[..4].copy_from_slice(&8u32.to_be_bytes());
+    req[4..].copy_from_slice(&80_877_103u32.to_be_bytes());
+    stream.write_all(&req).await.map_err(io_err)?;
+    stream.flush().await.map_err(io_err)?;
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).await.map_err(io_err)?;
+    if answer[0] != b'S' {
+        return Ok(Err(stream));
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Transfer(format!("postgres tls: {e}")))?;
+    let cfg = if verify {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify(provider)))
+            .with_no_client_auth()
+    };
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| Error::Transfer(format!("postgres tls servername: {e}")))?;
+    let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg))
+        .connect(name, stream)
+        .await
+        .map_err(|e| {
+            Error::Transfer(format!(
+                "postgres tls handshake: {e}{}",
+                if verify {
+                    " — sslmode=verify-full checks the chain against the system \
+                     roots and the hostname against the certificate. A private CA \
+                     or a self-signed server certificate will fail here; use \
+                     sslmode=require if you want encryption without verification."
+                } else {
+                    ""
+                }
+            ))
+        })?;
+    Ok(Ok(tls))
+}
+
+/// Accept-anything verifier for `sslmode=require`, which is libpq's own
+/// meaning: encrypt, do not verify. Never used for `verify-full`.
+#[derive(Debug)]
+struct NoVerify(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// What the URL asks of the transport, in libpq's own vocabulary.
+///
+/// The names are libpq's and so are the meanings — a user who writes
+/// `sslmode=require` in a psql connection string and in an apitap URL should
+/// get the same thing from both. In particular `require` ENCRYPTS BUT DOES
+/// NOT VERIFY: that is what libpq has always meant by it, and quietly making
+/// it stricter would break connections to the self-signed certificates most
+/// managed Postgres instances present, while quietly making it weaker would
+/// be a lie. `verify-full` is the one that checks the chain and the hostname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SslMode {
+    /// No TLS at all.
+    Disable,
+    /// Try TLS; if the server says no, continue in cleartext. libpq's default.
+    Prefer,
+    /// TLS required. Certificate NOT verified (libpq semantics).
+    Require,
+    /// TLS required, chain verified against the system roots, hostname checked.
+    VerifyFull,
+}
+
 struct ConnInfo {
     host: String,
     port: u16,
     user: String,
     password: String,
     db: String,
+    ssl: SslMode,
+}
+
+/// Reject an ssl mode this client cannot honour, before any socket is opened.
+///
+/// Called by the CDC driver: the control pool it opens first is sqlx's, and
+/// sqlx accepts modes the replication client does not, so without this the
+/// failure surfaces later and describes the wrong problem.
+pub(crate) fn check_ssl_mode(url: &str) -> Result<()> {
+    parse_url(url).map(|_| ())
 }
 
 fn parse_url(url: &str) -> Result<ConnInfo> {
@@ -142,13 +350,39 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
         .host_str()
         .ok_or_else(|| Error::InvalidInput("postgres url needs a host".into()))?
         .to_string();
+    let mut ssl = SslMode::Prefer;
     for (k, v) in u.query_pairs() {
-        if k == "sslmode" && v != "disable" && v != "prefer" {
-            return Err(Error::InvalidInput(format!(
-                "log_based: sslmode={v} on the replication connection isn't \
-                 supported yet — the walsender client speaks plain TCP for now \
-                 (sslmode=disable). TLS termination lands next."
-            )));
+        if k == "sslmode" {
+            ssl = match v.as_ref() {
+                "disable" => SslMode::Disable,
+                // libpq treats `allow` as "plaintext first, TLS only if that
+                // fails". Nobody deploys it deliberately and the distinction
+                // buys nothing here, so it maps to the same attempt order as
+                // `prefer` rather than to an unsupported-value error.
+                "prefer" | "allow" => SslMode::Prefer,
+                "require" => SslMode::Require,
+                "verify-full" => SslMode::VerifyFull,
+                // verify-ca means "check the chain but not the hostname".
+                // rustls's standard verifier does both together, and a
+                // chain-only verifier is a custom implementation with its own
+                // failure modes — so it is refused by name rather than
+                // silently upgraded to verify-full or downgraded to require.
+                "verify-ca" => {
+                    return Err(Error::InvalidInput(
+                        "sslmode=verify-ca is not implemented — it verifies the \
+                         certificate chain while skipping the hostname check, \
+                         which this client cannot express. Use verify-full (chain \
+                         AND hostname) or require (encrypt without verifying)."
+                            .into(),
+                    ))
+                }
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "sslmode={other} is not a Postgres ssl mode — use disable, \
+                         prefer, require or verify-full"
+                    )))
+                }
+            };
         }
     }
     Ok(ConnInfo {
@@ -157,6 +391,7 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
         user: percent_decode(u.username())?,
         password: percent_decode(u.password().unwrap_or(""))?,
         db: u.path().trim_matches('/').to_string(),
+        ssl,
     })
 }
 
@@ -220,10 +455,61 @@ impl Walsender {
             .await
             .map_err(|e| Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port)))?;
         stream.set_nodelay(true).ok();
-        // 8 KiB (the tokio default) means a syscall every few WAL messages;
-        // a drain moves millions. Same reasoning as the vendored sqlx socket
-        // buffer bump (vendor/sqlx-core/src/net/socket/buffered.rs).
-        let (r, w) = stream.into_split();
+        // TLS is negotiated BEFORE the startup message, so it happens here or
+        // not at all.
+        let (r, w) = match ci.ssl {
+            SslMode::Disable => {
+                // 8 KiB (the tokio default) means a syscall every few WAL
+                // messages; a drain moves millions. Same reasoning as the
+                // vendored sqlx socket buffer bump.
+                let (r, w) = stream.into_split();
+                (PgRead::Tcp(r), PgWrite::Tcp(w))
+            }
+            SslMode::Prefer => match tls_upgrade(stream, &ci.host, false).await? {
+                Ok(tls) => {
+                    let (r, w) = tokio::io::split(tls);
+                    (PgRead::Tls(r), PgWrite::Tls(w))
+                }
+                // The server said no. `prefer` means exactly that this is
+                // allowed — but it is also the case a reviewer of a URL would
+                // never guess from reading it, so the run says so. Once per
+                // process, not once per connection: a `slots=8` run opens
+                // nine of these and the ninth copy tells nobody anything.
+                Err(plain) => {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    let (h, p) = (ci.host.clone(), ci.port);
+                    SAID.call_once(|| {
+                        crate::progress::note(&format!(
+                            "postgres {h}:{p} refused TLS and sslmode=prefer permits \
+                             cleartext — this replication connection is NOT \
+                             encrypted. sslmode=require makes that a failure instead."
+                        ));
+                    });
+                    let (r, w) = plain.into_split();
+                    (PgRead::Tcp(r), PgWrite::Tcp(w))
+                }
+            },
+            SslMode::Require | SslMode::VerifyFull => {
+                let verify = ci.ssl == SslMode::VerifyFull;
+                match tls_upgrade(stream, &ci.host, verify).await? {
+                    Ok(tls) => {
+                        let (r, w) = tokio::io::split(tls);
+                        (PgRead::Tls(r), PgWrite::Tls(w))
+                    }
+                    Err(_) => {
+                        return Err(Error::Transfer(format!(
+                            "postgres {}:{} answered the SSLRequest with 'N': it is \
+                             not built with TLS support, or ssl is off in \
+                             postgresql.conf. sslmode={} does not permit a cleartext \
+                             fallback.",
+                            ci.host,
+                            ci.port,
+                            if verify { "verify-full" } else { "require" }
+                        )));
+                    }
+                }
+            }
+        };
         let mut ws = Self {
             rd: Some(BufReader::with_capacity(1 << 20, r)),
             wr: BufWriter::with_capacity(64 << 10, w),
@@ -285,19 +571,33 @@ impl Walsender {
             let (tag, msg) = self.read_message().await?;
             match tag {
                 b'R' => {
-                    let code = u32::from_be_bytes(msg[0..4].try_into().unwrap());
+                    // `read_frame` guarantees the length field is at least 4,
+                    // which is a length of ZERO body bytes — so these slices
+                    // are the peer's word, not a fact. A hijacked port, a
+                    // proxy answering with its own protocol, or one corrupt
+                    // frame aborted the whole host process here, and this is a
+                    // library: the process it aborts is the caller's.
+                    let short =
+                        || Error::Transfer("walsender: truncated authentication request".into());
+                    let code = u32::from_be_bytes(
+                        msg.get(0..4).ok_or_else(short)?.try_into().unwrap(),
+                    );
                     match code {
                         0 => {} // AuthenticationOk
                         3 => self.send_password(&ci.password).await?, // cleartext
                         5 => {
-                            let salt: [u8; 4] = msg[4..8].try_into().unwrap();
+                            let salt: [u8; 4] =
+                                msg.get(4..8).ok_or_else(short)?.try_into().unwrap();
                             self.send_password(&md5_password(&ci.user, &ci.password, salt))
                                 .await?;
                         }
                         10 => {
                             // SASL: mechanisms as cstr list. We speak
                             // SCRAM-SHA-256 (no channel binding on plain TCP).
-                            let mechs = std::str::from_utf8(&msg[4..]).unwrap_or("");
+                            let mechs = msg
+                                .get(4..)
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                                .unwrap_or("");
                             if !mechs.contains("SCRAM-SHA-256") {
                                 return Err(Error::Transfer(format!(
                                     "walsender: server offers SASL {mechs:?}, only \
@@ -314,7 +614,9 @@ impl Walsender {
                             scram = Some(st);
                         }
                         11 => {
-                            let server_first = std::str::from_utf8(&msg[4..])
+                            let server_first = std::str::from_utf8(
+                                msg.get(4..).ok_or_else(bad_scram)?,
+                            )
                                 .map_err(|_| bad_scram())?;
                             let st = scram.as_mut().ok_or_else(bad_scram)?;
                             let fin = st.client_final(server_first, &ci.password)?;
@@ -322,7 +624,8 @@ impl Walsender {
                         }
                         12 => {
                             let server_final =
-                                std::str::from_utf8(&msg[4..]).map_err(|_| bad_scram())?;
+                                std::str::from_utf8(msg.get(4..).ok_or_else(bad_scram)?)
+                                    .map_err(|_| bad_scram())?;
                             let st = scram.as_ref().ok_or_else(bad_scram)?;
                             st.verify_server(server_final)?;
                         }
@@ -663,6 +966,17 @@ impl Walsender {
             if len < 4 {
                 return Err(Error::Transfer("copy_out: bad message length".into()));
             }
+            // Same ceiling as `read_frame`, and for the same reason: this loop
+            // refills until the window holds `len` bytes, so a peer answering
+            // with 0xFFFFFFFF grows `co_win` to four gigabytes before anything
+            // downstream gets a chance to reject the message.
+            if len > MAX_FRAME {
+                return Err(Error::Transfer(format!(
+                    "copy_out: message announces {len} bytes, past the 1 GB \
+                     protocol limit — the peer on this socket is not answering \
+                     the Postgres frontend protocol"
+                )));
+            }
             while self.co_window().len() < 5 + (len - 4) {
                 self.co_refill().await?;
             }
@@ -686,6 +1000,14 @@ impl Walsender {
                         let w = self.co_window();
                         let t = w[0];
                         let l = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+                        // Draining after an error is still the peer's protocol,
+                        // and a peer that just sent us an error is exactly the
+                        // one worth not trusting with an allocation. The length
+                        // also has to be at least 4 or the advance below would
+                        // walk backwards through the window.
+                        if !(4..=MAX_FRAME).contains(&l) {
+                            return Err(e);
+                        }
                         while self.co_window().len() < 1 + l {
                             self.co_refill().await?;
                         }
@@ -1124,11 +1446,26 @@ mod tests {
     }
 
     #[test]
-    fn url_parse_rejects_tls_and_decodes_credentials() {
+    fn url_parse_reads_sslmode_and_decodes_credentials() {
         let ci = parse_url("postgres://u%40x:p%3Aw@h:5433/db").unwrap();
         assert_eq!((ci.user.as_str(), ci.password.as_str()), ("u@x", "p:w"));
         assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
-        assert!(parse_url("postgres://u:p@h/db?sslmode=require").is_err());
+        // libpq's default, and so this client's.
+        assert_eq!(ci.ssl, SslMode::Prefer);
+        for (q, want) in [
+            ("disable", SslMode::Disable),
+            ("prefer", SslMode::Prefer),
+            ("allow", SslMode::Prefer),
+            ("require", SslMode::Require),
+            ("verify-full", SslMode::VerifyFull),
+        ] {
+            let ci = parse_url(&format!("postgres://u:p@h/db?sslmode={q}")).unwrap();
+            assert_eq!(ci.ssl, want, "sslmode={q}");
+        }
+        // Refused by name rather than silently mapped to a neighbouring mode:
+        // one of them would be weaker than asked for, the other stricter.
+        assert!(parse_url("postgres://u:p@h/db?sslmode=verify-ca").is_err());
+        assert!(parse_url("postgres://u:p@h/db?sslmode=yes-please").is_err());
     }
 
     /// LIVE smoke against a real Postgres (`wal_level=logical`):
