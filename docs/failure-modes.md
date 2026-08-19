@@ -59,14 +59,43 @@ The two properties everything else rests on:
 - **Destination-side crash mid-apply** (ClickHouse or BigQuery restarting under
   us). The apply is idempotent by design and the watermark is written last, so
   the expectation is a clean replay — again, expectation, not receipt.
-- **A single very wide value.** `chunk_bytes` bounds a chunk, not one row, and
-  Postgres ships one protocol message per row — so a table with 32 MB values
-  drives peak RSS by row width instead of by the budget. Measured: three 32 MB
-  rows peak at ~440 MB. It does not corrupt anything and it is not silent (the
-  container OOMs, loudly), but a memory model that holds at 170 MB for 100 GB
-  does not hold for a table with a PDF in it. `benchmarks/e2e_review_gate.py`
-  leg 3 measures it on every run and reports it as a KNOWN GAP rather than
-  passing — the number in that output is the current state of this line.
+- **Wide values.** `chunk_bytes` bounds a chunk, not one row, and Postgres
+  ships one protocol message per row, so nothing caps a single value. A memory
+  model that holds at 170 MB for 100 GB does not hold for a table with a PDF in
+  it. Measured on v0.53.0, pg -> ClickHouse, `mode="replace"`, each point in its
+  own process:
+
+  | widest value | rows | fat payload | peak RSS |
+  |---|---|---|---|
+  | 1 MB | 3 | 3 MB | 28 MB |
+  | 4 MB | 3 | 12 MB | 66 MB |
+  | 8 MB | 3 | 24 MB | 120 MB |
+  | 16 MB | 3 | 48 MB | 246 MB |
+  | 32 MB | 3 | 96 MB | 525 MB |
+  | 64 MB | 3 | 192 MB | 1037 MB |
+  | 8 MB | 16 | 128 MB | 480 MB |
+  | 8 MB | 64 | 512 MB | 1031 MB |
+
+  Two things this corrects. **It is not "the widest row"** — an earlier version
+  of this line said peak tracked row width, but 8 MB x 16 costs 480 MB where
+  8 MB x 3 costs 120 MB, so the fat bytes a chunk holds is what matters, and
+  both axes feed it. **`parallel=` does not help**: the same shapes at
+  `parallel=1` measured 583 / 461 / 944 MB against 480 / 525 / 1037, which is
+  noise. There is no tuning around this today.
+
+  The working rule: budget about **5x the fat bytes in a chunk**, up to roughly
+  a gigabyte where a chunk cap starts binding. In practice a 256 MB container
+  is comfortable to ~8 MB values and at the wall by 16 MB.
+
+  It corrupts nothing and it is not silent — the container OOMs, loudly.
+  `benchmarks/e2e_review_gate.py` leg 3 measures it on every run and reports it
+  as a KNOWN GAP rather than passing; the number in that output is the current
+  state of this line.
+
+  One caveat on that leg's number: it reads `RUSAGE_CHILDREN.ru_maxrss`, which
+  is a HIGH-WATER MARK over every child the script has reaped, so it is only
+  the wide-row child's peak as long as no earlier leg spawned a hungrier one.
+  The table above was measured one point per process for that reason.
 
 ## Being stopped on purpose
 

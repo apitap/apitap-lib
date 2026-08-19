@@ -205,9 +205,19 @@ ch(f"DROP TABLE IF EXISTS {IT}")
 # ───────────────────────────────────────────────────────────────────────────
 print("== leg 3: one wide row must not cost more than the budget ==")
 # Postgres sends one CopyData message per ROW, so a single fat value is a single
-# fat protocol message. If nothing caps a value, peak RSS tracks the widest row
-# rather than the chunk size — which is the difference between a memory model
-# that holds at 170 MB for 100 GB and one that dies on a table with a PDF in it.
+# fat protocol message, and nothing caps a value. Peak RSS then tracks the fat
+# BYTES a chunk holds — measured at roughly 5x them — which is the difference
+# between a memory model that holds at 170 MB for 100 GB and one that dies on a
+# table with a PDF in it.
+#
+# Not "the widest row", which is what this comment used to say: 8 MB x 16 rows
+# costs 480 MB where 8 MB x 3 costs 120 MB, so row count feeds it too. And
+# parallel=1 does not help — the same shapes measured within noise of the
+# auto-sized default. The full table is in docs/failure-modes.md.
+#
+# The number below is only this child's peak as long as no earlier leg in this
+# script spawned a hungrier one: ru_maxrss for RUSAGE_CHILDREN is a high-water
+# mark over every child reaped so far, not a per-child reading.
 
 pg(f"DROP TABLE IF EXISTS {WT}")
 pg(f"CREATE TABLE {WT} (id int primary key, blob bytea)")
