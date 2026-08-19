@@ -362,6 +362,10 @@ case("the final resume is exact too", ch_count() == src_total,
      f"{ch_count()} vs {src_total}")
 pg(f"DROP TABLE IF EXISTS {T}")
 ch(f"DROP TABLE IF EXISTS {T}")
+# The CDC apply also leaves a delete-marker sidecar next to the
+# destination. Dropping only the main table left one behind on the
+# shared bench rig after every run.
+ch(f"DROP TABLE IF EXISTS `{T}__apitap_cdc_del`")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1")
 pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
 

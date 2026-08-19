@@ -199,6 +199,10 @@ case("and its key sum matches exactly", src_sum == dst_sum, f"my={src_sum} ch={d
 print("== cleanup ==")
 my(f"DROP TABLE IF EXISTS {T}")
 ch(f"DROP TABLE IF EXISTS {T}")
+# The CDC apply also leaves a delete-marker sidecar next to the
+# destination. Dropping only the main table left one behind on the
+# shared bench rig after every run.
+ch(f"DROP TABLE IF EXISTS `{T}__apitap_cdc_del`")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1")
 
 for n in notes:
