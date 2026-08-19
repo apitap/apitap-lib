@@ -386,3 +386,139 @@ fn mysql_rows_survive_anything_a_server_can_send() {
         "rows torture reached too little: {ok} accepted, {err} rejected"
     );
 }
+
+// ── the readers that TOUCH the pages they allocate ─────────────────────────
+//
+// The decoders above take a buffer someone already read. These two do the
+// reading, and that is the difference that matters: `BytesMut::zeroed(len)`
+// in the Postgres frame reader and `Vec::resize(len, 0)` in the MySQL packet
+// reader both WRITE every byte they reserve. Unlike a bare
+// `Vec::with_capacity`, they cannot be satisfied by address space — a length
+// off the wire becomes resident memory immediately.
+//
+// That is why they get a socket instead of a buffer: a real loopback pair,
+// hostile bytes written from the far end, the reader run against them. No
+// production code changes shape to be testable, and the path under test is
+// the one that runs in production.
+
+/// A connected loopback pair. The returned server half is where the hostile
+/// bytes go; the client half is what the reader reads.
+async fn socket_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let client = tokio::net::TcpStream::connect(addr);
+    let server = listener.accept();
+    let (client, server) = tokio::join!(client, server);
+    let (server, _addr) = server.expect("accept");
+    (client.expect("connect"), server)
+}
+
+/// The Postgres frame reader, against lengths a peer chooses.
+///
+/// Two things are checked, and the second exists because the first turned out
+/// to prove less than it looked like it did.
+///
+/// **It returns.** No hang, no panic, whatever the header claims.
+///
+/// **It returns the RIGHT refusal.** The obvious version of this test —
+/// announce 4 GB and expect the process to die without a cap — does not work,
+/// and finding that out took disabling the cap and watching the test stay
+/// green. `BytesMut::zeroed` reaches `calloc`, which on Linux hands back
+/// pages mapped to the shared zero page: nothing is touched, nothing fails,
+/// and the `read_exact` that follows meets EOF and errors politely anyway.
+/// Same overcommit lesson as `Vec::with_capacity`, in a third disguise.
+///
+/// So the assertion is on the message. A frame past the protocol's own
+/// ceiling must be refused BY THE CAP and say so — a statement about the code
+/// that the allocator's good manners cannot satisfy on its behalf.
+///
+/// Disabling the cap now fails this test, and what it prints is the second
+/// reason the cap earns its place: without it the reader accepts the absurd
+/// length, waits for bytes that will never come, and reports "postgres closed
+/// the connection mid-stream — a server restart, a pg_terminate_backend, an
+/// idle/statement timeout, or a dropped network path". It blames the network
+/// for a frame that could never have been valid. A cap is not only a memory
+/// bound; it is what keeps the diagnosis honest.
+#[tokio::test]
+async fn walsender_frames_survive_hostile_lengths() {
+    use tokio::io::AsyncWriteExt;
+
+    // (bytes, must the refusal come from the SIZE CAP?)
+    let hostile: Vec<(Vec<u8>, bool)> = vec![
+        // One byte past the 1 GB protocol ceiling, and everything a u32 can
+        // say — these must be refused BY THE CAP.
+        (vec![b'd', 0x40, 0x00, 0x00, 0x01], true),
+        (vec![b'd', 0xFF, 0xFF, 0xFF, 0xFF], true),
+        (vec![b'E', 0x80, 0x00, 0x00, 0x00], true),
+        // Below the four-byte minimum the protocol guarantees, a header cut
+        // in half, and a frame promising more than it delivers: refused, but
+        // by whichever check gets there first.
+        (vec![b'd', 0x00, 0x00, 0x00, 0x00], false),
+        (vec![b'd', 0x00, 0x00, 0x00, 0x03], false),
+        (vec![b'd', 0x00], false),
+        (vec![b'C', 0x00, 0x00, 0x10, 0x00, b'x', b'y'], false),
+    ];
+
+    for (bytes, expect_cap) in hostile {
+        let (client, mut server) = socket_pair().await;
+        let (r, _w) = client.into_split();
+        let mut rd =
+            tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
+        // Write, then close: a reader waiting for bytes that never come must
+        // see EOF rather than hang.
+        server.write_all(&bytes).await.expect("write");
+        server.shutdown().await.ok();
+        drop(server);
+        let got = super::walsender::read_frame_for_test(&mut rd).await;
+        assert!(got.is_err(), "a truncated frame must not be accepted: {bytes:?}");
+        if expect_cap {
+            let msg = format!("{:?}", got.unwrap_err());
+            assert!(
+                msg.contains("1 GB protocol limit"),
+                "a frame announcing more than the protocol permits must be refused \
+                 by the SIZE CAP, not by whatever happens next — got: {msg}"
+            );
+        }
+    }
+}
+
+/// The MySQL packet reader, against a chain of maximum-size continuations.
+///
+/// One packet is capped at 16 MB by the protocol, but a larger payload is a
+/// CHAIN of full packets with no count in front of it — so the assembly loop
+/// has no bound of its own, and every byte it reserves it also writes.
+#[tokio::test]
+async fn mysql_packets_survive_hostile_lengths() {
+    use tokio::io::AsyncWriteExt;
+
+    // A single packet claiming the full 16 MB, delivering nothing: the reader
+    // must give up at EOF rather than sit on 16 MB of zeroes for ever.
+    let (client, mut server) = socket_pair().await;
+    let mut c = client;
+    server
+        .write_all(&[0xFF, 0xFF, 0xFF, 0x00])
+        .await
+        .expect("write");
+    server.shutdown().await.ok();
+    drop(server);
+    let mut seq = 0u8;
+    let got = super::mywire::read_packet_raw_for_test(&mut c, &mut seq).await;
+    assert!(got.is_err(), "a packet whose body never arrives must not be accepted");
+
+    // A continuation chain: several maximum-size packets in a row. Without a
+    // ceiling on the ASSEMBLED payload this grows without bound.
+    let (client, mut server) = socket_pair().await;
+    let mut c = client;
+    tokio::spawn(async move {
+        for i in 0..4u8 {
+            // 0xFFFFFF means "more follows"; the body is never sent, so the
+            // reader blocks and then sees EOF.
+            let _ = server.write_all(&[0xFF, 0xFF, 0xFF, i]).await;
+        }
+        let _ = server.shutdown().await;
+    });
+    let mut seq = 0u8;
+    let _ = super::mywire::read_packet_raw_for_test(&mut c, &mut seq).await;
+}

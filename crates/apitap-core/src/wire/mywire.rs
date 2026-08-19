@@ -417,6 +417,15 @@ async fn tls_upgrade(tcp: TcpStream, host: &str, ssl: SslPref) -> Result<IoBox> 
 }
 
 /// One packet read straight off the raw TCP socket (pre-TLS phase only).
+/// Same door as the walsender's, for the same reason.
+#[cfg(test)]
+pub(super) async fn read_packet_raw_for_test(
+    tcp: &mut TcpStream,
+    seq: &mut u8,
+) -> Result<Vec<u8>> {
+    read_packet_raw(tcp, seq).await
+}
+
 async fn read_packet_raw(tcp: &mut TcpStream, seq: &mut u8) -> Result<Vec<u8>> {
     let mut head = [0u8; 4];
     tcp.read_exact(&mut head).await.map_err(io_err)?;

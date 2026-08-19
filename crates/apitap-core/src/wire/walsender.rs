@@ -120,6 +120,19 @@ async fn pump_frames(
 /// that allocates from a wire-supplied length checks against this.
 const MAX_FRAME: usize = 1 << 30;
 
+/// The frame reader, reachable from the torture harness in this crate.
+///
+/// A test-only door rather than a widened visibility: the reader's contract
+/// is with this module, and the harness needs to run the real one — feeding
+/// it a socket — without anything about the production path changing shape
+/// to accommodate a test.
+#[cfg(test)]
+pub(super) async fn read_frame_for_test(
+    rd: &mut BufReader<PgRead>,
+) -> Result<(u8, bytes::Bytes)> {
+    read_frame(rd).await
+}
+
 async fn read_frame(rd: &mut BufReader<PgRead>) -> Result<(u8, bytes::Bytes)> {
     let mut head = [0u8; 5];
     rd.read_exact(&mut head).await.map_err(io_err)?;
@@ -171,7 +184,7 @@ pub(crate) type Rows = Vec<Vec<Option<String>>>;
 // TLS, which is most of them.
 
 /// Read half of either transport.
-enum PgRead {
+pub(super) enum PgRead {
     Tcp(OwnedReadHalf),
     Tls(tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>),
 }
