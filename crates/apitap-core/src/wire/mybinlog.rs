@@ -882,6 +882,17 @@ pub(crate) fn parse_rows(body: &[u8], kind: u8, map: &TableMap) -> Result<RowsEv
         }
     }
     let ncols = r.lenenc()? as usize;
+    // A rows event describes at least one column, and never more than the
+    // TABLE_MAP that frames it declared. Both bounds matter for the same
+    // reason: `ncols` is a length-encoded integer off the wire, and
+    // everything below sizes itself from it.
+    if ncols == 0 || ncols > map.cols.len() {
+        return Err(bad(&format!(
+            "rows event declares {ncols} columns but its table map declares {} \
+             — the event does not belong to that map, or the frame is damaged",
+            map.cols.len()
+        )));
+    }
     let bmlen = (ncols + 7) / 8;
     let present1 = r.take(bmlen)?.to_vec();
     let present2 = if op == RowOp::Update {
@@ -892,6 +903,12 @@ pub(crate) fn parse_rows(body: &[u8], kind: u8, map: &TableMap) -> Result<RowsEv
 
     let mut rows = Vec::new();
     while r.left() > 0 {
+        // Forward progress is a precondition, not an assumption. A row that
+        // consumes NOTHING leaves `r.left()` unchanged and this loop pushes
+        // for ever — the process grows until the OOM killer takes it, with no
+        // error, from one damaged byte on the wire. Found by the decoder
+        // torture harness, which was killed by exactly that.
+        let before = r.left();
         match op {
             RowOp::Insert => {
                 let t = read_row(&mut r, &map.cols, &present1, ncols)?;
@@ -902,10 +919,17 @@ pub(crate) fn parse_rows(body: &[u8], kind: u8, map: &TableMap) -> Result<RowsEv
                 rows.push((Some(t), None));
             }
             RowOp::Update => {
-                let before = read_row(&mut r, &map.cols, &present1, ncols)?;
+                let before_img = read_row(&mut r, &map.cols, &present1, ncols)?;
                 let after = read_row(&mut r, &map.cols, &present2, ncols)?;
-                rows.push((Some(before), Some(after)));
+                rows.push((Some(before_img), Some(after)));
             }
+        }
+        if r.left() == before {
+            return Err(bad(
+                "rows event stopped consuming bytes with data still left — a row \
+                 that reads nothing would repeat for ever, so the frame is \
+                 refused as damaged",
+            ));
         }
     }
     Ok(RowsEvent { table_id, rows })

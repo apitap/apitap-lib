@@ -15,3 +15,8 @@ pub(crate) mod pgmytsv;
 pub(crate) mod pgtext;
 pub(crate) mod rowbinary;
 pub(crate) mod textrow;
+
+// Decoder torture tests — see the module's own note for why this is a
+// deterministic harness rather than a fuzzer.
+#[cfg(test)]
+mod torture;
