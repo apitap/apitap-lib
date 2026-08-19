@@ -40,6 +40,8 @@ mod http;
 mod pipeline;
 mod plan;
 mod progress;
+pub mod shutdown;
+mod urlerr;
 mod sink;
 mod source;
 mod wire;

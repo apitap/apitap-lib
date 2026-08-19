@@ -357,7 +357,7 @@ fn env_nonempty(name: &str) -> Option<String> {
 impl GithubApiSource {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
-            .map_err(|e| Error::InvalidInput(format!("github+api url: {e}")))?;
+            .map_err(|e| crate::urlerr::bad_url("github url", url, e))?;
         let owner = u
             .host_str()
             .filter(|s| !s.is_empty())

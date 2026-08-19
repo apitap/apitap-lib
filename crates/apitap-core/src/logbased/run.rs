@@ -965,6 +965,10 @@ async fn run_group_mysql(
     let rows_applied: Vec<std::cell::Cell<u64>> =
         ctxs.iter().map(|_| std::cell::Cell::new(0u64)).collect();
 
+    // Armed for the incremental drain only — the bootstrap branch above returns
+    // before reaching here. See `crate::shutdown` and the note in `drain_group`.
+    let _stop = crate::shutdown::Guard::install();
+
     myrun::drain_windows(
         src_url,
         &pool,
@@ -1167,6 +1171,14 @@ async fn drain_group(
     changelog: bool,
     budget_denom: usize,
 ) -> Result<Vec<(u64, usize)>> {
+    // A SIGTERM from here on lands the window in flight instead of throwing it
+    // away — see `crate::shutdown`. It is armed HERE and not at the entry point
+    // on purpose: the sibling branch is `bootstrap_group`, a bulk load that
+    // publishes at the swap, so a signal absorbed there would buy nothing and
+    // cost the process its clean stop while the load ran on. Restored when this
+    // returns.
+    let _stop = crate::shutdown::Guard::install();
+
     // How much WAL is this slot holding on the SOURCE, and is that safe?
     //
     // A logical slot keeps every WAL segment its consumer has not confirmed.

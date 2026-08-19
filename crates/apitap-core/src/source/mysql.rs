@@ -753,7 +753,7 @@ impl MySqlSource {
             })
             .connect(url)
             .await
-            .map_err(|e| Error::Connect(e.to_string()))?;
+            .map_err(|e| crate::urlerr::connect_err("mysql source", url, e))?;
         Ok(Self { pool, url: url.into() })
     }
 }

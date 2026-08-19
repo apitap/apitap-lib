@@ -17,6 +17,7 @@ never silently.
 | `apitap.read(...)` | the function, `table=`/`query=`, and the Arrow/Polars handoff |
 | `mode=` values | `"replace"`, `"append"`, `"merge"`, `"log_based"` — spellings and meanings |
 | URL schemes | `postgres://`, `postgresql://`, `mysql://`, `clickhouse://`, `clickhouse+https://`, `bigquery://`, `gcs://`, `s3://`, `iceberg://`, `gsheets://`, `github://`, `github+api://` |
+| `apitap.request_stop()` | the function and its meaning: a running `mode="log_based"` drain stops at its next safe point and returns normally. It is a no-op for a bulk transfer and for a CDC table's first (bootstrap) run — neither has a safe point to stop at |
 | `TransferReport` | `rows`, `elapsed_ms`, `parallel` — fields are added, never removed or repurposed |
 | `MultiReport` | `tables`, and each `TableResult`'s `table`/`rows`/`elapsed_ms`/`parallel`/`error` |
 | destination artifacts | the `_apitap_state` table's columns, and the `__apitap_cl` / `__current` changelog shapes — a run of an older apitap must not choke on a newer one's state |
@@ -25,7 +26,8 @@ never silently.
 ## What is explicitly NOT stable
 
 - **Environment variables.** `APITAP_PROGRESS`, `APITAP_CH_MAX_BODY`,
-  `APITAP_PG_BINARY`, `APITAP_SLOT_WAL_WARN`, `APITAP_MEM_BUDGET` and friends are
+  `APITAP_PG_BINARY`, `APITAP_SLOT_WAL_WARN`, `APITAP_MEM_BUDGET`,
+  `APITAP_GRACEFUL_STOP` and friends are
   operational escape hatches. They may be renamed or retired when the default
   gets good enough to make them pointless. Nothing you *need* lives only in an
   env var.

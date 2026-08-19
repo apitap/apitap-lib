@@ -394,8 +394,44 @@ fn read_schema(
         .collect())
 }
 
+/// Ask a running transfer to stop at its next safe point.
+///
+/// A log_based run already handles SIGTERM for you — it chains to whatever
+/// handler was there before, so `signal.signal(signal.SIGTERM, ...)` keeps
+/// working and the drain still stops cleanly. This function is the door for
+/// the cases that handler cannot reach: a host that installed a three-argument
+/// (`SA_SIGINFO`) handler, a process that has SIGTERM set to `SIG_IGN`, or a
+/// supervisor that decides to wind a job down for a reason of its own.
+///
+/// It is also the way to stop a transfer running on another thread:
+///
+/// ```python
+/// t = threading.Thread(target=apitap.transfer, args=(src, dst), kwargs={...})
+/// t.start()
+/// ...
+/// apitap.request_stop()   # the current window lands, then the run returns
+/// ```
+///
+/// The current window finishes draining what it has, applies it, and advances
+/// the watermark, rather than losing it to an abrupt exit.
+///
+/// Scope, because it is narrower than the name suggests: only a
+/// `mode="log_based"` INCREMENTAL drain reads this. A bulk
+/// replace/append/merge transfer does not, and neither does a CDC table's
+/// first run, which is a bootstrap load — a bulk load publishes at the swap,
+/// so neither has a point at which stopping early would leave anything worth
+/// keeping. Calling it in those cases is harmless and does nothing.
+///
+/// Calling it when nothing is running is harmless too: a run that starts with
+/// no other run in flight clears the flag first.
+#[pyfunction]
+fn request_stop() {
+    apitap_core::shutdown::request();
+}
+
 #[pymodule]
 fn _apitap(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(request_stop, m)?)?;
     m.add_function(wrap_pyfunction!(transfer, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_many, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;

@@ -48,7 +48,7 @@ fn pct(s: &str) -> Result<String> {
 impl ChConn {
     pub(crate) fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
-            .map_err(|e| Error::InvalidInput(format!("clickhouse url: {e}")))?;
+            .map_err(|e| crate::urlerr::bad_url("clickhouse url", url, e))?;
         let https = matches!(u.scheme(), "clickhouse+https" | "https") || u.port() == Some(8443);
         let host = u
             .host_str()

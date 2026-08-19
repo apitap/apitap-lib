@@ -108,7 +108,7 @@ fn xml_tags(body: &str, tag: &str) -> Vec<String> {
 
 impl S3Conn {
     pub(crate) async fn parse(url: &str) -> Result<Self> {
-        let u = reqwest::Url::parse(url).map_err(|e| Error::InvalidInput(format!("s3 url: {e}")))?;
+        let u = reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("s3 url", url, e))?;
         let bucket = u
             .host_str()
             .filter(|s| !s.is_empty())

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from apitap._apitap import (
     __version__,
     read as _read,
+    request_stop,
     read_schema as _read_schema,
     transfer as _transfer,
     transfer_many as _transfer_many,
@@ -32,6 +33,7 @@ __all__ = [
     "read",
     "Reader",
     "transfer",
+    "request_stop",
     "TransferReport",
     "TableResult",
     "MultiTransferError",

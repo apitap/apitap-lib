@@ -130,7 +130,7 @@ fn connectable_host(h: &str) -> &str {
 }
 pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
     let u = reqwest::Url::parse(url)
-        .map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?;
+        .map_err(|e| crate::urlerr::bad_url("mysql url", url, e))?;
     let host = u
         .host_str()
         .map(connectable_host)

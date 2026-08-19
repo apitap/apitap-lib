@@ -135,9 +135,25 @@ pub(crate) async fn drain(
     let mut in_stream: Option<u32> = None;
 
     loop {
-        if std::time::Instant::now() > deadline {
-            // Wall-clock stop: whatever transaction is mid-flight is
-            // discarded; end_lsn still points at the last complete commit.
+        if std::time::Instant::now() > deadline || crate::shutdown::requested() {
+            // Wall-clock stop, or a SIGTERM. Both leave the drain at the same
+            // place: whatever transaction is mid-flight is discarded, and
+            // `end_lsn` still points at the last COMPLETE commit — so the
+            // window that gets applied is a whole one, and the watermark that
+            // follows it is true.
+            //
+            // A scheduler that stops a task (Kubernetes evicting a pod,
+            // Airflow clearing a run, systemd on `stop`) sends SIGTERM and
+            // then, seconds later, SIGKILL. Ignoring the first one means the
+            // second arrives mid-apply: correct, because the watermark is
+            // written last and a replay is idempotent, but it throws away
+            // every row the window had already collected. Reading it means the
+            // run lands what it has and exits with its state consistent, which
+            // is the difference between a redeploy costing nothing and costing
+            // a window.
+            //
+            // NOT ^C: SIGINT is left to the interpreter, so Ctrl-C behaves
+            // exactly as it always did — see `crate::shutdown`.
             break;
         }
         // No per-event timeout: cancelling next_event mid-read would tear a

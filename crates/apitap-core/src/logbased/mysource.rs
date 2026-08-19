@@ -392,7 +392,10 @@ pub(crate) async fn drain_binlog(
     let mut hit_budget = false;
 
     loop {
-        if std::time::Instant::now() > deadline {
+        if std::time::Instant::now() > deadline || crate::shutdown::requested() {
+            // Wall-clock stop, or a SIGTERM. Either way the position this
+            // window reports is the last COMPLETE transaction's, so the
+            // window applies whole and the watermark that follows is true.
             break;
         }
         let Some(raw) = w.next_binlog_event().await? else {

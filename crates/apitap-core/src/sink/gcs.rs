@@ -102,7 +102,7 @@ fn decode_component(s: &str) -> Result<String> {
 
 impl GcsConn {
     pub(crate) async fn parse(url: &str) -> Result<Self> {
-        let u = reqwest::Url::parse(url).map_err(|e| Error::InvalidInput(format!("gcs url: {e}")))?;
+        let u = reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("gcs url", url, e))?;
         let bucket = u
             .host_str()
             .filter(|s| !s.is_empty())

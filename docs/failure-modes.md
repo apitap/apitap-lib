@@ -37,7 +37,8 @@ The two properties everything else rests on:
 | what happened | state left behind | recovery | verified |
 |---|---|---|---|
 | **Process SIGKILLed mid bulk transfer** | Previous destination table **intact and readable throughout** (proven: 1,000 rows and their marker unchanged while 10M rows were streaming into staging). A staging table `<dest>__apitap_staging` may be orphaned. | Just re-run. The next run starts with `DROP TABLE IF EXISTS` on staging, so the orphan costs disk until then, nothing more. Proven: re-run landed 10,000,000 rows = source count. | `e2e_failure_modes.py` case 1 |
-| **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. | Re-run. Every change is applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2 |
+| **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) | Re-run. Every change is applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2 |
+| **SIGTERM mid CDC window** (pod evicted, Airflow run cleared, `systemctl stop`) | The window in flight is **applied**, not discarded, and the watermark advances with it. The run exits 0 with a report of the rows it landed. | Nothing. The next run picks up from the new watermark. A second SIGTERM is not absorbed — the default disposition comes back and the process ends at once, which is the SIGKILL case above and equally safe. | `e2e_sigterm.py` (Postgres, incl. a control run with the mechanism disabled), `e2e_sigterm_my.py` (MySQL binlog) |
 | **Source connection cut mid-COPY** (server restart, `pg_terminate_backend`, idle/statement timeout, network drop) | Nothing published. The destination table is **not even created** — it only comes into existence at the swap. | Re-run. The error says so explicitly rather than making you guess. | case 3 |
 | **Structural DDL on the source during a bulk run** | Cannot interleave on Postgres: `COPY` holds `ACCESS SHARE`, and `ALTER TABLE … DROP/ADD COLUMN` needs `ACCESS EXCLUSIVE`, so the DDL **waits for the read to finish**. Column mapping cannot drift mid-stream. | Nothing to do. If the DDL wins a race we do not yet know about, the run fails loudly rather than writing values into the wrong column — that is the assertion the test makes. | case 4 |
 | **CDC schedule stopped for a long time — Postgres** | The replication slot keeps holding WAL on the **source**, which is the guarantee CDC rests on and also how a stopped schedule fills the source's disk. | Run the drain: a backlog is not a reason to refuse, it is a reason to run. apitap prints the retained WAL every run and warns past `APITAP_SLOT_WAL_WARN` (default 4 GiB). Set `max_slot_wal_keep_size` on the server so an abandoned slot is *invalidated* instead of filling the disk — apitap reports that as slot-is-GONE and recovers with a fresh bootstrap. | `e2e_cdc_retention.py` |
@@ -66,6 +67,57 @@ The two properties everything else rests on:
   does not hold for a table with a PDF in it. `benchmarks/e2e_review_gate.py`
   leg 3 measures it on every run and reports it as a KNOWN GAP rather than
   passing — the number in that output is the current state of this line.
+
+## Being stopped on purpose
+
+A scheduler stopping a job is not an accident, and it is the most common way a
+CDC run ends in production: Kubernetes evicts the pod, Airflow clears the run,
+an operator restarts the service. All of them send SIGTERM first and SIGKILL a
+few seconds later.
+
+apitap used to die on the first signal. That was safe — the watermark is
+written after the rows it covers and a replay is idempotent — but it was
+expensive: everything the in-flight window had already drained went back to
+the WAL and was read again next time. On a busy table that is minutes of work
+lost per redeploy, every redeploy.
+
+Now the first SIGTERM sets a flag. Both drains read it where they already read
+their wall-clock deadline — between events, never inside a half-decoded frame
+— so the window ends at the last COMPLETE commit, applies, and advances the
+watermark exactly as a budget-limited window does. The process exits 0 with a
+report of what it landed.
+
+Details worth knowing before you rely on it:
+
+- **A second SIGTERM is not absorbed.** The handler restores the default
+  disposition and re-raises, so an operator who wants the process gone now
+  gets it gone now. Once to ask, twice to insist.
+- **An existing handler is kept.** Whatever SIGTERM pointed at before the run
+  is called from inside apitap's, so `signal.signal(signal.SIGTERM, ...)` still
+  works. This matters because CPython's handler only *schedules* your Python
+  function — it runs when the interpreter next reaches the eval loop, which
+  during a transfer is after the run returns. Chaining is what makes both
+  happen: the drain stops now, your handler runs when control comes back.
+- **Two dispositions are left alone**: `SIG_IGN`, and a handler installed with
+  `SA_SIGINFO` (three arguments, which cannot be called safely through the
+  one-argument prototype). Those hosts can call `apitap.request_stop()`
+  instead — which is also how you stop a transfer running on another thread.
+- **Nothing is interrupted mid-read.** If the source has gone quiet the flag
+  is not seen until the next event or keepalive: seconds on a live connection,
+  the second SIGTERM on a wedged one.
+- **`APITAP_GRACEFUL_STOP=0`** turns the whole thing off and restores the
+  kernel default. `e2e_sigterm.py` leg 0 runs with it set, on the same
+  scenario, and requires the process to die by signal — the file's own proof
+  that the legs below it are measuring something.
+
+- **Only CDC.** A bulk `replace` / `append` / `merge` run installs no handler
+  and still dies on the first signal. That is deliberate: a bulk load publishes
+  at the swap, so there is no partial result worth landing, and the recovery is
+  the killed-run row in the table above.
+
+SIGKILL is not catchable and is not handled. If the apply outlives the
+scheduler's grace period, SIGKILL still arrives, and that is still safe for
+the reason it always was.
 
 ## Rules of thumb
 

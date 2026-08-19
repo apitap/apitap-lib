@@ -492,7 +492,7 @@ fn connectable_host(h: &str) -> &str {
 }
 fn parse_url(url: &str) -> Result<ConnInfo> {
     let u = reqwest::Url::parse(url)
-        .map_err(|e| Error::InvalidInput(format!("postgres url: {e}")))?;
+        .map_err(|e| crate::urlerr::bad_url("postgres url", url, e))?;
     let host = u
         .host_str()
         .map(connectable_host)
@@ -1130,78 +1130,76 @@ impl Walsender {
     /// framed consumer stopped on a non-'d' header). Returns true when the
     /// COPY conversation is DONE (ReadyForQuery consumed).
     pub(crate) async fn co_control(&mut self) -> Result<bool> {
-        loop {
-            while self.co_window().len() < 5 {
-                self.co_refill().await?;
+        while self.co_window().len() < 5 {
+            self.co_refill().await?;
+        }
+        let w = self.co_window();
+        let tag = w[0];
+        let len = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+        if len < 4 {
+            return Err(Error::Transfer("copy_out: bad message length".into()));
+        }
+        // Same ceiling as `read_frame`, and for the same reason: this loop
+        // refills until the window holds `len` bytes, so a peer answering
+        // with 0xFFFFFFFF grows `co_win` to four gigabytes before anything
+        // downstream gets a chance to reject the message.
+        if len > MAX_FRAME {
+            return Err(Error::Transfer(format!(
+                "copy_out: message announces {len} bytes, past the 1 GB \
+                 protocol limit — the peer on this socket is not answering \
+                 the Postgres frontend protocol"
+            )));
+        }
+        while self.co_window().len() < 5 + (len - 4) {
+            self.co_refill().await?;
+        }
+        let body_len = len - 4;
+        match tag {
+            b'Z' => {
+                self.co_advance(5 + body_len);
+                self.copy_eof = true;
+                return Ok(true);
             }
-            let w = self.co_window();
-            let tag = w[0];
-            let len = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
-            if len < 4 {
-                return Err(Error::Transfer("copy_out: bad message length".into()));
-            }
-            // Same ceiling as `read_frame`, and for the same reason: this loop
-            // refills until the window holds `len` bytes, so a peer answering
-            // with 0xFFFFFFFF grows `co_win` to four gigabytes before anything
-            // downstream gets a chance to reject the message.
-            if len > MAX_FRAME {
-                return Err(Error::Transfer(format!(
-                    "copy_out: message announces {len} bytes, past the 1 GB \
-                     protocol limit — the peer on this socket is not answering \
-                     the Postgres frontend protocol"
-                )));
-            }
-            while self.co_window().len() < 5 + (len - 4) {
-                self.co_refill().await?;
-            }
-            let body_len = len - 4;
-            match tag {
-                b'Z' => {
-                    self.co_advance(5 + body_len);
-                    self.copy_eof = true;
-                    return Ok(true);
-                }
-                b'E' => {
-                    let body = self.co_window()[5..5 + body_len].to_vec();
-                    self.co_advance(5 + body_len);
-                    let e = parse_error(&body);
-                    self.copy_eof = true;
-                    // Drain to ReadyForQuery through the window.
-                    loop {
-                        while self.co_window().len() < 5 {
-                            self.co_refill().await?;
-                        }
-                        let w = self.co_window();
-                        let t = w[0];
-                        let l = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
-                        // Draining after an error is still the peer's protocol,
-                        // and a peer that just sent us an error is exactly the
-                        // one worth not trusting with an allocation. The length
-                        // also has to be at least 4 or the advance below would
-                        // walk backwards through the window.
-                        if !(4..=MAX_FRAME).contains(&l) {
-                            return Err(e);
-                        }
-                        while self.co_window().len() < 1 + l {
-                            self.co_refill().await?;
-                        }
-                        self.co_advance(1 + l);
-                        if t == b'Z' {
-                            return Err(e);
-                        }
+            b'E' => {
+                let body = self.co_window()[5..5 + body_len].to_vec();
+                self.co_advance(5 + body_len);
+                let e = parse_error(&body);
+                self.copy_eof = true;
+                // Drain to ReadyForQuery through the window.
+                loop {
+                    while self.co_window().len() < 5 {
+                        self.co_refill().await?;
+                    }
+                    let w = self.co_window();
+                    let t = w[0];
+                    let l = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+                    // Draining after an error is still the peer's protocol,
+                    // and a peer that just sent us an error is exactly the
+                    // one worth not trusting with an allocation. The length
+                    // also has to be at least 4 or the advance below would
+                    // walk backwards through the window.
+                    if !(4..=MAX_FRAME).contains(&l) {
+                        return Err(e);
+                    }
+                    while self.co_window().len() < 1 + l {
+                        self.co_refill().await?;
+                    }
+                    self.co_advance(1 + l);
+                    if t == b'Z' {
+                        return Err(e);
                     }
                 }
-                // CopyDone / CommandComplete / ParameterStatus / Notice / …
-                b'c' | b'C' | b'S' | b'N' | b'A' => {
-                    self.co_advance(5 + body_len);
-                    return Ok(false);
-                }
-                other => {
-                    return Err(Error::Transfer(format!(
-                        "copy_out: unexpected message {:?}",
-                        other as char
-                    )))
-                }
+            }
+            // CopyDone / CommandComplete / ParameterStatus / Notice / …
+            b'c' | b'C' | b'S' | b'N' | b'A' => {
+                self.co_advance(5 + body_len);
+                return Ok(false);
+            }
+            other => {
+                return Err(Error::Transfer(format!(
+                    "copy_out: unexpected message {:?}",
+                    other as char
+                )))
             }
         }
     }

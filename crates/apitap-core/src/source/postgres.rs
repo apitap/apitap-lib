@@ -51,7 +51,7 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
         })
         .connect(url)
         .await
-        .map_err(|e| Error::Connect(e.to_string()))
+        .map_err(|e| crate::urlerr::connect_err("postgres source", url, e))
 }
 
 pub(crate) struct PgSource {

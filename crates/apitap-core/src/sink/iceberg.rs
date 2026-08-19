@@ -111,7 +111,7 @@ fn dec(s: &str) -> Result<String> {
 impl IcebergConn {
     pub(crate) async fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
-            .map_err(|e| Error::InvalidInput(format!("iceberg url: {e}")))?;
+            .map_err(|e| crate::urlerr::bad_url("iceberg url", url, e))?;
         let host = u
             .host_str()
             .filter(|s| !s.is_empty())

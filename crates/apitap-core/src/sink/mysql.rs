@@ -123,7 +123,7 @@ impl MySqlShared {
 /// chain; `verify_identity` checks the chain and the hostname.
 fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>)> {
     let parsed = reqwest::Url::parse(url)
-        .map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?;
+        .map_err(|e| crate::urlerr::bad_url("mysql url", url, e))?;
     let mut mode: Option<String> = None;
     let kept: Vec<(String, String)> = parsed
         .query_pairs()

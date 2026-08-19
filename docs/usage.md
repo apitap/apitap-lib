@@ -80,6 +80,20 @@ url = f"clickhouse+https://user:{pw}@ch.example:443/analytics"
 apitap decodes the userinfo back before authenticating, so the server sees the
 real password on every route.
 
+When a URL does not parse, the error names the character that broke it and
+shows the authority the parser actually saw — with the password replaced by its
+length, never its text:
+
+```
+mysql url: invalid port number
+  read as: mysql://root:<8 chars, hidden>@db.internal:3307
+  the password contains '@' — those are URL syntax, not text, so they end the
+  authority early and the parser reports the damage further along
+  percent-encode the password before it goes in the URL:
+      from urllib.parse import quote
+      url = f"scheme://{user}:{quote(password, safe='')}@{host}:{port}/{db}"
+```
+
 ## API
 
 ### `apitap.transfer(src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=True, mode="replace", engine=None, order_by=None, on_cluster=None, partition_by=None, changelog=False, slots=None) -> TransferReport`
@@ -100,6 +114,14 @@ real password on every route.
 | `partition_by` | auto | ClickHouse/BigQuery changelog tables — the column to partition on, or a `{table: column}` map. See [`changelog=True`](#changelogtrue--the-destination-as-an-audit-trail-not-a-replica) |
 | `changelog` | `False` | `mode="log_based"` only — keep every operation instead of collapsing to the final image. See [`changelog=True`](#changelogtrue--the-destination-as-an-audit-trail-not-a-replica) |
 | `slots` | `1` | `mode="log_based"` multi-table groups only — split the group across N replication slots drained in parallel. See [Parallel slots](#parallel-slots-slotsn) |
+
+### `apitap.request_stop()`
+
+Asks a running transfer to stop at its next safe point: the current CDC window
+finishes draining what it has, applies it, advances the watermark, and the
+`transfer()` call returns normally with a report of the rows it landed.
+Harmless when no transfer is running — every run clears the flag as it starts.
+See [Stopping a run on purpose](#stopping-a-run-on-purpose).
 
 ### `TransferReport`
 
@@ -1147,6 +1169,58 @@ The short version: re-running is the recovery, a killed run costs disk rather
 than correctness, and the readers of your destination table never see a partial
 load.
 
+## Stopping a run on purpose
+
+Schedulers stop jobs. Kubernetes evicts a pod, Airflow clears a run, an
+operator restarts the service — all of them send SIGTERM first and SIGKILL a
+few seconds later.
+
+A `mode="log_based"` run takes the first SIGTERM as a request to wind down. The
+window in flight stops at the last complete commit, applies, and advances the
+watermark; the process then exits 0 with a report of the rows it landed:
+
+```
+2026-08-19T05:45:25Z apitap done table=orders changes=70000 ... elapsed_s=1.5
+```
+
+Nothing is lost either way — a killed run was always safe, because the
+watermark is written after the rows it covers and a replay is idempotent. What
+the handler saves is the *work*: without it, everything the window had already
+drained went back to the WAL to be read again on the next run.
+
+A **second** SIGTERM is not absorbed. It restores the default disposition and
+re-raises, so an operator who wants the process gone now gets it gone now. Once
+to ask, twice to insist.
+
+If your process installs its own SIGTERM handler, keep it — apitap calls
+whatever was there before from inside its own, so `signal.signal` keeps
+working. (Worth knowing why that is not automatic: CPython's handler only
+*schedules* your Python function, which runs when the interpreter next reaches
+the eval loop — during a transfer, that is after the run returns.)
+
+For the two cases apitap deliberately will not touch — a `SIG_IGN`
+disposition, or a handler installed with `SA_SIGINFO` — and for stopping a
+transfer running on another thread, call `apitap.request_stop()`:
+
+```python
+t = threading.Thread(target=apitap.transfer, args=(SRC, DST),
+                     kwargs={"table": "orders", "mode": "log_based"})
+t.start()
+...
+apitap.request_stop()   # the current window lands, then the run returns
+t.join()
+```
+
+**Only `mode="log_based"` does this.** A bulk `replace` / `append` / `merge`
+run installs no handler and still dies on the first SIGTERM, because there is
+nothing useful to land: a bulk load publishes at the swap, so a run stopped
+halfway has produced no partial result to keep. That case is the killed-run row
+in [failure-modes.md](failure-modes.md) — re-run, and the only cost is a
+staging table left on disk until the next run drops it.
+
+Set `APITAP_GRACEFUL_STOP=0` to turn all of this off and get the kernel
+default back.
+
 ## Progress while it runs
 
 A transfer that moves half a billion rows used to say nothing until it finished
@@ -1206,6 +1280,7 @@ defaults cannot see. None of them change what lands — only how it gets there.
 | `APITAP_SLOT_WAL_WARN` | `4G` | **CDC.** How much retained WAL on the source turns the `slot.wal` gauge's warning on. The gauge itself is emitted every run regardless. |
 | `APITAP_HTTP_CONNECT_TIMEOUT` | `15` (seconds) | How long a connection to an HTTP service (ClickHouse, BigQuery, GCS, S3, Iceberg, the GitHub/Sheets sources) may take to establish. |
 | `APITAP_HTTP_READ_TIMEOUT` | `120` (seconds) | The longest gap allowed BETWEEN bytes of a response before the peer is treated as gone. Not a limit on how long a transfer may take — a load job that keeps streaming is never cut off, however long it runs. Raise it for a warehouse that legitimately pauses under load. |
+| `APITAP_GRACEFUL_STOP` | `1` (on) | **CDC.** Set to `0` to go back to dying on the first SIGTERM instead of landing the window in flight — see [Stopping a run on purpose](#stopping-a-run-on-purpose). |
 | `APITAP_MEM_BUDGET` | the cgroup limit | **Shared containers.** The auto-sizing spends the whole limit on batches and pipes, so when something else in the container needs memory too, say what apitap may have. Plain bytes, or an `M`/`G` suffix. |
 
 Both HTTP deadlines exist because a client with none waits forever: a peer that

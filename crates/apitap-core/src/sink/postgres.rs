@@ -72,7 +72,7 @@ impl PgSink {
             .max_connections(max_conns as u32)
             .connect(url)
             .await
-            .map_err(|e| Error::Connect(e.to_string()))
+            .map_err(|e| crate::urlerr::connect_err("postgres destination", url, e))
     }
 
     /// Bind one destination table onto an existing pool. All per-table state

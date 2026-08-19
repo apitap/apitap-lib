@@ -98,7 +98,7 @@ fn encode_path(p: &str) -> String {
 impl GithubSource {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let u =
-            reqwest::Url::parse(url).map_err(|e| Error::InvalidInput(format!("github url: {e}")))?;
+            reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("github url", url, e))?;
         let owner = u
             .host_str()
             .filter(|s| !s.is_empty())

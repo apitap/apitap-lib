@@ -45,7 +45,7 @@ pub(crate) struct GsheetsSource {
 impl GsheetsSource {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
-            .map_err(|e| Error::InvalidInput(format!("gsheets url: {e}")))?;
+            .map_err(|e| crate::urlerr::bad_url("gsheets url", url, e))?;
         // The spreadsheet id rides as the host; ids are [A-Za-z0-9_-] so they
         // survive URL host parsing intact.
         let spreadsheet = u

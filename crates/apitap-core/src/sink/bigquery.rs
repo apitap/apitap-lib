@@ -116,7 +116,7 @@ impl BqConn {
     /// without `credentials` the `GOOGLE_APPLICATION_CREDENTIALS` env var is used.
     pub(crate) async fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
-            .map_err(|e| Error::InvalidInput(format!("bigquery url: {e}")))?;
+            .map_err(|e| crate::urlerr::bad_url("bigquery url", url, e))?;
         let project = u
             .host_str()
             .filter(|s| !s.is_empty())
@@ -710,6 +710,23 @@ pub(crate) fn sql_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// A response worth PUTting again: a transient backend failure, or a throttle.
+///
+/// The two look nothing alike over HTTP. A backend failure is 5xx. A throttle
+/// is **429**, or — the one that has actually bitten — **403**, because
+/// BigQuery classes `rateLimitExceeded` and `quotaExceeded` as authorization
+/// outcomes. Treating 403 as permanent is correct for a real permission
+/// problem and wrong for this, so the status alone is not enough to decide;
+/// but the body is not readable without consuming the response, which would
+/// forfeit the one we may still want. Retrying every 403 a few times costs a
+/// few seconds on a genuinely unauthorized run and saves the whole transfer on
+/// a throttled one, so 403 is retried and the real permission error surfaces
+/// with its own message once the attempts are spent.
+fn throttled_or_transient(r: &reqwest::Response) -> bool {
+    let c = r.status().as_u16();
+    r.status().is_server_error() || c == 429 || c == 403
+}
+
 /// A BigQuery error worth retrying with backoff: DML serialization conflicts
 /// (concurrent transactions on the shared state table), rate limits, and the
 /// transient backend classes Google's own error text tells you to retry —
@@ -751,6 +768,17 @@ mod retry_tests {
         assert!(!retryable(r#"{"reason":"resourcesExceeded"}"#));
         assert!(!retryable("Access Denied: Table apitap:ds.t"));
         assert!(!retryable("Not found: Dataset apitap:missing"));
+        // The bootstrap path's own throttle text, as BigQuery writes it on a
+        // resumable-session start. This is the string begin_session sees.
+        assert!(retryable(
+            "bigquery resumable begin 403 Forbidden: {\"error\":{\"errors\":\
+             [{\"reason\":\"rateLimitExceeded\",\"message\":\"Exceeded rate limits\"}]}}"
+        ));
+        assert!(retryable("bigquery resumable begin 503 Service Unavailable: backendError"));
+        // …and a real authorization failure on the same call must NOT loop.
+        assert!(!retryable(
+            "bigquery resumable begin 403 Forbidden: Access Denied: Project apitap"
+        ));
     }
 }
 
@@ -926,7 +954,41 @@ impl BqLoader {
         }
     }
 
+    /// Open a resumable session, retrying the throttles BigQuery answers job
+    /// creation with.
+    ///
+    /// This is the ONE job-creating call on the bootstrap path that had no
+    /// backoff, and it is also the one most likely to be throttled: a wide
+    /// multi-table run opens a session per worker per table at almost the same
+    /// instant, and `jobs.insert` is rate-limited per project. BigQuery answers
+    /// that with **403 `rateLimitExceeded`**, not a 5xx — so the retry that
+    /// `put_chunk` already had (`is_server_error()`) could never have caught
+    /// it, and one throttled table failed the whole run while its twelve
+    /// siblings finished.
+    ///
+    /// Retrying is free of consequence here: no session exists yet, so there is
+    /// nothing half-written to reason about, and the caller's buffer is still
+    /// in hand.
     async fn begin_session(&mut self) -> Result<()> {
+        let mut attempt = 0u32;
+        loop {
+            match self.begin_session_once().await {
+                Ok(()) => return Ok(()),
+                Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
+                    attempt += 1;
+                    crate::progress::note(&format!(
+                        "bigquery throttled the load-job start, retry {attempt}/5                          in {}ms",
+                        400u64 << attempt
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn begin_session_once(&mut self) -> Result<()> {
         // Belt-and-braces vs a leftover staging that slipped past the sweep
         // (all jobs WRITE_APPEND — appending onto stale rows would be silent
         // duplication; a TRUNCATE first-job can't fix it because BigQuery does
@@ -982,9 +1044,12 @@ impl BqLoader {
             None => format!("bytes {}-{}/*", self.offset, end - 1),
         };
         // Re-PUTting a byte range is idempotent in the resumable protocol, so
-        // transient network errors and 5xx get a couple of paced retries.
+        // transient network errors, 5xx AND throttles get paced retries. The
+        // throttle case matters as much as the 5xx one and does not look like
+        // it: BigQuery says 403 `rateLimitExceeded` or 429, both of which
+        // `is_server_error()` reads as success-to-fail-on.
         let mut resp = None;
-        for attempt in 0..3u32 {
+        for attempt in 0..5u32 {
             let r = self
                 .conn
                 .client
@@ -996,17 +1061,17 @@ impl BqLoader {
                 .send()
                 .await;
             match r {
-                Ok(r) if r.status().is_server_error() && attempt < 2 => {}
+                Ok(r) if attempt < 4 && throttled_or_transient(&r) => {}
                 Ok(r) => {
                     resp = Some(r);
                     break;
                 }
-                Err(e) if attempt < 2 => {
+                Err(e) if attempt < 4 => {
                     let _ = e; // transient; retried below
                 }
                 Err(e) => return Err(Error::Transfer(format!("bigquery upload chunk: {e}"))),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1))).await;
+            tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
         }
         let resp =
             resp.ok_or_else(|| Error::Transfer("bigquery upload chunk: retries exhausted".into()))?;
