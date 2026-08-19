@@ -1,0 +1,54 @@
+# What `cargo audit` is allowed to stay quiet about, and why.
+#
+# The point of this file is that the gate can require a GREEN audit. A red audit
+# everyone has learned to scroll past reports nothing; a green one that turns red
+# the day a new advisory lands reports exactly the thing worth knowing. So every
+# entry below is a decision with a reason, re-checkable against the dependency's
+# source, and none of them is "we did not get round to it".
+#
+# Two advisories were NOT ignored and were fixed instead, on 2026-08-20:
+#   RUSTSEC-2026-0221  event-listener 5.4.1 -> 5.4.2  (unsound: !Send tags)
+#   RUSTSEC-2026-0253  lru 0.18.1 -> 0.18.2           (unsound: UAF in pop())
+# Both were patch bumps inside the existing semver range. Look for that first
+# before adding anything here.
+
+[advisories]
+ignore = [
+  # ── RUSTSEC-2023-0071 — rsa 0.9.10, "Marvin Attack", 5.9 medium ──────────
+  # Reached through sqlx-mysql 0.8.6. Upstream says "No fixed upgrade is
+  # available"; rsa 0.10 is still a release candidate.
+  #
+  # The vulnerable operation is not in our path. Marvin recovers an RSA PRIVATE
+  # key by timing repeated DECRYPTION. apitap is a MySQL client: in
+  # sha256_password / caching_sha2_password full auth it ENCRYPTS the password
+  # with the server's PUBLIC key, and does nothing else with RSA. Verified in
+  # the dependency's source rather than assumed — sqlx-mysql's
+  # src/connection/auth.rs imports only `rsa::{pkcs8::DecodePublicKey, Oaep,
+  # RsaPublicKey}` and its one use is `pkey.encrypt(...)`. There is no
+  # RsaPrivateKey in the crate and no decrypt call anywhere. apitap holds no RSA
+  # private key.
+  #
+  # Re-check if sqlx-mysql ever starts decrypting, and delete this entry when
+  # rsa 0.10 is stable and sqlx moves to it.
+  "RUSTSEC-2023-0071",
+
+  # ── RUSTSEC-2024-0436 — paste 1.0.15, unmaintained ───────────────────────
+  # A proc-macro that runs at BUILD time and contributes no code to the shipped
+  # binary. "Unmaintained" is a supply-chain signal, not a defect: there is no
+  # advisory against its behaviour, and nothing in the published wheel can reach
+  # it at runtime.
+  "RUSTSEC-2024-0436",
+]
+
+# `spin` 0.9.8 is reported as YANKED, which carries no advisory id, so there is
+# nothing to ignore by even if we wanted to. It arrives as
+# lazy_static <- num-bigint-dig <- rsa, so it cannot move until rsa does, and rsa
+# cannot move (above). A yanked crate already pinned in Cargo.lock keeps
+# building; the risk of a yank is that a FRESH resolve cannot pick it, which the
+# committed lockfile prevents.
+#
+# Deliberately left as a warning rather than switched off here: warnings do not
+# fail the audit, so the gate still goes green, and the day a yank matters it is
+# still on the screen instead of configured away.
+[yanked]
+enabled = true
