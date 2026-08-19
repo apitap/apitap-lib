@@ -66,6 +66,25 @@ def run(env_extra, interval="0.3"):
     return p.stdout, p.stderr, time.time() - t0
 
 
+def _slots_now():
+    return set(pg("SELECT slot_name FROM pg_replication_slots").split())
+
+
+# Slots that existed BEFORE this leg started. Anything else is ours.
+#
+# The blanket `SELECT pg_drop_replication_slot(slot_name) ... WHERE NOT active`
+# that used to be in the cleanup is a live grenade on a shared rig: a CDC job
+# that is merely BETWEEN drains has an inactive slot, and dropping it destroys
+# its WAL continuity. It took out a running 24 h soak on 2026-08-20.
+_SLOTS_BEFORE = _slots_now()
+
+
+def drop_our_slots():
+    for _s in sorted(_slots_now() - _SLOTS_BEFORE):
+        pg(f"SELECT pg_drop_replication_slot('{_s}') FROM pg_replication_slots "
+           f"WHERE slot_name='{_s}' AND NOT active")
+
+
 ok = True
 
 print("== captured pipe (Airflow / Kubernetes / docker logs) ==")
@@ -181,7 +200,7 @@ else:
         print("   ✓ every line in JSON mode is JSON, warnings included")
 
 pg(f"DROP TABLE IF EXISTS {GT}")
-pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
+drop_our_slots()
 ch(f"DROP TABLE IF EXISTS {GT}")
 
 print("== APITAP_PROGRESS=0 restores silence ==")

@@ -108,6 +108,25 @@ def case(label, good, detail=""):
     global ok
     print(f"   {'OK' if good else 'XX'} {label}{': ' + detail if detail else ''}")
     ok = ok and bool(good)
+def _slots_now():
+    return set(pg("SELECT slot_name FROM pg_replication_slots").split())
+
+
+# Slots that existed BEFORE this leg started. Anything else is ours.
+#
+# The blanket `SELECT pg_drop_replication_slot(slot_name) ... WHERE NOT active`
+# that used to be here is a live grenade on a shared rig: a CDC job that is
+# merely BETWEEN drains has an inactive slot, and dropping it destroys its WAL
+# continuity. It took out a running 24 h soak on 2026-08-20. Scope the cleanup
+# to what this leg made.
+_SLOTS_BEFORE = _slots_now()
+
+
+def drop_our_slots():
+    for s in sorted(_slots_now() - _SLOTS_BEFORE):
+        pg(f"SELECT pg_drop_replication_slot('{s}')"
+           f" FROM pg_replication_slots WHERE slot_name='{s}' AND NOT active")
+
 
 
 def backlog(frm, n):
@@ -174,7 +193,7 @@ pg(f"CREATE TABLE {T} (id int primary key, v text)")
 pg(f"INSERT INTO {T} SELECT g, 'seed'||g FROM generate_series(1,{SEED}) g")
 ch(f"DROP TABLE IF EXISTS {T}")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1")
-pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
+drop_our_slots()
 
 boot = sh([sys.executable, "-c", RUN], env=dict(os.environ, APITAP_CDC_WINDOW_BYTES=WINDOW))
 if boot.returncode:
@@ -367,7 +386,7 @@ ch(f"DROP TABLE IF EXISTS {T}")
 # shared bench rig after every run.
 ch(f"DROP TABLE IF EXISTS `{T}__apitap_cdc_del`")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1")
-pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
+drop_our_slots()
 
 for n in notes:
     print(f"   .. {n}")

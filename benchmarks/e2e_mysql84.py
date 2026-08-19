@@ -74,6 +74,25 @@ def case(label, good, detail=""):
     global ok
     print(f"   {'OK' if good else 'XX'} {label}{': ' + detail if detail else ''}")
     ok = ok and bool(good)
+def _slots_now():
+    return set(pg("SELECT slot_name FROM pg_replication_slots").split())
+
+
+# Slots that existed BEFORE this leg started. Anything else is ours.
+#
+# The blanket `SELECT pg_drop_replication_slot(slot_name) ... WHERE NOT active`
+# that used to be here is a live grenade on a shared rig: a CDC job that is
+# merely BETWEEN drains has an inactive slot, and dropping it destroys its WAL
+# continuity. It took out a running 24 h soak on 2026-08-20. Scope the cleanup
+# to what this leg made.
+_SLOTS_BEFORE = _slots_now()
+
+
+def drop_our_slots():
+    for s in sorted(_slots_now() - _SLOTS_BEFORE):
+        pg(f"SELECT pg_drop_replication_slot('{s}')"
+           f" FROM pg_replication_slots WHERE slot_name='{s}' AND NOT active")
+
 
 
 def transfer(src, dst, table, mode="replace", dest_table=None):
@@ -125,8 +144,14 @@ if not r["hung"]:
 
 # ---------------------------------------------------------------------------
 print("== leg 2: 8.4 as DESTINATION, log_based apply ==")
-pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
-my(f"DROP TABLE IF EXISTS my84_feed")
+drop_our_slots()
+my("DROP TABLE IF EXISTS my84_feed", check=False)
+# Dropping the destination TABLE is not enough: the watermark lives in the
+# destination's _apitap_state, and a watermark whose slot no longer exists is
+# exactly what apitap refuses (correctly) to drain against. The first version of
+# this leg cleared only the table and failed on its own second run with
+# "destination has a watermark but slot ... is GONE".
+my("DELETE FROM _apitap_state WHERE dest_table='my84_feed'", check=False)
 r = transfer(PG, MY84, "my84_feed", "log_based")
 case("the CDC bootstrap into 8.4 returns", not r["hung"],
      f"HUNG after {DEADLINE}s" if r["hung"] else f"{r['secs']:.1f}s")
@@ -181,10 +206,11 @@ if not r["hung"]:
 # ---------------------------------------------------------------------------
 print("== cleanup ==")
 pg("DROP TABLE IF EXISTS my84_feed")
-pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
+drop_our_slots()
 my(f"DROP TABLE IF EXISTS {SRC_T}", check=False)
 my(f"DROP TABLE IF EXISTS {DST_T}", check=False)
 my("DROP TABLE IF EXISTS my84_feed", check=False)
+my("DELETE FROM _apitap_state WHERE dest_table IN ('my84_feed','" + DST_T + "')", check=False)
 ch(f"DROP TABLE IF EXISTS {SRC_T}")
 ch(f"DROP TABLE IF EXISTS `{SRC_T}__apitap_cdc_del`")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{SRC_T}' SETTINGS mutations_sync=1")

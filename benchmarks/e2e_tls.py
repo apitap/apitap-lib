@@ -81,6 +81,25 @@ def case(label, good, detail=""):
     global ok
     print(f"   {'✓' if good else '✗'} {label}{': ' + detail if detail else ''}")
     ok = ok and good
+def _slots_now():
+    return set(pg("SELECT slot_name FROM pg_replication_slots").split())
+
+
+# Slots that existed BEFORE this leg started. Anything else is ours.
+#
+# The blanket `SELECT pg_drop_replication_slot(slot_name) ... WHERE NOT active`
+# that used to be here is a live grenade on a shared rig: a CDC job that is
+# merely BETWEEN drains has an inactive slot, and dropping it destroys its WAL
+# continuity. It took out a running 24 h soak on 2026-08-20. Scope the cleanup
+# to what this leg made.
+_SLOTS_BEFORE = _slots_now()
+
+
+def drop_our_slots():
+    for s in sorted(_slots_now() - _SLOTS_BEFORE):
+        pg(f"SELECT pg_drop_replication_slot('{s}')"
+           f" FROM pg_replication_slots WHERE slot_name='{s}' AND NOT active")
+
 
 
 def url(mode):
@@ -100,7 +119,7 @@ case("the server has ssl on", pg("SHOW ssl") == "on", pg("SHOW ssl"))
 print("== leg 1: sslmode=require opens the replication socket over TLS ==")
 ch(f"DROP TABLE IF EXISTS {T}")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1")
-pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
+drop_our_slots()
 # The server's log is the witness: it records the walsender's connection and,
 # with log_connections on, whether it was SSL. A client claiming encryption is
 # not evidence of encryption.
@@ -202,7 +221,7 @@ else:
              f"src {src} / dst {dst}")
 
 pg(f"DROP TABLE IF EXISTS {CT}")
-pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active")
+drop_our_slots()
 ch(f"DROP TABLE IF EXISTS {CT}")
 ch(f"DROP TABLE IF EXISTS {T}")
 
