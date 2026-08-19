@@ -87,6 +87,23 @@ The two properties everything else rests on:
   a gigabyte where a chunk cap starts binding. In practice a 256 MB container
   is comfortable to ~8 MB values and at the wall by 16 MB.
 
+  **It costs memory, not throughput.** Same 256 MB of payload, five value
+  widths, n=3, median MB/s (pg -> ClickHouse, `replace`):
+
+  | value width | rows | median MB/s | median peak RSS |
+  |---|---|---|---|
+  | 1 KiB | 262,144 | 176 | 226 MB |
+  | 16 KiB | 16,384 | 185 | 233 MB |
+  | 256 KiB | 1,024 | 202 | 264 MB |
+  | 4 MiB | 64 | 171 | 494 MB |
+  | 32 MiB | 8 | 144 | 1209 MB |
+
+  Across a 32,000x range in value width the clock moves 1.4x and memory moves
+  5.3x. The 32 MiB row is the noisiest (134-167 MB/s across the three runs)
+  because the whole transfer is eight rows. So the failure to plan for is the
+  container, not the schedule: throughput does not degrade as values grow, it
+  stops when the process is killed.
+
   It corrupts nothing and it is not silent — the container OOMs, loudly.
   `benchmarks/e2e_review_gate.py` leg 3 measures it on every run and reports it
   as a KNOWN GAP rather than passing; the number in that output is the current
