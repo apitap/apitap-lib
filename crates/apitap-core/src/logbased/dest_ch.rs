@@ -790,6 +790,68 @@ impl ChDest {
                     let pred = key_pred(pk_cols, key, &pk_oids)?;
                     self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
                 }
+                ResidueOp::Rekey { old_key, row, .. } => {
+                    // ClickHouse has no cheap row UPDATE, so the move is a
+                    // readback + delete + insert like MaskedUpdate — except the
+                    // readback addresses the OLD key. That is the whole
+                    // difference: the row still exists there, and it is the
+                    // only place the TOASTed value can be found.
+                    let mut full = row.clone();
+                    let missing: Vec<usize> = full
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let old_pred = key_pred(pk_cols, old_key, &pk_oids)?;
+                    if !missing.is_empty() {
+                        let sel = missing
+                            .iter()
+                            .map(|&i| ch_ident(&wal_cols[i]))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let body = self
+                            .ch
+                            .exec(&format!(
+                                "SELECT {sel} FROM {ft} WHERE {old_pred} FORMAT TabSeparated"
+                            ))
+                            .await?;
+                        match body.lines().next() {
+                            Some(line) => {
+                                let fields: Vec<&str> = line.split('\t').collect();
+                                if fields.len() != missing.len() {
+                                    return Err(Error::Transfer(
+                                        "log_based: re-key readback column count mismatch"
+                                            .into(),
+                                    ));
+                                }
+                                for (&i, f) in missing.iter().zip(fields.iter()) {
+                                    full[i] = match tsv_unescape(f) {
+                                        None => Cell::Null,
+                                        Some(v) => Cell::Text(bytes::Bytes::from(v)),
+                                    };
+                                }
+                            }
+                            None => {
+                                // The old key is not there. On a replayed
+                                // window that is the expected shape — the move
+                                // already happened and the row sits at the new
+                                // key — so skip rather than fail. Deleting the
+                                // old key below would be a no-op either way.
+                                continue;
+                            }
+                        }
+                    }
+                    self.ch.exec(&format!("DELETE FROM {ft} WHERE {old_pred}")).await?;
+                    let mut buf = Vec::new();
+                    render_residue_row(&full, oids, &missing, &mut buf)?;
+                    self.ch
+                        .insert_stream(
+                            &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
+                            reqwest::Body::from(buf),
+                        )
+                        .await?;
+                }
             }
         }
 

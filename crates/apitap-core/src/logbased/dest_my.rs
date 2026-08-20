@@ -432,6 +432,33 @@ impl MyDest {
                 ResidueOp::Delete { key } => {
                     format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key, &pk_oids)?)
                 }
+                ResidueOp::Rekey { old_key, row, .. } => {
+                    // Move the row rather than delete-and-reinsert: the columns
+                    // this UPDATE does not name keep their values, and the
+                    // TOASTed cell the source did not resend is one of them.
+                    // The PK columns ARE included, unlike MaskedUpdate — moving
+                    // the key is the point.
+                    let sets = wal_cols
+                        .iter()
+                        .zip(row.iter().zip(oids.iter()))
+                        .filter(|(_, (cell, _))| !matches!(cell, Cell::UnchangedToast))
+                        .map(|(cname, (cell, &oid))| {
+                            Ok(format!("{} = {}", my_ident(cname), my_literal(cell, oid)?))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ");
+                    if sets.is_empty() {
+                        // Unreachable: the key changed, so a PK column carries
+                        // a real value.
+                        continue;
+                    }
+                    // Idempotent on replay: after the move the old key is gone,
+                    // so a re-applied window matches nothing.
+                    format!(
+                        "UPDATE {ft} SET {sets} WHERE {}",
+                        key_pred(pk_cols, old_key, &pk_oids)?
+                    )
+                }
             };
             tx.query_drop(sql).await.map_err(my_err("residue"))?;
         }

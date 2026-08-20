@@ -1,44 +1,52 @@
 """A key-changing UPDATE on a row with an unchanged TOAST column.
 
 Postgres does not re-send a large (externally TOASTed) value when an UPDATE does
-not touch it — the new tuple carries `UnchangedToast` in that slot. apitap's
-collapser handles that by putting the key on a "residue" tail and emitting a
-MaskedUpdate: an `UPDATE ... SET <the columns it does have> WHERE <key>`.
+not touch it — the new tuple carries `UnchangedToast` in that slot. The
+collapser handles that with a residue `MaskedUpdate`: an `UPDATE ... SET <the
+columns it does have> WHERE <key>`.
 
 That is right when the key did not move. When it DID move, the same `update()`
-call has already queued a DELETE for the OLD key, and the MaskedUpdate targets
-the NEW key — which has never existed at the destination. On ClickHouse the
-applier reads the row back first and raises "masked update for a row missing at
-the destination". On a Postgres or MySQL destination it is a plain UPDATE whose
-WHERE matches nothing, nobody checks rows-affected, the window commits and the
-watermark advances.
+call had already queued a DELETE for the OLD key, and the MaskedUpdate targeted
+the NEW key — which never existed at the destination. Measured before the fix,
+pg -> pg:
 
-So the question this leg asks is exactly: after a re-key, is the row still there?
+    source: 3,101,102
+    dest:   3,102          <- the row is gone
+    run:    changes=3, exit 0
 
-  row 1  key change, TOAST untouched   — the case under test
-  row 2  key change, TOAST rewritten   — the control: no UnchangedToast, so the
-                                         ordinary upsert path runs and the row
-                                         must survive. If row 2 also vanishes
-                                         the leg is testing re-keying in
-                                         general, not the masked path.
-  row 3  no key change, TOAST untouched — the other control: MaskedUpdate on a
-                                         key that DOES exist, which is the case
-                                         the residue tail was built for.
+Postgres and MySQL matched zero rows and checked nothing. ClickHouse read the
+row back first and raised, so it failed loudly instead of losing data. Neither
+is acceptable and both came from the same place, so the fix is one op:
+`ResidueOp::Rekey` carries BOTH keys and every destination MOVES the row rather
+than deleting and rewriting it — which carries the untouched value across
+without anyone having to know what it is.
 
-Rows 2 and 3 are what make row 1 mean something. Without them a failure could
-be "apitap cannot re-key at all" or "apitap cannot do masked updates at all",
-and the fix would be aimed at the wrong place.
+Runs against every destination whose applier that change touched, because a fix
+proven on one of four is a fix proven on one of four.
 
-Rig: `apitap-bench-pg-src` on :5544, `apitap-bench-pg-dst` on :5545.
+  case 1  re-key, TOAST untouched     — the bug
+  case 2  re-key, TOAST rewritten     — control: ordinary upsert path
+  case 3  masked update, key unmoved  — control: what the residue tail was for
+  case A  re-key, then a NEW row takes the vacated key in the same window
+  case B  insert and re-key the same row inside one window
+
+Cases 2 and 3 are what make case 1 mean something: without them a failure reads
+as "cannot re-key at all" or "cannot do masked updates at all", and the fix gets
+aimed at the wrong place. A and B exist because moving the row instead of
+deleting it puts the operation in the residue tail, AFTER the set phase — so a
+later INSERT reusing the old key could be dragged along with it. Both keys go
+sticky to prevent that, and reasoning is not evidence.
+
+Rig: `apitap-bench-pg-src` on :5544 (source, always), and as destinations
+`apitap-bench-pg-dst` on :5545, `apitap-bench-my-dst` on :3308, ClickHouse on
+:8124. Pass DESTS to narrow it, e.g. DESTS=ch.
 """
 import os
 import subprocess
 import sys
 
 SRC = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
-DST = os.environ.get("PGD_URL", "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst")
 SRC_C = "apitap-bench-pg-src"
-DST_C = "apitap-bench-pg-dst"
 T = "toast_rekey"
 
 ok = True
@@ -48,19 +56,12 @@ def sh(args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw)
 
 
-def _psql(container, db, sql):
-    o = sh(["docker", "exec", "-i", container, "psql", "-U", "postgres", "-d", db, "-Atc", sql])
+def src(sql):
+    o = sh(["docker", "exec", "-i", SRC_C, "psql", "-U", "postgres",
+            "-d", "apitap_bench_src", "-Atc", sql])
     if o.returncode:
         raise RuntimeError(o.stderr[-400:])
     return o.stdout.strip()
-
-
-def src(sql):
-    return _psql(SRC_C, "apitap_bench_src", sql)
-
-
-def dst(sql):
-    return _psql(DST_C, "apitap_bench_dst", sql)
 
 
 def _slots_now():
@@ -82,83 +83,160 @@ def case(label, good, detail=""):
     ok = ok and bool(good)
 
 
-def drain():
-    code = (
-        "import apitap\n"
-        f"r = apitap.transfer({SRC!r}, {DST!r}, table={T!r}, mode='log_based')\n"
-        "print('ROWS', r.rows, flush=True)\n"
+# ── destinations ───────────────────────────────────────────────────────────
+# Each one answers the same three questions in its own dialect: which ids are
+# here, what does one row look like, and please forget everything about this
+# table. Nothing else about them differs from this leg's point of view.
+def pg_dest():
+    def q(sql):
+        o = sh(["docker", "exec", "-i", "apitap-bench-pg-dst", "psql", "-U", "postgres",
+                "-d", "apitap_bench_dst", "-Atc", sql])
+        if o.returncode:
+            raise RuntimeError(o.stderr[-400:])
+        return o.stdout.strip()
+    return dict(
+        name="postgres",
+        url=os.environ.get("PGD_URL",
+                           "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst"),
+        ids=lambda: q(f"SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM {T}"),
+        row=lambda i: q(f"SELECT note || '/' || length(blob) FROM {T} WHERE id = {i}"),
+        reset=lambda: (q(f"DROP TABLE IF EXISTS {T}"),
+                       q(f"DELETE FROM _apitap_state WHERE dest_table = '{T}'")),
     )
-    return sh([sys.executable, "-c", code])
 
 
-# ---------------------------------------------------------------------------
-print("== setup: a table whose big column really is TOASTed out of line ==")
-src(f"DROP TABLE IF EXISTS {T}")
-# EXTERNAL storage forces the value out of line and uncompressed, so an UPDATE
-# that does not touch it produces UnchangedToast rather than an inline value.
-src(f"CREATE TABLE {T} (id int PRIMARY KEY, note text, blob text)")
-src(f"ALTER TABLE {T} ALTER COLUMN blob SET STORAGE EXTERNAL")
-src(f"INSERT INTO {T} SELECT g, 'note'||g, repeat('z', 40000) FROM generate_series(1,3) g")
-toasted = src(f"SELECT count(*) FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid "
-              f"WHERE c.relname = '{T}' AND t.reltuples <> 0 OR c.relname = '{T}'")
-stored = src(f"SELECT pg_column_size(blob) FROM {T} WHERE id = 1")
-case("the big column is stored out of line", int(stored) > 2000, f"{stored} bytes on-row")
+def my_dest():
+    def q(sql):
+        o = sh(["docker", "exec", "-i", "apitap-bench-my-dst", "mysql", "-uroot",
+                "-pbench", "-N", "-D", "bench", "-e", sql])
+        if o.returncode and "Unknown table" not in o.stderr:
+            # stdout too: mysql puts the password warning on stderr for every
+            # invocation, so stderr alone shows that and never the real cause.
+            raise RuntimeError(f"{sql[:120]} -> {o.stdout.strip()[-200:]} {o.stderr.strip()[-300:]}")
+        return o.stdout.strip()
+    return dict(
+        name="mysql",
+        url=os.environ.get("MYD_URL", "mysql://root:bench@127.0.0.1:3308/bench"),
+        ids=lambda: q(f"SELECT coalesce(group_concat(id ORDER BY id), '') FROM {T}"),
+        # `blob` is a MySQL type keyword; unquoted it is a syntax error.
+        row=lambda i: q(f"SELECT concat(note,'/',length(`blob`)) FROM {T} WHERE id = {i}"),
+        reset=lambda: (q(f"DROP TABLE IF EXISTS {T}"),
+                       q(f"DELETE FROM _apitap_state WHERE dest_table = '{T}'")),
+    )
 
-dst(f"DROP TABLE IF EXISTS {T}")
-dst("DELETE FROM _apitap_state WHERE dest_table = %s" .replace("%s", f"'{T}'")
-    ) if dst("SELECT count(*) FROM information_schema.tables WHERE table_name='_apitap_state'") == "1" else None
-drop_our_slots()
 
-r = drain()
-if r.returncode:
-    case("bootstrap", False, r.stderr.strip()[-400:])
-    print("\nTOAST REKEY E2E: FAILED")
-    raise SystemExit(1)
-case("bootstrap landed all three rows", dst(f"SELECT count(*) FROM {T}") == "3")
+def ch_dest():
+    def q(sql):
+        return sh(["docker", "exec", "-i", "apitap-bench-ch", "clickhouse-client",
+                   "--user", "default", "--password", "bench", "-q", sql]).stdout.strip()
+    return dict(
+        name="clickhouse",
+        url=os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default"),
+        ids=lambda: q(f"SELECT arrayStringConcat(arraySort(groupArray(id)), ',') FROM {T}"),
+        row=lambda i: q(f"SELECT concat(note,'/',toString(length(blob))) FROM {T} WHERE id = {i}"),
+        reset=lambda: (q(f"DROP TABLE IF EXISTS {T}"),
+                       q(f"DROP TABLE IF EXISTS `{T}__apitap_cdc_del`"),
+                       q(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' "
+                         f"SETTINGS mutations_sync=1")),
+    )
 
-# ---------------------------------------------------------------------------
-print("== the three updates, in one transaction ==")
-src(f"""
+
+ALL = {"pg": pg_dest, "my": my_dest, "ch": ch_dest}
+WANT = os.environ.get("DESTS", "pg,my,ch").split(",")
+
+
+def seed(rows):
+    src(f"DROP TABLE IF EXISTS {T}")
+    src(f"CREATE TABLE {T} (id int PRIMARY KEY, note text, blob text)")
+    # EXTERNAL storage forces the value out of line and uncompressed, so an
+    # UPDATE that does not touch it really does produce UnchangedToast rather
+    # than an inline value. Without this the leg passes while testing nothing.
+    src(f"ALTER TABLE {T} ALTER COLUMN blob SET STORAGE EXTERNAL")
+    src(f"INSERT INTO {T} SELECT g, 'note'||g, repeat('z', 40000) "
+        f"FROM generate_series(1,{rows}) g")
+
+
+def run_for(d):
+    global ok
+    print(f"\n════════ destination: {d['name']} ════════")
+
+    def drain():
+        code = ("import apitap\n"
+                f"r = apitap.transfer({SRC!r}, {d['url']!r}, table={T!r}, mode='log_based')\n"
+                "print('ROWS', r.rows, flush=True)\n")
+        return sh([sys.executable, "-c", code])
+
+    # ── the bug and its two controls ───────────────────────────────────────
+    seed(3)
+    stored = src(f"SELECT pg_column_size(blob) FROM {T} WHERE id = 1")
+    case("the big column is stored out of line", int(stored) > 2000, f"{stored} bytes")
+    d["reset"]()
+    drop_our_slots()
+    r = drain()
+    if r.returncode:
+        case("bootstrap", False, r.stderr.strip()[-400:])
+        return
+    case("bootstrap landed all three rows", d["ids"]() == "1,2,3", d["ids"]())
+
+    src(f"""
 BEGIN;
-UPDATE {T} SET id = 101, note = 'rekeyed-masked'   WHERE id = 1;
+UPDATE {T} SET id = 101, note = 'rekeyed-masked' WHERE id = 1;
 UPDATE {T} SET id = 102, note = 'rekeyed-full', blob = repeat('y', 40000) WHERE id = 2;
-UPDATE {T} SET note = 'same-key-masked'            WHERE id = 3;
+UPDATE {T} SET note = 'same-key-masked' WHERE id = 3;
 COMMIT;
 """)
-src_ids = src(f"SELECT string_agg(id::text, ',' ORDER BY id) FROM {T}")
-case("the source now holds exactly the re-keyed rows", src_ids == "3,101,102", src_ids)
+    want = src(f"SELECT string_agg(id::text, ',' ORDER BY id) FROM {T}")
+    r = drain()
+    case("the drain succeeds", r.returncode == 0, r.stderr.strip()[-250:])
+    got = d["ids"]()
+    print(f"   source: {want}\n   dest:   {got}")
+    case("control: re-key with the TOAST column REWRITTEN survives", "102" in got.split(","))
+    case("control: masked update on a key that did NOT move survives", "3" in got.split(","))
+    case("re-key with the TOAST column UNTOUCHED survives", "101" in got.split(","), got)
+    if "101" in got.split(","):
+        case("and it carries the new note AND the untouched blob",
+             d["row"](101) == "rekeyed-masked/40000", d["row"](101))
+    case("the destination agrees with the source exactly", got == want, f"{want} vs {got}")
 
-r = drain()
-case("the drain succeeds", r.returncode == 0, r.stderr.strip()[-300:])
+    # ── the two ordering cases the fix's stickiness has to get right ───────
+    seed(2)
+    d["reset"]()
+    drop_our_slots()
+    r = drain()
+    case("bootstrap for the ordering cases", r.returncode == 0 and d["ids"]() == "1,2")
+    src(f"""
+BEGIN;
+UPDATE {T} SET id = 201, note = 'moved' WHERE id = 1;
+INSERT INTO {T} VALUES (1, 'brand-new', repeat('w', 40000));
+INSERT INTO {T} VALUES (300, 'fresh', repeat('v', 40000));
+UPDATE {T} SET id = 301, note = 'fresh-moved' WHERE id = 300;
+COMMIT;
+""")
+    want = src(f"SELECT string_agg(id::text, ',' ORDER BY id) FROM {T}")
+    r = drain()
+    case("the ordering drain succeeds", r.returncode == 0, r.stderr.strip()[-250:])
+    got = d["ids"]()
+    print(f"   source: {want}\n   dest:   {got}")
+    case("A: the key a re-key vacated can be reused in the same window",
+         got == want, f"{want} vs {got}")
+    if got == want:
+        case("A: the new row stayed put and the moved row kept its blob",
+             d["row"](1) == "brand-new/40000" and d["row"](201) == "moved/40000",
+             f"id=1 {d['row'](1)}  id=201 {d['row'](201)}")
+        case("B: insert-then-re-key in one window lands once, with its blob",
+             d["row"](301) == "fresh-moved/40000", d["row"](301))
 
-# ---------------------------------------------------------------------------
-print("== what survived at the destination ==")
-dst_ids = dst(f"SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM {T}")
-print(f"   source: {src_ids}")
-print(f"   dest:   {dst_ids}")
+    src(f"DROP TABLE IF EXISTS {T}")
+    d["reset"]()
+    drop_our_slots()
 
-case("row 2 survived — key change with the TOAST column REWRITTEN (control)",
-     "102" in dst_ids.split(","), dst_ids)
-case("row 3 survived — masked update on a key that did NOT move (control)",
-     "3" in dst_ids.split(","), dst_ids)
-case("row 1 survived — key change with the TOAST column UNTOUCHED",
-     "101" in dst_ids.split(","), dst_ids)
 
-if "101" in dst_ids.split(","):
-    n1 = dst(f"SELECT note FROM {T} WHERE id = 101")
-    b1 = dst(f"SELECT length(blob) FROM {T} WHERE id = 101")
-    case("and it carries both the new note and the old blob",
-         n1 == "rekeyed-masked" and b1 == "40000", f"note={n1} blob_len={b1}")
-
-case("the destination agrees with the source exactly", dst_ids == src_ids,
-     f"src {src_ids} vs dst {dst_ids}")
-
-# ---------------------------------------------------------------------------
-print("== cleanup ==")
-src(f"DROP TABLE IF EXISTS {T}")
-dst(f"DROP TABLE IF EXISTS {T}")
-dst(f"DELETE FROM _apitap_state WHERE dest_table = '{T}'")
-drop_our_slots()
+for k in WANT:
+    k = k.strip()
+    if k in ALL:
+        run_for(ALL[k]())
+    else:
+        print(f"   .. unknown destination {k!r}, skipped")
 
 print("\nTOAST REKEY E2E: " + ("PASSED" if ok else "FAILED"))
 raise SystemExit(0 if ok else 1)

@@ -296,6 +296,33 @@ impl PgDest {
                 ResidueOp::Delete { key } => {
                     format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key))
                 }
+                ResidueOp::Rekey { old_key, row, .. } => {
+                    // Move the row rather than delete-and-reinsert. The columns
+                    // this UPDATE does not name keep their values, and the one
+                    // that matters here — the TOASTed cell the source did not
+                    // resend — is exactly such a column.
+                    //
+                    // The PK columns ARE included, unlike MaskedUpdate: moving
+                    // the key is the entire point.
+                    let sets = wal_cols
+                        .iter()
+                        .zip(row.iter())
+                        .filter(|(_, cell)| !matches!(cell, Cell::UnchangedToast))
+                        .map(|(cname, cell)| {
+                            format!("{} = {}", quote_ident(cname), cell_literal(cell))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if sets.is_empty() {
+                        // Unreachable: the key changed, so at least one PK
+                        // column carries a real value.
+                        continue;
+                    }
+                    // Idempotent on replay by construction: once the move has
+                    // been applied the old key is gone, so a re-applied window
+                    // matches zero rows and changes nothing.
+                    format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, old_key))
+                }
             };
             tx.execute(sql.as_str()).await.map_err(db_err)?;
         }

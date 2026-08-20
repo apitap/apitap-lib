@@ -81,6 +81,37 @@ pub(crate) fn resolve_window<'a>(c: &'a Collapsed, pk_idx: &[usize]) -> Vec<(Key
                 };
                 put(&mut order, &mut index, key.clone(), fin);
             }
+            ResidueOp::Rekey { old_key, new_key, row } => {
+                // The row moves: the old key ends up Gone, the new key takes
+                // the image. The TOASTed cells the source did not resend are
+                // patched from whatever this window already knows about the
+                // OLD key — that is where the row still is. If nothing in the
+                // window carries it, the hole survives as Refetch and the
+                // destination resolves it the way it resolves any other one
+                // (iceberg refetches from the source; BigQuery masks the column
+                // and lets the MERGE keep the target's value).
+                let base: Option<Vec<Cell>> =
+                    index.get(old_key).and_then(|&i| match &order[i].1 {
+                        Fin::Row(b) => Some(b.to_vec()),
+                        Fin::Owned(b) | Fin::Refetch(b) => Some(b.clone()),
+                        Fin::Gone => None,
+                    });
+                let mut patched = row.clone();
+                if let Some(b) = base {
+                    for (cell, bc) in patched.iter_mut().zip(b.iter()) {
+                        if matches!(cell, Cell::UnchangedToast) {
+                            *cell = bc.clone();
+                        }
+                    }
+                }
+                put(&mut order, &mut index, old_key.clone(), Fin::Gone);
+                let fin = if patched.iter().any(|x| matches!(x, Cell::UnchangedToast)) {
+                    Fin::Refetch(patched)
+                } else {
+                    Fin::Owned(patched)
+                };
+                put(&mut order, &mut index, new_key.clone(), fin);
+            }
         }
     }
     order

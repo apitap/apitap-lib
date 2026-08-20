@@ -53,6 +53,20 @@ pub(crate) enum ResidueOp {
     Upsert { row: Vec<Cell> },
     /// Delete of a key that previously went masked.
     Delete { key: Key },
+    /// A key-changing UPDATE whose new image is missing its TOASTed cells.
+    ///
+    /// This cannot be expressed as delete-old + write-new: the new image does
+    /// not contain the TOASTed value, and the delete phase runs FIRST, so by
+    /// the time anything could read the old row it is gone. The row is MOVED
+    /// instead — one `UPDATE ... SET <pk = new>, <changed cols> WHERE <old
+    /// key>` carries the untouched value across without anyone having to know
+    /// what it is.
+    ///
+    /// Carrying both keys is what lets every destination do that: the OLTP
+    /// appliers address the old key, ClickHouse reads its missing cells back
+    /// from the old key before replacing the row, and `resolve.rs` folds the
+    /// old key to `Gone` and the new key to the patched image.
+    Rekey { old_key: Key, new_key: Key, row: Vec<Cell> },
 }
 
 #[derive(Debug)]
@@ -160,14 +174,43 @@ impl Collapser {
     pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple) -> Result<()> {
         self.events += 1;
         let new_key = self.key_of_row(&row)?;
+        let toast = row.has_toast();
         if let Some(old) = old {
             let old_key = self.key_of_old(old)?;
             if old_key != new_key {
+                if toast {
+                    // Identity changed AND the new image is masked. Deleting
+                    // the old row and writing the new one loses the TOASTed
+                    // value: the write has no value to carry, and the delete
+                    // phase has already run by the time anything could read it
+                    // back. Before this existed, the pair became
+                    // delete(old) + MaskedUpdate(new) — an UPDATE against a key
+                    // that had never existed at the destination, which matched
+                    // zero rows on Postgres and MySQL and made the row vanish
+                    // while the run reported success.
+                    //
+                    // Move the row instead. Both keys go sticky: the new one
+                    // for the usual reason, and the OLD one so that a later
+                    // INSERT reusing that key lands in the ordered tail AFTER
+                    // this move rather than in the set phase before it — where
+                    // this UPDATE would pick it up and move the wrong row.
+                    self.residue.push(ResidueOp::Rekey {
+                        old_key: old_key.clone(),
+                        new_key: new_key.clone(),
+                        row: row.to_cells(),
+                    });
+                    // A set-phase upsert already queued for the old key stays
+                    // queued: it lands first, and the move then carries it to
+                    // the new key with its real TOAST value. That is the
+                    // insert-then-rekey case, and it is correct.
+                    self.map.insert(old_key, Slot::Residue);
+                    self.map.insert(new_key, Slot::Residue);
+                    return Ok(());
+                }
                 // Identity changed: the old row must die.
                 self.put_delete(old_key);
             }
         }
-        let toast = row.has_toast();
         match self.map.entry(new_key) {
             Entry::Occupied(mut e) => match *e.get() {
                 Slot::Residue => {
