@@ -85,7 +85,8 @@ impl PgSink {
         };
         let staging_t = quote_ident_path(&format!(
             "{schema_pfx}{}",
-            crate::sink::staging_ident(&bare, crate::sink::PG_IDENT_MAX)
+            crate::naming::artifact_ident(
+                &bare, crate::naming::Artifact::Staging, crate::naming::PG_IDENT_MAX)
         ));
         let schema = schema_pfx.trim_end_matches('.').to_string();
         let schema = if schema.is_empty() {

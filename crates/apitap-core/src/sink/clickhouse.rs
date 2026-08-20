@@ -777,7 +777,8 @@ impl ChSink {
         Ok(Self {
             ch,
             final_t: ch_ident(dest_bare),
-            staging_t: ch_ident(&format!("{dest_bare}__apitap_staging")),
+            staging_t: ch_ident(&crate::naming::artifact_ident(
+                dest_bare, crate::naming::Artifact::Staging, crate::naming::ROOMY)),
             final_bare: dest_bare.to_string(),
             source_id: None,
             cursor_col: None,
@@ -1466,7 +1467,9 @@ impl crate::sink::Sink for ChSink {
                                 self.final_t
                             )));
                         }
-                        let tmp = ch_ident(&format!("{}__apitap_new", self.final_bare));
+                        let tmp = ch_ident(&crate::naming::artifact_ident(
+                            &self.final_bare, crate::naming::Artifact::New,
+                            crate::naming::ROOMY));
                         self.ch
                             .exec(&format!("DROP TABLE IF EXISTS {tmp}{oc}"))
                             .await?;

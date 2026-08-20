@@ -123,7 +123,10 @@ impl BqDest {
         }
         let table = bare(dest_table);
         self.conn.cdc_delete_table(&cdc_staging(table)).await?;
-        self.conn.cdc_delete_table(&format!("{table}__apitap_cl")).await?;
+        self.conn
+            .cdc_delete_table(&crate::naming::artifact_ident(
+                table, crate::naming::Artifact::ChangelogTmp, crate::naming::ROOMY))
+            .await?;
         self.cluster_target(table, pk_cols, rows).await?;
         self.conn.cdc_ensure_state_table().await?;
         self.write_state(table, source_id, lsn, rows).await
@@ -227,7 +230,8 @@ impl BqDest {
             // rebuilt table is sitting there under its temp name, complete.
             // Finish the move rather than declaring the destination lost.
             None => {
-                let tmp = format!("{table}__apitap_cl");
+                let tmp = crate::naming::artifact_ident(
+                    table, crate::naming::Artifact::ChangelogTmp, crate::naming::ROOMY);
                 if self.conn.table_get(&tmp).await?.is_some() {
                     self.conn
                         .cdc_script(&format!(

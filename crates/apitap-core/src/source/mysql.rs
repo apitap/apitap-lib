@@ -838,15 +838,15 @@ impl Source for MySqlSource {
         }
         // Whole schema (None = the URL's database). BASE TABLE only — views are
         // derived data; apitap's own staging/state artifacts never travel.
-        let rows = sqlx::query(
+        // Exclusion GENERATED from `naming::Artifact::ALL` — see the note on the
+        // Postgres side; the hand-written clause covered three of eight.
+        let rows = sqlx::query(&format!(
             "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(COALESCE(TABLE_ROWS, -1) AS SIGNED) AS est \
              FROM information_schema.tables \
-             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_TYPE = 'BASE TABLE' \
-               AND TABLE_NAME NOT LIKE '%|_|_apitap|_staging' ESCAPE '|' \
-               AND TABLE_NAME NOT LIKE '%|_|_apitap|_old' ESCAPE '|' \
-               AND TABLE_NAME <> '_apitap_state' \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_TYPE = 'BASE TABLE'{} \
              ORDER BY TABLE_ROWS DESC",
-        )
+            crate::naming::sql_exclusion("TABLE_NAME", crate::naming::Dialect::MySql),
+        ))
         .bind(schema)
         .fetch_all(&self.pool)
         .await

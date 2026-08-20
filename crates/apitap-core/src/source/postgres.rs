@@ -140,7 +140,11 @@ impl Source for PgSource {
         // listing both would move every row twice. A child whose parent lives in
         // ANOTHER schema stays listed (its parent isn't in this run — dropping it
         // would silently omit its rows). apitap's own artifacts never travel.
-        let rows = sqlx::query(
+        // The artifact exclusion is GENERATED from `naming::Artifact::ALL`, not
+        // written here: the hand-written version listed three of the eight
+        // artifacts, so a schema= transfer picked up apitap's own scratch
+        // objects as if a user had made them.
+        let rows = sqlx::query(&format!(
             "SELECT n.nspname || '.' || c.relname AS name, \
                     CASE WHEN c.reltuples < 0 THEN -1 ELSE c.reltuples::bigint END AS est \
              FROM pg_class c \
@@ -150,12 +154,10 @@ impl Source for PgSource {
                AND NOT EXISTS (SELECT 1 FROM pg_inherits i \
                                JOIN pg_class p ON p.oid = i.inhparent \
                                JOIN pg_namespace pn ON pn.oid = p.relnamespace \
-                               WHERE i.inhrelid = c.oid AND pn.nspname = $1) \
-               AND c.relname NOT LIKE '%\\_\\_apitap\\_staging' \
-               AND c.relname NOT LIKE '%\\_\\_apitap\\_old' \
-               AND c.relname <> '_apitap_state' \
+                               WHERE i.inhrelid = c.oid AND pn.nspname = $1){} \
              ORDER BY c.reltuples DESC",
-        )
+            crate::naming::sql_exclusion("c.relname", crate::naming::Dialect::Postgres),
+        ))
         .bind(schema)
         .fetch_all(&self.pool)
         .await

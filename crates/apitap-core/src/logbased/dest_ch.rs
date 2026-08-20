@@ -262,7 +262,8 @@ impl ChDest {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let tmp = ch_ident(&format!("{dest_table}__apitap_cl"));
+        let tmp = ch_ident(&crate::naming::artifact_ident(
+            dest_table, crate::naming::Artifact::ChangelogTmp, crate::naming::ROOMY));
         self.ch.exec(&format!("DROP TABLE IF EXISTS {tmp}")).await?;
         self.ch
             .exec(&format!(
@@ -627,7 +628,8 @@ impl ChDest {
         // Clear the delete-set ∪ every upsert key first, so the insert phase
         // is a plain bulk INSERT (same move as the pg apply).
         if !c.deletes.is_empty() || !c.upserts.is_empty() {
-            let del = ch_ident(&format!("{dest_table}__apitap_cdc_del"));
+            let del = ch_ident(&crate::naming::artifact_ident(
+                dest_table, crate::naming::Artifact::CdcDelete, crate::naming::ROOMY));
             // The key table is built ONCE per run and truncated per window. The
             // old DROP → CREATE → … → DROP cycle spent three HTTP round trips of
             // pure ceremony on every window of every table, and at ~20k events

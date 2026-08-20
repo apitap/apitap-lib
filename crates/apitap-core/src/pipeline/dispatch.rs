@@ -509,10 +509,32 @@ async fn jobs_for<S: crate::source::Source>(
             )));
         }
     }
+    // Naming one of apitap's own artifacts as a table to transfer is always a
+    // mistake — most often a `schema=` run against a destination that apitap
+    // itself has written to. Discovery hides them now, but an explicit
+    // `tables=[...]` can still reach one, and copying a half-written staging
+    // table somewhere is never what anybody meant.
+    for key in &seen {
+        let bare = key.rsplit_once('.').map_or(key.as_str(), |(_, t)| t);
+        if crate::naming::is_artifact(bare) {
+            return Err(Error::InvalidInput(format!(
+                "'{key}' is one of apitap's own working tables, not a table to \
+                 transfer — it holds a partial load or replication state, and \
+                 its contents are meaningless outside the run that made it"
+            )));
+        }
+    }
     // A sibling named like another table's staging artifact would get DROPped by
     // that table's prepare mid-run — reserve the `__apitap_*` namespace up front.
     for key in &seen {
-        for suffix in ["__apitap_staging", "__apitap_old"] {
+        // Derived from the enum, never a literal list: this reserved exactly
+        // two of the nine suffixes in use, so a user table named like any of
+        // the other seven was silently destroyed by a sibling's run.
+        for suffix in crate::naming::Artifact::ALL
+            .iter()
+            .filter(|a| a.reserved())
+            .map(|a| a.suffix())
+        {
             if let Some(base) = key.strip_suffix(suffix) {
                 if seen.contains(base) {
                     return Err(Error::InvalidInput(format!(
@@ -749,6 +771,12 @@ mod tests {
         let err = jobs_for(&src, &TableSel::Schema(Some("public")), true)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("staging artifacts"));
+        // The message changed when the artifact guard moved ahead of the
+        // sibling-collision check: naming one of apitap's own working tables
+        // is refused outright now, whether or not its base table is in the
+        // same run. Assert on the property, not on the older wording.
+        let msg = err.to_string();
+        assert!(msg.contains("working tables") || msg.contains("staging artifacts"),
+                "unexpected refusal: {msg}");
     }
 }
