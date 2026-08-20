@@ -83,7 +83,10 @@ impl PgSink {
             Some((s, t)) => (format!("{s}."), t.to_string()),
             None => (String::new(), dest_table.to_string()),
         };
-        let staging_t = quote_ident_path(&format!("{schema_pfx}{bare}__apitap_staging"));
+        let staging_t = quote_ident_path(&format!(
+            "{schema_pfx}{}",
+            crate::sink::staging_ident(&bare, crate::sink::PG_IDENT_MAX)
+        ));
         let schema = schema_pfx.trim_end_matches('.').to_string();
         let schema = if schema.is_empty() {
             "public".into()

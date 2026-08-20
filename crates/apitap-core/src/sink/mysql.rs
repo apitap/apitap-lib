@@ -248,7 +248,7 @@ impl MySqlSink {
             registry: shared.registry,
             next_id: shared.next_id,
             db: shared.db,
-            staging: format!("{bare}__apitap_staging"),
+            staging: crate::sink::staging_ident(&bare, crate::sink::MY_IDENT_MAX),
             bare: bare.to_string(),
             cols: Vec::new(),
             source_id: None,
@@ -518,7 +518,7 @@ impl crate::sink::Sink for MySqlSink {
         // clear it so the next replace's RENAME can't collide (error 1050).
         self.exec(&format!(
             "DROP TABLE IF EXISTS {}",
-            self.fq(&format!("{}__apitap_old", self.bare))
+            self.fq(&crate::sink::apitap_ident(&self.bare, "__apitap_old", crate::sink::MY_IDENT_MAX))
         ))
         .await?;
         self.exec(&format!(
@@ -806,7 +806,8 @@ impl crate::sink::Sink for MySqlSink {
                     > 0;
                 if exists {
                     // Atomic across both tables: readers never see it missing.
-                    let old = format!("{}__apitap_old", self.bare);
+                    let old = crate::sink::apitap_ident(
+                        &self.bare, "__apitap_old", crate::sink::MY_IDENT_MAX);
                     self.exec(&format!(
                         "RENAME TABLE {final} TO {old}, {staging} TO {final}",
                         final = self.fq(&self.bare),

@@ -6,6 +6,7 @@
 //! the same database's source lives in [`crate::dialect`].
 
 use crate::error::{Error, Result};
+use md5::Digest;
 use crate::plan::{DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
 use std::future::Future;
@@ -183,4 +184,117 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// mode. `mode` here is the EFFECTIVE mode (a bootstrapped incremental run gets
     /// `Replace`).
     fn finalize(&self, rows: u64, mode: Mode) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// `<bare>__apitap_staging`, kept inside a dialect's identifier limit.
+///
+/// The obvious `format!("{bare}__apitap_staging")` is wrong at the edges, and
+/// wrong in a way that is hard to see. Postgres truncates identifiers at 63
+/// bytes, so a 63-character destination produced a staging name IDENTICAL to
+/// the destination. `prepare`'s unconditional `DROP TABLE IF EXISTS <staging>`
+/// then aimed at the destination itself, and every run ended with
+///
+///     rename staging: relation "txxx…" does not exist
+///
+/// *after* the data had landed — the finalize transaction rolled back the DROP
+/// and left the freshly loaded table sitting under the destination's name. So
+/// the run reported failure while having changed the destination table, which
+/// is the one thing this library promises never happens.
+///
+/// Two different tables sharing a long prefix collided the same way: at 48
+/// characters or more the suffix starts getting cut, and everything past the
+/// limit is simply the same name.
+///
+/// Truncating the BARE part instead keeps the whole suffix — which is what
+/// makes the object recognisable as ours, sweepable, and excluded from table
+/// discovery — and a short hash of the FULL original name keeps distinct
+/// tables distinct. The hash is md5 because it is already a dependency and
+/// this is a naming aid, not a security boundary.
+pub(crate) fn staging_ident(bare: &str, limit: usize) -> String {
+    apitap_ident(bare, "__apitap_staging", limit)
+}
+
+/// The same, for any of apitap's `__apitap_*` sidecar names.
+///
+/// There is more than one: MySQL's swap parks the outgoing table at
+/// `<bare>__apitap_old` between its two RENAMEs. That suffix overflows just as
+/// readily, and MySQL does not truncate — it REJECTS the statement — so a
+/// 64-character table simply could not be replaced, with the error naming an
+/// identifier the user never wrote. Postgres is the more dangerous of the two
+/// precisely because it accepts the name and silently shortens it.
+pub(crate) fn apitap_ident(bare: &str, suffix: &str, limit: usize) -> String {
+    const HASH: usize = 8;
+    if bare.len() + suffix.len() <= limit {
+        return format!("{bare}{suffix}");
+    }
+    // `limit` is a byte count and `bare` may be UTF-8, so cut on a char
+    // boundary rather than slicing blind.
+    let room = limit.saturating_sub(suffix.len() + HASH + 1);
+    let mut head = String::with_capacity(room);
+    for c in bare.chars() {
+        if head.len() + c.len_utf8() > room {
+            break;
+        }
+        head.push(c);
+    }
+    // Hash the suffix in as well: two different sidecars of the same
+    // over-long table are truncated to the same head, and only the suffix
+    // would tell them apart otherwise.
+    let h = hex::encode(md5::Md5::digest(format!("{bare}{suffix}").as_bytes()));
+    format!("{head}_{}{suffix}", &h[..HASH])
+}
+
+/// Identifier byte limits, per dialect. Postgres is NAMEDATALEN-1; MySQL
+/// allows 64 for a table name.
+pub(crate) const PG_IDENT_MAX: usize = 63;
+pub(crate) const MY_IDENT_MAX: usize = 64;
+
+#[cfg(test)]
+mod staging_ident_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_name_is_left_alone() {
+        assert_eq!(staging_ident("orders", PG_IDENT_MAX), "orders__apitap_staging");
+    }
+
+    /// The case that made every run fail while changing the destination: at
+    /// exactly 63 characters the suffix used to truncate away completely.
+    #[test]
+    fn a_max_length_name_never_collapses_onto_itself() {
+        let bare = "t".repeat(63);
+        let st = staging_ident(&bare, PG_IDENT_MAX);
+        assert!(st.len() <= PG_IDENT_MAX, "{} bytes", st.len());
+        assert_ne!(st, bare, "staging must not be the destination");
+        assert!(st.ends_with("__apitap_staging"), "{st}");
+    }
+
+    /// Two tables sharing a long prefix must not share a staging object.
+    #[test]
+    fn a_shared_prefix_does_not_produce_a_shared_staging_name() {
+        let a = format!("{}_alpha", "p".repeat(60));
+        let b = format!("{}_beta", "p".repeat(60));
+        let (sa, sb) = (staging_ident(&a, PG_IDENT_MAX), staging_ident(&b, PG_IDENT_MAX));
+        assert_ne!(sa, sb, "{sa} vs {sb}");
+        assert!(sa.len() <= PG_IDENT_MAX && sb.len() <= PG_IDENT_MAX);
+    }
+
+    /// The same source name must always produce the same staging name, or the
+    /// sweep that removes a crashed run's leftovers can never find them.
+    #[test]
+    fn the_name_is_deterministic() {
+        let bare = "z".repeat(80);
+        assert_eq!(staging_ident(&bare, PG_IDENT_MAX), staging_ident(&bare, PG_IDENT_MAX));
+    }
+
+    /// A multi-byte name must not be cut through the middle of a character.
+    #[test]
+    fn a_utf8_name_is_cut_on_a_character_boundary() {
+        let bare = "\u{e9}".repeat(60); // 120 bytes
+        let st = staging_ident(&bare, PG_IDENT_MAX);
+        assert!(st.len() <= PG_IDENT_MAX, "{} bytes", st.len());
+        assert!(st.ends_with("__apitap_staging"));
+        // The assertion is that this line runs at all: a blind byte slice
+        // would have panicked inside staging_ident.
+    }
 }
