@@ -121,11 +121,59 @@ impl ChDest {
         Ok(())
     }
 
+    /// Refuse a clustered (Replicated*) destination table, loudly, before the
+    /// CDC apply touches it.
+    ///
+    /// Every object this file creates for itself — the `_apitap_state`
+    /// watermark, the per-window `__apitap_cdc_del` key table, the changelog
+    /// rebuild and its `__current` view — is node-local DDL, no ON CLUSTER.
+    /// The bootstrap rides the bulk sink, which DOES thread on_cluster, so on
+    /// a cluster the destination table would exist on every node while
+    /// apitap's sidecars existed only on whichever node the balancer happened
+    /// to route. A later drain lands where they are missing — or reads a
+    /// stale node-local watermark and silently skips a window, the one
+    /// failure the state table exists to prevent. Until this file can emit
+    /// cluster-wide DDL (and survive a balancer BETWEEN statements — the
+    /// apply order assumes every step sees the previous step's writes), a
+    /// clustered destination is refused rather than silently diverged.
+    ///
+    /// The verdict comes from the destination itself, not from the run's
+    /// options: the bulk sink only accepts on_cluster with a Replicated*
+    /// engine, and a pre-created Replicated table diverges exactly the same
+    /// way with no options passed at all — so the table's ENGINE is the fact
+    /// to ask for. Memoized per table, but only once the table has actually
+    /// been SEEN: a table that does not exist yet passes (there is nothing to
+    /// diverge from), and is asked again by the first state write after the
+    /// bootstrap has created it.
+    async fn refuse_clustered(&self, dest_table: &str) -> Result<()> {
+        let key = format!("\u{1}cluster\u{1}{dest_table}");
+        if self.ensured.lock().unwrap().contains(&key) {
+            return Ok(());
+        }
+        let eng = self
+            .ch
+            .exec(&format!(
+                "SELECT engine FROM system.tables WHERE database = currentDatabase() \
+                 AND name = '{t}'",
+                t = ch_str(dest_table),
+            ))
+            .await?;
+        ch_engine_ok(dest_table, eng.trim())?;
+        if !eng.trim().is_empty() {
+            self.ensured.lock().unwrap().insert(key);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn read_state(
         &self,
         dest_table: &str,
         source_id: &str,
     ) -> Result<Option<u64>> {
+        // Run admission: read_state is the FIRST thing a run asks this
+        // destination, for every table — the moment to notice a clustered
+        // target and refuse before a bootstrap or a drain moves any data.
+        self.refuse_clustered(dest_table).await?;
         let sql = format!(
             "SELECT watermark, cursor_col, mode FROM `_apitap_state` FINAL \
              WHERE dest_table = '{}' AND source_id = '{}' \
@@ -186,6 +234,9 @@ impl ChDest {
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
+        // The rebuild below DROPs and RENAMEs the destination table itself —
+        // on a cluster that would tear it down on ONE node. Refused first.
+        self.refuse_clustered(dest_table).await?;
         let ft = ch_ident(dest_table);
         // Already a changelog (a re-bootstrap of a table we own)? Leave it.
         //
@@ -416,6 +467,10 @@ impl ChDest {
         lsn: u64,
         rows: u64,
     ) -> Result<()> {
+        // Before the state table's node-local CREATE — this is the first
+        // destination write on a fresh bootstrap (the table did not exist at
+        // run admission, so the engine gets asked here, post-creation).
+        self.refuse_clustered(dest_table).await?;
         self.ensure_state_table().await?;
         self.ch
             .exec(&format!(
@@ -499,6 +554,9 @@ impl ChDest {
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
+        // Memoized no-op in steady state; here so no window ever writes to a
+        // table that turned Replicated under us mid-run.
+        self.refuse_clustered(dest_table).await?;
         let Some(c) = outcome.changes.get(qualified_src) else {
             self.write_state(dest_table, source_id, outcome.end_lsn, 0).await?;
             return Ok(0);
@@ -602,6 +660,8 @@ impl ChDest {
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
+        // Same guard as apply_changelog: before the window's first DDL.
+        self.refuse_clustered(dest_table).await?;
         let Some(c) = outcome.tables.get(qualified_src) else {
             // Foreign-table traffic only: nothing for our table, still advance.
             self.write_state(dest_table, source_id, outcome.end_lsn, 0).await?;
@@ -889,6 +949,55 @@ fn ch_partition_expr(spec: Option<&str>) -> String {
     }
 }
 
+/// The refusal itself, split from the probe so it can be unit-tested: given
+/// the destination table's engine exactly as `system.tables` reports it, may
+/// the CDC apply run against this table? `Replicated*` means a cluster, and
+/// this file's sidecars are node-local (see [`ChDest::refuse_clustered`]).
+/// An empty string — the table does not exist yet — passes. So does
+/// ClickHouse Cloud's `Shared*` family: there the whole service shares one
+/// catalog, so a node-local CREATE is visible from every node.
+fn ch_engine_ok(dest_table: &str, engine: &str) -> Result<()> {
+    if !engine.starts_with("Replicated") {
+        return Ok(());
+    }
+    // The escape hatch exists because the refusal below is broader than the
+    // defect. A Replicated destination reached through a BALANCER is genuinely
+    // broken — the sidecars land wherever the balancer went. A Replicated
+    // destination reached at a FIXED node is not: the data replicates through
+    // the engine, the sidecars stay on that node, and every drain finds them
+    // because every drain dials the same address. That configuration works
+    // today, and refusing it outright would break a working pipeline to
+    // protect it from a hazard it does not have.
+    //
+    // So: refuse by default, because a balancer is the common shape and silent
+    // divergence is the worst outcome; and let an operator who knows their URL
+    // names one node say so. Deliberately an env var and not a keyword
+    // argument — it is a statement about the DEPLOYMENT, not about the
+    // transfer, and the next person to write the same call in a different
+    // place should not have to remember it.
+    if std::env::var("APITAP_CH_CDC_ALLOW_REPLICATED").as_deref() == Ok("1") {
+        crate::progress::note(&format!(
+            "{dest_table} is {engine}; APITAP_CH_CDC_ALLOW_REPLICATED=1 — apitap's \
+             own CDC objects stay node-local, so every run must reach the SAME \
+             node or the watermark it reads will not be the one it wrote"
+        ));
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "log_based: ClickHouse destination {dest_table} is {engine} — a replicated \
+         (cluster) table. The bootstrap's bulk load can ride on_cluster, but the \
+         CDC apply cannot yet: the objects it creates for itself (the _apitap_state \
+         watermark, the per-window __apitap_cdc_del key table, the changelog \
+         rebuild and its __current view) are node-local, so on a cluster they \
+         would exist only on the node the balancer routed — a later drain lands \
+         where they are missing, or reads a stale watermark and silently skips a \
+         window. Point log_based at a non-replicated destination table (bulk \
+         modes keep full on_cluster support). If your URL names ONE node \
+         rather than a balancer, apitap's node-local objects are consistent \
+         there and you can set APITAP_CH_CDC_ALLOW_REPLICATED=1"
+    )))
+}
+
 /// One verdict for "the destination's shape matches the mode", shared by both
 /// analytical destinations so the two engines say the same thing.
 pub(crate) fn is_shape_ok(
@@ -1017,7 +1126,25 @@ fn render_residue_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{ch_partition_expr, cl_nullable};
+    use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
+
+    #[test]
+    fn a_replicated_destination_is_refused_not_silently_diverged() {
+        // The bulk sink only grants on_cluster to Replicated* engines, so a
+        // Replicated destination IS the cluster case — and the apply's
+        // node-local sidecars may not silently land on one node of it.
+        assert!(ch_engine_ok("orders", "ReplicatedMergeTree").is_err());
+        assert!(ch_engine_ok("orders", "ReplicatedReplacingMergeTree").is_err());
+        // The near-miss that a sloppier prefix would also refuse: Replacing
+        // is not Replicated.
+        assert!(ch_engine_ok("orders", "ReplacingMergeTree").is_ok());
+        assert!(ch_engine_ok("orders", "MergeTree").is_ok());
+        // ClickHouse Cloud shares ONE catalog across the whole service, so a
+        // node-local CREATE is visible everywhere — Shared* stays allowed.
+        assert!(ch_engine_ok("orders", "SharedMergeTree").is_ok());
+        // No table yet: nothing to diverge from, the bootstrap decides.
+        assert!(ch_engine_ok("orders", "").is_ok());
+    }
 
     #[test]
     fn a_bare_column_name_means_monthly_on_clickhouse_too() {
