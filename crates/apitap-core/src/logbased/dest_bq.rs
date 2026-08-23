@@ -79,6 +79,12 @@ impl BqDest {
             sid = sql_str(source_id),
         );
         let rows = self.conn.cdc_query(&sql).await?;
+        // That SELECT paid for the table's whole append-only history (one row
+        // per applied window, forever); past the threshold, fold it down to
+        // the newest row per key. Best-effort — an error is noted inside and
+        // never fails the run — and it runs BEFORE this run's first window
+        // commits, so the compaction never races its own writer.
+        self.conn.compact_state_if_bloated().await;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };

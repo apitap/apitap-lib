@@ -19,9 +19,12 @@
 //!
 //! Auth: a service-account key (JSON key file) is exchanged for a ~1h OAuth2
 //! access token via the JWT-bearer grant (RS256). The private key never leaves
-//! the process. Incremental state lives in `<dataset>._apitap_state`, upserted
-//! with a single-statement MERGE right after the copy job commits; the watermark
-//! is `greatest(state, data)`, so a crash between the two costs a bounded
+//! the process. Incremental state lives in `<dataset>._apitap_state`, APPENDED
+//! as one row per run right after the copy job commits (load jobs only — DML is
+//! rejected on sandbox projects); readers resolve the newest row per key, and a
+//! state read that finds the history bloated folds it back down with a
+//! WRITE_TRUNCATE load (see `compact_state`). The watermark is
+//! `greatest(state, data)`, so a crash between the two costs a bounded
 //! re-read, never a skip.
 
 use crate::sink::Loader;
@@ -51,6 +54,23 @@ const ROTATE_BYTES: u64 = 12 * 1024 * 1024;
 const ROTATE_SECS: u64 = 6;
 const ROTATE_HARD_BYTES: u64 = 96 * 1024 * 1024;
 const STATE_TABLE: &str = "_apitap_state";
+
+/// The `_apitap_state` schema, defined ONCE. The bulk sink and the CDC lane
+/// both create the table from it, and state compaction REWRITES the whole
+/// table while passing it explicitly (a WRITE_TRUNCATE load replaces the
+/// table's schema with the load's) — a second, drifted copy of these fields
+/// would let a compaction silently retype or drop a column under every lane.
+fn state_schema_fields() -> Value {
+    json!([
+        {"name": "dest_table", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "source_id", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "cursor_col", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "watermark", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "mode", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "last_rows", "type": "INT64", "mode": "NULLABLE"},
+        {"name": "synced_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
+    ])
+}
 
 // Service-account auth lives in crate::gcp (shared with the Sheets source).
 use crate::gcp::fetch_access_token;
@@ -387,14 +407,33 @@ impl BqConn {
     /// Free-tier safe: the state machinery must never need DML (sandbox projects
     /// reject it), so state rows are APPENDED and readers take the newest.
     async fn load_rows(&self, table: &str, ndjson: Vec<u8>) -> Result<()> {
+        self.load_rows_job(table, ndjson, "WRITE_APPEND", None).await
+    }
+
+    /// The disposition-aware body of [`load_rows`]. `WRITE_TRUNCATE` is used
+    /// by state compaction only, and then always WITH an explicit `schema`:
+    /// a truncate replaces the table's schema with the load's, so leaving it
+    /// to the destination's current shape would make the rewrite depend on
+    /// what it is about to destroy.
+    async fn load_rows_job(
+        &self,
+        table: &str,
+        ndjson: Vec<u8>,
+        disposition: &str,
+        schema: Option<Value>,
+    ) -> Result<()> {
         // BigQuery rate-limits table update operations (5 per 10 s per table),
         // and its own guidance for that class is to retry with backoff. This
         // path keeps its payload, so a failed job is simply run again — no
         // partial state to reason about, because a load job that fails writes
-        // nothing.
+        // nothing (true for WRITE_TRUNCATE too: the truncate and its rows
+        // commit atomically or not at all).
         let mut attempt = 0u32;
         loop {
-            match self.load_rows_once(table, &ndjson).await {
+            match self
+                .load_rows_once(table, &ndjson, disposition, schema.as_ref())
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
                     attempt += 1;
@@ -406,18 +445,26 @@ impl BqConn {
         }
     }
 
-    async fn load_rows_once(&self, table: &str, ndjson: &[u8]) -> Result<()> {
-        let config = json!({
-            "configuration": { "load": {
-                "destinationTable": {
-                    "projectId": self.project, "datasetId": self.dataset,
-                    "tableId": table,
-                },
-                "sourceFormat": "NEWLINE_DELIMITED_JSON",
-                "writeDisposition": "WRITE_APPEND",
-                "maxBadRecords": 0,
-            }}
+    async fn load_rows_once(
+        &self,
+        table: &str,
+        ndjson: &[u8],
+        disposition: &str,
+        schema: Option<&Value>,
+    ) -> Result<()> {
+        let mut load = json!({
+            "destinationTable": {
+                "projectId": self.project, "datasetId": self.dataset,
+                "tableId": table,
+            },
+            "sourceFormat": "NEWLINE_DELIMITED_JSON",
+            "writeDisposition": disposition,
+            "maxBadRecords": 0,
         });
+        if let Some(fields) = schema {
+            load["schema"] = json!({ "fields": fields });
+        }
+        let config = json!({ "configuration": { "load": load } });
         let boundary = "apitap_state_boundary";
         let mut body = Vec::new();
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -523,20 +570,120 @@ impl BqConn {
         if self.table_get(STATE_TABLE).await?.is_some() {
             return Ok(());
         }
-        let fields = json!([
-            {"name": "dest_table", "type": "STRING", "mode": "REQUIRED"},
-            {"name": "source_id", "type": "STRING", "mode": "REQUIRED"},
-            {"name": "cursor_col", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "watermark", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "mode", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "last_rows", "type": "INT64", "mode": "NULLABLE"},
-            {"name": "synced_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
-        ]);
-        match self.table_create(STATE_TABLE, &fields).await {
+        match self.table_create(STATE_TABLE, &state_schema_fields()).await {
             Ok(()) => Ok(()),
             Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Rows in `_apitap_state` beyond which a state READ compacts the table.
+    ///
+    /// The append-only design (DML is rejected on sandbox projects, so every
+    /// run APPENDS its row and readers resolve the newest per key) has an
+    /// unbounded tail: a scheduled pipeline gains one row per run per table
+    /// forever, and every read scans the whole history. 512 is deliberately
+    /// lazy — at one row per run that is over a year of daily schedules and
+    /// weeks of hourly ones, a scan of 512 tiny rows still costs nothing, and
+    /// the compaction is one free load job — so triggering rarely beats
+    /// triggering precisely, and the exact number is not load-bearing.
+    const STATE_COMPACT_ROWS: u64 = 512;
+
+    /// Opportunistic `_apitap_state` compaction, called from the state READ
+    /// paths (both lanes) once the table has visibly bloated. Best-effort by
+    /// contract: the read already has its answer, so nothing here may fail
+    /// the run — an error is surfaced as a note and dropped, and the next
+    /// read past the threshold simply tries again.
+    pub(crate) async fn compact_state_if_bloated(&self) {
+        if let Err(e) = self.compact_state().await {
+            crate::progress::note(&format!(
+                "_apitap_state compaction skipped (next run retries): {e}"
+            ));
+        }
+    }
+
+    /// Rewrite `_apitap_state` down to the newest row per
+    /// (dest_table, source_id).
+    ///
+    /// DELETE is not available — DML is rejected on the sandbox projects the
+    /// append-only design exists for — but a load job with WRITE_TRUNCATE is
+    /// the same free, sandbox-safe machinery the appends already ride, and it
+    /// commits the truncate and the replacement rows atomically. Rewriting is
+    /// safe where deleting is not because the content is DERIVED: readers
+    /// only ever resolve the newest row per key (the `*` barrier comparison
+    /// included — a stale key's newest row stays older than the barrier and
+    /// stays ignored), so a table holding exactly those rows answers every
+    /// read identically to the full history.
+    ///
+    /// Concurrency is tolerated rather than locked out:
+    ///   - two compactions racing derive the same newest-per-key content, and
+    ///     load-job commits serialize per table — the loser overwrites the
+    ///     winner with an identical payload;
+    ///   - an append landing between this SELECT and the truncate committing
+    ///     is lost, regressing that key's watermark by at most one run. The
+    ///     design already budgets exactly that: bulk append takes
+    ///     greatest(state, data) (a bounded re-read, never a skip) and a CDC
+    ///     window replays idempotently — the same tolerance a crash between
+    ///     data commit and state write has always demanded.
+    async fn compact_state(&self) -> Result<()> {
+        let Some(meta) = self.table_get(STATE_TABLE).await? else {
+            return Ok(());
+        };
+        // numRows can lag a hair behind recent jobs; for a bloat threshold,
+        // exact is not interesting.
+        let rows: u64 = meta["numRows"]
+            .as_str()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        if rows <= Self::STATE_COMPACT_ROWS {
+            return Ok(());
+        }
+        // The server renders the NDJSON lines itself: TO_JSON_STRING handles
+        // NULLs and escaping, and synced_at is formatted at full microsecond
+        // precision (the writers' own format) — a truncated timestamp could
+        // reorder a replace barrier against the state row it must sort under.
+        // The window function ranks the RAW synced_at in an inner query so
+        // the formatting alias cannot shadow the column it orders by.
+        let sql = format!(
+            "SELECT TO_JSON_STRING(t) FROM ( \
+               SELECT dest_table, source_id, cursor_col, watermark, mode, last_rows, \
+                      FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E6SZ', synced_at) AS synced_at \
+               FROM ( \
+                 SELECT *, ROW_NUMBER() OVER \
+                   (PARTITION BY dest_table, source_id ORDER BY synced_at DESC) AS rn \
+                 FROM {state} \
+               ) WHERE rn = 1 \
+             ) t",
+            state = self.state_fq(),
+        );
+        let mut ndjson = Vec::new();
+        let mut kept = 0u64;
+        for row in self.query(&sql).await? {
+            if let Some(line) = row.into_iter().next().flatten() {
+                ndjson.extend_from_slice(line.as_bytes());
+                ndjson.push(b'\n');
+                kept += 1;
+            }
+        }
+        // An empty result from a table we just measured as non-empty means
+        // the read went wrong, not that the state vanished — truncating on it
+        // would erase every watermark. Refuse.
+        if ndjson.is_empty() {
+            return Err(Error::Transfer(
+                "state compaction read returned nothing for a non-empty table".into(),
+            ));
+        }
+        self.load_rows_job(
+            STATE_TABLE,
+            ndjson,
+            "WRITE_TRUNCATE",
+            Some(state_schema_fields()),
+        )
+        .await?;
+        crate::progress::note(&format!(
+            "_apitap_state compacted: {rows} rows -> {kept} (newest per source)"
+        ));
+        Ok(())
     }
 
     /// Run a standard-SQL script (the CDC MERGE + watermark transaction) as one
@@ -1364,16 +1511,7 @@ impl BqSink {
         if self.conn.table_get(STATE_TABLE).await?.is_some() {
             return Ok(());
         }
-        let fields = json!([
-            {"name": "dest_table", "type": "STRING", "mode": "REQUIRED"},
-            {"name": "source_id", "type": "STRING", "mode": "REQUIRED"},
-            {"name": "cursor_col", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "watermark", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "mode", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "last_rows", "type": "INT64", "mode": "NULLABLE"},
-            {"name": "synced_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
-        ]);
-        match self.conn.table_create(STATE_TABLE, &fields).await {
+        match self.conn.table_create(STATE_TABLE, &state_schema_fields()).await {
             Ok(()) => Ok(()),
             // Two first-runs can race the CREATE; whoever loses appends fine.
             Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
@@ -1728,6 +1866,11 @@ impl crate::sink::Sink for BqSink {
             let row = rows.into_iter().next().unwrap_or_default();
             let own = row.first().cloned().flatten();
             let sib = row.get(1).cloned().flatten().as_deref() == Some("true");
+            // The SELECT above just paid for the table's whole append-only
+            // history; if it has bloated past the threshold, fold it down to
+            // what readers can still use. Best-effort — an error is noted
+            // inside and never fails the run.
+            self.conn.compact_state_if_bloated().await;
             (own, sib)
         } else {
             (None, false)
