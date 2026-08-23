@@ -89,6 +89,71 @@ pub(crate) async fn master_position(
 /// This is the mirror image of the Postgres risk. A Postgres slot keeps WAL
 /// until it is consumed, so an abandoned consumer threatens the source's DISK.
 /// MySQL keeps nothing, so an abandoned consumer threatens the DATA.
+/// Report how much binlog retention this pipeline has left, every run.
+///
+/// The Postgres lane prints the WAL its slot is holding on every drain, so an
+/// operator watching logs sees trouble coming. The MySQL lane printed nothing
+/// at all until the position it needed was already purged — at which point the
+/// only honest answer is a full re-bootstrap. The difference is not the
+/// engine's, it is ours: MySQL will happily tell you what it still has.
+///
+/// The number that matters is not "how many bytes of binlog exist" — that grows
+/// with write traffic and says nothing about safety. It is **how many files
+/// stand between the one we must resume from and the one the server will purge
+/// next**. At zero, the file we need IS the oldest the server has: one rotation
+/// from a bootstrap.
+///
+/// Best-effort, and silent on failure. `SHOW BINARY LOGS` needs REPLICATION
+/// CLIENT, and a source that withholds it must still be drainable — a
+/// diagnostic that can fail a transfer is worse than no diagnostic.
+pub(crate) async fn binlog_retention_report(pool: &sqlx::MySqlPool, our_file: &str) {
+    use sqlx::Row;
+    let Ok(rows) = sqlx::query("SHOW BINARY LOGS").fetch_all(pool).await else {
+        return;
+    };
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>(0).ok())
+        .collect();
+    // Empty means "no privilege" rather than "no logs" — the same reading
+    // `binlog_file_present` makes, and the same reason not to say anything.
+    if names.is_empty() {
+        return;
+    }
+    let Some(idx) = names.iter().position(|n| n == our_file) else {
+        // Not listed: either already purged (the drain's own check refuses
+        // that loudly a moment later and says what to do) or the server renamed
+        // the series. Either way this gauge has nothing true to report.
+        return;
+    };
+    let total: u64 = rows
+        .iter()
+        .filter_map(|r| r.try_get::<u64, _>(1).ok())
+        .sum();
+    crate::progress::gauge(
+        "binlog.retention",
+        &[
+            ("resume_file", our_file.to_string()),
+            ("files_retained", names.len().to_string()),
+            // Files between us and the purge edge. 0 = we are the edge.
+            ("files_before_ours", idx.to_string()),
+            ("retained_bytes", total.to_string()),
+            ("at_purge_edge", (idx == 0).to_string()),
+        ],
+    );
+    if idx == 0 && names.len() > 1 {
+        crate::progress::warn(&format!(
+            "binlog retention: this pipeline resumes from {our_file}, which is \
+             the OLDEST binlog the server still has ({} retained). The next \
+             rotation plus purge takes the position out from under it, and the \
+             recovery from that is a full re-bootstrap, not a retry. Either \
+             drain more often or raise the server's retention \
+             (binlog_expire_logs_seconds) above the longest gap between runs.",
+            names.len(),
+        ));
+    }
+}
+
 pub(crate) async fn binlog_file_present(pool: &sqlx::MySqlPool, file: &str) -> Result<bool> {
     // SHOW BINARY LOGS lists Log_name plus File_size (and Encrypted on newer
     // servers), so bind by name and read the first column only.
@@ -367,6 +432,16 @@ pub(crate) struct MySession {
 /// into per-table collapsers at XID (the commit boundary), stop only at a
 /// commit — at the stop-line, the byte budget, or the wall clock.
 #[allow(clippy::too_many_arguments)]
+/// How often the stream asks the server for a heartbeat. Mirrored into
+/// `binlog_dump`'s argument by `myrun`, and used here to reason about silence.
+pub(crate) const HEARTBEAT_SECS: u64 = 5;
+
+/// How long a read may see NOTHING — not an event, not a heartbeat — before the
+/// peer is declared gone. Six heartbeats: wide enough that a loaded server or a
+/// brief network stall never trips it, narrow enough that a scheduled run fails
+/// in seconds instead of hanging until someone notices.
+const EVENT_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(HEARTBEAT_SECS * 6);
+
 pub(crate) async fn drain_binlog(
     w: &mut MyWire,
     pool: &sqlx::MySqlPool,
@@ -398,7 +473,37 @@ pub(crate) async fn drain_binlog(
             // window applies whole and the watermark that follows is true.
             break;
         }
-        let Some(raw) = w.next_binlog_event().await? else {
+        // A bound on the READ itself, not just between reads. The loop's
+        // wall-clock deadline and the SIGTERM flag above are both checked
+        // between events, so neither can end a run that is parked inside the
+        // await — and a half-open socket (NAT reaped the flow, the host lost
+        // power) produces exactly that park: no bytes, no EOF, no error, ever.
+        //
+        // The number is not arbitrary. `binlog_dump` asks the server for a
+        // heartbeat every HEARTBEAT_SECS, so on a healthy connection something
+        // arrives at that cadence even when nothing is happening on the source.
+        // Silence for many multiples of it is not a quiet database, it is a
+        // dead peer — and saying so is the whole value of the heartbeat we
+        // already pay for.
+        //
+        // TCP keepalive (see `wire::mywire::set_keepalive`) usually notices
+        // first; this is the backstop for the cases it cannot cover, and it
+        // does not depend on the kernel honouring a socket option.
+        let raw = tokio::time::timeout(EVENT_SILENCE_LIMIT, w.next_binlog_event())
+            .await
+            .map_err(|_| {
+                Error::Transfer(format!(
+                    "mysql binlog: no event and no heartbeat for {}s — the \
+                     stream asks the server for a heartbeat every {}s, so this \
+                     is a peer that is gone rather than a source that is quiet \
+                     (half-open socket: NAT or firewall reaped the flow, or the \
+                     host vanished without closing). Re-run: the drain resumes \
+                     from its stored position.",
+                    EVENT_SILENCE_LIMIT.as_secs(),
+                    HEARTBEAT_SECS,
+                ))
+            })??;
+        let Some(raw) = raw else {
             break;
         };
         // `raw` is an owned Bytes now — the old borrowed-slice shape forced a

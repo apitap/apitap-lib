@@ -439,6 +439,50 @@ async fn read_packet_raw(tcp: &mut TcpStream, seq: &mut u8) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Turn on TCP keepalive for a replication socket.
+///
+/// A binlog stream can sit idle for minutes by design, which is exactly the
+/// shape a NAT or a stateful firewall reaps: it drops the flow's entry without
+/// telling either end, and both sides keep a socket that will never produce
+/// another byte and will never report an error. `read` on such a socket does
+/// not return — not EOF, not ECONNRESET, nothing — so a drain parks forever
+/// with its wall-clock deadline and its SIGTERM flag both unreachable, because
+/// both are checked BETWEEN events.
+///
+/// Keepalive is the layer that can tell "idle" from "gone": the kernel probes
+/// the peer, and when nobody answers the socket errors and the read returns.
+/// Set through libc rather than adding a dependency for four setsockopt calls;
+/// libc is already here for the signal handling.
+///
+/// Best-effort by design. A kernel that refuses one of these options leaves the
+/// socket exactly as good as it was before this function existed, and failing a
+/// transfer over a tuning knob would be worse than the hang it prevents — the
+/// event-level deadline in `mysource` is the backstop that does not depend on
+/// the kernel cooperating.
+fn set_keepalive(tcp: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = tcp.as_raw_fd();
+    // SAFETY: every call passes a live fd owned by `tcp` and a correctly sized
+    // pointer to a local i32; setsockopt writes nothing back.
+    unsafe {
+        let on: libc::c_int = 1;
+        let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let set = |level, name, val: &libc::c_int| {
+            libc::setsockopt(fd, level, name, val as *const _ as *const libc::c_void, sz);
+        };
+        set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, &on);
+        // Probe after 30s idle, every 10s, give up after 3 — roughly a minute
+        // to notice, which is far below any scheduler's patience and far above
+        // any real network hiccup.
+        let idle: libc::c_int = 30;
+        let intvl: libc::c_int = 10;
+        let cnt: libc::c_int = 3;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle);
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &intvl);
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, &cnt);
+    }
+}
+
 impl MyWire {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let info = parse_my_url(url)?;
@@ -452,6 +496,7 @@ impl MyWire {
             .await
             .map_err(io_err)?;
         tcp.set_nodelay(true).map_err(io_err)?;
+        set_keepalive(&tcp);
 
         let mut seq = 0u8;
         let hs = parse_handshake(&read_packet_raw(&mut tcp, &mut seq).await?)?;

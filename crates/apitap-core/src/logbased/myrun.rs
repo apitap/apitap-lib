@@ -35,14 +35,41 @@ pub(crate) struct MyCtx {
 /// A replica id derived from the group identity: stable across runs (so a
 /// restart reclaims its own stream) and unlikely to collide with a real
 /// replica or another apitap group.
+/// The `server_id` this run registers as a replica.
+///
+/// It used to be a pure function of the group, which read as a virtue — the
+/// same pipeline always showed up as the same replica — and was in fact a way
+/// for a pipeline to strangle itself. MySQL evicts an existing replica the
+/// moment a new one registers the SAME id, so two overlapping apitap runs (a
+/// schedule that overran, a manual backfill beside the cron, two pipelines off
+/// one source) knock each other off the socket in a loop, each dying with a
+/// connection reset it cannot explain.
+///
+/// So the id is now unique per CONNECTION, while keeping the two properties
+/// that were load-bearing: it stays out of the low range operators hand out by
+/// convention, and it is never 0 (a 0 replica is disconnected at end-of-log).
+/// The group's hash still occupies the high bits, so `SHOW REPLICAS` on the
+/// source still tells an operator WHICH pipeline a connection belongs to —
+/// which was the real value of stability — while the low 16 bits carry a
+/// per-connection nonce so two of them can coexist.
 fn replica_id(seed: &str) -> u32 {
     let mut h: u32 = 2_166_136_261;
     for b in seed.as_bytes() {
         h ^= *b as u32;
         h = h.wrapping_mul(16_777_619);
     }
-    // Keep it out of the low range operators hand out by convention.
-    0x4000_0000 | (h & 0x3FFF_FFFF)
+    // No RNG dependency for what is a collision-avoidance nonce, not a secret:
+    // the clock gives entropy across processes, the pid across siblings started
+    // in the same nanosecond, and the counter across connections inside one
+    // process.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        ^ std::process::id()
+        ^ NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    0x4000_0000 | (h & 0x3FFF_0000) | (nonce & 0x0000_FFFF)
 }
 
 /// Resolve db/table + PK for each member off information_schema.
@@ -213,7 +240,16 @@ where
     }
 
     let mut w = MyWire::connect(src_url).await?;
-    w.binlog_dump(replica_id(group_seed), &start_file, start_pos, 5)
+    // Same moment the Postgres lane reports its slot's WAL: once per run,
+    // before the stream opens, so an unattended pipeline has a number to alert
+    // on rather than only a failure to react to.
+    mysource::binlog_retention_report(pool, &start_file).await;
+    w.binlog_dump(
+        replica_id(group_seed),
+        &start_file,
+        start_pos,
+        crate::logbased::mysource::HEARTBEAT_SECS,
+    )
         .await?;
 
     let mut sess = MySession {
@@ -261,12 +297,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replica_ids_are_stable_distinct_and_high() {
+    fn replica_ids_are_unique_grouped_and_high() {
         let a = replica_id("apitap_g_abc");
         let b = replica_id("apitap_g_abd");
-        assert_eq!(a, replica_id("apitap_g_abc"), "stable across runs");
-        assert_ne!(a, b, "different groups get different ids");
-        for id in [a, b] {
+        // The property that changed, and the reason: two connections of the
+        // SAME pipeline must not collide, because MySQL evicts the previous
+        // replica holding that id.
+        assert_ne!(a, replica_id("apitap_g_abc"), "unique per connection");
+        // The property that survived: the group is still legible in the id, so
+        // SHOW REPLICAS still says which pipeline a connection belongs to.
+        assert_eq!(a & 0x3FFF_0000, replica_id("apitap_g_abc") & 0x3FFF_0000);
+        assert_ne!(a & 0x3FFF_0000, b & 0x3FFF_0000, "different groups differ");
+        for id in [a, b, replica_id("x")] {
             assert!(id >= 0x4000_0000, "stays out of the hand-assigned range");
             assert_ne!(id, 0, "0 gets disconnected at end-of-log");
         }
