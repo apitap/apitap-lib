@@ -557,15 +557,15 @@ impl crate::sink::Sink for PgSink {
         // by the bare name where this lane keys by schema.bare, and a guard
         // that cannot SEE the other lane's row guards nothing. See
         // `naming::pg_state_keys`.
-        let (key_canonical, key_legacy) = crate::naming::pg_state_keys(&self.dest_key);
+        let (key_bare, key_qualified) = crate::naming::pg_state_keys(&self.dest_key);
         let row: Option<(Option<String>, String, String)> = sqlx::query_as(&format!(
             "SELECT watermark, cursor_col, mode FROM {} \
              WHERE dest_table IN ($1, $2) AND source_id = $3 \
              ORDER BY (dest_table = $1) DESC LIMIT 1",
             self.state_table()
         ))
-        .bind(&key_canonical)
-        .bind(&key_legacy)
+        .bind(&key_qualified)
+        .bind(&key_bare)
         .bind(source_id)
         .fetch_optional(&self.pool)
         .await
@@ -692,13 +692,13 @@ impl crate::sink::Sink for PgSink {
                     // log_based run then resumes from a position that predates
                     // this replace and re-applies changes the new table never
                     // saw. See `naming::pg_state_keys`.
-                    let (kc, kl) = crate::naming::pg_state_keys(&self.dest_key);
+                    let (bare, qualified) = crate::naming::pg_state_keys(&self.dest_key);
                     sqlx::query(&format!(
                         "DELETE FROM {} WHERE dest_table IN ($1, $2)",
                         self.state_table()
                     ))
-                    .bind(kc)
-                    .bind(kl)
+                    .bind(bare)
+                    .bind(qualified)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| Error::Transfer(format!("state clear: {e}")))?;

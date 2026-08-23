@@ -195,16 +195,24 @@ pub(crate) enum Dialect {
 /// mode switch read the other lane's row or missed it depending on which
 /// spelling the caller used.
 ///
-/// Canonical is the QUALIFIED form, because it is the unambiguous one. Every
-/// write goes there. Every read tries canonical first and falls back to the
-/// legacy bare spelling, so a deployment upgraded mid-life keeps its
-/// watermark; the first write after that migrates the row (upsert canonical,
-/// delete legacy in the same transaction), so the fallback is transitional,
-/// not permanent.
+/// Nothing is rewritten. Each lane keeps the spelling it has always written —
+/// the CDC lane the bare name, the bulk lane the qualified one — and every
+/// READ and every DELETE covers both. That closes the defect without touching
+/// a single row on anybody's disk.
+///
+/// Canonicalising instead was the first attempt, and it was wrong for a reason
+/// worth keeping written down: these rows are not private. Error messages tell
+/// operators to "clear the state row", runbooks and fixtures do it with
+/// `DELETE FROM _apitap_state WHERE dest_table = 'orders'`, and moving the key
+/// to `public.orders` would have made every one of those silently match
+/// nothing. A tidier key is not worth breaking the recovery instructions the
+/// software itself prints.
+///
+/// Returns (bare, qualified) — both spellings a row for this table may wear.
 pub(crate) fn pg_state_keys(dest_table: &str) -> (String, String) {
     match dest_table.split_once('.') {
-        Some((_, bare)) => (dest_table.to_string(), bare.to_string()),
-        None => (format!("public.{dest_table}"), dest_table.to_string()),
+        Some((_, bare)) => (bare.to_string(), dest_table.to_string()),
+        None => (dest_table.to_string(), format!("public.{dest_table}")),
     }
 }
 
@@ -214,14 +222,21 @@ mod pg_state_key_tests {
 
     /// The bug this exists for: the two lanes must produce the SAME canonical
     /// key for the same table, however the caller spelled it.
+    /// However the caller spelled the table, the pair must contain BOTH
+    /// spellings a row could wear — that is what lets one lane's delete reach
+    /// the other lane's row.
     #[test]
-    fn both_spellings_share_one_canonical_key() {
-        assert_eq!(pg_state_keys("orders").0, "public.orders");
-        assert_eq!(pg_state_keys("public.orders").0, "public.orders");
-        assert_eq!(pg_state_keys("orders").1, "orders");
-        assert_eq!(pg_state_keys("public.orders").1, "orders");
-        assert_eq!(pg_state_keys("sales.orders").0, "sales.orders");
-        assert_eq!(pg_state_keys("sales.orders").1, "orders");
+    fn the_pair_covers_both_spellings_either_way_round() {
+        assert_eq!(pg_state_keys("orders"), ("orders".into(), "public.orders".into()));
+        assert_eq!(pg_state_keys("public.orders"), ("orders".into(), "public.orders".into()));
+        assert_eq!(pg_state_keys("sales.orders"), ("orders".into(), "sales.orders".into()));
+    }
+
+    /// The bare name comes FIRST, because it is what the CDC lane writes and
+    /// what every "clear the state row" instruction names.
+    #[test]
+    fn the_bare_name_is_the_one_operators_are_told_to_use() {
+        assert_eq!(pg_state_keys("public.orders").0, "orders");
     }
 }
 

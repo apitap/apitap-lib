@@ -31,10 +31,10 @@ impl PgDest {
     /// Remove this table's watermark row — a failed group bootstrap must leave
     /// no state, or the next run refuses the group as torn.
     pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        let (kc, kl) = crate::naming::pg_state_keys(dest_table);
+        let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
         sqlx::query("DELETE FROM _apitap_state WHERE dest_table IN ($1, $2) AND source_id = $3")
-            .bind(kc)
-            .bind(kl)
+            .bind(bare)
+            .bind(qualified)
             .bind(source_id)
             .execute(&self.pool)
             .await
@@ -150,17 +150,27 @@ impl PgDest {
         dest_table: &str,
         source_id: &str,
     ) -> Result<Option<u64>> {
-        // Canonical key first, historical bare spelling as fallback — an
-        // upgraded deployment keeps its watermark, and the next write migrates
-        // the row. See `naming::pg_state_keys` for why two spellings exist.
-        let (kc, kl) = crate::naming::pg_state_keys(dest_table);
-        let row: Option<(Option<String>, String)> = sqlx::query_as(
-            "SELECT watermark, cursor_col FROM _apitap_state \
-             WHERE dest_table IN ($1, $2) AND source_id = $3 AND mode = 'log_based' \
+        // Both spellings, because the bulk lane keys the same table as
+        // schema.bare where this lane keys it bare — see `naming::pg_state_keys`.
+        //
+        // And deliberately NOT filtered on mode. It used to be
+        // `AND mode = 'log_based'`, which reads like a safety check and is the
+        // opposite: a row written by the cursor lane was simply invisible, so a
+        // table that had been append-ed and was then pointed at log_based saw
+        // NO state, decided it was a fresh destination, and quietly ran a full
+        // bootstrap — discarding the incremental history and leaving two rows
+        // for one table in two vocabularies. Read the row whatever wrote it,
+        // and refuse below if it is not ours; that is the same shape the bulk
+        // lane's read now has, and the two directions have to match or the
+        // guard only works when you approach it from one side.
+        let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
+        let row: Option<(Option<String>, String, String)> = sqlx::query_as(
+            "SELECT watermark, cursor_col, mode FROM _apitap_state \
+             WHERE dest_table IN ($1, $2) AND source_id = $3 \
              ORDER BY (dest_table = $1) DESC LIMIT 1",
         )
-        .bind(kc)
-        .bind(kl)
+        .bind(bare)
+        .bind(qualified)
         .bind(source_id)
         .fetch_optional(&self.pool)
         .await
@@ -171,12 +181,15 @@ impl PgDest {
         })?;
         match row {
             None => Ok(None),
-            Some((wm, cursor)) => {
-                if cursor != STATE_CURSOR {
+            Some((wm, cursor, mode)) => {
+                if mode != "log_based" || cursor != STATE_CURSOR {
                     return Err(Error::InvalidInput(format!(
-                        "log_based: state row for this table tracks cursor '{cursor}', \
-                         not an LSN — it was written by mode append/merge. Use a \
-                         different dest_table or clear the state row"
+                        "log_based: {dest_table} is managed by mode='{mode}' — its \
+                         state watermark tracks cursor '{cursor}', not an LSN, so a \
+                         CDC drain cannot resume from it. Keep using that mode, or \
+                         clear this table's _apitap_state rows (both the bare and \
+                         the schema-qualified spelling) to hand it to CDC, which \
+                         then re-bootstraps with a full load."
                     )));
                 }
                 let wm = wm.ok_or_else(|| {
@@ -410,18 +423,11 @@ async fn upsert_state_tx(
     lsn: u64,
     rows: u64,
 ) -> Result<()> {
-    // Write under the canonical key, and retire the legacy-spelled row in the
-    // same transaction: the dual-spelling read above is a migration ramp, not
-    // a permanent state of affairs, and it converges exactly here.
-    let (kc, kl) = crate::naming::pg_state_keys(dest_table);
-    if kc != kl {
-        sqlx::query("DELETE FROM _apitap_state WHERE dest_table = $1 AND source_id = $2")
-            .bind(&kl)
-            .bind(source_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(db_err)?;
-    }
+    // The spelling this lane has always written, unchanged: every "clear the
+    // state row" message, every runbook and every fixture names it. The
+    // dual-spelling READ above is what reaches the bulk lane's row; nothing
+    // needs to move on disk for that to work.
+    let (bare, _qualified) = crate::naming::pg_state_keys(dest_table);
     sqlx::query(
         "INSERT INTO _apitap_state \
            (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
@@ -430,7 +436,7 @@ async fn upsert_state_tx(
            cursor_col = EXCLUDED.cursor_col, watermark = EXCLUDED.watermark, \
            mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()",
     )
-    .bind(kc)
+    .bind(bare)
     .bind(source_id)
     .bind(STATE_CURSOR)
     .bind(lsn.to_string())
