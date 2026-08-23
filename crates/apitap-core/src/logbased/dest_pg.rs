@@ -50,14 +50,46 @@ impl PgDest {
         lsn: u64,
         rows: u64,
     ) -> Result<()> {
-        let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-        sqlx::query(&format!(
-            "ALTER TABLE {} ADD PRIMARY KEY ({pklist})",
-            quote_table(dest_table)
-        ))
-        .execute(&self.pool)
+        // The bootstrap's full load lands into a PK-less table on purpose (the
+        // constraint would slow the COPY), so the identity is added here. But
+        // "here" is not always a PK-less table: a destination previously built
+        // by a user-run replace carries the PK its DDL gave it, and a blind
+        // ADD PRIMARY KEY then fails with "multiple primary keys" AFTER the
+        // full load — a wasted bootstrap for a constraint that was already
+        // right. Ask the catalog first: an equal PK is the job already done; a
+        // DIFFERENT one is a real conflict the user has to resolve, refused
+        // with both spellings on the table.
+        let existing: Vec<String> = sqlx::query_scalar(
+            "SELECT a.attname FROM pg_index i \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+             WHERE i.indrelid = $1::regclass AND i.indisprimary \
+               AND array_position(i.indkey, a.attnum) < i.indnkeyatts \
+             ORDER BY array_position(i.indkey, a.attnum)",
+        )
+        .bind(dest_table)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
+        if existing.is_empty() {
+            let pklist =
+                pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+            sqlx::query(&format!(
+                "ALTER TABLE {} ADD PRIMARY KEY ({pklist})",
+                quote_table(dest_table)
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        } else if existing != pk_cols {
+            return Err(Error::InvalidInput(format!(
+                "log_based: {dest_table} already has PRIMARY KEY ({}) but the \
+                 source's key is ({}) — the drain would apply updates against \
+                 the wrong identity. Drop the destination table (or its \
+                 constraint) and re-run.",
+                existing.join(", "),
+                pk_cols.join(", "),
+            )));
+        }
         self.ensure_state_table().await?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         upsert_state_tx(&mut tx, dest_table, source_id, lsn, rows).await?;
