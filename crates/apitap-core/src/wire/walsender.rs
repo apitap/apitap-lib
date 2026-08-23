@@ -720,6 +720,20 @@ impl Walsender {
             // depend on the offset being a fixed +00. The SQL plane pins it
             // too — the sqlx pool it replaces does the same in after_connect.
             ("TimeZone", "UTC"),
+            // Pin the REST of the text-rendering GUCs for the same reason.
+            // Everything on this connection arrives as the string the session
+            // renders, and the bootstrap runs under sqlx, which pins
+            // DateStyle=ISO and extra_float_digits at its own startup — so
+            // the CDC lane must render a value exactly the way the bootstrap
+            // did, or one value round-trips as two different strings: a
+            // server with DateStyle='German, DMY' bootstraps 2026-08-23 and
+            // then streams 23.08.2026 into the same destination column.
+            // IntervalStyle=postgres is the server default made explicit;
+            // extra_float_digits=3 makes floats round-trip exactly on every
+            // server version (pre-12 truncates float4 at 8 digits without it).
+            ("DateStyle", "ISO"),
+            ("IntervalStyle", "postgres"),
+            ("extra_float_digits", "3"),
         ];
         if replication {
             params.push(("replication", "database"));
@@ -811,7 +825,21 @@ impl Walsender {
                     }
                 }
                 b'S' | b'K' | b'N' => {} // ParameterStatus / BackendKeyData / Notice
-                b'Z' => return Ok(()),   // ReadyForQuery
+                b'Z' => {
+                    // ReadyForQuery — but when the exchange was SCRAM,
+                    // reaching here is not authentication. AuthenticationOk
+                    // and ReadyForQuery are words ANY peer can say; the
+                    // server-final v= signature is the one artifact that
+                    // requires the stored key to produce, and with
+                    // sslmode=require the certificate is unverified, so this
+                    // gate is the only server authentication there is. A
+                    // peer that skipped AuthenticationSASLFinal is refused
+                    // here rather than trusted.
+                    if let Some(st) = scram.as_ref() {
+                        st.require_verified()?;
+                    }
+                    return Ok(());
+                }
                 b'E' => return Err(parse_error(&msg)),
                 other => {
                     return Err(Error::Transfer(format!(
@@ -1531,13 +1559,22 @@ struct ScramState {
     client_first_bare: String,
     /// Set by client_final for verify_server.
     server_signature: std::cell::RefCell<Option<Vec<u8>>>,
+    /// Set ONLY by verify_server accepting a matching v= signature. This is
+    /// the bit `require_verified` gates startup on: without it, a peer could
+    /// skip AuthenticationSASLFinal, say AuthenticationOk, and be believed.
+    verified: std::cell::Cell<bool>,
 }
 
 impl ScramState {
     fn start() -> Self {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let client_first_bare = format!("n=,r={nonce}");
-        Self { nonce, client_first_bare, server_signature: Default::default() }
+        Self {
+            nonce,
+            client_first_bare,
+            server_signature: Default::default(),
+            verified: Default::default(),
+        }
     }
 
     fn client_first(&self) -> String {
@@ -1564,6 +1601,24 @@ impl ScramState {
         if !r.starts_with(&self.nonce) {
             return Err(Error::Transfer("walsender: SCRAM nonce mismatch".into()));
         }
+        // The iteration count is the peer's number, and it drives the
+        // synchronous PBKDF2 loop in `hi` on a runtime thread — before
+        // anything about this peer has been authenticated. RFC 7677's own
+        // example vector uses 4096 and real servers ship 4096–15000
+        // (Postgres defaults to 4096); a peer demanding orders of magnitude
+        // more is broken or burning our CPU on purpose (i=2^31 pins a core
+        // for hours before any authentication result). Refused by name, not
+        // silently clamped — a clamped count would compute the wrong proof
+        // and surface as a baffling authentication failure.
+        const MAX_ITERATIONS: u32 = 1_000_000;
+        if i > MAX_ITERATIONS {
+            return Err(Error::Transfer(format!(
+                "walsender: SCRAM server-first demands i={i} PBKDF2 \
+                 iterations, past the {MAX_ITERATIONS} cap. Real servers use \
+                 4096–15000; a count this size is a misconfigured or hostile \
+                 peer, and obeying it would pin a core before authentication."
+            )));
+        }
         let salt = B64.decode(&s).map_err(|_| bad_scram())?;
         let salted = hi(password.as_bytes(), &salt, i);
         let client_key = hmac_sha256(&salted, b"Client Key");
@@ -1583,20 +1638,63 @@ impl ScramState {
         Ok(format!("{without_proof},p={}", B64.encode(proof)))
     }
 
+    /// The server-authentication half of SCRAM. The v= signature is
+    /// HMAC(ServerKey, auth-message), and ServerKey comes out of the same
+    /// salted password as our own proof — so a valid v= can only be produced
+    /// by a peer that actually holds this user's stored credentials. It is
+    /// the ONE artifact a man-in-the-middle relaying the exchange, or a
+    /// server with a different password store, cannot fake, which is why the
+    /// startup loop refuses to finish until this has passed.
     fn verify_server(&self, server_final: &str) -> Result<()> {
-        let v = server_final
-            .strip_prefix("v=")
-            .ok_or_else(bad_scram)?
-            .trim_end_matches(['\0', '\n']);
+        let v = server_final.strip_prefix("v=").ok_or_else(|| {
+            Error::Transfer(
+                "walsender: SCRAM server-final carries no v= signature — the \
+                 peer never proved it knows the password. A man-in-the-middle \
+                 relaying the exchange, or a wrong server, looks exactly like \
+                 this; refusing to treat the connection as authenticated."
+                    .into(),
+            )
+        })?
+        .trim_end_matches(['\0', '\n']);
         let got = B64.decode(v).map_err(|_| bad_scram())?;
         let want = self.server_signature.borrow();
-        if want.as_deref() == Some(got.as_slice()) {
-            Ok(())
-        } else {
-            Err(Error::Transfer(
-                "walsender: SCRAM server signature mismatch — wrong server?".into(),
-            ))
+        let want = want.as_deref().ok_or_else(bad_scram)?;
+        // Constant-time compare: an early-exit == leaks how many leading
+        // bytes matched through timing, which is the oracle that lets a
+        // signature be forged byte by byte. Only the (public, fixed) length
+        // may decide anything early.
+        let mut diff = u8::from(want.len() != got.len());
+        for (a, b) in want.iter().zip(got.iter()) {
+            diff |= a ^ b;
         }
+        if diff != 0 {
+            return Err(Error::Transfer(
+                "walsender: SCRAM server signature mismatch — the peer does \
+                 NOT know this user's password. Either the connection is being \
+                 intercepted (sslmode=require encrypts without verifying the \
+                 certificate, so TLS alone rules nothing out) or it reached a \
+                 server with a different password store."
+                    .into(),
+            ));
+        }
+        self.verified.set(true);
+        Ok(())
+    }
+
+    /// The startup gate: SCRAM is complete ONLY once verify_server accepted
+    /// a v= signature. AuthenticationOk and ReadyForQuery are claims any
+    /// peer can make; the signature is the proof.
+    fn require_verified(&self) -> Result<()> {
+        if self.verified.get() {
+            return Ok(());
+        }
+        Err(Error::Transfer(
+            "walsender: the server completed SCRAM without ever sending its \
+             v= signature (AuthenticationSASLFinal) — it never proved it \
+             knows the password. A man-in-the-middle relaying the exchange \
+             looks exactly like this; refusing the connection."
+                .into(),
+        ))
     }
 }
 
@@ -1623,13 +1721,16 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// RFC 7677's published SCRAM-SHA-256 test vector.
+    /// RFC 7677's published SCRAM-SHA-256 test vector — including the
+    /// server-authentication half: the v= signature must be REQUIRED, not
+    /// merely checked when the server happens to send one.
     #[test]
     fn scram_matches_the_rfc7677_vector() {
         let st = ScramState {
             nonce: "rOprNGfwEbeRWgbNEkqO".into(),
             client_first_bare: "n=user,r=rOprNGfwEbeRWgbNEkqO".into(),
             server_signature: Default::default(),
+            verified: Default::default(),
         };
         let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
                             s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
@@ -1639,8 +1740,47 @@ mod tests {
             "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
              p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
         );
+        // Before the server-final arrives, the exchange must NOT count as
+        // complete — this is what the startup loop's gate leans on when a
+        // peer skips AuthenticationSASLFinal and jumps to AuthenticationOk.
+        assert!(st.require_verified().is_err(), "unverified must not pass");
         st.verify_server("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
             .unwrap();
+        st.require_verified().unwrap();
+        // A signature the RFC vector does NOT produce (first byte flipped)
+        // is a peer that does not know the password: rejected, and the
+        // verified bit stays down.
+        let st2 = ScramState {
+            nonce: "rOprNGfwEbeRWgbNEkqO".into(),
+            client_first_bare: "n=user,r=rOprNGfwEbeRWgbNEkqO".into(),
+            server_signature: Default::default(),
+            verified: Default::default(),
+        };
+        st2.client_final(server_first, "pencil").unwrap();
+        assert!(st2
+            .verify_server("v=7rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+            .is_err());
+        assert!(st2.require_verified().is_err(), "a bad v= must not verify");
+        // And a server-final with no v= at all is the same refusal.
+        assert!(st2.verify_server("e=other-error").is_err());
+        assert!(st2.require_verified().is_err());
+    }
+
+    /// A hostile iteration count must be refused before the PBKDF2 loop
+    /// runs, not obeyed (i=2^31 pins a core for hours) and not clamped
+    /// (a clamped count computes the wrong proof).
+    #[test]
+    fn scram_refuses_a_hostile_iteration_count() {
+        let st = ScramState {
+            nonce: "rOprNGfwEbeRWgbNEkqO".into(),
+            client_first_bare: "n=user,r=rOprNGfwEbeRWgbNEkqO".into(),
+            server_signature: Default::default(),
+            verified: Default::default(),
+        };
+        let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+                            s=W22ZaJ0SNY7soEsUEjb6gQ==,i=2000000000";
+        let e = st.client_final(server_first, "pencil").unwrap_err();
+        assert!(format!("{e}").contains("iterations"), "refusal names the cap");
     }
 
     #[test]
