@@ -183,6 +183,48 @@ pub(crate) enum Dialect {
     MySql,
 }
 
+/// The two spellings a Postgres `_apitap_state` key has historically had, and
+/// which one is canonical now.
+///
+/// The bulk lane always keyed state rows by the schema-qualified name
+/// (`public.orders`); the CDC lane keyed them by the name it was handed
+/// (usually bare `orders`). Same table, same purpose, two vocabularies — and
+/// the meeting points were exactly where it mattered: a bulk `replace` deleted
+/// state rows under ITS spelling and missed the CDC row, so the next
+/// `log_based` run resumed from a watermark that predated the replace; and a
+/// mode switch read the other lane's row or missed it depending on which
+/// spelling the caller used.
+///
+/// Canonical is the QUALIFIED form, because it is the unambiguous one. Every
+/// write goes there. Every read tries canonical first and falls back to the
+/// legacy bare spelling, so a deployment upgraded mid-life keeps its
+/// watermark; the first write after that migrates the row (upsert canonical,
+/// delete legacy in the same transaction), so the fallback is transitional,
+/// not permanent.
+pub(crate) fn pg_state_keys(dest_table: &str) -> (String, String) {
+    match dest_table.split_once('.') {
+        Some((_, bare)) => (dest_table.to_string(), bare.to_string()),
+        None => (format!("public.{dest_table}"), dest_table.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod pg_state_key_tests {
+    use super::*;
+
+    /// The bug this exists for: the two lanes must produce the SAME canonical
+    /// key for the same table, however the caller spelled it.
+    #[test]
+    fn both_spellings_share_one_canonical_key() {
+        assert_eq!(pg_state_keys("orders").0, "public.orders");
+        assert_eq!(pg_state_keys("public.orders").0, "public.orders");
+        assert_eq!(pg_state_keys("orders").1, "orders");
+        assert_eq!(pg_state_keys("public.orders").1, "orders");
+        assert_eq!(pg_state_keys("sales.orders").0, "sales.orders");
+        assert_eq!(pg_state_keys("sales.orders").1, "orders");
+    }
+}
+
 /// The state table's name is fixed — it is per-destination, not per-table, so
 /// it never needs shortening.
 pub(crate) const STATE_TABLE: &str = "_apitap_state";

@@ -31,8 +31,10 @@ impl PgDest {
     /// Remove this table's watermark row — a failed group bootstrap must leave
     /// no state, or the next run refuses the group as torn.
     pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM _apitap_state WHERE dest_table = $1 AND source_id = $2")
-            .bind(dest_table)
+        let (kc, kl) = crate::naming::pg_state_keys(dest_table);
+        sqlx::query("DELETE FROM _apitap_state WHERE dest_table IN ($1, $2) AND source_id = $3")
+            .bind(kc)
+            .bind(kl)
             .bind(source_id)
             .execute(&self.pool)
             .await
@@ -91,7 +93,23 @@ impl PgDest {
                    PRIMARY KEY (dest_table, source_id))",
             )
             .await
-            .map_err(db_err)?;
+            .map(|_| ())
+            .or_else(|e| match &e {
+                // IF NOT EXISTS is not atomic: two first-runs bootstrapping
+                // into a fresh destination at once can both pass the existence
+                // check, and the loser raises 42P07 (duplicate_table) or 23505
+                // on pg_type's unique index. The table exists either way,
+                // which is the only thing this function promises. The bulk
+                // sink has carried the same tolerance for a long time; a group
+                // bootstrap fanning out per-table workers hits this window far
+                // more often than a human ever would.
+                sqlx::Error::Database(d)
+                    if matches!(d.code().as_deref(), Some("42P07") | Some("23505")) =>
+                {
+                    Ok(())
+                }
+                _ => Err(db_err(e)),
+            })?;
         Ok(())
     }
 
@@ -100,11 +118,17 @@ impl PgDest {
         dest_table: &str,
         source_id: &str,
     ) -> Result<Option<u64>> {
+        // Canonical key first, historical bare spelling as fallback — an
+        // upgraded deployment keeps its watermark, and the next write migrates
+        // the row. See `naming::pg_state_keys` for why two spellings exist.
+        let (kc, kl) = crate::naming::pg_state_keys(dest_table);
         let row: Option<(Option<String>, String)> = sqlx::query_as(
             "SELECT watermark, cursor_col FROM _apitap_state \
-             WHERE dest_table = $1 AND source_id = $2 AND mode = 'log_based'",
+             WHERE dest_table IN ($1, $2) AND source_id = $3 AND mode = 'log_based' \
+             ORDER BY (dest_table = $1) DESC LIMIT 1",
         )
-        .bind(dest_table)
+        .bind(kc)
+        .bind(kl)
         .bind(source_id)
         .fetch_optional(&self.pool)
         .await
@@ -354,6 +378,18 @@ async fn upsert_state_tx(
     lsn: u64,
     rows: u64,
 ) -> Result<()> {
+    // Write under the canonical key, and retire the legacy-spelled row in the
+    // same transaction: the dual-spelling read above is a migration ramp, not
+    // a permanent state of affairs, and it converges exactly here.
+    let (kc, kl) = crate::naming::pg_state_keys(dest_table);
+    if kc != kl {
+        sqlx::query("DELETE FROM _apitap_state WHERE dest_table = $1 AND source_id = $2")
+            .bind(&kl)
+            .bind(source_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+    }
     sqlx::query(
         "INSERT INTO _apitap_state \
            (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
@@ -362,7 +398,7 @@ async fn upsert_state_tx(
            cursor_col = EXCLUDED.cursor_col, watermark = EXCLUDED.watermark, \
            mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()",
     )
-    .bind(dest_table)
+    .bind(kc)
     .bind(source_id)
     .bind(STATE_CURSOR)
     .bind(lsn.to_string())

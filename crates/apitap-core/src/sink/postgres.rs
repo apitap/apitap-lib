@@ -546,15 +546,60 @@ impl crate::sink::Sink for PgSink {
         // precision differences, and enables per-source watermarks (fan-in). Only a
         // missing row (pre-state-table destinations, or a fresh dest built by plain
         // replace) falls back to deriving the watermark from the data itself.
-        let from_state: Option<String> = sqlx::query_scalar(&format!(
-            "SELECT watermark FROM {} WHERE dest_table = $1 AND source_id = $2",
+        // Read the row's whole vocabulary, not just its value. A watermark is
+        // only meaningful in the terms it was written in: a `log_based` row
+        // holds an LSN, and a cursor lane that adopts an LSN as a cursor value
+        // starts from a position that means nothing — skipping or repeating
+        // rows while reporting success. That exact switch (CDC table later run
+        // with mode="append") used to do exactly that, silently.
+        //
+        // Both key spellings are consulted — the CDC lane historically keyed
+        // by the bare name where this lane keys by schema.bare, and a guard
+        // that cannot SEE the other lane's row guards nothing. See
+        // `naming::pg_state_keys`.
+        let (key_canonical, key_legacy) = crate::naming::pg_state_keys(&self.dest_key);
+        let row: Option<(Option<String>, String, String)> = sqlx::query_as(&format!(
+            "SELECT watermark, cursor_col, mode FROM {} \
+             WHERE dest_table IN ($1, $2) AND source_id = $3 \
+             ORDER BY (dest_table = $1) DESC LIMIT 1",
             self.state_table()
         ))
-        .bind(&self.dest_key)
+        .bind(&key_canonical)
+        .bind(&key_legacy)
         .bind(source_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| Error::Transfer(format!("state read: {e}")))?;
+        let from_state: Option<String> = match row {
+            None => None,
+            Some((wm, row_cursor, row_mode)) => {
+                if row_mode == "log_based" {
+                    return Err(Error::InvalidInput(format!(
+                        "{}: this destination table is CDC-managed — its state \
+                         watermark is an LSN, which a mode=\"{}\" run cannot \
+                         resume from. Keep using mode=\"log_based\", or clear \
+                         this table's _apitap_state rows to hand it to the \
+                         cursor lane (the next run then re-bootstraps).",
+                        self.dest_key,
+                        match mode {
+                            Mode::Merge => "merge",
+                            _ => "append",
+                        },
+                    )));
+                }
+                if row_cursor != cursor {
+                    return Err(Error::InvalidInput(format!(
+                        "{}: the state row tracks cursor '{row_cursor}' but this \
+                         run uses cursor '{cursor}' — a watermark in one \
+                         column's terms cannot resume another's. Re-run with \
+                         cursor=\"{row_cursor}\", or clear this table's \
+                         _apitap_state rows to restart from a full load.",
+                        self.dest_key,
+                    )));
+                }
+                wm
+            }
+        };
         let (siblings, data_max) = match &from_state {
             Some(_) => (false, None), // authoritative: the data max is never consulted
             None => {
@@ -641,11 +686,19 @@ impl crate::sink::Sink for PgSink {
                     .await
                     .map_err(|e| Error::Transfer(format!("state lookup: {e}")))?;
                 if has_state {
+                    // Both spellings: the CDC lane historically keyed rows by
+                    // the bare name, and a replace that deletes only its own
+                    // spelling leaves the CDC watermark alive — the next
+                    // log_based run then resumes from a position that predates
+                    // this replace and re-applies changes the new table never
+                    // saw. See `naming::pg_state_keys`.
+                    let (kc, kl) = crate::naming::pg_state_keys(&self.dest_key);
                     sqlx::query(&format!(
-                        "DELETE FROM {} WHERE dest_table = $1",
+                        "DELETE FROM {} WHERE dest_table IN ($1, $2)",
                         self.state_table()
                     ))
-                    .bind(&self.dest_key)
+                    .bind(kc)
+                    .bind(kl)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| Error::Transfer(format!("state clear: {e}")))?;
