@@ -353,6 +353,12 @@ apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_a
   run). Adding a *second* source to a destination that already has state rows
   requires an explicit choice — the run fails loudly instead of guessing a
   watermark; seed a state row manually or rebuild with replace.
+- Do not run two syncs of the same (source, destination) pair concurrently. They
+  share one staging object, and the loser can publish the winner's empty table
+  while reporting success — see [failure-modes.md](failure-modes.md). Guarding
+  this properly is open work; until then, one run per destination table, which
+  a scheduler's own concurrency setting (Airflow `max_active_runs=1`, a cron
+  `flock`) gives you.
 - Avoid running two syncs of the same (source, destination) pair concurrently —
   they would each read the same watermark and land the same delta twice. (The
   ClickHouse state table is a `ReplacingMergeTree`; it self-compacts old state
@@ -839,7 +845,15 @@ apitap.transfer(
 - **TOAST, handled**: an UPDATE that leaves a TOASTed column untouched
   omits that value from the WAL; those rows apply as column-masked UPDATEs
   so the destination's large values survive. Verified in the e2e suite
-  with 200 KB values.
+  with 200 KB values. An UPDATE that ALSO changes the primary key moves the
+  row rather than deleting and rewriting it — deleting first would throw away
+  the value the WAL never sent.
+- **Partitioned tables, handled**: name the parent. apitap creates its
+  publication with `publish_via_partition_root`, so changes arrive under the
+  parent's name however many leaf partitions they came from, and a partition
+  attached later flows on the next drain with no re-bootstrap. Needs
+  PostgreSQL 13 or newer, which is where that option arrived; an older server
+  is refused up front with the reason rather than replicating nothing.
 - **Requirements, checked loudly**: `wal_level=logical`; the table needs a
   primary key (its replica identity); `REPLICA IDENTITY NOTHING` and
   key columns outside the replica identity fail with the exact `ALTER

@@ -45,6 +45,7 @@ The two properties everything else rests on:
 | **Process SIGKILLed mid bulk transfer** | Previous destination table **intact and readable throughout** (proven: 1,000 rows and their marker unchanged while 10M rows were streaming into staging). A staging table `<dest>__apitap_staging` may be orphaned. | Just re-run. The next run starts with `DROP TABLE IF EXISTS` on staging, so the orphan costs disk until then, nothing more. Proven: re-run landed 10,000,000 rows = source count. | `e2e_failure_modes.py` case 1 |
 | **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) | Re-run. Every change is applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2 |
 | **SIGTERM mid CDC window** (pod evicted, Airflow run cleared, `systemctl stop`) | The window in flight is **applied**, not discarded, and the watermark advances with it. The run exits 0 with a report of the rows it landed. | Nothing. The next run picks up from the new watermark. A second SIGTERM is not absorbed — the default disposition comes back and the process ends at once, which is the SIGKILL case above and equally safe. | `e2e_sigterm.py` (Postgres, incl. a control run with the mechanism disabled), `e2e_sigterm_my.py` (MySQL binlog) |
+| **Two runs of the same destination table at once** | They share one staging object. Run A streams its rows in; run B's `prepare` DROPs that object and creates a fresh empty one; A's `finalize` then publishes B's empty table over the destination — and A returns a successful report with A's row count. A green run and an empty table. | **Prevent it**: one run per destination table (Airflow `max_active_runs=1`, a cron `flock`). If it has already happened, re-run — the next single run rebuilds the table correctly. Guarding this inside apitap is open work: Postgres and MySQL have advisory locks, ClickHouse and the object stores have nothing equivalent, so it needs a design rather than a patch. | read from the source, not yet reproduced in a leg |
 | **Source connection cut mid-COPY** (server restart, `pg_terminate_backend`, idle/statement timeout, network drop) | Nothing published. The destination table is **not even created** — it only comes into existence at the swap. | Re-run. The error says so explicitly rather than making you guess. | case 3 |
 | **Structural DDL on the source during a bulk run** | Cannot interleave on Postgres: `COPY` holds `ACCESS SHARE`, and `ALTER TABLE … DROP/ADD COLUMN` needs `ACCESS EXCLUSIVE`, so the DDL **waits for the read to finish**. Column mapping cannot drift mid-stream. | Nothing to do. If the DDL wins a race we do not yet know about, the run fails loudly rather than writing values into the wrong column — that is the assertion the test makes. | case 4 |
 | **CDC schedule stopped for a long time — Postgres** | The replication slot keeps holding WAL on the **source**, which is the guarantee CDC rests on and also how a stopped schedule fills the source's disk. | Run the drain: a backlog is not a reason to refuse, it is a reason to run. apitap prints the retained WAL every run and warns past `APITAP_SLOT_WAL_WARN` (default 4 GiB). Set `max_slot_wal_keep_size` on the server so an abandoned slot is *invalidated* instead of filling the disk — apitap reports that as slot-is-GONE and recovers with a fresh bootstrap. | `e2e_cdc_retention.py` |
@@ -58,10 +59,6 @@ The two properties everything else rests on:
   error with the staging table left behind, i.e. the same recovery as a killed
   run — but expected is not measured, and this page is only worth something if
   it distinguishes the two.
-- **Long-duration soak.** File-descriptor growth, slot growth and watermark
-  drift are duration bugs; a 24–48 hour CDC soak has not been run. The longest
-  measured run is a 200-million-change campaign over ~2 minutes of apply work
-  plus its bootstrap.
 - **Destination-side crash mid-apply** (ClickHouse or BigQuery restarting under
   us). The apply is idempotent by design and the watermark is written last, so
   the expectation is a clean replay — again, expectation, not receipt.
@@ -170,6 +167,43 @@ Details worth knowing before you rely on it:
 SIGKILL is not catchable and is not handled. If the apply outlives the
 scheduler's grace period, SIGKILL still arrives, and that is still safe for
 the reason it always was.
+
+## The 24-hour soak, and what it did and did not settle
+
+File-descriptor growth, replication-slot growth and watermark drift are
+DURATION bugs: none of them can appear in the two-minute runs every other
+measurement on this page is made from. So the shape apitap is actually deployed
+in — a fresh process per drain, on a schedule, against a source being written to
+the whole time — was run for a day.
+
+`benchmarks/soak_cdc.py`, 2026-08-22, Postgres → ClickHouse, one drain every
+30 s for 24 hours while a writer pushed inserts, updates and deletes
+continuously:
+
+| | first | max | last |
+|---|---|---|---|
+| peak RSS per drain | 20 MB | 25 MB | 25 MB |
+| open file descriptors | 4 | 4 | 4 |
+| replication slots | 1 | 2 | 1 |
+| WAL retained by the slot | 128 KB | 289 MB | 2.5 MB |
+
+**2,880 drains, 0 failures, 96 exact verifications.** Every 30th drain paused
+the writer, let the drain catch up, and compared both sides on count, `sum(id)`
+and `sum(touched)` — all 96 matched exactly.
+
+The WAL figure is the one worth reading carefully, because "it went up" is not
+the same as "it leaks": retention rises while a drain is behind and falls when
+the watermark advances past it. A number that rose and never fell would be the
+duration bug this was looking for. It rose to 289 MB and came back to 2.5 MB.
+
+Each drain reports its OWN peak RSS from inside the child process. That is not
+a detail: `RUSAGE_CHILDREN.ru_maxrss` in the parent is a high-water mark over
+every child it has ever reaped, so across thousands of runs it can only rise —
+it would have manufactured exactly the leak the soak existed to look for.
+
+What this does NOT settle: a soak is one shape at one rate on one rig. It says
+nothing about a month, about a source with a different write pattern, or about
+the object-store destinations, which were not exercised.
 
 ## Rules of thumb
 
