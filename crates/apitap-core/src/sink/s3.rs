@@ -70,7 +70,14 @@ fn decode_component(s: &str) -> Result<String> {
                 .and_then(|h| std::str::from_utf8(h).ok())
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
                 .ok_or_else(|| {
-                    Error::InvalidInput(format!("s3 url: invalid percent-escape in '{s}'"))
+                    // The component is NOT echoed: this decoder runs on query
+                    // values too, and for this sink that includes
+                    // secret_access_key — the component may BE the secret.
+                    Error::InvalidInput(
+                        "s3 url: invalid percent-escape in a url component — \
+                         percent-encode it fully, e.g. quote(value, safe='')"
+                            .into(),
+                    )
                 })?;
             out.push(hex);
             i += 3;
@@ -104,6 +111,15 @@ fn xml_tags(body: &str, tag: &str) -> Vec<String> {
         rest = &rest[start + j + close.len()..];
     }
     out
+}
+
+/// The (key, upload_id) pairs on one ListMultipartUploads page — each
+/// `<Upload>` element holds both, alongside owner/date noise we don't need.
+fn parse_uploads(body: &str) -> Vec<(String, String)> {
+    xml_tags(body, "Upload")
+        .iter()
+        .filter_map(|u| Some((xml_tag(u, "Key")?, xml_tag(u, "UploadId")?)))
+        .collect()
 }
 
 impl S3Conn {
@@ -180,8 +196,11 @@ impl S3Conn {
                     .split_once("://")
                     .map(|(_, h)| h.to_string())
                     .ok_or_else(|| {
+                        // sanitized: an endpoint can carry userinfo, and
+                        // userinfo can carry a secret.
                         Error::InvalidInput(format!(
-                            "s3 endpoint must include a scheme, e.g. http://127.0.0.1:9000 — got '{e}'"
+                            "s3 endpoint must include a scheme, e.g. http://127.0.0.1:9000 — got '{}'",
+                            crate::urlerr::sanitized(&e)
                         ))
                     })?;
                 (e, host, true)
@@ -219,8 +238,11 @@ impl S3Conn {
                     .split_once("://")
                     .map(|(_, h)| h.to_string())
                     .ok_or_else(|| {
+                        // sanitized: an endpoint can carry userinfo, and
+                        // userinfo can carry a secret.
                         Error::InvalidInput(format!(
-                            "s3 endpoint must include a scheme, e.g. http://127.0.0.1:9000 — got '{e}'"
+                            "s3 endpoint must include a scheme, e.g. http://127.0.0.1:9000 — got '{}'",
+                            crate::urlerr::sanitized(&e)
                         ))
                     })?;
                 (e, host, true)
@@ -459,12 +481,80 @@ impl S3Conn {
         Ok(())
     }
 
-    pub(crate) async fn abort_multipart(&self, object: &str, upload_id: &str) {
+    /// Abort one multipart upload so its parts stop being stored (and
+    /// billed). The caller decides what a failure means: prepare's sweep
+    /// stays silent best-effort, live error paths go through
+    /// [`Self::abort_multipart_noted`] so an operator hears about the orphan.
+    pub(crate) async fn abort_multipart(&self, object: &str, upload_id: &str) -> Result<()> {
         let uri = self.uri_for(object);
         let q = vec![("uploadId".to_string(), upload_id.to_string())];
-        let _ = self
+        let r = self
             .request(reqwest::Method::DELETE, &uri, &q, Vec::new(), &payload_hash(b""), &[])
-            .await;
+            .await?;
+        // 404 = NoSuchUpload: already aborted or completed — the end state
+        // this call exists to reach.
+        if r.status().as_u16() == 404 {
+            return Ok(());
+        }
+        Self::check(r, "abort multipart").await.map(|_| ())
+    }
+
+    /// Abort with the failure NOTED — for live error paths, where the caller
+    /// is about to surface a more important error and must not mask it, but
+    /// where a silently leaked upload would bill invisibly forever.
+    pub(crate) async fn abort_multipart_noted(&self, object: &str, upload_id: &str) {
+        if let Err(e) = self.abort_multipart(object, upload_id).await {
+            crate::progress::note(&format!(
+                "s3: aborting the incomplete multipart upload for {object} \
+                 failed ({e}) — its parts keep billing until the upload is \
+                 removed (a later run's staging sweep, `aws s3api \
+                 abort-multipart-upload`, or a bucket lifecycle rule)"
+            ));
+        }
+    }
+
+    /// Incomplete multipart uploads under a prefix, as (key, upload_id)
+    /// pairs. These are invisible to [`Self::list`] — no object exists until
+    /// CompleteMultipartUpload — but their parts are stored (and billed) all
+    /// the same, so a sweep has to ask for them by name.
+    pub(crate) async fn list_multipart_uploads(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let uri = if self.path_style {
+            format!("/{}", enc_seg(&self.bucket))
+        } else {
+            "/".to_string()
+        };
+        let mut out = Vec::new();
+        let mut markers: Option<(String, String)> = None;
+        loop {
+            let mut q = vec![
+                ("uploads".to_string(), String::new()),
+                ("prefix".to_string(), prefix.to_string()),
+            ];
+            if let Some((k, id)) = &markers {
+                q.push(("key-marker".to_string(), k.clone()));
+                q.push(("upload-id-marker".to_string(), id.clone()));
+            }
+            let r = self
+                .request(reqwest::Method::GET, &uri, &q, Vec::new(), &payload_hash(b""), &[])
+                .await?;
+            let body = Self::check(r, "list multipart uploads").await?;
+            out.extend(parse_uploads(&body));
+            if xml_tag(&body, "IsTruncated").as_deref() != Some("true") {
+                return Ok(out);
+            }
+            markers = match (
+                xml_tag(&body, "NextKeyMarker"),
+                xml_tag(&body, "NextUploadIdMarker"),
+            ) {
+                (Some(k), Some(id)) => Some((k, id)),
+                // Truncated but no continuation markers: looping again would
+                // spin forever on the same page — hand back what we have.
+                _ => return Ok(out),
+            };
+        }
     }
 
     pub(crate) async fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -588,6 +678,17 @@ impl crate::sink::Sink for S3Sink {
         for obj in self.conn.list(&self.staging).await? {
             self.conn.delete(&obj).await?;
         }
+        // A killed run's multipart UPLOADS are invisible to the object sweep
+        // above — no object exists until CompleteMultipartUpload, but the
+        // parts are stored and billed, and nothing else ever removes them
+        // (no bucket lifecycle rule can be assumed). Best-effort: an
+        // S3-compatible store with patchy ListMultipartUploads support must
+        // not fail a run that would otherwise succeed.
+        if let Ok(uploads) = self.conn.list_multipart_uploads(&self.staging).await {
+            for (key, id) in uploads {
+                let _ = self.conn.abort_multipart(&key, &id).await;
+            }
+        }
         Ok(())
     }
 
@@ -700,18 +801,29 @@ impl crate::sink::Loader for S3Loader {
         if self.etags.is_empty() && pending.is_empty() {
             // Nothing was ever produced (0-row worker): abort the upload so no
             // empty object lands; finalize's 0-row guard handles the rest.
-            self.conn.abort_multipart(&self.object, &self.upload_id).await;
+            self.conn.abort_multipart_noted(&self.object, &self.upload_id).await;
             return Ok(0);
         }
-        self.flush_part(pending).await?;
-        self.conn
-            .complete_multipart(&self.object, &self.upload_id, &self.etags)
-            .await?;
+        let done = match self.flush_part(pending).await {
+            Ok(()) => {
+                self.conn
+                    .complete_multipart(&self.object, &self.upload_id, &self.etags)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = done {
+            // The object will never complete — abort the upload so its parts
+            // stop billing, then surface the ORIGINAL error (a failed abort
+            // is noted, never allowed to mask it).
+            self.conn.abort_multipart_noted(&self.object, &self.upload_id).await;
+            return Err(e);
+        }
         Ok(self.rows)
     }
 
     async fn abort(self, cause: Error) -> Error {
-        self.conn.abort_multipart(&self.object, &self.upload_id).await;
+        self.conn.abort_multipart_noted(&self.object, &self.upload_id).await;
         cause
     }
 }
@@ -748,5 +860,34 @@ mod tests {
         assert_eq!(decode_component("a%C3%B1o%201").unwrap(), "año 1");
         assert_eq!(decode_component("k+ey").unwrap(), "k+ey");
         assert!(decode_component("bad%zz").is_err());
+    }
+
+    /// The decoder runs on query VALUES, and one of those is
+    /// secret_access_key — a decode failure must not quote it back.
+    #[test]
+    fn a_bad_percent_escape_never_echoes_the_component() {
+        let e = decode_component("S3CRET%ZZ").unwrap_err();
+        assert!(!e.to_string().contains("S3CRET"), "leaked: {e}");
+    }
+
+    #[test]
+    fn multipart_upload_listing_parses_keys_and_ids() {
+        // The markers echo request state and must not be mistaken for
+        // uploads; each <Upload> carries key + id amid noise we skip.
+        let body = "<ListMultipartUploadsResult><Bucket>b</Bucket>\
+                    <KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker>\
+                    <IsTruncated>false</IsTruncated>\
+                    <Upload><Key>a/part-00000.parquet</Key><UploadId>id1</UploadId>\
+                    <Initiated>2026-08-23T00:00:00Z</Initiated></Upload>\
+                    <Upload><Key>a/part-00001.parquet</Key><UploadId>id2</UploadId></Upload>\
+                    </ListMultipartUploadsResult>";
+        assert_eq!(
+            parse_uploads(body),
+            vec![
+                ("a/part-00000.parquet".to_string(), "id1".to_string()),
+                ("a/part-00001.parquet".to_string(), "id2".to_string()),
+            ]
+        );
+        assert_eq!(xml_tag(body, "IsTruncated").as_deref(), Some("false"));
     }
 }

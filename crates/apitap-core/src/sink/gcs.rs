@@ -87,7 +87,14 @@ fn decode_component(s: &str) -> Result<String> {
                 .and_then(|h| std::str::from_utf8(h).ok())
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
                 .ok_or_else(|| {
-                    Error::InvalidInput(format!("gcs url: invalid percent-escape in '{s}'"))
+                    // The component is NOT echoed — same rule as the s3 and
+                    // iceberg twins of this decoder, whose query values carry
+                    // real secrets; a shared contract stays shared.
+                    Error::InvalidInput(
+                        "gcs url: invalid percent-escape in a url component — \
+                         percent-encode it fully, e.g. quote(value, safe='')"
+                            .into(),
+                    )
                 })?;
             out.push(hex);
             i += 3;

@@ -95,7 +95,14 @@ fn dec(s: &str) -> Result<String> {
                 .and_then(|h| std::str::from_utf8(h).ok())
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
                 .ok_or_else(|| {
-                    Error::InvalidInput(format!("iceberg url: invalid percent-escape in '{s}'"))
+                    // The component is NOT echoed: this decoder runs on query
+                    // values too, and here those include secret_access_key
+                    // and token — the component may BE the secret.
+                    Error::InvalidInput(
+                        "iceberg url: invalid percent-escape in a url component — \
+                         percent-encode it fully, e.g. quote(value, safe='')"
+                            .into(),
+                    )
                 })?;
             out.push(hex);
             i += 3;
@@ -1777,13 +1784,24 @@ impl crate::sink::Loader for IcebergLoader {
         // A 0-row worker still produced parquet header+footer bytes — don't
         // land an empty data file in the manifest; abort the upload instead.
         if self.rows == 0 {
-            self.s3.abort_multipart(&self.key, &self.upload_id).await;
+            self.s3.abort_multipart_noted(&self.key, &self.upload_id).await;
             return Ok(0);
         }
-        self.flush_part(pending).await?;
-        self.s3
-            .complete_multipart(&self.key, &self.upload_id, &self.etags)
-            .await?;
+        let done = match self.flush_part(pending).await {
+            Ok(()) => {
+                self.s3
+                    .complete_multipart(&self.key, &self.upload_id, &self.etags)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = done {
+            // The data file will never complete — abort the upload so its
+            // parts stop billing, then surface the ORIGINAL error (a failed
+            // abort is noted, never allowed to mask it).
+            self.s3.abort_multipart_noted(&self.key, &self.upload_id).await;
+            return Err(e);
+        }
         self.done.lock().expect("done list").push(FileDone {
             path: self.path,
             key: self.key,
@@ -1796,7 +1814,7 @@ impl crate::sink::Loader for IcebergLoader {
     }
 
     async fn abort(self, cause: Error) -> Error {
-        self.s3.abort_multipart(&self.key, &self.upload_id).await;
+        self.s3.abort_multipart_noted(&self.key, &self.upload_id).await;
         cause
     }
 }
