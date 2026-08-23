@@ -674,9 +674,26 @@ async fn run_group(
     // Resolve every member: real (schema, name) + PK on the source.
     let single = tables.len() == 1;
     let mut ctxs = Vec::with_capacity(tables.len());
+    // publish_via_partition_root exists from PostgreSQL 13. Before that a
+    // partitioned parent cannot be published usefully at all, so it is refused
+    // up front — by us, with the reason, rather than later by the server with
+    // a message about publications.
+    let server_num: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&src)
+        .await
+        .map_err(db_err)?;
     for t in tables {
-        let (schema_name, bare) = resolve_table(&src, t).await?;
+        let (schema_name, bare, partitioned) = resolve_table(&src, t).await?;
         let qualified = format!("{schema_name}.{bare}");
+        if partitioned && server_num < 130_000 {
+            return Err(Error::InvalidInput(format!(
+                "log_based: {qualified} is a partitioned table and this server is \
+                 PostgreSQL {} — replicating a partitioned parent needs \
+                 publish_via_partition_root, which arrived in PostgreSQL 13. \
+                 Upgrade the server, or CDC the leaf partitions individually.",
+                server_num / 10_000
+            )));
+        }
         let pk_cols = pk_columns(&src, &qualified).await?;
         if pk_cols.is_empty() {
             return Err(Error::InvalidInput(format!(
@@ -1427,16 +1444,22 @@ fn db_err(e: sqlx::Error) -> Error {
     Error::Transfer(format!("log_based: {e}"))
 }
 
-async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String)> {
-    let row: (String, String) = sqlx::query_as(
-        "SELECT n.nspname, c.relname FROM pg_class c \
+async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String, bool)> {
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT n.nspname, c.relname, c.relkind::text FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1::regclass",
     )
     .bind(table)
     .fetch_one(src)
     .await
     .map_err(|e| Error::InvalidInput(format!("log_based: table '{table}': {e}")))?;
-    Ok(row)
+    // relkind 'p' is a declaratively partitioned PARENT. It matters because a
+    // parent emits no WAL of its own: without `publish_via_partition_root` the
+    // Relation messages name the LEAF partitions, the drain's tracking map
+    // (keyed by the name the user asked for) discards every change, and the
+    // watermark advances past them — the bootstrap is correct, so the
+    // destination looks right on day one and then freezes forever.
+    Ok((row.0, row.1, row.2 == "p"))
 }
 
 async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
@@ -1467,14 +1490,34 @@ async fn ensure_publication(
             .fetch_optional(src)
             .await
             .map_err(db_err)?;
+    // publish_via_partition_root=true wherever the server knows the option
+    // (PostgreSQL 13+). For a partitioned parent this is the difference between
+    // working and silently discarding every change: without it the Relation
+    // messages carry each LEAF's name, which the drain does not track. For a
+    // plain table it changes nothing. It also fixes the catalog view this very
+    // function reads — with the option off, pg_publication_tables lists the
+    // LEAVES, so the membership check below concluded the parent had vanished
+    // and died re-adding it ("is already member of publication").
+    let viaroot: bool = sqlx::query_scalar::<_, i32>(
+        "SELECT current_setting('server_version_num')::int",
+    )
+    .fetch_one(src)
+    .await
+    .map(|v| v >= 130_000)
+    .unwrap_or(false);
     if exists.is_none() {
         let list = qualified_tables
             .iter()
             .map(|q| format!("ONLY {}", quote_table(q)))
             .collect::<Vec<_>>()
             .join(", ");
+        let with = if viaroot {
+            " WITH (publish_via_partition_root = true)"
+        } else {
+            ""
+        };
         sqlx::query(&format!(
-            "CREATE PUBLICATION {} FOR TABLE {list}",
+            "CREATE PUBLICATION {} FOR TABLE {list}{with}",
             quote_ident(publication)
         ))
         .execute(src)
@@ -1486,6 +1529,20 @@ async fn ensure_publication(
             ))
         })?;
         return Ok(());
+    }
+    if viaroot {
+        // Heal a publication made before this option was set (or by an older
+        // apitap): one idempotent catalog update, and the next drain's
+        // Relation messages carry the ROOT's name. The changes a broken
+        // pipeline already confirmed past are gone either way — that needs a
+        // re-bootstrap and the docs say so — but from here on it tracks.
+        sqlx::query(&format!(
+            "ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
+            quote_ident(publication)
+        ))
+        .execute(src)
+        .await
+        .map_err(db_err)?;
     }
     for qualified in qualified_tables {
         let (schema, bare) = qualified.split_once('.').unwrap_or(("public", qualified));
