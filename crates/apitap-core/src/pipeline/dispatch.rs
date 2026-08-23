@@ -105,6 +105,25 @@ struct SinkCfg {
     ch_ddl: ChDdl,
     /// BigQuery only: the run's pipe budget (staging-table load fan-out).
     budget: usize,
+    /// This run's identity, carried into every scratch object it creates.
+    ///
+    /// Minted once per dispatch and shared by every table in the run: two
+    /// tables have different `bare` names, so their artifacts cannot collide
+    /// with each other whatever the token says, and sharing it means an
+    /// operator looking at a listing can see which staging objects belong
+    /// together. See `crate::naming::RunId`.
+    run: crate::naming::RunId,
+}
+
+/// How this run's mode lands rows, which is what decides whether a concurrent
+/// run of the same table can be allowed to proceed.
+fn land_kind(mode: crate::Mode) -> crate::naming::LandKind {
+    use crate::naming::LandKind;
+    match mode {
+        crate::Mode::Replace => LandKind::Swap,
+        crate::Mode::Append | crate::Mode::Merge => LandKind::Incremental,
+        crate::Mode::LogBased => LandKind::Cdc,
+    }
 }
 
 /// A source engine, keyed by URL scheme: how to open it with a given pool size.
@@ -178,7 +197,7 @@ impl DstScheme for PgTo {
     type Shared = sqlx::PgPool;
     const BARE_DEST: bool = false;
     async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<PgSink> {
-        PgSink::connect(url, dest_table, parallel + 1, cfg.pg_overlap).await
+        PgSink::connect(url, dest_table, parallel + 1, cfg.pg_overlap, &cfg.run).await
     }
     async fn shared(url: &str, budget: usize, _cfg: &SinkCfg) -> Result<sqlx::PgPool> {
         // +8 headroom over the budget: pipes take most connections, the extra
@@ -187,7 +206,7 @@ impl DstScheme for PgTo {
         PgSink::shared_pool(url, budget + 8).await
     }
     fn bind(shared: sqlx::PgPool, table: &str, cfg: &SinkCfg) -> Result<PgSink> {
-        Ok(PgSink::bind(shared, table, cfg.pg_overlap))
+        Ok(PgSink::bind(shared, table, cfg.pg_overlap, &cfg.run))
     }
 }
 struct ChTo;
@@ -307,7 +326,16 @@ async fn one<S: SrcScheme, D: DstScheme>(
     // clamping HERE also sizes the connection pools honestly for single-stream
     // sources (a 1-pipe github read must not open a 33-connection pool).
     let parallel = parallel.min(profile.table_pipe_cap).max(1);
-    let cfg = SinkCfg { pg_overlap, ch_ddl, budget: parallel };
+    // The source URL, not the per-table source identity: two runs of the SAME
+    // table from one URL must see each other (they would read one watermark
+    // twice), and two runs of DIFFERENT tables never share an artifact name
+    // anyway, so the table part adds nothing the name does not already carry.
+    let cfg = SinkCfg {
+        pg_overlap,
+        ch_ddl,
+        budget: parallel,
+        run: crate::naming::RunId::mint(land_kind(opts.mode), src_url),
+    };
     let src = S::connect(src_url, parallel + 1).await?;
     let sink = D::connect(dst_url, dest_table, parallel, &cfg).await?;
     super::run(
@@ -329,7 +357,12 @@ async fn many<S: SrcScheme, D: DstScheme>(
     ch_ddl: ChDdl,
 ) -> Result<(usize, Vec<crate::TableResult>)> {
     let (chunk, budget) = super::knobs(opts, &profile)?;
-    let cfg = SinkCfg { pg_overlap, ch_ddl, budget };
+    let cfg = SinkCfg {
+        pg_overlap,
+        ch_ddl,
+        budget,
+        run: crate::naming::RunId::mint(land_kind(opts.mode), src_url),
+    };
     let src = S::connect(src_url, budget + 8).await?;
     let jobs = jobs_for(&src, &sel, D::BARE_DEST).await?;
     let shared = D::shared(dst_url, budget, &cfg).await?;

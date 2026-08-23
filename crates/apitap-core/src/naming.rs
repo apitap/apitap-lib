@@ -406,6 +406,20 @@ pub(crate) fn artifact_match(bare: &str, artifact: Artifact, limit: usize) -> (S
     (format!("{head}_{}", &h[..HASH]), suffix)
 }
 
+/// How long a staging object may sit before a later run treats it as a crashed
+/// run's leftover rather than a live peer's workspace.
+///
+/// One hour, not a day: with per-run names an orphan is only left by a hard
+/// kill (every error path drops its own), and a 100 GB staging table sitting
+/// for a day is real money. `APITAP_STAGING_REAP_SECS=0` disables reaping for
+/// an operator who would rather inspect the wreckage.
+pub(crate) fn reap_horizon_secs() -> u64 {
+    std::env::var("APITAP_STAGING_REAP_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3600)
+}
+
 /// Does this name look like something apitap made?
 ///
 /// Used by table discovery and by the namespace reservation, so both answer the

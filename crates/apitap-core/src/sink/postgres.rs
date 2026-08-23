@@ -22,6 +22,9 @@ pub(crate) struct PgSink {
     bare: String,
     /// Unquoted schema name, for catalog lookups (`public` when unqualified).
     schema: String,
+    /// This run's identity — in the staging name, and what `prepare` compares
+    /// a live peer's staging against.
+    run: crate::naming::RunId,
     /// DDL captured from the pre-swap table (indexes, constraints, grants) — the swap
     /// destroys them, so replace mode re-applies these after the commit.
     restore_ddl: Vec<String>,
@@ -57,11 +60,13 @@ impl PgSink {
         dest_table: &str,
         max_conns: usize,
         overlap_send: bool,
+        run: &crate::naming::RunId,
     ) -> Result<Self> {
         Ok(Self::bind(
             Self::shared_pool(url, max_conns).await?,
             dest_table,
             overlap_send,
+            run,
         ))
     }
 
@@ -75,19 +80,135 @@ impl PgSink {
             .map_err(|e| crate::urlerr::connect_err("postgres destination", url, e))
     }
 
+    /// Collect dead staging objects and refuse live peers.
+    ///
+    /// The listing is one catalog SELECT, and it REPLACES the `DROP TABLE IF
+    /// EXISTS` it stands in for — on Postgres that is strictly cheaper, because
+    /// the DROP took an ACCESS EXCLUSIVE lock and this takes none.
+    ///
+    /// Liveness is read from the name, not the catalog: Postgres stores no
+    /// table creation time (MySQL has `create_time`, ClickHouse
+    /// `metadata_modification_time`, BigQuery `creationTime`, the object stores
+    /// their own), so the age lives in the token. One rule on every engine
+    /// beats five clever ones.
+    async fn reap_and_check_peers(&self) -> Result<()> {
+        use crate::naming::{parse_peer, Artifact};
+        let (head, suffix) =
+            crate::naming::artifact_match(&self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX);
+        // `_` and `%` are LIKE wildcards and both appear in these names.
+        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+        let pattern = format!("{}%{}", esc(&head), esc(suffix));
+        let found: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE $2",
+        )
+        .bind(&self.schema)
+        .bind(&pattern)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
+
+        let mine = parse_peer(
+            &crate::naming::artifact_ident_run(
+                &self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX, &self.run),
+            Artifact::Staging,
+        )
+        .expect("a name this process minted parses");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = crate::naming::reap_horizon_secs();
+        // The one name an older apitap would have used. It carries no token and
+        // therefore no age, so it cannot be aged out — but leaving it forever
+        // would break the cleanup this sink has always promised, and a
+        // concurrent old-version run is the very bug being fixed. Collect it.
+        let legacy =
+            crate::naming::artifact_ident(&self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX);
+
+        for name in found {
+            let Some(peer) = parse_peer(&name, Artifact::Staging) else {
+                if name == legacy {
+                    self.drop_staging(&name).await?;
+                }
+                continue;
+            };
+            let age = now.saturating_sub(peer.started_unix);
+            if horizon != 0 && age > horizon {
+                self.drop_staging(&name).await?;
+                continue;
+            }
+            if crate::naming::peer_blocks(&mine, &peer) {
+                return Err(Error::Locked(format!(
+                    "{}.{}: another apitap run is already loading this table — it \
+                     started {age}s ago and lands rows by {}. Two of them cannot \
+                     share one destination: {}. Run them one at a time (a \
+                     scheduler's own concurrency setting is the usual answer: \
+                     Airflow max_active_runs=1, a cron flock). If that run is \
+                     dead rather than slow, its staging table {name} is reaped \
+                     automatically after {}s, or you can DROP it now.",
+                    self.schema,
+                    self.bare,
+                    match peer.kind {
+                        crate::naming::LandKind::Swap => "replacing the whole table",
+                        crate::naming::LandKind::Incremental => "appending to it",
+                        crate::naming::LandKind::Cdc => "draining changes into it",
+                    },
+                    match mine.kind {
+                        crate::naming::LandKind::Swap =>
+                            "a replace swaps the whole table, so whichever finishes \
+                             second throws the other's work away",
+                        crate::naming::LandKind::Cdc =>
+                            "a CDC drain owns the watermark and the replication slot",
+                        crate::naming::LandKind::Incremental =>
+                            "both would read the same watermark and land the same \
+                             rows twice",
+                    },
+                    horizon,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn drop_staging(&self, name: &str) -> Result<()> {
+        sqlx::query(&format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident_path(&format!("{}.{}", self.schema, name))
+        ))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| Error::Transfer(format!("reap staging {name}: {e}")))
+    }
+
     /// Bind one destination table onto an existing pool. All per-table state
     /// (staging name, swap keys) lives in the sink; the pool carries none.
-    pub(crate) fn bind(pool: PgPool, dest_table: &str, overlap_send: bool) -> Self {
+    pub(crate) fn bind(
+        pool: PgPool,
+        dest_table: &str,
+        overlap_send: bool,
+        run: &crate::naming::RunId,
+    ) -> Self {
         let qualified = dest_table.contains('.');
         let (schema_pfx, bare) = match dest_table.rsplit_once('.') {
             Some((s, t)) => (format!("{s}."), t.to_string()),
             None => (String::new(), dest_table.to_string()),
         };
-        let staging_t = quote_ident_path(&format!(
-            "{schema_pfx}{}",
-            crate::naming::artifact_ident(
-                &bare, crate::naming::Artifact::Staging, crate::naming::PG_IDENT_MAX)
-        ));
+        // The run's token is IN the name, which is what makes it impossible for
+        // one run to publish another's work: finalize renames a name only this
+        // run could have minted. Before this, two runs shared one staging
+        // object — A streamed its rows in, B's prepare dropped it and made a
+        // fresh one, and A's finalize published B's empty table over the
+        // destination while returning A's row count.
+        let staging_bare = crate::naming::artifact_ident_run(
+            &bare,
+            crate::naming::Artifact::Staging,
+            crate::naming::PG_IDENT_MAX,
+            run,
+        );
+        let staging_t = quote_ident_path(&format!("{schema_pfx}{staging_bare}"));
         let schema = schema_pfx.trim_end_matches('.').to_string();
         let schema = if schema.is_empty() {
             "public".into()
@@ -111,6 +232,7 @@ impl PgSink {
             wm_udt: None,
             col_names: Vec::new(),
             overlap_send,
+            run: run.clone(),
         }
     }
 }
@@ -429,17 +551,23 @@ impl crate::sink::Sink for PgSink {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let st = &self.staging_t;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {st}"))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Error::Transfer(format!("drop staging: {e}")))?;
+        // No blind DROP any more. That statement WAS the defect: it destroyed
+        // whatever staging object it found, including a concurrent run's, and
+        // this run's finalize then published the empty replacement over the
+        // destination while reporting its own row count.
+        //
+        // Instead: look at what is there, reap what is dead, refuse what is
+        // alive and cannot coexist. Then create a name only this run could have
+        // minted — so nothing has to be dropped first, and the CREATE failing
+        // would mean a token collision, which is loud rather than destructive.
+        self.reap_and_check_peers().await?;
         // Incremental staging never becomes the final table — always skip its WAL.
         let unlogged = if durable && mode == Mode::Replace {
             ""
         } else {
             "UNLOGGED "
         };
+        let st = &self.staging_t;
         sqlx::query(&format!("CREATE {unlogged}TABLE {st} ({cols_ddl})"))
             .execute(&self.pool)
             .await
