@@ -138,6 +138,274 @@ pub(crate) fn artifact_ident(bare: &str, artifact: Artifact, limit: usize) -> St
     format!("{head}_{}{suffix}", &h[..HASH])
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Run identity
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Everything about a run that a CONCURRENT run needs to know, packed into
+/// something a table name can carry.
+///
+/// # Why this is in the name rather than beside it
+///
+/// Two runs of one destination table share a staging object today, and the
+/// interleave is destructive: A streams its rows in, B's `prepare` drops that
+/// object and creates a fresh one, and A's `finalize` publishes B's empty table
+/// over the destination — returning A's row count as a success. A green run and
+/// an empty table.
+///
+/// The obvious fixes both fail on the destinations that need them most.
+/// Advisory locks exist on Postgres and MySQL and nowhere else; ClickHouse,
+/// BigQuery and the object stores have no lock to take and no transaction that
+/// spans the statements a publish needs. A stamp written *beside* the staging
+/// object has to be read and checked before publishing, and on those same
+/// engines nothing can check-and-publish atomically, so the check is always
+/// TOCTOU.
+///
+/// Putting the identity in the NAME needs neither. A run can only publish an
+/// object whose name it minted, and that is enforced by the object system
+/// itself — on every engine, with no extra round trip and no atomicity
+/// requirement. What the peer listing then buys is not exclusion but a *loud
+/// refusal*: seeing another run's live staging is how a `replace` learns it
+/// should not proceed, rather than discovering it at the swap.
+///
+/// # What the token carries, and why each part is there
+///
+/// `_` + 7 (start) + 1 (mode) + 4 (source) + 3 (nonce) = 16 bytes, fixed width,
+/// no inner separator, so it parses positionally from any name.
+///
+/// * **start**, base36 unix seconds. Postgres stores no table creation time —
+///   MySQL has `create_time`, ClickHouse `metadata_modification_time`, BigQuery
+///   `creationTime`, object stores their own — so the one place an age is
+///   readable on EVERY engine is the name. It is what lets a sweep tell a
+///   crashed run's leftovers from a live run's staging without asking the
+///   catalog anything.
+/// * **mode**, one letter. A `replace` publishes by swapping the whole table,
+///   which cannot coexist with anything; an `append` adds rows, which can.
+///   Refusing both alike would have shipped a regression dressed as a fix.
+/// * **source**, 4 base36 chars of the source identity. This is the part a
+///   first draft of the design left out, and it is the difference between a fix
+///   and a duplicate-row bug: two `append` runs of the SAME (source, table)
+///   pair both read watermark W and land the same delta twice, while two
+///   appends from DIFFERENT sources into one table are the fan-in the manual
+///   advertises. Only the source tells those apart.
+/// * **nonce**, so two runs that start in the same second with the same mode
+///   and source still mint different names. Within one process it is a
+///   COUNTER, so uniqueness there is guaranteed rather than probable — a
+///   collision is the exact bug this whole mechanism exists to prevent, and
+///   "unlikely" is not the right guarantee for it. Across processes a
+///   per-process base offsets the counter, so two processes collide only if
+///   their offset-plus-counter land on the same value in the same second on
+///   the same table, which is 1 in 36^4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunId {
+    token: String,
+}
+
+/// How a run's landing operation behaves towards a concurrent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LandKind {
+    /// Swaps the whole table. Exclusive with everything, including itself.
+    Swap,
+    /// Adds rows against a watermark. Safe beside a DIFFERENT source; not
+    /// beside the same one, which would read the same watermark twice.
+    Incremental,
+    /// A CDC drain. Exclusive: it owns a replication slot and a watermark.
+    Cdc,
+}
+
+impl LandKind {
+    const fn letter(self) -> char {
+        match self {
+            LandKind::Swap => 'r',
+            LandKind::Incremental => 'a',
+            LandKind::Cdc => 'l',
+        }
+    }
+
+    fn from_letter(c: char) -> Option<Self> {
+        match c {
+            'r' => Some(LandKind::Swap),
+            'a' => Some(LandKind::Incremental),
+            'l' => Some(LandKind::Cdc),
+            _ => None,
+        }
+    }
+}
+
+/// Total token width, including its leading `_`.
+pub(crate) const RUN_TOKEN_LEN: usize = 16;
+
+fn base36(mut n: u64, width: usize) -> String {
+    const D: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = vec![b'0'; width];
+    for i in (0..width).rev() {
+        out[i] = D[(n % 36) as usize];
+        n /= 36;
+    }
+    String::from_utf8(out).expect("base36 digits are ascii")
+}
+
+impl RunId {
+    /// Mint one identity for one `transfer()` call.
+    ///
+    /// Deliberately NOT a process-wide global: two `apitap.transfer()` calls in
+    /// one Python process are two runs and must not share a token. (The
+    /// progress counters already have that bug and it is documented; this is
+    /// not the place to add a second instance of it.)
+    pub(crate) fn mint(kind: LandKind, source_id: &str) -> Self {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let src = u64::from_str_radix(
+            &hex::encode(md5::Md5::digest(source_id.as_bytes()))[..8],
+            16,
+        )
+        .unwrap_or(0);
+        // A COUNTER, not a hash of the clock. A hash gives collisions at the
+        // birthday rate — 500 mints into 36^3 values collide 93% of the time,
+        // which a test found immediately — and a collision here means two runs
+        // share a staging object, which is the defect this mechanism exists to
+        // prevent. Inside one process the counter makes that impossible.
+        //
+        // The per-process base is what separates processes: without it every
+        // process would start at 0 and two of them would mint the same
+        // sequence. It is derived once from the clock and the pid, which is
+        // enough entropy for a name and needs no RNG dependency.
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = *BASE.get_or_init(|| {
+            let ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            ns.wrapping_mul(0x9E37_79B9).wrapping_add(std::process::id() as u64)
+        });
+        let nonce = base.wrapping_add(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        RunId {
+            token: format!(
+                "_{}{}{}{}",
+                base36(secs, 7),
+                kind.letter(),
+                base36(src, 3),
+                base36(nonce, 4),
+            ),
+        }
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+/// What a run can read off a PEER's artifact name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerRun {
+    pub(crate) started_unix: u64,
+    pub(crate) kind: LandKind,
+    /// The peer's source identity, hashed. Comparable, not reversible — which
+    /// is all the decision needs, and means a source URL never appears in a
+    /// table name.
+    pub(crate) source_hash: String,
+}
+
+/// Read a token out of a name that carries one, or `None` for a name that does
+/// not (an artifact from before this existed, or something that merely ends the
+/// same way).
+pub(crate) fn parse_peer(name: &str, artifact: Artifact) -> Option<PeerRun> {
+    let head = name.strip_suffix(artifact.suffix())?;
+    if head.len() < RUN_TOKEN_LEN {
+        return None;
+    }
+    let tok = &head[head.len() - RUN_TOKEN_LEN..];
+    let b = tok.as_bytes();
+    if b[0] != b'_' {
+        return None;
+    }
+    let started = u64::from_str_radix(&tok[1..8], 36).ok()?;
+    let kind = LandKind::from_letter(tok.as_bytes()[8] as char)?;
+    Some(PeerRun {
+        started_unix: started,
+        kind,
+        // 3 base36 chars = 46,656 buckets. Two different sources sharing a
+        // bucket makes a fan-in pair refuse each other — an error in the safe
+        // direction (refuse, never corrupt), which is the only direction a
+        // hash this short is allowed to be wrong in.
+        source_hash: tok[9..12].to_string(),
+    })
+}
+
+/// May `mine` proceed while `peer` is running?
+///
+/// The matrix, and the reasoning for each cell:
+///
+/// * A **swap** cannot coexist with anything, including another swap: it
+///   replaces the whole table, so whatever the other run lands is thrown away
+///   or throws this one away.
+/// * A **CDC drain** cannot coexist with anything either: it owns a
+///   replication slot and a watermark, and two drains of one destination fight
+///   over both.
+/// * Two **incremental** runs are the interesting cell, and the one a first
+///   draft got wrong. From DIFFERENT sources they are the fan-in the manual
+///   advertises — independent watermarks, per `_apitap_state`'s
+///   `(dest_table, source_id)` key — and refusing them would remove a
+///   documented capability. From the SAME source they both read watermark W
+///   and both land every row past it: duplicate rows, silently, which
+///   `usage.md` warns about in prose and nothing enforced.
+pub(crate) fn peer_blocks(mine: &PeerRun, peer: &PeerRun) -> bool {
+    use LandKind::*;
+    match (mine.kind, peer.kind) {
+        (Swap, _) | (_, Swap) => true,
+        (Cdc, _) | (_, Cdc) => true,
+        (Incremental, Incremental) => mine.source_hash == peer.source_hash,
+    }
+}
+
+/// `<head><token><suffix>`, inside `limit`.
+///
+/// The token goes BEFORE the suffix so the suffix stays terminal — every sweep,
+/// namespace reservation and discovery exclusion in the tree matches on it, and
+/// `is_artifact` still works unchanged.
+///
+/// Note this is NOT a prefix extension of [`artifact_ident`]: the token sits in
+/// the middle, so a sweep matches `head` + wildcard + suffix rather than a
+/// prefix. [`artifact_match`] returns exactly that pair, and is the only
+/// supported way to build the pattern.
+pub(crate) fn artifact_ident_run(
+    bare: &str,
+    artifact: Artifact,
+    limit: usize,
+    run: &RunId,
+) -> String {
+    let (head, suffix) = artifact_match(bare, artifact, limit);
+    format!("{head}{}{suffix}", run.token())
+}
+
+/// The two fixed parts of every name this table+artifact can produce: the head
+/// it always starts with, and the suffix it always ends with. A sweep is
+/// `LIKE '<head>%<suffix>'`.
+pub(crate) fn artifact_match(bare: &str, artifact: Artifact, limit: usize) -> (String, &'static str) {
+    let suffix = artifact.suffix();
+    // The token is part of the budget, so the head gives way sooner than it
+    // does for an un-tokenized name. Everything else is `artifact_ident`'s
+    // rule, unchanged — including hashing the suffix in, so two artifacts of
+    // one over-long table stay distinct.
+    let room = limit.saturating_sub(suffix.len() + RUN_TOKEN_LEN);
+    if bare.len() <= room {
+        return (bare.to_string(), suffix);
+    }
+    let keep = room.saturating_sub(HASH + 1);
+    let mut head = String::with_capacity(keep);
+    for c in bare.chars() {
+        if head.len() + c.len_utf8() > keep {
+            break;
+        }
+        head.push(c);
+    }
+    let h = hex::encode(md5::Md5::digest(format!("{bare}{suffix}").as_bytes()));
+    (format!("{head}_{}", &h[..HASH]), suffix)
+}
+
 /// Does this name look like something apitap made?
 ///
 /// Used by table discovery and by the namespace reservation, so both answer the
@@ -386,6 +654,132 @@ mod tests {
                     "{:?} is reserved but not namespaced — reserving it could \
                      hide a user's table", a);
         }
+    }
+
+    // ── run identity ──────────────────────────────────────────────────────
+
+    fn peer(kind: LandKind, src: &str) -> PeerRun {
+        let id = RunId::mint(kind, src);
+        parse_peer(&artifact_ident_run("t", Artifact::Staging, PG_IDENT_MAX, &id),
+                   Artifact::Staging)
+            .expect("a name this module minted must parse")
+    }
+
+    /// Everything a concurrent run needs must survive the round trip through a
+    /// table name — that is the whole premise, and if it does not hold the
+    /// peer check silently degrades to "no peers found".
+    #[test]
+    fn a_minted_token_round_trips_through_the_name() {
+        for &a in Artifact::ALL {
+            for &lim in &[PG_IDENT_MAX, MY_IDENT_MAX, ROOMY] {
+                let id = RunId::mint(LandKind::Incremental, "postgres://h/db::orders");
+                let name = artifact_ident_run("orders", a, lim, &id);
+                assert!(name.len() <= lim, "{:?} at {lim}: {} bytes", a, name.len());
+                let p = parse_peer(&name, a).expect("must parse");
+                assert_eq!(p.kind, LandKind::Incremental);
+                assert!(name.ends_with(a.suffix()), "suffix stays terminal: {name}");
+                assert_eq!(is_artifact(&name), a.reserved());
+            }
+        }
+    }
+
+    /// The invariants `artifact_ident` has, the tokenized form must have too —
+    /// at every length, or a long table name loses them exactly where the
+    /// original bug lived.
+    #[test]
+    fn a_tokenized_name_keeps_every_naming_invariant() {
+        for &a in Artifact::ALL {
+            for &lim in &[PG_IDENT_MAX, MY_IDENT_MAX] {
+                for n in [1usize, 30, 31, 32, 46, 47, 63, 64, 200] {
+                    let bare = "t".repeat(n);
+                    let id = RunId::mint(LandKind::Swap, "s");
+                    let name = artifact_ident_run(&bare, a, lim, &id);
+                    assert!(name.len() <= lim, "{:?} bare={n} lim={lim}: {}", a, name.len());
+                    assert_ne!(name, bare, "never equal to its own table");
+                    assert!(name.ends_with(a.suffix()));
+                    assert!(parse_peer(&name, a).is_some(), "{name}");
+                }
+            }
+        }
+    }
+
+    /// Two runs must never mint the same name — that is the entire defence,
+    /// so this asserts a guarantee rather than a likelihood. It failed on the
+    /// first draft, which hashed the clock into 36^3 values: 500 mints collide
+    /// 93% of the time at that width. Inside one process the nonce is now a
+    /// counter, so the property is exact.
+    #[test]
+    fn two_runs_never_mint_the_same_name() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50_000 {
+            let id = RunId::mint(LandKind::Swap, "postgres://h/db::orders");
+            let name = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &id);
+            assert!(seen.insert(name.clone()), "collision: {name}");
+        }
+    }
+
+    /// The sweep pattern has to match what the minter produces. These two are
+    /// used in different files and drift apart silently if nothing pins them.
+    #[test]
+    fn the_match_pattern_brackets_every_name_the_minter_makes() {
+        for &a in Artifact::ALL {
+            for n in [5usize, 40, 100] {
+                let bare = "x".repeat(n);
+                let (head, suffix) = artifact_match(&bare, a, PG_IDENT_MAX);
+                let id = RunId::mint(LandKind::Cdc, "s");
+                let name = artifact_ident_run(&bare, a, PG_IDENT_MAX, &id);
+                assert!(name.starts_with(&head), "head {head} vs {name}");
+                assert!(name.ends_with(suffix), "suffix {suffix} vs {name}");
+                assert_eq!(name.len(), head.len() + RUN_TOKEN_LEN + suffix.len());
+            }
+        }
+    }
+
+    /// A name from before tokens existed must not parse as a peer — otherwise
+    /// an old orphan reads as a live run and blocks every future run forever.
+    #[test]
+    fn an_untokenized_name_is_not_mistaken_for_a_peer() {
+        let old = artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX);
+        assert_eq!(old, "orders__apitap_staging");
+        assert!(parse_peer(&old, Artifact::Staging).is_none());
+        // And something that merely ends the same way is not one either.
+        assert!(parse_peer("__apitap_staging", Artifact::Staging).is_none());
+        assert!(parse_peer("x__apitap_staging", Artifact::Staging).is_none());
+    }
+
+    /// The matrix. Fan-in — two DIFFERENT sources appending into one table — is
+    /// a capability the manual advertises, and the first draft of this design
+    /// would have removed it. Same-source appends are the duplicate-row bug.
+    #[test]
+    fn the_matrix_refuses_what_collides_and_permits_fan_in() {
+        let a1 = peer(LandKind::Incremental, "postgres://h/db::orders");
+        let a2 = peer(LandKind::Incremental, "postgres://h/db::orders");
+        let b = peer(LandKind::Incremental, "mysql://other/db::orders");
+        let r = peer(LandKind::Swap, "postgres://h/db::orders");
+        let c = peer(LandKind::Cdc, "postgres://h/db::orders");
+
+        assert!(peer_blocks(&a1, &a2), "same source appending twice = duplicate rows");
+        assert!(!peer_blocks(&a1, &b), "fan-in from two sources must stay allowed");
+        assert!(!peer_blocks(&b, &a1), "and it is symmetric");
+
+        for other in [&a1, &b, &c] {
+            assert!(peer_blocks(&r, other), "a swap coexists with nothing");
+            assert!(peer_blocks(other, &r), "and nothing coexists with a swap");
+        }
+        assert!(peer_blocks(&c, &a1), "a CDC drain owns the watermark");
+        assert!(peer_blocks(&c, &c), "including against another drain");
+    }
+
+    /// The age gate the reap depends on: a token minted now must read as now.
+    #[test]
+    fn the_start_time_is_readable_from_the_name() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let p = peer(LandKind::Swap, "s");
+        assert!(p.started_unix <= now && now - p.started_unix < 5,
+                "started {} vs now {now}", p.started_unix);
     }
 
     /// Multi-byte names must not be cut through a character.
