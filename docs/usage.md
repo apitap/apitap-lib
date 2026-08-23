@@ -1211,6 +1211,13 @@ apitap.request_stop()   # the current window lands, then the run returns
 t.join()
 ```
 
+One honest limitation while you are here: the progress counters are
+process-global, so two transfers running concurrently in one process
+interleave their numbers in the progress output — you cannot attribute a live
+counter to one of them. The data each transfer lands is unaffected; only the
+reporting mixes. Known, and deferred rather than fixed: run concurrent
+transfers in separate processes if you need their progress apart.
+
 **Only `mode="log_based"` does this.** A bulk `replace` / `append` / `merge`
 run installs no handler and still dies on the first SIGTERM, because there is
 nothing useful to land: a bulk load publishes at the swap, so a run stopped
@@ -1279,15 +1286,19 @@ defaults cannot see. None of them change what lands — only how it gets there.
 | `APITAP_PROGRESS`, `APITAP_PROGRESS_INTERVAL` | auto | **Live reporting** — see [Progress while it runs](#progress-while-it-runs). |
 | `APITAP_SLOT_WAL_WARN` | `4G` | **CDC.** How much retained WAL on the source turns the `slot.wal` gauge's warning on. The gauge itself is emitted every run regardless. |
 | `APITAP_HTTP_CONNECT_TIMEOUT` | `15` (seconds) | How long a connection to an HTTP service (ClickHouse, BigQuery, GCS, S3, Iceberg, the GitHub/Sheets sources) may take to establish. |
-| `APITAP_HTTP_READ_TIMEOUT` | `120` (seconds) | The longest gap allowed BETWEEN bytes of a response before the peer is treated as gone. Not a limit on how long a transfer may take — a load job that keeps streaming is never cut off, however long it runs. Raise it for a warehouse that legitimately pauses under load. |
+| `APITAP_HTTP_READ_TIMEOUT` | unset (**off**) | Opt-in **total** deadline on an HTTP request, in seconds. Despite the name it is not a between-bytes timer: ClickHouse holds one request open for a worker's whole share of a load and sends nothing until the INSERT is done, so this clock runs against the entire load — a 120-second default here once killed every load longer than two minutes, which is why it ships off. Set it only where you *want* long requests to fail. |
 | `APITAP_GRACEFUL_STOP` | `1` (on) | **CDC.** Set to `0` to go back to dying on the first SIGTERM instead of landing the window in flight — see [Stopping a run on purpose](#stopping-a-run-on-purpose). |
 | `APITAP_MEM_BUDGET` | the cgroup limit | **Shared containers.** The auto-sizing spends the whole limit on batches and pipes, so when something else in the container needs memory too, say what apitap may have. Plain bytes, or an `M`/`G` suffix. |
 
-Both HTTP deadlines exist because a client with none waits forever: a peer that
-accepts the connection and then stops reading leaves the request parked, and a
-scheduled task that never fails and never finishes is worse than one that
-errors. Zero and junk values fall back to the default rather than disabling the
-deadline.
+The connect deadline exists because a client with none waits forever: a peer
+that accepts the connection and then stops reading leaves the request parked,
+and a scheduled task that never fails and never finishes is worse than one that
+errors. Once a transfer is streaming, a peer that vanished is detected by TCP
+keepalive instead — the kernel probes an idle connection and errors the socket
+when nobody answers — which tells "dead" apart from "slow" without putting a
+wall clock on a legitimate long load. That is why the read deadline is opt-in
+rather than defaulted. Zero and junk values fall back to the connect default
+rather than disabling it, and leave the read deadline off.
 
 ### Alerting on a CDC run
 

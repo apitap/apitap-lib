@@ -14,12 +14,12 @@ never silently.
 | surface | what is stable |
 |---|---|
 | `apitap.transfer(...)` | the function, its positional arguments (`src`, `dst`, `table`), and every keyword listed in [the manual](usage.md#api) |
-| `apitap.read(...)` | the function, `table=`/`query=`, and the Arrow/Polars handoff |
+| `apitap.read(...)` | the function, `table=` (with `cursor=`/`parallel=`/`columns=`), and the Arrow/Polars handoff via `Reader`. `query=` is reserved in the signature but **refused today** — passing it raises `ValueError`; raw-SQL reads are a roadmap item, not a commitment |
 | `mode=` values | `"replace"`, `"append"`, `"merge"`, `"log_based"` — spellings and meanings |
 | URL schemes | `postgres://`, `postgresql://`, `mysql://`, `clickhouse://`, `clickhouse+https://`, `bigquery://`, `gcs://`, `s3://`, `iceberg://`, `gsheets://`, `github://`, `github+api://` |
 | `apitap.request_stop()` | the function and its meaning: a running `mode="log_based"` drain stops at its next safe point and returns normally. It is a no-op for a bulk transfer and for a CDC table's first (bootstrap) run — neither has a safe point to stop at |
 | `TransferReport` | `rows`, `elapsed_ms`, `parallel` — fields are added, never removed or repurposed |
-| `MultiReport` | `tables`, and each `TableResult`'s `table`/`rows`/`elapsed_ms`/`parallel`/`error` |
+| multi-table results | there is no separate report class: `TransferReport.tables` holds the per-table outcomes (`None` on a single-table run), each `TableResult`'s `table`/`rows`/`elapsed_ms`/`parallel`/`error` is committed, and partial failure raises `MultiTransferError` whose `report` carries that same `TransferReport` |
 | destination artifacts | the `_apitap_state` table's columns, and the `__apitap_cl` / `__current` changelog shapes — a run of an older apitap must not choke on a newer one's state |
 | exit behaviour | invalid input raises `ValueError`, a failed transfer raises `RuntimeError`, and a failed transfer never leaves the destination table changed |
 

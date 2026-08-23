@@ -14,8 +14,14 @@ The two properties everything else rests on:
 
 - **A bulk load publishes only at the end.** Rows stream into a staging table;
   the destination is replaced by an atomic swap (`EXCHANGE TABLES`, `RENAME`).
-  Until that swap, readers see the previous table, whole. There is no window in
-  which a query returns half a load.
+  Until that swap, readers see the previous table, whole. For a **table**
+  destination there is no window in which a query returns half a load — the
+  swap is what buys that. **Object stores do not get the same promise**: S3 and
+  GCS have no swap, so finalize publishes the part objects one at a time, and a
+  reader that LISTs the prefix while a run is finishing can see a subset — or,
+  for a Parquet directory, a mix of old and new parts. If something reads those
+  paths while runs may be finalizing, gate it on a manifest or
+  `_SUCCESS`-style marker of your own, or read only after the run reports done.
 - **A CDC watermark is written last, and replay is idempotent by
   construction** — the apply clears the keys it is about to write before it
   writes them. What that buys you depends on what the destination can promise,
@@ -196,11 +202,9 @@ identity adopts what it is reading now; from the run after that, a switch is
 refused. Proven in `benchmarks/e2e_review_gate.py` leg 4, which bootstraps
 against one server and then points the same table at another.
 
-Closing this needs the watermark to carry the server's identity (`server_uuid`
-on MySQL, the GTID domain on MariaDB) so a changed identity refuses on sight.
-That is a change to the destination's state schema and is not in this release —
-recorded here rather than left for someone to discover.
-
-Until then, treat these as bootstrap-again events: restoring a source from a
-backup, rebuilding a replica, `RESET MASTER`, or repointing a URL at a
-different server.
+When that refusal fires — after restoring a source from a backup, rebuilding a
+replica, `RESET MASTER`, or repointing a URL at a different server — the
+recovery is the same as the purged-binlog row above: clear that table's state
+on the destination and let the next run bootstrap against the server it is
+actually reading. The refusal is the feature; what it replaced was a drain
+that resumed into foreign history and reported success.
