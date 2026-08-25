@@ -45,7 +45,7 @@ The two properties everything else rests on:
 | **Process SIGKILLed mid bulk transfer** | Previous destination table **intact and readable throughout** (proven: 1,000 rows and their marker unchanged while 10M rows were streaming into staging). A staging table `<dest>__apitap_staging` may be orphaned. | Just re-run. The next run starts with `DROP TABLE IF EXISTS` on staging, so the orphan costs disk until then, nothing more. Proven: re-run landed 10,000,000 rows = source count. | `e2e_failure_modes.py` case 1 |
 | **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) | Re-run. Every change is applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2 |
 | **SIGTERM mid CDC window** (pod evicted, Airflow run cleared, `systemctl stop`) | The window in flight is **applied**, not discarded, and the watermark advances with it. The run exits 0 with a report of the rows it landed. | Nothing. The next run picks up from the new watermark. A second SIGTERM is not absorbed — the default disposition comes back and the process ends at once, which is the SIGKILL case above and equally safe. | `e2e_sigterm.py` (Postgres, incl. a control run with the mechanism disabled), `e2e_sigterm_my.py` (MySQL binlog) |
-| **Two runs of the same destination table at once** | They share one staging object. Run A streams its rows in; run B's `prepare` DROPs that object and creates a fresh empty one; A's `finalize` then publishes B's empty table over the destination — and A returns a successful report with A's row count. A green run and an empty table. | **Prevent it**: one run per destination table (Airflow `max_active_runs=1`, a cron `flock`). If it has already happened, re-run — the next single run rebuilds the table correctly. Guarding this inside apitap is open work: Postgres and MySQL have advisory locks, ClickHouse and the object stores have nothing equivalent, so it needs a design rather than a patch. | read from the source, not yet reproduced in a leg |
+| **Two runs of the same destination table at once** (0.55.0+) | **Refused, at `prepare`, before a row moves.** The second run exits non-zero with a `locked:` error naming how long ago the other started, what it is doing, and why the two cannot share the table. Nothing is written; the first run finishes normally. On 0.54.0 and earlier the two interleaved destructively — see [Two runs, one table](#two-runs-one-table). | Run them one at a time — a scheduler's own concurrency setting is the usual answer (Airflow `max_active_runs=1`, a cron `flock`). If the other run is dead rather than slow, drop the staging object the error names and re-run; nothing collects it for you, and the section below says why. | `e2e_concurrent_runs.py` (Postgres: the refusal, the survivor, a control, and fan-in) |
 | **Source connection cut mid-COPY** (server restart, `pg_terminate_backend`, idle/statement timeout, network drop) | Nothing published. The destination table is **not even created** — it only comes into existence at the swap. | Re-run. The error says so explicitly rather than making you guess. | case 3 |
 | **Structural DDL on the source during a bulk run** | Cannot interleave on Postgres: `COPY` holds `ACCESS SHARE`, and `ALTER TABLE … DROP/ADD COLUMN` needs `ACCESS EXCLUSIVE`, so the DDL **waits for the read to finish**. Column mapping cannot drift mid-stream. | Nothing to do. If the DDL wins a race we do not yet know about, the run fails loudly rather than writing values into the wrong column — that is the assertion the test makes. | case 4 |
 | **CDC schedule stopped for a long time — Postgres** | The replication slot keeps holding WAL on the **source**, which is the guarantee CDC rests on and also how a stopped schedule fills the source's disk. | Run the drain: a backlog is not a reason to refuse, it is a reason to run. apitap prints the retained WAL every run and warns past `APITAP_SLOT_WAL_WARN` (default 4 GiB). Set `max_slot_wal_keep_size` on the server so an abandoned slot is *invalidated* instead of filling the disk — apitap reports that as slot-is-GONE and recovers with a fresh bootstrap. | `e2e_cdc_retention.py` |
@@ -204,6 +204,77 @@ it would have manufactured exactly the leak the soak existed to look for.
 What this does NOT settle: a soak is one shape at one rate on one rig. It says
 nothing about a month, about a source with a different write pattern, or about
 the object-store destinations, which were not exercised.
+
+## Two runs, one table
+
+Before v0.55.0 every run of a destination table used the same staging object,
+and `prepare` began by dropping it. Two overlapping runs therefore interleaved
+destructively: A streams its rows in, B's prepare drops that object and creates
+a fresh empty one, and A's finalize publishes B's empty table over the
+destination. Measured against v0.54.0, the loser died with
+
+    rename staging: relation "orders__apitap_staging" does not exist
+
+— a catalog error naming an object the user never created, for a table they were
+simply loading twice.
+
+**The run's identity is now part of the staging name.** A run can only publish
+an object whose name it minted, and that is enforced by the object system
+itself. It needs no lock, which matters because advisory locks exist on
+Postgres and MySQL and nowhere else: ClickHouse, BigQuery and the object stores
+have nothing equivalent, and a marker written *beside* the staging object could
+never be checked atomically with the publish on those engines.
+
+`prepare` no longer drops anything blindly. It lists what is present, collects
+only what it can PROVE is dead, and refuses to start beside anything else. The
+one thing it can prove is the un-tokenized name an older apitap wrote: no
+current run mints that name, so nothing living can own it.
+
+**Not every peer is refused, and the distinction is the point:**
+
+| this run | a live peer | outcome |
+|---|---|---|
+| `replace` | anything | refused — a swap replaces the whole table, so whichever finishes second throws the other's work away |
+| `log_based` | anything | refused — a CDC drain owns the watermark and the replication slot |
+| `append`/`merge` | `replace` or `log_based` | refused |
+| `append`/`merge` | same source | refused — both would read the same watermark and land the same rows twice |
+| `append`/`merge` | **different** source | **allowed** — this is fan-in, and `_apitap_state` keys watermarks per source precisely so it works |
+
+That last row is why the guard is a matrix rather than a mutex. Refusing every
+concurrent pair would have removed a capability the manual advertises.
+
+**A crashed run's leftover is NOT collected for you, and that is deliberate.**
+An earlier draft of this feature aged staging objects out after an hour, and
+the review of all seven sinks killed it. The timestamp in the name records when
+the RUN started, not when the object was created — table 40 of a long
+multi-table run mints its staging under a token that is already hours old. So
+`now - token` is an UPPER bound on the object's age and can never prove the
+object is old, while the load it belongs to is still writing into it. On
+Postgres the victim of a wrong guess dies loudly at its next statement; on
+BigQuery and the object stores the deleted staging is silently re-created and
+the run reports a full row count over a truncated table — which is the exact
+defect this whole mechanism exists to remove, one horizon later.
+
+Refusing is the safe action and collecting is the dangerous one, so they get
+different standards of proof: anything that could be live is refused, and only
+the provably-dead un-tokenized name is removed. Automatic collection needs a
+liveness signal from the engine itself — an object mtime that advances as the
+run writes, a catalog lock — which every engine has and every engine spells
+differently. That is follow-up work, not something to guess at.
+
+**What that costs you:** after a hard kill (SIGKILL, OOM, a lost node — every
+ordinary error path still drops its own staging), the leftover stays, and later
+runs of that table refuse until someone removes it. The error message names the
+exact object to drop. It is the right trade against silently truncating a live
+run's data, and it is the one operational cost this design knowingly accepts.
+
+**Why it fails instead of waiting.** The common cause of two runs on one table
+is a scheduler overrun, and waiting turns an overrun into a queue, a queue into
+a pile-up, and a pile-up into resource exhaustion at 3am with every run still
+reporting healthy. Failing on the first occurrence makes the overrun visible
+while it is still cheap. Retry and backoff belong to the scheduler, which
+already has them; a clean non-zero exit composes with all of them, and a hang
+composes with none.
 
 ## Rules of thumb
 

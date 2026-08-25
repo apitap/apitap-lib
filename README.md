@@ -186,6 +186,20 @@ use it for rebuildable destinations.
   transaction. Readers never see a partial load; a mid-run failure leaves the previous
   table untouched.
 - **0-row guard** — an empty source never wipes an existing destination table.
+- **One run per destination table** (0.55.0+) — the run's identity is part of the
+  staging object's name, so a run can only publish an object it minted. A second run
+  of the same table is refused at `prepare`, before a row moves, with an error naming
+  the run that holds it. Fan-in is still allowed: two `append` runs from *different*
+  sources into one table have independent watermarks, so they are not a collision.
+  No advisory lock is involved — which is why it works identically on ClickHouse,
+  BigQuery and the object stores, where no such lock exists.
+  ([the matrix, and what a killed run leaves](docs/failure-modes.md))
+
+The failure modes these guarantees do *not* cover — a killed process, a cut
+connection, a DDL change mid-run, a CDC schedule paused past the source's
+retention — are written down, each one produced on purpose against live servers,
+in [docs/failure-modes.md](docs/failure-modes.md). What is stable enough to
+depend on, and what may still move, is [docs/stability.md](docs/stability.md).
 
 ## Roadmap
 
@@ -203,10 +217,10 @@ use it for rebuildable destinations.
       key); the watermark lives in `_apitap_state`, a queryable table in the
       destination, written in the same transaction as the data; cost proportional
       to the delta, not the table
-- [x] Batch CDC — `mode="log_based"`: Postgres logical replication on a
-      schedule, no daemon. Everything the WAL saw (inserts, updates incl.
-      PK changes, deletes, TRUNCATEs, TOAST handled) collapsed per key and
-      applied set-based to **Postgres, ClickHouse, MySQL, BigQuery or
+- [x] Batch CDC — `mode="log_based"`: **Postgres logical replication, MySQL and
+      MariaDB binlog**, on a schedule, no daemon. Everything the log saw (inserts,
+      updates incl. PK changes, deletes, TRUNCATEs, TOAST handled) collapsed per key
+      and applied set-based to **Postgres, ClickHouse, MySQL, BigQuery or
       Iceberg** (BigQuery via a staging table + one `MERGE`, billed project
       required), with the watermark committed atomically with the data. Memory-bounded
       drain windows fit the smallest tier: a 2.1M-event backlog replays in
@@ -220,7 +234,12 @@ use it for rebuildable destinations.
       destination ([the ledger](benchmarks/logbased-cdc.md)). Many tables
       share ONE replication slot (`tables=[…]` — same-LSN windows across
       members, one retention risk, 22% faster than N slots), and a
-      ``{table: mode}`` dict mixes CDC and bulk modes in one call
+      ``{table: mode}`` dict mixes CDC and bulk modes in one call. `slots=N`
+      opens N parallel replication slots for a sharded source, and
+      `changelog=True` turns an analytical destination into an append-only
+      audit trail (`_apitap_op` per row, a `<table>__current` view) instead of a
+      replica — free on the Postgres lane, 34% faster on the MySQL one
+      ([the ledger](benchmarks/changelog-cdc.md))
 - [x] Postgres & MySQL → Polars / Arrow — `apitap.read(src, table=…)`:
       parallel range pipes decoded into Arrow batches in Rust, handed
       to Python zero-copy (hand-rolled Arrow C stream, no pyarrow
@@ -261,7 +280,20 @@ use it for rebuildable destinations.
 - [x] GitHub API → Postgres / ClickHouse (`github+api://owner/repo` — issues,
       PRs, commits, stars, releases … as TYPED tables + a raw jsonb column;
       incremental on the entities whose API filters server-side)
+- [x] Any source → S3-compatible object storage (`s3://bucket/prefix` — AWS,
+      MinIO, Cloudflare R2, OVH/Scaleway/Hetzner; ZSTD Parquet parts, SigV4
+      signed by hand, no AWS SDK in the dependency tree; a killed run's
+      multipart uploads are aborted rather than billed)
+- [x] Any source → **Apache Iceberg** (`iceberg://` on any REST catalog —
+      Lakekeeper, Polaris, Nessie, Glue, R2 Data Catalog, S3 Tables). Replace,
+      append and merge are all real snapshot commits, and the incremental
+      watermark rides in the table's own properties, committed **in the same
+      snapshot as the data** — bootstrapped from parquet footer stats, so it
+      picks up tables Spark/Trino/pyiceberg wrote ([the ledger](benchmarks/iceberg-showdown.md))
+- [x] ClickHouse → ClickHouse (`RowBinary` relayed untouched, no transcode at
+      all — 10M rows server-to-server in 8.4 s, or 20.6 s inside the 256 MB cage)
 - [ ] Postgres → Snowflake
+- [ ] `query=` for `read()` — arbitrary SQL, not just whole tables
 
 ## Development
 

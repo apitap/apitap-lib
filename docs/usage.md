@@ -353,14 +353,18 @@ apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_a
   run). Adding a *second* source to a destination that already has state rows
   requires an explicit choice — the run fails loudly instead of guessing a
   watermark; seed a state row manually or rebuild with replace.
-- Do not run two syncs of the same (source, destination) pair concurrently. They
-  share one staging object, and the loser can publish the winner's empty table
-  while reporting success — see [failure-modes.md](failure-modes.md). Guarding
-  this properly is open work; until then, one run per destination table, which
-  a scheduler's own concurrency setting (Airflow `max_active_runs=1`, a cron
-  `flock`) gives you.
-- Avoid running two syncs of the same (source, destination) pair concurrently —
-  they would each read the same watermark and land the same delta twice. (The
+- **Since 0.55.0**, two runs of one destination table are **refused**, at
+  `prepare`, before a row moves: the second exits non-zero with a `locked:`
+  error naming the other run, and nothing is written. Fan-in still works — two
+  `append` runs from DIFFERENT sources into one table are allowed, because
+  their watermarks are independent. A run killed with SIGKILL leaves its
+  staging object behind and later runs of that table refuse until you drop it;
+  the error names it. See [Two runs, one table](failure-modes.md) for the full
+  matrix and for why nothing collects that leftover automatically.
+- Do not schedule two syncs of the same (source, destination) pair to overlap.
+  On 0.55.0+ the second is refused rather than landing the same delta twice; on
+  earlier versions it is not, so a scheduler's own concurrency setting (Airflow
+  `max_active_runs=1`, a cron `flock`) is worth having either way. (The
   ClickHouse state table is a `ReplacingMergeTree`; it self-compacts old state
   versions in the background.)
 - **`append`** loads rows with `cursor >` watermark and lands them atomically

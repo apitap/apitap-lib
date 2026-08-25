@@ -50,9 +50,9 @@ on that table ingestr v1.1.14 and dlt 1.29.1 (pyarrow) are OOM-killed in
 100 GB also lands inside a **44 MB** container. Give it real hardware and the
 same zero-config call does the same 100 GB in **30.3 seconds** (~3.3 GB/s,
 three dedicated GCE machines — where the alternatives had landed zero rows
-when cut). v0.15.0 additionally auto-thins chunks on memory-capped boxes
-(128 MB tier: 2.5× faster than v0.14.0) and fixes a silent hang against
-MySQL 8.4 servers. Ladder, methodology and raw logs:
+when cut). On memory-capped boxes the chunk size auto-thins to fit the cgroup, so the
+128 MB tier is not a smaller version of the 256 MB one — it is a differently
+shaped run. Ladder, methodology and raw logs:
 [benchmarks/profiling.md](https://github.com/apitap/apitap-lib/blob/main/benchmarks/profiling.md)
 · [gcp-benchmark.md](https://github.com/apitap/apitap-lib/blob/main/benchmarks/gcp-benchmark.md).
 
@@ -86,7 +86,17 @@ Each pair negotiates the fastest wire format both sides speak — for example:
 
 Every transfer stages and swaps in atomically — readers never see a partial table,
 an empty source never wipes a good one, and a mid-run failure leaves the previous
-table untouched.
+table untouched. Since 0.55.0 the run's identity is part of the staging object's
+name, so **two runs of one destination table cannot touch each other's work**: the
+second is refused at `prepare`, before a row moves, with an error naming the run
+that holds the table. Fan-in is unaffected — two `append` runs from *different*
+sources into one table have independent watermarks and both proceed.
+
+What happens when a run does *not* finish — killed process, cut connection, DDL
+mid-run, a CDC schedule paused past the source's retention — is written down
+per case, each one produced on purpose against live servers:
+[failure modes](https://apitap.dev/docs/failure-modes). What you may depend on
+and what may still move: [stability](https://apitap.dev/docs/stability).
 
 ## How fast?
 
@@ -247,8 +257,11 @@ troubleshooting:
 - [x] Incremental sync — `mode="append"` / `mode="merge"` (transactional state table)
 - [x] Batch CDC — `mode="log_based"`: log drains on a schedule, every
       operation captured, snapshot-pinned bootstrap, a crash-safe watermark
-      committed with the data. **Postgres (logical replication) and MySQL
-      (binlog) sources**, into Postgres/ClickHouse/MySQL — the MySQL race:
+      committed with the data. **Postgres (logical replication), MySQL and
+      MariaDB (binlog) sources**, into Postgres, ClickHouse, MySQL, BigQuery
+      or Iceberg; `changelog=True` keeps the whole audit trail instead of a
+      replica, and `slots=N` drains a sharded source over N parallel
+      replication slots — the MySQL race:
       a 650K-event backlog caught up in **15.6 s on 0.5 vCPU / 256 MB**
       where ape-dts did not converge in 900 s; windows fit a 64 MB container
 - [x] Apache Iceberg destination — overwrite/append/row-delta snapshots on any
