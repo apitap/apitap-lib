@@ -8,25 +8,33 @@ with A's row count. A green run and an empty table.
 
 The fix puts the run's identity IN the staging name, so a run can only publish
 an object it minted. `prepare` no longer drops anything blindly: it lists what
-is there, reaps what is provably dead (the age is in the token, because
-Postgres stores no table creation time), and refuses to start beside a live
-peer it cannot coexist with.
+is there, collects only what it can PROVE is dead, and refuses to start beside
+anything else.
+
+"Provably dead" is a narrow set on purpose, and leg 3 is where that shows. The
+token records when the RUN started, not when the object was created, so on a
+long multi-table load `now - token` is only an UPPER bound on an object's age
+and can never prove it is old — while the run that owns it is still writing.
+An age horizon was tried and removed for exactly that reason. The one name
+nothing living can own is the un-tokenized one an older apitap wrote, and that
+is the only thing collected.
 
   leg 1  the refusal        — a second replace, while the first is mid-flight,
                               must fail with Error::Locked and NOT touch the
                               destination
   leg 2  the survivor       — the first run then finishes normally and the
                               destination holds ITS rows, whole
-  leg 1c the control        — the same race with APITAP_STAGING_REAP_SECS
-                              irrelevant and the guard bypassed by pointing
-                              both runs at DIFFERENT source URLs for the same
-                              table, which the matrix permits: both must
-                              succeed. If this leg fails, leg 1 is refusing
-                              everything rather than refusing collisions.
-  leg 3  the reap           — a leftover staging object older than the horizon
-                              is collected rather than mistaken for a peer,
-                              and a leftover from BEFORE tokens existed is
-                              collected too
+  leg 1c the control        — the same race, with the guard bypassed by
+                              pointing both runs at DIFFERENT source URLs for
+                              the same table, which the matrix permits: both
+                              must succeed. If this leg fails, leg 1 is
+                              refusing everything rather than refusing
+                              collisions.
+  leg 3  what is collected   — the un-tokenized leftover is collected, a
+                              TOKENIZED one is not (however ancient its token
+                              looks), the run refuses while it is there, and
+                              dropping it by hand — the recovery the error
+                              message prescribes — makes the run work again
   leg 4  fan-in survives    — two appends from two different sources into one
                               table still both land, because that is a
                               capability the manual advertises and a guard
@@ -218,27 +226,44 @@ dst(f"DROP TABLE IF EXISTS {T2}")
 dst(f"DELETE FROM _apitap_state WHERE dest_table IN ('{T2}', 'public.{T2}')")
 
 # ---------------------------------------------------------------------------
-print("== leg 3: dead leftovers are reaped, not mistaken for peers ==")
+print("== leg 3: only the provably-dead name is collected ==")
 reset(rows=1000)
 r = run("replace")
 case("a clean run", r.returncode == 0, r.stderr.strip()[-200:])
 
-# A leftover from a crashed run of THIS version: a tokenized name with an old
-# timestamp. '0000000' is 1970, which is past any horizon.
-# Exactly 16 bytes, or it does not parse as a token at all and the reap
-# correctly ignores it: _ + 7 start + 1 mode + 3 source + 4 nonce. A first
-# draft wrote 15 and then reported the reap as broken.
-dst(f'CREATE TABLE "{T}_0000000r000abcd__apitap_staging" (id bigint)')
-# And one from BEFORE tokens existed, which carries no age at all.
+# (a) The leftover from BEFORE tokens existed. No current run mints this name,
+#     so nothing living can own it — the one thing collection can prove.
 dst(f'CREATE TABLE "{T}__apitap_staging" (id bigint)')
-case("(rig) two leftovers are in place", len(staging_names()) == 2,
+case("(rig) the un-tokenized leftover is in place", len(staging_names()) == 1,
      f"{staging_names()}")
-
 r = run("replace")
-case("the next run succeeds despite them", r.returncode == 0,
+case("the run succeeds despite it", r.returncode == 0,
      (r.stderr.strip().splitlines() or [""])[-1][:170])
-case("and both leftovers were collected", staging_names() == [],
-     f"left: {staging_names()}")
+case("and it was collected", staging_names() == [], f"left: {staging_names()}")
+
+# (b) A TOKENIZED leftover whose token says 1970. It looks maximally dead, and
+#     it must STILL not be collected: the token is the run's start time, not the
+#     object's creation time, so age cannot tell a crashed run from table 40 of
+#     a slow one. Exactly 16 bytes or it does not parse as a token at all and
+#     the test proves nothing: _ + 7 start + 1 mode + 3 source + 4 nonce. A
+#     first draft wrote 15 and then reported the guard as broken.
+ancient = f"{T}_0000000r000abcd__apitap_staging"
+dst(f'CREATE TABLE "{ancient}" (id bigint)')
+r = run("replace")
+case("an ancient TOKENIZED leftover is refused, not collected",
+     r.returncode != 0 and "locked" in (r.stderr or "").lower(),
+     (r.stderr.strip().splitlines() or [""])[-1][:200])
+case("and it is still there — refusing is the safe action",
+     staging_names() == [ancient], f"{staging_names()}")
+
+# (c) The recovery the error message actually prescribes: drop it, re-run.
+#     If this fails, the refusal is a dead end rather than a speed bump.
+case("the refusal names the object to drop", ancient in (r.stderr or ""),
+     (r.stderr or "")[-200:])
+dst(f'DROP TABLE IF EXISTS "{ancient}"')
+r = run("replace")
+case("after dropping it by hand the run works again", r.returncode == 0,
+     (r.stderr.strip().splitlines() or [""])[-1][:170])
 
 # ---------------------------------------------------------------------------
 print("== cleanup ==")
