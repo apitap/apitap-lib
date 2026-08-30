@@ -16,6 +16,16 @@
 //! swaps it in atomically (`RENAME TABLE`) for replace, or `INSERT … SELECT` for
 //! append. Incremental state lives in `_apitap_state`, upserted in the same
 //! statement family as the other sinks.
+//!
+//! Both scratch tables — staging and the `__apitap_old` slot the swap parks the
+//! outgoing table in — carry THIS run's token in their names (see
+//! [`crate::naming::RunId`]). A run can therefore only publish an object it
+//! minted itself, which is what makes two concurrent runs of one destination
+//! safe. MySQL does have advisory locks, and they were deliberately not used:
+//! ClickHouse, BigQuery and the object stores have none, and one mechanism that
+//! works on every destination beats a different one per engine. `prepare` no
+//! longer drops anything on sight either — it lists what is there, reaps
+//! orphans by age and refuses live peers that cannot coexist.
 
 use crate::sink::Loader;
 use crate::dialect::mysql::{is_binary_udt, my_ident};
@@ -51,6 +61,14 @@ pub(crate) struct MySqlSink {
     db: String,
     bare: String,
     staging: String,
+    /// Where `finalize`'s first RENAME parks the outgoing table. Per-run like
+    /// staging is: a fixed name here was the other half of the same defect —
+    /// two replaces of one table raced for one `__apitap_old` slot, and the
+    /// pre-drop that papered over it could delete a live peer's outgoing table.
+    old: String,
+    /// This run's identity — it is IN both artifact names above, and it is what
+    /// `prepare` compares a live peer's leftovers against.
+    run: crate::naming::RunId,
     /// (column name, is_binary) for the LOAD DATA column list.
     cols: Vec<(String, bool)>,
     /// Incremental context, set in dest_state.
@@ -173,8 +191,12 @@ fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>)> {
 }
 
 impl MySqlSink {
-    pub(crate) async fn connect(url: &str, dest_table: &str) -> Result<Self> {
-        Ok(Self::bind(Self::shared_pool(url)?, dest_table))
+    pub(crate) async fn connect(
+        url: &str,
+        dest_table: &str,
+        run: &crate::naming::RunId,
+    ) -> Result<Self> {
+        Ok(Self::bind(Self::shared_pool(url)?, dest_table, run))
     }
 
     /// Pool + INFILE registry + id counter, built once per destination.
@@ -241,15 +263,28 @@ impl MySqlSink {
     }
 
     /// Bind one destination table onto the shared resources.
-    pub(crate) fn bind(shared: MySqlShared, dest_table: &str) -> Self {
+    pub(crate) fn bind(
+        shared: MySqlShared,
+        dest_table: &str,
+        run: &crate::naming::RunId,
+    ) -> Self {
         let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
+        // The run's token is IN both names, which is what makes it impossible
+        // for one run to publish another's work: the swap renames objects only
+        // this run could have minted. Before this, every run of a table shared
+        // one staging table — A streamed its rows in, B's prepare DROPped it
+        // and created a fresh one, and A's RENAME published B's empty table
+        // over the destination while returning A's row count.
         Self {
             pool: shared.pool,
             registry: shared.registry,
             next_id: shared.next_id,
             db: shared.db,
-            staging: crate::naming::artifact_ident(
-                &bare, crate::naming::Artifact::Staging, crate::naming::MY_IDENT_MAX),
+            staging: crate::naming::artifact_ident_run(
+                bare, crate::naming::Artifact::Staging, crate::naming::MY_IDENT_MAX, run),
+            old: crate::naming::artifact_ident_run(
+                bare, crate::naming::Artifact::Old, crate::naming::MY_IDENT_MAX, run),
+            run: run.clone(),
             bare: bare.to_string(),
             cols: Vec::new(),
             source_id: None,
@@ -284,6 +319,134 @@ impl MySqlSink {
         conn.query_drop(sql)
             .await
             .map_err(|e| Error::Transfer(format!("mysql exec [{sql}]: {e}")))
+    }
+
+    /// Delete one dead artifact. `IF EXISTS` because two runs can decide to
+    /// reap the same orphan at the same moment, and losing that race is not an
+    /// error — the table is gone either way. (`exec` already names the failing
+    /// statement, so there is nothing to add to the error here.)
+    async fn drop_artifact(&self, name: &str) -> Result<()> {
+        self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(name)))
+            .await
+    }
+
+    /// Collect dead artifacts and refuse live peers.
+    ///
+    /// This one catalog SELECT REPLACES the two unconditional `DROP TABLE IF
+    /// EXISTS` statements `prepare` used to open with. Those were the defect:
+    /// they destroyed whatever object was there, including a concurrent run's,
+    /// and this run's swap then published the empty replacement over the
+    /// destination while reporting its own row count.
+    ///
+    /// Liveness is read from the NAME, not the catalog. MySQL does keep a
+    /// `create_time` per table, but Postgres keeps nothing of the sort,
+    /// ClickHouse spells it `metadata_modification_time` and the object stores
+    /// have their own — so the one place an age is readable on EVERY engine is
+    /// the token. One rule everywhere beats five clever ones.
+    ///
+    /// BOTH per-run artifacts are swept, because MySQL has two: staging, and
+    /// the `__apitap_old` slot `finalize`'s first RENAME parks the outgoing
+    /// table in. That slot used to be pre-dropped here as a special case — a
+    /// crash between the two RENAMEs stranded a FIXED name, and the next
+    /// replace's RENAME collided with it (error 1050). Now that the token is in
+    /// that name too, nothing can pre-exist for this run, and a stranded table
+    /// is simply another orphan the age gate collects.
+    async fn reap_and_check_peers(&self) -> Result<()> {
+        use crate::naming::{parse_peer, Artifact};
+        let mine = parse_peer(
+            &crate::naming::artifact_ident_run(
+                &self.bare, Artifact::Staging, crate::naming::MY_IDENT_MAX, &self.run),
+            Artifact::Staging,
+        )
+        .expect("a name this process minted parses");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = crate::naming::reap_horizon_secs();
+        // `_` and `%` are LIKE wildcards and every suffix is full of the first.
+        // MySQL does not enable backslash escaping under NO_BACKSLASH_ESCAPES,
+        // so the escape character is declared explicitly — the same convention
+        // `naming::sql_exclusion` uses for this dialect.
+        let esc = |v: &str| v.replace('|', "||").replace('_', "|_").replace('%', "|%");
+        for art in [Artifact::Staging, Artifact::Old] {
+            // The token sits BETWEEN the head and the suffix, so the pattern is
+            // head + wildcard + suffix — not a prefix.
+            let (head, suffix) =
+                crate::naming::artifact_match(&self.bare, art, crate::naming::MY_IDENT_MAX);
+            let pattern = format!("{}%{}", esc(&head), esc(suffix));
+            let found: Vec<String> = {
+                let mut conn = self.deadline_conn().await?;
+                conn.query_map(
+                    format!(
+                        // BASE TABLE only, the way the Postgres sweep is
+                        // `relkind = 'r'`: every artifact here is a real table,
+                        // and a VIEW that happens to match the pattern is
+                        // somebody else's object that `DROP TABLE` cannot even
+                        // remove.
+                        "SELECT table_name FROM information_schema.tables \
+                         WHERE table_schema = '{}' AND table_type = 'BASE TABLE' \
+                           AND table_name LIKE '{}' ESCAPE '|'",
+                        sql_lit(&self.db),
+                        sql_lit(&pattern)
+                    ),
+                    |n: String| n,
+                )
+                .await
+                .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?
+            };
+            // The one name an older apitap would have used for this artifact.
+            // It carries no token and therefore no age, so it can never be aged
+            // out — but leaving it forever would break the cleanup this sink has
+            // always promised, and a concurrent old-version run is the very bug
+            // being fixed. Collect exactly that name, and no other untokenized
+            // one: anything else matching the pattern is a table apitap did not
+            // make, and deleting a stranger's table is how this started.
+            let legacy =
+                crate::naming::artifact_ident(&self.bare, art, crate::naming::MY_IDENT_MAX);
+            for name in found {
+                let Some(peer) = parse_peer(&name, art) else {
+                    if name == legacy {
+                        self.drop_artifact(&name).await?;
+                    }
+                    continue;
+                };
+                let age = now.saturating_sub(peer.started_unix);
+                if horizon != 0 && age > horizon {
+                    self.drop_artifact(&name).await?;
+                    continue;
+                }
+                if crate::naming::peer_blocks(&mine, &peer) {
+                    return Err(Error::Locked(format!(
+                        "{}.{}: another apitap run is already loading this table — it \
+                         started {age}s ago and lands rows by {}. Two of them cannot \
+                         share one destination: {}. Run them one at a time (a \
+                         scheduler's own concurrency setting is the usual answer: \
+                         Airflow max_active_runs=1, a cron flock). If that run is \
+                         dead rather than slow, the table it left behind ({name}) is \
+                         reaped automatically after {horizon}s, or you can DROP it now.",
+                        self.db,
+                        self.bare,
+                        match peer.kind {
+                            crate::naming::LandKind::Swap => "replacing the whole table",
+                            crate::naming::LandKind::Incremental => "appending to it",
+                            crate::naming::LandKind::Cdc => "draining changes into it",
+                        },
+                        match mine.kind {
+                            crate::naming::LandKind::Swap =>
+                                "a replace swaps the whole table, so whichever finishes \
+                                 second throws the other's work away",
+                            crate::naming::LandKind::Cdc =>
+                                "a CDC drain owns the watermark and the replication slot",
+                            crate::naming::LandKind::Incremental =>
+                                "both would read the same watermark and land the same \
+                                 rows twice",
+                        },
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn scalar(&self, sql: &str) -> Result<Option<String>> {
@@ -513,16 +676,17 @@ impl crate::sink::Sink for MySqlSink {
             let pk: Vec<String> = plan.pk_cols.iter().map(|c| my_ident(c)).collect();
             ddl.push(format!("PRIMARY KEY ({})", pk.join(", ")));
         }
-        self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(&self.staging)))
-            .await?;
-        // A crash between the two RENAMEs in finalize can strand `<bare>__apitap_old`;
-        // clear it so the next replace's RENAME can't collide (error 1050).
-        self.exec(&format!(
-            "DROP TABLE IF EXISTS {}",
-            self.fq(&crate::naming::artifact_ident(
-                &self.bare, crate::naming::Artifact::Old, crate::naming::MY_IDENT_MAX))
-        ))
-        .await?;
+        // No blind DROP any more, of staging or of the `__apitap_old` slot.
+        // Those two statements WERE the defect: they destroyed whatever objects
+        // they found, including a concurrent run's, and this run's RENAME then
+        // published the empty replacement over the destination while reporting
+        // its own row count.
+        //
+        // Instead: look at what is there, reap what is dead, refuse what is
+        // alive and cannot coexist. Then create a name only this run could have
+        // minted — so nothing has to be dropped first, and the CREATE failing
+        // would mean a token collision, which is loud rather than destructive.
+        self.reap_and_check_peers().await?;
         self.exec(&format!(
             "CREATE TABLE {} ({}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
             self.fq(&self.staging),
@@ -808,17 +972,19 @@ impl crate::sink::Sink for MySqlSink {
                     > 0;
                 if exists {
                     // Atomic across both tables: readers never see it missing.
-                    let old = crate::naming::artifact_ident(
-                        &self.bare, crate::naming::Artifact::Old,
-                        crate::naming::MY_IDENT_MAX);
+                    // Both names carry THIS run's token, so the outgoing table
+                    // is parked somewhere no peer can be using and no peer can
+                    // drop — which is why `prepare` no longer has to clear the
+                    // slot before the swap.
                     self.exec(&format!(
                         "RENAME TABLE {final} TO {old}, {staging} TO {final}",
                         final = self.fq(&self.bare),
-                        old = self.fq(&old),
+                        old = self.fq(&self.old),
                         staging = self.fq(&self.staging),
                     ))
                     .await?;
-                    self.exec(&format!("DROP TABLE {}", self.fq(&old))).await?;
+                    self.exec(&format!("DROP TABLE {}", self.fq(&self.old)))
+                        .await?;
                 } else {
                     self.exec(&format!(
                         "RENAME TABLE {} TO {}",

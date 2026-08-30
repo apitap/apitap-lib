@@ -215,14 +215,14 @@ impl DstScheme for ChTo {
     type Shared = ChConn;
     const BARE_DEST: bool = true;
     async fn connect(url: &str, dest_table: &str, _parallel: usize, cfg: &SinkCfg) -> Result<ChSink> {
-        ChSink::connect(url, dest_table, cfg.ch_ddl.clone())
+        ChSink::connect(url, dest_table, cfg.ch_ddl.clone(), &cfg.run)
     }
     async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<ChConn> {
         // Parse once: the reqwest client inside ChConn is shared by every table.
         ChConn::parse(url)
     }
     fn bind(shared: ChConn, table: &str, cfg: &SinkCfg) -> Result<ChSink> {
-        ChSink::bind(shared, table, cfg.ch_ddl.clone())
+        ChSink::bind(shared, table, cfg.ch_ddl.clone(), &cfg.run)
     }
 }
 struct MyTo;
@@ -230,14 +230,14 @@ impl DstScheme for MyTo {
     type Sink = MySqlSink;
     type Shared = crate::sink::mysql::MySqlShared;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, _parallel: usize, _cfg: &SinkCfg) -> Result<MySqlSink> {
-        MySqlSink::connect(url, dest_table).await
+    async fn connect(url: &str, dest_table: &str, _parallel: usize, cfg: &SinkCfg) -> Result<MySqlSink> {
+        MySqlSink::connect(url, dest_table, &cfg.run).await
     }
     async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<Self::Shared> {
         MySqlSink::shared_pool(url)
     }
-    fn bind(shared: Self::Shared, table: &str, _cfg: &SinkCfg) -> Result<MySqlSink> {
-        Ok(MySqlSink::bind(shared, table))
+    fn bind(shared: Self::Shared, table: &str, cfg: &SinkCfg) -> Result<MySqlSink> {
+        Ok(MySqlSink::bind(shared, table, &cfg.run))
     }
 }
 struct GcsTo;
@@ -245,15 +245,15 @@ impl DstScheme for GcsTo {
     type Sink = GcsSink;
     type Shared = GcsConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, _cfg: &SinkCfg) -> Result<GcsSink> {
-        GcsSink::bind(GcsConn::parse(url).await?, dest_table, parallel)
+    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<GcsSink> {
+        GcsSink::bind(GcsConn::parse(url).await?, dest_table, parallel, &cfg.run)
     }
     async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<GcsConn> {
         // Authenticate once — the token and client are shared by every table.
         GcsConn::parse(url).await
     }
     fn bind(shared: GcsConn, table: &str, cfg: &SinkCfg) -> Result<GcsSink> {
-        GcsSink::bind(shared, table, cfg.budget)
+        GcsSink::bind(shared, table, cfg.budget, &cfg.run)
     }
 }
 struct S3To;
@@ -261,14 +261,14 @@ impl DstScheme for S3To {
     type Sink = S3Sink;
     type Shared = S3Conn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, _cfg: &SinkCfg) -> Result<S3Sink> {
-        S3Sink::bind(S3Conn::parse(url).await?, dest_table, parallel)
+    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<S3Sink> {
+        S3Sink::bind(S3Conn::parse(url).await?, dest_table, parallel, &cfg.run)
     }
     async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<S3Conn> {
         S3Conn::parse(url).await
     }
     fn bind(shared: S3Conn, table: &str, cfg: &SinkCfg) -> Result<S3Sink> {
-        S3Sink::bind(shared, table, cfg.budget)
+        S3Sink::bind(shared, table, cfg.budget, &cfg.run)
     }
 }
 struct IceTo;
@@ -276,14 +276,14 @@ impl DstScheme for IceTo {
     type Sink = IcebergSink;
     type Shared = IcebergConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, _cfg: &SinkCfg) -> Result<IcebergSink> {
-        IcebergSink::bind(IcebergConn::parse(url).await?, dest_table, parallel)
+    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<IcebergSink> {
+        IcebergSink::bind(IcebergConn::parse(url).await?, dest_table, parallel, &cfg.run)
     }
     async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<IcebergConn> {
         IcebergConn::parse(url).await
     }
     fn bind(shared: IcebergConn, table: &str, cfg: &SinkCfg) -> Result<IcebergSink> {
-        IcebergSink::bind(shared, table, cfg.budget)
+        IcebergSink::bind(shared, table, cfg.budget, &cfg.run)
     }
 }
 struct BqTo;
@@ -291,8 +291,8 @@ impl DstScheme for BqTo {
     type Sink = BqSink;
     type Shared = BqConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, _cfg: &SinkCfg) -> Result<BqSink> {
-        BqSink::connect(url, dest_table, parallel).await
+    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<BqSink> {
+        BqSink::connect(url, dest_table, parallel, &cfg.run).await
     }
     async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<BqConn> {
         // Authenticate once (JWT sign + OAuth round-trip live in parse) — a
@@ -302,7 +302,7 @@ impl DstScheme for BqTo {
     fn bind(shared: BqConn, table: &str, cfg: &SinkCfg) -> Result<BqSink> {
         // BigQuery has no schema qualifiers — land `public.events` as `events`.
         let bare = table.rsplit_once('.').map_or(table, |(_, b)| b);
-        BqSink::bind(shared, bare, cfg.budget)
+        BqSink::bind(shared, bare, cfg.budget, &cfg.run)
     }
 }
 

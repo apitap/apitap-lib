@@ -82,19 +82,20 @@ impl PgSink {
 
     /// Collect dead staging objects and refuse live peers.
     ///
-    /// The listing is one catalog SELECT, and it REPLACES the `DROP TABLE IF
-    /// EXISTS` it stands in for — on Postgres that is strictly cheaper, because
-    /// the DROP took an ACCESS EXCLUSIVE lock and this takes none.
+    /// One catalog SELECT, and it REPLACES the `DROP TABLE IF EXISTS` it stands
+    /// in for — on Postgres that is strictly cheaper, because the DROP took an
+    /// ACCESS EXCLUSIVE lock and this takes none.
     ///
-    /// Liveness is read from the name, not the catalog: Postgres stores no
-    /// table creation time (MySQL has `create_time`, ClickHouse
-    /// `metadata_modification_time`, BigQuery `creationTime`, the object stores
-    /// their own), so the age lives in the token. One rule on every engine
-    /// beats five clever ones.
+    /// The classification itself is `naming::classify`, deliberately not
+    /// re-derived here. The first version of this method open-coded it, six
+    /// other sinks copied the shape, and the review found the same class of
+    /// mistake in all seven: a pattern anchored at one end reaped a SIBLING
+    /// table's staging, and a run failed to recognise its own artifacts inside
+    /// a multi-table transfer. Those are ordering and boundary questions with
+    /// one right answer, so they have one implementation.
     async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{parse_peer, Artifact};
-        let (head, suffix) =
-            crate::naming::artifact_match(&self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX);
+        use crate::naming::{artifact_match, classify, Artifact, Found};
+        let (head, suffix) = artifact_match(&self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX);
         // `_` and `%` are LIKE wildcards and both appear in these names.
         let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
         let pattern = format!("{}%{}", esc(&head), esc(suffix));
@@ -109,64 +110,25 @@ impl PgSink {
         .await
         .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
 
-        let mine = parse_peer(
+        let mine = crate::naming::parse_peer(
             &crate::naming::artifact_ident_run(
                 &self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX, &self.run),
             Artifact::Staging,
         )
         .expect("a name this process minted parses");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let horizon = crate::naming::reap_horizon_secs();
-        // The one name an older apitap would have used. It carries no token and
-        // therefore no age, so it cannot be aged out — but leaving it forever
-        // would break the cleanup this sink has always promised, and a
-        // concurrent old-version run is the very bug being fixed. Collect it.
-        let legacy =
-            crate::naming::artifact_ident(&self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX);
+        let now = crate::naming::now_unix();
 
         for name in found {
-            let Some(peer) = parse_peer(&name, Artifact::Staging) else {
-                if name == legacy {
-                    self.drop_staging(&name).await?;
+            match classify(&name, &self.bare, Artifact::Staging,
+                           crate::naming::PG_IDENT_MAX, &self.run, now) {
+                Found::Foreign | Found::Mine => {}
+                Found::Dead => self.drop_staging(&name).await?,
+                Found::Live(peer) => {
+                    if crate::naming::peer_blocks(&mine, &peer) {
+                        return Err(crate::naming::locked_error(
+                            &format!("{}.{}", self.schema, self.bare), &name, &mine, &peer, now));
+                    }
                 }
-                continue;
-            };
-            let age = now.saturating_sub(peer.started_unix);
-            if horizon != 0 && age > horizon {
-                self.drop_staging(&name).await?;
-                continue;
-            }
-            if crate::naming::peer_blocks(&mine, &peer) {
-                return Err(Error::Locked(format!(
-                    "{}.{}: another apitap run is already loading this table — it \
-                     started {age}s ago and lands rows by {}. Two of them cannot \
-                     share one destination: {}. Run them one at a time (a \
-                     scheduler's own concurrency setting is the usual answer: \
-                     Airflow max_active_runs=1, a cron flock). If that run is \
-                     dead rather than slow, its staging table {name} is reaped \
-                     automatically after {}s, or you can DROP it now.",
-                    self.schema,
-                    self.bare,
-                    match peer.kind {
-                        crate::naming::LandKind::Swap => "replacing the whole table",
-                        crate::naming::LandKind::Incremental => "appending to it",
-                        crate::naming::LandKind::Cdc => "draining changes into it",
-                    },
-                    match mine.kind {
-                        crate::naming::LandKind::Swap =>
-                            "a replace swaps the whole table, so whichever finishes \
-                             second throws the other's work away",
-                        crate::naming::LandKind::Cdc =>
-                            "a CDC drain owns the watermark and the replication slot",
-                        crate::naming::LandKind::Incremental =>
-                            "both would read the same watermark and land the same \
-                             rows twice",
-                    },
-                    horizon,
-                )));
             }
         }
         Ok(())

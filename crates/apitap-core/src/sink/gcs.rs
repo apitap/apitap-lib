@@ -459,14 +459,70 @@ pub(crate) struct GcsSink {
     conn: GcsConn,
     /// The table's file name (schema qualifiers dropped by dispatch).
     bare: String,
+    /// The staging prefix shared by every run of this table — where a peer
+    /// scan looks. Nothing is ever written directly here any more.
+    staging_root: String,
+    /// THIS run's staging directory: `staging_root` + the run token + `/`.
+    /// Every part this run writes, lists, composes and deletes is under it.
     staging: String,
+    /// This run's identity — the segment name above, and what the peer scan
+    /// compares a live peer's segment against.
+    run: crate::naming::RunId,
     names: Arc<Vec<String>>,
     delivered: Arc<Vec<Delivered>>,
     next_part: Arc<AtomicU64>,
 }
 
+/// What one key found under the staging prefix is, to this run.
+enum Staged {
+    /// Directly under the staging prefix, with no run segment — the layout
+    /// apitap used before run tokens existed. That prefix is apitap's own
+    /// name for this table and nothing else writes there, so it is reapable
+    /// for the same reason the SQL sinks reap the one exact legacy identifier.
+    Legacy,
+    /// Under some run's token segment.
+    Run {
+        seg: String,
+        peer: crate::naming::PeerRun,
+    },
+    /// A segment no apitap minted. Not ours; never touched.
+    Foreign,
+}
+
+/// Read the run identity out of a key found under `root`.
+///
+/// Note the token sits in a path SEGMENT here, not inside an identifier the
+/// way the SQL sinks carry it — an object store has a path and no identifier
+/// length limit, and a segment is what keeps `finalize`'s list-and-compose
+/// confined to one run's own parts. So `parse_peer` — which reads a token
+/// sitting immediately before an artifact suffix — is handed the name that
+/// segment stands for.
+fn classify(root: &str, key: &str) -> Staged {
+    let Some(rest) = key.strip_prefix(root) else {
+        return Staged::Foreign;
+    };
+    let Some((seg, _)) = rest.split_once('/') else {
+        return Staged::Legacy;
+    };
+    match crate::naming::parse_peer(
+        &format!("{seg}{}", crate::naming::Artifact::Staging.suffix()),
+        crate::naming::Artifact::Staging,
+    ) {
+        Some(peer) => Staged::Run {
+            seg: seg.to_string(),
+            peer,
+        },
+        None => Staged::Foreign,
+    }
+}
+
 impl GcsSink {
-    pub(crate) fn bind(conn: GcsConn, dest_table: &str, parallel: usize) -> Result<Self> {
+    pub(crate) fn bind(
+        conn: GcsConn,
+        dest_table: &str,
+        parallel: usize,
+        run: &crate::naming::RunId,
+    ) -> Result<Self> {
         // The CSV lane composes header + one part per pipe; GCS compose caps at
         // 32 sources. Refuse BEFORE uploading anything, not after.
         if conn.format == GcsFormat::Csv && parallel + 1 > COMPOSE_MAX {
@@ -478,15 +534,125 @@ impl GcsSink {
             )));
         }
         let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
-        let staging = format!("{}{bare}__apitap_staging/", conn.prefix);
+        // Every run of a table used to stage into ONE directory, and prepare
+        // began by emptying it: run A uploaded its parts, run B's prepare
+        // deleted them, and A's finalize then composed whatever was left over
+        // the destination while reporting A's row count. The token makes each
+        // run's parts its own, so a compose can only ever see what this run
+        // wrote.
+        //
+        // Placement differs from the SQL sinks on purpose: there the token
+        // lives INSIDE the table identifier, because a table has no path to
+        // hang it on. Here it is a path SEGMENT under the same staging prefix
+        // deployments already have — the prefix stays exactly what it was, and
+        // liveness is still read from the token, the same rule as everywhere.
+        let (head, suffix) = crate::naming::artifact_match(
+            bare,
+            crate::naming::Artifact::Staging,
+            crate::naming::ROOMY,
+        );
+        let staging_root = format!("{}{head}{suffix}/", conn.prefix);
+        let staging = format!("{staging_root}{}/", run.token());
         Ok(Self {
             conn,
             bare: bare.to_string(),
+            staging_root,
             staging,
+            run: run.clone(),
             names: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
             next_part: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Reap dead runs' staging parts and refuse a live peer.
+    ///
+    /// This REPLACES the unconditional "delete everything under staging" the
+    /// sink opened with — that statement was the defect, not a safeguard.
+    ///
+    /// Liveness comes from the token, not from object metadata: an object's
+    /// update time is when it was last WRITTEN, which for a slow run's first
+    /// part can be an hour before that run finishes, and would age a live peer
+    /// out from under itself. One rule on every engine beats five clever ones.
+    async fn reap_and_check_peers(&self) -> Result<()> {
+        use crate::naming::{parse_peer, Artifact};
+        let mine = parse_peer(
+            &format!("{}{}", self.run.token(), Artifact::Staging.suffix()),
+            Artifact::Staging,
+        )
+        .expect("a token this process minted parses");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = crate::naming::reap_horizon_secs();
+        // Nothing is deleted until the whole listing has been judged: a live
+        // peer anywhere in it means this run does not get to touch the prefix
+        // at all.
+        let mut dead: Vec<String> = Vec::new();
+        for key in self.conn.list(&self.staging_root).await? {
+            let what = classify(&self.staging_root, &key);
+            match what {
+                Staged::Foreign => {}
+                Staged::Legacy => dead.push(key),
+                Staged::Run { seg, peer } => {
+                    // Our own segment is not a peer of itself.
+                    if seg == self.run.token() {
+                        continue;
+                    }
+                    let age = now.saturating_sub(peer.started_unix);
+                    if horizon != 0 && age > horizon {
+                        dead.push(key);
+                        continue;
+                    }
+                    if crate::naming::peer_blocks(&mine, &peer) {
+                        return Err(Error::Locked(format!(
+                            "gcs://{}/{}{}: another apitap run is already writing \
+                             this table — it started {age}s ago and lands rows by \
+                             {}. Two of them cannot share one destination: {}. Run \
+                             them one at a time (a scheduler's own concurrency \
+                             setting is the usual answer: Airflow \
+                             max_active_runs=1, a cron flock). If that run is dead \
+                             rather than slow, its staging objects under \
+                             gcs://{}/{}{seg}/ are reaped automatically after \
+                             {horizon}s, or you can delete them now.",
+                            self.conn.bucket,
+                            self.conn.prefix,
+                            self.bare,
+                            match peer.kind {
+                                crate::naming::LandKind::Swap => "replacing the whole table",
+                                crate::naming::LandKind::Incremental => "appending to it",
+                                crate::naming::LandKind::Cdc => "draining changes into it",
+                            },
+                            match mine.kind {
+                                crate::naming::LandKind::Swap =>
+                                    "a replace rewrites the whole object set, so \
+                                     whichever finishes second throws the other's \
+                                     work away",
+                                crate::naming::LandKind::Cdc =>
+                                    "a CDC drain owns the watermark and the \
+                                     replication slot",
+                                crate::naming::LandKind::Incremental =>
+                                    "both would read the same watermark and land \
+                                     the same rows twice",
+                            },
+                            self.conn.bucket,
+                            self.staging_root,
+                        )));
+                    }
+                }
+            }
+        }
+        // No separate sweep of the pre-token PREFIX is needed:
+        // `artifact_match`'s head and `artifact_ident`'s name agree for every
+        // table name that can exist here. They only diverge past ~990 bytes of
+        // name, and a key that long is already over the 1024-byte object-name
+        // limit GCS enforces — such a run could never have written a staging
+        // object to reap.
+        for key in &dead {
+            self.conn.delete(key).await?;
+        }
+        Ok(())
     }
 
     fn ext(&self) -> &'static str {
@@ -545,10 +711,11 @@ impl crate::sink::Sink for GcsSink {
         }
         self.names = Arc::new(names);
         self.delivered = Arc::new(delivered);
-        // Sweep stale staging parts (crashed runs included).
-        for obj in self.conn.list(&self.staging).await? {
-            self.conn.delete(&obj).await?;
-        }
+        // Reap crashed runs' parts, refuse a live peer — and then write only
+        // under THIS run's segment, which no other run can name. There is
+        // nothing to delete first: a colliding key would mean a colliding
+        // token, which is loud rather than destructive.
+        self.reap_and_check_peers().await?;
         if self.conn.format == GcsFormat::Csv {
             // The header is its own tiny gzip member, named to sort BEFORE the
             // part files so finalize's sorted compose puts it first —
@@ -813,5 +980,51 @@ mod tests {
         assert!(!is_part_object("e2e/events/users-notes.parquet"));
         assert!(!is_part_object("e2e/events/part-00003.csv"));
         assert!(!is_part_object("e2e/events/README.md"));
+    }
+
+    /// The three things the peer scan has to tell apart, and what each one
+    /// costs when it is wrong: a run segment misread as legacy deletes a live
+    /// peer's parts (the defect), a legacy object misread as foreign leaks
+    /// forever, and a foreign object misread as either deletes a user's data.
+    #[test]
+    fn a_staging_key_is_classified_by_its_run_segment() {
+        let root = "e2e/events__apitap_staging/";
+        let id = crate::naming::RunId::mint(crate::naming::LandKind::Swap, "gcs://b/e2e");
+        let tok = id.token().to_string();
+        match classify(root, &format!("{root}{tok}/part-00000.parquet")) {
+            Staged::Run { seg, peer } => {
+                assert_eq!(seg, tok);
+                assert_eq!(peer.kind, crate::naming::LandKind::Swap);
+            }
+            _ => panic!("a token segment must read as a run"),
+        }
+        // The pre-token layout put parts directly under the prefix.
+        assert!(matches!(
+            classify(root, &format!("{root}part-00000.parquet")),
+            Staged::Legacy
+        ));
+        // Anything else under the prefix, and anything outside it, is not
+        // ours to delete.
+        assert!(matches!(
+            classify(root, &format!("{root}notes/keep.txt")),
+            Staged::Foreign
+        ));
+        assert!(matches!(
+            classify(root, "e2e/events/part-00000.parquet"),
+            Staged::Foreign
+        ));
+    }
+
+    /// Two runs of one table must land in DIFFERENT directories — that is the
+    /// whole fix, and a shared prefix would put it straight back.
+    #[test]
+    fn two_runs_never_share_a_staging_directory() {
+        let root = "e2e/events__apitap_staging/";
+        let a = crate::naming::RunId::mint(crate::naming::LandKind::Swap, "gcs://b/e2e");
+        let b = crate::naming::RunId::mint(crate::naming::LandKind::Swap, "gcs://b/e2e");
+        assert_ne!(
+            format!("{root}{}/", a.token()),
+            format!("{root}{}/", b.token())
+        );
     }
 }

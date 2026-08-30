@@ -898,6 +898,73 @@ fn retryable(msg: &str) -> bool {
 }
 
 #[cfg(test)]
+mod staging_name_tests {
+    use super::*;
+    use crate::naming::{
+        artifact_ident, artifact_ident_run, artifact_match, parse_peer, Artifact, LandKind, RunId,
+        ROOMY, RUN_TOKEN_LEN,
+    };
+
+    /// The trap this sink has that no other does: worker tables end in `_<i>`,
+    /// so the artifact suffix is NOT terminal and `parse_peer` cannot see the
+    /// token. If this regresses, every peer reads as "no token" and the peer
+    /// check silently degrades to letting everything through.
+    #[test]
+    fn a_worker_table_still_yields_its_run_token() {
+        let (_, suffix) = artifact_match("orders", Artifact::Staging, ROOMY);
+        let base = artifact_ident_run(
+            "orders",
+            Artifact::Staging,
+            ROOMY,
+            &RunId::mint(LandKind::Swap, "postgres://h/db::orders"),
+        );
+        // One binding, because `got` borrows FROM this name — inlining the
+        // format! makes it a temporary that dies at the end of the statement.
+        let indexed = format!("{base}_7");
+        assert!(
+            parse_peer(&indexed, Artifact::Staging).is_none(),
+            "the raw worker name must NOT parse — that is why staging_base exists"
+        );
+        let got = staging_base(&indexed, suffix).expect("worker index strips");
+        assert_eq!(got, base);
+        let peer = parse_peer(got, Artifact::Staging).expect("and then the token reads");
+        assert_eq!(peer.kind, LandKind::Swap);
+        // The un-indexed base (what an older layout or a legacy sweep leaves)
+        // goes through untouched.
+        assert_eq!(staging_base(&base, suffix), Some(base.as_str()));
+    }
+
+    /// A run of `orders` lists by the head `orders`, which also brings back a
+    /// neighbouring destination's tables. Anchoring on both ends is what stops
+    /// it reaping them — the same check `reap_and_check_peers` applies.
+    #[test]
+    fn a_neighbours_staging_is_not_mistaken_for_ours() {
+        let (head, suffix) = artifact_match("orders", Artifact::Staging, ROOMY);
+        let run = RunId::mint(LandKind::Incremental, "postgres://h/db::orders");
+        let ours = artifact_ident_run("orders", Artifact::Staging, ROOMY, &run);
+        let theirs = artifact_ident_run("orders_archive", Artifact::Staging, ROOMY, &run);
+        let anchored = |name: &str| match staging_base(name, suffix) {
+            Some(b) => {
+                b.starts_with(head.as_str()) && b.len() == head.len() + RUN_TOKEN_LEN + suffix.len()
+            }
+            None => false,
+        };
+        assert!(anchored(&format!("{ours}_0")));
+        assert!(!anchored(&format!("{theirs}_0")), "would delete live data");
+        // Plain user tables under the same prefix are not candidates at all.
+        assert!(staging_base("orders", suffix).is_none());
+        assert!(staging_base("orders_2024", suffix).is_none());
+        // The pre-token name is recognised by equality, not by anchoring.
+        let legacy = artifact_ident("orders", Artifact::Staging, ROOMY);
+        assert_eq!(
+            staging_base(&format!("{legacy}_3"), suffix),
+            Some(legacy.as_str())
+        );
+        assert!(!anchored(&format!("{legacy}_3")));
+    }
+}
+
+#[cfg(test)]
 mod retry_tests {
     use super::retryable;
 
@@ -1136,10 +1203,15 @@ impl BqLoader {
     }
 
     async fn begin_session_once(&mut self) -> Result<()> {
-        // Belt-and-braces vs a leftover staging that slipped past the sweep
+        // Belt-and-braces vs a leftover staging under this worker's own name
         // (all jobs WRITE_APPEND — appending onto stale rows would be silent
         // duplication; a TRUNCATE first-job can't fix it because BigQuery does
         // not order concurrent load-job commits). Once per worker.
+        //
+        // Since the base name carries the run's token this can no longer reach
+        // a PEER's table — the only thing that could sit here is wreckage of
+        // this same run. That is why it stays a delete rather than becoming a
+        // refusal: there is nobody left to refuse.
         if !self.stale_dropped {
             self.conn.table_delete(&self.staging_table).await?;
             self.stale_dropped = true;
@@ -1432,7 +1504,13 @@ impl Loader for BqLoader {
 pub(crate) struct BqSink {
     conn: BqConn,
     final_table: String,
+    /// The BASE staging name this run minted — every worker table is
+    /// `<staging_table>_<i>`. The run's token is inside it, so no other run can
+    /// ever hand a table to this run's `finalize`.
     staging_table: String,
+    /// This run's identity: it is IN `staging_table`, and it is what `prepare`
+    /// compares a live peer's staging against.
+    run: crate::naming::RunId,
     job_config: Value,
     /// Worker stagings that actually received data (see BqLoader.staging_table).
     staging_registry: Arc<std::sync::Mutex<Vec<String>>>,
@@ -1456,14 +1534,24 @@ pub(crate) struct BqSink {
 }
 
 impl BqSink {
-    pub(crate) async fn connect(url: &str, dest_table: &str, parallel: usize) -> Result<Self> {
-        Self::bind(BqConn::parse(url).await?, dest_table, parallel)
+    pub(crate) async fn connect(
+        url: &str,
+        dest_table: &str,
+        parallel: usize,
+        run: &crate::naming::RunId,
+    ) -> Result<Self> {
+        Self::bind(BqConn::parse(url).await?, dest_table, parallel, run)
     }
 
     /// Bind one destination table onto an existing connection — a multi-table run
     /// authenticates ONCE (`BqConn::parse` signs a JWT and fetches an OAuth token;
     /// per-table auth would burst the token endpoint) and binds per table.
-    pub(crate) fn bind(conn: BqConn, dest_table: &str, parallel: usize) -> Result<Self> {
+    pub(crate) fn bind(
+        conn: BqConn,
+        dest_table: &str,
+        parallel: usize,
+        run: &crate::naming::RunId,
+    ) -> Result<Self> {
         // The bulk sink builds its DDL and its cursor probe as text too — the
         // CDC lane's vetting never covered it, so a table name with a backtick
         // in it reached BigQuery raw from here.
@@ -1487,7 +1575,22 @@ impl BqSink {
         Ok(Self {
             conn,
             final_table: bare.to_string(),
-            staging_table: format!("{bare}__apitap_staging"),
+            // The run's token goes in the BASE name, so the per-worker `_<i>`
+            // still hangs off it and every table this run creates carries the
+            // identity. Before this, every run of a destination used the one
+            // name `<bare>__apitap_staging_<i>`: A's workers streamed rows in,
+            // B's prepare deleted those very tables and B's workers recreated
+            // them, and A's finalize copied whatever was left over the
+            // destination while returning A's row count.
+            staging_table: crate::naming::artifact_ident_run(
+                bare,
+                crate::naming::Artifact::Staging,
+                // BigQuery allows 1024 characters in a table id — nothing here
+                // reaches it, so ROOMY is the honest limit to name.
+                crate::naming::ROOMY,
+                run,
+            ),
+            run: run.clone(),
             job_config: Value::Null,
             staging_registry: Arc::new(std::sync::Mutex::new(Vec::new())),
             loader_seq: std::sync::atomic::AtomicUsize::new(0),
@@ -1505,6 +1608,107 @@ impl BqSink {
 
     fn fq(&self, table: &str) -> String {
         format!("`{}.{}.{table}`", self.conn.project, self.conn.dataset)
+    }
+
+    /// Collect dead staging tables and refuse live peers.
+    ///
+    /// This REPLACES the blind prefix sweep, which was this sink's shape of the
+    /// defect: every run used the same staging names, so `prepare` deleted
+    /// whatever it found — including a concurrent run's half-loaded worker
+    /// tables — and that run's `finalize` then copied an empty set over the
+    /// destination while reporting its own row count.
+    ///
+    /// Liveness is read from the NAME, not from the table's `creationTime`.
+    /// BigQuery does expose one, but Postgres exposes nothing comparable, so
+    /// the age lives in the token on every engine — one rule beats five clever
+    /// ones. It costs nothing here either: this is the same single listing the
+    /// sweep already made.
+    async fn reap_and_check_peers(&self) -> Result<()> {
+        use crate::naming::{parse_peer, Artifact, ROOMY};
+        // `final_table` IS the bare name: `bind` strips the dataset qualifier,
+        // and a BigQuery table id is unqualified within its dataset.
+        let (head, suffix) =
+            crate::naming::artifact_match(&self.final_table, Artifact::Staging, ROOMY);
+        // The one name an older apitap would have used. It carries no token and
+        // therefore no age, so it can never be aged out — but leaving it forever
+        // would break the cleanup this sink has always promised, and a
+        // concurrent old-version run is the very bug being fixed. Collect it.
+        let legacy = crate::naming::artifact_ident(&self.final_table, Artifact::Staging, ROOMY);
+        // Minted from the run, not read back off `staging_table` — the same
+        // call `bind` made, so what this run compares peers against and what it
+        // writes into cannot drift apart.
+        let mine = parse_peer(
+            &crate::naming::artifact_ident_run(
+                &self.final_table,
+                Artifact::Staging,
+                ROOMY,
+                &self.run,
+            ),
+            Artifact::Staging,
+        )
+        .expect("a name this process minted parses");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = crate::naming::reap_horizon_secs();
+        // The token sits BETWEEN head and suffix, so the listing can only be
+        // narrowed to `head` — wider than the old `<bare>__apitap_staging`
+        // prefix, which is why every candidate below is anchored on BOTH ends
+        // before it is touched. Without that, a run of `orders` would reap
+        // `orders_archive`'s live staging.
+        for name in self.conn.tables_with_prefix(&head).await? {
+            let Some(base) = staging_base(&name, suffix) else {
+                continue;
+            };
+            if base == legacy {
+                self.conn.table_delete(&name).await?;
+                continue;
+            }
+            if !base.starts_with(head.as_str())
+                || base.len() != head.len() + crate::naming::RUN_TOKEN_LEN + suffix.len()
+            {
+                continue; // some other destination's staging: not ours to judge
+            }
+            let Some(peer) = parse_peer(base, Artifact::Staging) else {
+                continue; // ends the right way, but carries no token of ours
+            };
+            let age = now.saturating_sub(peer.started_unix);
+            if horizon != 0 && age > horizon {
+                self.conn.table_delete(&name).await?;
+                continue;
+            }
+            if crate::naming::peer_blocks(&mine, &peer) {
+                return Err(Error::Locked(format!(
+                    "{}.{}: another apitap run is already loading this table — it \
+                     started {age}s ago and lands rows by {}. Two of them cannot \
+                     share one destination: {}. Run them one at a time (a \
+                     scheduler's own concurrency setting is the usual answer: \
+                     Airflow max_active_runs=1, a cron flock). If that run is \
+                     dead rather than slow, its staging table {name} is reaped \
+                     automatically after {}s, or you can delete it now.",
+                    self.conn.dataset,
+                    self.final_table,
+                    match peer.kind {
+                        crate::naming::LandKind::Swap => "replacing the whole table",
+                        crate::naming::LandKind::Incremental => "appending to it",
+                        crate::naming::LandKind::Cdc => "draining changes into it",
+                    },
+                    match mine.kind {
+                        crate::naming::LandKind::Swap =>
+                            "a replace copies over the whole table, so whichever \
+                             finishes second throws the other's work away",
+                        crate::naming::LandKind::Cdc =>
+                            "a CDC drain owns the watermark and the replication slot",
+                        crate::naming::LandKind::Incremental =>
+                            "both would read the same watermark and land the same \
+                             rows twice",
+                    },
+                    horizon,
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_state_table(&self) -> Result<()> {
@@ -1676,6 +1880,37 @@ impl BqSink {
     }
 }
 
+/// The minted staging name inside a listed table id, or `None` when the id is
+/// not a staging table of any table at all.
+///
+/// This sink gives every worker its OWN table — BigQuery rate-limits table
+/// update operations per table, and one shared staging tripped
+/// `rateLimitExceeded` at 10M rows — so what is on disk is `<minted>_<i>`, not
+/// `<minted>`. `parse_peer` strips the artifact suffix from the END of a name,
+/// so it cannot see a token through that trailing `_<i>`; the index comes off
+/// here first, and only then is the base classified.
+///
+/// The other option was to mint per worker, with the index ahead of the token
+/// (`<bare>_<i>` as the bare name), which `parse_peer` reads unaided. It was
+/// rejected for two reasons: it takes the token off the ONE name this sink
+/// treats as the run's identity — the base every worker table hangs off, the
+/// value `finalize` copies from and `prepare` compares peers against — and it
+/// makes worker 0 of `orders` indistinguishable from a staging of a real
+/// neighbouring table called `orders_0`.
+fn staging_base<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    if name.ends_with(suffix) {
+        return Some(name);
+    }
+    let (base, idx) = name.rsplit_once('_')?;
+    // A worker index is digits and nothing else, and what remains must still be
+    // a whole artifact name — so a user's `orders_2024` is not a candidate.
+    if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) && base.ends_with(suffix) {
+        Some(base)
+    } else {
+        None
+    }
+}
+
 impl crate::sink::Sink for BqSink {
     type Loader = BqLoader;
 
@@ -1723,10 +1958,15 @@ impl crate::sink::Sink for BqSink {
             delivered.push(lc.delivered.clone());
         }
         self.names = names;
-        // Sweep every leftover worker staging (crashed runs included).
-        for t in self.conn.tables_with_prefix(&self.staging_table).await? {
-            self.conn.table_delete(&t).await?;
-        }
+        // No blind sweep any more. Deleting every table under the staging
+        // prefix WAS the defect: the prefix was the same for every run, so a
+        // run destroyed a concurrent run's worker tables and that run's
+        // finalize then copied the empty remains over the destination.
+        //
+        // Instead: look at what is there, reap what is dead, refuse what is
+        // alive and cannot coexist. The tables this run then creates carry a
+        // name only it could have minted, so nothing has to be deleted first.
+        self.reap_and_check_peers().await?;
         if let Some(cursor) = plan.cursor.as_deref() {
             if let Some(idx) = plan.cols.iter().position(|c| c.name == cursor) {
                 let numeric = matches!(
@@ -1770,6 +2010,10 @@ impl crate::sink::Sink for BqSink {
         BqLoader::open(
             self.conn.clone(),
             &self.job_config,
+            // `staging_table` already ends in the artifact suffix and carries
+            // this run's token, so the worker index hangs off a name no other
+            // run can mint. `staging_base` is what reads the token back out
+            // from under this `_<i>`.
             format!("{}_{i}", self.staging_table),
             self.staging_registry.clone(),
             &self.names,

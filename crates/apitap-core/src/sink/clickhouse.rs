@@ -402,6 +402,182 @@ impl ChSink {
         Ok(())
     }
 
+    /// Collect dead artifacts and refuse live peers, for every kind of object
+    /// this sink parks beside the destination.
+    ///
+    /// This REPLACES the two `DROP TABLE IF EXISTS` statements `prepare` used to
+    /// open with. Those drops were the defect, not the cleanup: they destroyed
+    /// whatever staging table they found — a concurrent run's included — and the
+    /// losing run's `EXCHANGE TABLES` then published an empty table over the
+    /// destination while reporting its own row count.
+    ///
+    /// Both artifacts are scanned, not just staging. The shadow (`Artifact::New`)
+    /// is what an engine-carrying replace actually EXCHANGEs onto the
+    /// destination, so it is exactly as much a publishing object as staging is —
+    /// and after the exchange it holds the OLD destination's data, so a crashed
+    /// replace leaves a full copy of the table on disk that nothing else in this
+    /// sink would ever collect.
+    ///
+    /// A shadow only lives for the three DDL statements at the end of a replace,
+    /// so a leftover one is nearly always a crash rather than a live peer — and
+    /// this refuses the next run for the reap horizon on that evidence. That is
+    /// the same bargain staging already makes, and the error says so: the object
+    /// is named, the horizon is quoted, and dropping it by hand is offered.
+    ///
+    /// Liveness is read from the NAME. ClickHouse does have
+    /// `metadata_modification_time`, but it moves on every ALTER and means
+    /// something different from MySQL's `create_time` or BigQuery's
+    /// `creationTime` — one rule that reads identically on every destination
+    /// beats five engine-specific ones.
+    async fn reap_and_check_peers(&self) -> Result<()> {
+        for artifact in [
+            crate::naming::Artifact::Staging,
+            crate::naming::Artifact::New,
+        ] {
+            self.reap_artifact(artifact).await?;
+        }
+        Ok(())
+    }
+
+    async fn reap_artifact(&self, artifact: crate::naming::Artifact) -> Result<()> {
+        use crate::naming::parse_peer;
+        let (head, suffix) =
+            crate::naming::artifact_match(&self.final_bare, artifact, crate::naming::ROOMY);
+        // The token sits BETWEEN head and suffix, so the pattern is
+        // head + wildcard + suffix, never a prefix. `_` and `%` are LIKE
+        // wildcards and every suffix is full of the first, so both are escaped;
+        // the one `%` in the middle is the only live wildcard. The finished
+        // pattern goes through `ch_str`, which doubles the backslashes for the
+        // string literal — ClickHouse unescapes the literal first, and LIKE then
+        // sees `\_` exactly as intended.
+        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+        let pattern = format!("{}%{}", esc(&head), esc(suffix));
+        // On a cluster this reads whichever node the balancer answered from,
+        // which is enough: everything apitap creates there is created ON CLUSTER
+        // and so exists on all of them.
+        //
+        // TabSeparatedRaw, like the other catalog reads in this file: plain TSV
+        // escapes the output, and a name that came back mangled would neither
+        // match the legacy name nor drop cleanly.
+        let found: Vec<String> = self
+            .ch
+            .exec(&format!(
+                "SELECT name FROM system.tables \
+                 WHERE database = currentDatabase() AND name LIKE '{}' \
+                 FORMAT TabSeparatedRaw",
+                ch_str(&pattern)
+            ))
+            .await?
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        let mine = parse_peer(
+            &crate::naming::artifact_ident_run(
+                &self.final_bare,
+                artifact,
+                crate::naming::ROOMY,
+                &self.run,
+            ),
+            artifact,
+        )
+        .expect("a name this process minted parses");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = crate::naming::reap_horizon_secs();
+        // The one name an older apitap would have used. It carries no token and
+        // therefore no age, so it cannot be aged out — but leaving it forever
+        // would break the cleanup this sink has always promised, and a
+        // concurrent old-version run is the very bug being fixed. Collect it.
+        let legacy =
+            crate::naming::artifact_ident(&self.final_bare, artifact, crate::naming::ROOMY);
+
+        for name in found {
+            // LIKE is a coarse filter, and on its own it is too coarse: the
+            // pattern for `orders` also matches every artifact of `orders_2024`,
+            // a prefix-sharing sibling that is a DIFFERENT destination. The token
+            // is fixed width, so pinning the length pins the middle to exactly
+            // one token — without this a sibling's live staging would refuse this
+            // run, and a sibling's orphan would be dropped by it.
+            let exact =
+                name.len() == head.len() + crate::naming::RUN_TOKEN_LEN + suffix.len();
+            let parsed = if exact {
+                parse_peer(&name, artifact)
+            } else {
+                None
+            };
+            let Some(peer) = parsed else {
+                // Not ours to judge unless it is exactly the pre-token name for
+                // THIS table. Anything else that merely ends the same way is a
+                // user's object, and dropping it is how the old blind DROP lost
+                // data in the first place.
+                if name == legacy {
+                    self.drop_artifact(&name).await?;
+                }
+                continue;
+            };
+            let age = now.saturating_sub(peer.started_unix);
+            if horizon != 0 && age > horizon {
+                self.drop_artifact(&name).await?;
+                continue;
+            }
+            if crate::naming::peer_blocks(&mine, &peer) {
+                return Err(Error::Locked(format!(
+                    "{}.{}: another apitap run is already loading this table — it \
+                     started {age}s ago and lands rows by {}. Two of them cannot \
+                     share one destination: {}. Run them one at a time (a \
+                     scheduler's own concurrency setting is the usual answer: \
+                     Airflow max_active_runs=1, a cron flock). If that run is \
+                     dead rather than slow, its table {name} is reaped \
+                     automatically after {}s, or you can DROP it now.",
+                    self.ch.database(),
+                    self.final_bare,
+                    match peer.kind {
+                        crate::naming::LandKind::Swap => "replacing the whole table",
+                        crate::naming::LandKind::Incremental => "appending to it",
+                        crate::naming::LandKind::Cdc => "draining changes into it",
+                    },
+                    match mine.kind {
+                        crate::naming::LandKind::Swap =>
+                            "a replace swaps the whole table, so whichever finishes \
+                             second throws the other's work away",
+                        crate::naming::LandKind::Cdc =>
+                            "a CDC drain owns the watermark and the replication slot",
+                        crate::naming::LandKind::Incremental =>
+                            "both would read the same watermark and land the same \
+                             rows twice",
+                    },
+                    horizon,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop one leftover artifact, in the same forms every other DROP in this
+    /// sink uses: ON CLUSTER so it reaches every node rather than whichever one
+    /// the balancer picked, and SYNC so a Replicated table's ZooKeeper path is
+    /// actually free afterwards.
+    async fn drop_artifact(&self, name: &str) -> Result<()> {
+        let sql = if self.ddl.on_cluster.is_some() {
+            format!(
+                "DROP TABLE IF EXISTS {}{} SYNC",
+                ch_ident(name),
+                self.ddl.on_cluster_clause()
+            )
+        } else {
+            format!("DROP TABLE IF EXISTS {}", ch_ident(name))
+        };
+        self.ch
+            .exec(&sql)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Transfer(format!("reap {name}: {e}")))
+    }
+
     async fn ensure_state_table(&self) -> Result<()> {
         // Cluster mode: the watermark must be one truth across every node a
         // balancer can answer from. A node-local state table would let run N
@@ -759,17 +935,30 @@ pub(crate) struct ChSink {
     /// table it creates (with the user's engine) is ATTACH-identical to staging.
     plan_ddl: String,
     staging_order_by: String,
+    /// This run's identity. It is IN the staging and shadow names, and it is what
+    /// `prepare` compares a live peer's artifacts against.
+    run: crate::naming::RunId,
 }
 
 impl ChSink {
-    pub(crate) fn connect(url: &str, dest_table: &str, ddl: ChDdl) -> Result<Self> {
-        Self::bind(ChConn::parse(url)?, dest_table, ddl)
+    pub(crate) fn connect(
+        url: &str,
+        dest_table: &str,
+        ddl: ChDdl,
+        run: &crate::naming::RunId,
+    ) -> Result<Self> {
+        Self::bind(ChConn::parse(url)?, dest_table, ddl, run)
     }
 
     /// Bind one destination table onto an existing connection (a multi-table run
     /// parses the URL — and builds the one HTTP client — once, then binds per
     /// table; `ChConn` is `Clone` and the client inside is reference-counted).
-    pub(crate) fn bind(ch: ChConn, dest_table: &str, ddl: ChDdl) -> Result<Self> {
+    pub(crate) fn bind(
+        ch: ChConn,
+        dest_table: &str,
+        ddl: ChDdl,
+        run: &crate::naming::RunId,
+    ) -> Result<Self> {
         ddl.validate()?;
         // ClickHouse table names aren't schema-qualified the Postgres way — take the
         // bare name (the URL's /database picks the namespace).
@@ -777,8 +966,15 @@ impl ChSink {
         Ok(Self {
             ch,
             final_t: ch_ident(dest_bare),
-            staging_t: ch_ident(&crate::naming::artifact_ident(
-                dest_bare, crate::naming::Artifact::Staging, crate::naming::ROOMY)),
+            // The run's token is IN the name, and that is what makes it
+            // impossible for one run to publish another's work: the EXCHANGE in
+            // finalize swaps a table only this run could have minted. Before
+            // this, every run of a destination shared ONE staging table — A
+            // streamed its rows in, B's prepare dropped that table and created a
+            // fresh empty one, and A's finalize exchanged B's empty table onto
+            // the destination while returning A's row count.
+            staging_t: ch_ident(&crate::naming::artifact_ident_run(
+                dest_bare, crate::naming::Artifact::Staging, crate::naming::ROOMY, run)),
             final_bare: dest_bare.to_string(),
             source_id: None,
             cursor_col: None,
@@ -790,6 +986,7 @@ impl ChSink {
             ddl,
             plan_ddl: String::new(),
             staging_order_by: String::new(),
+            run: run.clone(),
         })
     }
 }
@@ -958,9 +1155,19 @@ impl crate::sink::Sink for ChSink {
         }
         self.plan_ddl = ddl_list.clone();
         self.staging_order_by = order_by.clone();
+        // No blind DROP any more. That statement WAS the defect: it destroyed
+        // whatever staging table it found, including a concurrent run's, and this
+        // run's finalize then exchanged the empty replacement onto the
+        // destination while reporting its own row count.
+        //
+        // Instead: look at what is there, reap what is dead, refuse what is alive
+        // and cannot coexist. The CREATEs below then need nothing cleared out of
+        // the way — the name carries this run's token, so a collision would be a
+        // token collision, which is loud rather than destructive.
+        self.reap_and_check_peers().await?;
         if self.ddl.on_cluster.is_some() {
             // Behind a load balancer every HTTP request may reach a DIFFERENT
-            // node (seen live: DROP landed on node A, CREATE on node B →
+            // node (seen live: a DROP landed on node A, the CREATE on node B →
             // "already exists"; then CREATE on A, INSERT on B → "does not
             // exist"). So in cluster mode nothing about staging may be
             // node-local: the DDL goes ON CLUSTER and the staging table is
@@ -980,21 +1187,12 @@ impl crate::sink::Sink for ChSink {
             let eng = self.ddl.engine.as_deref().unwrap_or("ReplicatedMergeTree");
             self.ch
                 .exec(&format!(
-                    "DROP TABLE IF EXISTS {}{oc} SYNC",
-                    self.staging_t
-                ))
-                .await?;
-            self.ch
-                .exec(&format!(
                     "CREATE TABLE {} {oc} ({ddl_list}) ENGINE = {eng}{primary_key} \
                      ORDER BY {order_by}",
                     self.staging_t
                 ))
                 .await?;
         } else {
-            self.ch
-                .exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
-                .await?;
             self.ch
                 .exec(&format!(
                     "CREATE TABLE {} ({ddl_list}) ENGINE = MergeTree{primary_key} \
@@ -1380,7 +1578,8 @@ impl crate::sink::Sink for ChSink {
                     // final shell if none exists, one EXCHANGE, and a
                     // best-effort drop of the old data riding in the staging
                     // name afterwards (a leftover never blocks the next run —
-                    // prepare starts with DROP IF EXISTS ON CLUSTER).
+                    // that name is this run's alone, and the next run's scan
+                    // reaps it once it is past the horizon).
                     let oc = self.ddl.on_cluster_clause();
                     let eng = self.ddl.engine.as_deref().unwrap_or("ReplicatedMergeTree");
                     let create_cols = &self.plan_ddl;
@@ -1467,12 +1666,17 @@ impl crate::sink::Sink for ChSink {
                                 self.final_t
                             )));
                         }
-                        let tmp = ch_ident(&crate::naming::artifact_ident(
+                        // Tokenized like staging, and for the same reason: the
+                        // EXCHANGE below publishes this table onto the
+                        // destination, so it must be one only THIS run could
+                        // have minted. That also means nothing has to be
+                        // dropped first — a leftover from a crashed run is
+                        // collected by the next run's scan (reap_and_check_peers
+                        // covers Artifact::New too), rather than by blind-
+                        // dropping a name a live run may be holding.
+                        let tmp = ch_ident(&crate::naming::artifact_ident_run(
                             &self.final_bare, crate::naming::Artifact::New,
-                            crate::naming::ROOMY));
-                        self.ch
-                            .exec(&format!("DROP TABLE IF EXISTS {tmp}{oc}"))
-                            .await?;
+                            crate::naming::ROOMY, &self.run));
                         self.ch
                             .exec(&format!(
                                 "CREATE TABLE {tmp}{oc} ({create_cols}) \
@@ -1503,9 +1707,10 @@ impl crate::sink::Sink for ChSink {
                             .exec(&format!("EXCHANGE TABLES {tmp} AND {}{oc}", self.final_t))
                             .await?;
                         // Best-effort: a leftover shadow of old data never blocks
-                        // the next run (it starts with DROP IF EXISTS), while
-                        // failing HERE would abort before the state rows below
-                        // are cleared — a stale-high watermark, silent skips.
+                        // the next run (its name is this run's alone, and the
+                        // next run's scan reaps it once it is past the horizon),
+                        // while failing HERE would abort before the state rows
+                        // below are cleared — a stale-high watermark, silent skips.
                         let _ = self.ch.exec(&format!("DROP TABLE {tmp}{oc}")).await;
                     }
                 } else {

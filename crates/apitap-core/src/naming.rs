@@ -307,6 +307,10 @@ pub(crate) struct PeerRun {
     /// is all the decision needs, and means a source URL never appears in a
     /// table name.
     pub(crate) source_hash: String,
+    /// The whole token, so a run can recognise its OWN artifacts. One `RunId`
+    /// is minted per dispatch and shared by every table in a multi-table run,
+    /// so "is this mine?" is a question every sink has to be able to ask.
+    pub(crate) token: String,
 }
 
 /// Read a token out of a name that carries one, or `None` for a name that does
@@ -332,6 +336,7 @@ pub(crate) fn parse_peer(name: &str, artifact: Artifact) -> Option<PeerRun> {
         // direction (refuse, never corrupt), which is the only direction a
         // hash this short is allowed to be wrong in.
         source_hash: tok[9..12].to_string(),
+        token: tok.to_string(),
     })
 }
 
@@ -359,6 +364,170 @@ pub(crate) fn peer_blocks(mine: &PeerRun, peer: &PeerRun) -> bool {
         (Cdc, _) | (_, Cdc) => true,
         (Incremental, Incremental) => mine.source_hash == peer.source_hash,
     }
+}
+
+/// What a name found next to a destination table means to THIS run.
+///
+/// # Why this is one function and not one per sink
+///
+/// The first pass implemented this classification separately in seven sinks.
+/// Six of them got it wrong, in six different ways, and the review found every
+/// one: a pattern anchored at only one end reaped a *sibling table's* staging;
+/// a run's own artifacts read as a foreign peer and refused the run that made
+/// them; a horizon check placed before the ownership check deleted a live
+/// peer's work. None of those were careless — they are all the same shape of
+/// mistake, which is what a rule reimplemented seven times produces.
+///
+/// So the rule lives here, once, with the ordering that matters written down:
+///
+/// 1. **Is it even ours?** The token is fixed width and sits between a known
+///    head and a known suffix, so the name's LENGTH is exact. Anchoring on
+///    only `starts_with`/`ends_with` lets `orders` match
+///    `orders_items<token>__apitap_staging` — a different table's workspace,
+///    which a reap would then delete.
+/// 2. **Is it MINE?** One `RunId` is minted per dispatch and shared by every
+///    table in a multi-table run. Without this check a long run can outlive the
+///    reap horizon and collect its own sibling's live staging, or read it as a
+///    peer and refuse itself.
+/// 3. **Is it dead?** Only then does age matter.
+/// 4. Otherwise it is a live peer, and [`peer_blocks`] decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Found {
+    /// Not this table's artifact at all — a sibling's, or someone else's table.
+    /// Leave it alone.
+    Foreign,
+    /// This run's own. Never reaped, never blocking.
+    Mine,
+    /// A crashed run's leftover: older than the horizon, or an un-tokenized
+    /// name from before this mechanism existed. Safe to collect.
+    Dead,
+    /// A live run's workspace.
+    Live(PeerRun),
+}
+
+/// Classify one name found beside `bare`'s destination.
+///
+/// `now` is passed in rather than read here so a test can place a name at any
+/// age without touching the clock.
+pub(crate) fn classify(
+    name: &str,
+    bare: &str,
+    artifact: Artifact,
+    limit: usize,
+    mine: &RunId,
+    now: u64,
+) -> Found {
+    let (head, suffix) = artifact_match(bare, artifact, limit);
+    // The un-tokenized name an older apitap would have written. It carries no
+    // age, so it can never be aged out — but leaving it forever would break the
+    // cleanup these sinks have always promised, and a concurrent old-version
+    // run is the very bug being fixed.
+    if name == artifact_ident(bare, artifact, limit) {
+        return Found::Dead;
+    }
+    // Exact length is the anchor. Both ends matching is not enough.
+    if name.len() != head.len() + RUN_TOKEN_LEN + suffix.len()
+        || !name.starts_with(head.as_str())
+        || !name.ends_with(suffix)
+    {
+        return Found::Foreign;
+    }
+    let Some(peer) = parse_peer(name, artifact) else {
+        return Found::Foreign;
+    };
+    if peer.token == mine.token() {
+        return Found::Mine;
+    }
+    // NOT aged out. This is where an age check used to be, and removing it is
+    // the most important line in this module.
+    //
+    // The token carries the time the RUN started, which is not the age of the
+    // object: an artifact is created at or after that moment, so `now - token`
+    // is an UPPER bound on its age and can never prove it is old. For the
+    // multi-hour loads this engine exists for, the two differ by the whole
+    // duration of the load — table N of a long multi-table run mints its
+    // artifact under a token that is already hours old, and a concurrent run
+    // would then "collect" a workspace that is being written to. On Postgres
+    // the victim dies loudly at its next statement; on BigQuery and the object
+    // stores the deleted staging is silently re-created and the run reports a
+    // full row count over a truncated table — which is the exact defect this
+    // whole mechanism exists to remove, reintroduced one horizon later.
+    //
+    // So: refusing is the safe action and collecting is the dangerous one, and
+    // they get different standards of proof. A live-looking artifact is
+    // refused; only something PROVABLY dead is removed, and a timestamp that
+    // records the wrong event proves nothing. Automatic collection needs a
+    // liveness signal from the engine itself — an object mtime that advances
+    // as the run writes, a catalog lock — which each engine has and each
+    // spells differently; that is deliberate follow-up work rather than
+    // something to guess at here.
+    //
+    // What this costs: a crashed run's artifact is not collected on its own,
+    // and later runs of that table refuse until someone removes it. That is a
+    // real operational cost, and it is the one the error message names in its
+    // last sentence. It is the right trade against silently truncating a live
+    // run's data.
+    let _ = now;
+    Found::Live(peer)
+}
+
+/// Seconds since the epoch, for [`classify`].
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The refusal one run gives when another already holds the table.
+///
+/// Here rather than in each sink because it was written seven times and drifted
+/// immediately: one copy told the operator their leftover would be "reaped
+/// automatically after 0s" when `APITAP_STAGING_REAP_SECS=0` means reaping is
+/// switched off entirely — advice that would have them waiting for a cleanup
+/// that never comes. A message an operator reads at 3am is an interface, and
+/// interfaces do not get seven implementations.
+///
+/// It names four things, because each answers a question the reader will
+/// otherwise have to guess at: WHO holds the table, WHAT they are doing, WHY
+/// the two cannot share it, and WHAT to do next.
+pub(crate) fn locked_error(
+    dest: &str,
+    artifact_name: &str,
+    mine: &PeerRun,
+    peer: &PeerRun,
+    now: u64,
+) -> crate::error::Error {
+    let age = now.saturating_sub(peer.started_unix);
+    let doing = match peer.kind {
+        LandKind::Swap => "replacing the whole table",
+        LandKind::Incremental => "appending to it",
+        LandKind::Cdc => "draining changes into it",
+    };
+    let why = match (mine.kind, peer.kind) {
+        (LandKind::Swap, _) | (_, LandKind::Swap) =>
+            "a replace swaps the whole table, so whichever finishes second \
+             throws the other's work away",
+        (LandKind::Cdc, _) | (_, LandKind::Cdc) =>
+            "a CDC drain owns the watermark and the replication slot, and two \
+             of them cannot share either",
+        _ =>
+            "both read the same watermark and would land the same rows twice",
+    };
+    // No promise of automatic collection, because there is none: see
+    // `classify`. Naming the object is the whole recovery instruction, so it
+    // has to be exact.
+    let stale = format!(
+        "If that run is dead rather than slow, remove {artifact_name} and \
+         re-run — nothing collects it on its own, because a timestamp cannot \
+         tell a crashed run from a slow one."
+    );
+    crate::error::Error::Locked(format!(
+        "{dest}: another apitap run is already loading this table — it started \
+         {age}s ago and is {doing}. They cannot share one destination: {why}. \
+         Run them one at a time; a scheduler's own concurrency setting is the \
+         usual answer (Airflow max_active_runs=1, a cron flock). {stale}"
+    ))
 }
 
 /// `<head><token><suffix>`, inside `limit`.
@@ -406,13 +575,15 @@ pub(crate) fn artifact_match(bare: &str, artifact: Artifact, limit: usize) -> (S
     (format!("{head}_{}", &h[..HASH]), suffix)
 }
 
-/// How long a staging object may sit before a later run treats it as a crashed
-/// run's leftover rather than a live peer's workspace.
+/// Reserved for the per-engine liveness work that will drive automatic
+/// collection; not currently a gate on anything.
 ///
-/// One hour, not a day: with per-run names an orphan is only left by a hard
-/// kill (every error path drops its own), and a 100 GB staging table sitting
-/// for a day is real money. `APITAP_STAGING_REAP_SECS=0` disables reaping for
-/// an operator who would rather inspect the wreckage.
+/// It was a gate, briefly, and the review of seven sinks is why it is not: an
+/// age taken from the run's START time cannot show that an object is old (see
+/// `classify`), and four destinations lose data silently when a live
+/// workspace is collected. The knob stays so the name is stable when
+/// collection returns with evidence behind it.
+#[allow(dead_code)]
 pub(crate) fn reap_horizon_secs() -> u64 {
     std::env::var("APITAP_STAGING_REAP_SECS")
         .ok()
@@ -794,6 +965,107 @@ mod tests {
         let p = peer(LandKind::Swap, "s");
         assert!(p.started_unix <= now && now - p.started_unix < 5,
                 "started {} vs now {now}", p.started_unix);
+    }
+
+    // ── classification ────────────────────────────────────────────────────
+
+    /// The bug the review found in six sinks at once: a pattern anchored at
+    /// only one end lets a run reap a DIFFERENT table's workspace.
+    #[test]
+    fn a_siblings_artifact_is_never_mistaken_for_ours() {
+        let run = RunId::mint(LandKind::Swap, "s");
+        let now = now_unix();
+        for &a in Artifact::ALL {
+            // `orders` and `orders_items` share a prefix, which is entirely
+            // ordinary, and their artifacts must not see each other.
+            let theirs = artifact_ident_run("orders_items", a, PG_IDENT_MAX, &run);
+            assert_eq!(classify(&theirs, "orders", a, PG_IDENT_MAX, &run, now),
+                       Found::Foreign, "{:?}: {theirs}", a);
+            // And the reverse: the longer name must not claim the shorter's.
+            let ours = artifact_ident_run("orders", a, PG_IDENT_MAX, &run);
+            assert_eq!(classify(&ours, "orders_items", a, PG_IDENT_MAX, &run, now),
+                       Found::Foreign, "{:?}: {ours}", a);
+        }
+    }
+
+    /// One RunId is shared by every table in a multi-table run, so a run must
+    /// recognise its own work — otherwise a long run outlives the horizon and
+    /// collects its own sibling's LIVE staging, or reads it as a peer and
+    /// refuses itself.
+    #[test]
+    fn a_run_recognises_its_own_artifacts_however_old_they_are() {
+        let run = RunId::mint(LandKind::Swap, "s");
+        let mine = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &run);
+        // Far past any horizon: ownership is checked before age, on purpose.
+        let much_later = now_unix() + 10_000_000;
+        assert_eq!(
+            classify(&mine, "orders", Artifact::Staging, PG_IDENT_MAX, &run, much_later),
+            Found::Mine);
+    }
+
+    /// A foreign artifact is NEVER collected on age, however old its token
+    /// looks. The token records when the RUN started, not when the object was
+    /// made, so on a long load the two are hours apart — and collecting a live
+    /// workspace is silent data loss on BigQuery and the object stores.
+    /// Refusing is the safe action; collecting needs evidence this does not
+    /// have.
+    #[test]
+    fn a_foreign_artifact_is_never_collected_on_age_alone() {
+        let ours = RunId::mint(LandKind::Swap, "a");
+        let theirs = RunId::mint(LandKind::Swap, "b");
+        let name = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &theirs);
+        for at in [now_unix(), now_unix() + 10_000_000] {
+            assert!(matches!(
+                classify(&name, "orders", Artifact::Staging, PG_IDENT_MAX, &ours, at),
+                Found::Live(_)),
+                "a peer stays a peer at every age — see classify's comment");
+        }
+    }
+
+    /// The one name an older apitap wrote carries no age, so it has to be
+    /// recognised explicitly or it would sit there forever.
+    #[test]
+    fn the_pre_token_name_is_collectable() {
+        let run = RunId::mint(LandKind::Swap, "s");
+        for &a in Artifact::ALL {
+            let legacy = artifact_ident("orders", a, PG_IDENT_MAX);
+            assert_eq!(classify(&legacy, "orders", a, PG_IDENT_MAX, &run, now_unix()),
+                       Found::Dead, "{:?}: {legacy}", a);
+        }
+    }
+
+    /// Anything else beside the table is none of our business.
+    #[test]
+    fn an_unrelated_name_is_left_alone() {
+        let run = RunId::mint(LandKind::Swap, "s");
+        let now = now_unix();
+        for name in ["orders", "orders_backup", "orders__apitap_stagingX",
+                     "totally_unrelated", "__apitap_staging"] {
+            assert_eq!(classify(name, "orders", Artifact::Staging, PG_IDENT_MAX, &run, now),
+                       Found::Foreign, "{name}");
+        }
+    }
+
+    /// The wording bug the review found: with reaping switched off, six sinks
+    /// told the operator to wait 0 seconds for a cleanup that never happens.
+    #[test]
+    fn the_refusal_tells_the_truth_about_collection() {
+        let mine = PeerRun { started_unix: 100, kind: LandKind::Swap,
+                             source_hash: "aaa".into(), token: "_x".into() };
+        let peer = PeerRun { started_unix: 40, kind: LandKind::Incremental,
+                             source_hash: "bbb".into(), token: "_y".into() };
+        let msg = format!("{}", locked_error("public.orders", "orders_x__apitap_staging",
+                                             &mine, &peer, 100));
+        assert!(msg.contains("60s ago"), "{msg}");
+        assert!(msg.contains("appending to it"), "names what the peer is doing: {msg}");
+        assert!(msg.contains("throws the other's work away"), "names why: {msg}");
+        assert!(msg.contains("max_active_runs"), "names the remedy: {msg}");
+        // The recovery instruction must name the object and must not promise a
+        // cleanup that does not exist — an earlier draft told the operator to
+        // wait N seconds for one.
+        assert!(msg.contains("orders_x__apitap_staging"), "names the object: {msg}");
+        assert!(msg.contains("remove"), "{msg}");
+        assert!(!msg.contains("automatically"), "promises no cleanup: {msg}");
     }
 
     /// Multi-byte names must not be cut through a character.
