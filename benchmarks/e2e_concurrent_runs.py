@@ -35,10 +35,25 @@ is the only thing collected.
                               looks), the run refuses while it is there, and
                               dropping it by hand — the recovery the error
                               message prescribes — makes the run work again
-  leg 4  fan-in survives    — two appends from two different sources into one
-                              table still both land, because that is a
-                              capability the manual advertises and a guard
-                              that refused it would be a regression
+  leg 4  NOT WRITTEN        — fan-in (two appends from two different sources
+                              into one table) is the one matrix row that says
+                              "allowed", and no leg here proves it end to end.
+                              It is covered as a unit test instead
+                              (naming::tests::the_matrix_refuses_what_collides_
+                              and_permits_fan_in), which exercises peer_blocks
+                              directly. A live-server version has to seed the
+                              second source's _apitap_state row first, or it
+                              trips a separate, older guard that refuses a new
+                              source on a destination that already carries
+                              state — see leg 1c's note. Worth writing; do not
+                              read this list as if it were written.
+  leg 5  the refusal's TYPE  — it arrives as apitap.LockedError, catchable as a
+                              class rather than by matching the message, and
+                              still a RuntimeError subclass
+  leg 6  the window left     — two runs starting in the SAME INSTANT both pass
+                              a check-then-act guard. The outcome is two-valued
+                              and not asserted; the invariants are: the
+                              destination is whole and no staging is orphaned
 
 Leg 1c and leg 4 are what stop leg 1 from being a fix that simply refuses
 everything.
@@ -162,6 +177,12 @@ if a is not None and b is not None:
         err = results[losers[0]].stderr
         case("the loser refused with a lock error", "locked:" in err.lower(),
              (err.strip().splitlines() or [""])[-1][:170])
+        # The TYPE, not the text. A scheduler is supposed to branch on the
+        # class; if this only ever asserted the message we would not notice
+        # the day the binding flattens it back into a bare RuntimeError.
+        case("and it is apitap.LockedError, not a bare RuntimeError",
+             "apitap.LockedError" in err or "LockedError:" in err,
+             (err.strip().splitlines() or [""])[-1][:170])
         case("and the refusal names how to avoid it",
              "one at a time" in err or "max_active_runs" in err,
              (err.strip().splitlines() or [""])[-1][:170])
@@ -264,6 +285,91 @@ dst(f'DROP TABLE IF EXISTS "{ancient}"')
 r = run("replace")
 case("after dropping it by hand the run works again", r.returncode == 0,
      (r.stderr.strip().splitlines() or [""])[-1][:170])
+
+# ---------------------------------------------------------------------------
+print("== leg 5: the refusal is a catchable TYPE, not a message to regex ==")
+# docs/stability.md commits to two things about this class: it exists, and it
+# subclasses RuntimeError so code written before it still catches it.
+#
+# The overlap is GATED the same way leg 1 gates it — B starts only once A has a
+# staging table. That is not the test being soft on itself: an ungated start is
+# a different scenario with a different answer, and leg 6 is where it lives.
+reset(rows=400_000)
+probe = f"""
+import apitap, threading, time, subprocess
+assert issubclass(apitap.LockedError, RuntimeError), "must stay catchable as RuntimeError"
+SRC, DST, T = {SRC!r}, {DST!r}, {T!r}
+def staged():
+    o = subprocess.run(["docker","exec","-i","apitap-bench-pg-dst","psql","-U","postgres",
+        "-d","apitap_bench_dst","-Atc",
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='public' AND c.relkind='r' AND relname LIKE '" + T + "%staging'"],
+        capture_output=True, text=True)
+    return o.stdout.strip() not in ("0", "")
+hit, gate = [], threading.Event()
+def a():
+    try: apitap.transfer(SRC, DST, table=T, mode="replace"); hit.append(("A","ok"))
+    except Exception as e: hit.append(("A", type(e).__name__))
+def watch():
+    for _ in range(3000):
+        if staged(): break
+        time.sleep(0.02)
+    gate.set()
+def b():
+    gate.wait(180)
+    try: apitap.transfer(SRC, DST, table=T, mode="replace"); hit.append(("B","ok"))
+    except apitap.LockedError: hit.append(("B","LockedError"))
+    except Exception as e: hit.append(("B", type(e).__name__))
+ts = [threading.Thread(target=f) for f in (a, watch, b)]
+[t.start() for t in ts]; [t.join(900) for t in ts]
+print("CAUGHT", sorted(hit))
+"""
+r = sh([sys.executable, "-c", probe])
+case("apitap.LockedError exists and subclasses RuntimeError",
+     "AssertionError" not in r.stderr,
+     (r.stderr.strip().splitlines() or [""])[-1][:170])
+case("the loser was caught BY TYPE, not by message",
+     "('B', 'LockedError')" in r.stdout,
+     (r.stdout.strip() or r.stderr.strip()[-170:]))
+
+# ---------------------------------------------------------------------------
+print("== leg 6: two runs starting in the SAME INSTANT — the window that is left ==")
+# `prepare` lists the catalog and then creates its staging table. Two runs that
+# start inside that gap both see an empty catalog and both proceed: the guard is
+# check-then-act, and this is the act it cannot see.
+#
+# The outcome is deliberately NOT asserted, because it is genuinely two-valued —
+# both may land (the swap serialises, last writer wins), or the loser may fail at
+# RENAME with a duplicate-key error instead of a clean LockedError. What IS
+# asserted is the pair of invariants that must hold either way, because their
+# failure is the original defect returning: the destination is whole, and no
+# staging object is orphaned. If this leg ever reports a short table, the
+# concurrency work has regressed to what it was written to fix.
+reset(rows=400_000)
+want = src(f"SELECT count(*) FROM {T}")
+burst = f"""
+import apitap, threading
+out = []
+def go(tag):
+    try:
+        r = apitap.transfer({SRC!r}, {DST!r}, table={T!r}, mode="replace")
+        out.append((tag, "ok", r.rows))
+    except Exception as e:
+        out.append((tag, type(e).__name__))
+ts = [threading.Thread(target=go, args=(t,)) for t in ("A", "B")]
+[t.start() for t in ts]; [t.join(900) for t in ts]
+print("BURST", sorted(out))
+"""
+r = sh([sys.executable, "-c", burst])
+print(f"      (outcome, not asserted: {(r.stdout.strip() or 'no output')[:120]})")
+got = dst(f"SELECT count(*) FROM {T}")
+case("INVARIANT: the destination is whole, whoever won", got == want,
+     f"dest {got} vs source {want}")
+case("INVARIANT: no staging object was orphaned", staging_names() == [],
+     f"left: {staging_names()}")
+case("and the failure, if any, was loud — never a green run over a short table",
+     "ok" in r.stdout or "Error" in r.stdout,
+     (r.stdout.strip() or "")[:120])
 
 # ---------------------------------------------------------------------------
 print("== cleanup ==")

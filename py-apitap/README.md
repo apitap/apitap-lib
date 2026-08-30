@@ -88,9 +88,14 @@ Every transfer stages and swaps in atomically — readers never see a partial ta
 an empty source never wipes a good one, and a mid-run failure leaves the previous
 table untouched. Since 0.55.0 the run's identity is part of the staging object's
 name, so **two runs of one destination table cannot touch each other's work**: the
-second is refused at `prepare`, before a row moves, with an error naming the run
-that holds the table. Fan-in is unaffected — two `append` runs from *different*
-sources into one table have independent watermarks and both proceed.
+second is refused at `prepare`, before a row moves, and raises
+`apitap.LockedError` (a `RuntimeError` subclass) naming the run that holds the
+table — so a scheduler backs off on a type, not on a message match. Fan-in is
+unaffected: two `append` runs from *different* sources into one table have
+independent watermarks and both proceed. (The check runs before the staging
+object exists, so two runs starting in the same instant can still both pass it —
+the destination is left whole either way; the
+[failure modes](https://apitap.dev/docs/failure-modes) page measures it.)
 
 What happens when a run does *not* finish — killed process, cut connection, DDL
 mid-run, a CDC schedule paused past the source's retention — is written down
@@ -175,7 +180,9 @@ one failure never poisons its siblings.
 
 The GIL is released for the whole transfer. Errors are `ValueError` for bad input
 (unknown table, unsupported type — always at probe time, never mid-copy) and
-`RuntimeError` for transfer failures.
+`RuntimeError` for transfer failures — with `apitap.LockedError` (a
+`RuntimeError` subclass) for the one case a scheduler wants to branch on:
+another run already holds this destination table.
 
 ### `apitap.read()` → Arrow / polars
 

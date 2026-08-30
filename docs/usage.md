@@ -135,6 +135,21 @@ Errors raise `ValueError` for invalid input (unknown table, bad URL, unsupported
 type, `parallel=0`) and `RuntimeError` for transfer failures. A failed transfer
 never touches the existing destination table.
 
+One transfer failure has its own type: **`apitap.LockedError`** (a `RuntimeError`
+subclass, so `except RuntimeError` still catches it) means another run already
+holds this destination table. It is raised at `prepare`, before a row moves, so
+a scheduler can back off without wondering what got written:
+
+```python
+try:
+    apitap.transfer(src, dst, table="public.orders")
+except apitap.LockedError:
+    return          # another run has it; come back on the next tick
+```
+
+Branch on the type, not on the message text — see
+[Two runs, one table](failure-modes.md#two-runs-one-table).
+
 ## How a transfer runs
 
 1. **Probe** — the source catalog is read once: columns, native types, nullability,
@@ -360,7 +375,9 @@ apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_a
   their watermarks are independent. A run killed with SIGKILL leaves its
   staging object behind and later runs of that table refuse until you drop it;
   the error names it. See [Two runs, one table](failure-modes.md) for the full
-  matrix and for why nothing collects that leftover automatically.
+  matrix, for why nothing collects that leftover automatically, and for the one
+  case the guard does not cover — two runs that start in the very same instant,
+  where the destination still ends up whole but the loser's error is uglier.
 - Do not schedule two syncs of the same (source, destination) pair to overlap.
   On 0.55.0+ the second is refused rather than landing the same delta twice; on
   earlier versions it is not, so a scheduler's own concurrency setting (Airflow

@@ -22,7 +22,8 @@ never silently.
 | multi-table results | there is no separate report class: `TransferReport.tables` holds the per-table outcomes (`None` on a single-table run), each `TableResult`'s `table`/`rows`/`elapsed_ms`/`parallel`/`error` is committed, and partial failure raises `MultiTransferError` whose `report` carries that same `TransferReport` |
 | destination artifacts | the `_apitap_state` table's columns, and the `__apitap_cl` / `__current` changelog shapes — a run of an older apitap must not choke on a newer one's state |
 | exit behaviour | invalid input raises `ValueError`, a failed transfer raises `RuntimeError`, and a failed transfer never leaves the destination table changed |
-| one run per destination table | **0.55.0+.** A second run of a table another run already holds is refused at `prepare`, before a row moves, and the refusal never touches the destination. Fan-in — two `append` runs from *different* sources into one table — stays allowed; that is a capability, not a collision. [The matrix](failure-modes.md#two-runs-one-table) |
+| one run per destination table | **0.55.0+.** A second run of a table another run already holds is refused at `prepare`, before a row moves, and the refusal never touches the destination. Fan-in — two `append` runs from *different* sources into one table — stays allowed; that is a capability, not a collision. Two runs starting in the SAME INSTANT can still both pass the check; what is committed there is only that the destination stays whole and no staging is orphaned. [The matrix, and that window](failure-modes.md#two-runs-one-table) |
+| `apitap.LockedError` | **0.55.0+.** The refusal above raises this type, not a bare `RuntimeError` — so a scheduler branches on a class instead of matching message text. It subclasses `RuntimeError`, and that subclassing is part of the commitment: code written before it keeps catching it |
 
 ## What is explicitly NOT stable
 
@@ -36,11 +37,6 @@ never silently.
   for humans and dashboards, not parsers-of-record. Field names will be added.
 - **Performance numbers.** They are measurements, not promises, and every one is
   dated in the ledgers.
-- **How the concurrency refusal is typed in Python.** The engine has a distinct
-  `Locked` error, but the binding currently surfaces it as an ordinary
-  `RuntimeError` whose message begins `locked:`. Match on that prefix if you must
-  branch a scheduler on it today, and expect a dedicated exception class later —
-  that is the shape worth committing to, and it is not committed yet.
 - **Anything the manual marks as a caveat or a roadmap item.**
 
 ## Pinning

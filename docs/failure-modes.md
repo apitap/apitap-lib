@@ -268,6 +268,40 @@ runs of that table refuse until someone removes it. The error message names the
 exact object to drop. It is the right trade against silently truncating a live
 run's data, and it is the one operational cost this design knowingly accepts.
 
+**The refusal has its own type.** It raises `apitap.LockedError`, a
+`RuntimeError` subclass, so a scheduler branches on the class rather than
+matching the message — the engine has always kept `Locked` as its own error
+variant, and from 0.55.0 that distinction survives the trip into Python:
+
+```python
+try:
+    apitap.transfer(src, dst, table="public.orders")
+except apitap.LockedError:
+    return          # someone else has it; nothing was written
+```
+
+**What the guard does NOT cover: two runs starting in the same instant.**
+`prepare` lists the destination's catalog and then creates its staging object.
+Two runs that start inside that gap both see an empty catalog and both proceed —
+it is check-then-act, and this is the act it cannot see. Measured on Postgres,
+the outcome is two-valued: usually both land (the swap serialises, last writer
+wins), and sometimes the loser fails at `RENAME` with a duplicate-key error
+instead of a clean `LockedError`.
+
+Two things hold either way, and they are the ones that matter: **the destination
+is whole afterwards, and no staging object is orphaned.** The defect this whole
+mechanism exists to remove — a run reporting a full row count over a truncated
+table — does not come back through this window; a same-instant collision is loud
+or harmless, never silently wrong. `e2e_concurrent_runs.py` leg 6 asserts those
+two invariants and deliberately does not assert the outcome, because the outcome
+is genuinely non-deterministic.
+
+Closing it needs announce-then-check ordering plus a deterministic tie-break —
+without one, both runs discover each other and both refuse, trading a rare wrong
+error for a rare double failure. That is a design change across all seven
+destinations, so it is follow-up work rather than something to improvise. Until
+then the scheduler setting below is what actually prevents it.
+
 **Why it fails instead of waiting.** The common cause of two runs on one table
 is a scheduler overrun, and waiting turns an overrun into a queue, a queue into
 a pile-up, and a pile-up into resource exhaustion at 3am with every run still

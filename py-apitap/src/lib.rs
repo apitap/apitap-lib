@@ -16,6 +16,36 @@ use std::ffi::CStr;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
+pyo3::create_exception!(
+    _apitap,
+    LockedError,
+    PyRuntimeError,
+    "Another apitap run already holds this destination table.
+
+A subclass of RuntimeError, so `except RuntimeError` keeps working — but a
+scheduler that wants to back off can branch on THIS instead of matching the
+message, which is the whole reason the engine keeps `locked` as its own error
+variant. Raised at prepare, before a row moves: the destination is untouched."
+);
+
+/// The one place a core error becomes a Python one.
+///
+/// A function rather than five copies of the same `match`, because it WAS five
+/// copies — and every one of them ended in a catch-all that flattened `Locked`
+/// into a plain `RuntimeError`. That left callers matching on the message
+/// prefix, which is exactly what keeping `Locked` a separate variant exists to
+/// avoid. Adding a variant to `apitap_core::Error` now means editing one arm
+/// here, not finding all five.
+fn to_py(e: apitap_core::Error) -> PyErr {
+    match e {
+        apitap_core::Error::InvalidInput(m) => PyValueError::new_err(m),
+        // Re-prefixed rather than passed bare: `Locked`'s Display is
+        // "locked: {0}", and anything already matching that text keeps working.
+        apitap_core::Error::Locked(m) => LockedError::new_err(format!("locked: {m}")),
+        e => PyRuntimeError::new_err(e.to_string()),
+    }
+}
+
 /// One shared multi-thread runtime for every call (building one per call would pay
 /// thread-spawn latency each time).
 fn rt() -> &'static Runtime {
@@ -136,8 +166,7 @@ fn transfer(
     });
     match out {
         Ok(r) => Ok((r.rows, r.elapsed_ms, r.parallel)),
-        Err(apitap_core::Error::InvalidInput(m)) => Err(PyValueError::new_err(m)),
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
+        Err(e) => Err(to_py(e)),
     }
 }
 
@@ -229,8 +258,7 @@ fn transfer_many(
                 .map(|t| (t.table, t.rows, t.elapsed_ms, t.parallel, t.error))
                 .collect(),
         )),
-        Err(apitap_core::Error::InvalidInput(m)) => Err(PyValueError::new_err(m)),
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
+        Err(e) => Err(to_py(e)),
     }
 }
 
@@ -347,8 +375,7 @@ fn read(
     let handle = py
         .detach(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
         .map_err(|e| match e {
-            apitap_core::Error::InvalidInput(m) => PyValueError::new_err(m),
-            e => PyRuntimeError::new_err(e.to_string()),
+            e => to_py(e),
         })?;
     let names = handle.schema.iter().map(|f| f.name.clone()).collect();
     let stream = capsule::new_stream(handle) as usize;
@@ -368,8 +395,7 @@ fn read_schema(
     let fields = py
         .detach(|| rt().block_on(apitap_core::read_schema(&src, &table)))
         .map_err(|e| match e {
-            apitap_core::Error::InvalidInput(m) => PyValueError::new_err(m),
-            e => PyRuntimeError::new_err(e.to_string()),
+            e => to_py(e),
         })?;
     Ok(fields
         .into_iter()
@@ -437,6 +463,7 @@ fn _apitap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read, m)?)?;
     m.add_function(wrap_pyfunction!(read_schema, m)?)?;
     m.add_class::<PgRead>()?;
+    m.add("LockedError", m.py().get_type::<LockedError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

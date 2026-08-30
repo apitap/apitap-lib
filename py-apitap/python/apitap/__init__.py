@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from apitap._apitap import (
+    LockedError,
     __version__,
     read as _read,
     request_stop,
@@ -37,6 +38,7 @@ __all__ = [
     "TransferReport",
     "TableResult",
     "MultiTransferError",
+    "LockedError",
     "__version__",
 ]
 
@@ -72,6 +74,19 @@ class TransferReport:
     Multi-table: the shared pipe budget the tables drew from."""
     tables: tuple[TableResult, ...] | None = None
     """Per-table outcomes for a multi-table run; ``None`` for a single table."""
+
+
+# LockedError comes from the extension module (see py-apitap/src/lib.rs) rather
+# than being defined here, because the engine already distinguishes this case and
+# re-deriving it from the message would be the string matching it exists to
+# avoid. It subclasses RuntimeError, so code that predates it still catches it:
+#
+#     try:
+#         apitap.transfer(src, dst, table="orders")
+#     except apitap.LockedError:
+#         return  # another run has it; the scheduler will come back
+#
+# Raised before a row moves. The destination is untouched when it is raised.
 
 
 class MultiTransferError(RuntimeError):
