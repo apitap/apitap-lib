@@ -52,7 +52,25 @@ def transfer(chunk=None):
 
 
 ok = True
-ch(f"DROP TABLE IF EXISTS {T}")
+def drop_artifacts():
+    """Drop the destination AND every artifact of it, tokenized or not.
+
+    The control run below is MEANT to fail, and a failed run leaves its staging
+    table behind — deliberately, since 0.55.0: nothing collects a crashed run's
+    workspace on a timer, because the token records when the run STARTED and so
+    cannot prove the object is dead. The next run therefore refuses while it is
+    there, which is correct behaviour and was this leg failing for the right
+    reason. Dropping by name is not enough any more: the name carries a run
+    token, so the artifacts have to be discovered.
+    """
+    ch(f"DROP TABLE IF EXISTS {T}")
+    rows = ch("SELECT name FROM system.tables WHERE database = currentDatabase() "
+              f"AND name LIKE '{T}%__apitap_%'")
+    for name in (rows or "").split():
+        ch(f"DROP TABLE IF EXISTS {name}")
+
+
+drop_artifacts()
 
 print("== without the cap: the proxy must refuse, and say how to fix it ==")
 os.environ.pop("APITAP_CH_MAX_BODY", None)
@@ -72,7 +90,7 @@ except Exception as e:  # noqa: BLE001 — any failure type, we assert on the te
 
 print("== with the cap: every row lands, through the same 1 MB proxy ==")
 os.environ["APITAP_CH_MAX_BODY"] = "512K"
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_artifacts()
 r = transfer(chunk=256 * 1024)
 print(f"   transfer: {r}")
 src_n, src_s = pg(f"SELECT count(*) FROM {SRC_TABLE}"), pg(f"SELECT sum(id::bigint) FROM {SRC_TABLE}")

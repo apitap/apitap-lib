@@ -585,7 +585,6 @@ impl GcsSink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let horizon = crate::naming::reap_horizon_secs();
         // Nothing is deleted until the whole listing has been judged: a live
         // peer anywhere in it means this run does not get to touch the prefix
         // at all.
@@ -600,45 +599,26 @@ impl GcsSink {
                     if seg == self.run.token() {
                         continue;
                     }
-                    let age = now.saturating_sub(peer.started_unix);
-                    if horizon != 0 && age > horizon {
-                        dead.push(key);
-                        continue;
-                    }
+                    // NOT aged out. The token is when that RUN started, not
+                    // when the object was written, so on a long multi-table load
+                    // the two are hours apart — and a wrongly deleted segment is
+                    // SILENT here: the next finalize re-creates the prefix and
+                    // the run reports a full row count over a truncated table.
+                    // `naming::classify` carries the full argument.
                     if crate::naming::peer_blocks(&mine, &peer) {
-                        return Err(Error::Locked(format!(
-                            "gcs://{}/{}{}: another apitap run is already writing \
-                             this table — it started {age}s ago and lands rows by \
-                             {}. Two of them cannot share one destination: {}. Run \
-                             them one at a time (a scheduler's own concurrency \
-                             setting is the usual answer: Airflow \
-                             max_active_runs=1, a cron flock). If that run is dead \
-                             rather than slow, its staging objects under \
-                             gcs://{}/{}{seg}/ are reaped automatically after \
-                             {horizon}s, or you can delete them now.",
-                            self.conn.bucket,
-                            self.conn.prefix,
-                            self.bare,
-                            match peer.kind {
-                                crate::naming::LandKind::Swap => "replacing the whole table",
-                                crate::naming::LandKind::Incremental => "appending to it",
-                                crate::naming::LandKind::Cdc => "draining changes into it",
-                            },
-                            match mine.kind {
-                                crate::naming::LandKind::Swap =>
-                                    "a replace rewrites the whole object set, so \
-                                     whichever finishes second throws the other's \
-                                     work away",
-                                crate::naming::LandKind::Cdc =>
-                                    "a CDC drain owns the watermark and the \
-                                     replication slot",
-                                crate::naming::LandKind::Incremental =>
-                                    "both would read the same watermark and land \
-                                     the same rows twice",
-                            },
-                            self.conn.bucket,
-                            self.staging_root,
-                        )));
+                        return Err(crate::naming::locked_error(
+                            &format!(
+                                "gcs://{}/{}{}",
+                                self.conn.bucket, self.conn.prefix, self.bare
+                            ),
+                            &format!(
+                                "the objects under gcs://{}/{}{seg}/",
+                                self.conn.bucket, self.conn.prefix
+                            ),
+                            &mine,
+                            &peer,
+                            now,
+                        ));
                     }
                 }
             }

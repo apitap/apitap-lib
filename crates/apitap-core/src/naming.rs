@@ -575,21 +575,22 @@ pub(crate) fn artifact_match(bare: &str, artifact: Artifact, limit: usize) -> (S
     (format!("{head}_{}", &h[..HASH]), suffix)
 }
 
-/// Reserved for the per-engine liveness work that will drive automatic
-/// collection; not currently a gate on anything.
-///
-/// It was a gate, briefly, and the review of seven sinks is why it is not: an
-/// age taken from the run's START time cannot show that an object is old (see
-/// `classify`), and four destinations lose data silently when a live
-/// workspace is collected. The knob stays so the name is stable when
-/// collection returns with evidence behind it.
-#[allow(dead_code)]
-pub(crate) fn reap_horizon_secs() -> u64 {
-    std::env::var("APITAP_STAGING_REAP_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(3600)
-}
+// There is deliberately no `reap_horizon_secs()` here any more, and its absence
+// is load-bearing.
+//
+// It existed, every sink called it, and the review found all seven aging
+// artifacts out on a number that cannot mean what it was being read to mean:
+// the token records when the RUN started, so `now - token` is an upper bound on
+// an object's age and can never prove the object is old (see `classify`). On
+// BigQuery and the object stores, collecting a live peer's workspace is SILENT
+// — the run reports a full row count over a truncated table, the exact defect
+// the mechanism exists to remove.
+//
+// Deleting the function rather than leaving it unused is the point: a sink that
+// reaches for an age horizon again does not compile. Automatic collection comes
+// back when there is a real liveness signal per engine (an mtime that advances
+// as the run writes, a catalog lock), and it will need a new name and new
+// evidence, not this one.
 
 /// Does this name look like something apitap made?
 ///

@@ -42,7 +42,7 @@ The two properties everything else rests on:
 
 | what happened | state left behind | recovery | verified |
 |---|---|---|---|
-| **Process SIGKILLed mid bulk transfer** | Previous destination table **intact and readable throughout** (proven: 1,000 rows and their marker unchanged while 10M rows were streaming into staging). A staging table `<dest>__apitap_staging` may be orphaned. | Just re-run. The next run starts with `DROP TABLE IF EXISTS` on staging, so the orphan costs disk until then, nothing more. Proven: re-run landed 10,000,000 rows = source count. | `e2e_failure_modes.py` case 1 |
+| **Process SIGKILLed mid bulk transfer** | Previous destination table **intact and readable throughout** (proven: 1,000 rows and their marker unchanged while 10M rows were streaming into staging). The staging object — `<dest>_<runtoken>__apitap_staging` — is left behind: SIGKILL runs no error path. | **0.55.0+: drop that object, then re-run.** The next run REFUSES while it is there, with a `locked:` error naming it, because nothing collects a crashed run's workspace on a timer — see [Two runs, one table](#two-runs-one-table) for why a timestamp cannot tell a crash from a slow load. Before 0.55.0 the next run dropped it blindly, which is the concurrency defect that release closed. Every *ordinary* error path still drops its own staging; only a kill skips it. | `e2e_failure_modes.py` case 1 |
 | **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) | Re-run. Every change is applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2 |
 | **SIGTERM mid CDC window** (pod evicted, Airflow run cleared, `systemctl stop`) | The window in flight is **applied**, not discarded, and the watermark advances with it. The run exits 0 with a report of the rows it landed. | Nothing. The next run picks up from the new watermark. A second SIGTERM is not absorbed — the default disposition comes back and the process ends at once, which is the SIGKILL case above and equally safe. | `e2e_sigterm.py` (Postgres, incl. a control run with the mechanism disabled), `e2e_sigterm_my.py` (MySQL binlog) |
 | **Two runs of the same destination table at once** (0.55.0+) | **Refused, at `prepare`, before a row moves.** The second run exits non-zero with a `locked:` error naming how long ago the other started, what it is doing, and why the two cannot share the table. Nothing is written; the first run finishes normally. On 0.54.0 and earlier the two interleaved destructively — see [Two runs, one table](#two-runs-one-table). | Run them one at a time — a scheduler's own concurrency setting is the usual answer (Airflow `max_active_runs=1`, a cron `flock`). If the other run is dead rather than slow, drop the staging object the error names and re-run; nothing collects it for you, and the section below says why. | `e2e_concurrent_runs.py` (Postgres: the refusal, the survivor, a control, and fan-in) |
@@ -56,9 +56,9 @@ The two properties everything else rests on:
 ## What is NOT covered yet, and I would rather say so
 
 - **Destination disk full.** Not tested. The expected shape is a loud write
-  error with the staging table left behind, i.e. the same recovery as a killed
-  run — but expected is not measured, and this page is only worth something if
-  it distinguishes the two.
+  error — and because that is an ordinary error path it should drop its own
+  staging, unlike a kill. Expected is not measured, though, and this page is
+  only worth something if it distinguishes the two.
 - **Destination-side crash mid-apply** (ClickHouse or BigQuery restarting under
   us). The apply is idempotent by design and the watermark is written last, so
   the expectation is a clean replay — again, expectation, not receipt.
@@ -288,13 +288,18 @@ the outcome is two-valued: usually both land (the swap serialises, last writer
 wins), and sometimes the loser fails at `RENAME` with a duplicate-key error
 instead of a clean `LockedError`.
 
-Two things hold either way, and they are the ones that matter: **the destination
-is whole afterwards, and no staging object is orphaned.** The defect this whole
-mechanism exists to remove — a run reporting a full row count over a truncated
-table — does not come back through this window; a same-instant collision is loud
-or harmless, never silently wrong. `e2e_concurrent_runs.py` leg 6 asserts those
-two invariants and deliberately does not assert the outcome, because the outcome
-is genuinely non-deterministic.
+One thing holds either way, and it is the one that matters: **the destination is
+whole afterwards.** The defect this whole mechanism exists to remove — a run
+reporting a full row count over a truncated table — does not come back through
+this window; a same-instant collision is loud or harmless, never silently wrong.
+`e2e_concurrent_runs.py` leg 6 asserts that, and deliberately asserts nothing
+about the outcome, which is not deterministic.
+
+What it can also leave is **an orphaned staging object**: the loser had already
+built one when it died at `RENAME`, and a crash runs no error path. That object
+then refuses the next run of the table until someone drops it — the error names
+it. So the practical cost of a same-instant collision is one manual `DROP`,
+not lost data.
 
 Closing it needs announce-then-check ordering plus a deterministic tie-break —
 without one, both runs discover each other and both refuse, trading a rare wrong

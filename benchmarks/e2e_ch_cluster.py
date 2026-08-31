@@ -53,9 +53,30 @@ def pg(sql):
 
 
 def clean():
-    for t in (T, f"{T}_append", f"{T}__apitap_staging", f"{T}_append__apitap_staging",
-              f"{T}__apitap_new", "_apitap_state"):
+    """Drop the destination and EVERY artifact beside it, tokenized or not.
+
+    Listing rather than naming, because since 0.55.0 an artifact's name carries
+    the run's token — so `<T>__apitap_staging` is only the pre-token spelling and
+    misses everything a real run makes. The control leg below is MEANT to fail,
+    a failed run deliberately leaves its staging behind (nothing collects a
+    crashed run's workspace on a timer: the token is when the run STARTED, which
+    cannot prove the object is dead), and the next run then refuses while it is
+    there. That refusal is correct; this cleanup is what makes the leg able to
+    run twice."""
+    for t in (T, f"{T}_append", "_apitap_state"):
         node("a", f"DROP TABLE IF EXISTS {t} ON CLUSTER benchcluster SYNC")
+    # Both nodes are listed, not just `a`. The control leg loads WITHOUT
+    # on_cluster through a round-robin balancer, so its staging table exists on
+    # whichever node the balancer happened to pick — asking only node `a` misses
+    # it half the time, and the leftover then refuses the next run. (`DROP ... ON
+    # CLUSTER` does reach both; it was the LISTING that was one-sided.)
+    for n in ("a", "b"):
+        listed = node(n, "SELECT name FROM system.tables WHERE database = currentDatabase() "
+                         "AND position(name, '__apitap_') > 0 "
+                         f"AND startsWith(name, '{T}')")
+        for name in (listed or "").split():
+            node(n, f"DROP TABLE IF EXISTS {name} ON CLUSTER benchcluster SYNC")
+            node(n, f"DROP TABLE IF EXISTS {name} SYNC")
 
 
 def transfer(mode="replace", cluster=True):

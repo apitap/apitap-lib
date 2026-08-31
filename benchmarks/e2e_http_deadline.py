@@ -27,6 +27,8 @@ CH = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default
 SRC = os.environ.get("SLOW_TABLE", "bench_data_10m")
 T = "http_deadline_probe"
 
+from _artifacts import drop_ch          # noqa: E402 — after T, used below
+
 ok = True
 
 
@@ -57,7 +59,7 @@ def case(label, good, detail=""):
 
 
 print("== leg 1: the default must not cut a healthy transfer ==")
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_ch(ch, T)
 env = {k: v for k, v in os.environ.items() if k != "APITAP_HTTP_READ_TIMEOUT"}
 os.environ.pop("APITAP_HTTP_READ_TIMEOUT", None)
 p, el = run({})
@@ -74,7 +76,7 @@ else:
          el > 6, f"{el:.0f}s")
 
 print("== leg 2: the opt-in knob is real ==")
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_ch(ch, T)
 p2, el2 = run({"APITAP_HTTP_READ_TIMEOUT": "5"})
 if p2.returncode == 0:
     case("a 5-second total deadline stops this transfer", False,
@@ -84,6 +86,6 @@ else:
     case(f"a 5-second total deadline stops this transfer ({el2:.1f}s)", True,
          tail[:120])
 
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_ch(ch, T)
 print("\n" + ("HTTP DEADLINE E2E: ALL GREEN" if ok else "HTTP DEADLINE E2E: FAILED"))
 raise SystemExit(0 if ok else 1)

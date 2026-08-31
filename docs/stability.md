@@ -1,6 +1,6 @@
 # What you may depend on, and what may still move
 
-apitap reached v0.54.0 in under four months. At that pace a version number stops
+apitap reached v0.55.0 in under four months. At that pace a version number stops
 carrying information, and "0.x" tells you only that we have not committed to
 anything — which is the opposite of useful if you are deciding whether to put
 this in a pipeline. So here is the commitment, written down.
@@ -44,7 +44,7 @@ never silently.
 Pin exactly while we are pre-1.0:
 
 ```
-apitap==0.54.0
+apitap==0.55.0
 ```
 
 Not `>=`. The surface above is committed, but the release cadence is fast enough
@@ -55,10 +55,13 @@ pin is also what makes a rollback one line.
 
 1.0 is not a feature list, it is a promise we can keep. What it waits on:
 
-1. **The release gate runs itself.** Today a 44-leg suite against live Postgres,
-   MySQL, MariaDB, ClickHouse, BigQuery, Iceberg and a 2-node ClickHouse cluster
-   runs before every tag — 44/44 green for v0.54.0 — but a human starts it.
-   Until CI enforces it, the version number depends on someone remembering.
+1. **The release gate runs itself.** *Half done.* A 36-leg suite against live
+   Postgres (plain and TLS), MySQL 8.0/8.4, MariaDB, ClickHouse (single, proxied
+   and 2-node clustered), BigQuery and Iceberg runs before every tag — 36/36
+   green for v0.55.0 — and since 0.55.0 it is one command,
+   `benchmarks/gate.py`, which reports every leg it could NOT run rather than
+   quietly running fewer. A human still starts it. Until CI enforces that, the
+   version number depends on someone remembering.
 2. **Wheels for the platforms people actually evaluate on.** aarch64 and macOS,
    plus an sdist. Shipping only `manylinux_x86_64` while selling "cheap small
    boxes" is a contradiction, given ARM *is* the cheap box.

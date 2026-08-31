@@ -363,7 +363,6 @@ impl MySqlSink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let horizon = crate::naming::reap_horizon_secs();
         // `_` and `%` are LIKE wildcards and every suffix is full of the first.
         // MySQL does not enable backslash escaping under NO_BACKSLASH_ESCAPES,
         // so the escape character is declared explicitly — the same convention
@@ -395,54 +394,41 @@ impl MySqlSink {
                 .await
                 .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?
             };
-            // The one name an older apitap would have used for this artifact.
-            // It carries no token and therefore no age, so it can never be aged
-            // out — but leaving it forever would break the cleanup this sink has
-            // always promised, and a concurrent old-version run is the very bug
-            // being fixed. Collect exactly that name, and no other untokenized
-            // one: anything else matching the pattern is a table apitap did not
-            // make, and deleting a stranger's table is how this started.
-            let legacy =
-                crate::naming::artifact_ident(&self.bare, art, crate::naming::MY_IDENT_MAX);
             for name in found {
-                let Some(peer) = parse_peer(&name, art) else {
-                    if name == legacy {
-                        self.drop_artifact(&name).await?;
+                // LIKE is a coarse filter. It has no length anchor, so the
+                // pattern for `orders` also matches `orders_2024`'s artifacts —
+                // a prefix-sharing sibling that is a DIFFERENT destination, whose
+                // live staging would refuse this run and whose orphan this run
+                // would drop. `naming::classify` owns that boundary, along with
+                // the ordering (is it ours? is it MINE? only then, is it dead?)
+                // that six sinks each got wrong in their own way.
+                match crate::naming::classify(
+                    &name,
+                    &self.bare,
+                    art,
+                    crate::naming::MY_IDENT_MAX,
+                    &self.run,
+                    now,
+                ) {
+                    // A sibling's, or a table apitap never made. Deleting a
+                    // stranger's table is how this whole defect started.
+                    crate::naming::Found::Foreign => {}
+                    // This run's own leftover — one RunId per dispatch.
+                    crate::naming::Found::Mine => self.drop_artifact(&name).await?,
+                    // The pre-token name an older apitap wrote: nothing living
+                    // mints it, which is the only thing collection can prove.
+                    crate::naming::Found::Dead => self.drop_artifact(&name).await?,
+                    crate::naming::Found::Live(peer) => {
+                        if crate::naming::peer_blocks(&mine, &peer) {
+                            return Err(crate::naming::locked_error(
+                                &format!("{}.{}", self.db, self.bare),
+                                &name,
+                                &mine,
+                                &peer,
+                                now,
+                            ));
+                        }
                     }
-                    continue;
-                };
-                let age = now.saturating_sub(peer.started_unix);
-                if horizon != 0 && age > horizon {
-                    self.drop_artifact(&name).await?;
-                    continue;
-                }
-                if crate::naming::peer_blocks(&mine, &peer) {
-                    return Err(Error::Locked(format!(
-                        "{}.{}: another apitap run is already loading this table — it \
-                         started {age}s ago and lands rows by {}. Two of them cannot \
-                         share one destination: {}. Run them one at a time (a \
-                         scheduler's own concurrency setting is the usual answer: \
-                         Airflow max_active_runs=1, a cron flock). If that run is \
-                         dead rather than slow, the table it left behind ({name}) is \
-                         reaped automatically after {horizon}s, or you can DROP it now.",
-                        self.db,
-                        self.bare,
-                        match peer.kind {
-                            crate::naming::LandKind::Swap => "replacing the whole table",
-                            crate::naming::LandKind::Incremental => "appending to it",
-                            crate::naming::LandKind::Cdc => "draining changes into it",
-                        },
-                        match mine.kind {
-                            crate::naming::LandKind::Swap =>
-                                "a replace swaps the whole table, so whichever finishes \
-                                 second throws the other's work away",
-                            crate::naming::LandKind::Cdc =>
-                                "a CDC drain owns the watermark and the replication slot",
-                            crate::naming::LandKind::Incremental =>
-                                "both would read the same watermark and land the same \
-                                 rows twice",
-                        },
-                    )));
                 }
             }
         }

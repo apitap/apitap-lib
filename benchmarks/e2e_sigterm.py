@@ -64,6 +64,8 @@ CH = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default
 PG_C = os.environ.get("PG_CONTAINER", "apitap-bench-pg-src")
 T = "sigterm_demo"
 
+from _artifacts import drop_ch, drop_pg   # noqa: E402 — after T, used below
+
 SEED = 100
 BACKLOG = 400_000
 TXN = 5_000            # rows per transaction — small enough to give many windows
@@ -191,7 +193,7 @@ print("== setup: seed, bootstrap, then a backlog worth interrupting ==")
 pg(f"DROP TABLE IF EXISTS {T}")
 pg(f"CREATE TABLE {T} (id int primary key, v text)")
 pg(f"INSERT INTO {T} SELECT g, 'seed'||g FROM generate_series(1,{SEED}) g")
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_ch(ch, T)
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1")
 drop_our_slots()
 
@@ -272,7 +274,13 @@ print("== leg 2: twice to insist - the second SIGTERM is not absorbed ==")
 # the moment that handler returns, so the ordering the contract needs holds
 # either way.
 twice_ok = False
-for attempt in range(3):
+# Six attempts, not three, and the pause between the two signals is as short as
+# the handler needs rather than a round 0.1s. A PGO-built wheel finishes the
+# graceful path in well under 100 ms, so the old spacing lost the race on every
+# attempt and the leg reported a FAILURE for a runtime that had simply got
+# faster. The window this leg needs is "the process is still alive", so the
+# second signal should go the instant that is confirmed, not on a timer.
+for attempt in range(6):
     backlog(2_000_000 + attempt * 1_000_000, BACKLOG)
     src_total = int(pg(f"SELECT count(*) FROM {T}"))
     floor = ch_count()
@@ -282,7 +290,12 @@ for attempt in range(3):
         p.kill(); p.wait()
         continue
     p.terminate()
-    time.sleep(0.1)
+    # Spin briefly rather than sleeping a fixed slice: fire the second signal on
+    # the first observation that the process is still running.
+    for _ in range(20):
+        time.sleep(0.005)
+        if p.poll() is None:
+            break
     if p.poll() is not None:
         # Lost the race: the run finished between the two signals. Nothing is
         # proven either way, so try again rather than record a verdict.
@@ -380,7 +393,7 @@ sh([sys.executable, "-c", RUN], env=dict(os.environ, APITAP_CDC_WINDOW_BYTES=WIN
 case("the final resume is exact too", ch_count() == src_total,
      f"{ch_count()} vs {src_total}")
 pg(f"DROP TABLE IF EXISTS {T}")
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_ch(ch, T)
 # The CDC apply also leaves a delete-marker sidecar next to the
 # destination. Dropping only the main table left one behind on the
 # shared bench rig after every run.

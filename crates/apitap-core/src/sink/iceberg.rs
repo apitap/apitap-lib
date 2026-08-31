@@ -620,10 +620,10 @@ impl IcebergSink {
         use crate::naming::{parse_peer, Artifact, ROOMY};
         let s3 = self.s3.clone().expect("storage bound before the claim");
         let prefix = self.claim_prefix();
-        // The token sits BETWEEN these two, so the pattern is head + anything +
-        // suffix — never a prefix match. S3 keys are byte-limited far above
-        // anything an Iceberg identifier reaches, hence ROOMY.
-        let (head, suffix) = crate::naming::artifact_match(&self.table, Artifact::Staging, ROOMY);
+        // No head/suffix pair is derived here any more: `naming::classify` takes
+        // the bare table name and works both anchors out itself, which is the
+        // point of it existing. S3 keys are byte-limited far above anything an
+        // Iceberg identifier reaches, hence ROOMY.
         let mine_name =
             crate::naming::artifact_ident_run(&self.table, Artifact::Staging, ROOMY, &self.run);
         let mine = parse_peer(&mine_name, Artifact::Staging)
@@ -632,59 +632,34 @@ impl IcebergSink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let horizon = crate::naming::reap_horizon_secs();
 
         for key in s3.list(&prefix).await? {
             let name = key.rsplit('/').next().unwrap_or(&key);
-            if !name.starts_with(head.as_str()) || !name.ends_with(suffix) {
-                continue;
-            }
-            // No legacy arm, unlike the SQL sinks: this prefix is new with the
-            // mechanism, so there is no untokenized marker an older apitap
-            // could have left. Anything unparseable here was put there by
-            // somebody else, and deleting a stranger's object is not this
-            // function's business.
-            let Some(peer) = parse_peer(name, Artifact::Staging) else { continue };
-            let age = now.saturating_sub(peer.started_unix);
-            if horizon != 0 && age > horizon {
-                // Best effort. A marker past the horizon is already inert —
-                // every future run ages it out on this same branch and carries
-                // on — so failing an otherwise-good transfer because we could
-                // not delete a one-line marker would trade a real run for
-                // nothing. (The SQL sinks propagate their reap failures for the
-                // opposite reason: what they are reaping is a billed table.)
-                let _ = s3.delete(&key).await;
-                continue;
-            }
-            if crate::naming::peer_blocks(&mine, &peer) {
-                return Err(Error::Locked(format!(
-                    "{}.{}: another apitap run is already loading this table — it \
-                     started {age}s ago and lands rows by {}. Two of them cannot \
-                     share one destination: {}. Run them one at a time (a \
-                     scheduler's own concurrency setting is the usual answer: \
-                     Airflow max_active_runs=1, a cron flock). If that run is \
-                     dead rather than slow, its claim marker {key} is reaped \
-                     automatically after {horizon}s, or you can delete that \
-                     object now.",
-                    self.conn.namespace,
-                    self.table,
-                    match peer.kind {
-                        crate::naming::LandKind::Swap => "replacing the whole table",
-                        crate::naming::LandKind::Incremental => "appending to it",
-                        crate::naming::LandKind::Cdc => "draining changes into it",
-                    },
-                    match mine.kind {
-                        crate::naming::LandKind::Swap =>
-                            "a replace commits an overwrite snapshot carrying only \
-                             its own data files, so whichever finishes second drops \
-                             the other's rows out of the live table",
-                        crate::naming::LandKind::Cdc =>
-                            "a CDC drain owns the watermark and the replication slot",
-                        crate::naming::LandKind::Incremental =>
-                            "both would read the same watermark property and land \
-                             the same rows twice",
-                    },
-                )));
+            // `naming::classify` owns both anchors, the exact token width and
+            // the ordering. There is no legacy arm to worry about here — this
+            // prefix is new with the mechanism, so no untokenized marker exists
+            // for `classify` to find, and its Dead branch simply never fires.
+            match crate::naming::classify(name, &self.table, Artifact::Staging, ROOMY, &self.run, now)
+            {
+                // Somebody else's object. Deleting a stranger's is not this
+                // function's business.
+                crate::naming::Found::Foreign => {}
+                // This run's own marker. Best effort: failing a good transfer
+                // over a one-line marker trades a real run for nothing.
+                crate::naming::Found::Mine | crate::naming::Found::Dead => {
+                    let _ = s3.delete(&key).await;
+                }
+                crate::naming::Found::Live(peer) => {
+                    if crate::naming::peer_blocks(&mine, &peer) {
+                        return Err(crate::naming::locked_error(
+                            &format!("{}.{}", self.conn.namespace, self.table),
+                            &key,
+                            &mine,
+                            &peer,
+                            now,
+                        ));
+                    }
+                }
             }
         }
 

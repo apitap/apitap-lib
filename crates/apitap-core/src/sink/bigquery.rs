@@ -1629,11 +1629,6 @@ impl BqSink {
         // and a BigQuery table id is unqualified within its dataset.
         let (head, suffix) =
             crate::naming::artifact_match(&self.final_table, Artifact::Staging, ROOMY);
-        // The one name an older apitap would have used. It carries no token and
-        // therefore no age, so it can never be aged out — but leaving it forever
-        // would break the cleanup this sink has always promised, and a
-        // concurrent old-version run is the very bug being fixed. Collect it.
-        let legacy = crate::naming::artifact_ident(&self.final_table, Artifact::Staging, ROOMY);
         // Minted from the run, not read back off `staging_table` — the same
         // call `bind` made, so what this run compares peers against and what it
         // writes into cannot drift apart.
@@ -1651,61 +1646,49 @@ impl BqSink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let horizon = crate::naming::reap_horizon_secs();
         // The token sits BETWEEN head and suffix, so the listing can only be
         // narrowed to `head` — wider than the old `<bare>__apitap_staging`
         // prefix, which is why every candidate below is anchored on BOTH ends
         // before it is touched. Without that, a run of `orders` would reap
         // `orders_archive`'s live staging.
         for name in self.conn.tables_with_prefix(&head).await? {
+            // A worker table carries a `_N` index the token does not; strip it
+            // first so what reaches `classify` is the name a run actually mints.
             let Some(base) = staging_base(&name, suffix) else {
                 continue;
             };
-            if base == legacy {
-                self.conn.table_delete(&name).await?;
-                continue;
-            }
-            if !base.starts_with(head.as_str())
-                || base.len() != head.len() + crate::naming::RUN_TOKEN_LEN + suffix.len()
-            {
-                continue; // some other destination's staging: not ours to judge
-            }
-            let Some(peer) = parse_peer(base, Artifact::Staging) else {
-                continue; // ends the right way, but carries no token of ours
-            };
-            let age = now.saturating_sub(peer.started_unix);
-            if horizon != 0 && age > horizon {
-                self.conn.table_delete(&name).await?;
-                continue;
-            }
-            if crate::naming::peer_blocks(&mine, &peer) {
-                return Err(Error::Locked(format!(
-                    "{}.{}: another apitap run is already loading this table — it \
-                     started {age}s ago and lands rows by {}. Two of them cannot \
-                     share one destination: {}. Run them one at a time (a \
-                     scheduler's own concurrency setting is the usual answer: \
-                     Airflow max_active_runs=1, a cron flock). If that run is \
-                     dead rather than slow, its staging table {name} is reaped \
-                     automatically after {}s, or you can delete it now.",
-                    self.conn.dataset,
-                    self.final_table,
-                    match peer.kind {
-                        crate::naming::LandKind::Swap => "replacing the whole table",
-                        crate::naming::LandKind::Incremental => "appending to it",
-                        crate::naming::LandKind::Cdc => "draining changes into it",
-                    },
-                    match mine.kind {
-                        crate::naming::LandKind::Swap =>
-                            "a replace copies over the whole table, so whichever \
-                             finishes second throws the other's work away",
-                        crate::naming::LandKind::Cdc =>
-                            "a CDC drain owns the watermark and the replication slot",
-                        crate::naming::LandKind::Incremental =>
-                            "both would read the same watermark and land the same \
-                             rows twice",
-                    },
-                    horizon,
-                )));
+            // Everything after this — both anchors, the exact token width, "is
+            // it mine", and the refusal to age anything out — is
+            // `naming::classify`. It is not re-derived here because it WAS, and
+            // the review found the same class of mistake in six sinks that each
+            // wrote their own copy.
+            match crate::naming::classify(
+                base,
+                &self.final_table,
+                Artifact::Staging,
+                ROOMY,
+                &self.run,
+                now,
+            ) {
+                // Another destination's staging: not ours to judge.
+                crate::naming::Found::Foreign => {}
+                // Ours — one RunId per dispatch — so this is a leftover of THIS
+                // run and safe to delete.
+                crate::naming::Found::Mine => self.conn.table_delete(&name).await?,
+                // The pre-token name an older apitap wrote. Nothing living mints
+                // it; that is the whole of what collection can prove here.
+                crate::naming::Found::Dead => self.conn.table_delete(&name).await?,
+                crate::naming::Found::Live(peer) => {
+                    if crate::naming::peer_blocks(&mine, &peer) {
+                        return Err(crate::naming::locked_error(
+                            &format!("{}.{}", self.conn.dataset, self.final_table),
+                            &name,
+                            &mine,
+                            &peer,
+                            now,
+                        ));
+                    }
+                }
             }
         }
         Ok(())

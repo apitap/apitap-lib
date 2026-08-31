@@ -419,10 +419,11 @@ impl ChSink {
     /// sink would ever collect.
     ///
     /// A shadow only lives for the three DDL statements at the end of a replace,
-    /// so a leftover one is nearly always a crash rather than a live peer — and
-    /// this refuses the next run for the reap horizon on that evidence. That is
-    /// the same bargain staging already makes, and the error says so: the object
-    /// is named, the horizon is quoted, and dropping it by hand is offered.
+    /// so a leftover one is nearly always a crash rather than a live peer. It is
+    /// still not COLLECTED on that hunch: the token records when the run
+    /// started, not when the shadow was made, so a five-hour load's shadow is
+    /// born with a five-hour-old token and no age test can tell it from a
+    /// crash. It is refused instead, and the error names the object to drop.
     ///
     /// Liveness is read from the NAME. ClickHouse does have
     /// `metadata_modification_time`, but it moves on every ALTER and means
@@ -487,71 +488,44 @@ impl ChSink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let horizon = crate::naming::reap_horizon_secs();
-        // The one name an older apitap would have used. It carries no token and
-        // therefore no age, so it cannot be aged out — but leaving it forever
-        // would break the cleanup this sink has always promised, and a
-        // concurrent old-version run is the very bug being fixed. Collect it.
-        let legacy =
-            crate::naming::artifact_ident(&self.final_bare, artifact, crate::naming::ROOMY);
 
         for name in found {
-            // LIKE is a coarse filter, and on its own it is too coarse: the
-            // pattern for `orders` also matches every artifact of `orders_2024`,
-            // a prefix-sharing sibling that is a DIFFERENT destination. The token
-            // is fixed width, so pinning the length pins the middle to exactly
-            // one token — without this a sibling's live staging would refuse this
-            // run, and a sibling's orphan would be dropped by it.
-            let exact =
-                name.len() == head.len() + crate::naming::RUN_TOKEN_LEN + suffix.len();
-            let parsed = if exact {
-                parse_peer(&name, artifact)
-            } else {
-                None
-            };
-            let Some(peer) = parsed else {
-                // Not ours to judge unless it is exactly the pre-token name for
-                // THIS table. Anything else that merely ends the same way is a
-                // user's object, and dropping it is how the old blind DROP lost
-                // data in the first place.
-                if name == legacy {
-                    self.drop_artifact(&name).await?;
+            // LIKE is a coarse filter and on its own too coarse — the pattern for
+            // `orders` also matches every artifact of `orders_2024`, a
+            // prefix-sharing sibling that is a DIFFERENT destination. The
+            // ordering and boundary rules that sort that out are
+            // `naming::classify`, deliberately not re-derived here: this sink
+            // used to open-code them, six others copied the shape, and the
+            // review found the same class of mistake in all seven.
+            match crate::naming::classify(
+                &name,
+                &self.final_bare,
+                artifact,
+                crate::naming::ROOMY,
+                &self.run,
+                now,
+            ) {
+                // A sibling's, or a user's object that merely ends the same way.
+                // Dropping it is how the old blind DROP lost data.
+                crate::naming::Found::Foreign => {}
+                // Ours. One RunId is minted per dispatch, so this is a leftover
+                // of THIS run — safe to collect, and the only thing that makes a
+                // retried table inside a multi-table run work.
+                crate::naming::Found::Mine => self.drop_artifact(&name).await?,
+                // The pre-token name an older apitap wrote. Nothing living mints
+                // it, which is the only thing collection can prove.
+                crate::naming::Found::Dead => self.drop_artifact(&name).await?,
+                crate::naming::Found::Live(peer) => {
+                    if crate::naming::peer_blocks(&mine, &peer) {
+                        return Err(crate::naming::locked_error(
+                            &format!("{}.{}", self.ch.database(), self.final_bare),
+                            &name,
+                            &mine,
+                            &peer,
+                            now,
+                        ));
+                    }
                 }
-                continue;
-            };
-            let age = now.saturating_sub(peer.started_unix);
-            if horizon != 0 && age > horizon {
-                self.drop_artifact(&name).await?;
-                continue;
-            }
-            if crate::naming::peer_blocks(&mine, &peer) {
-                return Err(Error::Locked(format!(
-                    "{}.{}: another apitap run is already loading this table — it \
-                     started {age}s ago and lands rows by {}. Two of them cannot \
-                     share one destination: {}. Run them one at a time (a \
-                     scheduler's own concurrency setting is the usual answer: \
-                     Airflow max_active_runs=1, a cron flock). If that run is \
-                     dead rather than slow, its table {name} is reaped \
-                     automatically after {}s, or you can DROP it now.",
-                    self.ch.database(),
-                    self.final_bare,
-                    match peer.kind {
-                        crate::naming::LandKind::Swap => "replacing the whole table",
-                        crate::naming::LandKind::Incremental => "appending to it",
-                        crate::naming::LandKind::Cdc => "draining changes into it",
-                    },
-                    match mine.kind {
-                        crate::naming::LandKind::Swap =>
-                            "a replace swaps the whole table, so whichever finishes \
-                             second throws the other's work away",
-                        crate::naming::LandKind::Cdc =>
-                            "a CDC drain owns the watermark and the replication slot",
-                        crate::naming::LandKind::Incremental =>
-                            "both would read the same watermark and land the same \
-                             rows twice",
-                    },
-                    horizon,
-                )));
             }
         }
         Ok(())
@@ -1577,9 +1551,10 @@ impl crate::sink::Sink for ChSink {
                     // valid from ANY node the load balancer picks: an empty
                     // final shell if none exists, one EXCHANGE, and a
                     // best-effort drop of the old data riding in the staging
-                    // name afterwards (a leftover never blocks the next run —
-                    // that name is this run's alone, and the next run's scan
-                    // reaps it once it is past the horizon).
+                    // name afterwards (that name is this run's alone, so the
+                    // next run of this table classifies it as Found::Mine only
+                    // if it IS the same run; a crashed run's leftover is refused
+                    // and named, not silently collected).
                     let oc = self.ddl.on_cluster_clause();
                     let eng = self.ddl.engine.as_deref().unwrap_or("ReplicatedMergeTree");
                     let create_cols = &self.plan_ddl;
@@ -1706,11 +1681,11 @@ impl crate::sink::Sink for ChSink {
                         self.ch
                             .exec(&format!("EXCHANGE TABLES {tmp} AND {}{oc}", self.final_t))
                             .await?;
-                        // Best-effort: a leftover shadow of old data never blocks
-                        // the next run (its name is this run's alone, and the
-                        // next run's scan reaps it once it is past the horizon),
-                        // while failing HERE would abort before the state rows
-                        // below are cleared — a stale-high watermark, silent skips.
+                        // Best-effort: failing HERE would abort before the state
+                        // rows below are cleared — a stale-high watermark and
+                        // silent skips, which is worse than a leftover. If the
+                        // drop does fail, the next run refuses and names the
+                        // object rather than collecting it on a guess.
                         let _ = self.ch.exec(&format!("DROP TABLE {tmp}{oc}")).await;
                     }
                 } else {

@@ -51,9 +51,10 @@ is the only thing collected.
                               class rather than by matching the message, and
                               still a RuntimeError subclass
   leg 6  the window left     — two runs starting in the SAME INSTANT both pass
-                              a check-then-act guard. The outcome is two-valued
-                              and not asserted; the invariants are: the
-                              destination is whole and no staging is orphaned
+                              a check-then-act guard. Neither the outcome nor
+                              the debris is asserted (both vary); the one
+                              INVARIANT is that the destination is whole and
+                              the failure, if any, is loud
 
 Leg 1c and leg 4 are what stop leg 1 from being a fix that simply refuses
 everything.
@@ -365,11 +366,19 @@ print(f"      (outcome, not asserted: {(r.stdout.strip() or 'no output')[:120]})
 got = dst(f"SELECT count(*) FROM {T}")
 case("INVARIANT: the destination is whole, whoever won", got == want,
      f"dest {got} vs source {want}")
-case("INVARIANT: no staging object was orphaned", staging_names() == [],
-     f"left: {staging_names()}")
 case("and the failure, if any, was loud — never a green run over a short table",
      "ok" in r.stdout or "Error" in r.stdout,
      (r.stdout.strip() or "")[:120])
+# NOT an invariant, and an earlier draft of this leg wrongly asserted it was:
+# when the loser dies at RENAME it has already built its staging, and no error
+# path runs for it, so the object is orphaned — and being orphaned it refuses
+# the NEXT run of this table until someone drops it. That is the same-instant
+# window's real operational cost and it belongs in the record, not in a
+# green-or-red assertion, because whether it happens is not deterministic.
+orphans = staging_names()
+print(f"      (orphaned by the race, not asserted: {orphans or 'none this time'})")
+for n in orphans:
+    dst(f'DROP TABLE IF EXISTS "{n}"')
 
 # ---------------------------------------------------------------------------
 print("== cleanup ==")

@@ -746,18 +746,22 @@ impl S3Sink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let horizon = crate::naming::reap_horizon_secs();
         // Whether a key belongs to a run this one may clean up after. Shared
         // by the object sweep and the upload sweep so the two can never
         // disagree about which segments are dead.
+        //
+        // ONLY the untokenized legacy layout qualifies. A foreign run's segment
+        // is never collected on age, however old its token reads: the token is
+        // when that RUN started, not when the object was written, so on a long
+        // multi-table load the two are hours apart — and here a wrongly deleted
+        // segment is SILENT. The next `finalize` re-creates the prefix and the
+        // run reports a full row count over a truncated table, which is the
+        // exact defect this mechanism exists to remove. `naming::classify` has
+        // the long version of the argument.
         let reapable = |key: &str| match classify(&self.staging_root, key) {
             Staged::Foreign => false,
             Staged::Legacy => true,
-            Staged::Run { seg, peer } => {
-                seg != self.run.token()
-                    && horizon != 0
-                    && now.saturating_sub(peer.started_unix) > horizon
-            }
+            Staged::Run { .. } => false,
         };
         // Nothing is deleted until the whole listing has been judged: a live
         // peer anywhere in it means this run does not get to touch the prefix
@@ -771,44 +775,18 @@ impl S3Sink {
             if seg == self.run.token() {
                 continue;
             }
-            let age = now.saturating_sub(peer.started_unix);
-            if horizon != 0 && age > horizon {
-                continue; // dead; `reapable` collects it below
-            }
             if crate::naming::peer_blocks(&mine, &peer) {
-                return Err(Error::Locked(format!(
-                    "s3://{}/{}{}: another apitap run is already writing this \
-                     table — it started {age}s ago and lands rows by {}. Two of \
-                     them cannot share one destination: {}. Run them one at a \
-                     time (a scheduler's own concurrency setting is the usual \
-                     answer: Airflow max_active_runs=1, a cron flock). If that \
-                     run is dead rather than slow, its staging objects and \
-                     multipart uploads under s3://{}/{}{seg}/ are reaped \
-                     automatically after {horizon}s, or you can remove them now \
-                     (`aws s3 rm --recursive`, `aws s3api \
-                     abort-multipart-upload`).",
-                    self.conn.bucket,
-                    self.conn.prefix,
-                    self.bare,
-                    match peer.kind {
-                        crate::naming::LandKind::Swap => "replacing the whole table",
-                        crate::naming::LandKind::Incremental => "appending to it",
-                        crate::naming::LandKind::Cdc => "draining changes into it",
-                    },
-                    match mine.kind {
-                        crate::naming::LandKind::Swap =>
-                            "a replace rewrites the whole object set, so whichever \
-                             finishes second throws the other's work away",
-                        crate::naming::LandKind::Cdc =>
-                            "a CDC drain owns the watermark and the replication \
-                             slot",
-                        crate::naming::LandKind::Incremental =>
-                            "both would read the same watermark and land the same \
-                             rows twice",
-                    },
-                    self.conn.bucket,
-                    self.staging_root,
-                )));
+                return Err(crate::naming::locked_error(
+                    &format!("s3://{}/{}{}", self.conn.bucket, self.conn.prefix, self.bare),
+                    &format!(
+                        "the objects and multipart uploads under s3://{}/{}{seg}/ \
+                         (`aws s3 rm --recursive`, `aws s3api abort-multipart-upload`)",
+                        self.conn.bucket, self.conn.prefix
+                    ),
+                    &mine,
+                    &peer,
+                    now,
+                ));
             }
         }
         // No separate sweep of the pre-token PREFIX is needed:

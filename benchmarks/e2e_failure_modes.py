@@ -26,6 +26,8 @@ PGD = "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst"
 CH = "clickhouse://default:bench@127.0.0.1:8124/default"
 SRC_BIG = "bench_data_10m_cap"          # 10M rows: long enough to kill mid-flight
 T = "fm_demo"
+
+from _artifacts import drop_ch            # noqa: E402 — after T, used below
 CT = "fm_cdc"
 
 
@@ -63,6 +65,33 @@ def kill_after(p, secs):
     return True
 
 
+def kill_once_staging_exists(p, probe, timeout=60.0):
+    """SIGKILL the run the moment the SERVER shows it has started writing.
+
+    A timer was here before — `kill_after(p, 3.0)` — and a PGO-built wheel loads
+    the fixture in under three seconds, so the kill stopped landing and the case
+    reported a FAILURE for a transfer that simply won. A timer is a guess about
+    how fast the box is today; the existence of the staging object is proof the
+    run is mid-flight. Same fix, same reason, as the gate in
+    e2e_concurrent_runs.py.
+
+    Returns True if the kill landed, False if the run finished first even so
+    (which is a rig too fast to test this at all, and says so out loud).
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if p.poll() is not None:
+            return False
+        if probe():
+            if p.poll() is not None:
+                return False
+            os.kill(p.pid, signal.SIGKILL)
+            p.wait(timeout=30)
+            return True
+        time.sleep(0.02)
+    return False
+
+
 ok = True
 results = []
 
@@ -75,7 +104,11 @@ def case(name, passed, detail):
 
 
 print("== 1. SIGKILL mid-transfer, over an EXISTING destination table ==")
-ch(f"DROP TABLE IF EXISTS {T}")
+# Not just the destination: a PREVIOUS run of this leg was killed on purpose and
+# left tokenized staging behind, and since 0.55.0 that refuses the next run
+# instantly — which looked exactly like "the transfer finished before it could be
+# killed", because the child had indeed exited. Clear the artifacts, not the name.
+drop_ch(ch, T)
 # A known-good version readers must keep seeing throughout.
 sh(["docker", "exec", "-i", "apitap-bench-ch", "clickhouse-client", "--user", "default",
     "--password", "bench", "-q",
@@ -87,27 +120,56 @@ p = spawn(f"""
 import apitap
 apitap.transfer({PG!r}, {CH!r}, table={SRC_BIG!r}, dest_table={T!r}, mode="replace")
 """)
-killed = kill_after(p, 3.0)
+killed = kill_once_staging_exists(p, lambda: bool([
+    n for n in ch("SELECT name FROM system.tables WHERE database = currentDatabase() "
+                  f"AND position(name, '__apitap_') > 0 AND startsWith(name, '{T}')").split()
+    if n
+]))
 if not killed:
-    case("mid-flight kill", False, "the transfer finished before it could be killed")
+    case("mid-flight kill", False,
+         "the transfer finished before its staging table was ever visible — this "
+         "rig is too fast to stage a mid-flight kill; use a larger SRC_BIG")
 else:
     after = ch(f"SELECT count(), uniqExact(marker) FROM {T}")
     case("old table survives a killed transfer", after == before,
          f"{after} (was {before}) — readers never saw a partial version")
-    orphan = ch(f"SELECT count() FROM system.tables WHERE name = '{T}__apitap_staging'")
-    case("what is left behind is named", True,
-         f"staging table orphaned: {'yes' if orphan != '0' else 'no'} "
-         f"(next run drops it first — DROP TABLE IF EXISTS)")
-    r = sh([sys.executable, "-c", f"""
+    # The staging name carries the run's token since 0.55.0, so the orphan can
+    # only be found by listing — and SIGKILL runs no error path, so there IS one.
+    listed = [n for n in ch(
+        "SELECT name FROM system.tables WHERE database = currentDatabase() "
+        f"AND position(name, '__apitap_') > 0 AND startsWith(name, '{T}')").split() if n]
+    case("what is left behind is named", bool(listed),
+         f"orphaned staging: {listed or 'none'}")
+
+    def rerun():
+        return sh([sys.executable, "-c", f"""
 import apitap
 r = apitap.transfer({PG!r}, {CH!r}, table={SRC_BIG!r}, dest_table={T!r}, mode="replace")
 print(r.rows)
 """])
+
+    # A killed run's leftover is NOT collected on a timer: the token records when
+    # the run STARTED, so on a long load it is already hours old when the object
+    # is made and age can never prove the object dead. Collecting a live peer's
+    # workspace is silent truncation on the object stores, so the safe action is
+    # to refuse. That costs a manual step, and the error has to earn it by
+    # naming the object.
+    r = rerun()
+    refused = r.returncode != 0 and "locked" in (r.stderr or "").lower()
+    case("the re-run REFUSES rather than dropping the orphan blindly", refused,
+         (r.stderr.strip().splitlines() or [""])[-1][:150])
+    case("and the refusal names the object to drop",
+         any(n in (r.stderr or "") for n in listed),
+         (r.stderr or "")[-150:])
+
+    for n in listed:
+        ch(f"DROP TABLE IF EXISTS {n}")
+    r = rerun()
     landed = ch(f"SELECT count() FROM {T}")
     truth = pg(f"SELECT count(*) FROM {SRC_BIG}")
-    case("re-run recovers with no manual step", r.returncode == 0 and landed == truth,
-         f"{landed} rows == source {truth}")
-ch(f"DROP TABLE IF EXISTS {T}")
+    case("after dropping it, the re-run recovers fully",
+         r.returncode == 0 and landed == truth, f"{landed} rows == source {truth}")
+drop_ch(ch, T)
 
 print("== 2. SIGKILL mid-CDC-window: the watermark must not move ==")
 pg(f"DROP TABLE IF EXISTS {CT}")
@@ -151,7 +213,7 @@ apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
          f"dst {dst_digest.split('|')[0]} / {dst_digest.split('|')[1]}")
 
 print("== 3. the source connection is cut mid-COPY ==")
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_ch(ch, T)
 p = spawn(f"""
 import apitap
 apitap.transfer({PG!r}, {CH!r}, table={SRC_BIG!r}, dest_table={T!r}, mode="replace")
@@ -181,7 +243,7 @@ if p.poll() is None:
 else:
     p.wait()
     case("cut connection", True, "transfer finished before the connection could be cut (skipped)")
-ch(f"DROP TABLE IF EXISTS {T}")
+drop_ch(ch, T)
 
 print("== 4. source DDL changes mid-run ==")
 pg("DROP TABLE IF EXISTS fm_ddl")
