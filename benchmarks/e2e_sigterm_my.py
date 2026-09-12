@@ -58,6 +58,17 @@ def ch_count():
     v = ch(f"SELECT count() FROM {T}")
     return int(v) if v.isdigit() else -1
 
+def clear_dead_lock():
+    """Drop the announcement a HARD-KILLED drain leaves behind — see the same
+    helper in `e2e_sigterm.py` for why it is the operator's job and why doing it
+    here is not working around the guard (`e2e_cdc_guard.py` asserts that)."""
+    for n in ch(
+        "SELECT name FROM system.tables WHERE database = currentDatabase() "
+        f"AND startsWith(name, '{T}') AND endsWith(name, '__apitap_lock')").split():
+        if n:
+            ch(f"DROP TABLE IF EXISTS `{n}`")
+
+
 
 def case(label, good, detail=""):
     global ok
@@ -159,6 +170,9 @@ else:
 
 # ---------------------------------------------------------------------------
 print("== leg 1: the graceful stop — exit 0, partial progress, work left ==")
+# A deliberate kill above left its announcement; do the operator's part.
+clear_dead_lock()
+
 floor = ch_count()
 if floor >= src_total:
     case("there is still a backlog to interrupt", False, "the control run drained it all")
@@ -185,6 +199,8 @@ else:
 
 # ---------------------------------------------------------------------------
 print("== leg 2: the resume is exact — the binlog position was told the truth ==")
+# The legs above kill the process outright, so they leave an announcement.
+clear_dead_lock()
 floor = ch_count()
 r = sh([sys.executable, "-c", RUN], env=dict(os.environ, APITAP_CDC_WINDOW_BYTES=WINDOW))
 case("the resume run succeeds", r.returncode == 0, r.stderr.strip()[-200:])

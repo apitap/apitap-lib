@@ -88,6 +88,49 @@ fn cdc_staging(table: &str) -> String {
 }
 
 impl BqDest {
+    fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
+        crate::naming::artifact_ident_run(
+            bare(dest_table), crate::naming::Artifact::Lock, crate::naming::ROOMY, run)
+    }
+
+    /// This run's announcement — see `sink::postgres::announce_run`. The name is
+    /// minted by `naming` and the verdict is `naming::guard_verdict`, so a drain
+    /// and a bulk run agree on both; only the dataset calls are spelled here.
+    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        self.conn.ensure_dataset().await?;
+        self.conn
+            .table_create(
+                &self.lock_name(dest_table, run),
+                // BigQuery has no zero-column table; nothing reads this one.
+                &serde_json::json!([{ "name": "t", "type": "INT64" }]),
+            )
+            .await
+    }
+
+    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        let b = bare(dest_table);
+        // One listing serves both guarded kinds: they share the head, and only
+        // the suffix differs.
+        let (head, _) =
+            crate::naming::artifact_match(b, crate::naming::Artifact::Staging, crate::naming::ROOMY);
+        let listed = self.conn.tables_with_prefix(&head).await?;
+        crate::naming::guard_verdict(
+            &format!("{}.{b}", self.conn.dataset),
+            b,
+            crate::naming::ROOMY,
+            run,
+            listed.iter().map(String::as_str),
+        )
+    }
+
+    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
+        let _ = self.conn.table_delete(&self.lock_name(dest_table, run)).await;
+    }
+
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         Ok(Self { conn: BqConn::parse(url).await? })
     }

@@ -281,13 +281,13 @@ impl BqConn {
             .await
     }
 
-    async fn table_delete(&self, table: &str) -> Result<()> {
+    pub(crate) async fn table_delete(&self, table: &str) -> Result<()> {
         self.api_opt(reqwest::Method::DELETE, self.table_url(table), None)
             .await
             .map(|_| ())
     }
 
-    async fn table_create(&self, table: &str, fields: &Value) -> Result<()> {
+    pub(crate) async fn table_create(&self, table: &str, fields: &Value) -> Result<()> {
         let body = json!({
             "tableReference": {
                 "projectId": self.project, "datasetId": self.dataset, "tableId": table
@@ -308,7 +308,7 @@ impl BqConn {
 
     /// Table ids in the dataset starting with `prefix` (one page is plenty —
     /// worker counts are small).
-    async fn tables_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+    pub(crate) async fn tables_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         // Follow every page: '_' sorts AFTER digits, so in a dataset full of
         // date-sharded tables a leftover staging is GUARANTEED off page one —
         // and a missed leftover would get appended into by the next run.
@@ -338,7 +338,7 @@ impl BqConn {
         }
     }
 
-    async fn ensure_dataset(&self) -> Result<()> {
+    pub(crate) async fn ensure_dataset(&self) -> Result<()> {
         let url = format!(
             "{BQ_BASE}/projects/{}/datasets/{}",
             self.project, self.dataset

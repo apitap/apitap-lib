@@ -132,6 +132,54 @@ impl Dest {
         }
     }
 
+    /// The drain's half of announce-then-check, written FIRST — before the
+    /// bootstrap decision, before a watermark is read, before a row moves.
+    ///
+    /// The artifact is the same `__apitap_lock` a bulk run writes, minted by the
+    /// same `naming` call and judged by the same `guard_verdict`, because that
+    /// is the only way the two lanes can see each other: the matrix says a
+    /// `log_based` drain is exclusive against ANYTHING, and 0.55.0 claimed that
+    /// row while a drain neither wrote nor read a single artifact.
+    ///
+    /// Iceberg is the exception and is NOT guarded here. A claim in that sink
+    /// lives in object storage, and `IceDest` holds only a catalog connection —
+    /// resolving the table's storage location and credentials is the sink's
+    /// `prepare` work, and doing it here would be a second implementation of the
+    /// thing this whole design exists to have only one of. An Iceberg CDC
+    /// bootstrap still rides the bulk sink, so the expensive half is covered;
+    /// its incremental windows are not.
+    async fn announce(&self, dest_table: &str, run: &crate::naming::RunId) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.announce(dest_table, run).await,
+            Dest::Ch(d) => d.announce(dest_table, run).await,
+            Dest::My(d) => d.announce(dest_table, run).await,
+            Dest::Bq(d) => d.announce(dest_table, run).await,
+            Dest::Ice(_) => Ok(()),
+        }
+    }
+
+    async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.check_peers(dest_table, run).await,
+            Dest::Ch(d) => d.check_peers(dest_table, run).await,
+            Dest::My(d) => d.check_peers(dest_table, run).await,
+            Dest::Bq(d) => d.check_peers(dest_table, run).await,
+            Dest::Ice(_) => Ok(()),
+        }
+    }
+
+    /// Best-effort, like every other release: a failure here must not turn a
+    /// finished drain into an error.
+    async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
+        match self {
+            Dest::Pg(d) => d.release(dest_table, run).await,
+            Dest::Ch(d) => d.release(dest_table, run).await,
+            Dest::My(d) => d.release(dest_table, run).await,
+            Dest::Bq(d) => d.release(dest_table, run).await,
+            Dest::Ice(_) => {}
+        }
+    }
+
     async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
         match self {
             Dest::Pg(d) => d.read_state(dest_table, source_id).await,
@@ -663,7 +711,7 @@ async fn run_group(
     // certificates when the real answer is "that mode is not implemented
     // here". One parse, up front, so the message is the right one.
     crate::wire::walsender::check_ssl_mode(src_url)?;
-    let dest = Dest::connect(dst_url).await?;
+    let dest = std::sync::Arc::new(Dest::connect(dst_url).await?);
 
     let src = PgPoolOptions::new()
         .max_connections(2)
@@ -769,52 +817,113 @@ async fn run_group(
     let qualified_all: Vec<&str> = ctxs.iter().map(|c| c.qualified.as_str()).collect();
     ensure_publication(&src, &publication, &qualified_all).await?;
 
-    // Per-table watermarks: all absent = fresh bootstrap; all present = drain
-    // from the group minimum; a mix is a torn group — refuse loudly.
-    let mut wms = Vec::with_capacity(ctxs.len());
+    // ANNOUNCE, THEN CHECK — before the bootstrap decision, before a watermark
+    // is read, before a row moves. Same artifact, same minting call and same
+    // verdict a bulk run uses, because the matrix's `log_based | anything |
+    // refused` row is only true if the two lanes can actually see each other.
+    // 0.55.0 asserted that row while a drain wrote and read nothing at all.
+    //
+    // Every member is announced before ANY member is checked: a group that
+    // announced table by table while checking as it went would let two
+    // overlapping groups each pass the member the other had not reached yet.
+    let run = crate::naming::RunId::mint(
+        crate::naming::LandKind::Cdc,
+        &crate::pipeline::source_origin(src_url),
+    );
     for c in &ctxs {
-        let wm = dest.read_state(&c.dest_table, &c.source_id).await?;
-        if wm.is_some() {
-            dest.precheck_mode(&c.dest_table, opts.changelog).await?;
+        // A group that failed to announce its third member must not keep the
+        // first two — they would refuse every later run of those tables.
+        if let Err(e) = dest.announce(&c.dest_table, &run).await {
+            for c in &ctxs {
+                dest.release(&c.dest_table, &run).await;
+            }
+            return Err(e);
         }
-        wms.push(wm);
     }
-    let have: Vec<&TableCtx> =
-        ctxs.iter().zip(&wms).filter(|(_, w)| w.is_some()).map(|(c, _)| c).collect();
-    if !have.is_empty() && have.len() != ctxs.len() {
-        let missing: Vec<&str> = ctxs
-            .iter()
-            .zip(&wms)
-            .filter(|(_, w)| w.is_none())
-            .map(|(c, _)| c.dest_table.as_str())
-            .collect();
-        return Err(Error::InvalidInput(format!(
-            "log_based: the group has state for {} of {} tables (missing: {}) — \
-             group membership changed, or a bootstrap was interrupted. Clear \
-             the group's state rows (and drop slot {slot}) to re-bootstrap",
-            have.len(),
-            ctxs.len(),
-            missing.join(", ")
-        )));
+    for c in &ctxs {
+        if let Err(e) = dest.check_peers(&c.dest_table, &run).await {
+            // A drain refused by its own scan must not leave its announcement
+            // behind — the next run would refuse over a drain that never ran.
+            for c in &ctxs {
+                dest.release(&c.dest_table, &run).await;
+            }
+            return Err(e);
+        }
     }
 
-    if have.is_empty() {
-        bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
-    } else {
-        let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
-        drain_group(
-            src_url,
-            &src,
-            dest,
-            &slot,
-            &publication,
-            &ctxs,
-            wm,
-            opts.changelog,
-            budget_denom,
-        )
-        .await
+    // Everything from here is inside one arm, so the announcement is taken
+    // back on EVERY exit. Without it, a run refused between the scan and the
+    // drain — a torn group, a mode mismatch, an unreadable watermark — left
+    // its own lock behind and every later run of the table was refused over a
+    // drain that never started. `e2e_state_contract.py` caught exactly that.
+    let out = async {
+        // Per-table watermarks: all absent = fresh bootstrap; all present = drain
+        // from the group minimum; a mix is a torn group — refuse loudly.
+        let mut wms = Vec::with_capacity(ctxs.len());
+        for c in &ctxs {
+            let wm = dest.read_state(&c.dest_table, &c.source_id).await?;
+            if wm.is_some() {
+                dest.precheck_mode(&c.dest_table, opts.changelog).await?;
+            }
+            wms.push(wm);
+        }
+        let have: Vec<&TableCtx> =
+            ctxs.iter().zip(&wms).filter(|(_, w)| w.is_some()).map(|(c, _)| c).collect();
+        if !have.is_empty() && have.len() != ctxs.len() {
+            let missing: Vec<&str> = ctxs
+                .iter()
+                .zip(&wms)
+                .filter(|(_, w)| w.is_none())
+                .map(|(c, _)| c.dest_table.as_str())
+                .collect();
+            return Err(Error::InvalidInput(format!(
+                "log_based: the group has state for {} of {} tables (missing: {}) — \
+                 group membership changed, or a bootstrap was interrupted. Clear \
+                 the group's state rows (and drop slot {slot}) to re-bootstrap",
+                have.len(),
+                ctxs.len(),
+                missing.join(", ")
+            )));
+        }
+
+        if have.is_empty() {
+            // HAND THE GUARD OVER. A bootstrap's full load IS a bulk run: it goes
+            // back through `transfer(mode="replace")`, whose sink `prepare`
+            // announces a `Swap` lock of its own and then scans — and it would find
+            // OURS and refuse itself. `peer_blocks` says a swap and a CDC drain
+            // cannot coexist, which is the matrix working correctly on the wrong
+            // pair: this is one run, not two.
+            //
+            // So the announcement is released here and the bulk lock covers the
+            // load, which is the long half and the one that moves data. What is
+            // given up is the instant between the two: two CDC runs that both read
+            // "no state" both reach the bootstrap, and the LOSER is refused by the
+            // bulk guard instead of by this one — loudly either way.
+            for c in &ctxs {
+                dest.release(&c.dest_table, &run).await;
+            }
+            bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
+        } else {
+            let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
+            drain_group(
+                src_url,
+                &src,
+                dest.clone(),
+                &slot,
+                &publication,
+                &ctxs,
+                wm,
+                opts.changelog,
+                budget_denom,
+            )
+            .await
+        }
     }
+    .await;
+    for c in &ctxs {
+        dest.release(&c.dest_table, &run).await;
+    }
+    out
 }
 
 // ── first run: one slot, every table pinned to its snapshot ─────────────────
@@ -905,129 +1014,172 @@ async fn run_group_mysql(
         Ok(())
     }
 
-    // State arbitration mirrors the Postgres path: all-absent bootstraps,
-    // all-present drains, a mix is a torn group.
-    let mut marks = Vec::with_capacity(ctxs.len());
+    // ANNOUNCE, THEN CHECK — the MySQL twin of the Postgres path above, for the
+    // same reason and with the same artifact. Every member is announced before
+    // ANY member is checked.
+    let run = crate::naming::RunId::mint(
+        crate::naming::LandKind::Cdc,
+        &crate::pipeline::source_origin(src_url),
+    );
     for c in &ctxs {
-        let m = dest.read_state(&c.dest_table, &c.source_id).await?;
-        if m.is_some() {
-            dest.precheck_mode(&c.dest_table, opts.changelog).await?;
+        // A group that failed to announce its third member must not keep the
+        // first two — they would refuse every later run of those tables.
+        if let Err(e) = dest.announce(&c.dest_table, &run).await {
+            for c in &ctxs {
+                dest.release(&c.dest_table, &run).await;
+            }
+            return Err(e);
         }
-        marks.push(m);
     }
-    let present = marks.iter().filter(|m| m.is_some()).count();
-    if present != 0 && present != marks.len() {
-        let missing: Vec<&str> = ctxs
-            .iter()
-            .zip(&marks)
-            .filter(|(_, m)| m.is_none())
-            .map(|(c, _)| c.qualified.as_str())
-            .collect();
-        return Err(Error::Transfer(format!(
-            "log_based: torn group — these members have no watermark: {}. \
-             Clear the group's state rows to re-bootstrap all of them",
-            missing.join(", ")
-        )));
+    for c in &ctxs {
+        if let Err(e) = dest.check_peers(&c.dest_table, &run).await {
+            for c in &ctxs {
+                dest.release(&c.dest_table, &run).await;
+            }
+            return Err(e);
+        }
     }
 
-    if present == 0 {
-        let su = src_url.to_string();
-        let du = dst_url.to_string();
-        let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, o2| {
-            let su = su.clone();
-            let du = du.clone();
-            async move {
-                let r = Box::pin(crate::transfer(&su, &du, &table_arg, &o2)).await?;
-                Ok((r.rows, r.parallel))
+    // Everything from here is inside one arm so the announcement is taken
+    // back on EVERY exit — a drain that fails for any reason must not leave
+    // its lock behind for the next run to refuse over.
+    let out = async {
+        // State arbitration mirrors the Postgres path: all-absent bootstraps,
+        // all-present drains, a mix is a torn group.
+        let mut marks = Vec::with_capacity(ctxs.len());
+        for c in &ctxs {
+            let m = dest.read_state(&c.dest_table, &c.source_id).await?;
+            if m.is_some() {
+                dest.precheck_mode(&c.dest_table, opts.changelog).await?;
             }
-        })
-        .await?;
-        if opts.changelog {
-            for c in ctxs.iter() {
-                let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
-                dest.validate_changelog_ddl(&c.dest_table, pb, ob).await?;
-            }
+            marks.push(m);
         }
-        for (c, (rows, _)) in ctxs.iter().zip(&out) {
-            let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
-            if let Err(e) = dest
-                .bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
-                    opts.changelog, pb, ob)
-                .await
-            {
-                // Same rollback as the Postgres group: a half-written group is
-                // worse than no group, because the next run refuses it.
+        let present = marks.iter().filter(|m| m.is_some()).count();
+        if present != 0 && present != marks.len() {
+            let missing: Vec<&str> = ctxs
+                .iter()
+                .zip(&marks)
+                .filter(|(_, m)| m.is_none())
+                .map(|(c, _)| c.qualified.as_str())
+                .collect();
+            return Err(Error::Transfer(format!(
+                "log_based: torn group — these members have no watermark: {}. \
+                 Clear the group's state rows to re-bootstrap all of them",
+                missing.join(", ")
+            )));
+        }
+
+        if present == 0 {
+            // HAND THE GUARD OVER — the same handover the Postgres path makes,
+            // and for the same reason: the bootstrap's full load re-enters
+            // `transfer(mode="replace")`, whose sink announces a `Swap` lock and
+            // would be refused by this drain's own. One run, not two.
+            for c in &ctxs {
+                dest.release(&c.dest_table, &run).await;
+            }
+            let su = src_url.to_string();
+            let du = dst_url.to_string();
+            let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, o2| {
+                let su = su.clone();
+                let du = du.clone();
+                async move {
+                    let r = Box::pin(crate::transfer(&su, &du, &table_arg, &o2)).await?;
+                    Ok((r.rows, r.parallel))
+                }
+            })
+            .await?;
+            if opts.changelog {
                 for c in ctxs.iter() {
-                    let _ = dest.clear_state(&c.dest_table, &c.source_id).await;
+                    let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
+                    dest.validate_changelog_ddl(&c.dest_table, pb, ob).await?;
                 }
-                return Err(e);
             }
+            for (c, (rows, _)) in ctxs.iter().zip(&out) {
+                let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
+                if let Err(e) = dest
+                    .bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
+                        opts.changelog, pb, ob)
+                    .await
+                {
+                    // Same rollback as the Postgres group: a half-written group is
+                    // worse than no group, because the next run refuses it.
+                    for c in ctxs.iter() {
+                        let _ = dest.clear_state(&c.dest_table, &c.source_id).await;
+                    }
+                    return Err(e);
+                }
+            }
+            stamp(&dest, &adopt, server).await?;
+            return Ok(out);
         }
+
+        // Drain from the group minimum — members ahead converge idempotently.
+        let wm = marks.iter().flatten().copied().min().unwrap_or(0);
+        let seed = ctxs
+            .iter()
+            .map(|c| c.source_id.as_str())
+            .collect::<Vec<_>>()
+            .join("\x1e");
+        let budget = dest.cdc_window_bytes();
+        let dbg = std::env::var("APITAP_DEBUG").is_ok();
+        // One counter PER TABLE. A single group-wide counter handed the same
+        // total to every member, so a 10-table group reported 10× the changes it
+        // actually applied (the data was right; the number was not).
+        let rows_applied: Vec<std::cell::Cell<u64>> =
+            ctxs.iter().map(|_| std::cell::Cell::new(0u64)).collect();
+
+        // Armed for the incremental drain only — the bootstrap branch above returns
+        // before reaching here. See `crate::shutdown` and the note in `drain_group`.
+        let _stop = crate::shutdown::Guard::install();
+
+        myrun::drain_windows(
+            src_url,
+            &pool,
+            &ctxs,
+            wm,
+            &seed,
+            30,
+            budget,
+            opts.changelog,
+            |outcome| {
+                let dest = &dest;
+                let ctxs = &ctxs;
+                let rows_applied = &rows_applied;
+                async move {
+                    let end = outcome.end_lsn;
+                    for (c, acc) in ctxs.iter().zip(rows_applied.iter()) {
+                        // Every member applies — a table with no traffic in this
+                        // window still advances its watermark.
+                        let n = dest
+                            .apply_no_src(
+                                &c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id,
+                                opts.changelog,
+                            )
+                            .await?;
+                        acc.set(acc.get() + n);
+                        crate::progress::add_rows(n);
+                    }
+                    // A long catch-up drains window after window; the number says
+                    // which one is running, so a stalled run is distinguishable
+                    // from a slow one.
+                    crate::progress::next_window();
+                    if dbg {
+                        eprintln!("[my cdc] window applied → watermark {end}");
+                    }
+                    Ok(end)
+                }
+            },
+        )
+        .await?;
+
         stamp(&dest, &adopt, server).await?;
-        return Ok(out);
+        Ok::<Vec<(u64, usize)>, Error>(rows_applied.iter().map(|a| (a.get(), 1)).collect())
     }
-
-    // Drain from the group minimum — members ahead converge idempotently.
-    let wm = marks.iter().flatten().copied().min().unwrap_or(0);
-    let seed = ctxs
-        .iter()
-        .map(|c| c.source_id.as_str())
-        .collect::<Vec<_>>()
-        .join("\x1e");
-    let budget = dest.cdc_window_bytes();
-    let dbg = std::env::var("APITAP_DEBUG").is_ok();
-    // One counter PER TABLE. A single group-wide counter handed the same
-    // total to every member, so a 10-table group reported 10× the changes it
-    // actually applied (the data was right; the number was not).
-    let rows_applied: Vec<std::cell::Cell<u64>> =
-        ctxs.iter().map(|_| std::cell::Cell::new(0u64)).collect();
-
-    // Armed for the incremental drain only — the bootstrap branch above returns
-    // before reaching here. See `crate::shutdown` and the note in `drain_group`.
-    let _stop = crate::shutdown::Guard::install();
-
-    myrun::drain_windows(
-        src_url,
-        &pool,
-        &ctxs,
-        wm,
-        &seed,
-        30,
-        budget,
-        opts.changelog,
-        |outcome| {
-            let dest = &dest;
-            let ctxs = &ctxs;
-            let rows_applied = &rows_applied;
-            async move {
-                let end = outcome.end_lsn;
-                for (c, acc) in ctxs.iter().zip(rows_applied.iter()) {
-                    // Every member applies — a table with no traffic in this
-                    // window still advances its watermark.
-                    let n = dest
-                        .apply_no_src(
-                            &c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id,
-                            opts.changelog,
-                        )
-                        .await?;
-                    acc.set(acc.get() + n);
-                    crate::progress::add_rows(n);
-                }
-                // A long catch-up drains window after window; the number says
-                // which one is running, so a stalled run is distinguishable
-                // from a slow one.
-                crate::progress::next_window();
-                if dbg {
-                    eprintln!("[my cdc] window applied → watermark {end}");
-                }
-                Ok(end)
-            }
-        },
-    )
-    .await?;
-
-    stamp(&dest, &adopt, server).await?;
-    Ok(rows_applied.iter().map(|a| (a.get(), 1)).collect())
+    .await;
+    for c in &ctxs {
+        dest.release(&c.dest_table, &run).await;
+    }
+    out
 }
 
 async fn bootstrap_group(
@@ -1180,7 +1332,10 @@ async fn bootstrap_group(
 async fn drain_group(
     src_url: &str,
     src: &PgPool,
-    dest: Dest,
+    // Shared, not owned: the apply task runs off the drain's clock and needs a
+    // handle of its own, while the caller keeps one to release its
+    // announcement when the drain is over.
+    dest: std::sync::Arc<Dest>,
     slot: &str,
     publication: &str,
     ctxs: &[TableCtx],
@@ -1287,7 +1442,7 @@ async fn drain_group(
         while let Some(o) = win_rx.recv().await {
             let t_apply = std::time::Instant::now();
             let lanes = dest.apply_lanes();
-            if let Dest::Bq(d) = &dest {
+            if let Dest::Bq(d) = &*dest {
                 // BigQuery: stage every table concurrently (one load job each),
                 // then commit the whole group's MERGEs + watermarks in as few
                 // script jobs as possible. A MERGE carries ~7.3 s of fixed job

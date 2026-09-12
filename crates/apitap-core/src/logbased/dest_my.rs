@@ -67,6 +67,12 @@ where
     )))
 }
 
+/// `dest_table` may arrive schema-qualified; the MySQL database comes from the
+/// URL, so only the bare name addresses the table (same trim as the sink).
+fn bare(dest_table: &str) -> &str {
+    dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t)
+}
+
 impl MyDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
         Ok(Self { shared: MySqlSink::shared_pool(url)? })
@@ -74,6 +80,69 @@ impl MyDest {
 
     fn fq(&self, table: &str) -> String {
         format!("{}.{}", my_ident(self.shared.db()), my_ident(table))
+    }
+
+    fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
+        crate::naming::artifact_ident_run(
+            bare(dest_table), crate::naming::Artifact::Lock, crate::naming::MY_IDENT_MAX, run)
+    }
+
+    /// This run's announcement — see `sink::postgres::announce_run`. The name is
+    /// minted by `naming` and the verdict is `naming::guard_verdict`, so a drain
+    /// and a bulk run agree on both; only the catalog statements are spelled
+    /// here, in this engine's dialect.
+    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        let mut conn = self.shared.conn().await?;
+        // MySQL has no zero-column table, so the lock carries one nothing reads.
+        conn.query_drop(format!(
+            "CREATE TABLE IF NOT EXISTS {} (t TINYINT) ENGINE=MEMORY",
+            self.fq(&self.lock_name(dest_table, run))
+        ))
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based: announce run: {e}")))
+    }
+
+    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        let b = bare(dest_table);
+        let esc = |v: &str| v.replace('|', "||").replace('_', "|_").replace('%', "|%");
+        let mut found: Vec<String> = Vec::new();
+        let mut conn = self.shared.conn().await?;
+        for &a in crate::naming::GUARDED {
+            let (head, suffix) =
+                crate::naming::artifact_match(b, a, crate::naming::MY_IDENT_MAX);
+            let rows: Vec<String> = conn
+                .exec(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = ? AND table_type = 'BASE TABLE' \
+                       AND table_name LIKE ? ESCAPE '|'",
+                    (self.shared.db(), format!("{}%{}", esc(&head), esc(suffix))),
+                )
+                .await
+                .map_err(|e| Error::Transfer(format!("log_based: staging scan: {e}")))?;
+            found.extend(rows);
+        }
+        crate::naming::guard_verdict(
+            &format!("{}.{b}", self.shared.db()),
+            b,
+            crate::naming::MY_IDENT_MAX,
+            run,
+            found.iter().map(String::as_str),
+        )
+    }
+
+    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
+        if let Ok(mut conn) = self.shared.conn().await {
+            let _ = conn
+                .query_drop(format!(
+                    "DROP TABLE IF EXISTS {}",
+                    self.fq(&self.lock_name(dest_table, run))
+                ))
+                .await;
+        }
     }
 
     pub(crate) async fn read_state(

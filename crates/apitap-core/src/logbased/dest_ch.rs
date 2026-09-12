@@ -131,6 +131,73 @@ impl ChDest {
         Ok(())
     }
 
+    fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
+        crate::naming::artifact_ident_run(
+            dest_table, crate::naming::Artifact::Lock, crate::naming::ROOMY, run)
+    }
+
+    /// This run's announcement — see `sink::postgres::announce_run`. The name is
+    /// minted by `naming` and the verdict is `naming::guard_verdict`, so a drain
+    /// and a bulk run agree on both; only the catalog statements are spelled
+    /// here, in this engine's dialect.
+    ///
+    /// No `ON CLUSTER`: the CDC lane refuses a Replicated destination outright
+    /// (`refuse_clustered`), so everything it touches is node-local by
+    /// construction.
+    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        self.ch
+            .exec(&format!(
+                "CREATE TABLE IF NOT EXISTS {} (t UInt8) ENGINE = Memory",
+                ch_ident(&self.lock_name(dest_table, run))
+            ))
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+        let mut found: Vec<String> = Vec::new();
+        for &a in crate::naming::GUARDED {
+            let (head, suffix) =
+                crate::naming::artifact_match(dest_table, a, crate::naming::ROOMY);
+            let body = self
+                .ch
+                .exec(&format!(
+                    "SELECT name FROM system.tables \
+                     WHERE database = currentDatabase() AND name LIKE '{}' \
+                     FORMAT TabSeparatedRaw",
+                    ch_str(&format!("{}%{}", esc(&head), esc(suffix)))
+                ))
+                .await?;
+            found.extend(
+                body.lines()
+                    .map(|l| l.trim_end_matches('\r').to_string())
+                    .filter(|l| !l.is_empty()),
+            );
+        }
+        crate::naming::guard_verdict(
+            &format!("{}.{dest_table}", self.ch.database()),
+            dest_table,
+            crate::naming::ROOMY,
+            run,
+            found.iter().map(String::as_str),
+        )
+    }
+
+    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
+        let _ = self
+            .ch
+            .exec(&format!(
+                "DROP TABLE IF EXISTS {}",
+                ch_ident(&self.lock_name(dest_table, run))
+            ))
+            .await;
+    }
+
     /// The changelog append's intent marker: "a window starting at `lsn` is
     /// being appended to `dest_table`".
     ///

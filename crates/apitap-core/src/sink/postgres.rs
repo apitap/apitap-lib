@@ -10,6 +10,95 @@ use crate::Mode;
 use sqlx::postgres::{PgPoolCopyExt, PgPoolOptions};
 use sqlx::PgPool;
 use crate::dialect::postgres::{quote_ident, quote_ident_path};
+
+/// The announce-then-check triple, as free functions.
+///
+/// Free, and not methods, because the CDC lane has to run exactly the same
+/// three steps against exactly the same names. A drain and a bulk run can only
+/// see each other if both spell the artifact identically and look in the same
+/// place — so there is one spelling and one scan, used by both, rather than a
+/// second copy in `logbased::dest_pg` that would drift the first time either
+/// side was touched. That drift is the whole story of the 0.55.0 guard, which
+/// was open-coded seven times and wrong in six of them.
+///
+/// `lock_q` is the fully quoted, schema-qualified lock name from
+/// [`lock_ident`]; `schema` and `bare` are the unquoted catalog spellings the
+/// scan needs.
+
+/// This run's announcement.
+///
+/// An empty table is enough: nothing reads its contents, only its name, which
+/// carries the run token the scan classifies. `UNLOGGED` because it never needs
+/// to survive a crash — a lock that outlives the process it belongs to is the
+/// operational cost this protocol trades for, not a feature.
+pub(crate) async fn announce_run(pool: &PgPool, lock_q: &str) -> Result<()> {
+    sqlx::query(&format!("CREATE UNLOGGED TABLE IF NOT EXISTS {lock_q} ()"))
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| Error::Transfer(format!("announce run: {e}")))
+}
+
+/// Best-effort: the run is over either way, and a failure to drop the lock must
+/// not turn a finished transfer into an error. What it leaves behind is a name
+/// the next run refuses with `locked_error`, which says how to clear it.
+pub(crate) async fn release_run(pool: &PgPool, lock_q: &str) {
+    let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {lock_q}"))
+        .execute(pool)
+        .await;
+}
+
+/// Every guarded artifact beside `schema.bare`, judged by `naming`.
+pub(crate) async fn check_peers(
+    pool: &PgPool,
+    schema: &str,
+    bare: &str,
+    run: &crate::naming::RunId,
+) -> Result<()> {
+    use crate::naming::{artifact_match, GUARDED};
+    // `_` and `%` are LIKE wildcards and both appear in these names.
+    let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+    let mut found: Vec<String> = Vec::new();
+    for &a in GUARDED {
+        let (head, suffix) = artifact_match(bare, a, crate::naming::PG_IDENT_MAX);
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE $2",
+        )
+        .bind(schema)
+        .bind(format!("{}%{}", esc(&head), esc(suffix)))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
+        found.extend(rows);
+    }
+    crate::naming::guard_verdict(
+        &format!("{schema}.{bare}"),
+        bare,
+        crate::naming::PG_IDENT_MAX,
+        run,
+        found.iter().map(String::as_str),
+    )
+}
+
+/// A destination table split the way `PgSink::bind` splits it, so both lanes
+/// derive the same quoted lock name and the same catalog schema from the same
+/// string. Returns `(quoted lock ident, catalog schema, bare table)`.
+pub(crate) fn lock_ident(dest_table: &str, run: &crate::naming::RunId) -> (String, String, String) {
+    let (pfx, bare) = match dest_table.rsplit_once('.') {
+        Some((s, t)) => (format!("{s}."), t.to_string()),
+        None => (String::new(), dest_table.to_string()),
+    };
+    let schema = pfx.trim_end_matches('.');
+    let schema = if schema.is_empty() { "public".to_string() } else { schema.to_string() };
+    let lock = quote_ident_path(&format!(
+        "{pfx}{}",
+        crate::naming::artifact_ident_run(
+            &bare, crate::naming::Artifact::Lock, crate::naming::PG_IDENT_MAX, run)
+    ));
+    (lock, schema, bare)
+}
 // ---------------------------------------------------------------------------------
 // Sink
 // ---------------------------------------------------------------------------------
@@ -96,57 +185,16 @@ impl PgSink {
     /// table's staging, and a run failed to recognise its own artifacts inside
     /// a multi-table transfer. Those are ordering and boundary questions with
     /// one right answer, so they have one implementation.
-    /// This run's announcement, written BEFORE the scan.
-    ///
-    /// An empty table is enough: nothing reads its contents, only its name,
-    /// which carries the run token the scan classifies. `UNLOGGED` because it
-    /// never needs to survive a crash — a lock that outlives the process it
-    /// belongs to is the operational cost this protocol trades for, not a
-    /// feature.
     async fn announce(&self) -> Result<()> {
-        sqlx::query(&format!("CREATE UNLOGGED TABLE IF NOT EXISTS {} ()", self.lock_t))
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Transfer(format!("announce run: {e}")))
+        announce_run(&self.pool, &self.lock_t).await
     }
 
-    /// Best-effort: the run is over either way, and a failure to drop the lock
-    /// must not turn a finished transfer into an error. What it leaves behind
-    /// is a name the next run refuses with `locked_error`, which says how to
-    /// clear it.
     async fn release(&self) {
-        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.lock_t))
-            .execute(&self.pool)
-            .await;
+        release_run(&self.pool, &self.lock_t).await
     }
 
     async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{artifact_match, GUARDED};
-        // `_` and `%` are LIKE wildcards and both appear in these names.
-        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
-        let mut found: Vec<String> = Vec::new();
-        for &a in GUARDED {
-            let (head, suffix) = artifact_match(&self.bare, a, crate::naming::PG_IDENT_MAX);
-            let rows: Vec<String> = sqlx::query_scalar(
-                "SELECT c.relname FROM pg_class c \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE $2",
-            )
-            .bind(&self.schema)
-            .bind(format!("{}%{}", esc(&head), esc(suffix)))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
-            found.extend(rows);
-        }
-        crate::naming::guard_verdict(
-            &format!("{}.{}", self.schema, self.bare),
-            &self.bare,
-            crate::naming::PG_IDENT_MAX,
-            &self.run,
-            found.iter().map(String::as_str),
-        )
+        check_peers(&self.pool, &self.schema, &self.bare, &self.run).await
     }
 
     async fn drop_staging(&self, name: &str) -> Result<()> {

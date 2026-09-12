@@ -43,7 +43,7 @@ The two properties everything else rests on:
 | what happened | state left behind | recovery | verified |
 |---|---|---|---|
 | **Process SIGKILLed mid bulk transfer** | Previous destination table **intact and readable throughout** (proven: 1,000 rows and their marker unchanged while 10M rows were streaming into staging). The staging object — `<dest>_<runtoken>__apitap_staging` — is left behind: SIGKILL runs no error path. | **0.55.0+: drop that object, then re-run.** The next run REFUSES while it is there, with a `locked:` error naming it, because nothing collects a crashed run's workspace on a timer — see [Two runs, one table](#two-runs-one-table) for why a timestamp cannot tell a crash from a slow load. Before 0.55.0 the next run dropped it blindly, which is the concurrency defect that release closed. Every *ordinary* error path drops its own staging **since 0.55.1**; only a kill skips it. On 0.55.0 exactly that sentence was false — the driver had no error arm at all, so a cut connection or a statement timeout also left staging behind and every later run of the table was refused for a run that had already died. | `e2e_failure_modes.py` case 1 (the kill) and case 3 (an ordinary error, which now asserts nothing is left and that the next run is not refused) |
-| **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) | Re-run. Every change is applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2 |
+| **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) **0.56.0+: the run's `<dest>_<runtoken>__apitap_lock` is left behind too**, and the next run of that table is REFUSED until it is dropped. A graceful stop does not leave one. | Drop the named lock table, then re-run. Nothing else is needed — no data was published and no watermark moved. Every change is then applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2, and `e2e_sigterm.py` legs 2-3, which kill the process outright and then do the operator's part before resuming |
 | **SIGTERM mid CDC window** (pod evicted, Airflow run cleared, `systemctl stop`) | The window in flight is **applied**, not discarded, and the watermark advances with it. The run exits 0 with a report of the rows it landed. | Nothing. The next run picks up from the new watermark. A second SIGTERM is not absorbed — the default disposition comes back and the process ends at once, which is the SIGKILL case above and equally safe. | `e2e_sigterm.py` (Postgres, incl. a control run with the mechanism disabled), `e2e_sigterm_my.py` (MySQL binlog) |
 | **Two runs of the same destination table at once** (0.55.0+) | **Refused, at `prepare`, before a row moves.** The second run exits non-zero with a `locked:` error naming how long ago the other started, what it is doing, and why the two cannot share the table. Nothing is written; the first run finishes normally. On 0.54.0 and earlier the two interleaved destructively — see [Two runs, one table](#two-runs-one-table). | Run them one at a time — a scheduler's own concurrency setting is the usual answer (Airflow `max_active_runs=1`, a cron `flock`). If the other run is dead rather than slow, drop the staging object the error names and re-run; nothing collects it for you, and the section below says why. | `e2e_concurrent_runs.py` (Postgres: the refusal, the survivor, a control, and fan-in) |
 | **Source connection cut mid-COPY** (server restart, `pg_terminate_backend`, idle/statement timeout, network drop) | Nothing published. The destination table is **not even created** — it only comes into existence at the swap. | Re-run. The error says so explicitly rather than making you guess. | case 3 |
@@ -257,32 +257,67 @@ run leaves it beside the parts.
 | this run | a live peer | outcome |
 |---|---|---|
 | `replace` | another BULK run | refused — a swap replaces the whole table, so whichever finishes second throws the other's work away |
-| `log_based` | anything | **not guarded yet** — see below |
+| `log_based` | anything | refused, **except into Iceberg** — see below |
 | `append`/`merge` | `replace` | refused |
-| `append`/`merge` | `log_based` | **not guarded yet** — see below |
+| `append`/`merge` | `log_based` | refused, **except into Iceberg** |
 | two BULK runs starting in the same instant | each other | **both refused** — the 0.56.0 trade above |
 | `append`/`merge` | same source | refused — both would read the same watermark and land the same rows twice |
 | `append`/`merge` | **different** source | **allowed** — this is fan-in, and `_apitap_state` keys watermarks per source precisely so it works |
 
-**The `log_based` rows are not enforced, and 0.55.0 said they were.** A CDC
-drain never enters the guard at all: `transfer(mode="log_based")` returns into
-the drain before the bulk dispatcher runs, and the dispatcher is the only place
-a run identity is minted. So a drain mints none, writes no tokenized artifact,
-and calls no sink's `prepare` — which means two drains of one table are not
-refused, and neither is a drain running beside a bulk `replace`, in either
-direction. Only a Postgres SOURCE gets partial cover, from a replication-slot
-check that predates this mechanism; a MySQL or MariaDB source has nothing.
+**The `log_based` rows were not enforced until 0.56.0, and 0.55.0 said they
+were.** A CDC drain never entered the guard at all: `transfer(mode="log_based")`
+returns into the drain before the bulk dispatcher runs, and the dispatcher was
+the only place a run identity was minted. So a drain minted none, wrote no
+tokenized artifact and called no sink's `prepare` — which meant two drains of
+one table were not refused, and neither was a drain running beside a bulk
+`replace`, in either direction. Only a Postgres SOURCE got partial cover, from a
+replication-slot check that predates this mechanism.
 
-Until that is closed, one drain per destination table is the operator's to
-enforce — the same scheduler setting the rest of this section recommends.
+**0.56.0 closed it on Postgres, MySQL, ClickHouse and BigQuery destinations.**
+The drain mints a `LandKind::Cdc` identity from the same normalized source
+origin the bulk lane uses, writes the same tokenized `__apitap_lock` before it
+reads a watermark or decides whether to bootstrap, and scans for BOTH kinds of
+artifact. A drain and a `replace` now refuse each other in both directions, and
+so do two drains, with the same typed `LockedError` and the same message.
 
-0.56.0 closed the *bulk* half of this: every sink announces itself before it
-scans, so bulk-against-bulk is now guarded at the start instant as well as
-mid-run. The drain does not yet write or read that announcement, so the two
-`log_based` rows above still say what they say. What 0.56.0 changed is that the
-mechanism the drain needs now exists and is the same one the bulk lane uses —
-a tokenized `__apitap_lock` written before the scan — rather than something
-still to be designed.
+Two details worth knowing:
+
+- **A bootstrap hands the guard over.** A first run's full load re-enters
+  `transfer(mode="replace")`, whose sink announces a *swap* lock of its own —
+  and the matrix would have it refuse the drain's. That is the matrix working
+  correctly on the wrong pair, because this is one run and not two, so the drain
+  releases its announcement and the bulk lock covers the load. What that gives
+  up is the instant between the two: two CDC runs that both read "no state" both
+  reach the bootstrap, and the loser is refused by the bulk guard rather than
+  the CDC one. Loudly, either way.
+- **A hard-killed drain leaves its announcement, and the next run refuses.**
+  This is new in 0.56.0 and it is the price of the row above. Every clean exit
+  takes the lock back — including the graceful SIGTERM stop, an ordinary error,
+  and a refusal — but a process killed outright (`SIGKILL`, an OOM kill, a node
+  that goes away) runs no code at all. The next run of that table then fails
+  with the `locked:` error naming the object, and removing it is a manual step.
+
+  It is the same contract a killed bulk run has always had for its staging
+  table, and the same reasoning: a timestamp in the name records when the RUN
+  started, not when the object was made, so nothing can prove a lock is stale
+  and collecting one on a guess is how two drains end up applying overlapping
+  windows. What is genuinely different is that before 0.56.0 a killed drain left
+  NOTHING, and the next scheduled run simply resumed from its watermark. If your
+  drains are unattended, know this: one hard kill now needs one `DROP TABLE`
+  before the pipeline runs again.
+
+  The proper fix is a liveness signal from the engine rather than a timestamp —
+  an object whose mtime advances while the run writes, a lease the run renews —
+  which is what would let a stale lock be collected safely. It is named
+  follow-up work, not a guess to make here.
+
+- **Iceberg destinations are still unguarded for the drain.** A claim there
+  lives in object storage, and the CDC lane holds only a catalog connection;
+  resolving the table's storage location and credentials is the sink's
+  `prepare` work, and doing it a second time in the drain is exactly the
+  duplication this design exists to avoid. An Iceberg CDC *bootstrap* rides the
+  bulk sink and is covered; its incremental windows are not. One drain per
+  Iceberg table stays the scheduler's job.
 
 An earlier plan for this said "an atomic create has exactly one winner, so use
 one lock". That was wrong and is recorded here so it is not re-proposed: an

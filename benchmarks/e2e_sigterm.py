@@ -106,6 +106,29 @@ def ch_count():
     return int(v) if v.isdigit() else -1
 
 
+def clear_dead_lock():
+    """Drop the announcement a HARD-KILLED drain leaves behind.
+
+    Since 0.56.0 a `log_based` run announces itself with a tokenized
+    `__apitap_lock` for the duration of the drain, so a `replace` and a drain of
+    one table refuse each other. Every clean exit — including the graceful
+    SIGTERM this file is about — takes it back; a process killed outright runs
+    no code at all and leaves it, exactly as a killed bulk run leaves its
+    staging table. The next run then refuses with a `locked:` error naming the
+    object, and removing it is the operator's call.
+
+    The legs below deliberately kill the process, so they do the operator's part
+    here. This is NOT the guard being worked around: `e2e_cdc_guard.py` is where
+    the refusal is asserted. It is this file saying out loud what a hard kill now
+    costs, so the cost cannot change silently.
+    """
+    for n in ch(
+        "SELECT name FROM system.tables WHERE database = currentDatabase() "
+        f"AND startsWith(name, '{T}') AND endsWith(name, '__apitap_lock')").split():
+        if n:
+            ch(f"DROP TABLE IF EXISTS `{n}`")
+
+
 def case(label, good, detail=""):
     global ok
     print(f"   {'OK' if good else 'XX'} {label}{': ' + detail if detail else ''}")
@@ -227,6 +250,9 @@ else:
 # That is fine: the next leg measures its own floor.
 # ---------------------------------------------------------------------------
 print("== leg 1: the graceful stop — exit 0, partial progress, work left ==")
+# A deliberate kill above left its announcement; do the operator's part.
+clear_dead_lock()
+
 floor = ch_count()
 if floor >= src_total:
     case("there is still a backlog to interrupt", False, "the control run drained it all")
@@ -257,6 +283,9 @@ else:
 
 # ---------------------------------------------------------------------------
 print("== leg 2: twice to insist - the second SIGTERM is not absorbed ==")
+# A deliberate kill above left its announcement; do the operator's part.
+clear_dead_lock()
+
 # The two signals go out back to back, ~0.1 s apart, and the leg checks the
 # process is STILL RUNNING in between. That check is what makes the leg valid:
 # without it, a second signal delivered to an already-finished process would
@@ -327,6 +356,8 @@ if not twice_ok:
 
 # ---------------------------------------------------------------------------
 print("== leg 3: the resume is exact — no rows skipped by the early stops ==")
+# Leg 2 killed the process outright, so it left its announcement behind.
+clear_dead_lock()
 floor = ch_count()
 r = sh([sys.executable, "-c", RUN], env=dict(os.environ, APITAP_CDC_WINDOW_BYTES=WINDOW))
 case("the resume run succeeds", r.returncode == 0, r.stderr.strip()[-200:])
@@ -339,6 +370,9 @@ case("and its key sum matches exactly", src_sum == dst_sum, f"pg={src_sum} ch={d
 
 # ---------------------------------------------------------------------------
 print("== leg 4: request_stop() from another thread ==")
+# A deliberate kill above left its announcement; do the operator's part.
+clear_dead_lock()
+
 # The public door, for hosts whose signal handling apitap will not touch. It
 # runs off-thread because that is the shape it exists for: the main thread
 # stays in the interpreter and decides to wind the job down.

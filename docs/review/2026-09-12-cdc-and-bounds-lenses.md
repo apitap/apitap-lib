@@ -62,10 +62,54 @@ changed, and both e2e legs go red without the fix.
   drains again. 0.55.1: `log rows 10 -> 17`, ids 4 and 5 each holding two `I`
   records. Now: `10 -> 10`.
 
-**Also closed in the same pass, from the older brief's §4:** the seven sinks now
-ANNOUNCE before they scan (`Artifact::Lock`), which closes the start-instant
-window for the bulk lane. The CDC lane does not yet write or read that
-announcement — that half of A2 is still open.
+**Also closed in the same pass, from the older brief's §4 and A2:** the seven
+sinks ANNOUNCE before they scan (`Artifact::Lock`), which closes the
+start-instant window for the bulk lane, and the CDC drain now writes and reads
+the SAME artifact — so the matrix's `log_based | anything | refused` row is true
+for the first time, on Postgres, MySQL, ClickHouse and BigQuery destinations.
+
+Three things that cost a measurement:
+
+* a run refused by its own scan leaked its lock and poisoned the next run, which
+  `e2e_failure_modes.py` leg 1 caught. `prepare` is the one step outside the
+  error arm that covers everything else, so `pipeline::run` releases it
+  (`Sink::release_lock`).
+* a CDC BOOTSTRAP re-enters `transfer(mode="replace")`, which announces a *swap*
+  lock — and `peer_blocks(swap, cdc)` would have it refuse the drain that
+  started it. The drain hands the guard over before the load and the bulk lock
+  covers it; the trade is written down in `docs/failure-modes.md`.
+* Iceberg's drain is NOT guarded: a claim there lives in object storage and the
+  CDC lane holds only a catalog connection. Its bootstrap rides the bulk sink,
+  so the expensive half is covered. Stated in the README and failure-modes.
+
+**The cost, and the follow-up it names.** A hard-killed drain now leaves its
+lock, and the next run of that table is refused until someone drops it. That is
+the same contract a killed bulk run has always had for its staging table, and it
+comes from the same rule — nothing is collected on a guess. What is genuinely
+new is that before 0.56.0 a killed drain left NOTHING and the next scheduled run
+simply resumed, so for unattended CDC this converts a self-healing failure into a
+manual one. Written down in `docs/failure-modes.md` in both the table and the
+section, and in the README.
+
+The clean fix is the one `naming::classify` already names: a liveness signal from
+the engine instead of a timestamp — a lease the run renews, or an object whose
+mtime advances while it writes. Two designs were considered and rejected here,
+and the reasons are worth keeping:
+
+* *Collect a lock whose replication slot is inactive.* Real liveness, and
+  available: `run_group` holds the source pool and the slot name. But a drain
+  that has announced and not yet attached its walsender reads as inactive, so a
+  live peer could be collected — which reintroduces exactly the start-instant
+  window the announcement closes.
+* *A deterministic per-pipeline token, so a re-run recognises its predecessor's
+  lock as its own.* Self-healing, and wrong: two CONCURRENT drains of one
+  pipeline would recognise each other the same way and both proceed.
+
+Verified: `benchmarks/e2e_cdc_guard.py` (new, in the gate). It plants a
+live-looking peer of each kind and asks for the refusal, in both directions,
+with two controls — a clean drain still works, and a prefix-sharing sibling's
+lock is none of this table's business. Against the 0.56.0 build that had the
+bulk half only, the three CDC-side assertions read `it was ALLOWED`.
 
 | sev | finding | where |
 |---|---|---|

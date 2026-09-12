@@ -17,6 +17,33 @@ pub(crate) struct PgDest {
 }
 
 impl PgDest {
+    /// The CDC lane's half of the announce-then-check protocol.
+    ///
+    /// It calls the BULK sink's functions, not copies of them, and that is the
+    /// entire point: a drain and a bulk `replace` can only refuse each other if
+    /// both write and read the same artifact name in the same place. A second
+    /// implementation here would agree on the day it was written and drift the
+    /// first time either side was touched — which is exactly how the 0.55.0
+    /// guard came to be wrong in six sinks out of seven.
+    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        let (lock_q, _, _) = crate::sink::postgres::lock_ident(dest_table, run);
+        crate::sink::postgres::announce_run(&self.pool, &lock_q).await
+    }
+
+    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        let (_, schema, bare) = crate::sink::postgres::lock_ident(dest_table, run);
+        crate::sink::postgres::check_peers(&self.pool, &schema, &bare, run).await
+    }
+
+    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
+        let (lock_q, _, _) = crate::sink::postgres::lock_ident(dest_table, run);
+        crate::sink::postgres::release_run(&self.pool, &lock_q).await
+    }
+
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(2)
