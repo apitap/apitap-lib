@@ -24,6 +24,7 @@ is worse than no gate, because it reads like proof.
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -86,6 +87,35 @@ LEGS = [
 ]
 
 
+# Uppercase FAILED is only ever a verdict in these legs — checked across all 34
+# at the time of writing, the sole other occurrence is inside a module docstring
+# (e2e_long_names.py), which is never printed. Lowercase "failed" IS ordinary
+# prose ("✓ failed as the topology dictates") so the match is case-sensitive and
+# word-bounded.
+_VERDICT_FAILED = re.compile(r"\bFAILED\b")
+
+
+def leg_verdict(returncode, stdout):
+    """PASS/FAIL for one leg, and WHY — the whole rule, in one testable place.
+
+    Returncode alone was the rule until 0.55.1, and four changelog legs printed
+    their verdict without ever exiting on it: `ok` was computed, FAILED was
+    printed, the process exited 0, and the gate recorded PASS. Those four now
+    exit properly, but a leg written tomorrow can forget again, so the gate no
+    longer trusts the exit code by itself. A leg that SAYS it failed has failed,
+    whatever it returns.
+
+    Returns (ok: bool, why: str) — `why` is empty when the two agree.
+    """
+    said_failed = bool(_VERDICT_FAILED.search(stdout or ""))
+    if returncode != 0:
+        return False, ""
+    if said_failed:
+        return False, ("exited 0 but its output says FAILED — the leg is not "
+                       "turning its verdict into an exit code")
+    return True, ""
+
+
 def capabilities():
     """What this box can actually exercise. Reported, never silently assumed."""
     have, why = set(), {}
@@ -110,6 +140,55 @@ def capabilities():
     return have, why
 
 
+def self_test():
+    """Prove the gate can record a FAIL. Run it after touching leg_verdict().
+
+    A gate is a claim about other code, and this file spent a release unable to
+    fail four of its legs. The unit cases pin the rule; the end-to-end case
+    spawns a real leg that prints FAILED and exits 0 — the exact shape that
+    slipped through — and asserts the gate calls it FAIL.
+    """
+    import tempfile
+    bad = 0
+
+    def case(label, got, want):
+        nonlocal bad
+        if got != want:
+            bad += 1
+            print(f"  XX {label}: got {got!r}, want {want!r}")
+        else:
+            print(f"  OK {label}")
+
+    print("gate self-test: the rule")
+    case("clean exit, clean output -> pass",
+         leg_verdict(0, "CH CHANGELOG E2E: ALL GREEN")[0], True)
+    case("non-zero exit -> fail",
+         leg_verdict(1, "CH CHANGELOG E2E: ALL GREEN")[0], False)
+    case("exit 0 but printed FAILED -> fail",
+         leg_verdict(0, "MYSQL CHANGELOG E2E: FAILED")[0], False)
+    case("...and says why",
+         "not turning its verdict into an exit code" in leg_verdict(0, "X: FAILED")[1], True)
+    # The two shapes that must NOT trip it, or the gate cries wolf and gets
+    # ignored — which is how a real failure hides.
+    case("lowercase prose is not a verdict",
+         leg_verdict(0, "   OK failed as the topology dictates")[0], True)
+    case("FAILURE-MODE ... ALL GREEN is not a verdict",
+         leg_verdict(0, "FAILURE-MODE E2E: ALL GREEN")[0], True)
+
+    print("gate self-test: end to end")
+    with tempfile.TemporaryDirectory() as d:
+        leg = os.path.join(d, "e2e_selftest_liar.py")
+        with open(leg, "w") as fh:
+            fh.write('print("LIAR E2E: FAILED")\n')          # prints failure, exits 0
+        r = subprocess.run([sys.executable, leg], capture_output=True, text=True)
+        case("a leg that prints FAILED and exits 0 is recorded FAIL",
+             leg_verdict(r.returncode, r.stdout)[0], False)
+        case("(rig) that leg really did exit 0", r.returncode, 0)
+
+    print(f"\ngate self-test: {'PASSED' if not bad else str(bad) + ' CASES WRONG'}")
+    return 0 if not bad else 1
+
+
 def main():
     # Line-buffered, because this runs redirected to a log for tens of minutes
     # and a silent log is indistinguishable from a hung one.
@@ -121,7 +200,12 @@ def main():
     ap.add_argument("--only", help="substring filter on the leg's script name")
     ap.add_argument("--list", action="store_true", help="show the plan, run nothing")
     ap.add_argument("--timeout", type=int, default=3600, help="per-leg seconds")
+    ap.add_argument("--self-test", action="store_true",
+                    help="prove the gate can fail a leg, then exit")
     args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     have, why = capabilities()
     legs = [l for l in LEGS if not args.only or args.only in l[0]]
@@ -158,20 +242,25 @@ def main():
                            timeout=args.timeout)
         dt = time.time() - t0
         tail = (r.stdout.strip().splitlines() or [""])[-1][:90]
-        if r.returncode == 0:
+        good, why = leg_verdict(r.returncode, r.stdout)
+        if good:
             passed.append(label)
             print(f"[{i:2}/{len(legs)}] PASS {label:<38} {dt:6.1f}s  {tail}")
         else:
-            failed.append((label, r))
+            failed.append((label, r, why))
             print(f"[{i:2}/{len(legs)}] FAIL {label:<38} {dt:6.1f}s  {tail}")
+            if why:
+                print(f"{'':9} ^^ {why}")
 
     print(f"\n{'='*70}")
     print(f"gate: {len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped "
           f"in {time.time()-started:.0f}s")
     for script, req in skipped:
         print(f"  SKIPPED {script} (needs {req}) — this gate is PARTIAL")
-    for script, r in failed:
+    for script, r, why in failed:
         print(f"\n--- {script} ---")
+        if why:
+            print(f"    !! {why}")
         for line in (r.stdout or "").strip().splitlines()[-15:]:
             print(f"    {line}")
         for line in (r.stderr or "").strip().splitlines()[-8:]:

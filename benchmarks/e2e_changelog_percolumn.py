@@ -171,3 +171,10 @@ print("== cleanup ==")
 reset()
 print(f"\n   ===== PER-TABLE PARTITION E2E ({DEST}): "
       + ("ALL GREEN" if ok else "FAILED") + " =====")
+
+# The verdict above was printed and then thrown away: this file used to end
+# here, so `python e2e_changelog_*.py` exited 0 whatever `ok` held, and
+# gate.py — which keys PASS on returncode — recorded a green leg over a
+# printed FAILED. Four legs shared the bug; e2e_changelog_ch.py was the only
+# one that ever exited on its verdict.
+raise SystemExit(0 if ok else 1)
