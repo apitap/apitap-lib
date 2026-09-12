@@ -186,7 +186,7 @@ use it for rebuildable destinations.
   transaction. Readers never see a partial load; a mid-run failure leaves the previous
   table untouched.
 - **0-row guard** — an empty source never wipes an existing destination table.
-- **One run per destination table** (0.55.0+) — the run's identity is part of the
+- **One run per destination table** (0.55.0+, **bulk modes only**) — the run's identity is part of the
   staging object's name, so a run can only publish an object it minted. A second run
   of the same table is refused at `prepare`, before a row moves, with an error naming
   the run that holds it. Fan-in is still allowed: two `append` runs from *different*
@@ -196,6 +196,9 @@ use it for rebuildable destinations.
   check-then-act, so two runs starting in the same *instant* can still both pass
   it; there the guarantee narrows to "the destination stays whole and no staging
   is orphaned", which is asserted on live servers.
+  `mode="log_based"` drains do NOT enter this guard yet — two drains of one
+  table, or a drain beside a bulk run, are not refused; that is 0.56.0, and
+  until then one drain per table is the scheduler's job.
   ([the matrix, the window, and what a killed run leaves](docs/failure-modes.md))
 
 The failure modes these guarantees do *not* cover — a killed process, a cut

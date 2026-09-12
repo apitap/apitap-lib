@@ -234,11 +234,28 @@ current run mints that name, so nothing living can own it.
 
 | this run | a live peer | outcome |
 |---|---|---|
-| `replace` | anything | refused — a swap replaces the whole table, so whichever finishes second throws the other's work away |
-| `log_based` | anything | refused — a CDC drain owns the watermark and the replication slot |
-| `append`/`merge` | `replace` or `log_based` | refused |
+| `replace` | another BULK run | refused — a swap replaces the whole table, so whichever finishes second throws the other's work away |
+| `log_based` | anything | **not guarded yet** — see below |
+| `append`/`merge` | `replace` | refused |
+| `append`/`merge` | `log_based` | **not guarded yet** — see below |
 | `append`/`merge` | same source | refused — both would read the same watermark and land the same rows twice |
 | `append`/`merge` | **different** source | **allowed** — this is fan-in, and `_apitap_state` keys watermarks per source precisely so it works |
+
+**The `log_based` rows are not enforced, and 0.55.0 said they were.** A CDC
+drain never enters the guard at all: `transfer(mode="log_based")` returns into
+the drain before the bulk dispatcher runs, and the dispatcher is the only place
+a run identity is minted. So a drain mints none, writes no tokenized artifact,
+and calls no sink's `prepare` — which means two drains of one table are not
+refused, and neither is a drain running beside a bulk `replace`, in either
+direction. Only a Postgres SOURCE gets partial cover, from a replication-slot
+check that predates this mechanism; a MySQL or MariaDB source has nothing.
+
+Until that is closed, one drain per destination table is the operator's to
+enforce — the same scheduler setting the rest of this section recommends.
+Closing it is 0.56.0: the drain takes the same lock a bulk run takes, which
+also closes the start-instant window below, because both are the same problem
+(two runs must agree who owns the table, atomically) and an atomic create is
+the one primitive every destination has.
 
 That last row is why the guard is a matrix rather than a mutex. Refusing every
 concurrent pair would have removed a capability the manual advertises.
