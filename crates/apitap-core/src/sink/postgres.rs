@@ -737,6 +737,18 @@ impl crate::sink::Sink for PgSink {
         Ok(loaded)
     }
 
+    /// Drop this run's staging table. See [`crate::sink::Sink::discard`].
+    ///
+    /// `staging_t` is already schema-qualified and quoted, so this does not go
+    /// through `drop_staging` (which takes a bare name and qualifies it).
+    async fn discard(&self) -> Result<()> {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Transfer(format!("discard staging: {e}")))
+    }
+
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
         // 0-row guard, every mode: an empty load never touches the destination.
         if rows == 0 {

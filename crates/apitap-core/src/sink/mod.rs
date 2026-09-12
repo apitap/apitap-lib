@@ -183,4 +183,28 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// mode. `mode` here is the EFFECTIVE mode (a bootstrapped incremental run gets
     /// `Replace`).
     fn finalize(&self, rows: u64, mode: Mode) -> impl Future<Output = Result<()>> + Send;
+
+    /// Undo what [`prepare`](Sink::prepare) created, after the run has failed.
+    ///
+    /// Drop THIS RUN's artifacts and nothing else — the name carries the run
+    /// token, so "mine" is decidable without a scan. Never touch a peer's.
+    ///
+    /// Why this exists: until 0.55.1 the driver's happy path was a straight `?`
+    /// chain with no error arm, and the trait had no hook it could have called.
+    /// A source connection dropped mid-COPY, a statement timeout, a destination
+    /// DDL error — any of them left this run's staging behind. Before 0.55.0
+    /// that cost disk until the next run blindly dropped it. Since 0.55.0 the
+    /// next run classifies a foreign token as `Found::Live` and REFUSES, so the
+    /// leftover turns every later run of that table into a `locked:` error
+    /// naming a run that is not running. `docs/failure-modes.md` promised
+    /// "every ordinary error path still drops its own staging"; this is the
+    /// method that makes the sentence true.
+    ///
+    /// Best-effort by contract: the driver logs a failure here and returns the
+    /// ORIGINAL error, because the reason the run failed is more useful to the
+    /// operator than the reason the cleanup did. A sink that leaves nothing
+    /// behind (or whose finalize already released it) can keep the default.
+    fn discard(&self) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
 }

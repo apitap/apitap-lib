@@ -240,6 +240,28 @@ if p.poll() is None:
     exists = ch(f"SELECT count() FROM system.tables WHERE name = '{T}'")
     case("no half-built table is published", exists == "0",
          "destination table absent (it is only created by the atomic swap)")
+    # THE assertion this case exists for, and the one it could not make before
+    # 0.55.1. A cut connection is an ORDINARY error path — the process is alive
+    # and its error arm runs — so the staging object must be gone. Until
+    # 0.55.1 the driver had no error arm at all: the run returned through `?`
+    # and left staging behind, and since 0.55.0 the NEXT run classifies a
+    # foreign token as a live peer and raises `locked:` about a run that is not
+    # running. This leg used to hide that by dropping the destination and its
+    # artifacts before the next case; now it checks instead.
+    left = [n for n in ch(
+        "SELECT name FROM system.tables WHERE database = currentDatabase() "
+        f"AND position(name, '__apitap_') > 0 AND startsWith(name, '{T}')").split() if n]
+    case("and the error path dropped its own staging", not left,
+         f"left behind: {left or 'nothing'}")
+    # Proof that the promise is worth something: the next run just works, with
+    # no manual step and no LockedError.
+    again = sh([sys.executable, "-c", f"""
+import apitap
+r = apitap.transfer({PG!r}, {CH!r}, table={SRC_BIG!r}, dest_table={T!r}, mode="replace")
+print(r.rows)
+"""])
+    case("so the next run is not refused", again.returncode == 0,
+         (again.stderr.strip().splitlines() or ["ok"])[-1][:150])
 else:
     p.wait()
     case("cut connection", True, "transfer finished before the connection could be cut (skipped)")

@@ -1075,6 +1075,26 @@ impl crate::sink::Sink for IcebergSink {
         Ok(loaded)
     }
 
+    /// Release the claim marker and sweep any data files this run wrote but
+    /// never committed. See [`crate::sink::Sink::discard`].
+    ///
+    /// Before 0.55.1 the claim was released only inside `finalize`, so a run
+    /// that died during the LOAD — the long part — left its marker forever and
+    /// every later run of the table was refused. The uncommitted parquet
+    /// objects are swept on the same pass: no snapshot references them, so
+    /// they are bytes nobody can reach and everybody pays for.
+    async fn discard(&self) -> Result<()> {
+        let Some(s3) = self.s3.clone() else {
+            return Ok(()); // prepare never got as far as binding storage
+        };
+        let files = std::mem::take(&mut *self.done.lock().expect("done list"));
+        for f in &files {
+            let _ = s3.delete(&f.key).await;
+        }
+        self.release_claim(&s3).await;
+        Ok(())
+    }
+
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
         let s3 = self.s3.clone().expect("prepare ran");
         let files = std::mem::take(&mut *self.done.lock().expect("done list"));

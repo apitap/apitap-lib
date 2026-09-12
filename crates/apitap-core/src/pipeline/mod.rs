@@ -439,26 +439,54 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
 
     sink.prepare(&plan, &lane, opts.durable, mode).await?;
 
-    let want = if parallel > 1 {
-        parallel * profile.span_mult
-    } else {
-        1
-    };
-    let stmts = src
-        .span_stmts(table, &plan, &lane, want, delta.as_ref())
-        .await?;
-    let used = resolve(stmts.len()).min(stmts.len()).max(1);
-    let mut loaders = Vec::with_capacity(used);
-    for _ in 0..used {
-        // Counted: one wrapper here instruments every source × destination
-        // pair at once — see `sink::Counted`.
-        loaders.push(crate::sink::Counted(sink.loader().await?));
-    }
-    crate::progress::set_pipes(used);
+    // Everything from here to finalize runs inside this block so that ONE error
+    // arm covers all of it. It used to be a straight `?` chain, and every `?`
+    // returned past the staging object prepare had just created. Before 0.55.0
+    // that leftover cost disk; since 0.55.0 the next run reads a foreign token
+    // as a live peer and REFUSES, so a dropped connection turned every
+    // subsequent run of that table into `locked: another apitap run is already
+    // loading this table — it started 4s ago` about a run that had died. The
+    // e2e rig hid it by dropping the destination between cases.
+    let staged: Result<(u64, usize)> = async {
+        let want = if parallel > 1 {
+            parallel * profile.span_mult
+        } else {
+            1
+        };
+        let stmts = src
+            .span_stmts(table, &plan, &lane, want, delta.as_ref())
+            .await?;
+        let used = resolve(stmts.len()).min(stmts.len()).max(1);
+        let mut loaders = Vec::with_capacity(used);
+        for _ in 0..used {
+            // Counted: one wrapper here instruments every source × destination
+            // pair at once — see `sink::Counted`.
+            loaders.push(crate::sink::Counted(sink.loader().await?));
+        }
+        crate::progress::set_pipes(used);
 
-    let loaded = src.run_workers(&plan, &lane, stmts, loaders, chunk).await?;
-    let rows = sink.rows_staged(loaded).await?;
-    sink.finalize(rows, mode).await?;
+        let loaded = src.run_workers(&plan, &lane, stmts, loaders, chunk).await?;
+        let rows = sink.rows_staged(loaded).await?;
+        sink.finalize(rows, mode).await?;
+        Ok((rows, used))
+    }
+    .await;
+
+    let (rows, used) = match staged {
+        Ok(v) => v,
+        Err(e) => {
+            // Best-effort, and the ORIGINAL error is what the caller gets: why
+            // the run failed is more useful at 3am than why the cleanup did.
+            // The cleanup failing is still worth a line, because it is the
+            // difference between "re-run" and "drop this object first".
+            if let Err(d) = sink.discard().await {
+                crate::progress::note(&format!(
+                    "could not drop this run's staging after the error below                      ({d}); the next run of {table} will refuse until it is                      removed"
+                ));
+            }
+            return Err(e);
+        }
+    };
 
     Ok(TransferReport {
         rows,

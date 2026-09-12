@@ -2133,6 +2133,26 @@ impl crate::sink::Sink for BqSink {
         })
     }
 
+    /// Delete every worker staging table this run registered.
+    /// See [`crate::sink::Sink::discard`].
+    ///
+    /// The registry is the authority, not a name scan: a BigQuery load job
+    /// fans out into `<base>_0 … _N` and only the registry knows which ones
+    /// this run actually created. Every one of them carries this run's token.
+    async fn discard(&self) -> Result<()> {
+        let stagings: Vec<String> = self.staging_registry.lock().expect("registry lock").clone();
+        let mut first_err = None;
+        for t in &stagings {
+            if let Err(e) = self.conn.table_delete(t).await {
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
         let stagings: Vec<String> = self.staging_registry.lock().expect("registry lock").clone();
         if rows == 0 {

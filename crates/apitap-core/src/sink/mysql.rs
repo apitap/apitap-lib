@@ -926,6 +926,11 @@ impl crate::sink::Sink for MySqlSink {
         })
     }
 
+    /// Drop this run's staging table. See [`crate::sink::Sink::discard`].
+    async fn discard(&self) -> Result<()> {
+        self.drop_artifact(&self.staging).await
+    }
+
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
         if rows == 0 {
             return self

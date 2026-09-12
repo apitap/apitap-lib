@@ -1502,6 +1502,31 @@ impl crate::sink::Sink for ChSink {
         })
     }
 
+    /// Drop both artifacts this run can have created — staging AND the shadow.
+    /// See [`crate::sink::Sink::discard`].
+    ///
+    /// The shadow (`Artifact::New`) only exists for the three DDL statements at
+    /// the end of an engine-carrying replace, so an error usually finds none.
+    /// It is dropped anyway: after the EXCHANGE it holds the OLD destination's
+    /// data, so a run that dies there leaves a full copy of the table on disk,
+    /// and since 0.55.0 nothing else ever collects it.
+    ///
+    /// Both names carry this run's token, so neither can belong to a peer.
+    async fn discard(&self) -> Result<()> {
+        let mut first_err = None;
+        for a in [crate::naming::Artifact::Staging, crate::naming::Artifact::New] {
+            let name = crate::naming::artifact_ident_run(
+                &self.final_bare, a, crate::naming::ROOMY, &self.run);
+            if let Err(e) = self.drop_artifact(&name).await {
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
         // 0-row guard, every mode.
         if rows == 0 {

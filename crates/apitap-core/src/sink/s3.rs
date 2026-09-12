@@ -874,6 +874,25 @@ impl crate::sink::Sink for S3Sink {
         Ok(loaded)
     }
 
+    /// Delete this run's staging objects. See [`crate::sink::Sink::discard`].
+    ///
+    /// `self.staging` is this run's own key prefix — it carries the run
+    /// segment — so the listing can only return objects this run wrote. The
+    /// published directory (`prefix/<table>/`) is never touched: a failed run
+    /// must leave the last good version of the table exactly as it was.
+    async fn discard(&self) -> Result<()> {
+        let mut first_err = None;
+        for p in self.conn.list(&self.staging).await? {
+            if let Err(e) = self.conn.delete(&p).await {
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     async fn finalize(&self, rows: u64, _mode: Mode) -> Result<()> {
         let mut parts = self.conn.list(&self.staging).await?;
         parts.sort();
