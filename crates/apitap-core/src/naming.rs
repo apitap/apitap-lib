@@ -851,6 +851,68 @@ mod tests {
             .expect("a name this module minted must parse")
     }
 
+    /// The guard and the watermark must mean the same thing by "source".
+    ///
+    /// 0.55.0 minted from the RAW url while `_apitap_state` keyed on the
+    /// normalized origin, so these two spellings of ONE server shared a
+    /// watermark and got different `source_hash` values. `peer_blocks` then
+    /// called them fan-in — two unrelated sources into one table, which IS
+    /// allowed — and refused neither, so both read watermark W and both landed
+    /// the same delta. A destination without a unique key kept every row twice
+    /// under two green runs.
+    ///
+    /// It drives `dispatch::mint_run`, the function the transfer path actually
+    /// calls, NOT `source_origin` directly: a test that normalizes the URL
+    /// itself passes even when the production call site does not, which is the
+    /// shape of bug this release is fixing elsewhere. Revert `mint_run` to
+    /// `src_url` and this test fails.
+    #[test]
+    fn aliased_urls_share_one_source_hash() {
+        use crate::pipeline::dispatch::mint_run;
+        use crate::Mode;
+
+        fn hash_of(mode: Mode, url: &str) -> String {
+            let id = mint_run(mode, url);
+            parse_peer(
+                &artifact_ident_run("t", Artifact::Staging, PG_IDENT_MAX, &id),
+                Artifact::Staging,
+            )
+            .expect("a name this module minted must parse")
+            .source_hash
+        }
+
+        // Every way ONE server gets spelled differently: scheme alias, elided
+        // default port, different credentials, an added query parameter.
+        let spellings = [
+            "postgres://bench:pw@127.0.0.1:5432/bench",
+            "postgresql://bench:pw@127.0.0.1:5432/bench",
+            "postgres://bench:pw@127.0.0.1/bench",
+            "postgresql://other:different@127.0.0.1/bench?application_name=x",
+        ];
+        let want = hash_of(Mode::Append, spellings[0]);
+        for u in &spellings {
+            assert_eq!(hash_of(Mode::Append, u), want, "one server, one source hash: {u}");
+        }
+
+        // …and the peers built from them refuse each other rather than reading
+        // as fan-in.
+        let a = peer(LandKind::Incremental, &crate::pipeline::source_origin(spellings[0]));
+        let b = peer(LandKind::Incremental, &crate::pipeline::source_origin(spellings[3]));
+        assert!(peer_blocks(&a, &b), "same source must be refused, not read as fan-in");
+
+        // The other half of the matrix must still hold: a genuinely DIFFERENT
+        // server is fan-in and stays ALLOWED. Without this assertion the fix
+        // "refuse everything" would pass, and that removes a capability the
+        // manual advertises.
+        let elsewhere = hash_of(Mode::Append, "postgres://bench:pw@10.0.0.9:5432/bench");
+        assert_ne!(elsewhere, want, "two servers must not collapse into one hash");
+        let far = peer(
+            LandKind::Incremental,
+            &crate::pipeline::source_origin("postgres://bench:pw@10.0.0.9:5432/bench"),
+        );
+        assert!(!peer_blocks(&a, &far), "fan-in from two servers must still pass");
+    }
+
     /// Everything a concurrent run needs must survive the round trip through a
     /// table name — that is the whole premise, and if it does not hold the
     /// peer check silently degrades to "no peers found".

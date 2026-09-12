@@ -114,6 +114,25 @@ struct SinkCfg {
     /// together. See `crate::naming::RunId`.
     run: crate::naming::RunId,
 }
+/// The run identity every bulk transfer mints, from the source ORIGIN.
+///
+/// A named function rather than two inline `RunId::mint` calls because the
+/// ARGUMENT is the whole of finding A1 and a test has to be able to pin it.
+/// 0.55.0 passed the raw URL string here while `_apitap_state` keyed its
+/// watermark on the normalized origin, so `postgres://h/db` and
+/// `postgresql://h:5432/db?application_name=x` read ONE watermark and minted
+/// TWO source hashes; `peer_blocks` read that as fan-in — two unrelated
+/// sources into one table, which is allowed — refused neither run, and both
+/// landed the same delta. A destination with no unique key kept every row
+/// twice, under two green runs.
+///
+/// Credentials, query and scheme alias are exactly how one server gets spelled
+/// two ways, never how two servers differ. The table is deliberately NOT in
+/// here: two runs of different tables never share an artifact name anyway.
+pub(crate) fn mint_run(mode: crate::Mode, src_url: &str) -> crate::naming::RunId {
+    crate::naming::RunId::mint(land_kind(mode), &super::source_origin(src_url))
+}
+
 
 /// How this run's mode lands rows, which is what decides whether a concurrent
 /// run of the same table can be allowed to proceed.
@@ -326,15 +345,11 @@ async fn one<S: SrcScheme, D: DstScheme>(
     // clamping HERE also sizes the connection pools honestly for single-stream
     // sources (a 1-pipe github read must not open a 33-connection pool).
     let parallel = parallel.min(profile.table_pipe_cap).max(1);
-    // The source URL, not the per-table source identity: two runs of the SAME
-    // table from one URL must see each other (they would read one watermark
-    // twice), and two runs of DIFFERENT tables never share an artifact name
-    // anyway, so the table part adds nothing the name does not already carry.
     let cfg = SinkCfg {
         pg_overlap,
         ch_ddl,
         budget: parallel,
-        run: crate::naming::RunId::mint(land_kind(opts.mode), src_url),
+        run: mint_run(opts.mode, src_url),
     };
     let src = S::connect(src_url, parallel + 1).await?;
     let sink = D::connect(dst_url, dest_table, parallel, &cfg).await?;
@@ -361,7 +376,7 @@ async fn many<S: SrcScheme, D: DstScheme>(
         pg_overlap,
         ch_ddl,
         budget,
-        run: crate::naming::RunId::mint(land_kind(opts.mode), src_url),
+        run: mint_run(opts.mode, src_url),
     };
     let src = S::connect(src_url, budget + 8).await?;
     let jobs = jobs_for(&src, &sel, D::BARE_DEST).await?;

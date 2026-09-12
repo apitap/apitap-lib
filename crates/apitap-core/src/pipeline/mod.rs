@@ -35,7 +35,21 @@ pub(crate) fn norm(scheme: &str) -> &str {
     }
 }
 
-pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
+/// Which SERVER and database a URL points at, normalized — the half of
+/// [`source_identity`] that has nothing to do with a table.
+///
+/// Split out because two mechanisms need the same answer and used to compute it
+/// differently, which is the whole of finding A1: `_apitap_state` keyed its
+/// watermark on this normalized form while `RunId::mint` hashed the raw URL
+/// string. So `postgres://h/db` and `postgresql://h:5432/db?application_name=x`
+/// shared one watermark but minted two different `source_hash` values — the
+/// concurrency guard read that as fan-in, refused neither run, and both landed
+/// the same delta. One normalization, one call site each, and the two can no
+/// longer disagree.
+///
+/// Credentials and query are dropped: they are how the SAME server gets spelled
+/// differently, never how two servers differ.
+pub(crate) fn source_origin(src_url: &str) -> String {
     match reqwest::Url::parse(src_url) {
         Ok(u) => {
             // Normalize so equivalent URLs yield ONE identity — a scheme alias or an
@@ -48,21 +62,25 @@ pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
                 _ => 0,
             });
             let db = u.path().trim_matches('/');
-            // Qualify the table half so 'events' and 'public.events' (the same
-            // Postgres table) share one identity.
-            let table = if scheme == "postgres" {
-                crate::dialect::postgres::canonical_table(table)
-            } else {
-                table.to_string()
-            };
-            format!("{scheme}://{host}:{port}/{db}::{table}")
+            format!("{scheme}://{host}:{port}/{db}")
         }
         // Defensive: strip anything before '@' so credentials can never leak.
-        Err(_) => format!(
-            "{}::{table}",
-            src_url.rsplit('@').next().unwrap_or("unknown")
-        ),
+        Err(_) => src_url.rsplit('@').next().unwrap_or("unknown").to_string(),
     }
+}
+
+pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
+    let origin = source_origin(src_url);
+    // Qualify the table half so 'events' and 'public.events' (the same Postgres
+    // table) share one identity. Read the scheme back off the origin rather
+    // than re-parsing: it is already normalized there, and an unparseable URL
+    // has no scheme to match, which is the pre-existing behaviour.
+    let table = if origin.starts_with("postgres://") {
+        crate::dialect::postgres::canonical_table(table)
+    } else {
+        table.to_string()
+    };
+    format!("{origin}::{table}")
 }
 
 
