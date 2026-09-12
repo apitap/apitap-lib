@@ -742,6 +742,21 @@ impl MySqlSource {
         // Before the pool: sqlx would accept `ssl-mode=verify_ca`, the raw
         // plane cannot express it, and the read path uses both.
         crate::wire::mywire::check_ssl_mode(url)?;
+        // TLS by default off-loopback, the same rule the MySQL DESTINATION
+        // follows since 0.55.1. sqlx's own default is PREFERRED — it tries TLS
+        // and falls back to plaintext if the server declines, which a
+        // man-in-the-middle can arrange by declining on the server's behalf. A
+        // URL that says nothing gets VERIFY_IDENTITY; one that says anything
+        // keeps what it says, including `disabled`.
+        let url = if crate::dialect::mysql::has_explicit_ssl_mode(url)
+            || crate::dialect::mysql::host_is_loopback(url)
+        {
+            url.to_string()
+        } else {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}ssl-mode=VERIFY_IDENTITY")
+        };
+        let url = url.as_str();
         let pool = MySqlPoolOptions::new()
             .max_connections(max_conns as u32)
             .after_connect(|conn, _| {
@@ -753,7 +768,20 @@ impl MySqlSource {
             })
             .connect(url)
             .await
-            .map_err(|e| crate::urlerr::connect_err("mysql source", url, e))?;
+            .map_err(|e| {
+                let base = crate::urlerr::connect_err("mysql source", url, e);
+                if crate::dialect::mysql::host_is_loopback(url) {
+                    base
+                } else {
+                    // Same reasoning as the destination: a server without TLS
+                    // now fails here, and an unhelpful TLS error is how people
+                    // disable security wholesale instead of narrowly.
+                    crate::error::Error::Connect(format!(
+                        "{base} — {}",
+                        crate::dialect::mysql::tls_required_hint(url)
+                    ))
+                }
+            })?;
         Ok(Self { pool, url: url.into() })
     }
 }

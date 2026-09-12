@@ -59,6 +59,8 @@ pub(crate) struct MySqlSink {
     /// collide in the registry.
     next_id: Arc<AtomicU64>,
     db: String,
+    /// See [`MySqlShared::tls_hint`].
+    tls_hint: Option<Arc<str>>,
     bare: String,
     staging: String,
     /// Where `finalize`'s first RENAME parks the outgoing table. Per-run like
@@ -86,6 +88,11 @@ pub(crate) struct MySqlShared {
     registry: Registry,
     next_id: Arc<AtomicU64>,
     db: String,
+    /// Set only when apitap chose TLS because the URL said nothing and the host
+    /// is not loopback. A connect failure then gets this appended, because the
+    /// raw driver error for "server speaks no TLS" is unhelpful and the fix
+    /// (`?ssl-mode=disabled`) has to be in the message.
+    tls_hint: Option<Arc<str>>,
 }
 
 impl MySqlShared {
@@ -96,7 +103,16 @@ impl MySqlShared {
     /// A pooled connection under the same 30 s deadline the sink uses.
     pub(crate) async fn conn(&self) -> Result<mysql_async::Conn> {
         match tokio::time::timeout(std::time::Duration::from_secs(30), self.pool.get_conn()).await {
-            Ok(r) => r.map_err(|e| Error::Transfer(format!("mysql conn: {e}"))),
+            Ok(r) => r.map_err(|e| {
+                // A server with no TLS now fails HERE, because TLS became the
+                // default off-loopback in 0.55.1. The raw mysql_async error
+                // for that is unhelpful ("connection closed"), and an
+                // unhelpful TLS error is how an operator ends up disabling
+                // security wholesale instead of narrowly — so the opt-out is
+                // named in the message.
+                let hint = self.tls_hint.as_deref().map(|h| format!(" — {h}")).unwrap_or_default();
+                Error::Transfer(format!("mysql conn: {e}{hint}"))
+            }),
             Err(_) => Err(Error::Transfer(
                 "mysql connection timed out after 30 s: the server accepted TCP but never \
                  completed the protocol (seen with MySQL 8.4 + older clients; MySQL 8.0 is \
@@ -139,7 +155,7 @@ impl MySqlShared {
 /// "encrypt if offered" setting, so it means the same as disabled here and
 /// says so; `required` encrypts without verifying; `verify_ca` checks the
 /// chain; `verify_identity` checks the chain and the hostname.
-fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>)> {
+fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>, bool)> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| crate::urlerr::bad_url("mysql url", url, e))?;
     let mut mode: Option<String> = None;
@@ -155,7 +171,21 @@ fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>)> {
         })
         .collect();
     let Some(mode) = mode else {
-        return Ok((url.to_string(), None));
+        // No mode in the URL. Until 0.55.1 that meant NO TLS, silently:
+        // mysql_async defaults `ssl_opts` to None, so a plain
+        // `mysql://user:pw@prod-host/db` put the password and every row on the
+        // wire in clear, and nothing said so. A tool that calls itself
+        // production-ready cannot have that default.
+        //
+        // Loopback keeps it — connecting to a database on this machine in clear
+        // is a local, deliberate choice, and the bench rig would otherwise need
+        // a certificate to run. Everything else gets TLS with full verification,
+        // and a server that cannot do TLS fails with a message naming the
+        // opt-out (`tls_required_hint`).
+        if crate::dialect::mysql::host_is_loopback(url) {
+            return Ok((url.to_string(), None, false));
+        }
+        return Ok((url.to_string(), Some(SslOpts::default()), true));
     };
     let mut clean = parsed.clone();
     clean.set_query(None);
@@ -187,7 +217,7 @@ fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>)> {
             )))
         }
     };
-    Ok((clean.to_string(), ssl))
+    Ok((clean.to_string(), ssl, false))
 }
 
 impl MySqlSink {
@@ -207,7 +237,7 @@ impl MySqlSink {
         // parameter ssl-mode", which reads like a typo rather than a missing
         // feature. The mode is translated instead, so one vocabulary works on
         // both sides of a transfer.
-        let (stripped, ssl) = split_ssl_mode(url)?;
+        let (stripped, ssl, tls_defaulted) = split_ssl_mode(url)?;
         let mut opts_builder = OptsBuilder::from_opts(
             Opts::from_url(&stripped)
                 .map_err(|e| Error::InvalidInput(format!("mysql url: {e}")))?,
@@ -259,6 +289,8 @@ impl MySqlSink {
             registry,
             next_id: Arc::new(AtomicU64::new(0)),
             db,
+            tls_hint: tls_defaulted
+                .then(|| crate::dialect::mysql::tls_required_hint(url).into()),
         })
     }
 
@@ -280,6 +312,7 @@ impl MySqlSink {
             registry: shared.registry,
             next_id: shared.next_id,
             db: shared.db,
+            tls_hint: shared.tls_hint,
             staging: crate::naming::artifact_ident_run(
                 bare, crate::naming::Artifact::Staging, crate::naming::MY_IDENT_MAX, run),
             old: crate::naming::artifact_ident_run(
@@ -300,7 +333,16 @@ impl MySqlSink {
     /// loudly and name the likely cause.
     async fn deadline_conn(&self) -> Result<mysql_async::Conn> {
         match tokio::time::timeout(std::time::Duration::from_secs(30), self.pool.get_conn()).await {
-            Ok(r) => r.map_err(|e| Error::Transfer(format!("mysql conn: {e}"))),
+            Ok(r) => r.map_err(|e| {
+                // A server with no TLS now fails HERE, because TLS became the
+                // default off-loopback in 0.55.1. The raw mysql_async error
+                // for that is unhelpful ("connection closed"), and an
+                // unhelpful TLS error is how an operator ends up disabling
+                // security wholesale instead of narrowly — so the opt-out is
+                // named in the message.
+                let hint = self.tls_hint.as_deref().map(|h| format!(" — {h}")).unwrap_or_default();
+                Error::Transfer(format!("mysql conn: {e}{hint}"))
+            }),
             Err(_) => Err(Error::Transfer(
                 "mysql connection timed out after 30 s: the server accepted TCP but never \
                  completed the protocol (seen with MySQL 8.4 + older clients; MySQL 8.0 is \
@@ -1068,3 +1110,43 @@ impl Loader for MySqlLoader {
         cause
     }
 }
+#[cfg(test)]
+mod ssl_default_tests {
+    use super::*;
+
+    /// The URL → SslOpts mapping, all four cases.
+    ///
+    /// This is where E1 actually lives, and it needs a unit test because no rig
+    /// can prove it: the bench MySQL binds to 127.0.0.1 only (loopback, so the
+    /// new path never runs) and the TLS rig sets `require_secure_transport=ON`
+    /// (so a plaintext attempt is refused by the SERVER whichever default
+    /// apitap picks — an e2e assertion there cannot tell the two apart, which
+    /// a control run against the 0.55.0 wheel demonstrated).
+    #[test]
+    fn no_ssl_mode_means_tls_off_loopback_and_plaintext_on_it() {
+        let ssl_of = |u: &str| split_ssl_mode(u).expect("parses").1.is_some();
+        let defaulted = |u: &str| split_ssl_mode(u).expect("parses").2;
+
+        // loopback, nothing said: plaintext, as before. The bench rig and every
+        // "database on my laptop" case keep working with no certificate.
+        assert!(!ssl_of("mysql://u:p@127.0.0.1:3307/db"));
+        assert!(!defaulted("mysql://u:p@127.0.0.1:3307/db"));
+        assert!(!ssl_of("mysql://u:p@localhost/db"));
+
+        // remote, nothing said: TLS — this is the behaviour change. Until
+        // 0.55.1 this returned None and sent the password in clear.
+        assert!(ssl_of("mysql://u:p@prod-host/db"));
+        assert!(defaulted("mysql://u:p@prod-host/db"), "the hint must be attached");
+        assert!(ssl_of("mysql://u:p@10.0.0.9/db"), "private is not loopback");
+
+        // remote, explicitly disabled: the operator's choice stands, and
+        // `defaulted` is false so no TLS hint is bolted onto an unrelated error.
+        assert!(!ssl_of("mysql://u:p@prod-host/db?ssl-mode=disabled"));
+        assert!(!defaulted("mysql://u:p@prod-host/db?ssl-mode=disabled"));
+
+        // remote, explicitly required: TLS, and again not a defaulted one.
+        assert!(ssl_of("mysql://u:p@prod-host/db?ssl-mode=required"));
+        assert!(!defaulted("mysql://u:p@prod-host/db?ssl-mode=required"));
+    }
+}
+

@@ -17,6 +17,9 @@ reject. A server that merely tolerates TLS could not tell these cases apart.
   leg 2  ssl-mode=disabled        — refused, because the SERVER will not take it
   leg 3  ssl-mode=verify_identity — must FAIL against a self-signed certificate
   leg 4  ssl-mode=verify_ca       — refused by apitap, by name
+  leg 6  no ssl-mode at all        — TLS off-loopback since 0.55.1 (was plaintext,
+                                     silently), with a control that the host is
+                                     reachable at all
   leg 4c a DESTINATION over TLS   — until now, no spelling encrypted a mysql:// sink
   leg 5  binlog CDC over TLS      — the encrypted socket carries a real drain
 
@@ -168,5 +171,56 @@ else:
 my(f"DROP TABLE IF EXISTS {CT}", check=False)
 ch(f"DROP TABLE IF EXISTS {CT}")
 ch(f"DROP TABLE IF EXISTS {T}")
+
+# ── leg 5: no ssl-mode at all ────────────────────────────────────────────────
+# Until 0.55.1 a URL with no ssl-mode meant NO TLS on the destination side,
+# silently — mysql_async defaults ssl_opts to None, so credentials and every row
+# went out in clear and nothing said so. Since 0.55.1 the default is TLS with
+# full verification for any host that is not loopback.
+#
+# `ip6-localhost` is what makes this testable on one box: /etc/hosts maps it to
+# ::1 and the rig listens on [::]:3312, but apitap decides loopback from the URL
+# STRING — literal addresses and the name `localhost`, nothing else — so it
+# reads as remote and takes the remote path. The rig's certificate is
+# self-signed (leg 3 proves verify_identity rejects it), which is exactly what
+# makes the assertion sharp: if the default were still plaintext this would
+# CONNECT, and if it were `required` it would connect too.
+print("== leg 6: a URL with no ssl-mode is TLS off-loopback ==")
+REMOTE = "mysql://root:bench@ip6-localhost:3312/tlsdb"
+DT6 = "tls_my_default"
+
+
+def into_mysql(dest_url):
+    return sh([sys.executable, "-c",
+               "import apitap\n"
+               f"apitap.transfer({PG_SRC!r}, {dest_url!r}, table='tls_src_seed', "
+               f"dest_table={DT6!r}, mode='replace')\n"])
+
+
+r = into_mysql(REMOTE)
+# NOT asserted here: "apitap chose TLS". This rig sets
+# require_secure_transport=ON, so a plaintext attempt is refused by the SERVER
+# whichever default apitap picks — running this against the 0.55.0 wheel showed
+# the connection failing for that reason, which would have made a "does not
+# connect in clear" assertion pass in both worlds and prove nothing. The
+# mapping itself is pinned where it can be:
+# apitap-core sink::mysql::ssl_default_tests.
+case("no ssl-mode + non-loopback host does not land rows", r.returncode != 0,
+     (r.stderr.strip().splitlines() or ["(it CONNECTED)"])[-1][:140])
+# THIS is the assertion that distinguishes 0.55.1 from 0.55.0: the hint is
+# attached only when apitap itself chose TLS, so it appears only on the new
+# default path. It fails against the 0.55.0 wheel.
+case("and the error names the opt-out, because apitap chose TLS itself",
+     "ssl-mode=disabled" in (r.stderr or ""),
+     (r.stderr or "")[-200:])
+# Control: same host, same URL, an explicit mode the self-signed certificate can
+# satisfy. Without this the leg proves nothing — a failure above could just mean
+# the host is unreachable.
+r2 = into_mysql(REMOTE + "?ssl-mode=required")
+case("CONTROL: the same remote host connects with ssl-mode=required",
+     r2.returncode == 0,
+     (r2.stderr.strip().splitlines() or ["ok"])[-1][:160])
+my(f"DROP TABLE IF EXISTS {DT6}", check=False)
+
 print("\n" + ("MYSQL TLS E2E: ALL GREEN" if ok else "MYSQL TLS E2E: FAILED"))
 raise SystemExit(0 if ok else 1)

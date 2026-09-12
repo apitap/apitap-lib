@@ -52,7 +52,7 @@ apitap.transfer("mysql://…/srcdb", "postgres://…/dstdb", table="events")
 | database | scheme | notes |
 |---|---|---|
 | Postgres | `postgres://` or `postgresql://` | standard DSN: `postgres://user:pass@host:5432/db` |
-| MySQL / MariaDB | `mysql://` | `mysql://user:pass@host:3306/db` — MySQL 8 negotiates TLS by default; on a trusted network add `?ssl-mode=disabled` (measured: −20% wall on a 10M-row transfer — the whole stream otherwise pays AES-GCM). MariaDB 10.x is a first-class source, CDC included (see [Batch CDC](#batch-cdc-modelog_based)). |
+| MySQL / MariaDB | `mysql://` | `mysql://user:pass@host:3306/db` — **apitap requires TLS off-loopback since 0.55.1**; on a trusted network add `?ssl-mode=disabled` (measured: −20% wall on a 10M-row transfer — the whole stream otherwise pays AES-GCM). MariaDB 10.x is a first-class source, CDC included (see [Batch CDC](#batch-cdc-modelog_based)). |
 | ClickHouse | `clickhouse://` | HTTP interface: `clickhouse://user:pass@host:8123/db`. Port defaults to 8123; `clickhouse+https://` (or port 8443) switches to TLS. Also works as a **source** into ClickHouse — see [ClickHouse source](#clickhouse-source-ch--ch). |
 | Google Sheets (source) | `gsheets://` | `gsheets://<spreadsheet_id>?credentials=/path/key.json` — the id from the sheet's URL. See [Google Sheets source](#google-sheets-source). |
 | GitHub (source) | `github://` | `github://<owner>/<repo>[/dir]?ref=main` — CSV files as tables. See [GitHub source](#github-source-csv-files-as-tables). |
@@ -972,10 +972,22 @@ apitap.transfer(
 - **TLS**, with MySQL's own `ssl-mode` meanings — a URL that works in the
   `mysql` client means the same here:
 
+  **Since 0.55.1 the default depends on the host.** A URL with no `ssl-mode`
+  reaching a **non-loopback** host gets `verify_identity` — TLS, chain and
+  hostname checked. Only `localhost`, `127.0.0.0/8` and `::1` written
+  literally in the URL keep the old cleartext default, because a database on
+  this machine is a deliberate local choice and a bench rig should not need a
+  certificate. Before 0.55.1 a plain `mysql://user:pw@prod-host/db` sent the
+  password and every row in clear and said nothing, which is not a default a
+  tool can call production-ready. If a server genuinely has no TLS, say
+  `?ssl-mode=disabled` — the connection error names that opt-out verbatim.
+
   | `ssl-mode` | what happens |
   |---|---|
+  | *(absent, loopback host)* | never encrypted — the same as `disabled` |
+  | *(absent, any other host)* | the same as `verify_identity` **(0.55.1+)** |
   | `disabled` | never encrypted |
-  | `preferred` (default) | TLS if the server offers it; if not, the run continues in cleartext, and **says so** when the URL asked for `preferred` explicitly |
+  | `preferred` | TLS if the server offers it; if not, the run continues in cleartext, and **says so**. No longer what an absent mode means |
   | `required` | TLS mandatory, certificate **not** verified — MySQL means the same, and every default install presents its own auto-generated self-signed certificate |
   | `verify_identity` | TLS mandatory, chain checked against the bundled trust anchors, hostname checked against the certificate |
 
