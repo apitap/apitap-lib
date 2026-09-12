@@ -50,6 +50,21 @@ pub(crate) enum Artifact {
     CdcDelete,
     /// The view that derives current state from a changelog table.
     Current,
+    /// A run's declaration that it is working on this table — written FIRST,
+    /// before any staging object, and by the CDC lane as well as the bulk one.
+    ///
+    /// It exists because the guard that reads staging objects is check-then-act:
+    /// `prepare` lists the catalog and only afterwards creates staging, so two
+    /// runs starting inside that gap both see an empty catalog and both
+    /// proceed. Announcing first and scanning second inverts that — a run only
+    /// ever proceeds on a scan taken AFTER its own announcement, so two of them
+    /// cannot both proceed. (They can both YIELD, if each sees the other; that
+    /// is a loud double failure with nothing written, and it is the trade.)
+    ///
+    /// Tokenized, not a single mutex name, because this matrix is reader/writer
+    /// and not mutual exclusion: two `append` runs from DIFFERENT sources are
+    /// fan-in and must both proceed. One shared name would refuse them.
+    Lock,
 }
 
 impl Artifact {
@@ -61,6 +76,7 @@ impl Artifact {
         Artifact::ChangelogTmp,
         Artifact::CdcDelete,
         Artifact::Current,
+        Artifact::Lock,
     ];
 
     /// May apitap claim this suffix as its own?
@@ -93,6 +109,7 @@ impl Artifact {
             Artifact::ChangelogTmp => "__apitap_cl",
             Artifact::CdcDelete => "__apitap_cdc_del",
             Artifact::Current => "__current",
+            Artifact::Lock => "__apitap_lock",
         }
     }
 }
@@ -339,6 +356,40 @@ pub(crate) fn parse_peer(name: &str, artifact: Artifact) -> Option<PeerRun> {
         token: tok.to_string(),
     })
 }
+/// The announce-then-check protocol, as one decision a sink can call.
+///
+/// Given every lock found beside the destination, does THIS run proceed?
+///
+/// The rule is "yield to any peer that blocks me", with no tie-break, and the
+/// absence of a tie-break is the correctness argument. A tie-break ("lower
+/// token wins") is only sound if both runs scanned after both announced; if A
+/// scans before B announces, A proceeds, and a tie-break can then tell B it won
+/// too — two winners, which is the defect. Yielding unconditionally cannot
+/// produce two winners: a run proceeds only on a scan taken after its own
+/// announcement, so if two ran concurrently at least one of them saw the other.
+///
+/// The cost is the case where each sees the other and BOTH yield. That is a
+/// loud double failure with nothing written — strictly better than the double
+/// success over a corrupted destination that check-then-act allows today, and
+/// rare, because the window is one round-trip wide.
+///
+/// `Found::Mine` is not a peer (one RunId is shared by every table of a
+/// multi-table run) and `Found::Legacy` is handled by the caller, which has the
+/// destination name needed for its distinct message.
+// Not called yet: the protocol is decided and tested, the per-sink announce and
+// scan are the next commit. Deliberately NOT deleted-until-needed — the rule is
+// the part that needed argument (see the doc comment and §4 of
+// docs/review/2026-09-12-prod-readiness-v0.55.0.md), and pinning it first is
+// what stops the integration from inventing a different one per sink, which is
+// exactly how the 0.55.0 guard went wrong in six of them.
+#[allow(dead_code)]
+pub(crate) fn lock_blocks<'a>(
+    mine: &PeerRun,
+    locks: impl IntoIterator<Item = &'a PeerRun>,
+) -> Option<&'a PeerRun> {
+    locks.into_iter().find(|peer| peer_blocks(mine, peer))
+}
+
 
 /// May `mine` proceed while `peer` is running?
 ///
@@ -883,6 +934,61 @@ mod tests {
         parse_peer(&artifact_ident_run("t", Artifact::Staging, PG_IDENT_MAX, &id),
                    Artifact::Staging)
             .expect("a name this module minted must parse")
+    }
+
+    /// The lock protocol, at the level where it is decidable: given the peers a
+    /// scan returned, does this run go?
+    ///
+    /// Pins the matrix — including the row that must stay ALLOWED, without
+    /// which "refuse everything" would pass every other assertion here and
+    /// silently delete fan-in.
+    #[test]
+    fn a_lock_yields_to_any_blocking_peer_and_to_nothing_else() {
+        let replace_a = peer(LandKind::Swap, "postgres://h:5432/db");
+        let cdc_a = peer(LandKind::Cdc, "postgres://h:5432/db");
+        let app_a = peer(LandKind::Incremental, "postgres://h:5432/db");
+        let app_b = peer(LandKind::Incremental, "postgres://other:5432/db");
+
+        // exclusive against everything
+        assert!(lock_blocks(&replace_a, [&app_b]).is_some(), "replace yields to any peer");
+        assert!(lock_blocks(&app_b, [&replace_a]).is_some(), "…and any peer yields to replace");
+        assert!(lock_blocks(&cdc_a, [&app_b]).is_some(), "a CDC drain is exclusive");
+        assert!(lock_blocks(&app_b, [&cdc_a]).is_some(), "…in both directions");
+
+        // same source: two appends would read one watermark twice
+        assert!(lock_blocks(&app_a, [&app_a]).is_some());
+
+        // FAN-IN stays allowed. Delete this assertion and "refuse everything"
+        // passes the whole test.
+        assert!(lock_blocks(&app_a, [&app_b]).is_none(), "fan-in must proceed");
+        assert!(lock_blocks(&app_b, [&app_a]).is_none());
+
+        // an empty scan is the common case
+        assert!(lock_blocks(&replace_a, []).is_none());
+        // the FIRST blocker is what the error will name
+        let found = lock_blocks(&replace_a, [&app_b, &cdc_a]).expect("blocked");
+        assert_eq!(found.kind, LandKind::Incremental);
+    }
+
+    /// A lock is a first-class artifact: reserved, namespaced, and fitting
+    /// every identifier limit at every length, like the other five.
+    #[test]
+    fn the_lock_artifact_obeys_the_artifact_contract() {
+        assert!(Artifact::ALL.contains(&Artifact::Lock));
+        assert!(Artifact::Lock.reserved(), "__apitap_lock is namespaced, so reserve it");
+        let run = RunId::mint(LandKind::Swap, "postgres://h:5432/db");
+        for &lim in &[PG_IDENT_MAX, MY_IDENT_MAX, ROOMY] {
+            let name = artifact_ident_run("orders", Artifact::Lock, lim, &run);
+            assert!(name.len() <= lim, "{lim}: {} bytes", name.len());
+            let p = parse_peer(&name, Artifact::Lock).expect("a lock name must parse");
+            assert_eq!(p.token, run.token());
+            assert!(is_artifact(&name), "discovery must exclude it: {name}");
+        }
+        // and it is not confused with any other kind
+        assert_eq!(
+            classify(&artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &run),
+                     "orders", Artifact::Lock, PG_IDENT_MAX, &run, now_unix()),
+            Found::Mine);
     }
 
     /// The guard and the watermark must mean the same thing by "source".
