@@ -250,13 +250,27 @@ loaded less than the old watermark, skips rows. Either way: wrong data, green
 run.
 
 *Fix shape (two steps):*
-1. **0.55.1 — a safety net at the reader:** before an incremental run trusts a
-   watermark, compare it to the destination's actual `max(cursor)`. If the
-   destination is **ahead** of the watermark, the bookkeeping is stale: refuse
-   with an error that says exactly that and names the row to fix. Cheap, engine-
-   agnostic, catches the symptom whatever caused it. Add an e2e leg that
-   manufactures the state (replace, then hand-edit `_apitap_state` backwards,
-   then append) on CH and MySQL.
+1. ~~**0.55.1 — a safety net at the reader**~~ — **ALREADY IN THE CODE, and the
+   finding is half wrong.** Implementing it turned up `WmArbitration::Greatest`
+   in `plan.rs`, which ClickHouse, MySQL and BigQuery all pass to
+   `resolve_watermark`: when a state row and a data max disagree, the FRESHER
+   wins. The audit lens that filed C1 read `finalize` and never read
+   `dest_state`, so it reported the ordering without the guard that compensates
+   for it.
+
+   What that guard actually covers, pinned in
+   `plan.rs::greatest_covers_a_stale_state_row_forward_but_not_backward`: a
+   replace that moved the cursor FORWARD and then failed before clearing state
+   is fully handled — the data max is higher, it wins, no duplicates. A replace
+   that moved the cursor BACKWARD is not: the stale row is the higher value,
+   wins, and rows landing in between are skipped later. `Greatest` cannot tell
+   that from an ordinary foreign delete, where trusting the state row is right.
+
+   So C1's severity drops from blocker to **medium**, its remaining scope is
+   "replace that shrinks the cursor, then fails mid-bookkeeping", and the fix
+   for it is step 2 — there is nothing sensible to add in 0.55.1 that step 2
+   does not do better. The `WmArbitration` doc comment claimed "never a skip",
+   which was wrong in exactly this direction; that is corrected.
 2. **0.56.0 — pending-swap protocol, exact spec.** Extend `_apitap_state`
    with one nullable column `pending TEXT` (the contract lives in
    `docs/usage.md` and `e2e_state_contract.py`; older readers ignore unknown

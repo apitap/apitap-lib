@@ -213,9 +213,26 @@ pub(crate) enum WmArbitration {
     /// it is authoritative alone, and the data max is deliberately distrusted —
     /// foreign writes to the destination would poison it.
     StateAuthoritative,
-    /// The state write lands AFTER the swap (ClickHouse ATTACH, MySQL RENAME):
-    /// a crash between them leaves state one run behind, so the effective
-    /// watermark is the fresher of the two — a bounded re-read, never a skip.
+    /// The state write lands AFTER the swap (ClickHouse ATTACH, MySQL RENAME,
+    /// BigQuery copy job): a crash between them leaves state one run behind, so
+    /// the effective watermark is the fresher of the two.
+    ///
+    /// This is a real safety net and it covers the common direction: when the
+    /// replace moved the cursor FORWARD, the data max is higher than the stale
+    /// state row, the data max wins, and the next append does not re-land rows
+    /// the replace already holds.
+    ///
+    /// It does NOT cover the other direction, and the comment here used to say
+    /// "never a skip", which was wrong. If the replace moved the cursor
+    /// BACKWARD — the source shrank, a partition was dropped, a purge ran —
+    /// the stale state row is the HIGHER value and wins, so the next append
+    /// starts above the data that is actually there and skips whatever lands
+    /// in between. `Greatest` cannot tell that case from an ordinary foreign
+    /// delete against the destination, where trusting the state row is exactly
+    /// right. Telling them apart needs to know whether the last replace
+    /// finished its bookkeeping, which is what the `pending` column in 0.56.0
+    /// records. Until then this is a partial guard, and saying so is the point
+    /// of this paragraph.
     Greatest { numeric: bool },
 }
 
@@ -276,5 +293,36 @@ mod wm_tests {
         // no state anywhere: data is the only truth
         assert_eq!(r(None, Some("9"), false, StateAuthoritative).unwrap(), Some("9".into()));
         assert_eq!(r(None, None, false, Greatest { numeric: false }).unwrap(), None);
+    }
+
+    /// What `Greatest` does and does not protect, both pinned.
+    ///
+    /// The audit filed the swap-before-state ordering on ClickHouse, MySQL and
+    /// BigQuery as unguarded. Half of that was already wrong: `Greatest` is the
+    /// guard, and it has been there the whole time. This test says which half.
+    #[test]
+    fn greatest_covers_a_stale_state_row_forward_but_not_backward() {
+        use WmArbitration::*;
+        let r = |o: &str, d: &str| {
+            resolve_watermark(
+                Some(o.into()), Some(d.into()), false, Greatest { numeric: true }, "t", "src",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // COVERED. A replace moved the cursor forward and then failed before
+        // clearing state. The stale row says 100, the table actually holds
+        // 5000. Taking 5000 means the next append does not re-land 100..5000 —
+        // which on a keyless destination would be 4900 duplicate rows under a
+        // green run.
+        assert_eq!(r("100", "5000"), "5000");
+        // NOT COVERED, and this assertion exists to keep that visible. The
+        // replace moved the cursor BACKWARD (the source shrank) and then failed
+        // the same way. The stale row says 5000, the table holds 3000, and 5000
+        // wins — so rows landing in 3000..5000 later are skipped. `Greatest`
+        // cannot distinguish this from a foreign delete against the
+        // destination, where trusting 5000 is correct. 0.56.0's `pending`
+        // column is what tells the two apart; until then this is the gap.
+        assert_eq!(r("5000", "3000"), "5000");
     }
 }
