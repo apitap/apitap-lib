@@ -30,11 +30,12 @@ is the only thing collected.
                               must succeed. If this leg fails, leg 1 is
                               refusing everything rather than refusing
                               collisions.
-  leg 3  what is collected   — the un-tokenized leftover is collected, a
-                              TOKENIZED one is not (however ancient its token
-                              looks), the run refuses while it is there, and
-                              dropping it by hand — the recovery the error
-                              message prescribes — makes the run work again
+  leg 3  nothing is collected — BOTH leftovers are refused: the un-tokenized
+                              one (an apitap <0.55.0 may be loading into it)
+                              and a TOKENIZED one however ancient its token
+                              looks (the token is the RUN's start time, not the
+                              object's). Dropping them by hand — the recovery
+                              each error prescribes — makes the run work again
   leg 4  NOT WRITTEN        — fan-in (two appends from two different sources
                               into one table) is the one matrix row that says
                               "allowed", and no leg here proves it end to end.
@@ -248,20 +249,30 @@ dst(f"DROP TABLE IF EXISTS {T2}")
 dst(f"DELETE FROM _apitap_state WHERE dest_table IN ('{T2}', 'public.{T2}')")
 
 # ---------------------------------------------------------------------------
-print("== leg 3: only the provably-dead name is collected ==")
+print("== leg 3: NOTHING is collected — every leftover is refused ==")
 reset(rows=1000)
 r = run("replace")
 case("a clean run", r.returncode == 0, r.stderr.strip()[-200:])
 
-# (a) The leftover from BEFORE tokens existed. No current run mints this name,
-#     so nothing living can own it — the one thing collection can prove.
+# (a) The un-tokenized leftover, the layout an apitap older than 0.55.0 writes.
+#     This leg asserted until 0.55.1 that it was COLLECTED — "no current run
+#     mints this name, so nothing living can own it". That reasoning holds right
+#     up until an upgrade, which is the one time both versions exist: a ≤0.54.0
+#     run is USING that name while it loads. Deleting it mid-load is loud on
+#     Postgres and SILENT on BigQuery and the object stores, which is the defect
+#     0.55.0 exists to remove. So it is refused like everything else.
 dst(f'CREATE TABLE "{T}__apitap_staging" (id bigint)')
 case("(rig) the un-tokenized leftover is in place", len(staging_names()) == 1,
      f"{staging_names()}")
 r = run("replace")
-case("the run succeeds despite it", r.returncode == 0,
-     (r.stderr.strip().splitlines() or [""])[-1][:170])
-case("and it was collected", staging_names() == [], f"left: {staging_names()}")
+case("an un-tokenized leftover is REFUSED, not collected",
+     r.returncode != 0 and "locked" in (r.stderr or "").lower(),
+     (r.stderr.strip().splitlines() or [""])[-1][:200])
+case("and the refusal says what to check before removing it",
+     "older than 0.55.0" in (r.stderr or ""), (r.stderr or "")[-220:])
+case("and it is still there", staging_names() == [f"{T}__apitap_staging"],
+     f"{staging_names()}")
+dst(f'DROP TABLE IF EXISTS "{T}__apitap_staging"')
 
 # (b) A TOKENIZED leftover whose token says 1970. It looks maximally dead, and
 #     it must STILL not be collected: the token is the run's start time, not the

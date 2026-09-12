@@ -1,6 +1,6 @@
 # What you may depend on, and what may still move
 
-apitap reached v0.55.0 in under four months. At that pace a version number stops
+apitap reached v0.55.1 in under four months. At that pace a version number stops
 carrying information, and "0.x" tells you only that we have not committed to
 anything — which is the opposite of useful if you are deciding whether to put
 this in a pipeline. So here is the commitment, written down.
@@ -44,7 +44,7 @@ never silently.
 Pin exactly while we are pre-1.0:
 
 ```
-apitap==0.55.0
+apitap==0.55.1
 ```
 
 Not `>=`. The surface above is committed, but the release cadence is fast enough
