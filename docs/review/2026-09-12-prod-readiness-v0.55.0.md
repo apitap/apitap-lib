@@ -129,12 +129,22 @@ nothing.
    (the committed-surface row), `README.md`, `py-apitap/README.md`, and the
    apitap.dev copies: the guard covers **bulk** modes; CDC drains are not yet
    guarded. Stop claiming otherwise.
-2. **The real fix (0.56.0) — `Artifact::Lock`, exact spec.** One artifact
-   kind, atomic create, used by BOTH lanes. This also closes the start-instant
-   window (§4), so do not implement A2 and §4 separately.
+2. **The real fix (0.56.0) — `Artifact::Lock`.** One artifact kind, written by
+   BOTH lanes. This also closes the start-instant window, so do not implement A2
+   and §4 separately.
 
-   *Name:* `artifact_ident(table, Artifact::Lock, limit)` — the **un-tokenized**
-   form, because it is the mutex, not a workspace: `<table>__apitap_lock`. Add
+   **READ §4 FIRST — the acquire protocol below is superseded.** It says "atomic
+   create, one winner by construction"; that is true only per NAME, and this
+   guard is a reader/writer matrix, not mutual exclusion. §4 carries the
+   corrected design (announce-then-check, yield on any blocker, no tie-break)
+   and the reasoning. What survives from this section is the NAMING, the
+   contents, the release points and the test plan; the per-engine atomic-create
+   table below is now just a menu of primitives, not the algorithm.
+
+   *Name:* `artifact_ident_run(table, Artifact::Lock, limit, &run)` — TOKENIZED
+   (the un-tokenized form was part of the superseded one-mutex design; a
+   tokenized name is what lets several fan-in runs announce at once and lets
+   `classify` say whose each lock is). Add
    `Lock` to `Artifact::ALL` so namespace reservation and discovery exclusion
    follow (that is what `ALL` is for). `naming::is_artifact` must return true
    for it.
@@ -356,15 +366,52 @@ Each step is one commit, one gate run on the VPS, and it de-risks the next.
 
 ## 4. Explicitly deferred past 0.55.1, with reasons
 
-- **The start-instant TOCTOU window** — designed, not deferred: it is
-  closed by `Artifact::Lock` (§2 A2 step 2) in 0.56.0. For the record, why a
-  token tie-break was rejected: "lower token yields" only works when both runs
-  scan **after** both announced. If A scans before B announces, A proceeds;
-  B then announces, scans, sees A — and if B's token is higher, B proceeds
-  too. Two winners. The only rule that never loses data without a lock is
-  "any peer seen → yield", which makes both yield when they see each other —
-  safe but a double failure. An atomic create has exactly one winner by
-  construction, on every engine, with no clock and no ordering assumption.
+- **The start-instant TOCTOU window** — design CORRECTED 2026-09-12 while
+  starting 0.56.0. The reasoning below is kept because the first half of it is
+  right and the conclusion was wrong.
+
+  Right: a token tie-break is unsafe. "Lower token yields" only works when both
+  runs scan AFTER both announced. If A scans before B announces, A proceeds; B
+  then announces, scans, sees A, and a tie-break can tell B it won too. Two
+  winners.
+
+  **Wrong: "an atomic create has exactly one winner, so use one lock."** An
+  atomic create has one winner *per name*. The matrix this guard implements is
+  not mutual exclusion — it is a reader/writer rule:
+
+  | | |
+  |---|---|
+  | `replace`, `log_based` | exclusive: must be alone |
+  | `append`/`merge`, same source | exclusive against each other |
+  | `append`/`merge`, different sources | **may share** — this is fan-in, and the manual sells it |
+
+  One lock name cannot express that. Give fan-in runs the same name and they
+  refuse each other, removing a capability. Give them different names (per
+  source) and an exclusive run creating its own name learns nothing about
+  theirs — it must still LIST, which puts the check back after the announce and
+  reintroduces exactly the window the lock was supposed to close.
+
+  **What 0.56.0 should build instead — announce-then-check, yield on any
+  blocker, no tie-break.** Each run writes a TOKENIZED lock
+  (`artifact_ident_run(table, Artifact::Lock, …)`) as the first act of prepare —
+  before any staging object, and for a CDC drain before the bootstrap decision.
+  Then it lists the locks, `classify`es them, and yields to any peer that
+  `peer_blocks`. The outcomes:
+
+  - A announces, scans clean, proceeds; B announces, sees A, yields → **one
+    winner**, which is the common case and the one 0.55.1 gets wrong today.
+  - A and B announce inside the same instant, each sees the other, **both
+    yield** → a double failure, loud, no data touched. Rare, and strictly better
+    than today's double SUCCESS with a corrupted destination.
+
+  Never two winners, because a run only proceeds on a scan that happened after
+  its own announce. That is the whole property, and it needs no clock, no
+  ordering assumption and no atomic-create primitive — only that the announce
+  is durable before the scan reads.
+
+  Cost to state plainly in the release notes: two runs starting in the same
+  instant may now BOTH fail where one used to succeed. That is the trade, and
+  it is the right one.
 - **aarch64 / macOS wheels + sdist** (stability.md road-to-1.0 item 2). Not a
   correctness issue; a CI matrix change. Schedule after 0.55.1.
 - **The gate in CI** (item 1). Needs a runner that can reach the rig; design
