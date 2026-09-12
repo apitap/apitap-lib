@@ -122,7 +122,13 @@ impl PgSink {
             match classify(&name, &self.bare, Artifact::Staging,
                            crate::naming::PG_IDENT_MAX, &self.run, now) {
                 Found::Foreign | Found::Mine => {}
-                Found::Dead => self.drop_staging(&name).await?,
+                // A pre-0.55.0 name. An older apitap may be loading into it
+                // right now, and this run cannot tell — so it refuses instead
+                // of deleting, the same rule every other artifact gets.
+                Found::Legacy => {
+                    return Err(crate::naming::legacy_error(
+                        &format!("{}.{}", self.schema, self.bare), &name));
+                }
                 Found::Live(peer) => {
                     if crate::naming::peer_blocks(&mine, &peer) {
                         return Err(crate::naming::locked_error(

@@ -514,7 +514,11 @@ impl ChSink {
                 crate::naming::Found::Mine => self.drop_artifact(&name).await?,
                 // The pre-token name an older apitap wrote. Nothing living mints
                 // it, which is the only thing collection can prove.
-                crate::naming::Found::Dead => self.drop_artifact(&name).await?,
+                // A pre-0.55.0 name: refuse, never delete. See Found::Legacy.
+                crate::naming::Found::Legacy => {
+                    return Err(crate::naming::legacy_error(
+                        &format!("{}.{}", self.ch.database(), self.final_bare), &name));
+                }
                 crate::naming::Found::Live(peer) => {
                     if crate::naming::peer_blocks(&mine, &peer) {
                         return Err(crate::naming::locked_error(

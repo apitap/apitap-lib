@@ -593,7 +593,19 @@ impl GcsSink {
             let what = classify(&self.staging_root, &key);
             match what {
                 Staged::Foreign => {}
-                Staged::Legacy => dead.push(key),
+                // A pre-0.55.0 key: refuse, never delete. It used to go onto
+                // `dead`, but an apitap older than 0.55.0 writes exactly this
+                // layout WHILE IT LOADS — the two versions meet during any
+                // rolling upgrade — and deleting a live old run's parts here is
+                // silent: it re-creates the prefix, composes what remains, and
+                // reports a full row count over a short object. See
+                // naming::Found::Legacy.
+                Staged::Legacy => {
+                    return Err(crate::naming::legacy_error(
+                        &format!("gcs://{}/{}{}", self.conn.bucket, self.conn.prefix, self.bare),
+                        &format!("the objects under gcs://{}/{}", self.conn.bucket, self.conn.prefix),
+                    ));
+                }
                 Staged::Run { seg, peer } => {
                     // Our own segment is not a peer of itself.
                     if seg == self.run.token() {

@@ -398,9 +398,22 @@ pub(crate) enum Found {
     Foreign,
     /// This run's own. Never reaped, never blocking.
     Mine,
-    /// A crashed run's leftover: older than the horizon, or an un-tokenized
-    /// name from before this mechanism existed. Safe to collect.
-    Dead,
+    /// The un-tokenized name an apitap older than 0.55.0 writes.
+    ///
+    /// Not "dead" — that is what it was called until 0.55.1, and every sink
+    /// deleted it on sight. But a ≤0.54.0 run is USING that name while it
+    /// loads, and the two versions meet in exactly the situation an upgrade
+    /// creates: a rolling worker deploy, or a backfill from a laptop that still
+    /// has the old wheel beside an upgraded cron. Deleting it mid-load kills
+    /// the old run's work. On Postgres, MySQL and ClickHouse the old run then
+    /// dies loudly; on BigQuery (`createDisposition: CREATE_IF_NEEDED`) and the
+    /// object stores (per-part uploads) it silently re-creates the object and
+    /// publishes the remainder as a full load — a green run over a truncated
+    /// table, which is the exact defect 0.55.0 exists to remove.
+    ///
+    /// So it is refused like any other artifact that might be live. Nothing is
+    /// collected on a guess; that rule has no exception for old names.
+    Legacy,
     /// A live run's workspace.
     Live(PeerRun),
 }
@@ -418,12 +431,12 @@ pub(crate) fn classify(
     now: u64,
 ) -> Found {
     let (head, suffix) = artifact_match(bare, artifact, limit);
-    // The un-tokenized name an older apitap would have written. It carries no
-    // age, so it can never be aged out — but leaving it forever would break the
-    // cleanup these sinks have always promised, and a concurrent old-version
-    // run is the very bug being fixed.
+    // The un-tokenized name an apitap older than 0.55.0 writes. It carries no
+    // token, so this run cannot tell a crashed old run's leftover from one an
+    // old run is loading into RIGHT NOW — and during an upgrade both are
+    // ordinary. Refuse; see `Found::Legacy`.
     if name == artifact_ident(bare, artifact, limit) {
-        return Found::Dead;
+        return Found::Legacy;
     }
     // Exact length is the anchor. Both ends matching is not enough.
     if name.len() != head.len() + RUN_TOKEN_LEN + suffix.len()
@@ -478,6 +491,27 @@ pub(crate) fn now_unix() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+/// The refusal for an UN-TOKENIZED artifact — one an apitap older than 0.55.0
+/// wrote, or is writing.
+///
+/// Separate from [`locked_error`] because the recovery is different and the
+/// difference matters: there is no token, so there is no run to name, no age to
+/// quote, and no way for this process to tell a crash from a load in progress.
+/// The operator is the only one who can answer that, so the message asks the
+/// question instead of pretending to know.
+pub(crate) fn legacy_error(dest: &str, artifact_name: &str) -> crate::error::Error {
+    crate::error::Error::Locked(format!(
+        "{dest}: {artifact_name} is an apitap staging object from before 0.55.0 \
+         — it carries no run identity, so this run cannot tell whether an older \
+         apitap is still loading into it or crashed and left it. Deleting it \
+         blind is what 0.55.0 exists to stop: on BigQuery and the object stores \
+         the older run would silently re-create it and then publish a truncated \
+         table while reporting a full row count. Check whether any apitap \
+         older than 0.55.0 is running against this table. If none is, remove \
+         {artifact_name} and re-run; if one is, let it finish first."
+    ))
+}
+
 
 /// The refusal one run gives when another already holds the table.
 ///
@@ -1085,16 +1119,31 @@ mod tests {
         }
     }
 
-    /// The one name an older apitap wrote carries no age, so it has to be
-    /// recognised explicitly or it would sit there forever.
+    /// The one name an older apitap wrote is REFUSED, not collected.
+    ///
+    /// It said `Found::Dead` until 0.55.1 and every sink deleted it on sight.
+    /// But an apitap ≤0.54.0 is USING that name while it loads, and the two
+    /// versions meet in exactly the situation an upgrade creates. Deleting it
+    /// mid-load is silent truncation on BigQuery and the object stores — the
+    /// defect this whole mechanism exists to remove, committed by the version
+    /// that removes it.
+    ///
+    /// The cost is a manual drop for a genuine pre-0.55 orphan, once. That is
+    /// the same cost already accepted for tokenized leftovers, and the rule is
+    /// the same rule: nothing is collected on a guess.
     #[test]
-    fn the_pre_token_name_is_collectable() {
+    fn the_pre_token_name_is_refused_not_collected() {
         let run = RunId::mint(LandKind::Swap, "s");
         for &a in Artifact::ALL {
             let legacy = artifact_ident("orders", a, PG_IDENT_MAX);
             assert_eq!(classify(&legacy, "orders", a, PG_IDENT_MAX, &run, now_unix()),
-                       Found::Dead, "{:?}: {legacy}", a);
+                       Found::Legacy, "{:?}: {legacy}", a);
         }
+        // And the refusal has to be actionable: it names the object and tells
+        // the operator what to check before removing it.
+        let msg = format!("{}", legacy_error("public.orders", "orders__apitap_staging"));
+        assert!(msg.contains("orders__apitap_staging"), "names the object: {msg}");
+        assert!(msg.contains("older than 0.55.0"), "names what to look for: {msg}");
     }
 
     /// Anything else beside the table is none of our business.

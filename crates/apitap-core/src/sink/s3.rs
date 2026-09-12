@@ -758,17 +758,34 @@ impl S3Sink {
         // run reports a full row count over a truncated table, which is the
         // exact defect this mechanism exists to remove. `naming::classify` has
         // the long version of the argument.
+        // NOTHING is reapable any more, and the empty set is the point.
+        //
+        // `Legacy` was `true` here until 0.55.1 — the pre-token layout puts
+        // parts directly under the prefix, and this deleted them. But an apitap
+        // older than 0.55.0 writes exactly that layout WHILE IT LOADS, and the
+        // two versions meet during any rolling upgrade. Deleting a live old
+        // run's parts here is silent: its next PutObject re-creates the prefix,
+        // its finalize copies what remains into place, and it reports a full
+        // row count over a truncated object set. That is the defect 0.55.0
+        // exists to remove. A legacy key is refused below instead.
         let reapable = |key: &str| match classify(&self.staging_root, key) {
-            Staged::Foreign => false,
-            Staged::Legacy => true,
-            Staged::Run { .. } => false,
+            Staged::Foreign | Staged::Legacy | Staged::Run { .. } => false,
         };
         // Nothing is deleted until the whole listing has been judged: a live
         // peer anywhere in it means this run does not get to touch the prefix
         // at all.
         let objects = self.conn.list(&self.staging_root).await?;
         for key in &objects {
-            let Staged::Run { seg, peer } = classify(&self.staging_root, key) else {
+            let what = classify(&self.staging_root, key);
+            // A pre-0.55.0 key: refuse, never delete. See naming::Found::Legacy
+            // — the argument is the same, and here the wrong guess is silent.
+            if matches!(what, Staged::Legacy) {
+                return Err(crate::naming::legacy_error(
+                    &format!("s3://{}/{}{}", self.conn.bucket, self.conn.prefix, self.bare),
+                    &format!("the objects under s3://{}/{}", self.conn.bucket, self.conn.prefix),
+                ));
+            }
+            let Staged::Run { seg, peer } = what else {
                 continue;
             };
             // Our own segment is not a peer of itself.

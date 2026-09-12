@@ -1677,7 +1677,14 @@ impl BqSink {
                 crate::naming::Found::Mine => self.conn.table_delete(&name).await?,
                 // The pre-token name an older apitap wrote. Nothing living mints
                 // it; that is the whole of what collection can prove here.
-                crate::naming::Found::Dead => self.conn.table_delete(&name).await?,
+                // A pre-0.55.0 name: refuse, never delete. Silent truncation
+                // lives on this branch — CREATE_IF_NEEDED would re-create it
+                // under the older run and publish a short table. See
+                // Found::Legacy.
+                crate::naming::Found::Legacy => {
+                    return Err(crate::naming::legacy_error(
+                        &format!("{}.{}", self.conn.dataset, self.final_table), &name));
+                }
                 crate::naming::Found::Live(peer) => {
                     if crate::naming::peer_blocks(&mine, &peer) {
                         return Err(crate::naming::locked_error(

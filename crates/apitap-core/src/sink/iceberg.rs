@@ -646,7 +646,16 @@ impl IcebergSink {
                 crate::naming::Found::Foreign => {}
                 // This run's own marker. Best effort: failing a good transfer
                 // over a one-line marker trades a real run for nothing.
-                crate::naming::Found::Mine | crate::naming::Found::Dead => {
+                // Legacy never fires here — this claim prefix is new with the
+                // mechanism, so no untokenized marker exists for classify to
+                // find. Matched explicitly rather than by a wildcard so adding
+                // an artifact kind later is a compile error, not a silent
+                // delete.
+                crate::naming::Found::Legacy => {
+                    return Err(crate::naming::legacy_error(
+                        &format!("{}.{}", self.conn.namespace, self.table), &key));
+                }
+                crate::naming::Found::Mine => {
                     let _ = s3.delete(&key).await;
                 }
                 crate::naming::Found::Live(peer) => {
