@@ -1096,7 +1096,7 @@ The destination table gains four columns:
 | column | meaning |
 |---|---|
 | `_apitap_op` | `I` insert · `U` update · `D` delete · `T` truncate · `B` the bootstrap baseline |
-| `_apitap_lsn` | the window's end LSN (binlog position for MySQL sources) |
+| `_apitap_lsn` | the window's START LSN — the watermark it was drained FROM (binlog position for MySQL sources) |
 | `_apitap_seq` | order WITHIN the window — one window stamps one LSN on every row it lands, so `seq` is what orders events inside it |
 | `_apitap_at` | when the window landed (the partition/retention key) |
 
@@ -1152,15 +1152,27 @@ The destination table gains four columns:
   `INSERT … SELECT` instead of a ~7.3 s MERGE job. BigQuery still needs a
   **billed** project either way — an `INSERT` is row-level DML, which sandbox
   projects reject.
-- **On replay, the VIEW is exact and the LOG is at-least-once.**
-  `<table>__current` always shows the right current state: the newest record
-  per key wins, and a re-applied event carries the same values. The log itself
-  can gain duplicate history — on ClickHouse the append and the watermark are
-  two statements, and a window's boundary is cut by a byte budget and a wall
-  clock, so a re-drain does NOT reproduce the same `_apitap_lsn`. Audit
-  queries that must not double-count should go through the view, or
-  deduplicate on the row's own content. On BigQuery the append and the
-  watermark commit in one transaction, so a window lands whole or not at all.
+- **`(_apitap_lsn, _apitap_seq)` identifies an event, and survives a replay.**
+  A window CAN be applied twice — the append and the watermark are two
+  statements on ClickHouse, and a group whose sibling table fails re-drains
+  every member from the group minimum. The stamp is the watermark the window was
+  drained FROM, which a re-drain reproduces exactly; before 0.56.0 it was the
+  window's END, which a re-drain recomputes from whatever arrived since, so the
+  same event came back under a different number every time and the pair could
+  not be used to de-duplicate anything.
+
+  On ClickHouse a replay now normally appends **nothing at all**: the destination
+  records the window it is about to append, and on the next attempt at the same
+  window it counts what is already there and skips it. On BigQuery a table's
+  `INSERT` and its own watermark row commit in one transaction — as of 0.56.0
+  the statement batcher can no longer split that pair across two.
+
+  One consequence worth knowing: the bootstrap baseline (`_apitap_op = 'B'`) is
+  stamped with the consistent point the snapshot was taken at, and the FIRST
+  window after a bootstrap starts at exactly that point — so a baseline row and
+  that window's first event can share a stamp. `__current` breaks the tie in
+  favour of the real change; if you read the raw log yourself, order by
+  `(_apitap_lsn, _apitap_seq, _apitap_op = 'B')`.
 - **Scope**: analytical destinations only — ClickHouse and BigQuery. Postgres,
   MySQL and Iceberg destinations refuse `changelog=True` loudly rather than
   quietly hand back a replica.

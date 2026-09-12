@@ -376,18 +376,62 @@ pub(crate) fn parse_peer(name: &str, artifact: Artifact) -> Option<PeerRun> {
 /// `Found::Mine` is not a peer (one RunId is shared by every table of a
 /// multi-table run) and `Found::Legacy` is handled by the caller, which has the
 /// destination name needed for its distinct message.
-// Not called yet: the protocol is decided and tested, the per-sink announce and
-// scan are the next commit. Deliberately NOT deleted-until-needed — the rule is
-// the part that needed argument (see the doc comment and §4 of
-// docs/review/2026-09-12-prod-readiness-v0.55.0.md), and pinning it first is
-// what stops the integration from inventing a different one per sink, which is
-// exactly how the 0.55.0 guard went wrong in six of them.
-#[allow(dead_code)]
 pub(crate) fn lock_blocks<'a>(
     mine: &PeerRun,
     locks: impl IntoIterator<Item = &'a PeerRun>,
 ) -> Option<&'a PeerRun> {
     locks.into_iter().find(|peer| peer_blocks(mine, peer))
+}
+
+/// The artifact kinds a concurrency scan has to look at.
+///
+/// The lock, because that is what a run announces itself with; the staging
+/// object, because a run started by an apitap that predates the lock announces
+/// itself with nothing else, and an upgrade puts the two versions side by side.
+/// Iterate this — never scan for one kind and assume the other cannot be there.
+pub(crate) const GUARDED: &[Artifact] = &[Artifact::Lock, Artifact::Staging];
+
+/// The whole verdict of the announce-then-check scan, as one call.
+///
+/// `names` is every artifact name found beside the destination — the caller
+/// supplies them because listing is the one part that is genuinely different on
+/// a catalog, an object store and a BigQuery dataset. Everything after the
+/// listing is the same decision everywhere, and it is made here precisely once:
+/// the 0.55.0 guard open-coded it seven times and the review found the same
+/// class of mistake in six of them.
+pub(crate) fn guard_verdict<'a>(
+    dest: &str,
+    bare: &str,
+    limit: usize,
+    run: &RunId,
+    names: impl IntoIterator<Item = &'a str>,
+) -> crate::error::Result<()> {
+    let now = now_unix();
+    let mine: Vec<(Artifact, PeerRun)> = GUARDED
+        .iter()
+        .map(|&a| {
+            let n = artifact_ident_run(bare, a, limit, run);
+            (a, parse_peer(&n, a).expect("a name this process minted parses"))
+        })
+        .collect();
+    for name in names {
+        for (a, me) in &mine {
+            // A name of a DIFFERENT kind classifies as `Foreign` here — the
+            // suffix does not match and the exact-length anchor fails — so
+            // asking every kind about every name is safe, and it is the only
+            // way a lock and a staging object both get seen.
+            match classify(name, bare, *a, limit, run, now) {
+                Found::Foreign | Found::Mine => {}
+                Found::Legacy => return Err(legacy_error(dest, name)),
+                Found::Live(peer) => {
+                    if let Some(blocker) = lock_blocks(me, std::iter::once(&peer)) {
+                        return Err(locked_error(dest, name, me, blocker, now));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 
@@ -682,7 +726,7 @@ pub(crate) fn artifact_match(bare: &str, artifact: Artifact, limit: usize) -> (S
 /// Used by table discovery and by the namespace reservation, so both answer the
 /// question the same way and neither can fall behind [`Artifact::ALL`].
 pub(crate) fn is_artifact(name: &str) -> bool {
-    name == STATE_TABLE
+    OWN_TABLES.contains(&name)
         || Artifact::ALL
             .iter()
             .filter(|a| a.reserved())
@@ -711,7 +755,9 @@ pub(crate) fn sql_exclusion(col: &str, dialect: Dialect) -> String {
         };
         out.push_str(&format!(" AND {col} NOT LIKE '%{pat}'{esc}"));
     }
-    out.push_str(&format!(" AND {col} <> '{STATE_TABLE}'"));
+    for t in OWN_TABLES {
+        out.push_str(&format!(" AND {col} <> '{t}'"));
+    }
     out
 }
 
@@ -782,6 +828,17 @@ mod pg_state_key_tests {
 /// The state table's name is fixed — it is per-destination, not per-table, so
 /// it never needs shortening.
 pub(crate) const STATE_TABLE: &str = "_apitap_state";
+
+/// The ClickHouse changelog apply's intent marker, also per-destination.
+///
+/// Listed here beside `STATE_TABLE` and not in `dest_ch.rs`, because the only
+/// thing every apitap-owned table name has in common is that discovery must not
+/// pick it up: a ClickHouse SOURCE with `tables="*"` would otherwise replicate
+/// apitap's own bookkeeping as if a user had made it.
+pub(crate) const CDC_PENDING_TABLE: &str = "_apitap_cdc_pending";
+
+/// Every table apitap owns whose name is a whole word rather than a suffix.
+pub(crate) const OWN_TABLES: &[&str] = &[STATE_TABLE, CDC_PENDING_TABLE];
 
 #[cfg(test)]
 mod tests {
@@ -909,7 +966,14 @@ mod tests {
                 };
                 assert!(sql.contains(&esc), "{:?} missing from {:?}: {sql}", a, d);
             }
-            assert!(sql.contains(STATE_TABLE), "state table missing: {sql}");
+            // Every whole-word table apitap owns, not just the state one: the
+            // changelog's `_apitap_cdc_pending` joined the set in 0.56.0, and a
+            // hand-written list is exactly how three of the eight suffixes were
+            // missing before this was derived.
+            for t in OWN_TABLES {
+                assert!(sql.contains(t), "{t} missing from {d:?}: {sql}");
+                assert!(is_artifact(t), "{t} must be hidden from discovery");
+            }
         }
     }
 
@@ -968,6 +1032,63 @@ mod tests {
         // the FIRST blocker is what the error will name
         let found = lock_blocks(&replace_a, [&app_b, &cdc_a]).expect("blocked");
         assert_eq!(found.kind, LandKind::Incremental);
+    }
+
+    /// What a sink actually calls: given the names a scan returned, does this
+    /// run proceed?
+    ///
+    /// The point of the whole 0.56.0 change is the FIRST case — a peer that has
+    /// announced itself and not yet created any staging object. The 0.55.x scan
+    /// looked only at staging, so that peer was invisible and both runs went.
+    #[test]
+    fn a_scan_sees_a_peer_that_has_only_announced_itself() {
+        let mine = RunId::mint(LandKind::Swap, "postgres://h:5432/db");
+        let peer_run = RunId::mint(LandKind::Incremental, "postgres://other:5432/db");
+        let their_lock = artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &peer_run);
+        let their_staging =
+            artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &peer_run);
+
+        // A lock ALONE refuses. This is the new capability; drop Artifact::Lock
+        // from GUARDED and only this assertion fails.
+        let e = guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
+                              [their_lock.as_str()])
+            .expect_err("a replace must yield to a peer that has announced itself");
+        assert!(format!("{e}").contains("locked:"), "{e}");
+        // …and so does staging alone, exactly as before.
+        assert!(guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
+                              [their_staging.as_str()]).is_err());
+
+        // This run's OWN announcement is not a peer — it is the thing the scan
+        // is taken after. If it were, every run would refuse itself.
+        let my_lock = artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &mine);
+        let my_staging = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &mine);
+        guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
+                      [my_lock.as_str(), my_staging.as_str()])
+            .expect("a run must not refuse itself");
+
+        // FAN-IN survives the lock: two appends from DIFFERENT sources share a
+        // table on purpose, and each one announces. Delete this and "refuse
+        // anything with a lock beside it" passes everything above.
+        let fanin = RunId::mint(LandKind::Incremental, "postgres://h:5432/db");
+        guard_verdict("public.orders", "orders", PG_IDENT_MAX, &fanin,
+                      [their_lock.as_str()])
+            .expect("two appends from different sources must both proceed");
+
+        // A sibling table's lock is not this table's business.
+        let sibling = artifact_ident_run("orders_archive", Artifact::Lock, PG_IDENT_MAX, &peer_run);
+        guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine, [sibling.as_str()])
+            .expect("a prefix-sharing sibling is a different destination");
+
+        // An un-tokenized name still refuses with the LEGACY message, whichever
+        // kind it is: an apitap that predates the lock is loading into it.
+        for legacy in [artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX),
+                       artifact_ident("orders", Artifact::Lock, PG_IDENT_MAX)] {
+            let e = guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
+                                  [legacy.as_str()])
+                .expect_err("an un-tokenized artifact is refused, never collected");
+            assert!(format!("{e}").contains("older than 0.55.0")
+                    || format!("{e}").contains("legacy"), "{legacy}: {e}");
+        }
     }
 
     /// A lock is a first-class artifact: reserved, namespaced, and fitting

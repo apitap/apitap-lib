@@ -437,7 +437,14 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         }
     }
 
-    sink.prepare(&plan, &lane, opts.durable, mode).await?;
+    if let Err(e) = sink.prepare(&plan, &lane, opts.durable, mode).await {
+        // `prepare` announced this run before it scanned, and it did not get to
+        // the point where something else makes the run visible. Take the
+        // announcement back, or the next run of this table refuses over a run
+        // that never started — see `Sink::release_lock`.
+        sink.release_lock().await;
+        return Err(e);
+    }
 
     // Everything from here to finalize runs inside this block so that ONE error
     // arm covers all of it. It used to be a straight `?` chain, and every `?`

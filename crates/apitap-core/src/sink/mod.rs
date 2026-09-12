@@ -207,4 +207,26 @@ pub(crate) trait Sink: Sized + Send + Sync {
     fn discard(&self) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
+
+    /// Drop this run's announcement — the tokenized `__apitap_lock` `prepare`
+    /// writes before it scans for peers.
+    ///
+    /// Called by `pipeline::run` when `prepare` FAILS, and only then: the
+    /// success paths release it themselves, each at the point where the run
+    /// becomes visible some other way (staging exists, or the run is over).
+    ///
+    /// It has to be the driver's job because `prepare` is the one step outside
+    /// the error arm that covers everything else, and a run refused by its own
+    /// scan has already announced itself. Without this it leaves that
+    /// announcement behind, and the NEXT run reads it as a live peer and refuses
+    /// too — forever, over a run that never started. Measured in
+    /// `e2e_failure_modes.py` leg 1, where it poisoned the retry after the
+    /// operator had already cleaned up. Same class of leak the 0.55.1 error arm
+    /// removed for staging.
+    ///
+    /// Best-effort by contract, like `discard`: the original error is what the
+    /// operator needs to read.
+    fn release_lock(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }

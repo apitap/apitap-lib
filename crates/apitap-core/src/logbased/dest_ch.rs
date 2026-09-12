@@ -25,6 +25,16 @@ const STATE_CURSOR: &str = "_lsn";
 // every captured operation is INSERTed with the meta columns below, nothing is
 // ever updated or deleted, and `<table>__current` derives the current state.
 // ClickHouse is built for exactly this shape — no mutations, no part rewrites.
+/// The changelog append's intent marker — see `ensure_pending_table`. The bare
+/// name lives in `naming` so table discovery excludes it along with
+/// `_apitap_state`; this is only its quoted spelling.
+const PENDING: &str = "`_apitap_cdc_pending`";
+const _: () = assert!(
+    // A rename that forgot the other half would make apitap replicate its own
+    // bookkeeping out of a ClickHouse source.
+    matches!(crate::naming::CDC_PENDING_TABLE.as_bytes(), b"_apitap_cdc_pending")
+);
+
 pub(crate) const CL_OP: &str = "_apitap_op";
 pub(crate) const CL_LSN: &str = "_apitap_lsn";
 pub(crate) const CL_SEQ: &str = "_apitap_seq";
@@ -119,6 +129,87 @@ impl ChDest {
             )
             .await?;
         Ok(())
+    }
+
+    /// The changelog append's intent marker: "a window starting at `lsn` is
+    /// being appended to `dest_table`".
+    ///
+    /// Its own table rather than a row in `_apitap_state`, because that one is
+    /// `ReplacingMergeTree ORDER BY (dest_table, source_id)` — a second row for
+    /// the same pair does not sit beside the watermark, it REPLACES it.
+    async fn ensure_pending_table(&self) -> Result<()> {
+        if !self.first_time("\u{1}pending") {
+            return Ok(());
+        }
+        self.ch
+            .exec(&format!(
+                "CREATE TABLE IF NOT EXISTS {PENDING} (\
+                   dest_table String, source_id String, lsn UInt64, \
+                   at DateTime64(6, 'UTC') DEFAULT now64(6)) \
+                 ENGINE = ReplacingMergeTree(at) ORDER BY (dest_table, source_id)"
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// The window start the last append ATTEMPT was made at, if any.
+    async fn pending_window(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        self.ensure_pending_table().await?;
+        let body = self
+            .ch
+            .exec(&format!(
+                "SELECT toString(argMax(lsn, at)) FROM {PENDING} \
+                 WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
+                ch_str(dest_table),
+                ch_str(source_id),
+            ))
+            .await?;
+        Ok(body.trim().parse::<u64>().ok())
+    }
+
+    async fn mark_pending(&self, dest_table: &str, source_id: &str, lsn: u64) -> Result<()> {
+        self.ensure_pending_table().await?;
+        self.ch
+            .exec(&format!(
+                "INSERT INTO {PENDING} (dest_table, source_id, lsn) VALUES ('{}', '{}', {lsn})",
+                ch_str(dest_table),
+                ch_str(source_id),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// How much of a window stamped `lsn` is already in the table, and whether
+    /// what is there is an unbroken prefix `seq = 0..n-1`.
+    ///
+    /// It matters because a torn INSERT is what we are recovering from: rows go
+    /// out in `seq` order and ClickHouse commits the blocks it received, so the
+    /// survivor is normally a prefix — but `count = max(seq) + 1` is the only
+    /// thing that PROVES it, and without the proof resuming at `count` would
+    /// silently drop the events in the hole.
+    async fn appended_prefix(&self, dest_table: &str, lsn: u64) -> Result<Option<usize>> {
+        let body = self
+            .ch
+            .exec(&format!(
+                // Baseline rows are excluded, and they have to be: the bootstrap
+                // stamps them with its consistent point, and the FIRST window
+                // after a bootstrap starts at exactly that point. Counted in,
+                // they made `count == max(seq) + 1` false on every first replay
+                // and the prefix looked torn when it was intact (measured).
+                "SELECT count(), ifNull(max({CL_SEQ}), 0) FROM {} \
+                 WHERE {CL_LSN} = {lsn} AND {CL_OP} != '{b}' \
+                 FORMAT TabSeparated",
+                ch_ident(dest_table),
+                b = ch_str(CL_BASELINE),
+            ))
+            .await?;
+        let mut f = body.trim().split('\t');
+        let n: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        let max_seq: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        if n == 0 {
+            return Ok(Some(0));
+        }
+        Ok(if n == max_seq + 1 { Some(n) } else { None })
     }
 
     /// Refuse a clustered (Replicated*) destination table, loudly, before the
@@ -416,11 +507,20 @@ impl ChDest {
                      SELECT ifNull(max(({CL_LSN}, {CL_SEQ})), (toUInt64(0), toUInt32(0))) \
                      FROM {t} WHERE {CL_OP} = '{tr}' \
                    ) \
-                   ORDER BY {CL_LSN} DESC, {CL_SEQ} DESC \
+                   ORDER BY {CL_LSN} DESC, {CL_SEQ} DESC, {CL_OP} = '{base}' ASC \
                    LIMIT 1 BY {keys} \
                  ) WHERE {CL_OP} != '{del}'",
                 tr = ch_str("T"),
                 del = ch_str("D"),
+                // The tie-break, and it became load-bearing in 0.56.0: a window
+                // is stamped with the watermark it was drained FROM, and the
+                // FIRST window after a bootstrap starts exactly where the
+                // baseline snapshot was taken. So a baseline row and that
+                // window's first event for the same key can carry the identical
+                // (lsn, seq) — every baseline row is written with seq 0 — and
+                // without this the winner of that tie is arbitrary. A real
+                // change always outranks the snapshot it changed.
+                base = ch_str(CL_BASELINE),
             ))
             .await?;
         Ok(())
@@ -489,9 +589,27 @@ impl ChDest {
     /// changelog=true apply: ONE plain INSERT of every captured operation.
     ///
     /// No delete-set, no key table, no DELETE, no TRUNCATE — ClickHouse never
-    /// writes a mutation, so the destination never rewrites parts. Replay is
-    /// safe because a re-drained window re-appends rows carrying the SAME
-    /// `(lsn, seq)`, and `__current` picks one of them; the duplicate is inert.
+    /// writes a mutation, so the destination never rewrites parts.
+    ///
+    /// **Replay.** The INSERT and the watermark are two round-trips and
+    /// ClickHouse has no transaction to hold them together, so a window CAN be
+    /// re-drained after its rows landed: the process dies in between, or a
+    /// sibling table in the same group fails its apply and the next run restarts
+    /// from the group minimum. Two things make that safe, and until 0.56.0
+    /// neither did.
+    ///
+    /// 1. The stamp is `outcome.start_lsn` — the watermark the window was
+    ///    drained FROM, the one position that is identical on a replay. It used
+    ///    to be `end_lsn`, which a re-drain recomputes from whatever has arrived
+    ///    since, so the same event came back under a different `_apitap_lsn`
+    ///    every time. The doc here claimed the opposite ("the SAME (lsn, seq)")
+    ///    and that claim was simply false; `(lsn, seq)` is a real event identity
+    ///    now, and a consumer can de-duplicate on it.
+    /// 2. `_apitap_cdc_pending` records the window we are ABOUT to append. If
+    ///    the next attempt opens on the same start, the rows already in the
+    ///    table at that stamp are counted and skipped — so the ordinary replay
+    ///    appends nothing twice at all, rather than appending a duplicate that
+    ///    is merely identifiable.
     /// One readback per window: the current value of every masked column, for
     /// every key that needs one, from `<table>__current`. The view filters the
     /// base table by key first, so this probes the sorting key rather than
@@ -607,7 +725,40 @@ impl ChDest {
             .chain([CL_OP.to_string(), CL_LSN.to_string(), CL_SEQ.to_string(), CL_AT.to_string()])
             .collect::<Vec<_>>()
             .join(", ");
-        let lsn = outcome.end_lsn;
+        // The window's START, not its end: see the replay note on this method.
+        let lsn = outcome.start_lsn;
+        // Did a previous attempt at THIS window already append? Only asked when
+        // the marker names the same start — on the ordinary path it names the
+        // previous window's, and the count below (which scans `_apitap_lsn`, a
+        // sorting-key SUFFIX, so it prunes nothing) is never run.
+        let mut skip = 0usize;
+        if !c.events.is_empty() && self.pending_window(dest_table, source_id).await? == Some(lsn) {
+            match self.appended_prefix(dest_table, lsn).await? {
+                Some(n) => skip = n.min(c.events.len()),
+                // Not a prefix: the surviving rows have a hole in them, so there
+                // is no safe place to resume. Re-append the whole window — the
+                // stamps are stable, so the overlap is an exact `(lsn, seq)`
+                // duplicate that `__current` and any consumer can collapse,
+                // which is the bad-but-honest outcome rather than a silent gap.
+                None => {
+                    eprintln!(
+                        "apitap: {dest_table}: a previous append of the window at lsn {lsn} \
+                         left an incomplete run of rows, so it cannot be resumed part-way. \
+                         Re-appending the whole window; rows carrying a repeated \
+                         ({CL_LSN}, {CL_SEQ}) are duplicates of each other and may be \
+                         de-duplicated on that pair."
+                    );
+                }
+            }
+        }
+        if skip >= c.events.len() {
+            // Everything already landed; only the watermark was missing.
+            self.write_state(dest_table, source_id, outcome.end_lsn, c.count).await?;
+            return Ok(c.count);
+        }
+        if !c.events.is_empty() {
+            self.mark_pending(dest_table, source_id, lsn).await?;
+        }
         // ONE stamp for the window. It is the PARTITION/retention key, never an
         // ordering key — `(lsn, seq)` orders. Sent explicitly rather than left
         // to a default: the rebuild materialised `_apitap_at` as a plain column,
@@ -615,7 +766,7 @@ impl ChDest {
         // partition.
         let at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let mut buf = Vec::with_capacity(4 << 20);
-        for (seq, ev) in c.events.iter().enumerate() {
+        for (seq, ev) in c.events.iter().enumerate().skip(skip) {
             match patched.get(&seq).or(ev.row.as_ref()) {
                 Some(row) => {
                     // A delete's old image carries the key and NULLs elsewhere —

@@ -21,6 +21,16 @@ pub(crate) struct DrainOutcome {
     /// The last collapsed transaction's `Commit.end_lsn` — the ONLY valid
     /// new watermark. Equal to the start watermark when nothing arrived.
     pub end_lsn: u64,
+    /// The watermark this window was drained FROM — the only position in the
+    /// window that is the same on a replay.
+    ///
+    /// `end_lsn` is not: a re-drain of the same window reads whatever has
+    /// arrived since and stops at a new boundary, so it is a different number
+    /// every time. The changelog destinations stamp `_apitap_lsn` with THIS
+    /// instead, which is what makes `(lsn, seq)` an event identity a consumer
+    /// can de-duplicate on. Until 0.56.0 they stamped `end_lsn` and the module
+    /// doc claimed the replay carried "the SAME (lsn, seq)" — it did not.
+    pub start_lsn: u64,
     /// Column names per table in WAL order (from Relation messages) — the
     /// apply layer aligns them to the destination plan by name.
     pub wal_cols: HashMap<String, Vec<String>>,
@@ -385,6 +395,7 @@ pub(crate) async fn drain(
             .collect(),
         changes: changelogs,
         end_lsn,
+        start_lsn,
         wal_cols: sess.wal_cols.clone(),
         wal_oids: sess.wal_oids.clone(),
         hit_budget,

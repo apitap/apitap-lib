@@ -36,6 +36,38 @@ const MASK_COL: &str = "_apitap_mask";
 // INSERTed, nothing is ever MERGEd, and `<table>__current` derives the current
 // state. On BigQuery this also sidesteps the MERGE's ~7.3 s fixed job cost —
 // the window becomes a load job plus one INSERT … SELECT.
+/// A `commit_batch` is one BigQuery transaction, so this is what decides which
+/// statements are atomic with which.
+const CHUNK_BYTES: usize = 256 << 10;
+
+/// Pack statement GROUPS into transaction-sized batches without ever splitting
+/// a group.
+///
+/// A group is one table's `INSERT` plus its own watermark row. Packing the
+/// flattened statements by byte size — what this did until 0.56.0 — let a
+/// boundary fall between those two, which committed a changelog window's rows
+/// in one transaction and its watermark in the next; any failure in between
+/// replayed the whole window into an append-only table. A group larger than
+/// `limit` still goes out whole: an oversized transaction is correct, a split
+/// one is not.
+fn pack_whole_groups(groups: Vec<Vec<String>>, limit: usize) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let (mut batch, mut len) = (Vec::new(), 0usize);
+    for g in groups {
+        let glen: usize = g.iter().map(String::len).sum();
+        if len + glen > limit && !batch.is_empty() {
+            out.push(std::mem::take(&mut batch));
+            len = 0;
+        }
+        len += glen;
+        batch.extend(g);
+    }
+    if !batch.is_empty() {
+        out.push(batch);
+    }
+    out
+}
+
 const CL_LSN: &str = "_apitap_lsn";
 const CL_SEQ: &str = "_apitap_seq";
 const CL_AT: &str = "_apitap_at";
@@ -333,7 +365,7 @@ impl BqDest {
     ///
     /// The ClickHouse view's three rules, in BigQuery's dialect: drop everything
     /// at or below the newest `T`; take the latest record per key by the PAIR
-    /// `(lsn, seq)` — one window stamps its end-LSN on every row it lands, so
+    /// `(lsn, seq)` — one window stamps its START-LSN on every row it lands, so
     /// `seq` is what orders events inside a window; then drop keys whose newest
     /// record is `D`, AFTER the pick, or the delete would be skipped and the
     /// previous version would resurrect. BigQuery has no row-value comparison,
@@ -363,9 +395,17 @@ impl BqDest {
                   OR (_apitap_s.{CL_LSN} = _apitap_tr.l AND _apitap_s.{CL_SEQ} > _apitap_tr.s) \
                QUALIFY ROW_NUMBER() OVER ( \
                  PARTITION BY {keys_q} \
-                 ORDER BY _apitap_s.{CL_LSN} DESC, _apitap_s.{CL_SEQ} DESC) = 1 \
+                 ORDER BY _apitap_s.{CL_LSN} DESC, _apitap_s.{CL_SEQ} DESC, \
+                          _apitap_s.{OP_COL} = '{base}' ASC) = 1 \
              ) WHERE {OP_COL} != 'D'",
             v = self.conn.fq(&format!("{table}__current")),
+            // The tie-break, load-bearing since 0.56.0: a window is stamped with
+            // the watermark it was drained FROM, and the first window after a
+            // bootstrap starts exactly where the baseline snapshot was taken —
+            // so a baseline row (always seq 0) and that window's first event for
+            // the same key can carry the identical (lsn, seq). A real change
+            // always outranks the snapshot it changed.
+            base = CL_BASELINE,
         );
         self.conn.cdc_script(&sql).await
     }
@@ -395,6 +435,13 @@ impl BqDest {
     /// Replay-safe without a dedup pass: the INSERT and the window's watermark
     /// row commit inside ONE transaction, so a window either landed whole or
     /// not at all, and a re-drained window re-lands from the same LSN.
+    ///
+    /// Both halves of that were untrue until 0.56.0. The chunker packed a FLAT
+    /// list of statements by byte size, so a boundary could fall between a
+    /// table's INSERT and its watermark and put them in two transactions; it
+    /// packs whole pairs now. And the stamp was `end_lsn`, which a re-drain
+    /// recomputes — so "re-lands from the same LSN" was false and `(lsn, seq)`
+    /// could not be used to de-duplicate. It is `start_lsn` now.
     pub(crate) async fn apply_group_changelog(
         &self,
         ctxs: &[(String, String, Vec<String>, String)],
@@ -413,26 +460,24 @@ impl BqDest {
             .await?;
 
         let mut rows = vec![0u64; ctxs.len()];
-        let mut stmts: Vec<String> = Vec::new();
+        // One GROUP per table — its INSERT and its own watermark row — never a
+        // flat statement list. `commit_batch` wraps each chunk in its own
+        // transaction, so a size-driven boundary that fell BETWEEN a table's two
+        // statements committed the log rows in one transaction and the watermark
+        // in the next: a failure in between replayed that table's whole window
+        // into an append-only table. The pair is indivisible; only whole pairs
+        // are packed.
+        let mut groups: Vec<Vec<String>> = Vec::with_capacity(staged.len());
         for (i, ev, sql) in staged {
             rows[i] = ev;
-            stmts.extend(sql);
+            if !sql.is_empty() {
+                groups.push(sql);
+            }
         }
-        if stmts.is_empty() {
+        if groups.is_empty() {
             return Ok(rows);
         }
-        const CHUNK_BYTES: usize = 256 << 10;
-        let (mut batch, mut len) = (Vec::new(), 0usize);
-        for s in stmts {
-            if len + s.len() > CHUNK_BYTES && !batch.is_empty() {
-                self.commit_batch(&batch).await?;
-                batch.clear();
-                len = 0;
-            }
-            len += s.len();
-            batch.push(s);
-        }
-        if !batch.is_empty() {
+        for batch in pack_whole_groups(groups, CHUNK_BYTES) {
             self.commit_batch(&batch).await?;
         }
         Ok(rows)
@@ -577,7 +622,12 @@ impl BqDest {
             .cloned()
             .chain([
                 bt(OP_COL),
-                format!("CAST({} AS INT64)", outcome.end_lsn),
+                // The window's START, not its end. `end_lsn` is recomputed by
+                // every re-drain, so the same event came back under a different
+                // `_apitap_lsn` and `(lsn, seq)` was useless as a de-duplication
+                // key on a log that this path CAN replay (see the chunking note
+                // on `apply_group_changelog`).
+                format!("CAST({} AS INT64)", outcome.start_lsn),
                 format!("CAST({} AS INT64)", bt(CL_SEQ)),
                 // One stamp for the whole window: it is the PARTITION and
                 // retention key, never an ordering key — `(lsn, seq)` orders.
@@ -1456,5 +1506,64 @@ mod tests {
         let line = String::from_utf8(out).unwrap();
         assert!(line.contains("\"_apitap_op\":\"D\""), "{line}");
         assert!(line.contains("\"id\":\"42\""), "{line}");
+    }
+
+    /// Each batch is one BigQuery transaction. A changelog table's INSERT and
+    /// its own watermark row must land in the SAME one — split across two, a
+    /// failure between them replays the window into an append-only table.
+    /// The OLD packer, kept here as the control: it is the reason this test
+    /// exists, and without it "the pairs are together" proves only that the new
+    /// code agrees with itself.
+    fn pack_flat(groups: Vec<Vec<String>>, limit: usize) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        let (mut batch, mut len) = (Vec::new(), 0usize);
+        for s in groups.into_iter().flatten() {
+            if len + s.len() > limit && !batch.is_empty() {
+                out.push(std::mem::take(&mut batch));
+                len = 0;
+            }
+            len += s.len();
+            batch.push(s);
+        }
+        if !batch.is_empty() {
+            out.push(batch);
+        }
+        out
+    }
+
+    /// Every batch is one BigQuery transaction, so a changelog table's INSERT
+    /// and its own watermark row must land in the SAME one. Split across two, a
+    /// failure in between commits the log rows without the watermark and the
+    /// next run replays the whole window into an append-only table.
+    #[test]
+    fn a_tables_insert_and_its_watermark_are_never_split_across_transactions() {
+        // Sized so a pair straddles the limit: the INSERT fits alone, the
+        // watermark row does not fit beside it. That is the boundary the old
+        // packer cut through.
+        let pair = |i: usize| vec![format!("INSERT t{i} {}", "x".repeat(280)),
+                                   format!("STATE t{i}")];
+        let groups: Vec<Vec<String>> = (0..7).map(pair).collect();
+        const LIMIT: usize = 295;
+
+        let split = |batches: &Vec<Vec<String>>| {
+            batches.iter().any(|b| b.len() % 2 != 0
+                || b.chunks(2).any(|p| p[1] != format!("STATE {}",
+                    p[0].split_whitespace().nth(1).unwrap())))
+        };
+
+        // Control: the flat packer really does cut a pair in half here.
+        assert!(split(&pack_flat(groups.clone(), LIMIT)),
+                "the control did not reproduce the split — the sizes stopped exercising it");
+
+        let batches = pack_whole_groups(groups, LIMIT);
+        assert!(!split(&batches), "a pair was separated: {batches:?}");
+        let n: usize = batches.iter().map(Vec::len).sum();
+        assert_eq!(n, 14, "every statement still goes out exactly once");
+
+        // A single pair bigger than the whole limit is still emitted whole: an
+        // oversized transaction is correct, a split one is not.
+        let one = pack_whole_groups(vec![pair(9)], 8);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].len(), 2);
     }
 }

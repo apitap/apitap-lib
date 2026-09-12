@@ -208,5 +208,43 @@ else:
     ok = False
     print(f"   ✗ __current mismatch\n   src:\n{src}\n   dst:\n{cur}")
 
+# ── a TRUNCATE at the source must empty the destination ─────────────────────
+# MySQL and MariaDB write TRUNCATE into the binlog as a QUERY event, not a rows
+# event. Until 0.56.0 the reader parsed it, matched it with is_ddl, used it to
+# invalidate the schema cache, and dropped it — so the window never carried
+# `truncate`, no destination ever emptied the table, and the run reported
+# success over a destination holding every row the source had discarded.
+#
+# Postgres has had TRUNCATE from the start (pgoutput emits a Truncate message),
+# so this gap was invisible to every leg that used a pg source.
+print("== a source TRUNCATE reaches the destination ==")
+TT = "ma_truncate"
+ma(f"DROP TABLE IF EXISTS bench.{TT}")
+ch(f"DROP TABLE IF EXISTS {TT}")
+ch(f"DELETE FROM _apitap_state WHERE dest_table = '{TT}'")
+ma(f"CREATE TABLE bench.{TT} (id BIGINT PRIMARY KEY, v VARCHAR(32))")
+ma(f"INSERT INTO bench.{TT} VALUES (1,'a'),(2,'b'),(3,'c')")
+apitap.transfer(MA, CH, table=TT, mode="log_based")          # bootstrap
+before = ch(f"SELECT count() FROM {TT}")
+
+# One window containing the truncate AND the rows that follow it: the order
+# inside the window is what decides whether the new rows survive the wipe.
+ma(f"TRUNCATE TABLE bench.{TT}")
+ma(f"INSERT INTO bench.{TT} VALUES (7,'x'),(8,'y')")
+apitap.transfer(MA, CH, table=TT, mode="log_based")
+after = ch(f"SELECT count() FROM {TT}")
+src_n = ma(f"SELECT count(*) FROM bench.{TT}")
+
+if before == "3" and after == src_n == "2":
+    print(f"   ✓ truncate replicated: {before} → {after}, source has {src_n}")
+else:
+    ok = False
+    print(f"   ✗ truncate NOT replicated: dest was {before}, is {after}, "
+          f"source has {src_n} (pre-0.56.0 predicts dest=5: the 3 old rows kept "
+          f"plus the 2 new ones)")
+ma(f"DROP TABLE IF EXISTS bench.{TT}")
+ch(f"DROP TABLE IF EXISTS {TT}")
+ch(f"DELETE FROM _apitap_state WHERE dest_table = '{TT}'")
+
 print("\n" + ("MARIADB CDC E2E: ALL GREEN" if ok else "MARIADB CDC E2E: FAILED"))
 raise SystemExit(0 if ok else 1)

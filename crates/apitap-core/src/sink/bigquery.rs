@@ -60,6 +60,12 @@ const STATE_TABLE: &str = "_apitap_state";
 /// table while passing it explicitly (a WRITE_TRUNCATE load replaces the
 /// table's schema with the load's) — a second, drifted copy of these fields
 /// would let a compaction silently retype or drop a column under every lane.
+/// The lock table's schema. BigQuery has no zero-column table, and nothing ever
+/// reads this one — only the table's NAME is the message.
+fn lock_schema_fields() -> Value {
+    serde_json::json!([{ "name": "t", "type": "INT64" }])
+}
+
 fn state_schema_fields() -> Value {
     json!([
         {"name": "dest_table", "type": "STRING", "mode": "REQUIRED"},
@@ -1508,6 +1514,9 @@ pub(crate) struct BqSink {
     /// `<staging_table>_<i>`. The run's token is inside it, so no other run can
     /// ever hand a table to this run's `finalize`.
     staging_table: String,
+    /// This run's announcement that it is working on this table, created before
+    /// the peer scan and deleted in `finalize`/`discard` — see `announce`.
+    lock_table: String,
     /// This run's identity: it is IN `staging_table`, and it is what `prepare`
     /// compares a live peer's staging against.
     run: crate::naming::RunId,
@@ -1590,6 +1599,8 @@ impl BqSink {
                 crate::naming::ROOMY,
                 run,
             ),
+            lock_table: crate::naming::artifact_ident_run(
+                bare, crate::naming::Artifact::Lock, crate::naming::ROOMY, run),
             run: run.clone(),
             job_config: Value::Null,
             staging_registry: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1623,25 +1634,39 @@ impl BqSink {
     /// the age lives in the token on every engine — one rule beats five clever
     /// ones. It costs nothing here either: this is the same single listing the
     /// sweep already made.
+    /// This run's announcement, written BEFORE the scan — see the Postgres
+    /// sink's `announce` for why that order is the entire property.
+    ///
+    /// Held for the whole run, unlike the SQL sinks, which hand the job over to
+    /// their staging table at the end of `prepare`. BigQuery's `prepare` creates
+    /// nothing: the first load job of each worker creates its own staging table
+    /// (`createDisposition: CREATE_IF_NEEDED`), so between `prepare` and the
+    /// first landed row there would be nothing at all for a peer's scan to see.
+    async fn announce(&self) -> Result<()> {
+        self.conn.table_create(&self.lock_table, &lock_schema_fields()).await
+    }
+
+    /// Best-effort: a failure to delete the lock must not fail a finished run.
+    async fn release(&self) {
+        let _ = self.conn.table_delete(&self.lock_table).await;
+    }
+
     async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{parse_peer, Artifact, ROOMY};
+        use crate::naming::{parse_peer, Artifact, GUARDED, ROOMY};
         // `final_table` IS the bare name: `bind` strips the dataset qualifier,
         // and a BigQuery table id is unqualified within its dataset.
-        let (head, suffix) =
+        let (head, _) =
             crate::naming::artifact_match(&self.final_table, Artifact::Staging, ROOMY);
         // Minted from the run, not read back off `staging_table` — the same
         // call `bind` made, so what this run compares peers against and what it
         // writes into cannot drift apart.
-        let mine = parse_peer(
-            &crate::naming::artifact_ident_run(
-                &self.final_table,
-                Artifact::Staging,
-                ROOMY,
-                &self.run,
-            ),
-            Artifact::Staging,
-        )
-        .expect("a name this process minted parses");
+        let mine: Vec<(Artifact, _)> = GUARDED
+            .iter()
+            .map(|&a| {
+                let n = crate::naming::artifact_ident_run(&self.final_table, a, ROOMY, &self.run);
+                (a, parse_peer(&n, a).expect("a name this process minted parses"))
+            })
+            .collect();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1650,11 +1675,17 @@ impl BqSink {
         // narrowed to `head` — wider than the old `<bare>__apitap_staging`
         // prefix, which is why every candidate below is anchored on BOTH ends
         // before it is touched. Without that, a run of `orders` would reap
-        // `orders_archive`'s live staging.
-        for name in self.conn.tables_with_prefix(&head).await? {
+        // `orders_archive`'s live staging. One listing serves both guarded
+        // kinds: they share the head, and only the suffix differs.
+        let listed = self.conn.tables_with_prefix(&head).await?;
+        for (artifact, mine) in &mine {
+          let suffix = crate::naming::artifact_match(&self.final_table, *artifact, ROOMY).1;
+          for name in &listed {
             // A worker table carries a `_N` index the token does not; strip it
             // first so what reaches `classify` is the name a run actually mints.
-            let Some(base) = staging_base(&name, suffix) else {
+            // (Only staging is ever sharded that way; for a lock this is the
+            // plain ends-with test.)
+            let Some(base) = staging_base(name, suffix) else {
                 continue;
             };
             // Everything after this — both anchors, the exact token width, "is
@@ -1665,7 +1696,7 @@ impl BqSink {
             match crate::naming::classify(
                 base,
                 &self.final_table,
-                Artifact::Staging,
+                *artifact,
                 ROOMY,
                 &self.run,
                 now,
@@ -1673,8 +1704,10 @@ impl BqSink {
                 // Another destination's staging: not ours to judge.
                 crate::naming::Found::Foreign => {}
                 // Ours — one RunId per dispatch — so this is a leftover of THIS
-                // run and safe to delete.
-                crate::naming::Found::Mine => self.conn.table_delete(&name).await?,
+                // run and safe to delete. Never the lock: that one IS this run's
+                // announcement, and this scan is the check it makes meaningful.
+                crate::naming::Found::Mine if *artifact == Artifact::Lock => {}
+                crate::naming::Found::Mine => self.conn.table_delete(name).await?,
                 // The pre-token name an older apitap wrote. Nothing living mints
                 // it; that is the whole of what collection can prove here.
                 // A pre-0.55.0 name: refuse, never delete. Silent truncation
@@ -1683,20 +1716,21 @@ impl BqSink {
                 // Found::Legacy.
                 crate::naming::Found::Legacy => {
                     return Err(crate::naming::legacy_error(
-                        &format!("{}.{}", self.conn.dataset, self.final_table), &name));
+                        &format!("{}.{}", self.conn.dataset, self.final_table), name));
                 }
                 crate::naming::Found::Live(peer) => {
-                    if crate::naming::peer_blocks(&mine, &peer) {
+                    if crate::naming::peer_blocks(mine, &peer) {
                         return Err(crate::naming::locked_error(
                             &format!("{}.{}", self.conn.dataset, self.final_table),
-                            &name,
-                            &mine,
+                            name,
+                            mine,
                             &peer,
                             now,
                         ));
                     }
                 }
             }
+          }
         }
         Ok(())
     }
@@ -1956,6 +1990,11 @@ impl crate::sink::Sink for BqSink {
         // Instead: look at what is there, reap what is dead, refuse what is
         // alive and cannot coexist. The tables this run then creates carry a
         // name only it could have minted, so nothing has to be deleted first.
+        // ANNOUNCE, then check — never the other way round. A run proceeds
+        // only on a scan taken AFTER its own announcement, so a concurrent
+        // pair cannot both miss each other. `pipeline::run` releases the
+        // announcement again if anything here fails; see `announce`.
+        self.announce().await?;
         self.reap_and_check_peers().await?;
         if let Some(cursor) = plan.cursor.as_deref() {
             if let Some(idx) = plan.cols.iter().position(|c| c.name == cursor) {
@@ -2146,6 +2185,10 @@ impl crate::sink::Sink for BqSink {
     /// The registry is the authority, not a name scan: a BigQuery load job
     /// fans out into `<base>_0 … _N` and only the registry knows which ones
     /// this run actually created. Every one of them carries this run's token.
+    async fn release_lock(&self) {
+        self.release().await;
+    }
+
     async fn discard(&self) -> Result<()> {
         let stagings: Vec<String> = self.staging_registry.lock().expect("registry lock").clone();
         let mut first_err = None;
@@ -2154,6 +2197,7 @@ impl crate::sink::Sink for BqSink {
                 first_err.get_or_insert(e);
             }
         }
+        self.release().await;
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -2161,6 +2205,15 @@ impl crate::sink::Sink for BqSink {
     }
 
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        let r = self.finalize_inner(rows, mode).await;
+        // Either outcome ends the run, so the announcement goes either way.
+        self.release().await;
+        r
+    }
+}
+
+impl BqSink {
+    async fn finalize_inner(&self, rows: u64, mode: Mode) -> Result<()> {
         let stagings: Vec<String> = self.staging_registry.lock().expect("registry lock").clone();
         if rows == 0 {
             for t in &stagings {

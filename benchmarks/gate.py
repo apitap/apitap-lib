@@ -67,6 +67,7 @@ LEGS = [
 
     ("e2e_mysql84.py",          "MySQL 8.4 both ways",                        {}, "mysql84", []),
     ("e2e_mariadb_cdc.py",      "MariaDB binlog as a CDC source",             {}, "mariadb", []),
+    ("e2e_changelog_replay.py", "a replayed changelog window is not appended twice", {}, "mariadb", []),
     ("e2e_my_liveness.py",      "a dead binlog peer is noticed",              {}, None, []),
 
     ("e2e_ch_source.py",        "ClickHouse -> ClickHouse, RowBinary relayed", {}, None, []),

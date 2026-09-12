@@ -668,9 +668,22 @@ fn classify(root: &str, key: &str) -> Staged {
     let Some(rest) = key.strip_prefix(root) else {
         return Staged::Foreign;
     };
-    let Some((seg, _)) = rest.split_once('/') else {
+    let Some((seg, tail)) = rest.split_once('/') else {
         return Staged::Legacy;
     };
+    // The lock directory is a SIBLING of the run segments, not one of them:
+    // `finalize` copies every object under this run's own segment into the
+    // published directory, so an announcement written in there would end up
+    // among the data files. Its entries are bare run tokens.
+    if seg == crate::naming::Artifact::Lock.suffix() {
+        return match crate::naming::parse_peer(
+            &format!("{tail}{}", crate::naming::Artifact::Staging.suffix()),
+            crate::naming::Artifact::Staging,
+        ) {
+            Some(peer) => Staged::Run { seg: tail.to_string(), peer },
+            None => Staged::Foreign,
+        };
+    }
     match crate::naming::parse_peer(
         &format!("{seg}{}", crate::naming::Artifact::Staging.suffix()),
         crate::naming::Artifact::Staging,
@@ -735,6 +748,34 @@ impl S3Sink {
     /// LastModified is when it was last WRITTEN, which for a slow run's first
     /// part can be an hour before that run finishes, and would age a live peer
     /// out from under itself. One rule on every engine beats five clever ones.
+    /// Where this run announces itself: `<staging_root>__apitap_lock/<token>`.
+    ///
+    /// Beside the run segments, never inside this run's own: `finalize` lists
+    /// `self.staging` and copies everything it finds there into the published
+    /// directory.
+    fn lock_key(&self) -> String {
+        format!("{}{}/{}", self.staging_root,
+                crate::naming::Artifact::Lock.suffix(), self.run.token())
+    }
+
+    /// This run's announcement, written BEFORE the scan — see the Postgres
+    /// sink's `announce` for why the order is the entire property.
+    ///
+    /// Held for the whole run, unlike the SQL sinks, which hand the job over to
+    /// their staging table at the end of `prepare`. Here `prepare` creates
+    /// nothing — a run's staging segment comes into existence with its first
+    /// part object — so a lock dropped early would leave the run invisible to a
+    /// peer's scan until the first bytes land.
+    async fn announce(&self) -> Result<()> {
+        // Zero bytes: the key is the whole message.
+        self.conn.put_object(&self.lock_key(), Vec::new()).await
+    }
+
+    /// Best-effort: a failure to delete the lock must not fail a finished run.
+    async fn release(&self) {
+        let _ = self.conn.delete(&self.lock_key()).await;
+    }
+
     async fn reap_and_check_peers(&self) -> Result<()> {
         use crate::naming::{parse_peer, Artifact};
         let mine = parse_peer(
@@ -868,6 +909,11 @@ impl crate::sink::Sink for S3Sink {
         // write only under THIS run's segment, which no other run can name.
         // There is nothing to delete first: a colliding key would mean a
         // colliding token, which is loud rather than destructive.
+        // ANNOUNCE, then check — never the other way round. A run proceeds
+        // only on a scan taken AFTER its own announcement, so a concurrent
+        // pair cannot both miss each other. `pipeline::run` releases the
+        // announcement again if anything here fails; see `announce`.
+        self.announce().await?;
         self.reap_and_check_peers().await?;
         Ok(())
     }
@@ -897,6 +943,10 @@ impl crate::sink::Sink for S3Sink {
     /// segment — so the listing can only return objects this run wrote. The
     /// published directory (`prefix/<table>/`) is never touched: a failed run
     /// must leave the last good version of the table exactly as it was.
+    async fn release_lock(&self) {
+        self.release().await;
+    }
+
     async fn discard(&self) -> Result<()> {
         let mut first_err = None;
         for p in self.conn.list(&self.staging).await? {
@@ -904,13 +954,23 @@ impl crate::sink::Sink for S3Sink {
                 first_err.get_or_insert(e);
             }
         }
+        self.release().await;
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
     }
 
-    async fn finalize(&self, rows: u64, _mode: Mode) -> Result<()> {
+    async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        let r = self.finalize_inner(rows, mode).await;
+        // Either outcome ends the run, so the announcement goes either way.
+        self.release().await;
+        r
+    }
+}
+
+impl S3Sink {
+    async fn finalize_inner(&self, rows: u64, _mode: Mode) -> Result<()> {
         let mut parts = self.conn.list(&self.staging).await?;
         parts.sort();
         if rows == 0 {

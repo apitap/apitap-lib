@@ -19,6 +19,9 @@ pub(crate) struct PgSink {
     /// Quoted destination / staging idents; staging lives in the destination's schema.
     final_t: String,
     staging_t: String,
+    /// This run's announcement that it is working on this table. Created before
+    /// the scan, dropped in `finalize` and `discard` — see `announce`.
+    lock_t: String,
     bare: String,
     /// Unquoted schema name, for catalog lookups (`public` when unqualified).
     schema: String,
@@ -93,51 +96,57 @@ impl PgSink {
     /// table's staging, and a run failed to recognise its own artifacts inside
     /// a multi-table transfer. Those are ordering and boundary questions with
     /// one right answer, so they have one implementation.
+    /// This run's announcement, written BEFORE the scan.
+    ///
+    /// An empty table is enough: nothing reads its contents, only its name,
+    /// which carries the run token the scan classifies. `UNLOGGED` because it
+    /// never needs to survive a crash — a lock that outlives the process it
+    /// belongs to is the operational cost this protocol trades for, not a
+    /// feature.
+    async fn announce(&self) -> Result<()> {
+        sqlx::query(&format!("CREATE UNLOGGED TABLE IF NOT EXISTS {} ()", self.lock_t))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Transfer(format!("announce run: {e}")))
+    }
+
+    /// Best-effort: the run is over either way, and a failure to drop the lock
+    /// must not turn a finished transfer into an error. What it leaves behind
+    /// is a name the next run refuses with `locked_error`, which says how to
+    /// clear it.
+    async fn release(&self) {
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.lock_t))
+            .execute(&self.pool)
+            .await;
+    }
+
     async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{artifact_match, classify, Artifact, Found};
-        let (head, suffix) = artifact_match(&self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX);
+        use crate::naming::{artifact_match, GUARDED};
         // `_` and `%` are LIKE wildcards and both appear in these names.
         let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
-        let pattern = format!("{}%{}", esc(&head), esc(suffix));
-        let found: Vec<String> = sqlx::query_scalar(
-            "SELECT c.relname FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE $2",
-        )
-        .bind(&self.schema)
-        .bind(&pattern)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
-
-        let mine = crate::naming::parse_peer(
-            &crate::naming::artifact_ident_run(
-                &self.bare, Artifact::Staging, crate::naming::PG_IDENT_MAX, &self.run),
-            Artifact::Staging,
-        )
-        .expect("a name this process minted parses");
-        let now = crate::naming::now_unix();
-
-        for name in found {
-            match classify(&name, &self.bare, Artifact::Staging,
-                           crate::naming::PG_IDENT_MAX, &self.run, now) {
-                Found::Foreign | Found::Mine => {}
-                // A pre-0.55.0 name. An older apitap may be loading into it
-                // right now, and this run cannot tell — so it refuses instead
-                // of deleting, the same rule every other artifact gets.
-                Found::Legacy => {
-                    return Err(crate::naming::legacy_error(
-                        &format!("{}.{}", self.schema, self.bare), &name));
-                }
-                Found::Live(peer) => {
-                    if crate::naming::peer_blocks(&mine, &peer) {
-                        return Err(crate::naming::locked_error(
-                            &format!("{}.{}", self.schema, self.bare), &name, &mine, &peer, now));
-                    }
-                }
-            }
+        let mut found: Vec<String> = Vec::new();
+        for &a in GUARDED {
+            let (head, suffix) = artifact_match(&self.bare, a, crate::naming::PG_IDENT_MAX);
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT c.relname FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE $2",
+            )
+            .bind(&self.schema)
+            .bind(format!("{}%{}", esc(&head), esc(suffix)))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
+            found.extend(rows);
         }
-        Ok(())
+        crate::naming::guard_verdict(
+            &format!("{}.{}", self.schema, self.bare),
+            &self.bare,
+            crate::naming::PG_IDENT_MAX,
+            &self.run,
+            found.iter().map(String::as_str),
+        )
     }
 
     async fn drop_staging(&self, name: &str) -> Result<()> {
@@ -177,6 +186,15 @@ impl PgSink {
             run,
         );
         let staging_t = quote_ident_path(&format!("{schema_pfx}{staging_bare}"));
+        let lock_t = quote_ident_path(&format!(
+            "{schema_pfx}{}",
+            crate::naming::artifact_ident_run(
+                &bare,
+                crate::naming::Artifact::Lock,
+                crate::naming::PG_IDENT_MAX,
+                run,
+            )
+        ));
         let schema = schema_pfx.trim_end_matches('.').to_string();
         let schema = if schema.is_empty() {
             "public".into()
@@ -188,6 +206,7 @@ impl PgSink {
             final_t: quote_ident_path(dest_table),
             copy_in_sql: format!("COPY {staging_t} FROM STDIN (FORMAT binary)"),
             staging_t,
+            lock_t,
             dest_key: format!("{schema}.{bare}"),
             bare,
             schema,
@@ -528,6 +547,11 @@ impl crate::sink::Sink for PgSink {
         // alive and cannot coexist. Then create a name only this run could have
         // minted — so nothing has to be dropped first, and the CREATE failing
         // would mean a token collision, which is loud rather than destructive.
+        // ANNOUNCE, then check — never the other way round. A run proceeds
+        // only on a scan taken AFTER its own announcement, so a concurrent
+        // pair cannot both miss each other. `pipeline::run` releases the
+        // announcement again if anything here fails; see `announce`.
+        self.announce().await?;
         self.reap_and_check_peers().await?;
         // Incremental staging never becomes the final table — always skip its WAL.
         let unlogged = if durable && mode == Mode::Replace {
@@ -540,6 +564,12 @@ impl crate::sink::Sink for PgSink {
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Transfer(format!("create staging: {e}")))?;
+        // The announcement has done its job: staging EXISTS now, and staging is
+        // what the scan reads. Dropping the lock here keeps a killed run's
+        // leftovers at ONE object rather than two — the operator's cleanup story
+        // is unchanged from 0.55.x, and the run stays continuously visible to a
+        // peer because staging was created before this line.
+        self.release().await;
         Ok(())
     }
 
@@ -747,15 +777,32 @@ impl crate::sink::Sink for PgSink {
     ///
     /// `staging_t` is already schema-qualified and quoted, so this does not go
     /// through `drop_staging` (which takes a bare name and qualifies it).
+    async fn release_lock(&self) {
+        self.release().await;
+    }
+
     async fn discard(&self) -> Result<()> {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
+        let r = sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|e| Error::Transfer(format!("discard staging: {e}")))
+            .map_err(|e| Error::Transfer(format!("discard staging: {e}")));
+        self.release().await;
+        r
     }
 
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        let r = self.finalize_inner(rows, mode).await;
+        // The run is over on either outcome, so the announcement goes either
+        // way — a lock left behind by a successful run would refuse every later
+        // one for a table that is perfectly fine.
+        self.release().await;
+        r
+    }
+}
+
+impl PgSink {
+    async fn finalize_inner(&self, rows: u64, mode: Mode) -> Result<()> {
         // 0-row guard, every mode: an empty load never touches the destination.
         if rows == 0 {
             let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.staging_t))

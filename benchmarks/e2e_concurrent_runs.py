@@ -62,6 +62,7 @@ everything.
 
 Rig: `apitap-bench-pg-src` on :5544, `apitap-bench-pg-dst` on :5545.
 """
+import ast
 import os
 import subprocess
 import sys
@@ -114,9 +115,14 @@ def run(mode="replace", url=None, cursor=None, env_extra=None):
 
 
 def staging_names():
+    # Every apitap artifact, not only `%staging`: since 0.56.0 a run also writes
+    # a `__apitap_lock` before it scans, and a leftover of EITHER kind refuses
+    # the next run. A sweep that saw only one of them left the other behind and
+    # the following leg failed for the wrong reason.
     return [n for n in dst(
         "SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        f"WHERE n.nspname='public' AND c.relkind='r' AND relname LIKE '{T}%staging'"
+        f"WHERE n.nspname='public' AND c.relkind='r' AND relname LIKE '{T}%\\_\\_apitap\\_%' "
+        "ESCAPE '\\'"
     ).split() if n]
 
 
@@ -345,18 +351,19 @@ case("the loser was caught BY TYPE, not by message",
      (r.stdout.strip() or r.stderr.strip()[-170:]))
 
 # ---------------------------------------------------------------------------
-print("== leg 6: two runs starting in the SAME INSTANT — the window that is left ==")
-# `prepare` lists the catalog and then creates its staging table. Two runs that
-# start inside that gap both see an empty catalog and both proceed: the guard is
-# check-then-act, and this is the act it cannot see.
+print("== leg 6: two runs starting in the SAME INSTANT ==")
+# This used to be the window the guard could not see. `prepare` listed the
+# catalog and THEN created its staging table, so two runs starting inside that
+# gap both saw an empty catalog and both proceeded — check-then-act, and this
+# was the act it could not see. The outcome was genuinely two-valued and this
+# leg asserted only the invariants around it.
 #
-# The outcome is deliberately NOT asserted, because it is genuinely two-valued —
-# both may land (the swap serialises, last writer wins), or the loser may fail at
-# RENAME with a duplicate-key error instead of a clean LockedError. What IS
-# asserted is the pair of invariants that must hold either way, because their
-# failure is the original defect returning: the destination is whole, and no
-# staging object is orphaned. If this leg ever reports a short table, the
-# concurrency work has regressed to what it was written to fix.
+# 0.56.0 inverts the order: a run writes a tokenized `__apitap_lock` FIRST and
+# scans second, so it only ever proceeds on a scan taken after its own
+# announcement. What that buys is the assertion below — NEVER TWO WINNERS — and
+# what it costs is the other branch: when each run sees the other, BOTH yield,
+# and nothing is written at all. That is the documented trade, and it is why the
+# destination is checked as "whole or untouched" rather than "whole".
 reset(rows=400_000)
 want = src(f"SELECT count(*) FROM {T}")
 burst = f"""
@@ -373,13 +380,35 @@ ts = [threading.Thread(target=go, args=(t,)) for t in ("A", "B")]
 print("BURST", sorted(out))
 """
 r = sh([sys.executable, "-c", burst])
-print(f"      (outcome, not asserted: {(r.stdout.strip() or 'no output')[:120]})")
-got = dst(f"SELECT count(*) FROM {T}")
-case("INVARIANT: the destination is whole, whoever won", got == want,
-     f"dest {got} vs source {want}")
-case("and the failure, if any, was loud — never a green run over a short table",
-     "ok" in r.stdout or "Error" in r.stdout,
-     (r.stdout.strip() or "")[:120])
+line = (r.stdout or "").strip()
+print(f"      outcome: {line[:160]}")
+try:
+    pairs = ast.literal_eval(line.split("BURST ", 1)[1].splitlines()[0])
+except Exception as e:                                  # noqa: BLE001
+    pairs = []
+    print(f"      (could not parse the burst outcome: {e}; stderr: {r.stderr[-200:]})")
+winners = [p for p in pairs if len(p) == 3]
+refusals = [p[1] for p in pairs if len(p) == 2]
+
+# THE property announce-then-check buys, and the one that was NOT true before:
+# a run proceeds only on a scan taken after its own announcement, so a
+# concurrent pair cannot both miss each other.
+case("INVARIANT: never two winners", len(pairs) == 2 and len(winners) <= 1,
+     f"{len(winners)} of 2 runs proceeded: {pairs}")
+# A run that yields must do it by the guard, with the typed error — not by
+# colliding at RENAME with a catalog message about an object nobody created.
+case("a run that yields does so with LockedError",
+     bool(pairs) and all(e == "LockedError" for e in refusals),
+     f"refusals: {refusals or 'none'}")
+# Whole if one landed; untouched if neither did (`reset` dropped it). Never
+# short — a short table is the original defect returning.
+# The table may legitimately not exist: when both runs yield, nothing is
+# written at all, and asking for a count would raise instead of reporting it.
+got = (dst(f"SELECT count(*) FROM {T}")
+       if dst(f"SELECT to_regclass('public.{T}') IS NOT NULL") == "t" else "absent")
+case("INVARIANT: the destination is whole, or untouched — never short",
+     got == want if winners else got in ("absent", "0", ""),
+     f"dest {got} vs source {want}, {len(winners)} winner(s)")
 # NOT an invariant, and an earlier draft of this leg wrongly asserted it was:
 # when the loser dies at RENAME it has already built its staging, and no error
 # path runs for it, so the object is orphaned — and being orphaned it refuses

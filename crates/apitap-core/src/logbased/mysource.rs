@@ -454,6 +454,9 @@ pub(crate) async fn drain_binlog(
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
+    // Tables truncated before this window had ever decoded a row of them — the
+    // wipe waits here for the accumulator that carries the real key layout.
+    let mut pending_truncate: std::collections::HashSet<String> = Default::default();
     // changelog=true captures every operation verbatim instead of collapsing
     // the window; `key_idx` is what lets a PK-changing update emit D-then-U
     // exactly like the Postgres lane does.
@@ -606,9 +609,16 @@ pub(crate) async fn drain_binlog(
                                 .map(|(i, _)| i)
                                 .collect();
                             key_idx.entry(q.clone()).or_insert_with(|| idx.clone());
-                            collapsers
+                            let c = collapsers
                                 .entry(q.clone())
                                 .or_insert_with(|| Collapser::new(idx));
+                            // The truncate that was held above happened BEFORE
+                            // these rows, and this accumulator is empty and
+                            // correctly keyed: applying it here puts the wipe
+                            // back in its original order.
+                            if pending_truncate.remove(&q) {
+                                c.truncate();
+                            }
                         }
                         PgoMessage::Insert { new, .. } => {
                             buf_bytes += cells_bytes(&new);
@@ -645,31 +655,70 @@ pub(crate) async fn drain_binlog(
                     // DDL invalidates cached column layouts for that db.
                     sess.st.schemas.retain(|k, _| !k.starts_with(&format!("{db}.")));
                     sess.st.maps.clear();
+                    // …and a TRUNCATE is not only a schema event: it empties the
+                    // table, and the destination has to hear about it. MySQL
+                    // writes it as a QUERY, so there is no rows event and no XID
+                    // — it is DDL, it auto-commits, and it is its own commit
+                    // boundary. Apply it here or it is lost, which is exactly
+                    // what happened until 0.56.0.
+                    if head.len() >= 8 && head[..8].eq_ignore_ascii_case("truncate") {
+                        match truncate_target(head, &db) {
+                            // `sess.tracked` is the authority on what this run
+                            // follows. The first draft asked `collapsers` instead
+                            // — and those are populated lazily, by the first ROWS
+                            // event for a table. A window shaped
+                            // `TRUNCATE t; INSERT …` puts the truncate BEFORE any
+                            // rows event, so the map was still empty and the
+                            // truncate was skipped exactly as before the fix. The
+                            // unit test passed; the e2e leg caught it.
+                            Some(t) if sess.tracked.contains_key(&t) => {
+                                // Anything already buffered belongs to the
+                                // transaction this DDL implicitly committed, so
+                                // it lands FIRST — then the wipe.
+                                drain_tx(&mut tx_buf, changelog, &key_idx,
+                                         &mut changelogs, &mut collapsers)?;
+                                // The collapser may not exist yet: it is built
+                                // from the first ROWS event for the table, and a
+                                // window shaped `TRUNCATE t; INSERT …` has not
+                                // reached one. Hold the truncate rather than
+                                // create a placeholder — `Collapser::new(vec![])`
+                                // hashes EVERY later row to the same empty key,
+                                // so the two inserts after the wipe would collapse
+                                // into one. Silent loss in place of silent loss.
+                                // The changelog lane needs no such care: a
+                                // `Changes` truncate carries no key.
+                                if changelog || collapsers.contains_key(&t) {
+                                    tx_buf.push((Arc::from(t.as_str()), TxOp::Truncate));
+                                    drain_tx(&mut tx_buf, changelog, &key_idx,
+                                             &mut changelogs, &mut collapsers)?;
+                                } else {
+                                    pending_truncate.insert(t);
+                                }
+                            }
+                            // A truncate of a table this run does not track is
+                            // none of our business.
+                            Some(_) => {}
+                            // A TRUNCATE we cannot read is refused, not skipped.
+                            // Skipping is the bug; a second spelling of it would
+                            // be no improvement, and this lane's standing rule is
+                            // that an event it does not understand stops the run.
+                            None => {
+                                return Err(Error::Transfer(format!(
+                                    "binlog: a TRUNCATE was seen but its table could not be \
+                                     read from the statement: {head:?}. Refusing rather than \
+                                     skipping it — a dropped TRUNCATE leaves the destination \
+                                     holding rows the source no longer has, silently. Please \
+                                     report the statement text."
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             bl::TYPE_XID => {
                 // Commit boundary: the buffered ops become real, and the
                 // watermark advances to the position AFTER this event.
-                for (table, op) in tx_buf.drain(..) {
-                    if changelog {
-                        let Some(ki) = key_idx.get(table.as_ref()) else { continue };
-                        let c = changelogs.entry(table.to_string()).or_default();
-                        match op {
-                            TxOp::Insert(row) => c.insert(row),
-                            TxOp::Update(old, row) => c.update(old.as_ref(), row, ki),
-                            TxOp::Delete(old) => c.delete(old),
-                        }
-                        continue;
-                    }
-                    let Some(c) = collapsers.get_mut(table.as_ref()) else {
-                        continue;
-                    };
-                    match op {
-                        TxOp::Insert(row) => c.insert(row)?,
-                        TxOp::Update(old, row) => c.update(old.as_ref(), row)?,
-                        TxOp::Delete(old) => c.delete(&old)?,
-                    }
-                }
+                drain_tx(&mut tx_buf, changelog, &key_idx, &mut changelogs, &mut collapsers)?;
                 end_mark = pack_pos(&sess.file, h.log_pos);
                 if end_mark >= stop_line {
                     break;
@@ -703,6 +752,17 @@ pub(crate) async fn drain_binlog(
         }
     }
 
+    // A table truncated and then left alone for the rest of the window never
+    // got a ROWS event, so it has no collapser — and without one the window
+    // carries no evidence of the wipe and the destination keeps its rows. An
+    // empty key layout is harmless here: the window is over, no row will ever
+    // be hashed against it.
+    for t in pending_truncate.drain() {
+        collapsers
+            .entry(t)
+            .or_insert_with(|| Collapser::new(Vec::new()))
+            .truncate();
+    }
     let tables: HashMap<String, Collapsed> = collapsers
         .into_iter()
         .map(|(k, v)| (k, v.finish()))
@@ -711,6 +771,7 @@ pub(crate) async fn drain_binlog(
         tables,
         changes: changelogs,
         end_lsn: end_mark,
+        start_lsn: start,
         wal_cols,
         wal_oids,
         hit_budget,
@@ -721,6 +782,12 @@ enum TxOp {
     Insert(Tuple),
     Update(Option<Tuple>, Tuple),
     Delete(Tuple),
+    /// MySQL writes `TRUNCATE TABLE` into the binlog as a QUERY event, not as a
+    /// rows event — so until 0.56.0 it was parsed, recognised as DDL, used to
+    /// invalidate the schema cache, and then dropped. The window never carried
+    /// `truncate`, no destination ever emptied the table, and the run reported
+    /// success over a destination that kept every row the source had discarded.
+    Truncate,
 }
 
 fn cells_bytes(row: &Tuple) -> usize {
@@ -729,11 +796,187 @@ fn cells_bytes(row: &Tuple) -> usize {
         + 48
 }
 
+/// Apply one transaction's buffered ops to whichever accumulator this run uses.
+///
+/// Extracted so the XID commit boundary and the TRUNCATE one cannot drift: a
+/// `TRUNCATE` is DDL and auto-commits, so it is its own boundary and never
+/// reaches an XID event. The first draft of the truncate fix pushed onto
+/// `tx_buf` and relied on XID to drain it, which meant the record sat in the
+/// buffer until the NEXT ordinary transaction committed — or was cleared by the
+/// next `BEGIN`, losing it again.
+fn drain_tx(
+    tx_buf: &mut Vec<(std::sync::Arc<str>, TxOp)>,
+    changelog: bool,
+    key_idx: &std::collections::HashMap<String, Vec<usize>>,
+    changelogs: &mut std::collections::HashMap<String, crate::logbased::changelog::Changes>,
+    collapsers: &mut std::collections::HashMap<String, Collapser>,
+) -> Result<()> {
+    for (table, op) in tx_buf.drain(..) {
+        if changelog {
+            // Before the key lookup: `key_idx` is filled from the first ROWS
+            // event, and a truncate can arrive ahead of one. It needs no key
+            // layout to record — gating it on one dropped it.
+            if matches!(op, TxOp::Truncate) {
+                changelogs.entry(table.to_string()).or_default().truncate();
+                continue;
+            }
+            let Some(ki) = key_idx.get(table.as_ref()) else { continue };
+            let c = changelogs.entry(table.to_string()).or_default();
+            match op {
+                TxOp::Insert(row) => c.insert(row),
+                TxOp::Update(old, row) => c.update(old.as_ref(), row, ki),
+                TxOp::Delete(old) => c.delete(old),
+                TxOp::Truncate => c.truncate(),
+            }
+            continue;
+        }
+        let Some(c) = collapsers.get_mut(table.as_ref()) else {
+            continue;
+        };
+        match op {
+            TxOp::Insert(row) => c.insert(row)?,
+            TxOp::Update(old, row) => c.update(old.as_ref(), row)?,
+            TxOp::Delete(old) => c.delete(&old)?,
+            TxOp::Truncate => c.truncate(),
+        }
+    }
+    Ok(())
+}
+
+/// The table a `TRUNCATE` statement names, qualified the way the rows-event
+/// path qualifies its own (`db.table`), or `None` if this is not a TRUNCATE.
+///
+/// Deliberately strict about the shapes it accepts. An unrecognised TRUNCATE
+/// must not read as "not a truncate" — the caller turns a None-on-a-truncate
+/// into a loud refusal, because silently continuing is the defect being fixed
+/// and a second spelling of it would be no better than the first.
+fn truncate_target(sql: &str, db: &str) -> Option<String> {
+    let s = sql.trim_start();
+    let rest = s.get(..8).filter(|h| h.eq_ignore_ascii_case("truncate"))?;
+    let _ = rest;
+    let mut rest = s[8..].trim_start();
+    // The TABLE keyword is optional in MySQL.
+    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("table") {
+        rest = rest[5..].trim_start();
+    }
+    // `db`.`t`, db.t, `t`, t — stop at whitespace or a statement terminator.
+    let name: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ';')
+        .filter(|c| *c != '`' && *c != '"')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    Some(if name.contains('.') {
+        name
+    } else {
+        format!("{db}.{name}")
+    })
+}
+
 fn is_ddl(sql: &str) -> bool {
     let s = sql.trim_start();
     ["alter", "create", "drop", "rename", "truncate"]
         .iter()
         .any(|k| s.len() >= k.len() && s[..k.len()].eq_ignore_ascii_case(k))
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+    use crate::wire::pgoutput::Cell;
+
+    /// MySQL writes TRUNCATE as a QUERY event, so the table name has to come out
+    /// of the statement text. These are the spellings a server actually emits —
+    /// the binlog carries what the client wrote, so all of them occur.
+    #[test]
+    fn a_truncate_names_its_table_in_every_spelling_mysql_emits() {
+        for (sql, want) in [
+            ("TRUNCATE TABLE t", "bench.t"),
+            ("truncate table t", "bench.t"),
+            ("TRUNCATE t", "bench.t"),
+            ("TRUNCATE TABLE `t`", "bench.t"),
+            ("TRUNCATE TABLE `bench`.`t`", "bench.t"),
+            ("TRUNCATE TABLE other.t", "other.t"),
+            ("  TRUNCATE   TABLE   t ;", "bench.t"),
+        ] {
+            assert_eq!(truncate_target(sql, "bench").as_deref(), Some(want), "{sql}");
+        }
+        // Not a truncate at all.
+        for sql in ["DROP TABLE t", "ALTER TABLE t ADD c INT", "INSERT INTO t VALUES (1)"] {
+            assert_eq!(truncate_target(sql, "bench"), None, "{sql}");
+        }
+        // A truncate whose target cannot be read returns None — the caller turns
+        // that into a refusal, never a skip.
+        assert_eq!(truncate_target("TRUNCATE TABLE", "bench"), None);
+        assert_eq!(truncate_target("TRUNCATE", "bench"), None);
+    }
+
+    /// A TRUNCATE reaches the accumulators, on both lanes. Until 0.56.0 it
+    /// reached neither: the window carried no truncate, so no destination ever
+    /// emptied the table and the run reported success over the divergence.
+    #[test]
+    fn a_truncate_reaches_both_accumulators() {
+        use std::collections::HashMap;
+        let key: std::sync::Arc<str> = std::sync::Arc::from("bench.t");
+
+        // replica lane
+        let mut collapsers: HashMap<String, Collapser> = HashMap::new();
+        collapsers.insert("bench.t".into(), Collapser::new(vec![0]));
+        let mut buf = vec![(key.clone(), TxOp::Truncate)];
+        drain_tx(&mut buf, false, &HashMap::new(), &mut HashMap::new(), &mut collapsers)
+            .expect("drain");
+        let c = collapsers.remove("bench.t").expect("collapser");
+        assert!(c.finish().truncate, "the replica lane must carry truncate");
+
+        // changelog lane
+        let mut key_idx: HashMap<String, Vec<usize>> = HashMap::new();
+        key_idx.insert("bench.t".into(), vec![0]);
+        let mut changelogs: HashMap<String, crate::logbased::changelog::Changes> = HashMap::new();
+        let mut buf = vec![(key, TxOp::Truncate)];
+        drain_tx(&mut buf, true, &key_idx, &mut changelogs, &mut HashMap::new()).expect("drain");
+        assert_eq!(changelogs["bench.t"].events.len(), 1,
+                   "the changelog lane must record a T");
+    }
+
+    /// The accumulators are built lazily, from the first ROWS event for a table.
+    /// A window shaped `TRUNCATE t; INSERT …` reaches the truncate first, when
+    /// there is no accumulator and — on the changelog lane — no key index. The
+    /// first fix gated the truncate on those maps, so it was dropped exactly as
+    /// before; the unit tests passed and the e2e leg caught it.
+    #[test]
+    fn a_truncate_that_arrives_before_the_first_rows_event_is_still_recorded() {
+        use std::collections::HashMap;
+        let key: std::sync::Arc<str> = std::sync::Arc::from("bench.t");
+        let mut changelogs: HashMap<String, crate::logbased::changelog::Changes> = HashMap::new();
+        let mut buf = vec![(key, TxOp::Truncate)];
+        // No key index at all: this is what the map looks like before the first
+        // ROWS event has been decoded.
+        drain_tx(&mut buf, true, &HashMap::new(), &mut changelogs, &mut HashMap::new())
+            .expect("drain");
+        assert_eq!(changelogs["bench.t"].events.len(), 1,
+                   "a truncate needs no key layout, so it must not be gated on one");
+    }
+
+    /// Why the replica lane HOLDS the truncate instead of creating an accumulator
+    /// for it: a `Collapser` with no key columns hashes every row to the same
+    /// empty key, so the rows that follow the wipe collapse into one. This is the
+    /// control for `pending_truncate` — delete it and the rows are lost silently.
+    #[test]
+    fn an_empty_key_collapser_would_fold_every_row_into_one() {
+        let cell = |s: &str| Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()));
+        let mut placeholder = Collapser::new(Vec::new());
+        placeholder.insert(Tuple::from_cells(&[cell("7"), cell("x")])).expect("insert");
+        placeholder.insert(Tuple::from_cells(&[cell("8"), cell("y")])).expect("insert");
+        assert_eq!(placeholder.finish().upserts.len(), 1,
+                   "an empty key layout is not a harmless placeholder");
+
+        let mut keyed = Collapser::new(vec![0]);
+        keyed.insert(Tuple::from_cells(&[cell("7"), cell("x")])).expect("insert");
+        keyed.insert(Tuple::from_cells(&[cell("8"), cell("y")])).expect("insert");
+        assert_eq!(keyed.finish().upserts.len(), 2, "the real key layout keeps both");
+    }
 }
 
 #[cfg(test)]

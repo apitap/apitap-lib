@@ -192,13 +192,14 @@ use it for rebuildable destinations.
   the run that holds it. Fan-in is still allowed: two `append` runs from *different*
   sources into one table have independent watermarks, so they are not a collision.
   No advisory lock is involved — which is why it works identically on ClickHouse,
-  BigQuery and the object stores, where no such lock exists. The check is
-  check-then-act, so two runs starting in the same *instant* can still both pass
-  it; there the guarantee narrows to "the destination stays whole and no staging
-  is orphaned", which is asserted on live servers.
+  BigQuery and the object stores, where no such lock exists.
+  Since 0.56.0 a run **announces itself before it looks**, so two runs starting in
+  the same *instant* can no longer both proceed — at most one does. The trade is
+  the other branch: when each sees the other, both fail, loudly, with nothing
+  written.
   `mode="log_based"` drains do NOT enter this guard yet — two drains of one
-  table, or a drain beside a bulk run, are not refused; that is 0.56.0, and
-  until then one drain per table is the scheduler's job.
+  table, or a drain beside a bulk run, are not refused; until then one drain per
+  table is the scheduler's job.
   ([the matrix, the window, and what a killed run leaves](docs/failure-modes.md))
 
 The failure modes these guarantees do *not* cover — a killed process, a cut

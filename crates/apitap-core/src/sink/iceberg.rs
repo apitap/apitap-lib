@@ -594,12 +594,24 @@ impl IcebergSink {
     /// A one-line object whose NAME is the run token, in a prefix nothing else
     /// writes — the body is there only so a human who finds one knows what it
     /// is; nothing reads it. Listing them is one LIST of a few keys, placing
-    /// one is a single PUT. It is not a lock and does not pretend to be: two
-    /// runs whose listings both precede the other's PUT will both proceed,
-    /// exactly as they do on Postgres, whose staging scan has the same shape
-    /// and the same window. The value is the loud refusal in every other
-    /// case, which is the difference between an operator seeing an error and
-    /// an operator seeing duplicate rows a week later.
+    /// one is a single PUT.
+    ///
+    /// **The PUT comes FIRST**, and that ordering is the whole guarantee. Until
+    /// 0.56.0 the marker was placed after the listing "so a run never trips over
+    /// its own marker", and this comment said so: "two runs whose listings both
+    /// precede the other's PUT will both proceed". They will not any more. A run
+    /// proceeds only on a listing taken AFTER its own announcement, so a
+    /// concurrent pair cannot both miss each other; at most one proceeds, and if
+    /// each sees the other, both yield — a loud double failure with nothing
+    /// written. The run's own marker is simply skipped in the loop, which is
+    /// what "tripping over it" was really about.
+    ///
+    /// The marker keeps its `Artifact::Staging` spelling rather than moving to
+    /// `Artifact::Lock` like the other sinks' announcements. A 0.55.x run's
+    /// marker is in flight during any rolling upgrade, and a name classified
+    /// against a different artifact kind reads as `Foreign` — the new run would
+    /// not see the old one at all. The kind is private to this prefix; the
+    /// ordering is the part that matters.
     ///
     /// Reaping is safe here only because the marker references nothing. The
     /// obvious alternative — treating a run's uncommitted DATA files as its
@@ -633,6 +645,24 @@ impl IcebergSink {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
+        // ANNOUNCE FIRST. Placed before the listing, not after it: a run that
+        // lists before announcing cannot be seen by a peer listing at the same
+        // moment, and both proceed — which is the defect this ordering removes.
+        // Not best-effort: a run that failed to claim is invisible to the next
+        // one, and that is the state this whole mechanism exists to prevent.
+        let mine_key = format!("{prefix}{mine_name}");
+        s3.put_object(
+            &mine_key,
+            format!(
+                "apitap run claim for {}.{} — safe to delete once no run is \
+                 loading this table\n",
+                self.conn.namespace, self.table
+            )
+            .into_bytes(),
+        )
+        .await?;
+        self.claim = Some(mine_key);
+
         for key in s3.list(&prefix).await? {
             let name = key.rsplit('/').next().unwrap_or(&key);
             // `naming::classify` owns both anchors, the exact token width and
@@ -655,9 +685,11 @@ impl IcebergSink {
                     return Err(crate::naming::legacy_error(
                         &format!("{}.{}", self.conn.namespace, self.table), &key));
                 }
-                crate::naming::Found::Mine => {
-                    let _ = s3.delete(&key).await;
-                }
+                // This run's own marker — the one placed a few lines above.
+                // Deleting it here is what the old post-listing placement made
+                // look harmless; now it would erase the announcement a
+                // concurrent peer is about to look for.
+                crate::naming::Found::Mine => {}
                 crate::naming::Found::Live(peer) => {
                     if crate::naming::peer_blocks(&mine, &peer) {
                         return Err(crate::naming::locked_error(
@@ -672,21 +704,6 @@ impl IcebergSink {
             }
         }
 
-        // Placed AFTER the listing, so a run never trips over its own marker.
-        // Not best-effort: a run that failed to claim is invisible to the next
-        // one, which is the state this whole mechanism exists to leave behind.
-        let mine_key = format!("{prefix}{mine_name}");
-        s3.put_object(
-            &mine_key,
-            format!(
-                "apitap run claim for {}.{} — safe to delete once no run is \
-                 loading this table\n",
-                self.conn.namespace, self.table
-            )
-            .into_bytes(),
-        )
-        .await?;
-        self.claim = Some(mine_key);
         Ok(())
     }
 
@@ -1092,6 +1109,12 @@ impl crate::sink::Sink for IcebergSink {
     /// every later run of the table was refused. The uncommitted parquet
     /// objects are swept on the same pass: no snapshot references them, so
     /// they are bytes nobody can reach and everybody pays for.
+    async fn release_lock(&self) {
+        if let Some(s3) = self.s3.clone() {
+            self.release_claim(&s3).await;
+        }
+    }
+
     async fn discard(&self) -> Result<()> {
         let Some(s3) = self.s3.clone() else {
             return Ok(()); // prepare never got as far as binding storage

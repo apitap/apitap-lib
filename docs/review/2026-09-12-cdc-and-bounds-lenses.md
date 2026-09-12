@@ -10,6 +10,63 @@ obviously calibrated. Treat `high` as unverified-in-practice until reproduced.
 I independently re-read and confirmed the two blockers verbatim; the rest carry
 the agents' citations only.
 
+---
+
+## Status, 2026-09-12 — both blockers CLOSED, reproduced live first
+
+Both were reproduced against the released 0.55.1 wheel before a line was
+changed, and both e2e legs go red without the fix.
+
+* **MySQL/MariaDB TRUNCATE.** Fixed in `mysource.rs`: a `TRUNCATE` QUERY event
+  is its own commit boundary (DDL auto-commits and never reaches an XID), so the
+  buffered transaction is drained, the wipe recorded, and the buffer drained
+  again. Two traps found on the way, both caught by the e2e and not by the unit
+  tests:
+  - the first guard asked `collapsers`/`key_idx`, which are filled by the FIRST
+    ROWS event — a window shaped `TRUNCATE t; INSERT …` reaches the truncate
+    before either exists, so it was dropped exactly as before while 270 unit
+    tests passed. `sess.tracked` is the authority.
+  - the obvious repair — create the accumulator on the spot — is silent data
+    loss: `Collapser::new(vec![])` hashes every later row to the same empty key,
+    so the two inserts after the wipe collapse into one. The truncate is HELD
+    instead, and applied to the accumulator the first rows event builds with the
+    real key layout. `an_empty_key_collapser_would_fold_every_row_into_one`
+    pins that.
+  Verified: `benchmarks/e2e_mariadb_cdc.py` — `truncate replicated: 3 → 2`,
+  where 0.55.1 gave `dest was 3, is 5`.
+
+* **ClickHouse changelog replay.** The stamp is now `outcome.start_lsn` — the
+  watermark the window was drained FROM, the one position a re-drain reproduces
+  — instead of `end_lsn`, which every re-drain recomputes. `(lsn, seq)` is a
+  real event identity now. On top of that, `_apitap_cdc_pending` records the
+  window about to be appended, so a replay counts what is already there and
+  skips it: the ordinary replay appends **nothing**, rather than appending a
+  duplicate that is merely identifiable. The same stamp fix landed on BigQuery,
+  together with the `high` finding below it — the statement batcher now packs
+  whole `INSERT`+watermark PAIRS, so a size-driven chunk boundary can no longer
+  split them into two transactions.
+
+  Two things the lens did not predict, both found by the new e2e leg:
+  - the prefix probe must exclude baseline rows. The bootstrap stamps them with
+    its consistent point and the first window starts at exactly that point, so
+    counting them in made an intact prefix look torn.
+  - for the same reason a baseline row and a window's first event can now share
+    `(lsn, seq)`. `__current` breaks the tie in favour of the change, on both
+    engines. Without that the winner was whichever row the engine returned
+    first — and it returned the right one on the run that measured it, which is
+    why the e2e asserts the view's ORDER BY and not just the outcome.
+
+  Verified: `benchmarks/e2e_changelog_replay.py` (new, in the gate). It applies
+  a window and then rewinds the destination watermark to where the window began
+  — the exact state a crash between the INSERT and `write_state` leaves — and
+  drains again. 0.55.1: `log rows 10 -> 17`, ids 4 and 5 each holding two `I`
+  records. Now: `10 -> 10`.
+
+**Also closed in the same pass, from the older brief's §4:** the seven sinks now
+ANNOUNCE before they scan (`Artifact::Lock`), which closes the start-instant
+window for the bulk lane. The CDC lane does not yet write or read that
+announcement — that half of A2 is still open.
+
 | sev | finding | where |
 |---|---|---|
 | blocker | ClickHouse changelog: the window INSERT and its watermark are two round-trips, and replay re-appends every event under a DIFFERENT _apitap_lsn | `dest_ch.rs:651` |

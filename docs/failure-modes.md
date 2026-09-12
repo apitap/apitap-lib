@@ -230,6 +230,28 @@ only what it can PROVE is dead, and refuses to start beside anything else. The
 one thing it can prove is the un-tokenized name an older apitap wrote: no
 current run mints that name, so nothing living can own it.
 
+**It announces itself before it looks — that is new in 0.56.0.** Until then
+`prepare` listed first and created staging second, which is check-then-act: two
+runs that both listed inside the gap before either wrote anything both saw an
+empty catalog and both proceeded. Now the first thing a run does is write a
+tokenized `__apitap_lock` object, and only then does it scan. A run proceeds
+only on a scan taken *after* its own announcement, so a concurrent pair cannot
+both miss each other.
+
+The trade, stated plainly: **two runs starting in the same instant may now both
+fail, where before one of them would have succeeded.** Each sees the other's
+announcement and each yields — there is no tie-break, because a tie-break is
+only sound when both runs scanned after both announced, and that is exactly what
+cannot be assumed. A loud double failure with nothing written is strictly better
+than the double success over a corrupted table that check-then-act allowed.
+
+On Postgres, MySQL and ClickHouse the lock is dropped at the end of `prepare`,
+as soon as the staging table exists — staging is what the scan reads from then
+on, so a killed run still leaves exactly ONE object behind, the same as before.
+On BigQuery and the object stores `prepare` creates nothing (staging appears
+with the first landed rows), so the lock is held for the whole run and a killed
+run leaves it beside the parts.
+
 **Not every peer is refused, and the distinction is the point:**
 
 | this run | a live peer | outcome |
@@ -238,6 +260,7 @@ current run mints that name, so nothing living can own it.
 | `log_based` | anything | **not guarded yet** — see below |
 | `append`/`merge` | `replace` | refused |
 | `append`/`merge` | `log_based` | **not guarded yet** — see below |
+| two BULK runs starting in the same instant | each other | **both refused** — the 0.56.0 trade above |
 | `append`/`merge` | same source | refused — both would read the same watermark and land the same rows twice |
 | `append`/`merge` | **different** source | **allowed** — this is fan-in, and `_apitap_state` keys watermarks per source precisely so it works |
 
@@ -252,10 +275,22 @@ check that predates this mechanism; a MySQL or MariaDB source has nothing.
 
 Until that is closed, one drain per destination table is the operator's to
 enforce — the same scheduler setting the rest of this section recommends.
-Closing it is 0.56.0: the drain takes the same lock a bulk run takes, which
-also closes the start-instant window below, because both are the same problem
-(two runs must agree who owns the table, atomically) and an atomic create is
-the one primitive every destination has.
+
+0.56.0 closed the *bulk* half of this: every sink announces itself before it
+scans, so bulk-against-bulk is now guarded at the start instant as well as
+mid-run. The drain does not yet write or read that announcement, so the two
+`log_based` rows above still say what they say. What 0.56.0 changed is that the
+mechanism the drain needs now exists and is the same one the bulk lane uses —
+a tokenized `__apitap_lock` written before the scan — rather than something
+still to be designed.
+
+An earlier plan for this said "an atomic create has exactly one winner, so use
+one lock". That was wrong and is recorded here so it is not re-proposed: an
+atomic create has one winner *per name*, and this guard is not mutual exclusion
+— two `append` runs from different sources are fan-in and must BOTH proceed.
+One shared name would refuse them. The tokenized announce-then-check rule above
+expresses the whole matrix, and needs no atomic primitive at all — only that the
+announcement is durable before the scan reads.
 
 That last row is why the guard is a matrix rather than a mutex. Refusing every
 concurrent pair would have removed a capability the manual advertises.

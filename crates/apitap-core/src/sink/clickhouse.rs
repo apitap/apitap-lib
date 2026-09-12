@@ -432,12 +432,40 @@ impl ChSink {
     /// beats five engine-specific ones.
     async fn reap_and_check_peers(&self) -> Result<()> {
         for artifact in [
+            // Lock first: a peer that has announced itself but not yet created
+            // staging is precisely the run the staging-only scan could not see.
+            crate::naming::Artifact::Lock,
             crate::naming::Artifact::Staging,
             crate::naming::Artifact::New,
         ] {
             self.reap_artifact(artifact).await?;
         }
         Ok(())
+    }
+
+    /// This run's announcement, written BEFORE the scan — see the Postgres
+    /// sink's `announce` for why that order is the entire property.
+    ///
+    /// `ON CLUSTER` like every other object this sink makes: the peer that has
+    /// to see it may be talking to a different node through the balancer.
+    async fn announce(&self) -> Result<()> {
+        let name = ch_ident(&crate::naming::artifact_ident_run(
+            &self.final_bare, crate::naming::Artifact::Lock, crate::naming::ROOMY, &self.run));
+        let oc = self.ddl.on_cluster_clause();
+        // One column it never reads: the name is the whole message.
+        self.ch
+            .exec(&format!(
+                "CREATE TABLE IF NOT EXISTS {name}{oc} (t UInt8) ENGINE = Memory"
+            ))
+            .await
+            .map(|_| ())
+    }
+
+    /// Best-effort: a failure to drop the lock must not fail a finished run.
+    async fn release(&self) {
+        let name = crate::naming::artifact_ident_run(
+            &self.final_bare, crate::naming::Artifact::Lock, crate::naming::ROOMY, &self.run);
+        let _ = self.drop_artifact(&name).await;
     }
 
     async fn reap_artifact(&self, artifact: crate::naming::Artifact) -> Result<()> {
@@ -510,7 +538,11 @@ impl ChSink {
                 crate::naming::Found::Foreign => {}
                 // Ours. One RunId is minted per dispatch, so this is a leftover
                 // of THIS run — safe to collect, and the only thing that makes a
-                // retried table inside a multi-table run work.
+                // retried table inside a multi-table run work. Except the lock:
+                // that IS this run's announcement, and the scan we are inside is
+                // the check it exists to make meaningful.
+                crate::naming::Found::Mine
+                    if artifact == crate::naming::Artifact::Lock => {}
                 crate::naming::Found::Mine => self.drop_artifact(&name).await?,
                 // The pre-token name an older apitap wrote. Nothing living mints
                 // it, which is the only thing collection can prove.
@@ -1142,6 +1174,11 @@ impl crate::sink::Sink for ChSink {
         // and cannot coexist. The CREATEs below then need nothing cleared out of
         // the way — the name carries this run's token, so a collision would be a
         // token collision, which is loud rather than destructive.
+        // ANNOUNCE, then check — never the other way round. A run proceeds
+        // only on a scan taken AFTER its own announcement, so a concurrent
+        // pair cannot both miss each other. `pipeline::run` releases the
+        // announcement again if anything here fails; see `announce`.
+        self.announce().await?;
         self.reap_and_check_peers().await?;
         if self.ddl.on_cluster.is_some() {
             // Behind a load balancer every HTTP request may reach a DIFFERENT
@@ -1187,6 +1224,12 @@ impl crate::sink::Sink for ChSink {
             WireFormat::PgCopyBinary => unreachable!("guarded by accepts()"),
         };
         self.insert_sql = format!("INSERT INTO {} FORMAT {fmt}", self.staging_t);
+        // The announcement has done its job: staging EXISTS now, and staging is
+        // what the scan reads. Dropping the lock here keeps a killed run's
+        // leftovers at ONE object rather than two, so the operator's cleanup
+        // story is unchanged from 0.55.x — and the run stays continuously
+        // visible to a peer, because staging was created before this line.
+        self.release().await;
         Ok(())
     }
 
@@ -1516,9 +1559,14 @@ impl crate::sink::Sink for ChSink {
     /// and since 0.55.0 nothing else ever collects it.
     ///
     /// Both names carry this run's token, so neither can belong to a peer.
+    async fn release_lock(&self) {
+        self.release().await;
+    }
+
     async fn discard(&self) -> Result<()> {
         let mut first_err = None;
-        for a in [crate::naming::Artifact::Staging, crate::naming::Artifact::New] {
+        for a in [crate::naming::Artifact::Staging, crate::naming::Artifact::New,
+                  crate::naming::Artifact::Lock] {
             let name = crate::naming::artifact_ident_run(
                 &self.final_bare, a, crate::naming::ROOMY, &self.run);
             if let Err(e) = self.drop_artifact(&name).await {
@@ -1532,6 +1580,15 @@ impl crate::sink::Sink for ChSink {
     }
 
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        let r = self.finalize_inner(rows, mode).await;
+        // Either outcome ends the run, so the announcement goes either way.
+        self.release().await;
+        r
+    }
+}
+
+impl ChSink {
+    async fn finalize_inner(&self, rows: u64, mode: Mode) -> Result<()> {
         // 0-row guard, every mode.
         if rows == 0 {
             let oc = self.ddl.on_cluster_clause();

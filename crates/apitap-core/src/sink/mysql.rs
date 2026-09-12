@@ -68,6 +68,9 @@ pub(crate) struct MySqlSink {
     /// two replaces of one table raced for one `__apitap_old` slot, and the
     /// pre-drop that papered over it could delete a live peer's outgoing table.
     old: String,
+    /// This run's announcement that it is working on this table, written before
+    /// the peer scan and dropped in `finalize`/`discard` — see `announce`.
+    lock: String,
     /// This run's identity — it is IN both artifact names above, and it is what
     /// `prepare` compares a live peer's leftovers against.
     run: crate::naming::RunId,
@@ -317,6 +320,8 @@ impl MySqlSink {
                 bare, crate::naming::Artifact::Staging, crate::naming::MY_IDENT_MAX, run),
             old: crate::naming::artifact_ident_run(
                 bare, crate::naming::Artifact::Old, crate::naming::MY_IDENT_MAX, run),
+            lock: crate::naming::artifact_ident_run(
+                bare, crate::naming::Artifact::Lock, crate::naming::MY_IDENT_MAX, run),
             run: run.clone(),
             bare: bare.to_string(),
             cols: Vec::new(),
@@ -410,7 +415,9 @@ impl MySqlSink {
         // so the escape character is declared explicitly — the same convention
         // `naming::sql_exclusion` uses for this dialect.
         let esc = |v: &str| v.replace('|', "||").replace('_', "|_").replace('%', "|%");
-        for art in [Artifact::Staging, Artifact::Old] {
+        // Lock FIRST: a peer that has only announced itself, and not yet
+        // created staging, is exactly the case the staging-only scan missed.
+        for art in [Artifact::Lock, Artifact::Staging, Artifact::Old] {
             // The token sits BETWEEN the head and the suffix, so the pattern is
             // head + wildcard + suffix — not a prefix.
             let (head, suffix) =
@@ -455,7 +462,12 @@ impl MySqlSink {
                     // A sibling's, or a table apitap never made. Deleting a
                     // stranger's table is how this whole defect started.
                     crate::naming::Found::Foreign => {}
-                    // This run's own leftover — one RunId per dispatch.
+                    // This run's own leftover — one RunId per dispatch. Never
+                    // the lock: that one is this run's announcement, and the
+                    // scan we are inside is the check it exists to make
+                    // meaningful. Dropping it here would erase the announcement
+                    // a concurrent peer is about to look for.
+                    crate::naming::Found::Mine if art == Artifact::Lock => {}
                     crate::naming::Found::Mine => self.drop_artifact(&name).await?,
                     // The pre-token name an older apitap wrote: nothing living
                     // mints it, which is the only thing collection can prove.
@@ -479,6 +491,25 @@ impl MySqlSink {
             }
         }
         Ok(())
+    }
+
+    /// This run's announcement, written BEFORE the scan — see the Postgres
+    /// sink's `announce` for why the order is the whole property.
+    async fn announce(&self) -> Result<()> {
+        // MySQL has no zero-column table, so the lock carries one it never
+        // reads. Nothing looks inside; only the name is the message.
+        self.exec(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (t TINYINT) ENGINE=MEMORY",
+            self.fq(&self.lock)
+        ))
+        .await
+    }
+
+    /// Best-effort: a failure to drop the lock must not fail a finished run.
+    async fn release(&self) {
+        let _ = self
+            .exec(&format!("DROP TABLE IF EXISTS {}", self.fq(&self.lock)))
+            .await;
     }
 
     async fn scalar(&self, sql: &str) -> Result<Option<String>> {
@@ -718,6 +749,11 @@ impl crate::sink::Sink for MySqlSink {
         // alive and cannot coexist. Then create a name only this run could have
         // minted — so nothing has to be dropped first, and the CREATE failing
         // would mean a token collision, which is loud rather than destructive.
+        // ANNOUNCE, then check — never the other way round. A run proceeds
+        // only on a scan taken AFTER its own announcement, so a concurrent
+        // pair cannot both miss each other. `pipeline::run` releases the
+        // announcement again if anything here fails; see `announce`.
+        self.announce().await?;
         self.reap_and_check_peers().await?;
         self.exec(&format!(
             "CREATE TABLE {} ({}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
@@ -730,6 +766,12 @@ impl crate::sink::Sink for MySqlSink {
             .iter()
             .map(|c| (c.name.clone(), is_binary_udt(&c.udt)))
             .collect();
+        // The announcement has done its job: staging EXISTS now, and staging is
+        // what the scan reads. Dropping the lock here keeps a killed run's
+        // leftovers at ONE object rather than two, so the operator's cleanup
+        // story is unchanged from 0.55.x — and the run stays continuously
+        // visible to a peer, because staging was created before this line.
+        self.release().await;
         Ok(())
     }
 
@@ -973,11 +1015,25 @@ impl crate::sink::Sink for MySqlSink {
     }
 
     /// Drop this run's staging table. See [`crate::sink::Sink::discard`].
+    async fn release_lock(&self) {
+        self.release().await;
+    }
+
     async fn discard(&self) -> Result<()> {
-        self.drop_artifact(&self.staging).await
+        let r = self.drop_artifact(&self.staging).await;
+        self.release().await;
+        r
     }
 
     async fn finalize(&self, rows: u64, mode: Mode) -> Result<()> {
+        let r = self.finalize_inner(rows, mode).await;
+        self.release().await;
+        r
+    }
+}
+
+impl MySqlSink {
+    async fn finalize_inner(&self, rows: u64, mode: Mode) -> Result<()> {
         if rows == 0 {
             return self
                 .exec(&format!("DROP TABLE IF EXISTS {}", self.fq(&self.staging)))
