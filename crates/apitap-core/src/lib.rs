@@ -40,6 +40,7 @@ mod http;
 mod pipeline;
 mod plan;
 mod progress;
+mod lease;
 mod naming;
 pub mod shutdown;
 mod urlerr;

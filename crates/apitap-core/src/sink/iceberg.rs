@@ -698,6 +698,9 @@ impl IcebergSink {
                             &mine,
                             &peer,
                             now,
+                            // No lease to read on this path — this sink keeps its own
+                            // classify loop and never collects. See `naming::collectable`.
+                            None,
                         ));
                     }
                 }

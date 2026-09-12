@@ -47,6 +47,10 @@ pub(crate) const CL_BASELINE: &str = "B";
 
 pub(crate) struct ChDest {
     ch: ChConn,
+    /// This run's token, set once by `set_run`. ClickHouse cannot FENCE — it has
+    /// no transaction and no row lock — so the apply CHECKS instead, and the
+    /// difference is stated rather than glossed. See `lease_claim`.
+    run_token: std::sync::Mutex<Option<String>>,
     /// DDL this connection has already issued. `CREATE TABLE IF NOT EXISTS` is
     /// idempotent but not free: it is a full HTTP round trip against a window
     /// that only has ~7 of them, repeated for every window of every table. The
@@ -62,6 +66,7 @@ impl ChDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
         Ok(Self {
             ch: ChConn::parse(url)?,
+            run_token: std::sync::Mutex::new(None),
             ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
             patch: std::sync::Mutex::new(None),
         })
@@ -131,6 +136,81 @@ impl ChDest {
         Ok(())
     }
 
+    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
+        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
+    }
+
+    /// The check, at the two points where it is worth paying for.
+    ///
+    /// Not a fence: between this returning Ok and the next statement landing,
+    /// a collector could still take the lease. What it bounds is HOW MUCH an
+    /// evicted drain can write — one window, whose rows carry that window's
+    /// start LSN and are therefore an exact duplicate a replay already collapses.
+    async fn check_still_mine(&self, dest_table: &str) -> Result<()> {
+        let Some(token) = self.run_token.lock().expect("run token").clone() else {
+            return Ok(());
+        };
+        self.lease_still_mine(dest_table, &token).await
+    }
+
+    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
+        format!("{}.{dest_table}", self.ch.database())
+    }
+
+    /// All of these delegate to the bulk sink's free functions, for the reason
+    /// `announce`/`check_peers`/`release` do: a drain and a bulk run can only
+    /// see each other's liveness if both read and write the same rows.
+    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        for k in keys {
+            crate::sink::clickhouse::lease_write(
+                &self.ch, k, run.token(), crate::lease::ttl_secs() as i64, 0).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId)
+        -> Result<u64>
+    {
+        let mut n = 0;
+        for k in keys {
+            crate::sink::clickhouse::lease_write(
+                &self.ch, k, run.token(), crate::lease::ttl_secs() as i64, 0).await?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    pub(crate) async fn lease_get(&self, key: &str, token: &str)
+        -> Result<Option<crate::lease::Lease>>
+    {
+        crate::sink::clickhouse::lease_get(&self.ch, key, token).await
+    }
+
+    pub(crate) async fn lease_claim(&self, key: &str, token: &str) -> Result<bool> {
+        crate::sink::clickhouse::lease_claim(&self.ch, key, token).await
+    }
+
+    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
+        crate::sink::clickhouse::lease_close(&self.ch, key, run.token()).await
+    }
+
+    /// Does this run still hold its claim? A check, not a fence — see
+    /// `lease_claim`.
+    pub(crate) async fn lease_still_mine(&self, dest_table: &str, token: &str) -> Result<()> {
+        let key = self.lease_key(dest_table);
+        match self.lease_get(&key, token).await? {
+            None => Ok(()),
+            Some(l) if !l.lapsed() => Ok(()),
+            Some(_) => Err(Error::Locked(format!(
+                "{key}: this drain no longer holds the table — its claim lapsed and \
+                 another run may have collected it, so it stops rather than write on \
+                 top of one that did. Re-run."
+            ))),
+        }
+    }
+
     fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
         crate::naming::artifact_ident_run(
             dest_table, crate::naming::Artifact::Lock, crate::naming::ROOMY, run)
@@ -179,23 +259,45 @@ impl ChDest {
                     .filter(|l| !l.is_empty()),
             );
         }
-        crate::naming::guard_verdict(
-            &format!("{}.{dest_table}", self.ch.database()),
-            dest_table,
-            crate::naming::ROOMY,
-            run,
-            found.iter().map(String::as_str),
-        )
+        let dest = self.lease_key(dest_table);
+        let now = crate::naming::now_unix();
+        for blk in crate::naming::blockers(
+            dest_table, crate::naming::ROOMY, run, found.iter().map(String::as_str))
+        {
+            let Some(tok) = crate::naming::collectable(&blk).map(str::to_string) else {
+                return Err(crate::naming::blocker_error(&dest, &blk, now, None));
+            };
+            let lease = self.lease_get(&dest, &tok).await?;
+            if lease.as_ref().is_some_and(|l| l.lapsed()) && self.lease_claim(&dest, &tok).await? {
+                let _ = self
+                    .ch
+                    .exec(&format!("DROP TABLE IF EXISTS {}", ch_ident(blk.name())))
+                    .await;
+                eprintln!(
+                    "apitap: {dest}: collected {} — the run that wrote it stopped \
+                     renewing its claim on this destination's own clock. Resuming.",
+                    blk.name()
+                );
+                continue;
+            }
+            return Err(crate::naming::blocker_error(&dest, &blk, now, lease.as_ref()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
-        let _ = self
-            .ch
+        let _ = self.release_ok(dest_table, run).await;
+    }
+
+    /// Did the lock actually go? The lease may only be dropped once it did.
+    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
+        self.ch
             .exec(&format!(
                 "DROP TABLE IF EXISTS {}",
                 ch_ident(&self.lock_name(dest_table, run))
             ))
-            .await;
+            .await
+            .is_ok()
     }
 
     /// The changelog append's intent marker: "a window starting at `lsn` is
@@ -860,12 +962,25 @@ impl ChDest {
             buf.extend_from_slice(at.as_bytes());
             buf.push(b'\n');
         }
+        // Before the data: cheap, and it catches the common case where this
+        // drain was collected while it was idle or between windows.
+        self.check_still_mine(dest_table).await?;
+        let t_write = std::time::Instant::now();
         self.ch
             .insert_stream(
                 &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
                 reqwest::Body::from(buf),
             )
             .await?;
+        // And again before the WATERMARK, but only when the write itself took
+        // longer than a renewal interval — i.e. only on the windows where the
+        // lease could plausibly have lapsed while this ran. A fast window pays
+        // one extra round trip per window; a slow one pays two, and a slow one
+        // is the dangerous one. Moving the cursor is the act that would make an
+        // evicted drain's damage permanent, so it is the act worth checking.
+        if t_write.elapsed().as_secs() >= crate::lease::renew_secs() {
+            self.check_still_mine(dest_table).await?;
+        }
         self.write_state(dest_table, source_id, outcome.end_lsn, c.count).await?;
         Ok(c.count)
     }
@@ -878,6 +993,9 @@ impl ChDest {
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
+        // Does this run still hold the table? A check, not a fence — see
+        // `check_still_mine`.
+        self.check_still_mine(dest_table).await?;
         // Same guard as apply_changelog: before the window's first DDL.
         self.refuse_clustered(dest_table).await?;
         let Some(c) = outcome.tables.get(qualified_src) else {
@@ -1135,6 +1253,9 @@ impl ChDest {
             }
         }
 
+        // Before the cursor moves: an evicted drain that has already written a
+        // window must at least not claim it.
+        self.check_still_mine(dest_table).await?;
         self.write_state(dest_table, source_id, outcome.end_lsn, c.events).await?;
         Ok(c.events)
     }

@@ -45,6 +45,114 @@ fn pct(s: &str) -> Result<String> {
         .map_err(|_| Error::InvalidInput("clickhouse url userinfo is not valid utf-8".into()))
 }
 
+/// The lease store, shared by both lanes — see `crate::lease`.
+///
+/// Append-only, like everything else this file writes: `ReplacingMergeTree(seq)`
+/// with `argMax` on read, and never `ALTER TABLE … DELETE`. That is a blocking,
+/// part-rewriting mutation, and a one-minute CDC schedule would issue well over
+/// a thousand a day on the engine whose own comment prices a single statement as
+/// "a full HTTP round trip against a window that only has ~7 of them". Released
+/// rows are stamped into the past and the table's TTL sweeps them.
+///
+/// Node-local, and legitimately: the CDC lane refuses a Replicated destination
+/// outright, so everything it touches is node-local already.
+pub(crate) async fn ensure_lease_table(ch: &ChConn) -> Result<()> {
+    ch.exec(&format!(
+        "CREATE TABLE IF NOT EXISTS `{t}` (\
+           dest_key String, token String, \
+           expires_at DateTime64(6, 'UTC'), collected UInt8, seq UInt64) \
+         ENGINE = ReplacingMergeTree(seq) ORDER BY (dest_key, token) \
+         TTL toDateTime(expires_at) + INTERVAL 1 DAY DELETE",
+        t = crate::lease::LEASE_TABLE
+    ))
+    .await
+    .map(|_| ())
+}
+
+/// One row-version. `ttl` seconds of life from now; a NEGATIVE value releases,
+/// and is spelled as an explicit epoch rather than `INTERVAL -n SECOND` —
+/// ClickHouse rejects the negative literal there, and because the release is
+/// best-effort the rejection was silent and the row stayed live (measured: a
+/// finished drain's lease read as alive for its full TTL).
+pub(crate) async fn lease_write(
+    ch: &ChConn,
+    key: &str,
+    token: &str,
+    ttl: i64,
+    collected: u8,
+) -> Result<()> {
+    ensure_lease_table(ch).await?;
+    let expires = if ttl >= 0 {
+        format!("now64(6) + INTERVAL {ttl} SECOND")
+    } else {
+        "toDateTime64(0, 6, 'UTC')".to_string()
+    };
+    ch.exec(&format!(
+        "INSERT INTO `{t}` (dest_key, token, expires_at, collected, seq) \
+         SELECT '{k}', '{tok}', {expires}, {collected}, toUnixTimestamp64Micro(now64(6))",
+        t = crate::lease::LEASE_TABLE,
+        k = ch_str(key),
+        tok = ch_str(token),
+    ))
+    .await
+    .map(|_| ())
+}
+
+pub(crate) async fn lease_get(
+    ch: &ChConn,
+    key: &str,
+    token: &str,
+) -> Result<Option<crate::lease::Lease>> {
+    let body = match ch
+        .exec(&format!(
+            "SELECT toInt64(dateDiff('second', now64(6), argMax(expires_at, seq))), \
+                    toUInt8(argMax(collected, seq)), count() \
+             FROM `{t}` WHERE dest_key = '{k}' AND token = '{tok}' FORMAT TabSeparated",
+            t = crate::lease::LEASE_TABLE,
+            k = ch_str(key),
+            tok = ch_str(token),
+        ))
+        .await
+    {
+        Ok(b) => b,
+        // No lease store = nothing is leased. Never an error: it is the default
+        // state of every destination that has never run a drain, and failing
+        // here would fail every bulk transfer into a fresh database.
+        Err(Error::Transfer(m)) if m.contains("UNKNOWN_TABLE") || m.contains("doesn't exist") => {
+            return Ok(None)
+        }
+        Err(e) => return Err(e),
+    };
+    let mut f = body.trim().split('\t');
+    let expires_in: i64 = f.next().unwrap_or("").trim().parse().unwrap_or(0);
+    let collected: u8 = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+    let n: u64 = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(crate::lease::Lease { expires_in, collected: collected != 0 }))
+}
+
+/// Check-then-act, and the comment says so rather than pretending otherwise:
+/// ClickHouse has no transaction and no row lock. Two collectors both succeed,
+/// which is correct — collecting is not proceeding, and each still meets the
+/// other's lock. What is genuinely weaker than Postgres: a wrongly evicted drain
+/// can land the ONE window already in flight, which the window machinery makes
+/// idempotent and the pre-watermark re-check keeps out of the cursor.
+pub(crate) async fn lease_claim(ch: &ChConn, key: &str, token: &str) -> Result<bool> {
+    match lease_get(ch, key, token).await? {
+        Some(l) if l.lapsed() => {
+            lease_write(ch, key, token, crate::lease::ttl_secs() as i64, 1).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(crate) async fn lease_close(ch: &ChConn, key: &str, token: &str) {
+    let _ = lease_write(ch, key, token, -1, 1).await;
+}
+
 impl ChConn {
     pub(crate) fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
@@ -553,12 +661,30 @@ impl ChSink {
                 }
                 crate::naming::Found::Live(peer) => {
                     if crate::naming::peer_blocks(&mine, &peer) {
+                        // A dead DRAIN's lock must not wedge a bulk run either:
+                        // the two lanes only see each other because they read
+                        // and write the same artifact, and a bulk run refusing
+                        // over a lock the CDC lane would collect is a matrix row
+                        // claimed and not enforced.
+                        let key = format!("{}.{}", self.ch.database(), self.final_bare);
+                        let lease = if artifact == crate::naming::Artifact::Lock {
+                            lease_get(&self.ch, &key, &peer.token).await?
+                        } else {
+                            None
+                        };
+                        if lease.as_ref().is_some_and(|l| l.lapsed())
+                            && lease_claim(&self.ch, &key, &peer.token).await?
+                        {
+                            self.drop_artifact(&name).await?;
+                            eprintln!(
+                                "apitap: {key}: collected {name} — the run that wrote it \
+                                 stopped renewing its claim on this destination's own \
+                                 clock. Resuming."
+                            );
+                            continue;
+                        }
                         return Err(crate::naming::locked_error(
-                            &format!("{}.{}", self.ch.database(), self.final_bare),
-                            &name,
-                            &mine,
-                            &peer,
-                            now,
+                            &key, &name, &mine, &peer, now, lease.as_ref(),
                         ));
                     }
                 }

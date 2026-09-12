@@ -114,8 +114,11 @@ def clear_dead_lock():
     one table refuse each other. Every clean exit — including the graceful
     SIGTERM this file is about — takes it back; a process killed outright runs
     no code at all and leaves it, exactly as a killed bulk run leaves its
-    staging table. The next run then refuses with a `locked:` error naming the
-    object, and removing it is the operator's call.
+    staging table — except that a drain's lock is LEASED, so it clears itself
+    once the lease lapses (`APITAP_LEASE_TTL_SECS`, 300s by default) and the next
+    scheduled run resumes with nothing for a human to do. These legs drop it by
+    hand only because waiting five minutes per signal is not something a gate can
+    afford; `e2e_cdc_lease.py` is where the self-heal is actually asserted.
 
     The legs below deliberately kill the process, so they do the operator's part
     here. This is NOT the guard being worked around: `e2e_cdc_guard.py` is where

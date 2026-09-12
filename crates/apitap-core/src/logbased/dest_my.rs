@@ -23,6 +23,9 @@ const STATE_CURSOR: &str = "_lsn";
 
 pub(crate) struct MyDest {
     shared: MySqlShared,
+    /// This run's token, set once by `set_run` — the apply path fences itself
+    /// with it. See `PgDest::fence_tx` for the argument.
+    run_token: std::sync::Mutex<Option<String>>,
 }
 
 /// Fail if the statement just run raised warnings.
@@ -75,11 +78,109 @@ fn bare(dest_table: &str) -> &str {
 
 impl MyDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self { shared: MySqlSink::shared_pool(url)? })
+        Ok(Self { shared: MySqlSink::shared_pool(url)?, run_token: std::sync::Mutex::new(None) })
     }
 
     fn fq(&self, table: &str) -> String {
         format!("{}.{}", my_ident(self.shared.db()), my_ident(table))
+    }
+
+    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
+        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
+    }
+
+    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
+        format!("{}.{}", self.shared.db(), bare(dest_table))
+    }
+
+    /// All of these delegate to the bulk sink's free functions, for the reason
+    /// `announce`/`check_peers`/`release` do: a drain and a bulk run can only
+    /// see each other's liveness if both read and write the same rows.
+    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        crate::sink::mysql::lease_open(self.shared.pool(), self.shared.db(), keys, run.token())
+            .await
+    }
+
+    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId)
+        -> Result<u64>
+    {
+        crate::sink::mysql::lease_renew(self.shared.pool(), self.shared.db(), keys, run.token())
+            .await
+    }
+
+    pub(crate) async fn lease_get(&self, key: &str, token: &str)
+        -> Result<Option<crate::lease::Lease>>
+    {
+        crate::sink::mysql::lease_get(self.shared.pool(), self.shared.db(), key, token).await
+    }
+
+    pub(crate) async fn lease_claim(&self, key: &str, token: &str) -> Result<bool> {
+        crate::sink::mysql::lease_claim(self.shared.pool(), self.shared.db(), key, token).await
+    }
+
+    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
+        crate::sink::mysql::lease_close(self.shared.pool(), self.shared.db(), key, run.token())
+            .await
+    }
+
+    /// FENCE — the MySQL twin of `PgDest::fence_tx`.
+    async fn fence_tx(
+        &self,
+        tx: &mut mysql_async::Transaction<'_>,
+        dest_table: &str,
+    ) -> Result<()> {
+        let Some(token) = self.run_token.lock().expect("run token").clone() else {
+            return Ok(());
+        };
+        let key = self.lease_key(dest_table);
+        let held: Option<(i32,)> = match tx
+            .exec_first(
+                format!(
+                    "SELECT 1 FROM {} WHERE dest_key = ? AND token = ? \
+                       AND collected = 0 AND expires_at > UTC_TIMESTAMP(6) FOR UPDATE",
+                    crate::sink::mysql::lease_t(self.shared.db())
+                ),
+                (&key, &token),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(mysql_async::Error::Server(e)) if e.code == 1146 => return Ok(()),
+            Err(e) => return Err(Error::Transfer(format!("log_based: fence: {e}"))),
+        };
+        if held.is_none() {
+            let any: Option<(i32,)> = tx
+                .exec_first(
+                    format!(
+                        "SELECT 1 FROM {} WHERE dest_key = ? AND token = ?",
+                        crate::sink::mysql::lease_t(self.shared.db())
+                    ),
+                    (&key, &token),
+                )
+                .await
+                .unwrap_or(None);
+            if any.is_none() {
+                return Ok(());
+            }
+            return Err(Error::Locked(format!(
+                "{key}: this drain no longer holds the table — its claim lapsed and \
+                 another run collected it, so it is not allowed to write. Nothing was \
+                 written. Re-run; the other run either finished or will be collected \
+                 in turn."
+            )));
+        }
+        tx.exec_drop(
+            format!(
+                "UPDATE {} SET expires_at = UTC_TIMESTAMP(6) + INTERVAL ? SECOND \
+                 WHERE dest_key = ? AND token = ?",
+                crate::sink::mysql::lease_t(self.shared.db())
+            ),
+            (crate::lease::ttl_secs(), &key, &token),
+        )
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based: fence renew: {e}")))
     }
 
     fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
@@ -125,24 +226,49 @@ impl MyDest {
                 .map_err(|e| Error::Transfer(format!("log_based: staging scan: {e}")))?;
             found.extend(rows);
         }
-        crate::naming::guard_verdict(
-            &format!("{}.{b}", self.shared.db()),
-            b,
-            crate::naming::MY_IDENT_MAX,
-            run,
-            found.iter().map(String::as_str),
-        )
+        let dest = format!("{}.{b}", self.shared.db());
+        let now = crate::naming::now_unix();
+        for blk in crate::naming::blockers(
+            b, crate::naming::MY_IDENT_MAX, run, found.iter().map(String::as_str))
+        {
+            let Some(tok) = crate::naming::collectable(&blk).map(str::to_string) else {
+                return Err(crate::naming::blocker_error(&dest, &blk, now, None));
+            };
+            let lease = self.lease_get(&dest, &tok).await?;
+            if lease.as_ref().is_some_and(|l| l.lapsed()) && self.lease_claim(&dest, &tok).await? {
+                // The claim is COMMITTED before the DROP, because MySQL DDL
+                // commits implicitly: a crash between them leaves
+                // `collected = 1` with the lock standing, which the next run
+                // re-claims through the `OR collected` disjunct.
+                let mut c2 = self.shared.conn().await?;
+                let _ = c2
+                    .query_drop(format!("DROP TABLE IF EXISTS {}", self.fq(blk.name())))
+                    .await;
+                eprintln!(
+                    "apitap: {dest}: collected {} — the run that wrote it stopped \
+                     renewing its claim on this destination's own clock. Resuming.",
+                    blk.name()
+                );
+                continue;
+            }
+            return Err(crate::naming::blocker_error(&dest, &blk, now, lease.as_ref()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
-        if let Ok(mut conn) = self.shared.conn().await {
-            let _ = conn
-                .query_drop(format!(
-                    "DROP TABLE IF EXISTS {}",
-                    self.fq(&self.lock_name(dest_table, run))
-                ))
-                .await;
-        }
+        let _ = self.release_ok(dest_table, run).await;
+    }
+
+    /// Did the lock actually go? The lease may only be dropped once it did.
+    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
+        let Ok(mut conn) = self.shared.conn().await else { return false };
+        conn.query_drop(format!(
+            "DROP TABLE IF EXISTS {}",
+            self.fq(&self.lock_name(dest_table, run))
+        ))
+        .await
+        .is_ok()
     }
 
     pub(crate) async fn read_state(
@@ -402,6 +528,11 @@ impl MyDest {
             .start_transaction(TxOpts::default())
             .await
             .map_err(my_err("begin"))?;
+        // FIRST statement of the transaction that writes data — see
+        // `PgDest::fence_tx` for the whole argument. A run whose lease was
+        // collected must write nothing afterwards, and the only way to
+        // guarantee that is to hold the lease row for the transaction's life.
+        self.fence_tx(&mut tx, dest_table).await?;
 
         if clear {
             let mut body = Vec::with_capacity(1 << 20);

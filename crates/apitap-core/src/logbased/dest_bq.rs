@@ -87,7 +87,180 @@ fn cdc_staging(table: &str) -> String {
     format!("{table}__apitap_cdc")
 }
 
+/// Read one lease row. Free, so the BULK sink can ask the same question about a
+/// dead drain's lock that the CDC lane asks — they only see each other because
+/// both read and write the same rows.
+pub(crate) async fn lease_get(
+    conn: &crate::sink::bigquery::BqConn,
+    key: &str,
+    token: &str,
+) -> Result<Option<crate::lease::Lease>> {
+    let sql = format!(
+        "SELECT TIMESTAMP_DIFF(expires_at, CURRENT_TIMESTAMP(), SECOND) AS e, collected AS c \
+         FROM {t} WHERE dest_key = '{k}' AND token = '{tok}'",
+        t = conn.fq(crate::lease::LEASE_TABLE), k = sql_str(key), tok = sql_str(token));
+    let rows = match conn.cdc_query(&sql).await {
+        Ok(r) => r,
+        // No lease store = nothing is leased, never an error.
+        Err(Error::Transfer(m))
+            if m.contains("404") || m.contains("Not found") || m.contains("was not found") =>
+        {
+            return Ok(None)
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(r) = rows.first() else { return Ok(None) };
+    Ok(Some(crate::lease::Lease {
+        expires_in: r.first().cloned().flatten().and_then(|v| v.parse().ok()).unwrap_or(0),
+        collected: matches!(r.get(1).cloned().flatten().as_deref(), Some("true") | Some("1")),
+    }))
+}
+
+pub(crate) async fn lease_claim(
+    conn: &crate::sink::bigquery::BqConn,
+    key: &str,
+    token: &str,
+) -> Result<bool> {
+    match lease_get(conn, key, token).await? {
+        Some(l) if l.lapsed() => {
+            conn.cdc_script(&format!(
+                "UPDATE {t} SET collected = TRUE WHERE dest_key = '{k}' AND token = '{tok}'",
+                t = conn.fq(crate::lease::LEASE_TABLE),
+                k = sql_str(key), tok = sql_str(token)))
+                .await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 impl BqDest {
+    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
+        format!("{}.{}", self.conn.dataset, bare(dest_table))
+    }
+
+    fn lease_fq(&self) -> String {
+        self.conn.fq(crate::lease::LEASE_TABLE)
+    }
+
+    async fn ensure_lease_table(&self) -> Result<()> {
+        self.conn.ensure_dataset().await?;
+        if self.conn.table_get(crate::lease::LEASE_TABLE).await?.is_some() {
+            return Ok(());
+        }
+        match self
+            .conn
+            .table_create(
+                crate::lease::LEASE_TABLE,
+                &serde_json::json!([
+                    {"name": "dest_key",   "type": "STRING"},
+                    {"name": "token",      "type": "STRING"},
+                    {"name": "expires_at", "type": "TIMESTAMP"},
+                    {"name": "collected",  "type": "BOOL"}
+                ]),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            // Two first-runs race the CREATE; whoever loses is fine.
+            Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// DML, and legitimately: CDC into BigQuery already requires a billing
+    /// project because the apply itself is row-level DML. The bulk lane's "state
+    /// machinery never needs DML" promise is untouched — bulk locks carry no
+    /// lease.
+    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        self.ensure_lease_table().await?;
+        let rows = keys
+            .iter()
+            .map(|k| format!(
+                "('{}','{}', TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {} SECOND), FALSE)",
+                sql_str(k), sql_str(run.token()), crate::lease::ttl_secs()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn
+            .cdc_script(&format!(
+                "DELETE FROM {t} WHERE token = '{tok}'; \
+                 INSERT INTO {t} (dest_key, token, expires_at, collected) VALUES {rows};",
+                t = self.lease_fq(),
+                tok = sql_str(run.token()),
+            ))
+            .await
+    }
+
+    pub(crate) async fn lease_renew(&self, _keys: &[String], run: &crate::naming::RunId)
+        -> Result<u64>
+    {
+        // One statement for the whole group: every row this run owns.
+        self.conn
+            .cdc_script(&format!(
+                "UPDATE {t} SET expires_at = \
+                   TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {ttl} SECOND) \
+                 WHERE token = '{tok}'",
+                t = self.lease_fq(),
+                ttl = crate::lease::ttl_secs(),
+                tok = sql_str(run.token()),
+            ))
+            .await
+            .map(|_| 1)
+    }
+
+    pub(crate) async fn lease_get_self(&self, key: &str, token: &str)
+        -> Result<Option<crate::lease::Lease>>
+    {
+        let sql = format!(
+            "SELECT TIMESTAMP_DIFF(expires_at, CURRENT_TIMESTAMP(), SECOND) AS e, \
+                    collected AS c \
+             FROM {t} WHERE dest_key = '{k}' AND token = '{tok}'",
+            t = self.lease_fq(), k = sql_str(key), tok = sql_str(token));
+        let rows = match self.conn.cdc_query(&sql).await {
+            Ok(r) => r,
+            // No lease store = nothing is leased, never an error.
+            Err(Error::Transfer(m))
+                if m.contains("404") || m.contains("Not found") || m.contains("was not found") =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(r) = rows.first() else { return Ok(None) };
+        Ok(Some(crate::lease::Lease {
+            expires_in: r.first().cloned().flatten()
+                .and_then(|v| v.parse().ok()).unwrap_or(0),
+            collected: matches!(
+                r.get(1).cloned().flatten().as_deref(), Some("true") | Some("1")),
+        }))
+    }
+
+    pub(crate) async fn lease_claim_self(&self, key: &str, token: &str) -> Result<bool> {
+        match self.lease_get_self(key, token).await? {
+            Some(l) if l.lapsed() => {
+                self.conn
+                    .cdc_script(&format!(
+                        "UPDATE {t} SET collected = TRUE \
+                         WHERE dest_key = '{k}' AND token = '{tok}'",
+                        t = self.lease_fq(), k = sql_str(key), tok = sql_str(token)))
+                    .await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
+        let _ = self
+            .conn
+            .cdc_script(&format!(
+                "DELETE FROM {t} WHERE dest_key = '{k}' AND token = '{tok}'",
+                t = self.lease_fq(), k = sql_str(key), tok = sql_str(run.token())))
+            .await;
+    }
+
     fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
         crate::naming::artifact_ident_run(
             bare(dest_table), crate::naming::Artifact::Lock, crate::naming::ROOMY, run)
@@ -118,17 +291,36 @@ impl BqDest {
         let (head, _) =
             crate::naming::artifact_match(b, crate::naming::Artifact::Staging, crate::naming::ROOMY);
         let listed = self.conn.tables_with_prefix(&head).await?;
-        crate::naming::guard_verdict(
-            &format!("{}.{b}", self.conn.dataset),
-            b,
-            crate::naming::ROOMY,
-            run,
-            listed.iter().map(String::as_str),
-        )
+        let dest = self.lease_key(dest_table);
+        let now = crate::naming::now_unix();
+        for blk in crate::naming::blockers(
+            b, crate::naming::ROOMY, run, listed.iter().map(String::as_str))
+        {
+            let Some(tok) = crate::naming::collectable(&blk).map(str::to_string) else {
+                return Err(crate::naming::blocker_error(&dest, &blk, now, None));
+            };
+            let lease = self.lease_get_self(&dest, &tok).await?;
+            if lease.as_ref().is_some_and(|l| l.lapsed()) && self.lease_claim_self(&dest, &tok).await? {
+                let _ = self.conn.table_delete(blk.name()).await;
+                eprintln!(
+                    "apitap: {dest}: collected {} — the run that wrote it stopped \
+                     renewing its claim on this destination's own clock. Resuming.",
+                    blk.name()
+                );
+                continue;
+            }
+            return Err(crate::naming::blocker_error(&dest, &blk, now, lease.as_ref()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
-        let _ = self.conn.table_delete(&self.lock_name(dest_table, run)).await;
+        let _ = self.release_ok(dest_table, run).await;
+    }
+
+    /// Did the lock actually go? The lease may only be dropped once it did.
+    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
+        self.conn.table_delete(&self.lock_name(dest_table, run)).await.is_ok()
     }
 
     pub(crate) async fn connect(url: &str) -> Result<Self> {

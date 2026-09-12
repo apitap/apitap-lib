@@ -1720,12 +1720,30 @@ impl BqSink {
                 }
                 crate::naming::Found::Live(peer) => {
                     if crate::naming::peer_blocks(mine, &peer) {
+                        // A dead DRAIN's lock must not wedge a bulk run either:
+                        // the two lanes only see each other because they read
+                        // and write the same artifact.
+                        let key = format!("{}.{}", self.conn.dataset, self.final_table);
+                        let lease = if *artifact == Artifact::Lock {
+                            crate::logbased::dest_bq::lease_get(&self.conn, &key, &peer.token)
+                                .await?
+                        } else {
+                            None
+                        };
+                        if lease.as_ref().is_some_and(|l| l.lapsed())
+                            && crate::logbased::dest_bq::lease_claim(
+                                &self.conn, &key, &peer.token).await?
+                        {
+                            let _ = self.conn.table_delete(name).await;
+                            eprintln!(
+                                "apitap: {key}: collected {name} — the run that wrote it \
+                                 stopped renewing its claim on this destination's own \
+                                 clock. Resuming."
+                            );
+                            continue;
+                        }
                         return Err(crate::naming::locked_error(
-                            &format!("{}.{}", self.conn.dataset, self.final_table),
-                            name,
-                            mine,
-                            &peer,
-                            now,
+                            &key, name, mine, &peer, now, lease.as_ref(),
                         ));
                     }
                 }

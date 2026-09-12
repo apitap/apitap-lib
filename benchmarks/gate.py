@@ -69,6 +69,7 @@ LEGS = [
     ("e2e_mariadb_cdc.py",      "MariaDB binlog as a CDC source",             {}, "mariadb", []),
     ("e2e_changelog_replay.py", "a replayed changelog window is not appended twice", {}, "mariadb", []),
     ("e2e_cdc_guard.py",        "a drain and a bulk run refuse each other",    {}, None, []),
+    ("e2e_cdc_lease.py",        "a killed drain's lock clears itself",         {}, None, []),
     ("e2e_my_liveness.py",      "a dead binlog peer is noticed",              {}, None, []),
 
     ("e2e_ch_source.py",        "ClickHouse -> ClickHouse, RowBinary relayed", {}, None, []),

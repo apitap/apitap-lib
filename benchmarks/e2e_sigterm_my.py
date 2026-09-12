@@ -59,9 +59,12 @@ def ch_count():
     return int(v) if v.isdigit() else -1
 
 def clear_dead_lock():
-    """Drop the announcement a HARD-KILLED drain leaves behind — see the same
-    helper in `e2e_sigterm.py` for why it is the operator's job and why doing it
-    here is not working around the guard (`e2e_cdc_guard.py` asserts that)."""
+    """Drop the announcement a HARD-KILLED drain leaves behind.
+
+    It would clear itself after the lease TTL; these legs do not wait, because
+    waiting five minutes per signal is not something a gate can afford. The
+    self-heal is asserted in `e2e_cdc_lease.py`, and the refusal itself in
+    `e2e_cdc_guard.py`."""
     for n in ch(
         "SELECT name FROM system.tables WHERE database = currentDatabase() "
         f"AND startsWith(name, '{T}') AND endsWith(name, '__apitap_lock')").split():

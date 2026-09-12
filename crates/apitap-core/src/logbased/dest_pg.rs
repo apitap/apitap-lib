@@ -14,9 +14,109 @@ const STATE_CURSOR: &str = "_lsn";
 
 pub(crate) struct PgDest {
     pool: PgPool,
+    /// This run's token, set once by `set_run`. The apply path needs it to
+    /// FENCE itself — see `fence_tx` — and threading a `&RunId` through every
+    /// apply signature on five destinations to deliver one string was the
+    /// alternative.
+    run_token: std::sync::Mutex<Option<String>>,
 }
 
 impl PgDest {
+    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
+        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
+    }
+
+    fn token(&self) -> Option<String> {
+        self.run_token.lock().expect("run token").clone()
+    }
+
+    /// FENCE: the first statement of every transaction this drain uses to write.
+    ///
+    /// A lapsed lease means "this run stopped renewing", and a run that is
+    /// merely PARTITIONED from its destination also stops renewing — so a lapse
+    /// alone cannot be allowed to authorise a collection while the victim is
+    /// still able to write. This closes that: the apply transaction takes its
+    /// own lease row `FOR UPDATE` before it touches any data and renews it in
+    /// the same transaction, and a collector's claim is an `UPDATE` of that same
+    /// row with `NOWAIT`. So either
+    ///
+    /// * this transaction takes the row first — the collector gets 55P03 at once
+    ///   and refuses, and this run is the only writer; or
+    /// * the collector takes it first and the lease really was lapsed — this
+    ///   returns zero rows, the transaction rolls back having written nothing,
+    ///   and the collector is the only writer.
+    ///
+    /// The interleaving that would hurt — fence passes, claim succeeds, then
+    /// this run writes — cannot happen, because the fence and the write are one
+    /// transaction holding one row lock for its whole duration.
+    ///
+    /// No lease (a run that never opened one, or an older destination) is not an
+    /// error: there is nothing to fence against, and refusing here would break
+    /// every path that writes state outside a leased drain.
+    async fn fence_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        dest_table: &str,
+    ) -> Result<()> {
+        let Some(token) = self.token() else { return Ok(()) };
+        let (_, schema, bare) = crate::sink::postgres::lock_ident_parts(dest_table);
+        let key = format!("{schema}.{bare}");
+        let t = crate::sink::postgres::lease_table(&schema);
+        let held: Option<(i32,)> = match sqlx::query_as(&format!(
+            "SELECT 1 FROM {t} WHERE dest_key = $1 AND token = $2 \
+               AND NOT collected AND expires_at > now() FOR UPDATE"
+        ))
+        .bind(&key)
+        .bind(&token)
+        .fetch_optional(&mut **tx)
+        .await
+        {
+            Ok(r) => r,
+            // No lease store: nothing to fence against. By SQLSTATE and by
+            // message — sqlx renders the server's text, not the code.
+            Err(e) if e.as_database_error().and_then(|d| d.code())
+                        .is_some_and(|c| c == "42P01")
+                      || e.to_string().contains("does not exist") => return Ok(()),
+            Err(e) => return Err(db_err(e)),
+        };
+        if held.is_none() {
+            // Either this run never opened a lease for this table, or its lease
+            // was collected. Distinguishing the two costs a second query and
+            // changes nothing: in both cases this transaction must not write.
+            let any: Option<(i32,)> = sqlx::query_as(&format!(
+                "SELECT 1 FROM {t} WHERE dest_key = $1 AND token = $2"
+            ))
+            .bind(&key)
+            .bind(&token)
+            .fetch_optional(&mut **tx)
+            .await
+            .unwrap_or(None);
+            if any.is_none() {
+                return Ok(());
+            }
+            return Err(Error::Locked(format!(
+                "{key}: this drain no longer holds the table — its claim lapsed and \
+                 another run collected it, so it is not allowed to write. Nothing was \
+                 written. Re-run; the other run either finished or will be collected \
+                 in turn."
+            )));
+        }
+        // Renew inside the same transaction: a long apply must not let its own
+        // lease expire while it holds the row (the keeper skips a locked row on
+        // purpose, because THIS is what renews it).
+        sqlx::query(&format!(
+            "UPDATE {t} SET expires_at = now() + make_interval(secs => $3) \
+             WHERE dest_key = $1 AND token = $2"
+        ))
+        .bind(&key)
+        .bind(&token)
+        .bind(crate::lease::ttl_secs() as f64)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+        .map_err(db_err)
+    }
+
     /// The CDC lane's half of the announce-then-check protocol.
     ///
     /// It calls the BULK sink's functions, not copies of them, and that is the
@@ -40,8 +140,64 @@ impl PgDest {
     }
 
     pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
+        let _ = self.release_ok(dest_table, run).await;
+    }
+
+    /// The lease key — the SAME schema-qualified string the peer scan and the
+    /// refusal already use. Never the bare name: the scan is scoped to one
+    /// schema, so a bare key would put `sales.orders` and `hr.orders` in one key
+    /// space and let a run in one schema collect a live drain in the other.
+    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
+        let (_, schema, bare) = crate::sink::postgres::lock_ident_parts(dest_table);
+        format!("{schema}.{bare}")
+    }
+
+    /// All four delegate to the bulk sink's free functions, for the same reason
+    /// `announce`/`check_peers`/`release` do: both lanes must read and write the
+    /// same rows in the same table.
+    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId)
+        -> Result<()>
+    {
+        // Every key in a group shares a schema in practice, but not by
+        // construction — so group by schema rather than assume.
+        let mut by_schema: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for k in keys {
+            let (_, schema, _) = crate::sink::postgres::lock_ident_parts(k);
+            by_schema.entry(schema).or_default().push(k.clone());
+        }
+        for (schema, ks) in by_schema {
+            crate::sink::postgres::lease_open(&self.pool, &schema, &ks, run.token()).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId)
+        -> Result<u64>
+    {
+        let mut by_schema: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for k in keys {
+            let (_, schema, _) = crate::sink::postgres::lock_ident_parts(k);
+            by_schema.entry(schema).or_default().push(k.clone());
+        }
+        let mut n = 0;
+        for (schema, ks) in by_schema {
+            n += crate::sink::postgres::lease_renew(&self.pool, &schema, &ks, run.token()).await?;
+        }
+        Ok(n)
+    }
+
+    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
+        let (_, schema, _) = crate::sink::postgres::lock_ident_parts(key);
+        crate::sink::postgres::lease_close(&self.pool, &schema, key, run.token()).await
+    }
+
+    /// Did the lock actually go? The lease may only be dropped once it did.
+    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
         let (lock_q, _, _) = crate::sink::postgres::lock_ident(dest_table, run);
-        crate::sink::postgres::release_run(&self.pool, &lock_q).await
+        sqlx::query(&format!("DROP TABLE IF EXISTS {lock_q}"))
+            .execute(&self.pool)
+            .await
+            .is_ok()
     }
 
     pub(crate) async fn connect(url: &str) -> Result<Self> {
@@ -50,7 +206,7 @@ impl PgDest {
             .connect(url)
             .await
             .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self { pool, run_token: std::sync::Mutex::new(None) })
     }
 
     /// The bootstrap's replace path lands data without constraints; the
@@ -244,6 +400,7 @@ impl PgDest {
             // Foreign-table traffic only: nothing for our table, still advance.
             self.ensure_state_table().await?;
             let mut tx = dst.begin().await.map_err(db_err)?;
+            self.fence_tx(&mut tx, dest_table).await?;
             upsert_state_tx(&mut tx, dest_table, source_id, outcome.end_lsn, 0).await?;
             tx.commit().await.map_err(db_err)?;
             return Ok(0);
@@ -259,6 +416,8 @@ impl PgDest {
         let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
 
         let mut tx = dst.begin().await.map_err(db_err)?;
+        // FIRST statement of the transaction that writes data — see `fence_tx`.
+        self.fence_tx(&mut tx, dest_table).await?;
 
         if c.truncate {
             tx.execute(format!("TRUNCATE {ft}").as_str()).await.map_err(db_err)?;

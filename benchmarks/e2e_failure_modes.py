@@ -103,6 +103,11 @@ def case(name, passed, detail):
     print(f"   {'✓' if passed else '✗'} {name}: {detail}")
 
 
+# A killed CDC drain's lock clears itself once its lease lapses. The default is
+# 300s, which no gate leg can afford to wait for; 30 is the clamp floor.
+LEASE_TTL = 30
+os.environ["APITAP_LEASE_TTL_SECS"] = str(LEASE_TTL)
+
 print("== 1. SIGKILL mid-transfer, over an EXISTING destination table ==")
 # Not just the destination: a PREVIOUS run of this leg was killed on purpose and
 # left tokenized staging behind, and since 0.55.0 that refuses the next run
@@ -199,7 +204,26 @@ apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
     else:
         case("watermark unmoved after a killed window", wm1 == wm0,
              f"{wm1 or '(none)'} == {wm0 or '(none)'}")
-    # Recovery: one clean run must land EVERY change exactly once.
+    # Recovery. A killed drain leaves its `__apitap_lock`, so the immediate
+    # re-run is REFUSED — and then clears itself once the lease lapses. This leg
+    # used to re-run straight away and assert success, which was green only
+    # because the 1.2s kill usually lost its race: whenever the kill actually
+    # landed, the re-run would have been refused and nobody would have known
+    # which of the two it was. Now it asserts both halves.
+    if killed:
+        immediate = sh([sys.executable, "-c", f"""
+import apitap
+apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
+"""])
+        case("a killed drain's lock refuses the immediate re-run",
+             immediate.returncode != 0 and "locked" in (immediate.stderr or "").lower(),
+             (immediate.stderr.strip().splitlines() or [""])[-1][:130])
+        # …and the refusal must say the wait is finite, or an operator reads it
+        # as the permanent wedge it used to be.
+        case("and the refusal promises the wait ends by itself",
+             "nothing for you to do" in (immediate.stderr or ""),
+             (immediate.stderr or "")[-130:])
+        time.sleep(LEASE_TTL + 3)
     r = sh([sys.executable, "-c", f"""
 import apitap
 apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
@@ -208,9 +232,11 @@ apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
     dst_digest = ch(f"SELECT toString(count()) || '|' || toString(sum(toInt64(id))) || '|' || "
                     f"lower(hex(MD5(arrayStringConcat(arraySort(x -> x.1, groupArray((id, v))).2, ',')))) FROM {CT}")
     exact = src_digest.split("|")[:2] == dst_digest.split("|")[:2]
-    case("replay applies every change exactly once", r.returncode == 0 and exact,
+    case("replay applies every change exactly once — with no manual step",
+         r.returncode == 0 and exact,
          f"src {src_digest.split('|')[0]} rows / sum {src_digest.split('|')[1]} == "
-         f"dst {dst_digest.split('|')[0]} / {dst_digest.split('|')[1]}")
+         f"dst {dst_digest.split('|')[0]} / {dst_digest.split('|')[1]}"
+         + (" (after the lease lapsed)" if killed else " (the kill lost its race)"))
 
 print("== 3. the source connection is cut mid-COPY ==")
 drop_ch(ch, T)

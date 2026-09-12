@@ -86,6 +86,7 @@ pub(crate) struct MySqlSink {
 /// global INFILE handler owns the registry), the registry itself, the pool-wide
 /// stream-id counter, and the URL's database.
 #[derive(Clone)]
+
 pub(crate) struct MySqlShared {
     pool: Pool,
     registry: Registry,
@@ -98,9 +99,150 @@ pub(crate) struct MySqlShared {
     tls_hint: Option<Arc<str>>,
 }
 
+/// The lease store, shared by both lanes — see `crate::lease`.
+///
+/// InnoDB, not `ENGINE=MEMORY` like the lock: a MEMORY table is emptied by a
+/// server restart, and losing every live lease at once would make every running
+/// drain look dead to the next scan — the one failure this mechanism must not
+/// have. Timestamps are stamped and compared with `UTC_TIMESTAMP(6)`, so no
+/// client clock enters the decision.
+pub(crate) fn lease_t(db: &str) -> String {
+    format!("{}.{}", my_ident(db), my_ident(crate::lease::LEASE_TABLE))
+}
+
+async fn ensure_lease_table(pool: &Pool, db: &str) -> Result<()> {
+    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    conn.query_drop(format!(
+        "CREATE TABLE IF NOT EXISTS {} (\
+           dest_key VARCHAR(320) NOT NULL, \
+           token VARCHAR(64) NOT NULL, \
+           expires_at DATETIME(6) NOT NULL, \
+           collected TINYINT NOT NULL DEFAULT 0, \
+           PRIMARY KEY (dest_key, token)) ENGINE=InnoDB",
+        lease_t(db)
+    ))
+    .await
+    .map_err(|e| Error::Transfer(format!("lease table: {e}")))
+}
+
+pub(crate) async fn lease_open(pool: &Pool, db: &str, keys: &[String], token: &str) -> Result<()> {
+    ensure_lease_table(pool, db).await?;
+    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    for k in keys {
+        conn.exec_drop(
+            format!(
+                "INSERT INTO {} (dest_key, token, expires_at) \
+                 VALUES (?, ?, UTC_TIMESTAMP(6) + INTERVAL ? SECOND) \
+                 ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)",
+                lease_t(db)
+            ),
+            (k, token, crate::lease::ttl_secs()),
+        )
+        .await
+        .map_err(|e| Error::Transfer(format!("lease open: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Never blocking. MySQL has no `SKIP LOCKED` on a plain UPDATE, so the lock
+/// wait is set to one second and a 1205 timeout is treated as "skip" — a row
+/// locked right now is held by this run's OWN apply transaction, which renews it
+/// in-transaction. Without that, one member of a group whose window runs long
+/// would block the renewal and every OTHER member's lease would expire under a
+/// live, healthy group.
+pub(crate) async fn lease_renew(pool: &Pool, db: &str, keys: &[String], token: &str) -> Result<u64> {
+    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    let _ = conn.query_drop("SET SESSION innodb_lock_wait_timeout = 1").await;
+    let mut done = 0u64;
+    for k in keys {
+        match conn
+            .exec_drop(
+                format!(
+                    "UPDATE {} SET expires_at = UTC_TIMESTAMP(6) + INTERVAL ? SECOND \
+                     WHERE dest_key = ? AND token = ?",
+                    lease_t(db)
+                ),
+                (crate::lease::ttl_secs(), k, token),
+            )
+            .await
+        {
+            Ok(()) => done += 1,
+            Err(e) if e.to_string().contains("1205") => {}
+            Err(e) => return Err(Error::Transfer(format!("lease renew: {e}"))),
+        }
+    }
+    Ok(done)
+}
+
+pub(crate) async fn lease_get(
+    pool: &Pool,
+    db: &str,
+    key: &str,
+    token: &str,
+) -> Result<Option<crate::lease::Lease>> {
+    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    let row: Option<(i64, i8)> = match conn
+        .exec_first(
+            format!(
+                "SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), expires_at), collected \
+                 FROM {} WHERE dest_key = ? AND token = ?",
+                lease_t(db)
+            ),
+            (key, token),
+        )
+        .await
+    {
+        Ok(r) => r,
+        // 1146: no lease store = nothing is leased, never an error.
+        Err(mysql_async::Error::Server(e)) if e.code == 1146 => None,
+        Err(e) => return Err(Error::Transfer(format!("lease read: {e}"))),
+    };
+    Ok(row.map(|(expires_in, collected)| crate::lease::Lease {
+        expires_in,
+        collected: collected != 0,
+    }))
+}
+
+pub(crate) async fn lease_claim(pool: &Pool, db: &str, key: &str, token: &str) -> Result<bool> {
+    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    let _ = conn.query_drop("SET SESSION innodb_lock_wait_timeout = 1").await;
+    match conn
+        .exec_drop(
+            format!(
+                "UPDATE {} SET collected = 1 WHERE dest_key = ? AND token = ? \
+                 AND (expires_at <= UTC_TIMESTAMP(6) OR collected = 1)",
+                lease_t(db)
+            ),
+            (key, token),
+        )
+        .await
+    {
+        Ok(()) => Ok(conn.affected_rows() > 0),
+        // 1205: the owner holds the row inside an apply — alive, so refuse.
+        Err(e) if e.to_string().contains("1205") => Ok(false),
+        Err(mysql_async::Error::Server(e)) if e.code == 1146 => Ok(false),
+        Err(e) => Err(Error::Transfer(format!("lease claim: {e}"))),
+    }
+}
+
+pub(crate) async fn lease_close(pool: &Pool, db: &str, key: &str, token: &str) {
+    if let Ok(mut conn) = pool.get_conn().await {
+        let _ = conn
+            .exec_drop(
+                format!("DELETE FROM {} WHERE dest_key = ? AND token = ?", lease_t(db)),
+                (key, token),
+            )
+            .await;
+    }
+}
+
 impl MySqlShared {
     pub(crate) fn db(&self) -> &str {
         &self.db
+    }
+
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
     }
 
     /// A pooled connection under the same 30 s deadline the sink uses.
@@ -478,12 +620,30 @@ impl MySqlSink {
                     }
                     crate::naming::Found::Live(peer) => {
                         if crate::naming::peer_blocks(&mine, &peer) {
+                            // A dead DRAIN's lock must not wedge a bulk run
+                            // either: the two lanes only see each other because
+                            // they read and write the same artifact, and a bulk
+                            // run refusing over a lock the CDC lane would
+                            // collect is a matrix row claimed and not enforced.
+                            let key = format!("{}.{}", self.db, self.bare);
+                            let lease = if art == Artifact::Lock {
+lease_get(&self.pool, &self.db, &key, &peer.token).await?
+                            } else {
+                                None
+                            };
+                            if lease.as_ref().is_some_and(|l| l.lapsed())
+                                && lease_claim(&self.pool, &self.db, &key, &peer.token).await?
+                            {
+                                self.drop_artifact(&name).await?;
+                                eprintln!(
+                                    "apitap: {key}: collected {name} — the run that wrote \
+                                     it stopped renewing its claim on this destination's \
+                                     own clock. Resuming."
+                                );
+                                continue;
+                            }
                             return Err(crate::naming::locked_error(
-                                &format!("{}.{}", self.db, self.bare),
-                                &name,
-                                &mine,
-                                &peer,
-                                now,
+                                &key, &name, &mine, &peer, now, lease.as_ref(),
                             ));
                         }
                     }

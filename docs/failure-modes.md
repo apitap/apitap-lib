@@ -43,7 +43,7 @@ The two properties everything else rests on:
 | what happened | state left behind | recovery | verified |
 |---|---|---|---|
 | **Process SIGKILLed mid bulk transfer** | Previous destination table **intact and readable throughout** (proven: 1,000 rows and their marker unchanged while 10M rows were streaming into staging). The staging object — `<dest>_<runtoken>__apitap_staging` — is left behind: SIGKILL runs no error path. | **0.55.0+: drop that object, then re-run.** The next run REFUSES while it is there, with a `locked:` error naming it, because nothing collects a crashed run's workspace on a timer — see [Two runs, one table](#two-runs-one-table) for why a timestamp cannot tell a crash from a slow load. Before 0.55.0 the next run dropped it blindly, which is the concurrency defect that release closed. Every *ordinary* error path drops its own staging **since 0.55.1**; only a kill skips it. On 0.55.0 exactly that sentence was false — the driver had no error arm at all, so a cut connection or a statement timeout also left staging behind and every later run of the table was refused for a run that had already died. | `e2e_failure_modes.py` case 1 (the kill) and case 3 (an ordinary error, which now asserts nothing is left and that the next run is not refused) |
-| **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) **0.56.0+: the run's `<dest>_<runtoken>__apitap_lock` is left behind too**, and the next run of that table is REFUSED until it is dropped. A graceful stop does not leave one. | Drop the named lock table, then re-run. Nothing else is needed — no data was published and no watermark moved. Every change is then applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2, and `e2e_sigterm.py` legs 2-3, which kill the process outright and then do the operator's part before resuming |
+| **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) The run's `<dest>_<runtoken>__apitap_lock` is left behind, so re-runs inside the lease's TTL are refused with `locked:`. | **Nothing.** The first run after the TTL (`APITAP_LEASE_TTL_SECS`, 300s by default) collects the lock on the destination's own clock and resumes from the watermark. Every change is then applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2, and `e2e_cdc_lease.py`, which kills a real drain and then asserts the self-heal |
 | **SIGTERM mid CDC window** (pod evicted, Airflow run cleared, `systemctl stop`) | The window in flight is **applied**, not discarded, and the watermark advances with it. The run exits 0 with a report of the rows it landed. | Nothing. The next run picks up from the new watermark. A second SIGTERM is not absorbed — the default disposition comes back and the process ends at once, which is the SIGKILL case above and equally safe. | `e2e_sigterm.py` (Postgres, incl. a control run with the mechanism disabled), `e2e_sigterm_my.py` (MySQL binlog) |
 | **Two runs of the same destination table at once** (0.55.0+) | **Refused, at `prepare`, before a row moves.** The second run exits non-zero with a `locked:` error naming how long ago the other started, what it is doing, and why the two cannot share the table. Nothing is written; the first run finishes normally. On 0.54.0 and earlier the two interleaved destructively — see [Two runs, one table](#two-runs-one-table). | Run them one at a time — a scheduler's own concurrency setting is the usual answer (Airflow `max_active_runs=1`, a cron `flock`). If the other run is dead rather than slow, drop the staging object the error names and re-run; nothing collects it for you, and the section below says why. | `e2e_concurrent_runs.py` (Postgres: the refusal, the survivor, a control, and fan-in) |
 | **Source connection cut mid-COPY** (server restart, `pg_terminate_backend`, idle/statement timeout, network drop) | Nothing published. The destination table is **not even created** — it only comes into existence at the swap. | Re-run. The error says so explicitly rather than making you guess. | case 3 |
@@ -225,10 +225,12 @@ Postgres and MySQL and nowhere else: ClickHouse, BigQuery and the object stores
 have nothing equivalent, and a marker written *beside* the staging object could
 never be checked atomically with the publish on those engines.
 
-`prepare` no longer drops anything blindly. It lists what is present, collects
-only what it can PROVE is dead, and refuses to start beside anything else. The
-one thing it can prove is the un-tokenized name an older apitap wrote: no
-current run mints that name, so nothing living can own it.
+`prepare` no longer drops anything blindly. It lists what is present and
+refuses to start beside anything it cannot prove is finished — including the
+un-tokenized name an older apitap wrote, which is refused rather than collected
+because a ≤0.54.0 run is USING that name while it loads. The single exception is
+a CDC lock whose LEASE has lapsed; that is the one liveness fact a dead run
+leaves behind, and it is the subject of its own section below.
 
 **It announces itself before it looks — that is new in 0.56.0.** Until then
 `prepare` listed first and created staging second, which is check-then-act: two
@@ -290,26 +292,63 @@ Two details worth knowing:
   up is the instant between the two: two CDC runs that both read "no state" both
   reach the bootstrap, and the loser is refused by the bulk guard rather than
   the CDC one. Loudly, either way.
-- **A hard-killed drain leaves its announcement, and the next run refuses.**
-  This is new in 0.56.0 and it is the price of the row above. Every clean exit
-  takes the lock back — including the graceful SIGTERM stop, an ordinary error,
-  and a refusal — but a process killed outright (`SIGKILL`, an OOM kill, a node
-  that goes away) runs no code at all. The next run of that table then fails
-  with the `locked:` error naming the object, and removing it is a manual step.
+- **A hard-killed drain's lock clears itself. This is the lease.**
+  Every clean exit takes the lock back — the graceful SIGTERM stop, an ordinary
+  error, a refusal — but a process killed outright (`SIGKILL`, an OOM kill, a
+  node that goes away) runs no code at all. On its own that would mean the lock
+  survives and the next run of that table is refused until a human drops it.
+  Unattended CDC is exactly the thing that cannot afford a manual step, so the
+  lock is not on its own.
 
-  It is the same contract a killed bulk run has always had for its staging
-  table, and the same reasoning: a timestamp in the name records when the RUN
-  started, not when the object was made, so nothing can prove a lock is stale
-  and collecting one on a guess is how two drains end up applying overlapping
-  windows. What is genuinely different is that before 0.56.0 a killed drain left
-  NOTHING, and the next scheduled run simply resumed from its watermark. If your
-  drains are unattended, know this: one hard kill now needs one `DROP TABLE`
-  before the pipeline runs again.
+  A drain now writes a row in `_apitap_lease` for every table it holds and
+  renews it on a timer from a task that is not on the window path. A peer may
+  drop a blocking lock **if and only if** a lease row exists for that exact peer
+  token and the destination server itself says it has lapsed. The default life
+  is 300 seconds (`APITAP_LEASE_TTL_SECS`, clamped to 30–3600); the renewal is
+  always a tenth of it, so ten ticks have to be missed before a live run looks
+  dead.
 
-  The proper fix is a liveness signal from the engine rather than a timestamp —
-  an object whose mtime advances while the run writes, a lease the run renews —
-  which is what would let a stale lock be collected safely. It is named
-  follow-up work, not a guess to make here.
+  Three properties are worth stating exactly, because each one is load-bearing:
+
+  * **The clock is the destination's, never a client's.** `expires_at` is
+    stamped and compared inside the same statement, against the destination's
+    own `now()`. Two runs on two machines with two badly-set clocks still agree.
+    A destination clock that steps BACKWARD fails safe — nothing is collected
+    until it catches up — and the refusal prints the remaining life, so an
+    absurd figure shows up in the log instead of nothing at all.
+  * **No lease, no collection — ever.** A lock written by an apitap that
+    predates the lease, one an operator planted, a bulk run's lock, and a
+    staging object at any age all have no liveness record, and the refusal for
+    them still says, word for word, that nothing collects them on their own.
+    This is the same decision that turned `Found::Dead` into `Found::Legacy`:
+    absence of evidence is refusal, not permission.
+  * **A lapse alone is not enough, because a partitioned run also stops
+    renewing.** On Postgres and MySQL the lease row is also the FENCE: the
+    drain's apply transaction takes it `FOR UPDATE` as its first statement and
+    renews it in the same transaction, while a collector's claim is an `UPDATE`
+    of that row with `NOWAIT`. Either the drain holds the row and the collector
+    is refused at once, or the collector takes it and the drain's next fence
+    returns nothing, rolls back having written nothing, and exits. The
+    interleaving that would hurt — fence passes, claim succeeds, drain writes —
+    cannot happen, because the fence and the write are one transaction.
+
+  **ClickHouse and BigQuery are not fenced, and the difference is real.**
+  Neither has a row lock the apply can hold, so there the lease is checked, not
+  held: a wrongly evicted drain can still land the ONE window already in flight.
+  That window is idempotent — its rows carry the window's start LSN, and a
+  same-start replay appends nothing twice — and the drain re-checks before it
+  moves the watermark, so the winner's cursor stays authoritative. On those two
+  engines the guarantee reads: *never two winners for longer than one window,
+  and the loser's extra window is an idempotent replay, never a truncation.*
+
+  **What this does NOT cover.** A killed BULK run's staging table is still not
+  collected by anything, and will not be: it holds data, and nothing can prove a
+  live loader is not writing into it — that is where `classify`'s severity
+  argument has full force. A killed CDC BOOTSTRAP is in the same position: it
+  hands the guard to the bulk lane's lock, which carries no lease. And a
+  partition longer than the TTL now ENDS a drain that would previously have
+  survived it — the correct direction, since a drain that cannot prove it still
+  holds the table must stop, but it is a new way to die.
 
 - **Iceberg destinations are still unguarded for the drain.** A claim there
   lives in object storage, and the CDC lane holds only a catalog connection;
@@ -367,32 +406,25 @@ except apitap.LockedError:
     return          # someone else has it; nothing was written
 ```
 
-**What the guard does NOT cover: two runs starting in the same instant.**
-`prepare` lists the destination's catalog and then creates its staging object.
-Two runs that start inside that gap both see an empty catalog and both proceed —
-it is check-then-act, and this is the act it cannot see. Measured on Postgres,
-the outcome is two-valued: usually both land (the swap serialises, last writer
-wins), and sometimes the loser fails at `RENAME` with a duplicate-key error
-instead of a clean `LockedError`.
+**Two runs starting in the same instant — closed in 0.56.0, and the trade.**
+Until then `prepare` listed the destination's catalog and then created its
+staging object, so two runs starting inside that gap both saw an empty catalog
+and both proceeded: check-then-act, and this was the act it could not see. The
+outcome was two-valued — usually both landed (the swap serialises, last writer
+wins), sometimes the loser failed at `RENAME` with a duplicate-key error instead
+of a clean `LockedError`.
 
-One thing holds either way, and it is the one that matters: **the destination is
-whole afterwards.** The defect this whole mechanism exists to remove — a run
-reporting a full row count over a truncated table — does not come back through
-this window; a same-instant collision is loud or harmless, never silently wrong.
-`e2e_concurrent_runs.py` leg 6 asserts that, and deliberately asserts nothing
-about the outcome, which is not deterministic.
+A run now announces itself *before* it looks, so it can only proceed on a scan
+taken after its own announcement and a concurrent pair cannot both miss each
+other. The cost is the other branch: when each sees the other, **both yield**,
+and nothing is written at all. There is deliberately no tie-break — a tie-break
+is only sound when both runs scanned after both announced, which is exactly what
+cannot be assumed, and one that fires early hands out two winners. A loud double
+failure beats a double success over a corrupted table.
 
-What it can also leave is **an orphaned staging object**: the loser had already
-built one when it died at `RENAME`, and a crash runs no error path. That object
-then refuses the next run of the table until someone drops it — the error names
-it. So the practical cost of a same-instant collision is one manual `DROP`,
-not lost data.
-
-Closing it needs announce-then-check ordering plus a deterministic tie-break —
-without one, both runs discover each other and both refuse, trading a rare wrong
-error for a rare double failure. That is a design change across all seven
-destinations, so it is follow-up work rather than something to improvise. Until
-then the scheduler setting below is what actually prevents it.
+`e2e_concurrent_runs.py` leg 6 asserts the property that is now deterministic —
+**never two winners** — and that the destination is whole or untouched, never
+short.
 
 **Why it fails instead of waiting.** The common cause of two runs on one table
 is a scheduler overrun, and waiting turns an overrun into a queue, a queue into
@@ -407,9 +439,11 @@ composes with none.
 1. **Re-running is the recovery.** Every failure mode above is repaired by
    running the same call again. If you find one that is not, that is a bug worth
    reporting.
-2. **A killed run costs disk, never correctness.** Orphaned staging tables are
-   the one mess left behind; they are named `<dest>__apitap_staging` and the
-   next run removes them.
+2. **A killed run costs disk, never correctness.** What it leaves is named
+   `<dest>_<runtoken>__apitap_staging`, and **nothing removes it for you** — the
+   next run refuses and names it. The exception is a killed CDC *drain*, whose
+   `__apitap_lock` clears itself once its lease lapses; see
+   [Two runs, one table](#two-runs-one-table).
 3. **The dangerous direction is a paused schedule, not a failed run.** A failure
    is loud and idempotent. A schedule that quietly stops is what fills a
    Postgres disk or outruns a MySQL binlog — the two cases apitap now reports

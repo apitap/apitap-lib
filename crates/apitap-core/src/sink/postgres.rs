@@ -73,31 +73,270 @@ pub(crate) async fn check_peers(
         .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
         found.extend(rows);
     }
-    crate::naming::guard_verdict(
-        &format!("{schema}.{bare}"),
-        bare,
-        crate::naming::PG_IDENT_MAX,
-        run,
-        found.iter().map(String::as_str),
-    )
+    let dest = format!("{schema}.{bare}");
+    let now = crate::naming::now_unix();
+    for b in crate::naming::blockers(
+        bare, crate::naming::PG_IDENT_MAX, run, found.iter().map(String::as_str))
+    {
+        // Staging and the un-tokenized pre-0.55.0 name are never collectable at
+        // any age — `classify`'s severity argument has full force on an object
+        // that is being written INTO.
+        let Some(tok) = crate::naming::collectable(&b).map(str::to_string) else {
+            return Err(crate::naming::blocker_error(&dest, &b, now, None));
+        };
+        // A lock with no lease row is uncollectable: an apitap older than the
+        // lease wrote it, or an operator planted it, or it is a bulk lock, and
+        // in every case there is no record of liveness to read. Refuse.
+        let lease = lease_get(pool, schema, &dest, &tok).await?;
+        if lease.as_ref().is_some_and(|l| l.lapsed())
+            && lease_claim(pool, schema, &dest, &tok).await?
+        {
+            let victim = quote_ident_path(&format!("{schema}.{}", b.name()));
+            release_run(pool, &victim).await;
+            eprintln!(
+                "apitap: {dest}: collected {} — the run that wrote it stopped \
+                 renewing its claim on this destination's own clock. Resuming.",
+                b.name()
+            );
+            continue;
+        }
+        return Err(crate::naming::blocker_error(&dest, &b, now, lease.as_ref()));
+    }
+    Ok(())
+}
+
+/// The lease store, and the five statements that operate on it.
+///
+/// Free functions beside `announce_run`/`check_peers`/`release_run` for the
+/// same reason those are: the CDC lane and the bulk lane must write and read
+/// exactly the same thing in exactly the same place, and a second copy agrees
+/// on the day it is written.
+///
+/// The table is LOGGED — deliberately, unlike the lock at `announce_run`, which
+/// is UNLOGGED because it is meant to be cheap and short-lived. Crash recovery
+/// TRUNCATES an unlogged table, and losing every live lease at once when a
+/// destination restarts is the one failure this mechanism must not have: every
+/// running drain would look dead to the next scan.
+/// Is this "the lease table is not there"?
+///
+/// Checked by SQLSTATE and not by message text. The first version matched only
+/// the string `"42P01"`, which sqlx does not put in its `Display` output — it
+/// renders the server's `relation "…" does not exist` — so a destination that
+/// had never run a drain turned every peer refusal into a bare `RuntimeError`
+/// instead of a typed `LockedError`. It showed up only in the one leg that
+/// reaches a lease read before any drain has created the table.
+fn no_lease_table(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|d| d.code()).is_some_and(|c| c == "42P01")
+        || e.to_string().contains("does not exist")
+}
+
+pub(crate) fn lease_table(schema: &str) -> String {
+    quote_ident_path(&format!("{schema}.{}", crate::lease::LEASE_TABLE))
+}
+
+pub(crate) async fn ensure_lease_table(pool: &PgPool, schema: &str) -> Result<()> {
+    let t = lease_table(schema);
+    match sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS {t} (\
+           dest_key   text        NOT NULL, \
+           token      text        NOT NULL, \
+           expires_at timestamptz NOT NULL, \
+           collected  boolean     NOT NULL DEFAULT false, \
+           PRIMARY KEY (dest_key, token))"
+    ))
+    .execute(pool)
+    .await
+    {
+        Ok(_) => Ok(()),
+        // Two first-runs race the CREATE; whoever loses is fine. Same tolerance
+        // the state table already carries.
+        Err(e) => {
+            let code = e.as_database_error().and_then(|d| d.code().map(|c| c.to_string()));
+            let m = e.to_string();
+            if matches!(code.as_deref(), Some("42P07") | Some("23505"))
+                || m.contains("already exists")
+            {
+                Ok(())
+            } else {
+                Err(Error::Transfer(format!("lease table: {e}")))
+            }
+        }
+    }
+}
+
+/// Open one lease per destination table, for the whole group, in one statement.
+///
+/// `ON CONFLICT DO NOTHING` rather than an upsert: a token is minted once per
+/// run, so a conflict means this run already opened it — a retry, not a peer.
+pub(crate) async fn lease_open(
+    pool: &PgPool,
+    schema: &str,
+    keys: &[String],
+    token: &str,
+) -> Result<()> {
+    ensure_lease_table(pool, schema).await?;
+    sqlx::query(&format!(
+        "INSERT INTO {} (dest_key, token, expires_at) \
+         SELECT unnest($1::text[]), $2, now() + make_interval(secs => $3) \
+         ON CONFLICT (dest_key, token) DO NOTHING",
+        lease_table(schema)
+    ))
+    .bind(keys)
+    .bind(token)
+    .bind(crate::lease::ttl_secs() as f64)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| Error::Transfer(format!("lease open: {e}")))
+}
+
+/// One renewal for the whole group, and it MUST NOT BLOCK.
+///
+/// `SKIP LOCKED` is load-bearing, not a micro-optimisation. Members of a group
+/// are applied serially, and an apply transaction holds its own lease row for
+/// the duration. Without `SKIP LOCKED` a single member whose window takes
+/// minutes — one source transaction larger than the byte budget is enough,
+/// because the budget is only checked at a commit boundary — blocks this one
+/// statement, and every OTHER member's lease expires under a live, healthy
+/// group. A peer then collects nineteen locks out of twenty. The row this
+/// statement cannot lock is the row that this run's own apply transaction is
+/// renewing in-transaction, so skipping it is exactly right.
+pub(crate) async fn lease_renew(
+    pool: &PgPool,
+    schema: &str,
+    keys: &[String],
+    token: &str,
+) -> Result<u64> {
+    sqlx::query(&format!(
+        "UPDATE {t} SET expires_at = now() + make_interval(secs => $3) \
+         WHERE ctid IN (SELECT ctid FROM {t} \
+                         WHERE token = $2 AND dest_key = ANY($1) \
+                         FOR UPDATE SKIP LOCKED)",
+        t = lease_table(schema)
+    ))
+    .bind(keys)
+    .bind(token)
+    .bind(crate::lease::ttl_secs() as f64)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| Error::Transfer(format!("lease renew: {e}")))
+}
+
+/// What a peer's lease says. `None` = no row at all, which always means refuse.
+pub(crate) async fn lease_get(
+    pool: &PgPool,
+    schema: &str,
+    key: &str,
+    token: &str,
+) -> Result<Option<crate::lease::Lease>> {
+    // The destination does the arithmetic. No client clock enters this.
+    let row: Option<(i64, bool)> = match sqlx::query_as(&format!(
+        "SELECT CAST(EXTRACT(EPOCH FROM (expires_at - now())) AS bigint), collected \
+         FROM {} WHERE dest_key = $1 AND token = $2",
+        lease_table(schema)
+    ))
+    .bind(key)
+    .bind(token)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(r) => r,
+        // No lease store at all is the default state of every destination that
+        // has never run a drain. It means "nothing is leased", never an error —
+        // otherwise every bulk transfer into a fresh database would fail here.
+        Err(e) if no_lease_table(&e) => None,
+        Err(e) => return Err(Error::Transfer(format!("lease read: {e}"))),
+    };
+    Ok(row.map(|(expires_in, collected)| crate::lease::Lease { expires_in, collected }))
+}
+
+/// Take a lapsed lease, so its lock may be dropped. `false` = do not collect.
+///
+/// `FOR UPDATE NOWAIT` rather than a plain UPDATE: a row locked right now is
+/// held by its owner's apply transaction, which is affirmative evidence that
+/// the owner is ALIVE. Refuse immediately instead of queueing behind an apply
+/// that may run for the whole window bound — the guard's own rule is that it
+/// never waits.
+///
+/// The predicate is `(lapsed OR collected)` and the second disjunct is
+/// deliberate: two collectors racing one dead lock must BOTH succeed. Collecting
+/// is not proceeding — each then meets the other's lock, written before either
+/// scanned, and at least one yields. Tightening this to `AND NOT collected`
+/// looks like an improvement and is a regression: the second collector would
+/// refuse over a lock that no longer exists.
+pub(crate) async fn lease_claim(
+    pool: &PgPool,
+    schema: &str,
+    key: &str,
+    token: &str,
+) -> Result<bool> {
+    let r = sqlx::query(&format!(
+        "UPDATE {t} SET collected = true \
+         WHERE ctid IN (SELECT ctid FROM {t} \
+                         WHERE dest_key = $1 AND token = $2 \
+                           AND (expires_at <= now() OR collected) \
+                         FOR UPDATE NOWAIT)",
+        t = lease_table(schema)
+    ))
+    .bind(key)
+    .bind(token)
+    .execute(pool)
+    .await;
+    match r {
+        Ok(d) => Ok(d.rows_affected() > 0),
+        // 55P03 lock_not_available: the owner holds it. Alive; refuse.
+        // 55P03 lock_not_available: the owner holds it. Alive; refuse.
+        Err(e) if e.as_database_error().and_then(|d| d.code())
+                    .is_some_and(|c| c == "55P03") => Ok(false),
+        Err(e) if no_lease_table(&e) => Ok(false),
+        Err(e) => Err(Error::Transfer(format!("lease claim: {e}"))),
+    }
+}
+
+/// Drop this run's own lease. Called ONLY after the lock DROP is observed to
+/// have succeeded — deleting the lease is what makes a lock uncollectable, so a
+/// clean run whose teardown blinked would otherwise reproduce the exact wedge
+/// this whole mechanism removes.
+pub(crate) async fn lease_close(pool: &PgPool, schema: &str, key: &str, token: &str) {
+    let _ = sqlx::query(&format!(
+        "DELETE FROM {} WHERE dest_key = $1 AND token = $2",
+        lease_table(schema)
+    ))
+    .bind(key)
+    .bind(token)
+    .execute(pool)
+    .await;
 }
 
 /// A destination table split the way `PgSink::bind` splits it, so both lanes
 /// derive the same quoted lock name and the same catalog schema from the same
 /// string. Returns `(quoted lock ident, catalog schema, bare table)`.
 pub(crate) fn lock_ident(dest_table: &str, run: &crate::naming::RunId) -> (String, String, String) {
-    let (pfx, bare) = match dest_table.rsplit_once('.') {
-        Some((s, t)) => (format!("{s}."), t.to_string()),
-        None => (String::new(), dest_table.to_string()),
-    };
-    let schema = pfx.trim_end_matches('.');
-    let schema = if schema.is_empty() { "public".to_string() } else { schema.to_string() };
+    let (pfx, schema, bare) = lock_ident_parts(dest_table);
     let lock = quote_ident_path(&format!(
         "{pfx}{}",
         crate::naming::artifact_ident_run(
             &bare, crate::naming::Artifact::Lock, crate::naming::PG_IDENT_MAX, run)
     ));
     (lock, schema, bare)
+}
+
+/// `(quoting prefix, catalog schema, bare table)` — the split both lanes use.
+///
+/// Extracted so the lease key is derived from the SAME string the guard's error
+/// message and peer scan use. It has to be the schema-QUALIFIED name: the peer
+/// scan is scoped to one schema, so keying the lease on the bare name would put
+/// `sales.orders` and `hr.orders` in one key space and let a run in one schema
+/// collect a live drain in the other.
+pub(crate) fn lock_ident_parts(dest_table: &str) -> (String, String, String) {
+    let (pfx, bare) = match dest_table.rsplit_once('.') {
+        Some((s, t)) => (format!("{s}."), t.to_string()),
+        None => (String::new(), dest_table.to_string()),
+    };
+    let schema = pfx.trim_end_matches('.');
+    let schema = if schema.is_empty() { "public".to_string() } else { schema.to_string() };
+    (pfx, schema, bare)
 }
 // ---------------------------------------------------------------------------------
 // Sink

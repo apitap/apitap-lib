@@ -158,6 +158,82 @@ impl Dest {
         }
     }
 
+    /// Tell every destination this run's identity, once, so the apply path can
+    /// FENCE itself without a `&RunId` threaded through five apply signatures.
+    fn set_run(&self, run: &crate::naming::RunId) {
+        match self {
+            Dest::Pg(d) => d.set_run(run),
+            Dest::My(d) => d.set_run(run),
+            Dest::Ch(d) => d.set_run(run),
+            // BigQuery's apply is one script inside one transaction; it carries
+            // no run token because its check rides that script, not a field.
+            Dest::Bq(_) | Dest::Ice(_) => {}
+        }
+    }
+
+    /// Open one lease per member, BEFORE the announce loop.
+    ///
+    /// Before, and not after: a lock with no lease is uncollectable by the rule
+    /// that "no record of liveness means refuse", so writing one first would
+    /// create a permanent orphan in exactly the window this mechanism exists to
+    /// remove. A lease with no lock is inert.
+    async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.lease_open(keys, run).await,
+            Dest::My(d) => d.lease_open(keys, run).await,
+            Dest::Ch(d) => d.lease_open(keys, run).await,
+            Dest::Bq(d) => d.lease_open(keys, run).await,
+            Dest::Ice(_) => Ok(()),
+        }
+    }
+
+    async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
+        match self {
+            Dest::Pg(d) => d.lease_renew(keys, run).await,
+            Dest::My(d) => d.lease_renew(keys, run).await,
+            Dest::Ch(d) => d.lease_renew(keys, run).await,
+            Dest::Bq(d) => d.lease_renew(keys, run).await,
+            Dest::Ice(_) => Ok(0),
+        }
+    }
+
+    /// Drop this run's own lease for one member. Called ONLY once that member's
+    /// lock is observed to be gone — the lease is what makes a lock
+    /// collectable, so deleting it while the lock survives recreates the exact
+    /// permanent wedge this mechanism removes.
+    async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
+        match self {
+            Dest::Pg(d) => d.lease_close(key, run).await,
+            Dest::My(d) => d.lease_close(key, run).await,
+            Dest::Ch(d) => d.lease_close(key, run).await,
+            Dest::Bq(d) => d.lease_close(key, run).await,
+            Dest::Ice(_) => {}
+        }
+    }
+
+    /// The lease key for one destination table — the SAME string the peer scan
+    /// and the refusal already use, schema-qualified.
+    fn lease_key(&self, dest_table: &str) -> String {
+        match self {
+            Dest::Pg(d) => d.lease_key(dest_table),
+            Dest::My(d) => d.lease_key(dest_table),
+            Dest::Ch(d) => d.lease_key(dest_table),
+            Dest::Bq(d) => d.lease_key(dest_table),
+            Dest::Ice(_) => dest_table.to_string(),
+        }
+    }
+
+    /// Did this member's lock actually go away?
+    async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
+        match self {
+            Dest::Pg(d) => d.release_ok(dest_table, run).await,
+            Dest::Ch(d) => d.release_ok(dest_table, run).await,
+            Dest::My(d) => d.release_ok(dest_table, run).await,
+            Dest::Bq(d) => d.release_ok(dest_table, run).await,
+            Dest::Ice(_) => true,
+        }
+    }
+
     async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId) -> Result<()> {
         match self {
             Dest::Pg(d) => d.check_peers(dest_table, run).await,
@@ -830,12 +906,21 @@ async fn run_group(
         crate::naming::LandKind::Cdc,
         &crate::pipeline::source_origin(src_url),
     );
+    dest.set_run(&run);
+    // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
+    // record of liveness means refuse" — so writing one first would create a
+    // permanent orphan in exactly the window this exists to close. A lease with
+    // no lock is inert.
+    let lease_keys: Vec<String> = ctxs.iter().map(|c| dest.lease_key(&c.dest_table)).collect();
+    dest.lease_open(&lease_keys, &run).await?;
     for c in &ctxs {
         // A group that failed to announce its third member must not keep the
         // first two — they would refuse every later run of those tables.
         if let Err(e) = dest.announce(&c.dest_table, &run).await {
             for c in &ctxs {
-                dest.release(&c.dest_table, &run).await;
+                if dest.release_ok(&c.dest_table, &run).await {
+                    dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+                }
             }
             return Err(e);
         }
@@ -845,11 +930,27 @@ async fn run_group(
             // A drain refused by its own scan must not leave its announcement
             // behind — the next run would refuse over a drain that never ran.
             for c in &ctxs {
-                dest.release(&c.dest_table, &run).await;
+                if dest.release_ok(&c.dest_table, &run).await {
+                    dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+                }
             }
             return Err(e);
         }
     }
+
+    // The scan has passed, so this run holds the table. Keep the claim alive
+    // from a task that is NOT on the window path: a renewal that could block
+    // behind an apply is a renewal that fails exactly when a long window makes
+    // it matter most.
+    let mut keeper = {
+        let d = dest.clone();
+        let keys = lease_keys.clone();
+        let r = run.clone();
+        crate::lease::Keeper::spawn(move || {
+            let (d, keys, r) = (d.clone(), keys.clone(), r.clone());
+            async move { d.lease_renew(&keys, &r).await }
+        })
+    };
 
     // Everything from here is inside one arm, so the announcement is taken
     // back on EVERY exit. Without it, a run refused between the scan and the
@@ -899,8 +1000,13 @@ async fn run_group(
             // given up is the instant between the two: two CDC runs that both read
             // "no state" both reach the bootstrap, and the LOSER is refused by the
             // bulk guard instead of by this one — loudly either way.
+            // The lease goes with it. A lease whose lock is gone is inert, but
+            // leaving one behind would let a later run "collect" a lock this
+            // run no longer owns.
             for c in &ctxs {
-                dest.release(&c.dest_table, &run).await;
+                if dest.release_ok(&c.dest_table, &run).await {
+                    dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+                }
             }
             bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
         } else {
@@ -920,8 +1026,20 @@ async fn run_group(
         }
     }
     .await;
+    // Stop AND JOIN the keeper before anything is released. On ClickHouse a
+    // renewal is an INSERT, so a tick still in flight would resurrect the row
+    // after it was closed and leave a lock nothing can ever collect.
+    keeper.stop().await;
+    // ORDERED, and the order is the point. The lease is what makes a lock
+    // collectable, so dropping the lease while the lock survives recreates the
+    // exact permanent wedge this mechanism removes — a clean run whose teardown
+    // blinked would wedge the table for ever. Release is best-effort BY
+    // CONTRACT, so "it probably worked" is not good enough: the lease is closed
+    // only for a member whose lock is observed to be gone.
     for c in &ctxs {
-        dest.release(&c.dest_table, &run).await;
+        if dest.release_ok(&c.dest_table, &run).await {
+            dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+        }
     }
     out
 }
@@ -941,8 +1059,8 @@ async fn run_group_mysql(
 ) -> Result<Vec<(u64, usize)>> {
     use crate::logbased::myrun;
 
-    let dest = Dest::connect(dst_url).await?;
-    if matches!(dest, Dest::Ice(_)) {
+    let dest = std::sync::Arc::new(Dest::connect(dst_url).await?);
+    if matches!(*dest, Dest::Ice(_)) {
         return Err(Error::InvalidInput(
             "log_based: mysql → iceberg needs a Postgres source — postgres, \
              clickhouse, mysql and bigquery destinations work from MySQL today"
@@ -1021,12 +1139,21 @@ async fn run_group_mysql(
         crate::naming::LandKind::Cdc,
         &crate::pipeline::source_origin(src_url),
     );
+    dest.set_run(&run);
+    // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
+    // record of liveness means refuse" — so writing one first would create a
+    // permanent orphan in exactly the window this exists to close. A lease with
+    // no lock is inert.
+    let lease_keys: Vec<String> = ctxs.iter().map(|c| dest.lease_key(&c.dest_table)).collect();
+    dest.lease_open(&lease_keys, &run).await?;
     for c in &ctxs {
         // A group that failed to announce its third member must not keep the
         // first two — they would refuse every later run of those tables.
         if let Err(e) = dest.announce(&c.dest_table, &run).await {
             for c in &ctxs {
-                dest.release(&c.dest_table, &run).await;
+                if dest.release_ok(&c.dest_table, &run).await {
+                    dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+                }
             }
             return Err(e);
         }
@@ -1034,11 +1161,23 @@ async fn run_group_mysql(
     for c in &ctxs {
         if let Err(e) = dest.check_peers(&c.dest_table, &run).await {
             for c in &ctxs {
-                dest.release(&c.dest_table, &run).await;
+                if dest.release_ok(&c.dest_table, &run).await {
+                    dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+                }
             }
             return Err(e);
         }
     }
+
+    let mut keeper = {
+        let d = dest.clone();
+        let keys = lease_keys.clone();
+        let r = run.clone();
+        crate::lease::Keeper::spawn(move || {
+            let (d, keys, r) = (d.clone(), keys.clone(), r.clone());
+            async move { d.lease_renew(&keys, &r).await }
+        })
+    };
 
     // Everything from here is inside one arm so the announcement is taken
     // back on EVERY exit — a drain that fails for any reason must not leave
@@ -1074,8 +1213,13 @@ async fn run_group_mysql(
             // and for the same reason: the bootstrap's full load re-enters
             // `transfer(mode="replace")`, whose sink announces a `Swap` lock and
             // would be refused by this drain's own. One run, not two.
+            // The lease goes with it. A lease whose lock is gone is inert, but
+            // leaving one behind would let a later run "collect" a lock this
+            // run no longer owns.
             for c in &ctxs {
-                dest.release(&c.dest_table, &run).await;
+                if dest.release_ok(&c.dest_table, &run).await {
+                    dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+                }
             }
             let su = src_url.to_string();
             let du = dst_url.to_string();
@@ -1176,8 +1320,20 @@ async fn run_group_mysql(
         Ok::<Vec<(u64, usize)>, Error>(rows_applied.iter().map(|a| (a.get(), 1)).collect())
     }
     .await;
+    // Stop AND JOIN the keeper before anything is released. On ClickHouse a
+    // renewal is an INSERT, so a tick still in flight would resurrect the row
+    // after it was closed and leave a lock nothing can ever collect.
+    keeper.stop().await;
+    // ORDERED, and the order is the point. The lease is what makes a lock
+    // collectable, so dropping the lease while the lock survives recreates the
+    // exact permanent wedge this mechanism removes — a clean run whose teardown
+    // blinked would wedge the table for ever. Release is best-effort BY
+    // CONTRACT, so "it probably worked" is not good enough: the lease is closed
+    // only for a member whose lock is observed to be gone.
     for c in &ctxs {
-        dest.release(&c.dest_table, &run).await;
+        if dest.release_ok(&c.dest_table, &run).await {
+            dest.lease_close(&dest.lease_key(&c.dest_table), &run).await;
+        }
     }
     out
 }

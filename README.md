@@ -186,7 +186,7 @@ use it for rebuildable destinations.
   transaction. Readers never see a partial load; a mid-run failure leaves the previous
   table untouched.
 - **0-row guard** — an empty source never wipes an existing destination table.
-- **One run per destination table** (0.55.0+, **bulk modes only**) — the run's identity is part of the
+- **One run per destination table** (0.55.0+) — the run's identity is part of the
   staging object's name, so a run can only publish an object it minted. A second run
   of the same table is refused at `prepare`, before a row moves, with an error naming
   the run that holds it. Fan-in is still allowed: two `append` runs from *different*
@@ -201,6 +201,12 @@ use it for rebuildable destinations.
   bulk run refuse each other in both directions, and so do two drains. Iceberg
   destinations are the exception — their drains are still unguarded, and one
   drain per Iceberg table stays the scheduler's job.
+  A drain also **renews a lease** while it runs, so a drain killed outright
+  stops blocking the table by itself once that lease lapses
+  (`APITAP_LEASE_TTL_SECS`, 300s by default) and the next scheduled run resumes
+  from its watermark with nothing for an operator to do. A killed *bulk* run's
+  staging table is not collected that way and still needs a manual drop — it
+  holds data, and nothing can prove a live loader is not still writing into it.
   ([the matrix, the window, and what a killed run leaves](docs/failure-modes.md))
 
 The failure modes these guarantees do *not* cover — a killed process, a cut

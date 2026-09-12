@@ -421,6 +421,51 @@ for n in orphans:
     dst(f'DROP TABLE IF EXISTS "{n}"')
 
 # ---------------------------------------------------------------------------
+print("== leg 7: the guard still works where no drain has ever run ==")
+# A refusal now asks the lease store whether the peer is still alive. On a
+# destination that has never run a `log_based` drain that store does not exist —
+# which is the DEFAULT state of every bulk-only deployment, not an edge case —
+# and "not there" has to read as "nothing is leased", never as an error.
+#
+# It was an error once: the missing-table check matched the SQLSTATE text, which
+# sqlx does not put in its message, so every peer refusal on such a destination
+# came back as a bare RuntimeError instead of a typed LockedError. The gate hid
+# it, because an earlier leg had already created the table.
+reset(rows=200_000)
+dst('DROP TABLE IF EXISTS "_apitap_lease"')
+case("(rig) the lease store really is absent",
+     dst("SELECT to_regclass('public._apitap_lease') IS NULL") == "t",
+     "dropped")
+r = sh([sys.executable, "-c", f"""
+import apitap, threading
+out = []
+def go(tag):
+    try:
+        r = apitap.transfer({SRC!r}, {DST!r}, table={T!r}, mode="replace")
+        out.append((tag, "ok", r.rows))
+    except Exception as e:
+        out.append((tag, type(e).__name__))
+ts = [threading.Thread(target=go, args=(t,)) for t in ("A", "B")]
+[t.start() for t in ts]; [t.join(900) for t in ts]
+print("BURST", sorted(out))
+"""])
+line = (r.stdout or "").strip()
+print(f"      outcome: {line[:160]}")
+try:
+    pairs = ast.literal_eval(line.split("BURST ", 1)[1].splitlines()[0])
+except Exception as e:                                        # noqa: BLE001
+    pairs = []
+    print(f"      (could not parse: {e}; stderr {r.stderr[-200:]})")
+refusals = [p[1] for p in pairs if len(p) == 2]
+case("a yielding run still refuses by TYPE with no lease store",
+     bool(pairs) and all(e == "LockedError" for e in refusals),
+     f"refusals: {refusals or 'none — nothing yielded this time'}")
+case("and no run died of the store's absence",
+     "RuntimeError" not in refusals, f"{pairs}")
+for n in staging_names():
+    dst(f'DROP TABLE IF EXISTS "{n}"')
+
+# ---------------------------------------------------------------------------
 print("== cleanup ==")
 src(f"DROP TABLE IF EXISTS {T}")
 dst(f"DROP TABLE IF EXISTS {T}")

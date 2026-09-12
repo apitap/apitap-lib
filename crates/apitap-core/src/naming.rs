@@ -406,6 +406,51 @@ pub(crate) fn guard_verdict<'a>(
     run: &RunId,
     names: impl IntoIterator<Item = &'a str>,
 ) -> crate::error::Result<()> {
+    match blockers(bare, limit, run, names).first() {
+        None => Ok(()),
+        Some(b) => Err(blocker_error(dest, b, now_unix(), None)),
+    }
+}
+
+/// One reason this run may not proceed.
+///
+/// Split out of [`guard_verdict`] so a caller that can do something about a
+/// blocker — ask whether its owner is still alive, and collect it if not — sees
+/// the blockers themselves instead of a formatted error. `guard_verdict` is the
+/// wrapper for every caller that cannot.
+#[derive(Debug)]
+pub(crate) enum Blocker {
+    /// The un-tokenized name an apitap older than 0.55.0 writes. Never
+    /// collected, at any age, by anything: see [`Found::Legacy`].
+    Legacy { name: String },
+    /// A live run's artifact that blocks this one.
+    Live {
+        name: String,
+        artifact: Artifact,
+        peer: PeerRun,
+        mine: PeerRun,
+    },
+}
+
+impl Blocker {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Blocker::Legacy { name } | Blocker::Live { name, .. } => name,
+        }
+    }
+}
+
+/// Every blocker beside this destination, in listing order.
+///
+/// No error construction and no side effects — the caller decides what to do
+/// with each one. Everything that decides WHETHER something blocks still lives
+/// here and only here.
+pub(crate) fn blockers<'a>(
+    bare: &str,
+    limit: usize,
+    run: &RunId,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<Blocker> {
     let now = now_unix();
     let mine: Vec<(Artifact, PeerRun)> = GUARDED
         .iter()
@@ -414,6 +459,7 @@ pub(crate) fn guard_verdict<'a>(
             (a, parse_peer(&n, a).expect("a name this process minted parses"))
         })
         .collect();
+    let mut out = Vec::new();
     for name in names {
         for (a, me) in &mine {
             // A name of a DIFFERENT kind classifies as `Foreign` here — the
@@ -422,16 +468,52 @@ pub(crate) fn guard_verdict<'a>(
             // way a lock and a staging object both get seen.
             match classify(name, bare, *a, limit, run, now) {
                 Found::Foreign | Found::Mine => {}
-                Found::Legacy => return Err(legacy_error(dest, name)),
+                Found::Legacy => out.push(Blocker::Legacy { name: name.to_string() }),
                 Found::Live(peer) => {
-                    if let Some(blocker) = lock_blocks(me, std::iter::once(&peer)) {
-                        return Err(locked_error(dest, name, me, blocker, now));
+                    if let Some(b) = lock_blocks(me, std::iter::once(&peer)) {
+                        out.push(Blocker::Live {
+                            name: name.to_string(),
+                            artifact: *a,
+                            peer: b.clone(),
+                            mine: me.clone(),
+                        });
                     }
                 }
             }
         }
     }
-    Ok(())
+    out
+}
+
+/// The peer token of a blocker whose owner can be ASKED whether it is alive —
+/// and therefore the only kind of blocker that may ever be collected.
+///
+/// A LOCK only. Never staging: a staging object is being written INTO, and
+/// `classify`'s severity argument has full force there — deleting a live run's
+/// workspace is silent truncation on the object stores. A lock holds no data,
+/// so removing one that is provably dead costs nothing; removing one whose
+/// owner is alive costs two winners, which is what the lease exists to make
+/// impossible. Never `Legacy` either: a pre-0.55.0 run writes no lease, and
+/// "no record of liveness" always means refuse.
+pub(crate) fn collectable(b: &Blocker) -> Option<&str> {
+    match b {
+        Blocker::Live { artifact: Artifact::Lock, peer, .. } => Some(&peer.token),
+        _ => None,
+    }
+}
+
+/// The refusal for one blocker. `lease` is what the caller learned about the
+/// peer's liveness, if it was able to ask.
+pub(crate) fn blocker_error(
+    dest: &str,
+    b: &Blocker,
+    now: u64,
+    lease: Option<&crate::lease::Lease>,
+) -> crate::error::Error {
+    match b {
+        Blocker::Legacy { name } => legacy_error(dest, name),
+        Blocker::Live { name, peer, mine, .. } => locked_error(dest, name, mine, peer, now, lease),
+    }
 }
 
 
@@ -626,6 +708,7 @@ pub(crate) fn locked_error(
     mine: &PeerRun,
     peer: &PeerRun,
     now: u64,
+    lease: Option<&crate::lease::Lease>,
 ) -> crate::error::Error {
     let age = now.saturating_sub(peer.started_unix);
     let doing = match peer.kind {
@@ -643,14 +726,37 @@ pub(crate) fn locked_error(
         _ =>
             "both read the same watermark and would land the same rows twice",
     };
-    // No promise of automatic collection, because there is none: see
-    // `classify`. Naming the object is the whole recovery instruction, so it
-    // has to be exact.
-    let stale = format!(
-        "If that run is dead rather than slow, remove {artifact_name} and \
-         re-run — nothing collects it on its own, because a timestamp cannot \
-         tell a crashed run from a slow one."
-    );
+    // What the operator should do, and it is genuinely three different things.
+    //
+    // The first branch is the one that has always been here and its words are
+    // load-bearing: with no lease there is no record of liveness at all, so
+    // nothing may ever collect this artifact and saying otherwise would be a
+    // promise the code does not keep. That is the case for a staging object at
+    // any age, for the un-tokenized pre-0.55.0 name, for a lock written by an
+    // apitap older than the lease, and for a bulk lock, which carries none.
+    let stale = match lease {
+        None => format!(
+            "If that run is dead rather than slow, remove {artifact_name} and \
+             re-run — nothing collects it on its own, because a timestamp cannot \
+             tell a crashed run from a slow one."
+        ),
+        // It renewed recently, on the DESTINATION's clock — so it is alive, and
+        // the honest instruction is to do nothing at all.
+        Some(l) if l.expires_in > 0 && !l.collected => format!(
+            "That run renewed its claim on this destination's own clock and it \
+             has about {}s left. If it dies, this clears by itself and the next \
+             run resumes from the watermark — nothing for you to do. To clear it \
+             now, stop that run and remove {artifact_name}.",
+            l.expires_in
+        ),
+        // Lapsed, but the claim could not be taken: the owner holds the row,
+        // which is affirmative evidence it is alive inside an apply right now.
+        Some(_) => format!(
+            "That run's claim has lapsed but it still holds it open, which means \
+             it is applying a window right now. This clears by itself as soon as \
+             that finishes — re-run then. Nothing for you to do."
+        ),
+    };
     crate::error::Error::Locked(format!(
         "{dest}: another apitap run is already loading this table — it started \
          {age}s ago and is {doing}. They cannot share one destination: {why}. \
@@ -838,7 +944,8 @@ pub(crate) const STATE_TABLE: &str = "_apitap_state";
 pub(crate) const CDC_PENDING_TABLE: &str = "_apitap_cdc_pending";
 
 /// Every table apitap owns whose name is a whole word rather than a suffix.
-pub(crate) const OWN_TABLES: &[&str] = &[STATE_TABLE, CDC_PENDING_TABLE];
+pub(crate) const OWN_TABLES: &[&str] =
+    &[STATE_TABLE, CDC_PENDING_TABLE, crate::lease::LEASE_TABLE];
 
 #[cfg(test)]
 mod tests {
@@ -1393,8 +1500,10 @@ mod tests {
                              source_hash: "aaa".into(), token: "_x".into() };
         let peer = PeerRun { started_unix: 40, kind: LandKind::Incremental,
                              source_hash: "bbb".into(), token: "_y".into() };
+        // NO LEASE — a staging object, a pre-lease lock, an operator's plant.
+        // Nothing will ever collect it, and the words must not suggest otherwise.
         let msg = format!("{}", locked_error("public.orders", "orders_x__apitap_staging",
-                                             &mine, &peer, 100));
+                                             &mine, &peer, 100, None));
         assert!(msg.contains("60s ago"), "{msg}");
         assert!(msg.contains("appending to it"), "names what the peer is doing: {msg}");
         assert!(msg.contains("throws the other's work away"), "names why: {msg}");
@@ -1404,7 +1513,77 @@ mod tests {
         // wait N seconds for one.
         assert!(msg.contains("orders_x__apitap_staging"), "names the object: {msg}");
         assert!(msg.contains("remove"), "{msg}");
-        assert!(!msg.contains("automatically"), "promises no cleanup: {msg}");
+        assert!(!msg.contains("nothing for you to do"), "promises no cleanup: {msg}");
+
+        // A LIVE lease: the peer is renewing, so the honest instruction is to
+        // do nothing, and the deadline has to be in the message or an operator
+        // cannot tell a wait from a wedge.
+        let live = crate::lease::Lease { expires_in: 58, collected: false };
+        let msg = format!("{}", locked_error("public.orders", "orders_y__apitap_lock",
+                                             &mine, &peer, 100, Some(&live)));
+        assert!(msg.contains("58s"), "names the deadline: {msg}");
+        assert!(msg.contains("nothing for you to do"), "{msg}");
+        assert!(!msg.contains("nothing collects it on its own"),
+                "must not repeat the no-collection sentence when there IS one: {msg}");
+
+        // A LAPSED lease whose claim could not be taken: the owner holds the
+        // row, which is evidence it is alive INSIDE an apply.
+        let busy = crate::lease::Lease { expires_in: -5, collected: false };
+        let msg = format!("{}", locked_error("public.orders", "orders_y__apitap_lock",
+                                             &mine, &peer, 100, Some(&busy)));
+        assert!(msg.contains("applying a window right now"), "{msg}");
+        assert!(msg.contains("Nothing for you to do"), "{msg}");
+    }
+
+    /// A lock may be collected; a staging object and a pre-lease name may not,
+    /// at any age. This is the line between "self-healing" and "silent
+    /// truncation" and it is one function.
+    #[test]
+    fn only_a_lock_is_ever_collectable() {
+        let mine = RunId::mint(LandKind::Swap, "postgres://h:5432/db");
+        let peer = RunId::mint(LandKind::Cdc, "postgres://other:5432/db");
+        let lock = artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &peer);
+        let staging = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &peer);
+        let legacy = artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX);
+
+        let bs = blockers("orders", PG_IDENT_MAX, &mine,
+                          [lock.as_str(), staging.as_str(), legacy.as_str()]);
+        assert_eq!(bs.len(), 3, "{bs:?}");
+        let collectable_names: Vec<&str> =
+            bs.iter().filter(|b| collectable(b).is_some()).map(|b| b.name()).collect();
+        assert_eq!(collectable_names, vec![lock.as_str()],
+                   "only the lock — staging is being written INTO, and the \
+                    un-tokenized name predates every liveness record");
+        // …and the token it hands back is the PEER's, not this run's: the claim
+        // is made against the row the dead run wrote.
+        let tok = bs.iter().find_map(collectable).expect("the lock is collectable");
+        assert_eq!(tok, peer.token());
+        assert_ne!(tok, mine.token());
+    }
+
+    /// The lease's own arithmetic, which decides whether a lock may go.
+    #[test]
+    fn a_lease_is_lapsed_when_it_has_run_out_or_was_already_taken() {
+        use crate::lease::Lease;
+        assert!(!Lease { expires_in: 1, collected: false }.lapsed(), "still alive");
+        assert!(Lease { expires_in: 0, collected: false }.lapsed(), "exactly out");
+        assert!(Lease { expires_in: -1, collected: false }.lapsed());
+        // Already collected counts as lapsed ON PURPOSE. Two collectors racing
+        // one dead lock must BOTH succeed: collecting is not proceeding, and
+        // each then meets the other's lock and at least one yields. Tighten this
+        // to `AND NOT collected` and the second collector refuses over a lock
+        // that no longer exists.
+        assert!(Lease { expires_in: 9_999, collected: true }.lapsed(),
+                "an already-taken lease must not block the second collector");
+    }
+
+    /// The renewal must fit inside the TTL many times over, at every setting the
+    /// env var can produce — a keeper that gets one chance is a keeper that
+    /// declares a live run dead the first time a tick is late.
+    #[test]
+    fn a_lease_outlives_at_least_eight_renewals() {
+        assert!(crate::lease::ttl_secs() >= 8 * crate::lease::renew_secs(),
+                "ttl {} vs renew {}", crate::lease::ttl_secs(), crate::lease::renew_secs());
     }
 
     /// Multi-byte names must not be cut through a character.
