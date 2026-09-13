@@ -119,7 +119,7 @@ bulk half only, the three CDC-side assertions read `it was ALLOWED`.
 | high | Every source ends its send path with `loader.send(...)?` — the Loader is dropped instead of aborted, so the sink commits or orphans the partial stream | `postgres.rs:919` |
 | high | Iceberg merge retains every merge-key value for the whole run — memory grows with ROW COUNT, then is copied again at commit | `bqparquet.rs:322` |
 | high | The parquet lane's per-pipe residency is a fixed 24 MiB row group, so the chunk-proportional pipe cap under-counts it — and the auto thin-chunk lever raises real memory while the model believes it lowers it | `mod.rs:265` |
-| high | BigQuery changelog: the group chunker can split a table's INSERT from its watermark into two transactions, and cdc_script can resubmit a committed one | `dest_bq.rs:427` |
+| high | ~~BigQuery changelog: the group chunker can split a table's INSERT from its watermark into two transactions~~ — **FIXED** (`pack_whole_groups`, whole pairs only). The `cdc_script` resubmit half is NOT fixed and is still open. | `dest_bq.rs:427` |
 | high | MySQL destination hides another mode's state row behind `AND mode = 'log_based'`, so a CDC run silently full-replaces a table the cursor lane owns | `dest_my.rs:89` |
 | high | changelog: a PK-changing UPDATE whose TOAST column is untouched can never be resolved, so the window dies with a 'torn window' error that re-bootstrapping does not fix | `changelog.rs:190` |
 | high | Collapsed::deletes is documented as dedup'd but pushes the same key twice on INSERT/DELETE/INSERT/DELETE, which BigQuery's MERGE rejects | `collapse.rs:272` |
