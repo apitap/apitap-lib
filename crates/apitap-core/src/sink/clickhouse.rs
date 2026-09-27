@@ -45,14 +45,34 @@ fn pct(s: &str) -> Result<String> {
         .map_err(|_| Error::InvalidInput("clickhouse url userinfo is not valid utf-8".into()))
 }
 
+/// Every claim or close version outranks every renewal version.
+///
+/// `ReplacingMergeTree(seq)` keeps the max `seq` on merge and `argMax(…, seq)`
+/// reads it, so without the bias a renewal stamped a microsecond after a claim
+/// would win — and an evicted drain's keeper did exactly that in 0.56.0, on its
+/// next tick. Epoch micros stay below 2^62 until about year 148 000, and the
+/// sum stays below 2^63.
+pub(crate) const CLAIM_SEQ_BIAS: u64 = 1 << 62;
+
+pub(crate) fn lease_seq(collected: u8, micros: u64) -> u64 {
+    micros + if collected == 1 { CLAIM_SEQ_BIAS } else { 0 }
+}
+
 /// The lease store, shared by both lanes — see `crate::lease`.
 ///
 /// Append-only, like everything else this file writes: `ReplacingMergeTree(seq)`
 /// with `argMax` on read, and never `ALTER TABLE … DELETE`. That is a blocking,
 /// part-rewriting mutation, and a one-minute CDC schedule would issue well over
 /// a thousand a day on the engine whose own comment prices a single statement as
-/// "a full HTTP round trip against a window that only has ~7 of them". Released
-/// rows are stamped into the past and the table's TTL sweeps them.
+/// "a full HTTP round trip against a window that only has ~7 of them".
+///
+/// No TTL, on purpose, and 0.56.0's is removed on first contact. A TTL deletes
+/// an UNCOLLECTED row that ages out — a drain killed on Friday and looked at on
+/// Monday had no lease left, so its lock read as "nothing collects it" and the
+/// table was wedged until a human came. And TTL is per part: it could delete a
+/// collected version while an older unclaimed version survived in another
+/// part, resurrecting a claim that had been taken. Lease rows are a few dozen
+/// bytes per run and table; they are not garbage-collected on any engine.
 ///
 /// Node-local, and legitimately: the CDC lane refuses a Replicated destination
 /// outright, so everything it touches is node-local already.
@@ -61,12 +81,35 @@ pub(crate) async fn ensure_lease_table(ch: &ChConn) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS `{t}` (\
            dest_key String, token String, \
            expires_at DateTime64(6, 'UTC'), collected UInt8, seq UInt64) \
-         ENGINE = ReplacingMergeTree(seq) ORDER BY (dest_key, token) \
-         TTL toDateTime(expires_at) + INTERVAL 1 DAY DELETE",
+         ENGINE = ReplacingMergeTree(seq) ORDER BY (dest_key, token)",
         t = crate::lease::LEASE_TABLE
     ))
-    .await
-    .map(|_| ())
+    .await?;
+    remove_lease_ttl(ch).await
+}
+
+/// Once per process and destination: a table 0.56.0 created carries
+/// `TTL … DELETE`, and it goes.
+async fn remove_lease_ttl(ch: &ChConn) -> Result<()> {
+    static DONE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = format!("{}{}", ch.base, ch.database);
+    let done = DONE.get_or_init(Default::default);
+    if done.lock().expect("lease ttl memo").contains(&key) {
+        return Ok(());
+    }
+    let engine = ch
+        .read(&format!(
+            "SELECT engine_full FROM system.tables \
+             WHERE database = currentDatabase() AND name = '{}' FORMAT TabSeparatedRaw",
+            crate::lease::LEASE_TABLE
+        ))
+        .await?;
+    if engine.contains(" TTL ") {
+        ch.exec(&format!("ALTER TABLE `{}` REMOVE TTL", crate::lease::LEASE_TABLE)).await?;
+    }
+    done.lock().expect("lease ttl memo").insert(key);
+    Ok(())
 }
 
 /// One row-version. `ttl` seconds of life from now; a NEGATIVE value releases,
@@ -89,13 +132,60 @@ pub(crate) async fn lease_write(
     };
     ch.exec(&format!(
         "INSERT INTO `{t}` (dest_key, token, expires_at, collected, seq) \
-         SELECT '{k}', '{tok}', {expires}, {collected}, toUnixTimestamp64Micro(now64(6))",
+         SELECT '{k}', '{tok}', {expires}, {collected}, \
+                toUnixTimestamp64Micro(now64(6)) + {bias}",
         t = crate::lease::LEASE_TABLE,
         k = ch_str(key),
         tok = ch_str(token),
+        bias = lease_seq(collected, 0),
     ))
     .await
     .map(|_| ())
+}
+
+/// A renewal writes a new version only while the row EXISTS and is NOT
+/// collected, in one statement, so it can never resurrect a claim — the
+/// unconditional write it replaces overwrote a collector's claim on the
+/// evicted drain's next tick. Expiry is deliberately not in the predicate: a
+/// lapsed lease nobody claimed is still this run's, and renewing it is right.
+/// Returns how many versions it wrote.
+pub(crate) async fn lease_renew(ch: &ChConn, keys: &[String], token: &str) -> Result<u64> {
+    let mut n = 0;
+    for k in keys {
+        let written = ch
+            .exec_written(
+                &format!(
+                    "INSERT INTO `{t}` (dest_key, token, expires_at, collected, seq) \
+                     SELECT '{k}', '{tok}', now64(6) + INTERVAL {ttl} SECOND, 0, \
+                            toUnixTimestamp64Micro(now64(6)) \
+                     WHERE 1 IN (SELECT toUInt8(count() > 0 AND argMax(collected, seq) = 0) \
+                                 FROM `{t}` WHERE dest_key = '{k}' AND token = '{tok}')",
+                    t = crate::lease::LEASE_TABLE,
+                    k = ch_str(k),
+                    tok = ch_str(token),
+                    ttl = crate::lease::ttl_secs(),
+                ),
+                &[],
+            )
+            .await?;
+        n += written.unwrap_or(0);
+    }
+    Ok(n)
+}
+
+/// This run's keys whose row exists and is not collected. Expiry ignored:
+/// only a CLAIM evicts.
+#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
+pub(crate) async fn lease_unclaimed(ch: &ChConn, token: &str) -> Result<Vec<String>> {
+    let body = ch
+        .read(&format!(
+            "SELECT dest_key FROM `{t}` WHERE token = '{tok}' GROUP BY dest_key \
+             HAVING count() > 0 AND argMax(collected, seq) = 0 FORMAT TabSeparatedRaw",
+            t = crate::lease::LEASE_TABLE,
+            tok = ch_str(token),
+        ))
+        .await?;
+    Ok(body.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty()).map(String::from).collect())
 }
 
 pub(crate) async fn lease_get(
@@ -104,7 +194,7 @@ pub(crate) async fn lease_get(
     token: &str,
 ) -> Result<Option<crate::lease::Lease>> {
     let body = match ch
-        .exec(&format!(
+        .read(&format!(
             "SELECT toInt64(dateDiff('second', now64(6), argMax(expires_at, seq))), \
                     toUInt8(argMax(collected, seq)), count() \
              FROM `{t}` WHERE dest_key = '{k}' AND token = '{tok}' FORMAT TabSeparated",
@@ -136,17 +226,20 @@ pub(crate) async fn lease_get(
 /// Check-then-act, and the comment says so rather than pretending otherwise:
 /// ClickHouse has no transaction and no row lock. Two collectors both succeed,
 /// which is correct — collecting is not proceeding, and each still meets the
-/// other's lock. What is genuinely weaker than Postgres: a wrongly evicted drain
-/// can land the ONE window already in flight, which the window machinery makes
-/// idempotent and the pre-watermark re-check keeps out of the cursor.
-pub(crate) async fn lease_claim(ch: &ChConn, key: &str, token: &str) -> Result<bool> {
-    match lease_get(ch, key, token).await? {
-        Some(l) if l.lapsed() => {
+/// other's lock. The claim version is biased above every renewal, so the
+/// victim's keeper cannot write over it, and its statements carry the
+/// ownership predicate that reads it.
+pub(crate) async fn lease_claim(ch: &ChConn, key: &str, token: &str) -> Result<crate::guard::Claim> {
+    use crate::guard::Claim;
+    Ok(match lease_get(ch, key, token).await? {
+        None => Claim::Absent,
+        Some(l) if l.collected => Claim::Taken,
+        Some(l) if l.expires_in > 0 => Claim::Refused,
+        Some(_) => {
             lease_write(ch, key, token, crate::lease::ttl_secs() as i64, 1).await?;
-            Ok(true)
+            Claim::Taken
         }
-        _ => Ok(false),
-    }
+    })
 }
 
 pub(crate) async fn lease_close(ch: &ChConn, key: &str, token: &str) {
@@ -256,16 +349,22 @@ impl crate::guard::GuardStore for ChGuard {
     }
 
     async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
-        Ok(if lease_claim(&self.ch, key, token).await? {
-            crate::guard::Claim::Taken
-        } else {
-            crate::guard::Claim::Refused
-        })
+        lease_claim(&self.ch, key, token).await
     }
 
     async fn lease_close(&self, proof: crate::guard::Released) {
         lease_close(&self.ch, &proof.key, &proof.token).await
     }
+}
+
+/// `written_rows` out of an `X-ClickHouse-Summary` header — a flat JSON object
+/// of quoted numbers, e.g. `{"read_rows":"1","written_rows":"1",…}`.
+fn summary_written_rows(h: &str) -> Option<u64> {
+    let at = h.find("\"written_rows\"")? + "\"written_rows\"".len();
+    let rest = h[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 impl ChConn {
@@ -291,7 +390,8 @@ impl ChConn {
             } else {
                 database
             },
-            client: crate::http::client(),
+            // Below the server's 10 s `keep_alive_timeout`; see `client_idle`.
+            client: crate::http::client_idle(std::time::Duration::from_secs(5)),
         })
     }
 
@@ -366,6 +466,28 @@ impl ChConn {
     /// mode they never do, and a silently doubled change history is worse
     /// than a failed run that the next schedule repeats safely.
     pub(crate) async fn exec(&self, query: &str) -> Result<String> {
+        self.exec_inner(query, &[]).await.map(|(b, _)| b)
+    }
+
+    /// `exec` with extra settings on the URL.
+    pub(crate) async fn exec_with(&self, query: &str, settings: &[(&str, &str)]) -> Result<String> {
+        self.exec_inner(query, settings).await.map(|(b, _)| b)
+    }
+
+    /// `exec_with`, answering how many rows the statement WROTE, from the
+    /// `X-ClickHouse-Summary` header (final, under `wait_end_of_query=1`).
+    /// `None` = the header was absent, which is not the same as zero.
+    pub(crate) async fn exec_written(&self, query: &str, settings: &[(&str, &str)]) -> Result<Option<u64>> {
+        self.exec_inner(query, settings).await.map(|(_, w)| w)
+    }
+
+    /// A read the server itself refuses to let write (`readonly=2` still
+    /// allows per-query settings).
+    pub(crate) async fn read(&self, sql: &str) -> Result<String> {
+        self.exec_with(sql, &[("readonly", "2")]).await
+    }
+
+    async fn exec_inner(&self, query: &str, settings: &[(&str, &str)]) -> Result<(String, Option<u64>)> {
         // Four attempts over ~7s of backoff: long enough for a rolling
         // restart or a failover to finish, short enough that a genuinely
         // down cluster still fails the run rather than hanging the schedule.
@@ -377,6 +499,7 @@ impl ChConn {
                 .post(&self.base)
                 .basic_auth(&self.user, Some(&self.password))
                 .query(&self.params("")[..4])
+                .query(settings)
                 .body(query.to_string())
                 .send()
                 .await;
@@ -400,6 +523,12 @@ impl ChConn {
             // exception in it. Defaulting to "" made an unreadable 5xx score
             // as "this came from a proxy, so ClickHouse never saw it" — and
             // retried a mutation on that basis. The distinction is kept.
+            // Before the body: `text()` consumes the response, headers and all.
+            let written = resp
+                .headers()
+                .get("X-ClickHouse-Summary")
+                .and_then(|v| v.to_str().ok())
+                .and_then(summary_written_rows);
             let body_read = resp.text().await;
             let body = body_read.as_deref().unwrap_or("");
             // A 5xx is retryable only when it demonstrably did NOT come from
@@ -435,7 +564,7 @@ impl ChConn {
                     }
                 )));
             }
-            return Ok(body.to_string());
+            return Ok((body.to_string(), written));
         }
     }
 
@@ -445,11 +574,22 @@ impl ChConn {
     /// OpenFileForWrite climbing into the hundreds — parts churn).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) async fn insert_stream(&self, query: &str, body: reqwest::Body) -> Result<()> {
+        self.insert_stream_with(query, body, &[]).await
+    }
+
+    /// `insert_stream` with extra settings on the URL.
+    pub(crate) async fn insert_stream_with(
+        &self,
+        query: &str,
+        body: reqwest::Body,
+        settings: &[(&str, &str)],
+    ) -> Result<()> {
         let resp = self
             .client
             .post(&self.base)
             .basic_auth(&self.user, Some(&self.password))
             .query(&self.params(query))
+            .query(settings)
             .query(&[
                 ("min_insert_block_size_rows", "1048576"),
                 ("min_insert_block_size_bytes", "536870912"),
@@ -2030,6 +2170,24 @@ impl Loader for ChLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_seq_outranks_every_renewal() {
+        assert!(lease_seq(1, 0) > lease_seq(0, (1 << 62) - 1), "a claim at epoch 0 outranks any renewal");
+        let m = 1_790_000_000_000_000; // micros, 2026
+        assert_eq!(lease_seq(1, m) - m, 1 << 62);
+        assert_eq!(lease_seq(0, m), m);
+        assert!(lease_seq(1, (1 << 62) - 1) <= i64::MAX as u64, "stays below 2^63");
+    }
+
+    #[test]
+    fn summary_header_gives_written_rows() {
+        let h = r#"{"read_rows":"3","read_bytes":"24","written_rows":"1","written_bytes":"57","total_rows_to_read":"0"}"#;
+        assert_eq!(summary_written_rows(h), Some(1));
+        assert_eq!(summary_written_rows(r#"{"written_rows":"0"}"#), Some(0));
+        assert_eq!(summary_written_rows(r#"{"written_rows": 42}"#), Some(42));
+        assert_eq!(summary_written_rows(r#"{"read_rows":"3"}"#), None, "absent is not zero");
+    }
 
     #[test]
     fn ch_url_userinfo_is_percent_decoded() {

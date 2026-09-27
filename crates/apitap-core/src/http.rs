@@ -51,12 +51,23 @@ fn env_secs(key: &str, default: u64) -> Duration {
 /// Falls back to a default client if the builder somehow fails, so a timeout
 /// setting can never be the reason a transfer refuses to start.
 pub(crate) fn client() -> reqwest::Client {
+    // A pooled connection an idle scheduler kept for an hour is usually dead
+    // on the other side; dropping it early turns a mysterious reset
+    // mid-request into a clean reconnect.
+    client_idle(Duration::from_secs(90))
+}
+
+/// `client()` for a server whose own keep-alive is SHORTER than 90 s, with
+/// `idle` below it. ClickHouse closes an idle connection after 10 s
+/// (`keep_alive_timeout`); a pooled connection older than that is closed on
+/// the far side, and reusing it fails the statement with "error sending
+/// request". A running process usually notices the FIN first — a process
+/// that was stopped (a frozen VM, a SIGSTOP, a starved cgroup) does not, and
+/// its first statement after the pause was the one that failed.
+pub(crate) fn client_idle(idle: Duration) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
         .connect_timeout(env_secs("APITAP_HTTP_CONNECT_TIMEOUT", CONNECT_SECS))
-        // A pooled connection an idle scheduler kept for an hour is usually
-        // dead on the other side; dropping it early turns a mysterious reset
-        // mid-request into a clean reconnect.
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(idle)
         // The one deadline that asks the right question. Probes start after a
         // minute of silence, and the socket errors when nobody answers them —
         // a transfer that is merely slow keeps sending and is never probed.

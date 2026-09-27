@@ -170,31 +170,21 @@ impl ChDest {
         Ok(())
     }
 
+    /// Predicated: never over a collected or missing row (see
+    /// `sink::clickhouse::lease_renew`).
     pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId)
         -> Result<u64>
     {
-        let mut n = 0;
-        for k in keys {
-            crate::sink::clickhouse::lease_write(
-                &self.ch, k, run.token(), crate::lease::ttl_secs() as i64, 0).await?;
-            n += 1;
-        }
-        Ok(n)
+        crate::sink::clickhouse::lease_renew(&self.ch, keys, run.token()).await
     }
 
     /// Does this run still hold its claim? A check, not a fence — see
-    /// `sink::clickhouse::lease_claim`.
+    /// `sink::clickhouse::lease_claim`. Owner = the row exists and is not
+    /// collected (`lease::owner_verdict`); a lapse nobody claimed is still ours.
     pub(crate) async fn lease_still_mine(&self, dest_table: &str, token: &str) -> Result<()> {
         let key = self.lease_key(dest_table);
-        match crate::sink::clickhouse::lease_get(&self.ch, &key, token).await? {
-            None => Ok(()),
-            Some(l) if !l.lapsed() => Ok(()),
-            Some(_) => Err(Error::Locked(format!(
-                "{key}: this drain no longer holds the table — its claim lapsed and \
-                 another run may have collected it, so it stops rather than write on \
-                 top of one that did. Re-run."
-            ))),
-        }
+        let row = crate::sink::clickhouse::lease_get(&self.ch, &key, token).await?;
+        crate::lease::owner_verdict(row.as_ref(), &[key])
     }
 
     /// This destination as the guard sees it — the same `ChGuard` the bulk

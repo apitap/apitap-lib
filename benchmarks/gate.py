@@ -106,6 +106,8 @@ LEGS = [
     leg("e2e_cdc_lease.py",        "a killed drain's lock clears itself",
         proves={"lease.killed-drain-self-heals": ("ch",), "lease.live-never-collected": ("ch",),
                 "guard.no-lease-no-collect": ("ch",)}),
+    leg("e2e_cdc_evict_ch.py",     "an evicted ClickHouse drain stays evicted", {"mariadb"},
+        proves={"lease.killed-drain-self-heals": ("ch",)}),
     leg("e2e_cdc_fence.py",        "an evicted drain writes nothing more",
         proves={"fence.evicted-writes-nothing": ("pg",), "keeper.skips-own-held-row": ("pg",),
                 "lease.killed-drain-self-heals": ("pg",)}),
