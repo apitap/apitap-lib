@@ -481,6 +481,84 @@ docker rm -f apitap-bench-pg-src apitap-bench-pg-dst
 Run everything twice and report the second (warm) number. If your numbers disagree
 with the table above, please open an issue with the full output.
 
+## The release gate
+
+`benchmarks/gate.py` runs every e2e leg against the wheel installed in the
+interpreter that runs it, and prints one verdict. It runs on the bench VPS,
+from the repo root, with the containers this directory's scripts bring up:
+
+```bash
+source ~/apitap-057.env                     # the variables below
+~/gate-venv/bin/python benchmarks/gate.py --self-test
+~/gate-venv/bin/python benchmarks/gate.py --matrix   # release pre-flight: exit 0 or do not tag
+~/gate-venv/bin/python benchmarks/gate.py            # every leg the rig can run
+```
+
+A skipped leg is a reported leg: the gate exits 3 when anything was skipped, and
+the summary names the capability that was missing.
+
+**What the rig needs.**
+
+| variable | what it points at | legs that need it |
+|---|---|---|
+| `BQ_SA` | the service-account JSON of the gate's BigQuery project | every `bq` leg |
+| `APITAP_PY_0551` | a venv python holding `apitap==0.55.1` | upgrade and rollback legs |
+| `APITAP_PY_0560` | a venv python holding `apitap==0.56.0` | upgrade legs, and the RED control of every new leg |
+| `APITAP_MY_GTID_URL` | `mysql://root:bench@127.0.0.1:3311/bench` (`apitap-bench-my-gtid`, started by `run-server.sh`) | GTID-destination legs |
+
+The old-release interpreters are prepared once from PyPI; the gate never
+installs anything, and refuses an interpreter that resolves to its own apitap
+(an upgrade leg run against itself compares a wheel with itself):
+
+```bash
+python3 -m venv ~/gate-0551-venv && ~/gate-0551-venv/bin/pip install apitap==0.55.1 pyarrow polars duckdb psycopg2-binary google-auth requests
+python3 -m venv ~/gate-0560-venv && ~/gate-0560-venv/bin/pip install apitap==0.56.0 pyarrow polars duckdb psycopg2-binary google-auth requests
+```
+
+**Claims, not just legs.** Every sentence the docs promise about the guard, the
+lease, the apply contracts and memory is a row in [`_claims.py`](_claims.py), a
+`claim:` marker comment in the doc that says it, and the legs that declare
+they prove it on each engine. `--matrix` fails on a cell no leg proves (GAP), a
+marker the table does not know, a claim no doc carries, or a paragraph that no
+longer says what the table requires. A cell this rig cannot prove is WAIVED in
+`_claims.py`, and its caveat must be printed beside the claim, word for word.
+After a run the gate prints each claim cell it touched as PASS, FAIL or SKIP.
+
+**Regression claims.** A leg that backs no sentence in the user docs still
+guards something that once broke. Each one is its own claim, carried here:
+
+| leg | what it keeps true |
+|---|---|
+| <!-- claim: leg.e2e_failure_modes --> `e2e_failure_modes.py` | what a killed run leaves behind |
+| <!-- claim: leg.e2e_replace_hazards --> `e2e_replace_hazards.py` | replace never publishes a partial table |
+| <!-- claim: leg.e2e_long_names --> `e2e_long_names.py` | a name at the identifier limit is safe |
+| <!-- claim: leg.e2e_url_errors --> `e2e_url_errors.py` | bad URLs fail at probe, not mid-copy |
+| <!-- claim: leg.e2e_progress --> `e2e_progress.py` | the progress record says what it means |
+| <!-- claim: leg.e2e_read --> `e2e_read.py` | read() -> Arrow/polars, typed end to end |
+| <!-- claim: leg.e2e_savepoint --> `e2e_savepoint.py` | a streamed savepoint rolls back for real |
+| <!-- claim: leg.e2e_http_deadline --> `e2e_http_deadline.py` | HTTP deadlines bound a stuck destination |
+| <!-- claim: leg.e2e_logbased_dests.ch --> `e2e_logbased_dests.py ch` | the same drain into ClickHouse |
+| <!-- claim: leg.e2e_logbased_dests.my --> `e2e_logbased_dests.py my` | the same drain into MySQL |
+| <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
+| <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
+| <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |
+| <!-- claim: leg.e2e_cdc_retention --> `e2e_cdc_retention.py` | a schedule paused past retention is refused |
+| <!-- claim: leg.e2e_toast_rekey --> `e2e_toast_rekey.py` | a key-changing UPDATE keeps its TOAST cols |
+| <!-- claim: leg.e2e_partitioned --> `e2e_partitioned.py` | a partitioned table replicates at all |
+| <!-- claim: leg.e2e_my_liveness --> `e2e_my_liveness.py` | a dead binlog peer is noticed |
+| <!-- claim: leg.e2e_ch_source --> `e2e_ch_source.py` | ClickHouse -> ClickHouse, RowBinary relayed |
+| <!-- claim: leg.e2e_ch_cluster --> `e2e_ch_cluster.py` | a replicated destination is refused, not scattered |
+| <!-- claim: leg.e2e_ch_body_cap --> `e2e_ch_body_cap.py` | APITAP_CH_MAX_BODY for proxied ClickHouse |
+| <!-- claim: leg.e2e_changelog_ch --> `e2e_changelog_ch.py` | changelog=True on ClickHouse |
+| <!-- claim: leg.e2e_changelog_my --> `e2e_changelog_my.py` | changelog=True on MySQL |
+| <!-- claim: leg.e2e_tls --> `e2e_tls.py` | Postgres TLS, verified not just offered |
+| <!-- claim: leg.e2e_tls_mysql --> `e2e_tls_mysql.py` | MySQL TLS, same |
+| <!-- claim: leg.e2e_review_gate --> `e2e_review_gate.py` | the findings of the 0.42.0 review, as proofs |
+| <!-- claim: leg.e2e_bq_cdc --> `e2e_bq_cdc.py` | CDC into BigQuery via staging + MERGE |
+| <!-- claim: leg.e2e_changelog_bq --> `e2e_changelog_bq.py` | changelog=True on BigQuery |
+| <!-- claim: leg.e2e_changelog_group --> `e2e_changelog_group.py` | changelog partition/order overrides |
+| <!-- claim: leg.e2e_changelog_percolumn --> `e2e_changelog_percolumn.py` | per-column changelog config |
+
 ## Multi-table on the tiny box — TPC-H, 10 × 1M rows, 256 MB / 0.5 CPU
 
 The multi-table release (`tables=[…]` / `schema=`) was benchmarked on REAL TPC-H

@@ -93,6 +93,27 @@ start_ch() {
 }
 chq() { docker exec "$CH_CONTAINER" clickhouse-client --password bench -q "$1"; }
 
+# A MySQL destination with GTIDs enforced, for the gate's `my-gtid` legs
+# (APITAP_MY_GTID_URL=mysql://root:bench@127.0.0.1:3311/bench). Under
+# enforce-gtid-consistency a CREATE TEMPORARY TABLE inside a transaction is
+# error 1787, which is exactly what those legs must see NOT happen. Loopback
+# only, like every other bench container.
+start_my_gtid() {
+    if ! docker inspect apitap-bench-my-gtid >/dev/null 2>&1; then
+        echo "==> starting apitap-bench-my-gtid (mysql:8.0, GTID enforced, 127.0.0.1:3311)"
+        docker run -d --name apitap-bench-my-gtid -p 127.0.0.1:3311:3306 \
+            -e MYSQL_ROOT_PASSWORD=bench -e MYSQL_DATABASE=bench mysql:8.0 \
+            --local-infile=1 --server-id=311 --log-bin=binlog --binlog-format=ROW \
+            --gtid-mode=ON --enforce-gtid-consistency=ON >/dev/null
+    fi
+    for _ in $(seq 90); do
+        docker exec apitap-bench-my-gtid mysql -uroot -pbench -N -e "SELECT @@gtid_mode" 2>/dev/null \
+            | grep -qx ON && break
+        sleep 1
+    done
+}
+start_my_gtid
+
 if [[ "$PG_DOCKER" == "1" ]]; then
     # SOURCE and DESTINATION are two SEPARATE postgres instances (own WAL, buffers,
     # checkpoints) so the read side and the write side don't share a server.
