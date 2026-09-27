@@ -12,6 +12,12 @@ use sqlx::{Executor, PgPool};
 
 const STATE_CURSOR: &str = "_lsn";
 
+/// The schema half of a lease key. Keys are `PgParts::label()`, always
+/// qualified, so this never guesses.
+fn key_schema(key: &str) -> String {
+    crate::sink::postgres::PgParts::split(key).map(|p| p.schema).unwrap_or_else(|| "public".into())
+}
+
 pub(crate) struct PgDest {
     pool: PgPool,
     /// This run's token, set once by `set_run`. The apply path needs it to
@@ -19,6 +25,10 @@ pub(crate) struct PgDest {
     /// apply signature on five destinations to deliver one string was the
     /// alternative.
     run_token: std::sync::Mutex<Option<String>>,
+    /// Where each destination table lives, resolved once per run by
+    /// `resolve_names` — the SAME rule the bulk lane uses, so the lock, the
+    /// scan, the lease and the fence all agree under any `search_path`.
+    parts: std::sync::Mutex<std::collections::HashMap<String, crate::sink::postgres::PgParts>>,
 }
 
 impl PgDest {
@@ -28,6 +38,32 @@ impl PgDest {
 
     fn token(&self) -> Option<String> {
         self.run_token.lock().expect("run token").clone()
+    }
+
+    /// Resolve every member's schema once, before a lease key is taken.
+    pub(crate) async fn resolve_names(&self, tables: &[String]) -> Result<()> {
+        for t in tables {
+            let p = crate::sink::postgres::resolve_parts(&self.pool, t).await?;
+            self.parts.lock().expect("parts").insert(t.clone(), p);
+        }
+        Ok(())
+    }
+
+    /// The resolved parts of `dest_table`. A table the run did not resolve can
+    /// only be a qualified one written as such (every member is resolved before
+    /// its first lease key), so the fallback is the name as written.
+    fn parts_of(&self, dest_table: &str) -> crate::sink::postgres::PgParts {
+        if let Some(p) = self.parts.lock().expect("parts").get(dest_table) {
+            return p.clone();
+        }
+        debug_assert!(dest_table.contains('.'), "{dest_table}: lease key before resolve_names");
+        crate::sink::postgres::PgParts::split(dest_table).unwrap_or_else(|| {
+            crate::sink::postgres::PgParts { schema: "public".into(), bare: dest_table.into() }
+        })
+    }
+
+    fn guard(&self, parts: &crate::sink::postgres::PgParts) -> crate::sink::postgres::PgGuard {
+        crate::sink::postgres::PgGuard::new(self.pool.clone(), parts.schema.clone())
     }
 
     /// FENCE: the first statement of every transaction this drain uses to write.
@@ -59,9 +95,9 @@ impl PgDest {
         dest_table: &str,
     ) -> Result<()> {
         let Some(token) = self.token() else { return Ok(()) };
-        let (_, schema, bare) = crate::sink::postgres::lock_ident_parts(dest_table);
-        let key = format!("{schema}.{bare}");
-        let t = crate::sink::postgres::lease_table(&schema);
+        let parts = self.parts_of(dest_table);
+        let key = parts.label();
+        let t = crate::sink::postgres::lease_table(&parts.schema);
         let held: Option<(i32,)> = match sqlx::query_as(&format!(
             "SELECT 1 FROM {t} WHERE dest_key = $1 AND token = $2 \
                AND NOT collected AND expires_at > now() FOR UPDATE"
@@ -119,24 +155,28 @@ impl PgDest {
 
     /// The CDC lane's half of the announce-then-check protocol.
     ///
-    /// It calls the BULK sink's functions, not copies of them, and that is the
-    /// entire point: a drain and a bulk `replace` can only refuse each other if
-    /// both write and read the same artifact name in the same place. A second
-    /// implementation here would agree on the day it was written and drift the
-    /// first time either side was touched — which is exactly how the 0.55.0
-    /// guard came to be wrong in six sinks out of seven.
+    /// Through the bulk sink's `PgGuard` and `crate::guard`, not copies of
+    /// them, and that is the entire point: a drain and a bulk `replace` can
+    /// only refuse each other if both write and read the same artifact name in
+    /// the same place. A second implementation here would agree on the day it
+    /// was written and drift the first time either side was touched — which is
+    /// exactly how the 0.55.0 guard came to be wrong in six sinks out of seven.
     pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
         -> Result<()>
     {
-        let (lock_q, _, _) = crate::sink::postgres::lock_ident(dest_table, run);
-        crate::sink::postgres::announce_run(&self.pool, &lock_q).await
+        use crate::guard::GuardStore;
+        let parts = self.parts_of(dest_table);
+        let lock = crate::naming::artifact_ident_run(
+            &parts.bare, crate::naming::Artifact::Lock, crate::naming::PG_IDENT_MAX, run);
+        self.guard(&parts).create_marker(&lock).await
     }
 
     pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
         -> Result<()>
     {
-        let (_, schema, bare) = crate::sink::postgres::lock_ident(dest_table, run);
-        crate::sink::postgres::check_peers(&self.pool, &schema, &bare, run).await
+        let parts = self.parts_of(dest_table);
+        crate::guard::check_peers(&self.guard(&parts), &parts.bare, run, crate::guard::Mine::Keep)
+            .await
     }
 
     pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
@@ -148,8 +188,7 @@ impl PgDest {
     /// schema, so a bare key would put `sales.orders` and `hr.orders` in one key
     /// space and let a run in one schema collect a live drain in the other.
     pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        let (_, schema, bare) = crate::sink::postgres::lock_ident_parts(dest_table);
-        format!("{schema}.{bare}")
+        self.parts_of(dest_table).label()
     }
 
     /// All four delegate to the bulk sink's free functions, for the same reason
@@ -162,8 +201,7 @@ impl PgDest {
         // construction — so group by schema rather than assume.
         let mut by_schema: std::collections::HashMap<String, Vec<String>> = Default::default();
         for k in keys {
-            let (_, schema, _) = crate::sink::postgres::lock_ident_parts(k);
-            by_schema.entry(schema).or_default().push(k.clone());
+            by_schema.entry(key_schema(k)).or_default().push(k.clone());
         }
         for (schema, ks) in by_schema {
             crate::sink::postgres::lease_open(&self.pool, &schema, &ks, run.token()).await?;
@@ -176,8 +214,7 @@ impl PgDest {
     {
         let mut by_schema: std::collections::HashMap<String, Vec<String>> = Default::default();
         for k in keys {
-            let (_, schema, _) = crate::sink::postgres::lock_ident_parts(k);
-            by_schema.entry(schema).or_default().push(k.clone());
+            by_schema.entry(key_schema(k)).or_default().push(k.clone());
         }
         let mut n = 0;
         for (schema, ks) in by_schema {
@@ -187,13 +224,12 @@ impl PgDest {
     }
 
     pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
-        let (_, schema, _) = crate::sink::postgres::lock_ident_parts(key);
-        crate::sink::postgres::lease_close(&self.pool, &schema, key, run.token()).await
+        crate::sink::postgres::lease_close(&self.pool, &key_schema(key), key, run.token()).await
     }
 
     /// Did the lock actually go? The lease may only be dropped once it did.
     pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
-        let (lock_q, _, _) = crate::sink::postgres::lock_ident(dest_table, run);
+        let lock_q = crate::sink::postgres::lock_ident(&self.parts_of(dest_table), run);
         sqlx::query(&format!("DROP TABLE IF EXISTS {lock_q}"))
             .execute(&self.pool)
             .await
@@ -206,7 +242,7 @@ impl PgDest {
             .connect(url)
             .await
             .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))?;
-        Ok(Self { pool, run_token: std::sync::Mutex::new(None) })
+        Ok(Self { pool, run_token: std::sync::Mutex::new(None), parts: Default::default() })
     }
 
     /// The bootstrap's replace path lands data without constraints; the
@@ -665,4 +701,37 @@ fn key_pred(pk_cols: &[String], key: &[Vec<u8>]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" AND ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guard::GuardStore;
+    use crate::sink::postgres::{PgGuard, PgParts};
+
+    /// The drain's lease key and the guard's refusal name are ONE string. If
+    /// they drift, a collector reads a lease row the drain never writes, and a
+    /// live drain looks dead (or a dead one uncollectable). 0.56.0 keyed the
+    /// drain on `public.<t>` whatever the `search_path`, while the bulk lane
+    /// resolved the real schema.
+    #[test]
+    fn lease_key_is_dest_label() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let pool = PgPoolOptions::new().connect_lazy("postgres://u@127.0.0.1:1/db").unwrap();
+            let d = PgDest { pool: pool.clone(), run_token: Default::default(), parts: Default::default() };
+            let cases = [
+                ("orders", PgParts { schema: "cdcdest".into(), bare: "orders".into() }),
+                ("events", PgParts { schema: "public".into(), bare: "events".into() }),
+                ("Mixed Case", PgParts { schema: "postgres".into(), bare: "Mixed Case".into() }),
+            ];
+            for (t, p) in &cases {
+                d.parts.lock().unwrap().insert(t.to_string(), p.clone());
+                assert_eq!(d.lease_key(t), PgGuard::new(pool.clone(), p.schema.clone()).dest_label(&p.bare),
+                           "{t}");
+            }
+            // A qualified name nobody resolved is taken as written, on both sides.
+            assert_eq!(d.lease_key("sales.orders"),
+                       PgGuard::new(pool.clone(), "sales").dest_label("orders"));
+        });
+    }
 }

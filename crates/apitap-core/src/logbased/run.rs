@@ -158,6 +158,17 @@ impl Dest {
         }
     }
 
+    /// Pin where each member lives before any lease key is taken. Postgres
+    /// resolves an unqualified name against the live `search_path` exactly as
+    /// the bulk lane does (`sink::postgres::resolve_parts`); the others name
+    /// their tables in full already.
+    async fn resolve_names(&self, tables: &[String]) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.resolve_names(tables).await,
+            Dest::My(_) | Dest::Ch(_) | Dest::Bq(_) | Dest::Ice(_) => Ok(()),
+        }
+    }
+
     /// Tell every destination this run's identity, once, so the apply path can
     /// FENCE itself without a `&RunId` threaded through five apply signatures.
     fn set_run(&self, run: &crate::naming::RunId) {
@@ -904,6 +915,8 @@ async fn run_group(
     // overlapping groups each pass the member the other had not reached yet.
     let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
     dest.set_run(&run);
+    let members: Vec<String> = ctxs.iter().map(|c| c.dest_table.clone()).collect();
+    dest.resolve_names(&members).await?;
     // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
     // record of liveness means refuse" — so writing one first would create a
     // permanent orphan in exactly the window this exists to close. A lease with
@@ -1134,6 +1147,8 @@ async fn run_group_mysql(
     // ANY member is checked.
     let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
     dest.set_run(&run);
+    let members: Vec<String> = ctxs.iter().map(|c| c.dest_table.clone()).collect();
+    dest.resolve_names(&members).await?;
     // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
     // record of liveness means refuse" — so writing one first would create a
     // permanent orphan in exactly the window this exists to close. A lease with

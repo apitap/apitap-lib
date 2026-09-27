@@ -98,7 +98,7 @@ LEGS = [
     leg("e2e_changelog_replay.py", "a replayed changelog window is not appended twice", {"mariadb"},
         proves={"changelog.replay-not-doubled": ("ch",)}),
     leg("e2e_cdc_guard.py",        "a drain and a bulk run refuse each other",
-        proves={"guard.drain-vs-bulk": ("ch",), "guard.drain-vs-drain": ("ch",)}),
+        proves={"guard.drain-vs-bulk": ("ch", "pg"), "guard.drain-vs-drain": ("ch", "pg")}),
     leg("e2e_cdc_lease.py",        "a killed drain's lock clears itself",
         proves={"lease.killed-drain-self-heals": ("ch",), "lease.live-never-collected": ("ch",),
                 "guard.no-lease-no-collect": ("ch",)}),

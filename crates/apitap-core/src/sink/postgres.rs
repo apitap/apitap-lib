@@ -11,110 +11,172 @@ use sqlx::postgres::{PgPoolCopyExt, PgPoolOptions};
 use sqlx::PgPool;
 use crate::dialect::postgres::{quote_ident, quote_ident_path};
 
-/// The announce-then-check triple, as free functions.
+/// A Postgres destination table, split into the schema it LIVES in and its
+/// bare name — the one answer both lanes use for where the lock goes, where the
+/// scan looks, which lease table holds the lease and what the lease is keyed
+/// by.
 ///
-/// Free, and not methods, because the CDC lane has to run exactly the same
-/// three steps against exactly the same names. A drain and a bulk run can only
-/// see each other if both spell the artifact identically and look in the same
-/// place — so there is one spelling and one scan, used by both, rather than a
-/// second copy in `logbased::dest_pg` that would drift the first time either
-/// side was touched. That drift is the whole story of the 0.55.0 guard, which
-/// was open-coded seven times and wrong in six of them.
-///
-/// `lock_q` is the fully quoted, schema-qualified lock name from
-/// [`lock_ident`]; `schema` and `bare` are the unquoted catalog spellings the
-/// scan needs.
-
-/// This run's announcement.
-///
-/// An empty table is enough: nothing reads its contents, only its name, which
-/// carries the run token the scan classifies. `UNLOGGED` because it never needs
-/// to survive a crash — a lock that outlives the process it belongs to is the
-/// operational cost this protocol trades for, not a feature.
-pub(crate) async fn announce_run(pool: &PgPool, lock_q: &str) -> Result<()> {
-    sqlx::query(&format!("CREATE UNLOGGED TABLE IF NOT EXISTS {lock_q} ()"))
-        .execute(pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| Error::Transfer(format!("announce run: {e}")))
+/// 0.56.0 had two answers. The bulk lane resolved an unqualified name against
+/// the live `search_path`; the CDC lane assumed `public`. Under any other
+/// `search_path` a drain put its lock in one schema and scanned another, so a
+/// drain and a bulk run of the same table could not see each other at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PgParts {
+    pub(crate) schema: String,
+    pub(crate) bare: String,
 }
 
-/// Best-effort: the run is over either way, and a failure to drop the lock must
-/// not turn a finished transfer into an error. What it leaves behind is a name
-/// the next run refuses with `locked_error`, which says how to clear it.
-pub(crate) async fn release_run(pool: &PgPool, lock_q: &str) {
-    let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {lock_q}"))
-        .execute(pool)
-        .await;
-}
-
-/// Every guarded artifact beside `schema.bare`, judged by `naming`.
-pub(crate) async fn check_peers(
-    pool: &PgPool,
-    schema: &str,
-    bare: &str,
-    run: &crate::naming::RunId,
-) -> Result<()> {
-    use crate::naming::{artifact_match, GUARDED};
-    // `_` and `%` are LIKE wildcards and both appear in these names.
-    let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
-    let mut found: Vec<String> = Vec::new();
-    for &a in GUARDED {
-        let (head, suffix) = artifact_match(bare, a, crate::naming::PG_IDENT_MAX);
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT c.relname FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE $2",
-        )
-        .bind(schema)
-        .bind(format!("{}%{}", esc(&head), esc(suffix)))
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
-        found.extend(rows);
+impl PgParts {
+    /// `"schema"."bare"`, quoted. The CDC data statements take it when they
+    /// move onto the resolved schema (handoff §3 step 19); until then, tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn qualified(&self) -> String {
+        quote_ident_path(&format!("{}.{}", self.schema, self.bare))
     }
-    let dest = format!("{schema}.{bare}");
-    let now = crate::naming::now_unix();
-    for b in crate::naming::blockers(
-        bare, crate::naming::PG_IDENT_MAX, run, GUARDED,
-        found.iter().map(|n| (n.as_str(), n.as_str()))).blockers
-    {
-        // Staging and the un-tokenized pre-0.55.0 name are never collectable at
-        // any age — `classify`'s severity argument has full force on an object
-        // that is being written INTO.
-        let Some(tok) = crate::naming::collectable(&b).map(str::to_string) else {
-            return Err(crate::naming::blocker_error(&dest, &b, now, None));
-        };
-        // A lock with no lease row is uncollectable: an apitap older than the
-        // lease wrote it, or an operator planted it, or it is a bulk lock, and
-        // in every case there is no record of liveness to read. Refuse.
-        let lease = lease_get(pool, schema, &dest, &tok).await?;
-        if lease.as_ref().is_some_and(|l| l.lapsed())
-            && lease_claim(pool, schema, &dest, &tok).await?
-        {
-            let victim = quote_ident_path(&format!("{schema}.{}", b.name()));
-            release_run(pool, &victim).await;
-            eprintln!(
-                "apitap: {dest}: collected {} — the run that wrote it stopped \
-                 renewing its claim on this destination's own clock. Resuming.",
-                b.name()
-            );
-            continue;
+
+    /// The lease key and the refusal's name: unquoted `schema.bare`.
+    pub(crate) fn label(&self) -> String {
+        format!("{}.{}", self.schema, self.bare)
+    }
+
+    /// A qualified name split as written; `None` for a bare one.
+    pub(crate) fn split(dest_table: &str) -> Option<PgParts> {
+        dest_table
+            .rsplit_once('.')
+            .map(|(s, t)| PgParts { schema: s.to_string(), bare: t.to_string() })
+    }
+}
+
+/// Where `dest_table` lives, by the server's own rule.
+///
+/// A qualified name is taken as written. A bare one is the namespace
+/// `to_regclass` finds it in — which honours the whole `search_path`, including
+/// a table in its second entry and a `"$user"` schema that shadows nothing —
+/// and, for a table that does not exist yet, `current_schema()`, which is where
+/// an unqualified CREATE puts it.
+pub(crate) async fn resolve_parts(pool: &PgPool, dest_table: &str) -> Result<PgParts> {
+    if let Some(p) = PgParts::split(dest_table) {
+        return Ok(p);
+    }
+    let found: Option<String> = sqlx::query_scalar(
+        "SELECT n.nspname::text FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = to_regclass($1::text)",
+    )
+    .bind(quote_ident(dest_table))
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?;
+    let schema = match found {
+        Some(s) => s,
+        None => sqlx::query_scalar::<_, Option<String>>("SELECT current_schema()::text")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("no schema on search_path resolves {dest_table}"))
+            })?,
+    };
+    Ok(PgParts { schema, bare: dest_table.to_string() })
+}
+
+/// The guard's view of a Postgres destination: one schema, spelled.
+///
+/// Every decision is `crate::guard`'s; this lists, creates and drops, in the
+/// schema `resolve_parts` gave — which is also where the lease table lives, so
+/// both lanes read the same liveness rows.
+pub(crate) struct PgGuard {
+    pool: PgPool,
+    schema: String,
+}
+
+impl PgGuard {
+    pub(crate) fn new(pool: PgPool, schema: impl Into<String>) -> Self {
+        PgGuard { pool, schema: schema.into() }
+    }
+
+    fn fq(&self, raw: &str) -> String {
+        quote_ident_path(&format!("{}.{raw}", self.schema))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::guard::GuardStore for PgGuard {
+    fn limit(&self) -> usize {
+        crate::naming::PG_IDENT_MAX
+    }
+
+    fn dest_label(&self, bare: &str) -> String {
+        PgParts { schema: self.schema.clone(), bare: bare.to_string() }.label()
+    }
+
+    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        // `_` and `%` are LIKE wildcards and both appear in these names.
+        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+        let mut found = Vec::new();
+        for &a in kinds {
+            let (head, suffix) = crate::naming::artifact_match(bare, a, crate::naming::PG_IDENT_MAX);
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT c.relname::text FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE $2",
+            )
+            .bind(&self.schema)
+            .bind(format!("{}%{}", esc(&head), esc(suffix)))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
+            found.extend(rows.into_iter().map(crate::guard::Listed::same));
         }
-        return Err(crate::naming::blocker_error(&dest, &b, now, lease.as_ref()));
+        Ok(found)
     }
-    Ok(())
+
+    /// An empty table is enough: nothing reads its contents, only its name,
+    /// which carries the run token the scan classifies. `UNLOGGED` because it
+    /// never needs to survive a crash — a marker that outlives its process is
+    /// the operational cost this protocol trades for, not a feature.
+    async fn create_marker(&self, raw: &str) -> Result<()> {
+        sqlx::query(&format!("CREATE UNLOGGED TABLE IF NOT EXISTS {} ()", self.fq(raw)))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Transfer(format!("announce run: {e}")))
+    }
+
+    async fn drop_object(&self, raw: &str) -> Result<()> {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.fq(raw)))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Transfer(format!("drop {raw}: {e}")))
+    }
+
+    async fn lease_get(&self, key: &str, token: &str) -> Result<Option<crate::lease::Lease>> {
+        lease_get(&self.pool, &self.schema, key, token).await
+    }
+
+    async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
+        Ok(if lease_claim(&self.pool, &self.schema, key, token).await? {
+            crate::guard::Claim::Taken
+        } else {
+            crate::guard::Claim::Refused
+        })
+    }
+
+    async fn lease_close(&self, proof: crate::guard::Released) {
+        lease_close(&self.pool, &self.schema, &proof.key, &proof.token).await
+    }
 }
 
 /// The lease store, and the five statements that operate on it.
 ///
-/// Free functions beside `announce_run`/`check_peers`/`release_run` for the
-/// same reason those are: the CDC lane and the bulk lane must write and read
-/// exactly the same thing in exactly the same place, and a second copy agrees
-/// on the day it is written.
+/// Free functions, shared by `PgGuard` and the CDC lane, for the reason the
+/// guard is shared: the CDC lane and the bulk lane must write and read exactly
+/// the same thing in exactly the same place, and a second copy agrees on the
+/// day it is written.
 ///
-/// The table is LOGGED — deliberately, unlike the lock at `announce_run`, which
-/// is UNLOGGED because it is meant to be cheap and short-lived. Crash recovery
+/// The table is LOGGED — deliberately, unlike a run's markers, which are
+/// UNLOGGED because they are meant to be cheap and short-lived. Crash recovery
 /// TRUNCATES an unlogged table, and losing every live lease at once when a
 /// destination restarts is the one failure this mechanism must not have: every
 /// running drain would look dead to the next scan.
@@ -310,35 +372,17 @@ pub(crate) async fn lease_close(pool: &PgPool, schema: &str, key: &str, token: &
     .await;
 }
 
-/// A destination table split the way `PgSink::bind` splits it, so both lanes
-/// derive the same quoted lock name and the same catalog schema from the same
-/// string. Returns `(quoted lock ident, catalog schema, bare table)`.
-pub(crate) fn lock_ident(dest_table: &str, run: &crate::naming::RunId) -> (String, String, String) {
-    let (pfx, schema, bare) = lock_ident_parts(dest_table);
-    let lock = quote_ident_path(&format!(
-        "{pfx}{}",
+/// The quoted, schema-qualified lock name of `parts` for `run` — always
+/// qualified, so the lock is created in the schema the scan reads.
+pub(crate) fn lock_ident(parts: &PgParts, run: &crate::naming::RunId) -> String {
+    quote_ident_path(&format!(
+        "{}.{}",
+        parts.schema,
         crate::naming::artifact_ident_run(
-            &bare, crate::naming::Artifact::Lock, crate::naming::PG_IDENT_MAX, run)
-    ));
-    (lock, schema, bare)
+            &parts.bare, crate::naming::Artifact::Lock, crate::naming::PG_IDENT_MAX, run)
+    ))
 }
 
-/// `(quoting prefix, catalog schema, bare table)` — the split both lanes use.
-///
-/// Extracted so the lease key is derived from the SAME string the guard's error
-/// message and peer scan use. It has to be the schema-QUALIFIED name: the peer
-/// scan is scoped to one schema, so keying the lease on the bare name would put
-/// `sales.orders` and `hr.orders` in one key space and let a run in one schema
-/// collect a live drain in the other.
-pub(crate) fn lock_ident_parts(dest_table: &str) -> (String, String, String) {
-    let (pfx, bare) = match dest_table.rsplit_once('.') {
-        Some((s, t)) => (format!("{s}."), t.to_string()),
-        None => (String::new(), dest_table.to_string()),
-    };
-    let schema = pfx.trim_end_matches('.');
-    let schema = if schema.is_empty() { "public".to_string() } else { schema.to_string() };
-    (pfx, schema, bare)
-}
 // ---------------------------------------------------------------------------------
 // Sink
 // ---------------------------------------------------------------------------------
@@ -348,9 +392,9 @@ pub(crate) struct PgSink {
     /// Quoted destination / staging idents; staging lives in the destination's schema.
     final_t: String,
     staging_t: String,
-    /// This run's announcement that it is working on this table. Created before
-    /// the scan, dropped in `finalize` and `discard` — see `announce`.
-    lock_t: String,
+    /// This run's announcement on this table, from `prepare` until the staging
+    /// it protects exists (or the run ends first). See `crate::guard`.
+    announced: std::sync::Mutex<Option<crate::guard::Announced>>,
     bare: String,
     /// Unquoted schema name, for catalog lookups (`public` when unqualified).
     schema: String,
@@ -374,8 +418,10 @@ pub(crate) struct PgSink {
     /// Canonical unquoted `schema.table` — the state row's other key half.
     dest_key: String,
     /// Was dest_table schema-qualified by the caller? Unqualified names get their
-    /// schema resolved from the live connection in dest_state.
+    /// schema resolved from the live connection, once — see `resolve_schema`.
     qualified: bool,
+    /// Has `resolve_schema` run?
+    resolved: bool,
     /// Plan column names in order, stashed at `prepare` for the merge upsert.
     col_names: Vec<String>,
     copy_in_sql: String,
@@ -412,29 +458,39 @@ impl PgSink {
             .map_err(|e| crate::urlerr::connect_err("postgres destination", url, e))
     }
 
-    /// Collect dead staging objects and refuse live peers.
-    ///
-    /// One catalog SELECT, and it REPLACES the `DROP TABLE IF EXISTS` it stands
-    /// in for — on Postgres that is strictly cheaper, because the DROP took an
-    /// ACCESS EXCLUSIVE lock and this takes none.
-    ///
-    /// The classification itself is `naming::classify`, deliberately not
-    /// re-derived here. The first version of this method open-coded it, six
-    /// other sinks copied the shape, and the review found the same class of
-    /// mistake in all seven: a pattern anchored at one end reaped a SIBLING
-    /// table's staging, and a run failed to recognise its own artifacts inside
-    /// a multi-table transfer. Those are ordering and boundary questions with
-    /// one right answer, so they have one implementation.
-    async fn announce(&self) -> Result<()> {
-        announce_run(&self.pool, &self.lock_t).await
+    /// Where an unqualified destination really lives, by the rule the CDC lane
+    /// uses too (`resolve_parts`). Once per sink, and before anything is
+    /// announced, scanned or keyed: `dest_state` runs only for the incremental
+    /// modes, so a `replace` that relied on it scanned the `bind` placeholder,
+    /// `public`, under any search_path — and missed a drain holding the table
+    /// in the schema it actually lives in.
+    async fn resolve_schema(&mut self) -> Result<()> {
+        if !self.qualified && !self.resolved {
+            let parts = resolve_parts(&self.pool, &self.bare).await?;
+            self.dest_key = parts.label();
+            self.schema = parts.schema;
+        }
+        self.resolved = true;
+        Ok(())
     }
 
+    /// This destination as the guard sees it, in the resolved schema — so the
+    /// lock goes where the scan looks, and the lease is read from the table the
+    /// CDC lane writes it to.
+    fn guard(&self) -> PgGuard {
+        PgGuard::new(self.pool.clone(), self.schema.clone())
+    }
+
+    /// Take the announcement back, if this run still holds one. Best-effort by
+    /// contract: the run is over either way, and what a failed drop leaves is a
+    /// name the next run refuses, saying how to clear it.
     async fn release(&self) {
-        release_run(&self.pool, &self.lock_t).await
-    }
-
-    async fn reap_and_check_peers(&self) -> Result<()> {
-        check_peers(&self.pool, &self.schema, &self.bare, &self.run).await
+        let a = self.announced.lock().expect("announcement").take();
+        if let Some(a) = a {
+            if let Err(a) = crate::guard::release(&self.guard(), a).await {
+                a.abandon();
+            }
+        }
     }
 
     async fn drop_staging(&self, name: &str) -> Result<()> {
@@ -474,15 +530,6 @@ impl PgSink {
             run,
         );
         let staging_t = quote_ident_path(&format!("{schema_pfx}{staging_bare}"));
-        let lock_t = quote_ident_path(&format!(
-            "{schema_pfx}{}",
-            crate::naming::artifact_ident_run(
-                &bare,
-                crate::naming::Artifact::Lock,
-                crate::naming::PG_IDENT_MAX,
-                run,
-            )
-        ));
         let schema = schema_pfx.trim_end_matches('.').to_string();
         let schema = if schema.is_empty() {
             "public".into()
@@ -494,11 +541,12 @@ impl PgSink {
             final_t: quote_ident_path(dest_table),
             copy_in_sql: format!("COPY {staging_t} FROM STDIN (FORMAT binary)"),
             staging_t,
-            lock_t,
+            announced: std::sync::Mutex::new(None),
             dest_key: format!("{schema}.{bare}"),
             bare,
             schema,
             qualified,
+            resolved: false,
             restore_ddl: Vec::new(),
             merge_keys: Vec::new(),
             bootstrap_pk: false,
@@ -723,6 +771,7 @@ impl crate::sink::Sink for PgSink {
         mode: Mode,
     ) -> Result<()> {
         self.col_names = plan.cols.iter().map(|c| c.name.clone()).collect();
+        self.resolve_schema().await?;
 
         // Replace destroys the old table's indexes, constraints and grants with it —
         // capture them now so finalize can re-apply after the swap. (Column DEFAULTs
@@ -839,8 +888,10 @@ impl crate::sink::Sink for PgSink {
         // only on a scan taken AFTER its own announcement, so a concurrent
         // pair cannot both miss each other. `pipeline::run` releases the
         // announcement again if anything here fails; see `announce`.
-        self.announce().await?;
-        self.reap_and_check_peers().await?;
+        let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
+        *self.announced.lock().expect("announcement") = Some(a);
+        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::DeleteLeftovers)
+            .await?;
         // Incremental staging never becomes the final table — always skip its WAL.
         let unlogged = if durable && mode == Mode::Replace {
             ""
@@ -878,26 +929,8 @@ impl crate::sink::Sink for PgSink {
         let exists = self.final_exists().await?;
         // An unqualified dest name follows search_path — resolve the REAL schema so
         // the state table and its keys land next to the actual data.
-        if !self.qualified {
-            let resolved: String = if exists {
-                sqlx::query_scalar(
-                    "SELECT n.nspname FROM pg_class c \
-                     JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE c.oid = to_regclass($1::text)",
-                )
-                .bind(&self.final_t)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?
-            } else {
-                sqlx::query_scalar("SELECT current_schema()")
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?
-            };
-            self.dest_key = format!("{resolved}.{}", self.bare);
-            self.schema = resolved;
-        }
+        // The same resolution the CDC lane uses, and `prepare` asks for it too.
+        self.resolve_schema().await?;
         self.ensure_state_table().await?;
         if !exists {
             if mode == Mode::Merge {
