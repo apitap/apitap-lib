@@ -550,7 +550,6 @@ mod tests {
         // Shrinks by one file per adapter (handoff §3 steps 7-13) and is empty
         // once the CDC lane is on this module.
         const NOT_YET: &[&str] = &[
-            "sink/iceberg.rs",
             "logbased/dest_my.rs",
             "logbased/dest_ch.rs",
             "logbased/dest_bq.rs",

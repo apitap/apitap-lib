@@ -30,9 +30,9 @@
 //! staging object to drop out from under a peer — but the watermark rides in a
 //! table PROPERTY, and the REST spec has no requirement that can assert a
 //! property, so two same-source appends still read one watermark and land the
-//! delta twice. `IcebergSink::claim_and_check_peers` closes that with the same
+//! delta twice. The shared guard, over `IceGuard`, closes that with the same
 //! run token the SQL sinks put in their staging names, carried by a marker
-//! object; its doc comment has the full matrix.
+//! object; `IceGuard`'s doc comment has the full matrix.
 //!
 //! v1 scope, loudly enforced: format-version 2 tables, single-level
 //! namespaces, single-column integer/text/uuid merge keys, storage the
@@ -476,6 +476,159 @@ fn split_s3_uri(uri: &str) -> Result<(String, String)> {
 // The sink
 // ============================================================================
 
+/// The guard's view of an Iceberg table: its claim markers, spelled.
+///
+/// # Why this sink needs the check but not the rename half of the fix
+///
+/// The defect this pattern exists for — two runs sharing one staging
+/// object, so B's `prepare` drops what A is streaming into and A's
+/// `finalize` publishes B's empty replacement — cannot happen here, and it
+/// is worth being precise about why, because "already safe" was very
+/// nearly the whole answer:
+///
+/// * Every object a run PUTs (data files, manifests, manifest lists) is
+///   already keyed by its own `run_id`, a per-`bind` uuid. Two runs
+///   never write the same key, and nothing here drops anything on the way
+///   in.
+/// * The publish is a catalog compare-and-swap: the commit carries
+///   `assert-table-uuid` and `assert-ref-snapshot-id`, so a run can only
+///   move `main` from the snapshot it actually read. Losing that race is a
+///   409/412, and the loop reloads and rebuilds rather than clobbering.
+///
+/// So the *staging* half of the fix is structural here and needs no token.
+/// What CAS does **not** protect is the state that rides beside the data,
+/// and that is where two runs still hurt each other:
+///
+/// * **Two appends from the same source.** Both read
+///   `apitap.watermark.<source>` in `dest_state`, both drain everything
+///   past it, and both commit — the second retries, carries the first's
+///   manifests over, and lands the same rows a second time. Duplicate
+///   rows, two green runs. CAS cannot see it: the Iceberg REST spec has
+///   requirements for the table uuid, refs, schema and spec ids — and none
+///   at all for a property value, so a watermark simply cannot be asserted
+///   in the commit that consumes it.
+/// * **A replace beside anything.** A replace's manifest list carries only
+///   its own data manifests. If it loses the CAS to a concurrent append,
+///   the retry re-derives from the winner's metadata and overwrites it
+///   anyway — the append's rows leave the live table after it reported
+///   success. (They survive in snapshot history, so this is recoverable by
+///   time travel, which is exactly why it is silent.)
+///
+/// Both cells are precisely what [`crate::naming::peer_blocks`] encodes,
+/// so the marker gives this sink the same refusal the SQL destinations get
+/// — and the same *permission*: two appends from DIFFERENT sources into
+/// one table are the documented fan-in, and stay allowed.
+///
+/// # What the marker is, and what it is not
+///
+/// A one-line object whose NAME is the run token, in a prefix nothing else
+/// writes — the body is there only so a human who finds one knows what it
+/// is; nothing reads it. Listing them is one LIST of a few keys, placing
+/// one is a single PUT.
+///
+/// **The PUT comes FIRST**, and that ordering is the whole guarantee. Until
+/// 0.56.0 the marker was placed after the listing "so a run never trips over
+/// its own marker", and this comment said so: "two runs whose listings both
+/// precede the other's PUT will both proceed". They will not any more. A run
+/// proceeds only on a listing taken AFTER its own announcement, so a
+/// concurrent pair cannot both miss each other; at most one proceeds, and if
+/// each sees the other, both yield — a loud double failure with nothing
+/// written. The run's own marker is simply skipped in the loop, which is
+/// what "tripping over it" was really about.
+///
+/// The marker keeps its `Artifact::Staging` spelling rather than moving to
+/// `Artifact::Lock` like the other sinks' announcements. A 0.55.x run's
+/// marker is in flight during any rolling upgrade, and a name classified
+/// against a different artifact kind reads as `Foreign` — the new run would
+/// not see the old one at all. The kind is private to this prefix; the
+/// ordering is the part that matters.
+///
+/// Reaping is safe here only because the marker references nothing. The
+/// obvious alternative — treating a run's uncommitted DATA files as its
+/// claim, since they already carry a per-run prefix — was rejected: a data
+/// file's name cannot tell a live upload from one a snapshot already
+/// commits, so the listing would read finished runs as live peers (a false
+/// refusal for the whole horizon) and a sweep would delete referenced
+/// files (a corrupt table). The marker has neither failure mode.
+///
+/// The CDC drain's per-window commits (`CdcBound::cdc_commit`) place no
+/// marker: they are driven by `logbased::dest_ice` and never build an
+/// `IcebergSink`, so no `RunId` reaches them. A log_based run's *bootstrap*
+/// does come through here (its full load runs in `Mode::Replace`), so the
+/// expensive half of that lane is covered; the incremental windows are not.
+/// That is the same coverage the Postgres sink has, whose check also lives
+/// in `prepare`.
+pub(crate) struct IceGuard {
+    s3: S3Conn,
+    /// `<table location>/metadata/apitap-runs/` — its own prefix, not
+    /// `metadata/` itself, which holds every manifest the table ever had.
+    prefix: String,
+    label: String,
+}
+
+#[async_trait::async_trait]
+impl crate::guard::GuardStore for IceGuard {
+    fn limit(&self) -> usize {
+        crate::naming::ROOMY
+    }
+
+    fn dest_label(&self, _bare: &str) -> String {
+        self.label.clone()
+    }
+
+    /// The claim keeps the `Staging` spelling 0.55.1 and 0.56.0 Iceberg runs
+    /// scan for (see above), so a lock is written under it.
+    fn spelling(&self, a: crate::naming::Artifact) -> crate::naming::Artifact {
+        match a {
+            crate::naming::Artifact::Lock => crate::naming::Artifact::Staging,
+            other => other,
+        }
+    }
+
+    async fn list(&self, _bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        Ok(self
+            .s3
+            .list(&self.prefix)
+            .await?
+            .into_iter()
+            .map(|key| crate::guard::Listed {
+                canonical: key.rsplit('/').next().unwrap_or(&key).to_string(),
+                raw: key,
+            })
+            .collect())
+    }
+
+    /// A one-line object whose NAME is the claim; the body only tells a human
+    /// who finds one what it is.
+    async fn create_marker(&self, raw: &str) -> Result<()> {
+        self.s3
+            .put_object(
+                &format!("{}{raw}", self.prefix),
+                format!(
+                    "apitap run claim for {} — safe to delete once no run is loading this table\n",
+                    self.label
+                )
+                .into_bytes(),
+            )
+            .await
+    }
+
+    async fn drop_object(&self, raw: &str) -> Result<()> {
+        let key = if raw.starts_with(&self.prefix) { raw.to_string() } else { format!("{}{raw}", self.prefix) };
+        self.s3.delete(&key).await
+    }
+
+    async fn lease_get(&self, _key: &str, _token: &str) -> Result<Option<crate::lease::Lease>> {
+        Ok(None)
+    }
+
+    async fn lease_claim(&self, _key: &str, _token: &str) -> Result<crate::guard::Claim> {
+        Ok(crate::guard::Claim::Absent)
+    }
+
+    async fn lease_close(&self, _proof: crate::guard::Released) {}
+}
+
 pub(crate) struct IcebergSink {
     conn: IcebergConn,
     table: String,
@@ -489,8 +642,8 @@ pub(crate) struct IcebergSink {
     run_id: String,
     /// This run's identity, in the claim marker's name.
     run: crate::naming::RunId,
-    /// Object key of this run's claim marker, once `prepare` has placed it.
-    claim: Option<String>,
+    /// This run's claim, from `prepare` to the end of the run. See `IceGuard`.
+    announced: std::sync::Mutex<Option<crate::guard::Announced>>,
     // Resolved by dest_state/prepare (both run before loaders):
     meta: Option<TableMetadata>,
     s3: Option<S3Conn>,
@@ -522,7 +675,7 @@ impl IcebergSink {
             table: bare.to_string(),
             run_id: uuid::Uuid::new_v4().simple().to_string(),
             run: run.clone(),
-            claim: None,
+            announced: std::sync::Mutex::new(None),
             meta: None,
             s3: None,
             location: String::new(),
@@ -546,179 +699,26 @@ impl IcebergSink {
         format!("{}metadata/apitap-runs/", self.key_prefix)
     }
 
-    /// Refuse a live peer, sweep a dead one's marker, then claim the table.
-    ///
-    /// # Why this sink needs the check but not the rename half of the fix
-    ///
-    /// The defect this pattern exists for — two runs sharing one staging
-    /// object, so B's `prepare` drops what A is streaming into and A's
-    /// `finalize` publishes B's empty replacement — cannot happen here, and it
-    /// is worth being precise about why, because "already safe" was very
-    /// nearly the whole answer:
-    ///
-    /// * Every object a run PUTs (data files, manifests, manifest lists) is
-    ///   already keyed by its own `run_id`, a per-`bind` uuid. Two runs
-    ///   never write the same key, and nothing here drops anything on the way
-    ///   in.
-    /// * The publish is a catalog compare-and-swap: the commit carries
-    ///   `assert-table-uuid` and `assert-ref-snapshot-id`, so a run can only
-    ///   move `main` from the snapshot it actually read. Losing that race is a
-    ///   409/412, and the loop reloads and rebuilds rather than clobbering.
-    ///
-    /// So the *staging* half of the fix is structural here and needs no token.
-    /// What CAS does **not** protect is the state that rides beside the data,
-    /// and that is where two runs still hurt each other:
-    ///
-    /// * **Two appends from the same source.** Both read
-    ///   `apitap.watermark.<source>` in `dest_state`, both drain everything
-    ///   past it, and both commit — the second retries, carries the first's
-    ///   manifests over, and lands the same rows a second time. Duplicate
-    ///   rows, two green runs. CAS cannot see it: the Iceberg REST spec has
-    ///   requirements for the table uuid, refs, schema and spec ids — and none
-    ///   at all for a property value, so a watermark simply cannot be asserted
-    ///   in the commit that consumes it.
-    /// * **A replace beside anything.** A replace's manifest list carries only
-    ///   its own data manifests. If it loses the CAS to a concurrent append,
-    ///   the retry re-derives from the winner's metadata and overwrites it
-    ///   anyway — the append's rows leave the live table after it reported
-    ///   success. (They survive in snapshot history, so this is recoverable by
-    ///   time travel, which is exactly why it is silent.)
-    ///
-    /// Both cells are precisely what [`crate::naming::peer_blocks`] encodes,
-    /// so the marker gives this sink the same refusal the SQL destinations get
-    /// — and the same *permission*: two appends from DIFFERENT sources into
-    /// one table are the documented fan-in, and stay allowed.
-    ///
-    /// # What the marker is, and what it is not
-    ///
-    /// A one-line object whose NAME is the run token, in a prefix nothing else
-    /// writes — the body is there only so a human who finds one knows what it
-    /// is; nothing reads it. Listing them is one LIST of a few keys, placing
-    /// one is a single PUT.
-    ///
-    /// **The PUT comes FIRST**, and that ordering is the whole guarantee. Until
-    /// 0.56.0 the marker was placed after the listing "so a run never trips over
-    /// its own marker", and this comment said so: "two runs whose listings both
-    /// precede the other's PUT will both proceed". They will not any more. A run
-    /// proceeds only on a listing taken AFTER its own announcement, so a
-    /// concurrent pair cannot both miss each other; at most one proceeds, and if
-    /// each sees the other, both yield — a loud double failure with nothing
-    /// written. The run's own marker is simply skipped in the loop, which is
-    /// what "tripping over it" was really about.
-    ///
-    /// The marker keeps its `Artifact::Staging` spelling rather than moving to
-    /// `Artifact::Lock` like the other sinks' announcements. A 0.55.x run's
-    /// marker is in flight during any rolling upgrade, and a name classified
-    /// against a different artifact kind reads as `Foreign` — the new run would
-    /// not see the old one at all. The kind is private to this prefix; the
-    /// ordering is the part that matters.
-    ///
-    /// Reaping is safe here only because the marker references nothing. The
-    /// obvious alternative — treating a run's uncommitted DATA files as its
-    /// claim, since they already carry a per-run prefix — was rejected: a data
-    /// file's name cannot tell a live upload from one a snapshot already
-    /// commits, so the listing would read finished runs as live peers (a false
-    /// refusal for the whole horizon) and a sweep would delete referenced
-    /// files (a corrupt table). The marker has neither failure mode.
-    ///
-    /// The CDC drain's per-window commits (`CdcBound::cdc_commit`) place no
-    /// marker: they are driven by `logbased::dest_ice` and never build an
-    /// `IcebergSink`, so no `RunId` reaches them. A log_based run's *bootstrap*
-    /// does come through here (its full load runs in `Mode::Replace`), so the
-    /// expensive half of that lane is covered; the incremental windows are not.
-    /// That is the same coverage the Postgres sink has, whose check also lives
-    /// in `prepare`.
-    async fn claim_and_check_peers(&mut self) -> Result<()> {
-        use crate::naming::{parse_peer, Artifact, ROOMY};
-        let s3 = self.s3.clone().expect("storage bound before the claim");
-        let prefix = self.claim_prefix();
-        // No head/suffix pair is derived here any more: `naming::classify` takes
-        // the bare table name and works both anchors out itself, which is the
-        // point of it existing. S3 keys are byte-limited far above anything an
-        // Iceberg identifier reaches, hence ROOMY.
-        let mine_name =
-            crate::naming::artifact_ident_run(&self.table, Artifact::Staging, ROOMY, &self.run);
-        let mine = parse_peer(&mine_name, Artifact::Staging)
-            .expect("a name this process minted parses");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        // ANNOUNCE FIRST. Placed before the listing, not after it: a run that
-        // lists before announcing cannot be seen by a peer listing at the same
-        // moment, and both proceed — which is the defect this ordering removes.
-        // Not best-effort: a run that failed to claim is invisible to the next
-        // one, and that is the state this whole mechanism exists to prevent.
-        let mine_key = format!("{prefix}{mine_name}");
-        s3.put_object(
-            &mine_key,
-            format!(
-                "apitap run claim for {}.{} — safe to delete once no run is \
-                 loading this table\n",
-                self.conn.namespace, self.table
-            )
-            .into_bytes(),
-        )
-        .await?;
-        self.claim = Some(mine_key);
-
-        for key in s3.list(&prefix).await? {
-            let name = key.rsplit('/').next().unwrap_or(&key);
-            // `naming::classify` owns both anchors, the exact token width and
-            // the ordering. There is no legacy arm to worry about here — this
-            // prefix is new with the mechanism, so no untokenized marker exists
-            // for `classify` to find, and its Dead branch simply never fires.
-            match crate::naming::classify(name, &self.table, Artifact::Staging, ROOMY, &self.run, now)
-            {
-                // Somebody else's object. Deleting a stranger's is not this
-                // function's business.
-                crate::naming::Found::Foreign => {}
-                // This run's own marker. Best effort: failing a good transfer
-                // over a one-line marker trades a real run for nothing.
-                // Legacy never fires here — this claim prefix is new with the
-                // mechanism, so no untokenized marker exists for classify to
-                // find. Matched explicitly rather than by a wildcard so adding
-                // an artifact kind later is a compile error, not a silent
-                // delete.
-                crate::naming::Found::Legacy => {
-                    return Err(crate::naming::legacy_error(
-                        &format!("{}.{}", self.conn.namespace, self.table), &key));
-                }
-                // This run's own marker — the one placed a few lines above.
-                // Deleting it here is what the old post-listing placement made
-                // look harmless; now it would erase the announcement a
-                // concurrent peer is about to look for.
-                crate::naming::Found::Mine => {}
-                // The run that spawned this one: not a peer, not ours to delete.
-                crate::naming::Found::Parent => {}
-                crate::naming::Found::Live(peer) => {
-                    if crate::naming::peer_blocks(&mine, &peer) {
-                        return Err(crate::naming::locked_error(
-                            &format!("{}.{}", self.conn.namespace, self.table),
-                            &key,
-                            &mine,
-                            &peer,
-                            now,
-                            // No lease to read on this path — this sink keeps its own
-                            // classify loop and never collects. See `naming::collectable`.
-                            None,
-                        ));
-                    }
-                }
-            }
+    /// This destination as the guard sees it: the claim prefix under the
+    /// table's own location, which only the catalog knows — so it exists only
+    /// once `bind_storage` has run.
+    fn guard(&self) -> IceGuard {
+        IceGuard {
+            s3: self.s3.clone().expect("storage bound before the claim"),
+            prefix: self.claim_prefix(),
+            label: format!("{}.{}", self.conn.namespace, self.table),
         }
-
-        Ok(())
     }
 
     /// Drop this run's claim. Best effort on purpose: the transfer is already
-    /// decided by the time this runs, and a marker left behind costs one reap
-    /// on the next run rather than a reported failure on this one. A run killed
-    /// outright never gets here at all, which is what the horizon is for.
-    async fn release_claim(&self, s3: &S3Conn) {
-        if let Some(key) = &self.claim {
-            let _ = s3.delete(key).await;
+    /// decided by the time this runs, and a marker left behind is named by the
+    /// next run's refusal rather than turned into a failure of this one.
+    async fn release(&self) {
+        let a = self.announced.lock().expect("announcement").take();
+        if let (Some(a), true) = (a, self.s3.is_some()) {
+            if let Err(a) = crate::guard::release(&self.guard(), a).await {
+                a.abandon();
+            }
         }
     }
 
@@ -1068,7 +1068,10 @@ impl crate::sink::Sink for IcebergSink {
         self.bind_storage(&meta)?;
         // Before a single byte moves, and after storage is bound (the marker
         // lives under the table's own location, which only the catalog knows).
-        self.claim_and_check_peers().await?;
+        let a = crate::guard::announce(&self.guard(), &self.table, &self.run).await?;
+        *self.announced.lock().expect("announcement") = Some(a);
+        crate::guard::check_peers(&self.guard(), &self.table, &self.run, crate::guard::Mine::Keep)
+            .await?;
         self.names = Arc::new(names);
         self.delivered = Arc::new(delivered);
         self.field_ids = Arc::new(ids);
@@ -1115,9 +1118,7 @@ impl crate::sink::Sink for IcebergSink {
     /// objects are swept on the same pass: no snapshot references them, so
     /// they are bytes nobody can reach and everybody pays for.
     async fn release_lock(&self) {
-        if let Some(s3) = self.s3.clone() {
-            self.release_claim(&s3).await;
-        }
+        self.release().await;
     }
 
     async fn discard(&self) -> Result<()> {
@@ -1128,7 +1129,7 @@ impl crate::sink::Sink for IcebergSink {
         for f in &files {
             let _ = s3.delete(&f.key).await;
         }
-        self.release_claim(&s3).await;
+        self.release().await;
         Ok(())
     }
 
@@ -1139,7 +1140,7 @@ impl crate::sink::Sink for IcebergSink {
             for f in &files {
                 let _ = s3.delete(&f.key).await;
             }
-            self.release_claim(&s3).await;
+            self.release().await;
             return Ok(());
         }
         let out = match self.commit(&s3, &files, mode).await {
@@ -1156,7 +1157,7 @@ impl crate::sink::Sink for IcebergSink {
         // Released on both arms: a run that failed at the commit is just as
         // finished as one that succeeded, and leaving its marker would make the
         // next run wait out the reap horizon for nothing.
-        self.release_claim(&s3).await;
+        self.release().await;
         out
     }
 }

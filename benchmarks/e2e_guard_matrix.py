@@ -12,10 +12,11 @@ takes every answer from the server's own catalog:
   B  a live DRAIN's lock with a live lease behind it refuses a drain BY TYPE,
      and is left in place                                 (guard.drain-vs-bulk)
 
-    python benchmarks/e2e_guard_matrix.py <bq|my|ch|s3>
+    python benchmarks/e2e_guard_matrix.py <bq|my|ch|s3|ice>
 
 Rig: `apitap-bench-pg-src` :5544 as the source; MySQL :3307, ClickHouse :8124,
-the gate's BigQuery dataset (BQ_SA), or the bench MinIO (:9100) as the destination.
+the gate's BigQuery dataset (BQ_SA), the bench MinIO (:9100), or the Iceberg
+REST catalog (:8181) over it as the destination.
 """
 import sys
 
@@ -190,7 +191,54 @@ class S3:
             _rig.s3_delete(k)
 
 
-E = {"bq": Bq, "my": My, "ch": Ch, "s3": S3}[ENGINE]()
+class Ice:
+    """An Iceberg table's claims live under the table's own location, in
+    `metadata/apitap-runs/`, spelled with the STAGING suffix every Iceberg run
+    since 0.55.1 scans for. The location is the catalog's to say, so the table
+    is created first and the plant goes where the catalog put it."""
+    ns = "cdc_e2e"
+    url = (f"iceberg://127.0.0.1:8181/{ns}?endpoint=http://{_rig.S3_ENDPOINT}"
+           "&access_key_id=bench&secret_access_key=benchbench")
+    table_url = f"http://127.0.0.1:8181/v1/namespaces/{ns}/tables/{T}"
+    staging_decoration = None
+
+    def _meta(self):
+        import requests
+        r = requests.get(self.table_url)
+        return r.json() if r.status_code == 200 else None
+
+    def claim_prefix(self):
+        loc = self._meta()["metadata"]["location"]              # s3://bucket/key/prefix
+        return loc.split("/", 3)[3].rstrip("/") + "/metadata/apitap-runs/"
+
+    def names(self):
+        return _rig.s3_list(self.claim_prefix()) if self._meta() else []
+
+    def plant(self, name):
+        _rig.s3_put(name, b"planted claim\n")
+
+    def unplant(self, name):
+        _rig.s3_delete(name)
+
+    def count(self):
+        import duckdb
+        d = duckdb.connect()
+        d.execute("INSTALL iceberg; LOAD iceberg;")
+        d.execute(f"SET s3_endpoint='{_rig.S3_ENDPOINT}'; SET s3_use_ssl=false; SET s3_url_style='path'; "
+                  "SET s3_access_key_id='bench'; SET s3_secret_access_key='benchbench'; "
+                  f"SET s3_region='{_rig.S3_REGION}';")
+        loc = self._meta()["metadata-location"]
+        return str(d.execute(f"SELECT count(*) FROM iceberg_scan('{loc}')").fetchone()[0])
+
+    def clean(self):
+        import requests
+        if self._meta():
+            for k in _rig.s3_list(self.claim_prefix()):
+                _rig.s3_delete(k)
+            requests.delete(self.table_url + "?purgeRequested=true")
+
+
+E = {"bq": Bq, "my": My, "ch": Ch, "s3": S3, "ice": Ice}[ENGINE]()
 _SLOTS = set(_rig.psql("SELECT slot_name FROM pg_replication_slots", _rig.PG_SRC).split())
 
 
@@ -213,6 +261,10 @@ try:
     print("== A. a live replace's staging refuses a replace, and stays ==")
     if ENGINE == "s3":
         staging = f"{E.root}{_rig.fresh_token('r')}/part-00000.parquet"
+    elif ENGINE == "ice":
+        # The claim lives under the table's location, so the table must exist.
+        apitap.transfer(PG, E.url, table=T, mode="replace")
+        staging = f"{E.claim_prefix()}{T}{_rig.fresh_token('r')}__apitap_staging"
     else:
         staging = f"{T}{_rig.fresh_token('r')}__apitap_staging{E.staging_decoration}"
     E.plant(staging)
