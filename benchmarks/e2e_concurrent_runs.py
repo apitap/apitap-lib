@@ -69,6 +69,8 @@ import sys
 import threading
 import time
 
+import _rig
+
 SRC = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
 DST = os.environ.get("PGD_URL", "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst")
 T = "conc_runs"
@@ -431,37 +433,71 @@ print("== leg 7: the guard still works where no drain has ever run ==")
 # sqlx does not put in its message, so every peer refusal on such a destination
 # came back as a bare RuntimeError instead of a typed LockedError. The gate hid
 # it, because an earlier leg had already created the table.
-reset(rows=200_000)
+#
+# The overlap is taken from the SERVER. An earlier version started two threads
+# and accepted "nothing yielded this time" — `all([])` is True, so a burst in
+# which neither run ever met the other passed without testing anything. Now A
+# runs alone until pg_class lists its staging, and only then does B start.
+reset(rows=2_000_000)
 dst('DROP TABLE IF EXISTS "_apitap_lease"')
 case("(rig) the lease store really is absent",
      dst("SELECT to_regclass('public._apitap_lease') IS NULL") == "t",
      "dropped")
-r = sh([sys.executable, "-c", f"""
-import apitap, threading
-out = []
-def go(tag):
-    try:
-        r = apitap.transfer({SRC!r}, {DST!r}, table={T!r}, mode="replace")
-        out.append((tag, "ok", r.rows))
-    except Exception as e:
-        out.append((tag, type(e).__name__))
-ts = [threading.Thread(target=go, args=(t,)) for t in ("A", "B")]
-[t.start() for t in ts]; [t.join(900) for t in ts]
-print("BURST", sorted(out))
-"""])
-line = (r.stdout or "").strip()
-print(f"      outcome: {line[:160]}")
-try:
-    pairs = ast.literal_eval(line.split("BURST ", 1)[1].splitlines()[0])
-except Exception as e:                                        # noqa: BLE001
-    pairs = []
-    print(f"      (could not parse: {e}; stderr {r.stderr[-200:]})")
-refusals = [p[1] for p in pairs if len(p) == 2]
-case("a yielding run still refuses by TYPE with no lease store",
-     bool(pairs) and all(e == "LockedError" for e in refusals),
-     f"refusals: {refusals or 'none — nothing yielded this time'}")
-case("and no run died of the store's absence",
-     "RuntimeError" not in refusals, f"{pairs}")
+a = subprocess.Popen([sys.executable, "-c",
+                      "import apitap\n"
+                      f"r = apitap.transfer({SRC!r}, {DST!r}, table={T!r}, mode='replace')\n"
+                      "print('ROWS', r.rows, flush=True)\n"],
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+if not _rig.wait_for(lambda: a.poll() is not None or any(
+        n.endswith("__apitap_staging") for n in staging_names()), 120, step=0.05) \
+        or a.poll() is not None:
+    a.kill(); a.wait()
+    _rig.rig_fail("A's staging never appeared in pg_class while A was running")
+b = sh([sys.executable, "-c",
+        "import apitap\n"
+        "try:\n"
+        f"    apitap.transfer({SRC!r}, {DST!r}, table={T!r}, mode='replace')\n"
+        "    print('B ok')\n"
+        "except Exception as e:\n"
+        "    print('B', type(e).__name__, str(e).splitlines()[0][:160])\n"])
+a_alive_after_b = a.poll() is None
+a_out, a_err = a.communicate(timeout=900)
+b_line = (b.stdout or "").strip().splitlines()[-1:] or [b.stderr.strip()[-160:]]
+case("(rig) A was still running when B was refused", a_alive_after_b,
+     "B's refusal must have met A, not an empty table")
+case("B is refused by TYPE with no lease store: LockedError",
+     b_line[0].startswith("B LockedError"), b_line[0])
+case("and no run died of the store's absence", "RuntimeError" not in b_line[0], b_line[0])
+case("A finished and its rows are all there",
+     a.returncode == 0 and dst(f"SELECT count(*) FROM {T}") == src(f"SELECT count(*) FROM {T}"),
+     f"rc={a.returncode} {(a_err or '').strip()[-160:]}")
+for n in staging_names():
+    dst(f'DROP TABLE IF EXISTS "{n}"')
+
+# 7b is the half of the leg that actually READS the absent store. A bulk run
+# takes its lock back at the end of `prepare`, so B above met A's staging —
+# which is never collectable and so never asks about a lease. What does ask is
+# a drain's lock: a CDC lock with no lease row behind it (an apitap older than
+# the lease, or an operator's plant). With no store at all, that read must mean
+# "nothing is leased" and end in a typed refusal — the path the SQLSTATE bug
+# turned into a bare RuntimeError.
+PLANT = f"{T}_0000001l000abcd__apitap_lock"
+dst(f'CREATE TABLE "{PLANT}" ()')
+b = sh([sys.executable, "-c",
+        "import apitap\n"
+        "try:\n"
+        f"    apitap.transfer({SRC!r}, {DST!r}, table={T!r}, mode='replace')\n"
+        "    print('B ok')\n"
+        "except Exception as e:\n"
+        "    print('B', type(e).__name__, str(e).splitlines()[0][:220])\n"])
+b_line = ((b.stdout or "").strip().splitlines()[-1:] or [b.stderr.strip()[-160:]])[0]
+case("(rig) the lease store is still absent when the drain's lock is met",
+     dst("SELECT to_regclass('public._apitap_lease') IS NULL") == "t")
+case("a drain's lock with no lease store is refused by TYPE: LockedError",
+     b_line.startswith("B LockedError"), b_line)
+case("and it is never collected — no record of liveness means refuse",
+     PLANT in staging_names(), f"{PLANT} still listed")
+dst(f'DROP TABLE IF EXISTS "{PLANT}"')
 for n in staging_names():
     dst(f'DROP TABLE IF EXISTS "{n}"')
 

@@ -157,8 +157,13 @@ got_lock = wait_for(lambda: bool(locks(T)), 60)
 tok = token_of(locks(T)[0]) if got_lock else None
 case("(rig) the drain announced itself", bool(tok), f"token {tok}")
 if tok:
-    dst(f"UPDATE _apitap_lease SET collected = true "
-        f"WHERE dest_key = 'public.{T}' AND token = '{tok}'")
+    # The eviction's own commit time, from the server. The UPDATE queues behind
+    # the drain's apply transaction whenever that transaction holds the row
+    # (`fence_tx` takes it FOR UPDATE first), so when it returns every window
+    # that will EVER commit has committed — and the count read next is final.
+    t_ev = dst(f"UPDATE _apitap_lease SET collected = true "
+               f"WHERE dest_key = 'public.{T}' AND token = '{tok}' "
+               "RETURNING clock_timestamp()").splitlines()[0]    # psql adds "UPDATE 1"
     at_eviction = int(dst(f"SELECT count(*) FROM {T}"))
     p.wait(180)
     err = (p.stderr.read() or "")
@@ -174,12 +179,23 @@ if tok:
     # long way short of the source.
     case("it did not run to completion — the source is far ahead", after < total,
          f"dest {after} of source {total} (was {at_eviction} when evicted)")
-    # The fence is the FIRST statement of the apply transaction, so a window
-    # that started after the eviction rolls back whole. At most the one already
-    # committed can be there.
-    case("and the rows it did land are a committed window, not a torn one",
-         after == at_eviction or after < total,
+    # Exactly, not "at most one window more": the fence is the FIRST statement
+    # of every apply transaction, and the eviction above waited for the one in
+    # flight. An earlier version asserted `after == at_eviction or after <
+    # total`, which the line above already guaranteed — it could not fail.
+    case("not one row landed after the eviction", after == at_eviction,
          f"{at_eviction} at eviction -> {after} at exit")
+    # The same fact from the bookkeeping side. `synced_at` is the apply
+    # transaction's start, so a window that began after the eviction and still
+    # committed would show a state row newer than it.
+    mine = f"dest_table IN ('{T}', 'public.{T}')"
+    case("(rig) the drain's state row is there to be asked",
+         dst(f"SELECT count(*) FROM _apitap_state WHERE {mine}") != "0",
+         "without it the next check would pass on an empty table")
+    late = dst(f"SELECT count(*) FROM _apitap_state WHERE {mine} "
+               f"AND synced_at > '{t_ev}'::timestamptz")
+    case("and no state row was written after it", late == "0",
+         f"{late} state row(s) with synced_at > {t_ev}")
 else:
     p.kill(); p.wait()
     case("(rig) leg 1 could not be staged", False, "the drain never announced itself")

@@ -59,6 +59,8 @@ import subprocess
 import sys
 import time
 
+import _rig
+
 PG = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
 CH = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default")
 PG_C = os.environ.get("PG_CONTAINER", "apitap-bench-pg-src")
@@ -136,6 +138,23 @@ def case(label, good, detail=""):
     global ok
     print(f"   {'OK' if good else 'XX'} {label}{': ' + detail if detail else ''}")
     ok = ok and bool(good)
+
+
+def assert_released(after):
+    """A run that ended cleanly — a graceful stop included — has taken back
+    everything it announced. Asked of the SERVER before anything is cleaned:
+    until 0.57.0 every leg after a graceful stop began with clear_dead_lock(),
+    which would have hidden a stop that left its lock behind exactly as well as
+    it hid a hard kill's.
+
+    The lease is not asked about here yet. On 0.56.0 a released ClickHouse
+    lease reads as live for its whole TTL: the release row is stamped into 1970
+    and the lease table's own `TTL … DELETE` drops it AT INSERT, so the close
+    never lands. The TTL goes in 0.57.0 (handoff §0 L7), and the lease half of
+    this assertion goes in with it."""
+    left = (_rig.locks_ch(T), _rig.markers_ch(T))
+    case(f"after {after}: no lock and no marker on the server",
+         left == ([], []), f"locks={left[0]} markers={left[1]}")
 def _slots_now():
     return set(pg("SELECT slot_name FROM pg_replication_slots").split())
 
@@ -286,8 +305,8 @@ else:
 
 # ---------------------------------------------------------------------------
 print("== leg 2: twice to insist - the second SIGTERM is not absorbed ==")
-# A deliberate kill above left its announcement; do the operator's part.
-clear_dead_lock()
+# Leg 1 stopped GRACEFULLY, so there is nothing for an operator to clear.
+assert_released("the graceful stop of leg 1")
 
 # The two signals go out back to back, ~0.1 s apart, and the leg checks the
 # process is STILL RUNNING in between. That check is what makes the leg valid:
@@ -373,8 +392,8 @@ case("and its key sum matches exactly", src_sum == dst_sum, f"pg={src_sum} ch={d
 
 # ---------------------------------------------------------------------------
 print("== leg 4: request_stop() from another thread ==")
-# A deliberate kill above left its announcement; do the operator's part.
-clear_dead_lock()
+# Leg 3 ran to completion, so it must have taken its lock back.
+assert_released("the resume run of leg 3")
 
 # The public door, for hosts whose signal handling apitap will not touch. It
 # runs off-thread because that is the shape it exists for: the main thread
@@ -423,6 +442,8 @@ landed = ch_count()
 case("a window landed", landed > floor, f"{floor} -> {landed}")
 case("and the run stopped short of the new backlog", landed < src_total,
      f"{landed} of {src_total}")
+
+assert_released("request_stop() of leg 4")
 
 # ---------------------------------------------------------------------------
 print("== cleanup ==")

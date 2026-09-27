@@ -23,6 +23,8 @@ import subprocess
 import sys
 import time
 
+import _rig
+
 MY = os.environ.get("MY_URL", "mysql://root:bench@127.0.0.1:3307/bench")
 CH = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default")
 MY_C = "apitap-bench-my"
@@ -77,6 +79,23 @@ def case(label, good, detail=""):
     global ok
     print(f"   {'OK' if good else 'XX'} {label}{': ' + detail if detail else ''}")
     ok = ok and bool(good)
+
+
+def assert_released(after):
+    """A run that ended cleanly — a graceful stop included — has taken back
+    everything it announced. Asked of the SERVER before anything is cleaned:
+    until 0.57.0 every leg after a graceful stop began with clear_dead_lock(),
+    which would have hidden a stop that left its lock behind exactly as well as
+    it hid a hard kill's.
+
+    The lease is not asked about here yet. On 0.56.0 a released ClickHouse
+    lease reads as live for its whole TTL: the release row is stamped into 1970
+    and the lease table's own `TTL … DELETE` drops it AT INSERT, so the close
+    never lands. The TTL goes in 0.57.0 (handoff §0 L7), and the lease half of
+    this assertion goes in with it."""
+    left = (_rig.locks_ch(T), _rig.markers_ch(T))
+    case(f"after {after}: no lock and no marker on the server",
+         left == ([], []), f"locks={left[0]} markers={left[1]}")
 
 
 def backlog(frm, n):
@@ -202,8 +221,8 @@ else:
 
 # ---------------------------------------------------------------------------
 print("== leg 2: the resume is exact — the binlog position was told the truth ==")
-# The legs above kill the process outright, so they leave an announcement.
-clear_dead_lock()
+# Leg 1 stopped GRACEFULLY, so there is nothing for an operator to clear.
+assert_released("the graceful stop of leg 1")
 floor = ch_count()
 r = sh([sys.executable, "-c", RUN], env=dict(os.environ, APITAP_CDC_WINDOW_BYTES=WINDOW))
 case("the resume run succeeds", r.returncode == 0, r.stderr.strip()[-200:])
@@ -213,6 +232,8 @@ case("the destination reaches the source's count", final == src_total,
 src_sum = my(f"SELECT COALESCE(SUM(id),0) FROM {T}")
 dst_sum = ch(f"SELECT sum(id) FROM {T}")
 case("and its key sum matches exactly", src_sum == dst_sum, f"my={src_sum} ch={dst_sum}")
+
+assert_released("the resume run of leg 2")
 
 # ---------------------------------------------------------------------------
 print("== cleanup ==")

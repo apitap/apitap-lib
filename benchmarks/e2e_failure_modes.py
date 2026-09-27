@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 
+import _rig
+
 PG = "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src"
 PGD = "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst"
 CH = "clickhouse://default:bench@127.0.0.1:8124/default"
@@ -49,20 +51,12 @@ def ch(sql):
                "default", "--password", "bench", "-q", sql]).stdout.strip()
 
 
-def spawn(code):
+def spawn(code, env=None):
     """Run engine work in a child so it can be killed the way an operator's
     process, pod or Airflow task gets killed."""
     return subprocess.Popen([sys.executable, "-c", code],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-
-def kill_after(p, secs):
-    time.sleep(secs)
-    if p.poll() is not None:
-        return False                      # finished too fast to be a mid-flight kill
-    os.kill(p.pid, signal.SIGKILL)
-    p.wait(timeout=30)
-    return True
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=dict(os.environ, **(env or {})))
 
 
 def kill_once_staging_exists(p, probe, timeout=60.0):
@@ -176,10 +170,25 @@ print(r.rows)
          r.returncode == 0 and landed == truth, f"{landed} rows == source {truth}")
 drop_ch(ch, T)
 
-print("== 2. SIGKILL mid-CDC-window: the watermark must not move ==")
+print("== 2. SIGKILL mid-CDC-drain: nothing lost, nothing doubled, the lock clears itself ==")
+# The kill used to be a timer — `kill_after(p, 1.2)` — and a run that finished
+# inside 1.2 s turned the whole case into "PASS (the kill lost its race)", with
+# none of the lease assertions run. A PGO wheel finishes this window in well
+# under that, so the case had quietly stopped testing anything. The kill is now
+# taken from the SERVER: the moment ClickHouse holds more rows than the
+# bootstrap left, the drain is provably mid-flight, and it dies there. A drain
+# that ends before that is a rig failure, never a pass.
+#
+# What is NOT asserted any more is "the watermark did not move". With the kill
+# landing after data has provably started to land, earlier windows may already
+# have committed their watermark — which is correct, and the old assertion
+# held only because the old kill usually landed before anything was applied.
+# The claim that matters is the replay's: every change exactly once.
+CT_ROWS = 1_000
+CT_BACKLOG = 60_000
 pg(f"DROP TABLE IF EXISTS {CT}")
 pg(f"CREATE TABLE {CT} (id int primary key, v text)")
-pg(f"INSERT INTO {CT} SELECT g, 'v'||g FROM generate_series(1,1000) g")
+pg(f"INSERT INTO {CT} SELECT g, 'v'||g FROM generate_series(1,{CT_ROWS}) g")
 ch(f"DROP TABLE IF EXISTS {CT}")
 ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{CT}' SETTINGS mutations_sync=1")
 boot = sh([sys.executable, "-c", f"""
@@ -190,40 +199,46 @@ if boot.returncode:
     case("cdc bootstrap", False, boot.stderr[-300:])
 else:
     wm0 = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{CT}' AND source_id NOT LIKE 'server-identity:%'")
-    # A window big enough that a kill lands inside the apply.
+    baseline = int(ch(f"SELECT count() FROM {CT}") or 0)
     pg(f"UPDATE {CT} SET v = v || '-x'")
-    pg(f"INSERT INTO {CT} SELECT g, 'n'||g FROM generate_series(1001,4000) g")
+    for lo in range(CT_ROWS + 1, CT_ROWS + CT_BACKLOG + 1, 5_000):
+        pg(f"INSERT INTO {CT} SELECT g, 'n'||g FROM generate_series({lo},{lo + 4_999}) g")
+    # Small windows, so the drain is many windows long and the kill lands
+    # between two of them rather than racing the only one.
     p = spawn(f"""
 import apitap
 apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
-""")
-    killed = kill_after(p, 1.2)
+""", env={"APITAP_CDC_WINDOW_BYTES": "262144"})
+    def landing():
+        n = ch(f"SELECT count() FROM {CT}")
+        return p.poll() is not None or (n.isdigit() and int(n) > baseline)
+    _rig.wait_for(landing, 60, step=0.02)
+    if p.poll() is not None:
+        _rig.rig_fail(f"the drain finished (rc={p.returncode}) before a row landed past the "
+                      f"{baseline}-row bootstrap, so the kill could not land mid-drain — "
+                      "raise CT_BACKLOG or lower the window")
+    os.kill(p.pid, signal.SIGKILL)
+    p.wait(timeout=30)
+    at_kill = ch(f"SELECT count() FROM {CT}")
     wm1 = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table='{CT}' AND source_id NOT LIKE 'server-identity:%'")
-    if not killed:
-        case("mid-window kill", True, "window completed before the kill — watermark advanced legitimately")
-    else:
-        case("watermark unmoved after a killed window", wm1 == wm0,
-             f"{wm1 or '(none)'} == {wm0 or '(none)'}")
+    case("(rig) the drain was killed mid-flight", p.returncode == -signal.SIGKILL,
+         f"rc={p.returncode}; {at_kill} of {CT_ROWS + CT_BACKLOG} rows had landed; "
+         f"watermark {wm0 or '(none)'} -> {wm1 or '(none)'}")
     # Recovery. A killed drain leaves its `__apitap_lock`, so the immediate
-    # re-run is REFUSED — and then clears itself once the lease lapses. This leg
-    # used to re-run straight away and assert success, which was green only
-    # because the 1.2s kill usually lost its race: whenever the kill actually
-    # landed, the re-run would have been refused and nobody would have known
-    # which of the two it was. Now it asserts both halves.
-    if killed:
-        immediate = sh([sys.executable, "-c", f"""
+    # re-run is REFUSED — and then clears itself once the lease lapses.
+    immediate = sh([sys.executable, "-c", f"""
 import apitap
 apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
 """])
-        case("a killed drain's lock refuses the immediate re-run",
-             immediate.returncode != 0 and "locked" in (immediate.stderr or "").lower(),
-             (immediate.stderr.strip().splitlines() or [""])[-1][:130])
-        # …and the refusal must say the wait is finite, or an operator reads it
-        # as the permanent wedge it used to be.
-        case("and the refusal promises the wait ends by itself",
-             "nothing for you to do" in (immediate.stderr or ""),
-             (immediate.stderr or "")[-130:])
-        time.sleep(LEASE_TTL + 3)
+    case("a killed drain's lock refuses the immediate re-run",
+         immediate.returncode != 0 and "locked" in (immediate.stderr or "").lower(),
+         (immediate.stderr.strip().splitlines() or [""])[-1][:130])
+    # …and the refusal must say the wait is finite, or an operator reads it
+    # as the permanent wedge it used to be.
+    case("and the refusal promises the wait ends by itself",
+         "nothing for you to do" in (immediate.stderr or ""),
+         (immediate.stderr or "")[-130:])
+    time.sleep(LEASE_TTL + 3)
     r = sh([sys.executable, "-c", f"""
 import apitap
 apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
@@ -232,11 +247,11 @@ apitap.transfer({PG!r}, {CH!r}, table={CT!r}, mode="log_based")
     dst_digest = ch(f"SELECT toString(count()) || '|' || toString(sum(toInt64(id))) || '|' || "
                     f"lower(hex(MD5(arrayStringConcat(arraySort(x -> x.1, groupArray((id, v))).2, ',')))) FROM {CT}")
     exact = src_digest.split("|")[:2] == dst_digest.split("|")[:2]
-    case("replay applies every change exactly once — with no manual step",
+    case("after the lease lapsed, the replay applies every change exactly once — no manual step",
          r.returncode == 0 and exact,
          f"src {src_digest.split('|')[0]} rows / sum {src_digest.split('|')[1]} == "
          f"dst {dst_digest.split('|')[0]} / {dst_digest.split('|')[1]}"
-         + (" (after the lease lapsed)" if killed else " (the kill lost its race)"))
+         + ("" if r.returncode == 0 else f"; rc={r.returncode} {(r.stderr or '')[-160:]}"))
 
 print("== 3. the source connection is cut mid-COPY ==")
 drop_ch(ch, T)
