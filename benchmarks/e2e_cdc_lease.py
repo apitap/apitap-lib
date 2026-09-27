@@ -95,7 +95,7 @@ def clean():
     pg(f"DROP PUBLICATION IF EXISTS apitap_pub_{T}")
     pg("SELECT pg_drop_replication_slot(s) FROM (SELECT slot_name s FROM "
        "pg_replication_slots WHERE slot_name LIKE 'apitap_%') x")
-    for n in locks():
+    for n in locks() + _rig.markers_ch(T):
         ch(f"DROP TABLE IF EXISTS `{n}`")
     ch(f"DROP VIEW IF EXISTS {T}__current")
     ch(f"DROP TABLE IF EXISTS {T}")

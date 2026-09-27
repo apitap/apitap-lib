@@ -26,6 +26,8 @@ import subprocess
 import sys
 import time
 
+import _rig
+
 SRC = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
 DST = os.environ.get("PGD_URL", "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst")
 T = "fence_demo"
@@ -113,7 +115,11 @@ def clean():
         src(f"DROP TABLE IF EXISTS {t} CASCADE")
         src(f"DROP PUBLICATION IF EXISTS apitap_pub_{t}")
         dst(f"DROP TABLE IF EXISTS {t} CASCADE")
-        for n in locks(t):
+        # The lock AND the staging marker a drain announces since 0.57.0. A
+        # marker left behind after its lease row is deleted below is never
+        # collected ("no record of liveness means refuse") — correctly — and
+        # would refuse the next run of this leg.
+        for n in _rig.locks_pg(t) + _rig.markers_pg(t):
             dst(f'DROP TABLE IF EXISTS "{n}"')
     src("DROP PUBLICATION IF EXISTS apitap_pub_fence_demo_fence_demo_two")
     drop_our_slots()

@@ -230,9 +230,14 @@ def held_new_drain():
             or d.poll() is not None:
         d.kill()
         _rig.rig_fail(f"the NEW drain never showed its lock (rc={d.poll()}, names={E.names()})")
+    # The marker is created right after the lock, by the same announcement —
+    # a second API call on BigQuery, so it can land a second or two later.
+    # Stop the drain only once it is there (or clearly never coming: the 0.56.0
+    # wheel as NEW writes none), or a kill below would take it with it.
+    _rig.wait_for(lambda: d.poll() is not None or bool(markers()), 15, step=0.05)
+    if d.poll() is not None:
+        _rig.rig_fail(f"the NEW drain finished before it could be held (names={E.names()})")
     os.kill(d.pid, signal.SIGSTOP)
-    # The marker is created right after the lock by the same announcement.
-    _rig.wait_for(lambda: bool(markers()), 2, step=0.05)
     return d
 
 
