@@ -999,23 +999,15 @@ async fn run_group(
         }
 
         if have.is_empty() {
-            // HAND THE GUARD OVER. A bootstrap's full load IS a bulk run: it goes
-            // back through `transfer(mode="replace")`, whose sink `prepare`
-            // announces a `Swap` lock of its own and then scans — and it would find
-            // OURS and refuse itself. `peer_blocks` says a swap and a CDC drain
-            // cannot coexist, which is the matrix working correctly on the wrong
-            // pair: this is one run, not two.
-            //
-            // So the announcement is released here and the bulk lock covers the
-            // load, which is the long half and the one that moves data. What is
-            // given up is the instant between the two: two CDC runs that both read
-            // "no state" both reach the bootstrap, and the LOSER is refused by the
-            // bulk guard instead of by this one — loudly either way.
-            // The lease goes with it. A lease whose lock is gone is inert, but
-            // leaving one behind would let a later run "collect" a lock this
-            // run no longer owns.
-            give_back(std::mem::take(&mut held)).await;
-            bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs).await
+            // The full load is a nested run (`transfer_within`): its own Swap
+            // token names this run as parent, so its guard classifies our lock
+            // and marker as `Found::Parent` and proceeds. The lock and lease stay
+            // held, renewed by the keeper, through the load and `bootstrap_finish`;
+            // the exit arm below is the only release. (0.56.0 released them here
+            // and let the bulk lock cover the load, which left the table free
+            // between the two and after the load, while the drain still owned
+            // its slot and its watermark.)
+            bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs, &run).await
         } else {
             let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
             drain_group(
@@ -1209,22 +1201,17 @@ async fn run_group_mysql(
         }
 
         if present == 0 {
-            // HAND THE GUARD OVER — the same handover the Postgres path makes,
-            // and for the same reason: the bootstrap's full load re-enters
-            // `transfer(mode="replace")`, whose sink announces a `Swap` lock and
-            // would be refused by this drain's own. One run, not two.
-            // The lease goes with it. A lease whose lock is gone is inert, but
-            // leaving one behind would let a later run "collect" a lock this
-            // run no longer owns.
-            give_back(std::mem::take(&mut held)).await;
+            // The full load is a nested run, exactly as on the Postgres path:
+            // the drain keeps its lock and lease through the load and
+            // `bootstrap_finish`, and the exit arm is the only release.
             let su = src_url.to_string();
             let du = dst_url.to_string();
+            let run_c = run.clone();
             let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, o2| {
-                let su = su.clone();
-                let du = du.clone();
+                let (su, du, r) = (su.clone(), du.clone(), run_c.clone());
                 async move {
-                    let r = Box::pin(crate::transfer(&su, &du, &table_arg, &o2)).await?;
-                    Ok((r.rows, r.parallel))
+                    let rep = Box::pin(crate::transfer_within(&r, &su, &du, &table_arg, &o2)).await?;
+                    Ok((rep.rows, rep.parallel))
                 }
             })
             .await?;
@@ -1327,6 +1314,7 @@ async fn run_group_mysql(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn bootstrap_group(
     src_url: &str,
     dst_url: &str,
@@ -1335,6 +1323,7 @@ async fn bootstrap_group(
     src: &PgPool,
     slot: &str,
     ctxs: &[TableCtx],
+    run: &crate::naming::RunId,
 ) -> Result<Vec<(u64, usize)>> {
     // A slot with no matching state is a leftover from an aborted bootstrap —
     // start fresh (refuse if something is actively draining it).
@@ -1405,7 +1394,8 @@ async fn bootstrap_group(
             o2.slots = None;
             strip_changelog_ddl(&mut o2);
             dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
-            let r = Box::pin(crate::transfer(pinned_url, dst_url, &c.table_arg, &o2)).await?;
+            let r = Box::pin(crate::transfer_within(run, pinned_url, dst_url, &c.table_arg, &o2))
+                .await?;
             Ok((r.rows, r.parallel))
         }
     }))

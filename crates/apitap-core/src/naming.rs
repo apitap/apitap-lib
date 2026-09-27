@@ -318,8 +318,6 @@ impl RunId {
     /// delete. That is what lets the drain keep its lock and lease through the
     /// whole first run instead of dropping them for the load and hoping nobody
     /// takes the table in between (0.56.0 did exactly that).
-    // Wired by the bootstrap in the dispatch step; until then only the tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mint_within(kind: BulkKind, source_id: &str, parent: &RunId) -> Self {
         RunId { parent: Some(parent.token.clone()), ..Self::mint_bulk(kind, source_id) }
     }

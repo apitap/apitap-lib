@@ -133,6 +133,19 @@ pub(crate) fn mint_run(mode: crate::Mode, src_url: &str) -> Result<crate::naming
     Ok(crate::naming::RunId::mint_bulk(land_kind(mode)?, &super::source_origin(src_url)))
 }
 
+/// The identity of a bulk run spawned inside `parent` — the CDC bootstrap's
+/// full load. Its own token (its own staging, its own lock), naming the drain
+/// it runs for, so the drain's markers are `Found::Parent` to it: not a peer,
+/// never deleted. That is what lets the drain keep its lock and lease through
+/// the whole first run.
+pub(crate) fn mint_run_within(
+    mode: crate::Mode,
+    src_url: &str,
+    parent: &crate::naming::RunId,
+) -> Result<crate::naming::RunId> {
+    Ok(crate::naming::RunId::mint_within(land_kind(mode)?, &super::source_origin(src_url), parent))
+}
+
 
 /// How this run's mode lands rows, which is what decides whether a concurrent
 /// run of the same table can be allowed to proceed.
@@ -345,6 +358,7 @@ async fn one<S: SrcScheme, D: DstScheme>(
     opts: &TransferOptions,
     ch_ddl: ChDdl,
     started: std::time::Instant,
+    parent: Option<&crate::naming::RunId>,
 ) -> Result<TransferReport> {
     let dest_table = opts.dest_table.as_deref().unwrap_or(table);
     let source_id = super::source_identity(src_url, table);
@@ -357,7 +371,10 @@ async fn one<S: SrcScheme, D: DstScheme>(
         pg_overlap,
         ch_ddl,
         budget: parallel,
-        run: mint_run(opts.mode, src_url)?,
+        run: match parent {
+            Some(p) => mint_run_within(opts.mode, src_url, p)?,
+            None => mint_run(opts.mode, src_url)?,
+        },
     };
     let src = S::connect(src_url, parallel + 1).await?;
     let sink = D::connect(dst_url, dest_table, parallel, &cfg).await?;
@@ -408,10 +425,12 @@ macro_rules! routes {
             s: &str, d: &str,
             src_url: &str, dst_url: &str, table: &str,
             opts: &TransferOptions, ch_ddl: ChDdl, started: std::time::Instant,
+            parent: Option<&crate::naming::RunId>,
         ) -> Result<TransferReport> {
             match (s, d) {
                 $( ($sname, $dname) =>
-                    one::<$S, $D>($prof, $ov, src_url, dst_url, table, opts, ch_ddl, started).await, )+
+                    one::<$S, $D>($prof, $ov, src_url, dst_url, table, opts, ch_ddl, started,
+                                  parent).await, )+
                 (s, d) => Err(unsupported(s, d)),
             }
         }
@@ -503,13 +522,14 @@ pub(crate) async fn single(
     dst_url: &str,
     table: &str,
     opts: &TransferOptions,
+    parent: Option<&crate::naming::RunId>,
 ) -> Result<TransferReport> {
     let started = std::time::Instant::now();
     let src_scheme = norm(src_url.split("://").next().unwrap_or(""));
     let dst_scheme = norm(dst_url.split("://").next().unwrap_or(""));
     let ch_ddl = ChDdl::from_opts(opts, dst_scheme == "clickhouse")?;
     route_single(
-        src_scheme, dst_scheme, src_url, dst_url, table, opts, ch_ddl, started,
+        src_scheme, dst_scheme, src_url, dst_url, table, opts, ch_ddl, started, parent,
     )
     .await
 }

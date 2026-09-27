@@ -388,7 +388,40 @@ pub async fn transfer(
         progress::Unit::Rows,
         0,
         |r: &TransferReport| r.rows,
-        pipeline::dispatch::single(src_url, dst_url, table, opts),
+        pipeline::dispatch::single(src_url, dst_url, table, opts, None),
+    )
+    .await
+}
+
+/// The bulk arm of [`transfer`], for a run spawned INSIDE `parent` — the CDC
+/// bootstrap's full load, and nothing else. The load mints its own token that
+/// names the drain as its parent, so the drain's lock and marker neither refuse
+/// it nor get deleted by it, and the drain keeps them for the whole first run.
+/// Not public: no `TransferOptions` field carries a parent, because the Python
+/// binding builds that struct by literal.
+pub(crate) async fn transfer_within(
+    parent: &naming::RunId,
+    src_url: &str,
+    dst_url: &str,
+    table: &str,
+    opts: &TransferOptions,
+) -> Result<TransferReport> {
+    if opts.mode == Mode::LogBased {
+        return Err(Error::InvalidInput("a nested run is never a drain".into()));
+    }
+    if opts.slots.is_some() {
+        return Err(Error::InvalidInput(
+            "slots applies to mode=\"log_based\" only — bulk modes already \
+             parallelize through `parallel`"
+                .into(),
+        ));
+    }
+    reported(
+        table,
+        progress::Unit::Rows,
+        0,
+        |r: &TransferReport| r.rows,
+        pipeline::dispatch::single(src_url, dst_url, table, opts, Some(parent)),
     )
     .await
 }
