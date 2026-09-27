@@ -216,6 +216,10 @@ pub(crate) fn artifact_ident(bare: &str, artifact: Artifact, limit: usize) -> St
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunId {
     token: String,
+    /// The token of the run this one was spawned INSIDE, in this process —
+    /// the CDC bootstrap's full load, which is a bulk run of its own nested in
+    /// the drain. `None` for every run a user started.
+    parent: Option<String>,
 }
 
 /// How a run's landing operation behaves towards a concurrent one.
@@ -300,6 +304,19 @@ impl RunId {
         Self::mint_token(LandKind::Cdc, source_id)
     }
 
+    /// A run spawned INSIDE another run in this process: the CDC bootstrap's
+    /// full load, and nothing else. It has its OWN token — its own staging, its
+    /// own lock — and names `parent`, so the parent's announcement classifies
+    /// as [`Found::Parent`]: not a peer to yield to, and never something to
+    /// delete. That is what lets the drain keep its lock and lease through the
+    /// whole first run instead of dropping them for the load and hoping nobody
+    /// takes the table in between (0.56.0 did exactly that).
+    // Wired by the bootstrap in the dispatch step; until then only the tests call it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mint_within(kind: BulkKind, source_id: &str, parent: &RunId) -> Self {
+        RunId { parent: Some(parent.token.clone()), ..Self::mint_bulk(kind, source_id) }
+    }
+
     fn mint_token(kind: LandKind, source_id: &str) -> Self {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -338,6 +355,7 @@ impl RunId {
                 base36(src, 3),
                 base36(nonce, 4),
             ),
+            parent: None,
         }
     }
 
@@ -358,6 +376,12 @@ impl RunId {
     /// object another run is using.
     pub(crate) fn is_self(&self, token: &str) -> bool {
         self.token == token
+    }
+
+    /// Is `token` the run this one was spawned inside? One-directional: a
+    /// parent never owns its child's artifacts.
+    pub(crate) fn is_parent(&self, token: &str) -> bool {
+        self.parent.as_deref() == Some(token)
     }
 }
 
@@ -420,8 +444,11 @@ pub(crate) fn parse_peer(name: &str, artifact: Artifact) -> Option<PeerRun> {
 /// rare, because the window is one round-trip wide.
 ///
 /// `Found::Mine` is not a peer (one RunId is shared by every table of a
-/// multi-table run) and `Found::Legacy` is handled by the caller, which has the
-/// destination name needed for its distinct message.
+/// multi-table run), nor is `Found::Parent` (a run nested in another — the CDC
+/// bootstrap — must not be refused by the run that spawned it; one-directional,
+/// a parent never owns its child's artifacts), and `Found::Legacy` is handled
+/// by the caller, which has the destination name needed for its distinct
+/// message.
 pub(crate) fn lock_blocks<'a>(
     mine: &PeerRun,
     locks: impl IntoIterator<Item = &'a PeerRun>,
@@ -512,7 +539,9 @@ pub(crate) fn blockers<'a>(
             // asking every kind about every name is safe, and it is the only
             // way a lock and a staging object both get seen.
             match classify(canonical, bare, *a, limit, run, now) {
-                Found::Foreign => {}
+                // The run that spawned this one: not a peer, and never ours to
+                // delete — deleting is for `Mine`, by exact token, only.
+                Found::Foreign | Found::Parent => {}
                 Found::Mine => {
                     if *a != Artifact::Lock
                         && parse_peer(canonical, *a).is_some_and(|p| run.is_self(&p.token))
@@ -626,6 +655,10 @@ pub(crate) fn peer_blocks(mine: &PeerRun, peer: &PeerRun) -> bool {
 ///    table in a multi-table run. Without this check a long run can outlive the
 ///    reap horizon and collect its own sibling's live staging, or read it as a
 ///    peer and refuse itself.
+///
+///    3a. **Is it my PARENT's?** A run nested in another (the CDC bootstrap)
+///    must not be refused by, nor delete, the run that spawned it.
+///    One-directional: a parent never owns its child's artifacts.
 /// 3. **Is it dead?** Only then does age matter.
 /// 4. Otherwise it is a live peer, and [`peer_blocks`] decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +668,9 @@ pub(crate) enum Found {
     Foreign,
     /// This run's own. Never reaped, never blocking.
     Mine,
+    /// The PARENT run's artifact (see [`RunId::mint_within`]). Never blocking,
+    /// NEVER deleted, never collected — deleting is for `Mine` only.
+    Parent,
     /// The un-tokenized name an apitap older than 0.55.0 writes.
     ///
     /// Not "dead" — that is what it was called until 0.55.1, and every sink
@@ -685,8 +721,11 @@ pub(crate) fn classify(
     let Some(peer) = parse_peer(name, artifact) else {
         return Found::Foreign;
     };
-    if peer.token == mine.token() {
+    if mine.is_self(&peer.token) {
         return Found::Mine;
+    }
+    if mine.is_parent(&peer.token) {
+        return Found::Parent;
     }
     // NOT aged out. This is where an age check used to be, and removing it is
     // the most important line in this module.
@@ -1771,6 +1810,49 @@ mod tests {
         let scan = blockers("orders", ROOMY, &run, GUARDED, [(canonical.as_str(), raw.as_str())]);
         assert_eq!(scan.blockers.len(), 1);
         assert_eq!(scan.blockers[0].name(), raw);
+    }
+
+    // ── lineage: a run nested in another ─────────────────────────────────
+
+    /// The CDC bootstrap's full load is a child of the drain. It must neither
+    /// yield to the drain's lock nor be yielded to by it — and a third run is a
+    /// peer to both, as it always was.
+    #[test]
+    fn a_child_run_owns_its_parents_lock_one_way() {
+        let src = "postgres://h:5432/db";
+        let parent = RunId::mint_drain(src);
+        let child = RunId::mint_within(BulkKind::Swap, src, &parent);
+        let other = RunId::mint_drain(src);
+        let lock = |r: &RunId| artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, r);
+        let (parent_lock, child_lock, other_lock) = (lock(&parent), lock(&child), lock(&other));
+        let now = now_unix();
+        assert_eq!(classify(&parent_lock, "orders", Artifact::Lock, PG_IDENT_MAX, &child, now),
+                   Found::Parent, "the child must not yield to the drain that spawned it");
+        assert!(matches!(classify(&child_lock, "orders", Artifact::Lock, PG_IDENT_MAX, &parent, now),
+                         Found::Live(_)), "one-directional: the parent does not own its child");
+        assert!(matches!(classify(&other_lock, "orders", Artifact::Lock, PG_IDENT_MAX, &child, now),
+                         Found::Live(_)), "an unrelated drain is still a peer");
+        let scan = blockers("orders", PG_IDENT_MAX, &child, GUARDED,
+                            [(parent_lock.as_str(), parent_lock.as_str()),
+                             (other_lock.as_str(), other_lock.as_str())]);
+        assert_eq!(scan.blockers.len(), 1, "{scan:?}");
+        assert_eq!(scan.blockers[0].name(), other_lock);
+        assert!(scan.mine_leftovers.is_empty(), "the parent's lock is never the child's to drop");
+    }
+
+    /// What keeps every "delete my leftovers" path away from the parent's
+    /// marker: the child sees it as `Parent`, never `Mine`.
+    #[test]
+    fn a_childs_view_of_its_parents_staging_is_never_mine() {
+        let src = "postgres://h:5432/db";
+        let parent = RunId::mint_drain(src);
+        let child = RunId::mint_within(BulkKind::Swap, src, &parent);
+        let marker = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &parent);
+        assert_eq!(classify(&marker, "orders", Artifact::Staging, PG_IDENT_MAX, &child, now_unix()),
+                   Found::Parent);
+        let scan = blockers("orders", PG_IDENT_MAX, &child, GUARDED,
+                            [(marker.as_str(), marker.as_str())]);
+        assert!(scan.blockers.is_empty() && scan.mine_leftovers.is_empty(), "{scan:?}");
     }
 
     // ── compatibility across releases ────────────────────────────────────

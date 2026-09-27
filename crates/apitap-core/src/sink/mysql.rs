@@ -611,6 +611,8 @@ impl MySqlSink {
                     // a concurrent peer is about to look for.
                     crate::naming::Found::Mine if art == Artifact::Lock => {}
                     crate::naming::Found::Mine => self.drop_artifact(&name).await?,
+                    // The run that spawned this one: not a peer, not ours to delete.
+                    crate::naming::Found::Parent => {}
                     // The pre-token name an older apitap wrote: nothing living
                     // mints it, which is the only thing collection can prove.
                     // A pre-0.55.0 name: refuse, never delete. See Found::Legacy.

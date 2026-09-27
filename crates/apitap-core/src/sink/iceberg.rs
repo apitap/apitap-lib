@@ -690,6 +690,8 @@ impl IcebergSink {
                 // look harmless; now it would erase the announcement a
                 // concurrent peer is about to look for.
                 crate::naming::Found::Mine => {}
+                // The run that spawned this one: not a peer, not ours to delete.
+                crate::naming::Found::Parent => {}
                 crate::naming::Found::Live(peer) => {
                     if crate::naming::peer_blocks(&mine, &peer) {
                         return Err(crate::naming::locked_error(

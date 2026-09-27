@@ -1708,6 +1708,8 @@ impl BqSink {
                 // announcement, and this scan is the check it makes meaningful.
                 crate::naming::Found::Mine if *artifact == Artifact::Lock => {}
                 crate::naming::Found::Mine => self.conn.table_delete(name).await?,
+                // The run that spawned this one: not a peer, not ours to delete.
+                crate::naming::Found::Parent => {}
                 // The pre-token name an older apitap wrote. Nothing living mints
                 // it; that is the whole of what collection can prove here.
                 // A pre-0.55.0 name: refuse, never delete. Silent truncation
