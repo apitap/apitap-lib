@@ -153,6 +153,121 @@ pub(crate) async fn lease_close(ch: &ChConn, key: &str, token: &str) {
     let _ = lease_write(ch, key, token, -1, 1).await;
 }
 
+/// The guard's view of a ClickHouse destination: the URL's database, spelled.
+///
+/// It scans `[Lock, Staging, New]` in BOTH lanes: the shadow (`New`) is what an
+/// engine-carrying replace EXCHANGEs onto the destination, and after the
+/// exchange it holds the old table's data — a publishing object exactly as much
+/// as staging is, which the CDC lane could not see in 0.56.0.
+///
+/// `on_cluster` is the bulk lane's `ON CLUSTER` clause (and `SYNC` on drops, so
+/// a Replicated table's ZooKeeper path is really free afterwards). The CDC lane
+/// passes `None`: it refuses a clustered destination outright.
+pub(crate) struct ChGuard {
+    ch: ChConn,
+    on_cluster: Option<String>,
+}
+
+impl ChGuard {
+    pub(crate) fn new(ch: ChConn, on_cluster: Option<String>) -> Self {
+        ChGuard { ch, on_cluster }
+    }
+
+    fn oc(&self) -> String {
+        self.on_cluster.as_deref().map(|c| format!(" ON CLUSTER `{c}`")).unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::guard::GuardStore for ChGuard {
+    fn limit(&self) -> usize {
+        crate::naming::ROOMY
+    }
+
+    fn dest_label(&self, bare: &str) -> String {
+        format!("{}.{bare}", self.ch.database())
+    }
+
+    fn scan_kinds(&self) -> &'static [crate::naming::Artifact] {
+        use crate::naming::Artifact::*;
+        &[Lock, Staging, New]
+    }
+
+    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        // The token sits BETWEEN head and suffix, so the pattern is
+        // head + wildcard + suffix, never a prefix. `_` and `%` are LIKE
+        // wildcards and every suffix is full of the first, so both are escaped;
+        // the one `%` in the middle is the only live wildcard. The finished
+        // pattern goes through `ch_str`, which doubles the backslashes for the
+        // string literal — ClickHouse unescapes the literal first, and LIKE then
+        // sees `\_` exactly as intended.
+        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+        let mut out = Vec::new();
+        for &a in kinds {
+            let (head, suffix) = crate::naming::artifact_match(bare, a, crate::naming::ROOMY);
+            let pattern = format!("{}%{}", esc(&head), esc(suffix));
+            // On a cluster this reads whichever node the balancer answered from,
+            // which is enough: every marker is created ON CLUSTER. TabSeparatedRaw,
+            // like the other catalog reads in this file: a name that came back
+            // escaped would neither match nor drop cleanly.
+            let found = self
+                .ch
+                .exec(&format!(
+                    "SELECT name FROM system.tables \
+                     WHERE database = currentDatabase() AND name LIKE '{}' \
+                     FORMAT TabSeparatedRaw",
+                    ch_str(&pattern)
+                ))
+                .await?;
+            out.extend(
+                found
+                    .lines()
+                    .map(|l| l.trim_end_matches('\r'))
+                    .filter(|l| !l.is_empty())
+                    .map(crate::guard::Listed::same),
+            );
+        }
+        Ok(out)
+    }
+
+    /// One column it never reads: the name is the whole message.
+    async fn create_marker(&self, raw: &str) -> Result<()> {
+        self.ch
+            .exec(&format!(
+                "CREATE TABLE IF NOT EXISTS {}{} (t UInt8) ENGINE = Memory",
+                ch_ident(raw),
+                self.oc()
+            ))
+            .await
+            .map(|_| ())
+    }
+
+    async fn drop_object(&self, raw: &str) -> Result<()> {
+        let sql = if self.on_cluster.is_some() {
+            format!("DROP TABLE IF EXISTS {}{} SYNC", ch_ident(raw), self.oc())
+        } else {
+            format!("DROP TABLE IF EXISTS {}", ch_ident(raw))
+        };
+        self.ch.exec(&sql).await.map(|_| ()).map_err(|e| Error::Transfer(format!("drop {raw}: {e}")))
+    }
+
+    async fn lease_get(&self, key: &str, token: &str) -> Result<Option<crate::lease::Lease>> {
+        lease_get(&self.ch, key, token).await
+    }
+
+    async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
+        Ok(if lease_claim(&self.ch, key, token).await? {
+            crate::guard::Claim::Taken
+        } else {
+            crate::guard::Claim::Refused
+        })
+    }
+
+    async fn lease_close(&self, proof: crate::guard::Released) {
+        lease_close(&self.ch, &proof.key, &proof.token).await
+    }
+}
+
 impl ChConn {
     pub(crate) fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
@@ -510,210 +625,22 @@ impl ChSink {
         Ok(())
     }
 
-    /// Collect dead artifacts and refuse live peers, for every kind of object
-    /// this sink parks beside the destination.
-    ///
-    /// This REPLACES the two `DROP TABLE IF EXISTS` statements `prepare` used to
-    /// open with. Those drops were the defect, not the cleanup: they destroyed
-    /// whatever staging table they found — a concurrent run's included — and the
-    /// losing run's `EXCHANGE TABLES` then published an empty table over the
-    /// destination while reporting its own row count.
-    ///
-    /// Both artifacts are scanned, not just staging. The shadow (`Artifact::New`)
-    /// is what an engine-carrying replace actually EXCHANGEs onto the
-    /// destination, so it is exactly as much a publishing object as staging is —
-    /// and after the exchange it holds the OLD destination's data, so a crashed
-    /// replace leaves a full copy of the table on disk that nothing else in this
-    /// sink would ever collect.
-    ///
-    /// A shadow only lives for the three DDL statements at the end of a replace,
-    /// so a leftover one is nearly always a crash rather than a live peer. It is
-    /// still not COLLECTED on that hunch: the token records when the run
-    /// started, not when the shadow was made, so a five-hour load's shadow is
-    /// born with a five-hour-old token and no age test can tell it from a
-    /// crash. It is refused instead, and the error names the object to drop.
-    ///
-    /// Liveness is read from the NAME. ClickHouse does have
-    /// `metadata_modification_time`, but it moves on every ALTER and means
-    /// something different from MySQL's `create_time` or BigQuery's
-    /// `creationTime` — one rule that reads identically on every destination
-    /// beats five engine-specific ones.
-    async fn reap_and_check_peers(&self) -> Result<()> {
-        for artifact in [
-            // Lock first: a peer that has announced itself but not yet created
-            // staging is precisely the run the staging-only scan could not see.
-            crate::naming::Artifact::Lock,
-            crate::naming::Artifact::Staging,
-            crate::naming::Artifact::New,
-        ] {
-            self.reap_artifact(artifact).await?;
-        }
-        Ok(())
+    /// This destination as the guard sees it: the same connection and the same
+    /// ON CLUSTER clause every other object this sink makes is created with, so
+    /// a peer talking to another node behind the balancer sees the markers too.
+    fn guard(&self) -> ChGuard {
+        ChGuard::new(self.ch.clone(), self.ddl.on_cluster.clone())
     }
 
-    /// This run's announcement, written BEFORE the scan — see the Postgres
-    /// sink's `announce` for why that order is the entire property.
-    ///
-    /// `ON CLUSTER` like every other object this sink makes: the peer that has
-    /// to see it may be talking to a different node through the balancer.
-    async fn announce(&self) -> Result<()> {
-        let name = ch_ident(&crate::naming::artifact_ident_run(
-            &self.final_bare, crate::naming::Artifact::Lock, crate::naming::ROOMY, &self.run));
-        let oc = self.ddl.on_cluster_clause();
-        // One column it never reads: the name is the whole message.
-        self.ch
-            .exec(&format!(
-                "CREATE TABLE IF NOT EXISTS {name}{oc} (t UInt8) ENGINE = Memory"
-            ))
-            .await
-            .map(|_| ())
-    }
-
-    /// Best-effort: a failure to drop the lock must not fail a finished run.
+    /// Take the announcement back, if this run still holds one. Best-effort by
+    /// contract: a failure to drop a marker must not fail a finished run.
     async fn release(&self) {
-        let name = crate::naming::artifact_ident_run(
-            &self.final_bare, crate::naming::Artifact::Lock, crate::naming::ROOMY, &self.run);
-        let _ = self.drop_artifact(&name).await;
-    }
-
-    async fn reap_artifact(&self, artifact: crate::naming::Artifact) -> Result<()> {
-        use crate::naming::parse_peer;
-        let (head, suffix) =
-            crate::naming::artifact_match(&self.final_bare, artifact, crate::naming::ROOMY);
-        // The token sits BETWEEN head and suffix, so the pattern is
-        // head + wildcard + suffix, never a prefix. `_` and `%` are LIKE
-        // wildcards and every suffix is full of the first, so both are escaped;
-        // the one `%` in the middle is the only live wildcard. The finished
-        // pattern goes through `ch_str`, which doubles the backslashes for the
-        // string literal — ClickHouse unescapes the literal first, and LIKE then
-        // sees `\_` exactly as intended.
-        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
-        let pattern = format!("{}%{}", esc(&head), esc(suffix));
-        // On a cluster this reads whichever node the balancer answered from,
-        // which is enough: everything apitap creates there is created ON CLUSTER
-        // and so exists on all of them.
-        //
-        // TabSeparatedRaw, like the other catalog reads in this file: plain TSV
-        // escapes the output, and a name that came back mangled would neither
-        // match the legacy name nor drop cleanly.
-        let found: Vec<String> = self
-            .ch
-            .exec(&format!(
-                "SELECT name FROM system.tables \
-                 WHERE database = currentDatabase() AND name LIKE '{}' \
-                 FORMAT TabSeparatedRaw",
-                ch_str(&pattern)
-            ))
-            .await?
-            .lines()
-            .map(|l| l.trim_end_matches('\r').to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-
-        let mine = parse_peer(
-            &crate::naming::artifact_ident_run(
-                &self.final_bare,
-                artifact,
-                crate::naming::ROOMY,
-                &self.run,
-            ),
-            artifact,
-        )
-        .expect("a name this process minted parses");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        for name in found {
-            // LIKE is a coarse filter and on its own too coarse — the pattern for
-            // `orders` also matches every artifact of `orders_2024`, a
-            // prefix-sharing sibling that is a DIFFERENT destination. The
-            // ordering and boundary rules that sort that out are
-            // `naming::classify`, deliberately not re-derived here: this sink
-            // used to open-code them, six others copied the shape, and the
-            // review found the same class of mistake in all seven.
-            match crate::naming::classify(
-                &name,
-                &self.final_bare,
-                artifact,
-                crate::naming::ROOMY,
-                &self.run,
-                now,
-            ) {
-                // A sibling's, or a user's object that merely ends the same way.
-                // Dropping it is how the old blind DROP lost data.
-                crate::naming::Found::Foreign => {}
-                // Ours. One RunId is minted per dispatch, so this is a leftover
-                // of THIS run — safe to collect, and the only thing that makes a
-                // retried table inside a multi-table run work. Except the lock:
-                // that IS this run's announcement, and the scan we are inside is
-                // the check it exists to make meaningful.
-                crate::naming::Found::Mine
-                    if artifact == crate::naming::Artifact::Lock => {}
-                crate::naming::Found::Mine => self.drop_artifact(&name).await?,
-                // The run that spawned this one: not a peer, not ours to delete.
-                crate::naming::Found::Parent => {}
-                // The pre-token name an older apitap wrote. Nothing living mints
-                // it, which is the only thing collection can prove.
-                // A pre-0.55.0 name: refuse, never delete. See Found::Legacy.
-                crate::naming::Found::Legacy => {
-                    return Err(crate::naming::legacy_error(
-                        &format!("{}.{}", self.ch.database(), self.final_bare), &name));
-                }
-                crate::naming::Found::Live(peer) => {
-                    if crate::naming::peer_blocks(&mine, &peer) {
-                        // A dead DRAIN's lock must not wedge a bulk run either:
-                        // the two lanes only see each other because they read
-                        // and write the same artifact, and a bulk run refusing
-                        // over a lock the CDC lane would collect is a matrix row
-                        // claimed and not enforced.
-                        let key = format!("{}.{}", self.ch.database(), self.final_bare);
-                        let lease = if artifact == crate::naming::Artifact::Lock {
-                            lease_get(&self.ch, &key, &peer.token).await?
-                        } else {
-                            None
-                        };
-                        if lease.as_ref().is_some_and(|l| l.lapsed())
-                            && lease_claim(&self.ch, &key, &peer.token).await?
-                        {
-                            self.drop_artifact(&name).await?;
-                            eprintln!(
-                                "apitap: {key}: collected {name} — the run that wrote it \
-                                 stopped renewing its claim on this destination's own \
-                                 clock. Resuming."
-                            );
-                            continue;
-                        }
-                        return Err(crate::naming::locked_error(
-                            &key, &name, &mine, &peer, now, lease.as_ref(),
-                        ));
-                    }
-                }
+        let a = self.announced.lock().expect("announcement").take();
+        if let Some(a) = a {
+            if let Err(a) = crate::guard::release(&self.guard(), a).await {
+                a.abandon();
             }
         }
-        Ok(())
-    }
-
-    /// Drop one leftover artifact, in the same forms every other DROP in this
-    /// sink uses: ON CLUSTER so it reaches every node rather than whichever one
-    /// the balancer picked, and SYNC so a Replicated table's ZooKeeper path is
-    /// actually free afterwards.
-    async fn drop_artifact(&self, name: &str) -> Result<()> {
-        let sql = if self.ddl.on_cluster.is_some() {
-            format!(
-                "DROP TABLE IF EXISTS {}{} SYNC",
-                ch_ident(name),
-                self.ddl.on_cluster_clause()
-            )
-        } else {
-            format!("DROP TABLE IF EXISTS {}", ch_ident(name))
-        };
-        self.ch
-            .exec(&sql)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Transfer(format!("reap {name}: {e}")))
     }
 
     async fn ensure_state_table(&self) -> Result<()> {
@@ -1076,6 +1003,9 @@ pub(crate) struct ChSink {
     /// This run's identity. It is IN the staging and shadow names, and it is what
     /// `prepare` compares a live peer's artifacts against.
     run: crate::naming::RunId,
+    /// This run's announcement on this table, from `prepare` until the staging
+    /// it protects exists (or the run ends first). See `crate::guard`.
+    announced: std::sync::Mutex<Option<crate::guard::Announced>>,
 }
 
 impl ChSink {
@@ -1125,6 +1055,7 @@ impl ChSink {
             plan_ddl: String::new(),
             staging_order_by: String::new(),
             run: run.clone(),
+            announced: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1306,8 +1237,11 @@ impl crate::sink::Sink for ChSink {
         // only on a scan taken AFTER its own announcement, so a concurrent
         // pair cannot both miss each other. `pipeline::run` releases the
         // announcement again if anything here fails; see `announce`.
-        self.announce().await?;
-        self.reap_and_check_peers().await?;
+        let a = crate::guard::announce(&self.guard(), &self.final_bare, &self.run).await?;
+        *self.announced.lock().expect("announcement") = Some(a);
+        crate::guard::check_peers(&self.guard(), &self.final_bare, &self.run,
+                                  crate::guard::Mine::DeleteLeftovers)
+            .await?;
         if self.ddl.on_cluster.is_some() {
             // Behind a load balancer every HTTP request may reach a DIFFERENT
             // node (seen live: a DROP landed on node A, the CREATE on node B →
@@ -1692,15 +1626,16 @@ impl crate::sink::Sink for ChSink {
     }
 
     async fn discard(&self) -> Result<()> {
+        use crate::guard::GuardStore;
         let mut first_err = None;
-        for a in [crate::naming::Artifact::Staging, crate::naming::Artifact::New,
-                  crate::naming::Artifact::Lock] {
+        for a in [crate::naming::Artifact::Staging, crate::naming::Artifact::New] {
             let name = crate::naming::artifact_ident_run(
                 &self.final_bare, a, crate::naming::ROOMY, &self.run);
-            if let Err(e) = self.drop_artifact(&name).await {
+            if let Err(e) = self.guard().drop_object(&name).await {
                 first_err.get_or_insert(e);
             }
         }
+        self.release().await;
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
