@@ -269,13 +269,13 @@ impl Drop for Guard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Every test here mutates PROCESS-wide state — the SIGTERM disposition and
     /// an env var. Cargo runs tests on parallel threads, so without this they
     /// would read each other's handlers and pass or fail by timing.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
     fn disposition() -> usize {
         unsafe {

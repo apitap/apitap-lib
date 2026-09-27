@@ -47,7 +47,9 @@
 //! in flight, which the window machinery already makes idempotent. That
 //! weakening is stated in `docs/failure-modes.md` rather than papered over.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::guard::{GuardStore, Mine};
+use crate::naming::RunId;
 
 /// The lease table. One per destination, like `_apitap_state` — it is keyed by
 /// (destination table, run token), so it never needs shortening.
@@ -105,6 +107,12 @@ pub(crate) fn renew_secs() -> u64 {
 /// The one row the group-wide renewal cannot lock is the row that run's own
 /// apply transaction is holding — and that transaction renews it itself, so
 /// skipping it is exactly right rather than a compromise.
+///
+/// It renews until it is stopped, and nothing else stops it. A SIGTERM
+/// wind-down used to end it early (`shutdown::requested()`), which let a run
+/// that was still landing its last window look dead to a peer; the lease now
+/// lives exactly as long as the run that holds it. `Drop` aborts it, so a
+/// panic that unwinds past its owner cannot leave it renewing a dead run.
 pub(crate) struct Keeper {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -118,26 +126,71 @@ impl Keeper {
         F: Fn() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<u64>> + Send,
     {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let every = std::time::Duration::from_secs(renew_secs());
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(every).await;
-                if flag.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::shutdown::requested()
-                {
-                    return;
-                }
+        Self::every(std::time::Duration::from_secs(renew_secs()), move || {
+            let fut = renew();
+            async move {
                 // A failed renewal is NOT a reason to kill a drain: a blip on
                 // the destination would then end a run that is perfectly
                 // healthy, and there are nine more ticks before the lease
                 // lapses. Note it and try again.
-                if let Err(e) = renew().await {
+                if let Err(e) = fut.await {
                     if std::env::var("APITAP_DEBUG").is_ok() {
                         eprintln!("[lease] renewal failed, retrying next tick: {e}");
                     }
                 }
+            }
+        })
+    }
+
+    /// The tenure's keeper: renew, then ask the destination which of this
+    /// run's rows still exist uncollected. A key missing from that answer was
+    /// CLAIMED (or deleted) by someone else — that, and never expiry, is an
+    /// eviction. A lapsed lease that nobody has claimed is still this run's:
+    /// the next renewal revives it, and every write is fenced on the row
+    /// anyway.
+    fn for_tenure<F: Fence>(
+        dest: std::sync::Arc<F>,
+        keys: Vec<String>,
+        token: String,
+        evicted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        every: std::time::Duration,
+    ) -> Keeper {
+        Self::every(every, move || {
+            let (dest, keys, token, evicted) = (dest.clone(), keys.clone(), token.clone(), evicted.clone());
+            async move {
+                if let Err(e) = dest.lease_renew(&keys, &token).await {
+                    if std::env::var("APITAP_DEBUG").is_ok() {
+                        eprintln!("[lease] renewal failed, retrying next tick: {e}");
+                    }
+                }
+                if let Ok(still) = dest.lease_unclaimed(&token).await {
+                    for k in keys.iter().filter(|k| !still.contains(k)) {
+                        if !evicted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            eprintln!(
+                                "apitap: {k}: another run collected this drain's claim; it stops \
+                                 before its next write"
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn every<T, Fut>(every: std::time::Duration, tick: T) -> Keeper
+    where
+        T: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                tick().await;
             }
         });
         Keeper { stop, handle: Some(handle) }
@@ -152,5 +205,564 @@ impl Keeper {
             h.abort();
             let _ = h.await;
         }
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Ownership as a value
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Wired into the CDC lane engine by engine (handoff §3 steps 16-24); until the
+// switch, only the tests below use what follows.
+
+/// What a script names when its fence found the run's claim gone (BigQuery).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LOST_MARK: &str = "apitap-lease-lost";
+
+/// The time fence where no row lock exists (ClickHouse statements, BigQuery
+/// DDL): an owner may write only while more than half its TTL is left, and a
+/// statement is bounded server-side to the same half, so it ends before any
+/// peer can claim the lease.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn owned_margin_secs() -> u64 {
+    ttl_secs() / 2
+}
+
+/// The refusal a drain gives when its claim is gone. Nothing was written.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn no_longer_holds(keys: &[String]) -> Error {
+    Error::Locked(format!(
+        "{}: this drain no longer holds the table — another run collected its claim, so it is \
+         not allowed to write. Nothing more was written. Re-run; the other run either finished \
+         or will be collected in turn.",
+        keys.join(", ")
+    ))
+}
+
+/// The one test a store applies to its own row before a unit may write.
+///
+/// Owner = the row EXISTS and is NOT collected. Expiry is not part of it: a
+/// lapsed lease only gives a collector permission to CLAIM, and until one does
+/// the run still owns the table (the next renewal revives it). A missing row is
+/// not an owner — 0.56.0 read "no row" as "nothing to fence against" and wrote,
+/// which is exactly what a collector that deleted the row would have wanted to
+/// stop.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn owner_verdict(row: Option<&Lease>, keys: &[String]) -> Result<()> {
+    match row {
+        Some(l) if !l.collected => Ok(()),
+        _ => Err(no_longer_holds(keys)),
+    }
+}
+
+/// The watermark a unit writes when it closes — the only place one is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Watermark {
+    Set { table: String, source_id: String, lsn: u64, rows: u64 },
+    Clear { table: String, source_id: String },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Watermark {
+    pub(crate) fn table(&self) -> &str {
+        match self {
+            Watermark::Set { table, .. } | Watermark::Clear { table, .. } => table,
+        }
+    }
+}
+
+/// The lease rows of one destination: open, renew, and who still holds what.
+/// Liveness questions a COLLECTOR asks (get, claim, close) are the guard's
+/// (`crate::guard::GuardStore`), so there is one spelling of each.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait LeaseStore: Send + Sync + 'static {
+    fn lease_key(&self, dest_table: &str) -> String;
+    /// Open this run's rows (and on BigQuery its per-run fence table).
+    fn lease_open(&self, keys: &[String], token: &str)
+        -> impl std::future::Future<Output = Result<()>> + Send;
+    /// Never blocks; never touches a collected or missing row.
+    fn lease_renew(&self, keys: &[String], token: &str)
+        -> impl std::future::Future<Output = Result<u64>> + Send;
+    /// Keys of `token` whose row EXISTS and is NOT collected. Expiry ignored.
+    fn lease_unclaimed(&self, token: &str)
+        -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+    /// Drop run-scoped objects not tied to a table (BigQuery's fence).
+    fn close_run(&self, token: &str) -> impl std::future::Future<Output = ()> + Send;
+    #[cfg(test)]
+    fn note(&self, _event: &str) {}
+}
+
+/// A destination that can fence a unit of writes on its own lease row.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait Fence: LeaseStore {
+    type Unit<'a>: Send
+    where
+        Self: 'a;
+    /// The guard adapter for one member, and the bare name it spells it with.
+    /// Per member, not per destination: a Postgres group's tables may live in
+    /// different schemas, and the guard lists one schema.
+    fn guard(&self, dest_table: &str) -> (Box<dyn GuardStore + '_>, String);
+    /// BigQuery: every close of one run mutates the same fence table, so the
+    /// closes are serialized rather than left to abort each other.
+    fn serial_commit(&self) -> bool {
+        false
+    }
+    fn open_unit<'a>(&'a self, keys: &[String], token: &str)
+        -> impl std::future::Future<Output = Result<Self::Unit<'a>>> + Send;
+    /// Writes every mark (and on BigQuery/Iceberg the data commit) and commits.
+    /// `Ok` = the destination accepted the unit as the owner's.
+    fn close_unit<'a>(&'a self, u: Self::Unit<'a>, token: &str, marks: Vec<Watermark>)
+        -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+/// One open unit of writes. Only `Tenure::open` makes one, and `release`
+/// cannot pass it: it carries a read guard `release` waits for.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Held<'t, F: Fence + 't> {
+    pub(crate) unit: F::Unit<'t>,
+    tables: Vec<String>,
+    _inflight: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+/// This run's ownership of a group of destination tables, as a value: every
+/// CDC write goes through a unit it opens, and nothing else can open one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Tenure<F: Fence> {
+    dest: std::sync::Arc<F>,
+    run: RunId,
+    tables: Vec<String>,
+    announced: std::sync::Mutex<Vec<(String, crate::guard::Announced)>>,
+    evicted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    closing: std::sync::atomic::AtomicBool,
+    units: std::sync::Arc<tokio::sync::RwLock<()>>,
+    commit_gate: tokio::sync::Mutex<()>,
+    keeper: std::sync::Mutex<Option<Keeper>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<F: Fence> Tenure<F> {
+    /// Lease first, then announce every member, then check every member — the
+    /// order that makes a dead run collectable and two live ones unable to
+    /// both proceed — then start renewing.
+    pub(crate) async fn acquire(dest: std::sync::Arc<F>, tables: &[String], run: RunId) -> Result<Self> {
+        Self::acquire_every(dest, tables, run, std::time::Duration::from_secs(renew_secs())).await
+    }
+
+    async fn acquire_every(
+        dest: std::sync::Arc<F>,
+        tables: &[String],
+        run: RunId,
+        every: std::time::Duration,
+    ) -> Result<Self> {
+        let keys: Vec<String> = tables.iter().map(|t| dest.lease_key(t)).collect();
+        dest.lease_open(&keys, run.token()).await?;
+        let mut held: Vec<(String, crate::guard::Announced)> = Vec::new();
+        for t in tables {
+            let (g, bare) = dest.guard(t);
+            match crate::guard::announce(&*g, &bare, &run).await {
+                Ok(a) => held.push((t.clone(), a)),
+                Err(e) => {
+                    give_back(&*dest, held, run.token()).await;
+                    return Err(e);
+                }
+            }
+        }
+        for t in tables {
+            let (g, bare) = dest.guard(t);
+            if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, Mine::Keep).await {
+                give_back(&*dest, held, run.token()).await;
+                return Err(e);
+            }
+        }
+        let evicted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keeper = Keeper::for_tenure(dest.clone(), keys, run.token().to_string(), evicted.clone(), every);
+        Ok(Tenure {
+            dest,
+            run,
+            tables: tables.to_vec(),
+            announced: std::sync::Mutex::new(held),
+            evicted,
+            closing: std::sync::atomic::AtomicBool::new(false),
+            units: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            commit_gate: tokio::sync::Mutex::new(()),
+            keeper: std::sync::Mutex::new(Some(keeper)),
+        })
+    }
+
+    pub(crate) fn run(&self) -> &RunId {
+        &self.run
+    }
+
+    /// Open a unit over `tables`. Refused, with no I/O, once the run is
+    /// winding down or the keeper has seen its claim taken.
+    pub(crate) async fn open(&self, tables: &[&str]) -> Result<Held<'_, F>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let keys: Vec<String> = tables.iter().map(|t| self.dest.lease_key(t)).collect();
+        if self.closing.load(SeqCst) {
+            return Err(Error::Locked(format!("{}: the run is winding down", keys.join(", "))));
+        }
+        if self.evicted.load(SeqCst) {
+            return Err(no_longer_holds(&keys));
+        }
+        let g = self.units.clone().read_owned().await;
+        // `release` may have started (and finished) while this waited.
+        if self.closing.load(SeqCst) {
+            return Err(Error::Locked(format!("{}: the run is winding down", keys.join(", "))));
+        }
+        let unit = self.dest.open_unit(&keys, self.run.token()).await?;
+        Ok(Held { unit, tables: tables.iter().map(|t| t.to_string()).collect(), _inflight: g })
+    }
+
+    /// Close a unit: its marks, then the commit — serialized where one run's
+    /// closes share a fence object.
+    pub(crate) async fn close<'t>(&'t self, h: Held<'t, F>, marks: Vec<Watermark>) -> Result<()> {
+        if let Some(m) = marks.iter().find(|m| !h.tables.iter().any(|t| t == m.table())) {
+            return Err(Error::Transfer(format!("internal: mark for unheld table {}", m.table())));
+        }
+        let _g = if self.dest.serial_commit() { Some(self.commit_gate.lock().await) } else { None };
+        let Held { unit, _inflight, .. } = h;
+        let r = self.dest.close_unit(unit, self.run.token(), marks).await;
+        drop(_inflight);
+        r
+    }
+
+    /// Give the table back: wait for every open unit, stop the keeper, drop
+    /// the markers, and close each lease only with the proof that its markers
+    /// are gone.
+    pub(crate) async fn release(&self) {
+        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _all = self.units.write().await;
+        let keeper = self.keeper.lock().expect("keeper").take();
+        if let Some(mut k) = keeper {
+            k.stop().await;
+            #[cfg(test)]
+            self.dest.note("keeper_stop");
+        }
+        let held = std::mem::take(&mut *self.announced.lock().expect("announced"));
+        if give_back(&*self.dest, held, self.run.token()).await {
+            self.dest.close_run(self.run.token()).await;
+        }
+    }
+
+    pub(crate) fn tables(&self) -> &[String] {
+        &self.tables
+    }
+}
+
+impl<F: Fence> Drop for Tenure<F> {
+    fn drop(&mut self) {
+        if let Some(k) = self.keeper.lock().ok().and_then(|mut k| k.take()) {
+            drop(k); // Keeper::drop aborts; there is no await in Drop.
+        }
+        if let Ok(mut held) = self.announced.lock() {
+            for (_, a) in held.drain(..) {
+                a.abandon();
+            }
+        }
+    }
+}
+
+/// Markers first; for each member whose markers are all gone, its scratch and
+/// then its lease. `true` when every member was given back.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn give_back<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announced)>, token: &str) -> bool {
+    let mut all = true;
+    for (t, a) in held {
+        let (g, bare) = dest.guard(&t);
+        match crate::guard::release(&*g, a).await {
+            Ok(proof) => {
+                let _ = g.sweep_run(&bare, token).await;
+                g.lease_close(proof).await;
+            }
+            Err(a) => {
+                a.abandon();
+                all = false;
+            }
+        }
+    }
+    all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// The guard side of the fake: no peers, and every call logged.
+    struct FakeGuard(Log);
+
+    #[async_trait::async_trait]
+    impl GuardStore for FakeGuard {
+        fn limit(&self) -> usize {
+            crate::naming::ROOMY
+        }
+        fn dest_label(&self, bare: &str) -> String {
+            format!("s.{bare}")
+        }
+        async fn list(&self, _b: &str, _k: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+            Ok(Vec::new())
+        }
+        async fn create_marker(&self, _raw: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn drop_object(&self, _raw: &str) -> Result<()> {
+            self.0.lock().unwrap().push("drop_marker".into());
+            Ok(())
+        }
+        async fn lease_get(&self, _k: &str, _t: &str) -> Result<Option<Lease>> {
+            Ok(None)
+        }
+        async fn lease_claim(&self, _k: &str, _t: &str) -> Result<crate::guard::Claim> {
+            Ok(crate::guard::Claim::Absent)
+        }
+        async fn lease_close(&self, _p: crate::guard::Released) {
+            self.0.lock().unwrap().push("lease_close".into());
+        }
+        async fn sweep_run(&self, _b: &str, _t: &str) -> Result<()> {
+            self.0.lock().unwrap().push("sweep_run".into());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeFence {
+        log: Log,
+        keys: Mutex<Vec<String>>,
+        collected: Mutex<HashSet<String>>,
+        expired: Mutex<HashSet<String>>,
+        renews: AtomicUsize,
+        opens: AtomicUsize,
+        serial: bool,
+        in_close: AtomicUsize,
+        max_in_close: AtomicUsize,
+        close_waits: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl FakeFence {
+        fn events(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl LeaseStore for FakeFence {
+        fn lease_key(&self, t: &str) -> String {
+            format!("s.{t}")
+        }
+        async fn lease_open(&self, keys: &[String], _t: &str) -> Result<()> {
+            *self.keys.lock().unwrap() = keys.to_vec();
+            Ok(())
+        }
+        async fn lease_renew(&self, _k: &[String], _t: &str) -> Result<u64> {
+            self.renews.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+        async fn lease_unclaimed(&self, _t: &str) -> Result<Vec<String>> {
+            let collected = self.collected.lock().unwrap().clone();
+            Ok(self.keys.lock().unwrap().iter().filter(|k| !collected.contains(*k)).cloned().collect())
+        }
+        async fn close_run(&self, _t: &str) {
+            self.log.lock().unwrap().push("close_run".into());
+        }
+        fn note(&self, e: &str) {
+            self.log.lock().unwrap().push(e.into());
+        }
+    }
+
+    impl Fence for FakeFence {
+        type Unit<'a> = ();
+        fn guard(&self, t: &str) -> (Box<dyn GuardStore + '_>, String) {
+            (Box::new(FakeGuard(self.log.clone())), t.to_string())
+        }
+        fn serial_commit(&self) -> bool {
+            self.serial
+        }
+        async fn open_unit<'a>(&'a self, _k: &[String], _t: &str) -> Result<()> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            self.log.lock().unwrap().push("open_unit".into());
+            Ok(())
+        }
+        async fn close_unit<'a>(&'a self, _u: (), _t: &str, _m: Vec<Watermark>) -> Result<()> {
+            let now = self.in_close.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_close.fetch_max(now, Ordering::SeqCst);
+            let wait = self.close_waits.lock().unwrap().take();
+            if let Some(rx) = wait {
+                let _ = rx.await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            self.in_close.fetch_sub(1, Ordering::SeqCst);
+            self.log.lock().unwrap().push("close_unit".into());
+            Ok(())
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    const SLOW: Duration = Duration::from_secs(3600);
+
+    async fn tenure(f: Arc<FakeFence>, every: Duration) -> Tenure<FakeFence> {
+        Tenure::acquire_every(f, &["a".to_string(), "b".to_string()], RunId::mint_drain("s"), every)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn open_refuses_after_eviction() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let t = tenure(f.clone(), SLOW).await;
+            t.evicted.store(true, Ordering::SeqCst);
+            let e = t.open(&["a"]).await.err().expect("an evicted run opens nothing");
+            assert!(matches!(e, Error::Locked(_)), "{e}");
+            assert_eq!(f.opens.load(Ordering::SeqCst), 0, "no I/O once evicted");
+            t.release().await;
+        });
+    }
+
+    #[test]
+    fn release_waits_for_open_units() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *f.close_waits.lock().unwrap() = Some(rx);
+            let t = tenure(f.clone(), SLOW).await;
+            let holder = async {
+                let h = t.open(&["a"]).await.unwrap();
+                t.close(h, vec![]).await.unwrap();
+            };
+            let releaser = async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                t.release().await;
+            };
+            let opener = async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                let _ = tx.send(());
+            };
+            tokio::join!(holder, releaser, opener);
+            let ev = f.events();
+            let at = |e: &str| ev.iter().position(|x| x == e).unwrap_or_else(|| panic!("{e} missing: {ev:?}"));
+            assert!(at("open_unit") < at("close_unit"), "{ev:?}");
+            assert!(at("close_unit") < at("keeper_stop"), "release passed an open unit: {ev:?}");
+            assert!(at("keeper_stop") < at("drop_marker"), "{ev:?}");
+            assert!(at("drop_marker") < at("sweep_run"), "{ev:?}");
+            assert!(at("sweep_run") < at("lease_close"), "{ev:?}");
+            assert!(at("lease_close") < at("close_run"), "{ev:?}");
+        });
+    }
+
+    #[test]
+    fn keeper_flags_claim_not_expiry() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let t = tenure(f.clone(), Duration::from_millis(10)).await;
+            f.collected.lock().unwrap().insert("s.a".into());
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(t.evicted.load(Ordering::SeqCst), "a claimed key is an eviction");
+            t.release().await;
+
+            let f = Arc::new(FakeFence::default());
+            let t = tenure(f.clone(), Duration::from_millis(10)).await;
+            f.expired.lock().unwrap().insert("s.b".into());
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(!t.evicted.load(Ordering::SeqCst), "an expired but unclaimed lease is still ours");
+            t.release().await;
+        });
+    }
+
+    #[test]
+    fn keeper_ignores_shutdown_flag() {
+        let _serial = crate::shutdown::tests::SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        crate::shutdown::request();
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let t = tenure(f.clone(), Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(45)).await;
+            let n = f.renews.load(Ordering::SeqCst);
+            t.release().await;
+            crate::shutdown::clear();
+            assert!(n >= 3, "a wind-down keeps the lease alive until release: {n} renewals");
+        });
+        crate::shutdown::clear();
+    }
+
+    #[test]
+    fn hold_refuses_missing_collected_lapsed() {
+        let keys = vec!["s.a".to_string()];
+        assert!(matches!(owner_verdict(None, &keys), Err(Error::Locked(_))), "no row is not an owner");
+        let collected = Lease { expires_in: 100, collected: true };
+        assert!(matches!(owner_verdict(Some(&collected), &keys), Err(Error::Locked(_))));
+        let lapsed = Lease { expires_in: -5, collected: false };
+        assert!(owner_verdict(Some(&lapsed), &keys).is_ok(), "lapsed but unclaimed is still ours");
+    }
+
+    #[test]
+    fn dropping_tenure_aborts_keeper() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let t = tenure(f.clone(), Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(35)).await;
+            drop(t);
+            let n = f.renews.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(f.renews.load(Ordering::SeqCst), n, "a dropped tenure keeps renewing");
+        });
+    }
+
+    #[test]
+    fn open_after_release_is_refused() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let t = tenure(f.clone(), SLOW).await;
+            t.release().await;
+            assert!(matches!(t.open(&["a"]).await, Err(Error::Locked(_))));
+            assert_eq!(f.opens.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn serial_commit_gate() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence { serial: true, ..Default::default() });
+            let t = tenure(f.clone(), SLOW).await;
+            let one = async {
+                let h = t.open(&["a"]).await.unwrap();
+                t.close(h, vec![]).await.unwrap();
+            };
+            let two = async {
+                let h = t.open(&["b"]).await.unwrap();
+                t.close(h, vec![]).await.unwrap();
+            };
+            tokio::join!(one, two);
+            assert_eq!(f.max_in_close.load(Ordering::SeqCst), 1, "two closes overlapped");
+            t.release().await;
+        });
+    }
+
+    #[test]
+    fn a_mark_must_name_a_held_table() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let t = tenure(f.clone(), SLOW).await;
+            let h = t.open(&["a"]).await.unwrap();
+            let bad = Watermark::Clear { table: "b".into(), source_id: "x".into() };
+            assert!(t.close(h, vec![bad]).await.is_err());
+            t.release().await;
+        });
     }
 }
