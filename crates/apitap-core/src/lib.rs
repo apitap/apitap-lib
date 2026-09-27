@@ -36,6 +36,7 @@ mod error;
 mod aws;
 mod logbased;
 mod gcp;
+mod guard;
 mod http;
 mod pipeline;
 mod plan;
