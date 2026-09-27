@@ -127,11 +127,10 @@ def clear_dead_lock():
     the refusal is asserted. It is this file saying out loud what a hard kill now
     costs, so the cost cannot change silently.
     """
-    for n in ch(
-        "SELECT name FROM system.tables WHERE database = currentDatabase() "
-        f"AND startsWith(name, '{T}') AND endsWith(name, '__apitap_lock')").split():
-        if n:
-            ch(f"DROP TABLE IF EXISTS `{n}`")
+    # Since 0.57.0 a drain announces a staging MARKER beside its lock, and a
+    # hard kill leaves both. Both clear themselves once the lease lapses.
+    for n in _rig.locks_ch(T) + _rig.markers_ch(T):
+        ch(f"DROP TABLE IF EXISTS `{n}`")
 
 
 def case(label, good, detail=""):

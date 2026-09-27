@@ -110,21 +110,6 @@ impl MyDest {
             .await
     }
 
-    pub(crate) async fn lease_get(&self, key: &str, token: &str)
-        -> Result<Option<crate::lease::Lease>>
-    {
-        crate::sink::mysql::lease_get(self.shared.pool(), self.shared.db(), key, token).await
-    }
-
-    pub(crate) async fn lease_claim(&self, key: &str, token: &str) -> Result<bool> {
-        crate::sink::mysql::lease_claim(self.shared.pool(), self.shared.db(), key, token).await
-    }
-
-    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
-        crate::sink::mysql::lease_close(self.shared.pool(), self.shared.db(), key, run.token())
-            .await
-    }
-
     /// FENCE — the MySQL twin of `PgDest::fence_tx`.
     async fn fence_tx(
         &self,
@@ -183,93 +168,11 @@ impl MyDest {
         .map_err(|e| Error::Transfer(format!("log_based: fence renew: {e}")))
     }
 
-    fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
-        crate::naming::artifact_ident_run(
-            bare(dest_table), crate::naming::Artifact::Lock, crate::naming::MY_IDENT_MAX, run)
-    }
-
-    /// This run's announcement — see `sink::postgres::announce_run`. The name is
-    /// minted by `naming` and the verdict is `naming::guard_verdict`, so a drain
-    /// and a bulk run agree on both; only the catalog statements are spelled
-    /// here, in this engine's dialect.
-    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        let mut conn = self.shared.conn().await?;
-        // MySQL has no zero-column table, so the lock carries one nothing reads.
-        conn.query_drop(format!(
-            "CREATE TABLE IF NOT EXISTS {} (t TINYINT) ENGINE=MEMORY",
-            self.fq(&self.lock_name(dest_table, run))
-        ))
-        .await
-        .map_err(|e| Error::Transfer(format!("log_based: announce run: {e}")))
-    }
-
-    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        let b = bare(dest_table);
-        let esc = |v: &str| v.replace('|', "||").replace('_', "|_").replace('%', "|%");
-        let mut found: Vec<String> = Vec::new();
-        let mut conn = self.shared.conn().await?;
-        for &a in crate::naming::GUARDED {
-            let (head, suffix) =
-                crate::naming::artifact_match(b, a, crate::naming::MY_IDENT_MAX);
-            let rows: Vec<String> = conn
-                .exec(
-                    "SELECT table_name FROM information_schema.tables \
-                     WHERE table_schema = ? AND table_type = 'BASE TABLE' \
-                       AND table_name LIKE ? ESCAPE '|'",
-                    (self.shared.db(), format!("{}%{}", esc(&head), esc(suffix))),
-                )
-                .await
-                .map_err(|e| Error::Transfer(format!("log_based: staging scan: {e}")))?;
-            found.extend(rows);
-        }
-        let dest = format!("{}.{b}", self.shared.db());
-        let now = crate::naming::now_unix();
-        for blk in crate::naming::blockers(
-            b, crate::naming::MY_IDENT_MAX, run, crate::naming::GUARDED,
-            found.iter().map(|n| (n.as_str(), n.as_str()))).blockers
-        {
-            let Some(tok) = crate::naming::collectable(&blk).map(str::to_string) else {
-                return Err(crate::naming::blocker_error(&dest, &blk, now, None));
-            };
-            let lease = self.lease_get(&dest, &tok).await?;
-            if lease.as_ref().is_some_and(|l| l.lapsed()) && self.lease_claim(&dest, &tok).await? {
-                // The claim is COMMITTED before the DROP, because MySQL DDL
-                // commits implicitly: a crash between them leaves
-                // `collected = 1` with the lock standing, which the next run
-                // re-claims through the `OR collected` disjunct.
-                let mut c2 = self.shared.conn().await?;
-                let _ = c2
-                    .query_drop(format!("DROP TABLE IF EXISTS {}", self.fq(blk.name())))
-                    .await;
-                eprintln!(
-                    "apitap: {dest}: collected {} — the run that wrote it stopped \
-                     renewing its claim on this destination's own clock. Resuming.",
-                    blk.name()
-                );
-                continue;
-            }
-            return Err(crate::naming::blocker_error(&dest, &blk, now, lease.as_ref()));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
-        let _ = self.release_ok(dest_table, run).await;
-    }
-
-    /// Did the lock actually go? The lease may only be dropped once it did.
-    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
-        let Ok(mut conn) = self.shared.conn().await else { return false };
-        conn.query_drop(format!(
-            "DROP TABLE IF EXISTS {}",
-            self.fq(&self.lock_name(dest_table, run))
-        ))
-        .await
-        .is_ok()
+    /// This destination as the guard sees it — the same `MyGuard` the bulk
+    /// sink uses, so a drain and a bulk run write and read the same markers
+    /// and lease rows — and the bare name the guard spells the table with.
+    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::mysql::MyGuard, String) {
+        (crate::sink::mysql::MyGuard::new(self.shared.clone()), bare(dest_table).to_string())
     }
 
     pub(crate) async fn read_state(

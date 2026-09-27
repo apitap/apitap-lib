@@ -182,25 +182,11 @@ impl ChDest {
         Ok(n)
     }
 
-    pub(crate) async fn lease_get(&self, key: &str, token: &str)
-        -> Result<Option<crate::lease::Lease>>
-    {
-        crate::sink::clickhouse::lease_get(&self.ch, key, token).await
-    }
-
-    pub(crate) async fn lease_claim(&self, key: &str, token: &str) -> Result<bool> {
-        crate::sink::clickhouse::lease_claim(&self.ch, key, token).await
-    }
-
-    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
-        crate::sink::clickhouse::lease_close(&self.ch, key, run.token()).await
-    }
-
     /// Does this run still hold its claim? A check, not a fence — see
-    /// `lease_claim`.
+    /// `sink::clickhouse::lease_claim`.
     pub(crate) async fn lease_still_mine(&self, dest_table: &str, token: &str) -> Result<()> {
         let key = self.lease_key(dest_table);
-        match self.lease_get(&key, token).await? {
+        match crate::sink::clickhouse::lease_get(&self.ch, &key, token).await? {
             None => Ok(()),
             Some(l) if !l.lapsed() => Ok(()),
             Some(_) => Err(Error::Locked(format!(
@@ -211,94 +197,12 @@ impl ChDest {
         }
     }
 
-    fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
-        crate::naming::artifact_ident_run(
-            dest_table, crate::naming::Artifact::Lock, crate::naming::ROOMY, run)
-    }
-
-    /// This run's announcement — see `sink::postgres::announce_run`. The name is
-    /// minted by `naming` and the verdict is `naming::guard_verdict`, so a drain
-    /// and a bulk run agree on both; only the catalog statements are spelled
-    /// here, in this engine's dialect.
-    ///
-    /// No `ON CLUSTER`: the CDC lane refuses a Replicated destination outright
-    /// (`refuse_clustered`), so everything it touches is node-local by
-    /// construction.
-    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        self.ch
-            .exec(&format!(
-                "CREATE TABLE IF NOT EXISTS {} (t UInt8) ENGINE = Memory",
-                ch_ident(&self.lock_name(dest_table, run))
-            ))
-            .await
-            .map(|_| ())
-    }
-
-    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
-        let mut found: Vec<String> = Vec::new();
-        for &a in crate::naming::GUARDED {
-            let (head, suffix) =
-                crate::naming::artifact_match(dest_table, a, crate::naming::ROOMY);
-            let body = self
-                .ch
-                .exec(&format!(
-                    "SELECT name FROM system.tables \
-                     WHERE database = currentDatabase() AND name LIKE '{}' \
-                     FORMAT TabSeparatedRaw",
-                    ch_str(&format!("{}%{}", esc(&head), esc(suffix)))
-                ))
-                .await?;
-            found.extend(
-                body.lines()
-                    .map(|l| l.trim_end_matches('\r').to_string())
-                    .filter(|l| !l.is_empty()),
-            );
-        }
-        let dest = self.lease_key(dest_table);
-        let now = crate::naming::now_unix();
-        for blk in crate::naming::blockers(
-            dest_table, crate::naming::ROOMY, run, crate::naming::GUARDED,
-            found.iter().map(|n| (n.as_str(), n.as_str()))).blockers
-        {
-            let Some(tok) = crate::naming::collectable(&blk).map(str::to_string) else {
-                return Err(crate::naming::blocker_error(&dest, &blk, now, None));
-            };
-            let lease = self.lease_get(&dest, &tok).await?;
-            if lease.as_ref().is_some_and(|l| l.lapsed()) && self.lease_claim(&dest, &tok).await? {
-                let _ = self
-                    .ch
-                    .exec(&format!("DROP TABLE IF EXISTS {}", ch_ident(blk.name())))
-                    .await;
-                eprintln!(
-                    "apitap: {dest}: collected {} — the run that wrote it stopped \
-                     renewing its claim on this destination's own clock. Resuming.",
-                    blk.name()
-                );
-                continue;
-            }
-            return Err(crate::naming::blocker_error(&dest, &blk, now, lease.as_ref()));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
-        let _ = self.release_ok(dest_table, run).await;
-    }
-
-    /// Did the lock actually go? The lease may only be dropped once it did.
-    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
-        self.ch
-            .exec(&format!(
-                "DROP TABLE IF EXISTS {}",
-                ch_ident(&self.lock_name(dest_table, run))
-            ))
-            .await
-            .is_ok()
+    /// This destination as the guard sees it — the same `ChGuard` the bulk
+    /// sink uses, with no cluster clause: the CDC lane refuses a clustered
+    /// destination outright. The table is addressed by `dest_table` as given
+    /// (the lease key is too), because this lane cannot address a dotted name.
+    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::clickhouse::ChGuard, String) {
+        (crate::sink::clickhouse::ChGuard::new(self.ch.clone(), None), dest_table.to_string())
     }
 
     /// The changelog append's intent marker: "a window starting at `lsn` is

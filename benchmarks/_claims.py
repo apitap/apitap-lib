@@ -69,7 +69,7 @@ CLAIMS = {
     "bq.multi-drain-one-dataset":    Claim(BQ_DEST, ("bq",), ("same dataset",)),
 
     # compatibility across releases
-    "compat.old-bulk-refused-by-new-drain": Claim(UPGRADE, ("pg@0551", "ch@0551", "bq@0551", "pg@0560"), ("0.55.1",)),
+    "compat.old-bulk-refused-by-new-drain": Claim(UPGRADE, ("pg@0551", "ch@0551", "bq@0551", "pg@0560", "ch@0560", "bq@0560"), ("0.55.1",)),
     "compat.new-drain-refused-by-old-bulk": Claim(UPGRADE, ("pg@0551", "ch@0551", "bq@0551"), ("per-worker",)),
     "compat.old-drain-writes-nothing":      Claim(UPGRADE, ("pg@0551",), ("upgrade the `log_based` jobs first",)),
     "compat.rollback-leaks":         Claim(UPGRADE, ("pg@0551",), ("_apitap_lease", "_apitap_cdc_pending")),

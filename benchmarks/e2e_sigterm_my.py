@@ -67,11 +67,10 @@ def clear_dead_lock():
     waiting five minutes per signal is not something a gate can afford. The
     self-heal is asserted in `e2e_cdc_lease.py`, and the refusal itself in
     `e2e_cdc_guard.py`."""
-    for n in ch(
-        "SELECT name FROM system.tables WHERE database = currentDatabase() "
-        f"AND startsWith(name, '{T}') AND endsWith(name, '__apitap_lock')").split():
-        if n:
-            ch(f"DROP TABLE IF EXISTS `{n}`")
+    # Since 0.57.0 a drain announces a staging MARKER beside its lock, and a
+    # hard kill leaves both. Both clear themselves once the lease lapses.
+    for n in _rig.locks_ch(T) + _rig.markers_ch(T):
+        ch(f"DROP TABLE IF EXISTS `{n}`")
 
 
 

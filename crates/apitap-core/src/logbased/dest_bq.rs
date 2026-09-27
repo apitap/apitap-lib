@@ -163,73 +163,12 @@ impl BqDest {
             .map(|_| 1)
     }
 
-    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
-        crate::sink::bigquery::lease_close(&self.conn, key, run.token()).await
-    }
-
-    fn lock_name(&self, dest_table: &str, run: &crate::naming::RunId) -> String {
-        crate::naming::artifact_ident_run(
-            bare(dest_table), crate::naming::Artifact::Lock, crate::naming::ROOMY, run)
-    }
-
-    /// This run's announcement — see `sink::postgres::announce_run`. The name is
-    /// minted by `naming` and the verdict is `naming::guard_verdict`, so a drain
-    /// and a bulk run agree on both; only the dataset calls are spelled here.
-    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        self.conn.ensure_dataset().await?;
-        self.conn
-            .table_create(
-                &self.lock_name(dest_table, run),
-                // BigQuery has no zero-column table; nothing reads this one.
-                &serde_json::json!([{ "name": "t", "type": "INT64" }]),
-            )
-            .await
-    }
-
-    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        let b = bare(dest_table);
-        // One listing serves both guarded kinds: they share the head, and only
-        // the suffix differs.
-        let (head, _) =
-            crate::naming::artifact_match(b, crate::naming::Artifact::Staging, crate::naming::ROOMY);
-        let listed = self.conn.tables_with_prefix(&head).await?;
-        let dest = self.lease_key(dest_table);
-        let now = crate::naming::now_unix();
-        for blk in crate::naming::blockers(
-            b, crate::naming::ROOMY, run, crate::naming::GUARDED,
-            listed.iter().map(|n| (n.as_str(), n.as_str()))).blockers
-        {
-            let Some(tok) = crate::naming::collectable(&blk).map(str::to_string) else {
-                return Err(crate::naming::blocker_error(&dest, &blk, now, None));
-            };
-            let lease = crate::sink::bigquery::lease_get(&self.conn, &dest, &tok).await?;
-            if lease.as_ref().is_some_and(|l| l.lapsed())
-                && crate::sink::bigquery::lease_claim(&self.conn, &dest, &tok).await?
-            {
-                let _ = self.conn.table_delete(blk.name()).await;
-                eprintln!(
-                    "apitap: {dest}: collected {} — the run that wrote it stopped \
-                     renewing its claim on this destination's own clock. Resuming.",
-                    blk.name()
-                );
-                continue;
-            }
-            return Err(crate::naming::blocker_error(&dest, &blk, now, lease.as_ref()));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
-        let _ = self.release_ok(dest_table, run).await;
-    }
-
-    /// Did the lock actually go? The lease may only be dropped once it did.
-    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
-        self.conn.table_delete(&self.lock_name(dest_table, run)).await.is_ok()
+    /// This destination as the guard sees it — the same `BqGuard` the bulk
+    /// sink uses, raw/canonical listing included, so a bulk run's `_N` worker
+    /// tables are seen by a drain (0.56.0's CDC twin classified the raw ids,
+    /// and a drain proceeded beside them).
+    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::bigquery::BqGuard, String) {
+        (crate::sink::bigquery::BqGuard::new(self.conn.clone()), bare(dest_table).to_string())
     }
 
     pub(crate) async fn connect(url: &str) -> Result<Self> {

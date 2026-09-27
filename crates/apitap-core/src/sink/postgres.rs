@@ -372,17 +372,6 @@ pub(crate) async fn lease_close(pool: &PgPool, schema: &str, key: &str, token: &
     .await;
 }
 
-/// The quoted, schema-qualified lock name of `parts` for `run` — always
-/// qualified, so the lock is created in the schema the scan reads.
-pub(crate) fn lock_ident(parts: &PgParts, run: &crate::naming::RunId) -> String {
-    quote_ident_path(&format!(
-        "{}.{}",
-        parts.schema,
-        crate::naming::artifact_ident_run(
-            &parts.bare, crate::naming::Artifact::Lock, crate::naming::PG_IDENT_MAX, run)
-    ))
-}
-
 // ---------------------------------------------------------------------------------
 // Sink
 // ---------------------------------------------------------------------------------

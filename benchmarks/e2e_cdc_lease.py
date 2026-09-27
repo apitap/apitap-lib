@@ -34,6 +34,8 @@ import time
 
 import apitap
 
+import _rig
+
 PG = "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src"
 CH = "clickhouse://default:bench@127.0.0.1:8124/default"
 T = "cdc_lease"
@@ -152,6 +154,9 @@ had_lock = bool(locks())
 p.kill()
 p.wait()
 case("the killed drain left a lock", had_lock, f"{locks() or 'none'}")
+# Since 0.57.0 a drain also announces an empty staging MARKER, because a 0.55.1
+# bulk run scans for staging only and would not see the lock.
+case("…and its staging marker", bool(_rig.markers_ch(T)), f"{_rig.markers_ch(T) or 'none'}")
 case("…and a lease row, which is what makes it recoverable",
      len(leases()) == 1, f"{leases() or 'none'}")
 
@@ -167,6 +172,8 @@ time.sleep(TTL + 3)
 e = refusal(drain)
 case("the next run proceeds", e is None, e or "collected and drained")
 case("and the dead run's lock is gone", locks() == [], f"{locks() or 'none'}")
+case("and so is its marker — one claim collects both", _rig.markers_ch(T) == [],
+     f"{_rig.markers_ch(T) or 'none'}")
 wm_after = watermark()
 case("it RESUMED — the watermark moved on from where the kill left it",
      wm_after != "" and wm_after != wm_before, f"{wm_before} -> {wm_after}")

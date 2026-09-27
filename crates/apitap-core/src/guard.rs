@@ -28,10 +28,6 @@
 //!    proof, so a lease closed while its lock still stands — the permanent
 //!    wedge — does not type-check.
 
-// Wired into the sinks and the CDC lane one engine at a time (handoff §3 steps
-// 7-13); until each adapter lands, only the tests below call this module.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crate::error::{Error, Result};
 use crate::naming::{self, Artifact, RunId};
 
@@ -126,6 +122,7 @@ impl Announced {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn names(&self) -> &[String] {
         &self.names
     }
@@ -547,13 +544,9 @@ mod tests {
     fn no_guard_decision_outside() {
         const DECISIONS: &[&str] =
             &["naming::classify(", "naming::blockers(", "naming::collectable(", "peer_blocks("];
-        // Shrinks by one file per adapter (handoff §3 steps 7-13) and is empty
-        // once the CDC lane is on this module.
-        const NOT_YET: &[&str] = &[
-            "logbased/dest_my.rs",
-            "logbased/dest_ch.rs",
-            "logbased/dest_bq.rs",
-        ];
+        // Emptied one adapter at a time (handoff §3 steps 7-13). It stays empty:
+        // a file that starts deciding again fails here, by name.
+        const NOT_YET: &[&str] = &[];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut deciding = Vec::new();
         for dir in ["sink", "logbased"] {

@@ -62,8 +62,11 @@ impl PgDest {
         })
     }
 
-    fn guard(&self, parts: &crate::sink::postgres::PgParts) -> crate::sink::postgres::PgGuard {
-        crate::sink::postgres::PgGuard::new(self.pool.clone(), parts.schema.clone())
+    /// This destination as the guard sees it for one member — the bulk sink's
+    /// `PgGuard`, in the schema that member resolved to — and its bare name.
+    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::postgres::PgGuard, String) {
+        let parts = self.parts_of(dest_table);
+        (crate::sink::postgres::PgGuard::new(self.pool.clone(), parts.schema), parts.bare)
     }
 
     /// FENCE: the first statement of every transaction this drain uses to write.
@@ -153,36 +156,6 @@ impl PgDest {
         .map_err(db_err)
     }
 
-    /// The CDC lane's half of the announce-then-check protocol.
-    ///
-    /// Through the bulk sink's `PgGuard` and `crate::guard`, not copies of
-    /// them, and that is the entire point: a drain and a bulk `replace` can
-    /// only refuse each other if both write and read the same artifact name in
-    /// the same place. A second implementation here would agree on the day it
-    /// was written and drift the first time either side was touched — which is
-    /// exactly how the 0.55.0 guard came to be wrong in six sinks out of seven.
-    pub(crate) async fn announce(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        use crate::guard::GuardStore;
-        let parts = self.parts_of(dest_table);
-        let lock = crate::naming::artifact_ident_run(
-            &parts.bare, crate::naming::Artifact::Lock, crate::naming::PG_IDENT_MAX, run);
-        self.guard(&parts).create_marker(&lock).await
-    }
-
-    pub(crate) async fn check_peers(&self, dest_table: &str, run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        let parts = self.parts_of(dest_table);
-        crate::guard::check_peers(&self.guard(&parts), &parts.bare, run, crate::guard::Mine::Keep)
-            .await
-    }
-
-    pub(crate) async fn release(&self, dest_table: &str, run: &crate::naming::RunId) {
-        let _ = self.release_ok(dest_table, run).await;
-    }
-
     /// The lease key — the SAME schema-qualified string the peer scan and the
     /// refusal already use. Never the bare name: the scan is scoped to one
     /// schema, so a bare key would put `sales.orders` and `hr.orders` in one key
@@ -221,19 +194,6 @@ impl PgDest {
             n += crate::sink::postgres::lease_renew(&self.pool, &schema, &ks, run.token()).await?;
         }
         Ok(n)
-    }
-
-    pub(crate) async fn lease_close(&self, key: &str, run: &crate::naming::RunId) {
-        crate::sink::postgres::lease_close(&self.pool, &key_schema(key), key, run.token()).await
-    }
-
-    /// Did the lock actually go? The lease may only be dropped once it did.
-    pub(crate) async fn release_ok(&self, dest_table: &str, run: &crate::naming::RunId) -> bool {
-        let lock_q = crate::sink::postgres::lock_ident(&self.parts_of(dest_table), run);
-        sqlx::query(&format!("DROP TABLE IF EXISTS {lock_q}"))
-            .execute(&self.pool)
-            .await
-            .is_ok()
     }
 
     pub(crate) async fn connect(url: &str) -> Result<Self> {
