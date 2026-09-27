@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn a_staging_key_is_classified_by_its_run_segment() {
         let root = "lake/events__apitap_staging/";
-        let id = crate::naming::RunId::mint(crate::naming::LandKind::Swap, "s3://b/lake");
+        let id = crate::naming::RunId::mint_bulk(crate::naming::BulkKind::Swap, "s3://b/lake");
         let tok = id.token().to_string();
         match classify(root, &format!("{root}{tok}/part-00000.parquet")) {
             Staged::Run { seg, peer } => {
@@ -1192,8 +1192,8 @@ mod tests {
     #[test]
     fn two_runs_never_share_a_staging_directory() {
         let root = "lake/events__apitap_staging/";
-        let a = crate::naming::RunId::mint(crate::naming::LandKind::Swap, "s3://b/lake");
-        let b = crate::naming::RunId::mint(crate::naming::LandKind::Swap, "s3://b/lake");
+        let a = crate::naming::RunId::mint_bulk(crate::naming::BulkKind::Swap, "s3://b/lake");
+        let b = crate::naming::RunId::mint_bulk(crate::naming::BulkKind::Swap, "s3://b/lake");
         assert_ne!(
             format!("{root}{}/", a.token()),
             format!("{root}{}/", b.token())

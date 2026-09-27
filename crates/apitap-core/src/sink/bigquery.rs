@@ -907,7 +907,7 @@ fn retryable(msg: &str) -> bool {
 mod staging_name_tests {
     use super::*;
     use crate::naming::{
-        artifact_ident, artifact_ident_run, artifact_match, parse_peer, Artifact, LandKind, RunId,
+        artifact_ident, artifact_ident_run, artifact_match, parse_peer, Artifact, BulkKind, LandKind, RunId,
         ROOMY, RUN_TOKEN_LEN,
     };
 
@@ -922,7 +922,7 @@ mod staging_name_tests {
             "orders",
             Artifact::Staging,
             ROOMY,
-            &RunId::mint(LandKind::Swap, "postgres://h/db::orders"),
+            &RunId::mint_bulk(BulkKind::Swap, "postgres://h/db::orders"),
         );
         // One binding, because `got` borrows FROM this name — inlining the
         // format! makes it a temporary that dies at the end of the statement.
@@ -946,7 +946,7 @@ mod staging_name_tests {
     #[test]
     fn a_neighbours_staging_is_not_mistaken_for_ours() {
         let (head, suffix) = artifact_match("orders", Artifact::Staging, ROOMY);
-        let run = RunId::mint(LandKind::Incremental, "postgres://h/db::orders");
+        let run = RunId::mint_bulk(BulkKind::Incremental, "postgres://h/db::orders");
         let ours = artifact_ident_run("orders", Artifact::Staging, ROOMY, &run);
         let theirs = artifact_ident_run("orders_archive", Artifact::Staging, ROOMY, &run);
         let anchored = |name: &str| match staging_base(name, suffix) {

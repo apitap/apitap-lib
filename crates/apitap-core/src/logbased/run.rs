@@ -902,10 +902,7 @@ async fn run_group(
     // Every member is announced before ANY member is checked: a group that
     // announced table by table while checking as it went would let two
     // overlapping groups each pass the member the other had not reached yet.
-    let run = crate::naming::RunId::mint(
-        crate::naming::LandKind::Cdc,
-        &crate::pipeline::source_origin(src_url),
-    );
+    let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
     dest.set_run(&run);
     // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
     // record of liveness means refuse" — so writing one first would create a
@@ -1135,10 +1132,7 @@ async fn run_group_mysql(
     // ANNOUNCE, THEN CHECK — the MySQL twin of the Postgres path above, for the
     // same reason and with the same artifact. Every member is announced before
     // ANY member is checked.
-    let run = crate::naming::RunId::mint(
-        crate::naming::LandKind::Cdc,
-        &crate::pipeline::source_origin(src_url),
-    );
+    let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
     dest.set_run(&run);
     // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
     // record of liveness means refuse" — so writing one first would create a

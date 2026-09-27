@@ -262,7 +262,8 @@ impl ChDest {
         let dest = self.lease_key(dest_table);
         let now = crate::naming::now_unix();
         for blk in crate::naming::blockers(
-            dest_table, crate::naming::ROOMY, run, found.iter().map(String::as_str))
+            dest_table, crate::naming::ROOMY, run, crate::naming::GUARDED,
+            found.iter().map(|n| (n.as_str(), n.as_str()))).blockers
         {
             let Some(tok) = crate::naming::collectable(&blk).map(str::to_string) else {
                 return Err(crate::naming::blocker_error(&dest, &blk, now, None));

@@ -249,6 +249,28 @@ impl LandKind {
     }
 }
 
+/// The two kinds a BULK run can be. A separate type from [`LandKind`] so that
+/// "a bulk dispatch minted a CDC token" is a compile error rather than a
+/// review comment: every Cdc token comes from [`RunId::mint_drain`], and the
+/// guard's collection rule leans on that (an object named under a Cdc token is
+/// an empty marker, never data — see [`collectable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BulkKind {
+    /// `replace`.
+    Swap,
+    /// `append` and `merge`.
+    Incremental,
+}
+
+impl From<BulkKind> for LandKind {
+    fn from(k: BulkKind) -> Self {
+        match k {
+            BulkKind::Swap => LandKind::Swap,
+            BulkKind::Incremental => LandKind::Incremental,
+        }
+    }
+}
+
 /// Total token width, including its leading `_`.
 pub(crate) const RUN_TOKEN_LEN: usize = 16;
 
@@ -263,13 +285,22 @@ fn base36(mut n: u64, width: usize) -> String {
 }
 
 impl RunId {
-    /// Mint one identity for one `transfer()` call.
+    /// The identity of one bulk `transfer()` call.
     ///
     /// Deliberately NOT a process-wide global: two `apitap.transfer()` calls in
     /// one Python process are two runs and must not share a token. (The
     /// progress counters already have that bug and it is documented; this is
     /// not the place to add a second instance of it.)
-    pub(crate) fn mint(kind: LandKind, source_id: &str) -> Self {
+    pub(crate) fn mint_bulk(kind: BulkKind, source_id: &str) -> Self {
+        Self::mint_token(kind.into(), source_id)
+    }
+
+    /// The identity of one `log_based` drain — the ONLY way a Cdc token is made.
+    pub(crate) fn mint_drain(source_id: &str) -> Self {
+        Self::mint_token(LandKind::Cdc, source_id)
+    }
+
+    fn mint_token(kind: LandKind, source_id: &str) -> Self {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -312,6 +343,21 @@ impl RunId {
 
     pub(crate) fn token(&self) -> &str {
         &self.token
+    }
+
+    /// What this run lands as, read back off its own token.
+    // The guard reads it to choose a run's markers; until that lands, only the
+    // tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn kind(&self) -> LandKind {
+        LandKind::from_letter(self.token.as_bytes()[8] as char).expect("minted")
+    }
+
+    /// Is `token` exactly this run's? The one test for "mine" that may decide
+    /// a DELETE: anything wider than token equality would let a run drop an
+    /// object another run is using.
+    pub(crate) fn is_self(&self, token: &str) -> bool {
+        self.token == token
     }
 }
 
@@ -391,33 +437,11 @@ pub(crate) fn lock_blocks<'a>(
 /// Iterate this — never scan for one kind and assume the other cannot be there.
 pub(crate) const GUARDED: &[Artifact] = &[Artifact::Lock, Artifact::Staging];
 
-/// The whole verdict of the announce-then-check scan, as one call.
-///
-/// `names` is every artifact name found beside the destination — the caller
-/// supplies them because listing is the one part that is genuinely different on
-/// a catalog, an object store and a BigQuery dataset. Everything after the
-/// listing is the same decision everywhere, and it is made here precisely once:
-/// the 0.55.0 guard open-coded it seven times and the review found the same
-/// class of mistake in six of them.
-pub(crate) fn guard_verdict<'a>(
-    dest: &str,
-    bare: &str,
-    limit: usize,
-    run: &RunId,
-    names: impl IntoIterator<Item = &'a str>,
-) -> crate::error::Result<()> {
-    match blockers(bare, limit, run, names).first() {
-        None => Ok(()),
-        Some(b) => Err(blocker_error(dest, b, now_unix(), None)),
-    }
-}
-
 /// One reason this run may not proceed.
 ///
-/// Split out of [`guard_verdict`] so a caller that can do something about a
-/// blocker — ask whether its owner is still alive, and collect it if not — sees
-/// the blockers themselves instead of a formatted error. `guard_verdict` is the
-/// wrapper for every caller that cannot.
+/// A caller that can do something about a blocker — ask whether its owner is
+/// still alive, and collect it if not — needs the blockers themselves, not a
+/// formatted error. [`blocker_error`] formats one for every caller that cannot.
 #[derive(Debug)]
 pub(crate) enum Blocker {
     /// The un-tokenized name an apitap older than 0.55.0 writes. Never
@@ -440,7 +464,27 @@ impl Blocker {
     }
 }
 
-/// Every blocker beside this destination, in listing order.
+/// What one scan of the catalog found: who blocks this run, and which of this
+/// run's OWN objects a previous attempt left behind.
+#[derive(Debug)]
+pub(crate) struct Scan {
+    pub(crate) blockers: Vec<Blocker>,
+    /// RAW names (as listed, so they can be dropped as listed) of objects that
+    /// carry exactly this run's token. Never a lock: a run's own lock is its
+    /// announcement, and dropping it here would un-announce the run mid-scan.
+    pub(crate) mine_leftovers: Vec<String>,
+}
+
+/// Every blocker beside this destination, in listing order, plus this run's
+/// own leftovers.
+///
+/// `kinds` is what to classify each name as — the scan set, which is
+/// [`GUARDED`] plus whatever extra kinds an engine's `prepare` also refuses
+/// on. `listed` pairs each name's CANONICAL spelling (what classification
+/// reads) with its RAW one (what is refused, dropped and printed). They differ
+/// only where an engine decorates a name — BigQuery's per-worker `_N` tables —
+/// and classifying the raw form there is what made a peer's workers look
+/// foreign in 0.56.0's CDC twin of the bulk scan.
 ///
 /// No error construction and no side effects — the caller decides what to do
 /// with each one. Everything that decides WHETHER something blocks still lives
@@ -449,30 +493,38 @@ pub(crate) fn blockers<'a>(
     bare: &str,
     limit: usize,
     run: &RunId,
-    names: impl IntoIterator<Item = &'a str>,
-) -> Vec<Blocker> {
+    kinds: &[Artifact],
+    listed: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Scan {
     let now = now_unix();
-    let mine: Vec<(Artifact, PeerRun)> = GUARDED
+    let mine: Vec<(Artifact, PeerRun)> = kinds
         .iter()
         .map(|&a| {
             let n = artifact_ident_run(bare, a, limit, run);
             (a, parse_peer(&n, a).expect("a name this process minted parses"))
         })
         .collect();
-    let mut out = Vec::new();
-    for name in names {
+    let mut out = Scan { blockers: Vec::new(), mine_leftovers: Vec::new() };
+    for (canonical, raw) in listed {
         for (a, me) in &mine {
             // A name of a DIFFERENT kind classifies as `Foreign` here — the
             // suffix does not match and the exact-length anchor fails — so
             // asking every kind about every name is safe, and it is the only
             // way a lock and a staging object both get seen.
-            match classify(name, bare, *a, limit, run, now) {
-                Found::Foreign | Found::Mine => {}
-                Found::Legacy => out.push(Blocker::Legacy { name: name.to_string() }),
+            match classify(canonical, bare, *a, limit, run, now) {
+                Found::Foreign => {}
+                Found::Mine => {
+                    if *a != Artifact::Lock
+                        && parse_peer(canonical, *a).is_some_and(|p| run.is_self(&p.token))
+                    {
+                        out.mine_leftovers.push(raw.to_string());
+                    }
+                }
+                Found::Legacy => out.blockers.push(Blocker::Legacy { name: raw.to_string() }),
                 Found::Live(peer) => {
                     if let Some(b) = lock_blocks(me, std::iter::once(&peer)) {
-                        out.push(Blocker::Live {
-                            name: name.to_string(),
+                        out.blockers.push(Blocker::Live {
+                            name: raw.to_string(),
                             artifact: *a,
                             peer: b.clone(),
                             mine: me.clone(),
@@ -488,16 +540,24 @@ pub(crate) fn blockers<'a>(
 /// The peer token of a blocker whose owner can be ASKED whether it is alive —
 /// and therefore the only kind of blocker that may ever be collected.
 ///
-/// A LOCK only. Never staging: a staging object is being written INTO, and
-/// `classify`'s severity argument has full force there — deleting a live run's
-/// workspace is silent truncation on the object stores. A lock holds no data,
-/// so removing one that is provably dead costs nothing; removing one whose
-/// owner is alive costs two winners, which is what the lease exists to make
-/// impossible. Never `Legacy` either: a pre-0.55.0 run writes no lease, and
-/// "no record of liveness" always means refuse.
+/// Only what a DRAIN announces. Every Cdc token is minted by
+/// [`RunId::mint_drain`] alone, and every object named under one is an EMPTY
+/// marker that `guard::announce` created — its lock, and the staging-named
+/// marker a 0.55.1 reader needs to see it (see [`compat`]). So removing one
+/// whose owner is provably dead costs nothing, and the lease is what proves it.
+///
+/// Never a bulk run's staging: it holds data, and deleting a live run's
+/// workspace is silent truncation on the object stores. Never a bulk lock
+/// either — it carries no lease, and "no record of liveness" always means
+/// refuse. Never `Legacy`: a pre-0.55.0 run writes no lease at all.
 pub(crate) fn collectable(b: &Blocker) -> Option<&str> {
     match b {
-        Blocker::Live { artifact: Artifact::Lock, peer, .. } => Some(&peer.token),
+        Blocker::Live { artifact, peer, .. }
+            if peer.kind == LandKind::Cdc
+                && compat::markers(LandKind::Cdc).contains(artifact) =>
+        {
+            Some(&peer.token)
+        }
         _ => None,
     }
 }
@@ -947,6 +1007,110 @@ pub(crate) const CDC_PENDING_TABLE: &str = "_apitap_cdc_pending";
 pub(crate) const OWN_TABLES: &[&str] =
     &[STATE_TABLE, CDC_PENDING_TABLE, crate::lease::LEASE_TABLE];
 
+/// What every SUPPORTED apitap writes beside a table and scans for — so a claim
+/// about another version is a compiled fact with a test, not an assumption.
+///
+/// 0.56.0 shipped without this and paid for it twice: its drain announced with
+/// a lock that a 0.55.1 bulk run (which scans for staging only) cannot see, so
+/// in a rolling upgrade the two ran over each other; and a rollback to 0.55.1
+/// replicated `_apitap_lease` and `_apitap_cdc_pending` as user data, because
+/// 0.55.1 hides only `_apitap_state` from discovery. Neither fact appeared
+/// anywhere in the tree.
+pub(crate) mod compat {
+    use super::{
+        Artifact::{self, *},
+        LandKind::{self, *},
+        CDC_PENDING_TABLE, STATE_TABLE,
+    };
+
+    /// What a SHIPPED apitap writes beside a table and what it scans for.
+    /// Cells are facts about released wheels and are never edited; a release
+    /// that changes either adds a row. They are spelled as literals — not as
+    /// `GUARDED` or `OWN_TABLES` — so that a change to the current sets is a
+    /// test failure here rather than a silent rewrite of history.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    // The table is read by the tests below, which are what fail the build when
+    // a supported reader cannot see a current run; outside them only `markers`
+    // is called.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) enum Generation {
+        G0,
+        G1,
+        G2,
+        G3,
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    impl Generation {
+        pub(crate) const CURRENT: Generation = Generation::G3;
+        /// G0 (<0.55.0) writes the un-tokenized name, which is `Found::Legacy`
+        /// and refused — never coexisted with. 0.55.0 is not a neighbour:
+        /// the stability page says upgrade it to 0.55.1 first.
+        pub(crate) const SUPPORTED: &'static [Generation] =
+            &[Generation::G1, Generation::G2, Generation::G3];
+        pub(crate) const fn versions(self) -> &'static str {
+            match self {
+                Self::G0 => "<0.55.0",
+                Self::G1 => "0.55.1",
+                Self::G2 => "0.56.0",
+                Self::G3 => "0.57.0+",
+            }
+        }
+
+        /// On disk while a run of `kind` must be visible to a peer, from the
+        /// end of `prepare` on, on the SQL catalogs and BigQuery. (The object
+        /// stores see staging only from a run's first part.)
+        pub(crate) const fn announces(self, kind: LandKind) -> &'static [Artifact] {
+            match (self, kind) {
+                (Self::G0, _) => &[],
+                // the hole: a 0.55.1 drain writes nothing at all
+                (Self::G1, Cdc) => &[],
+                (Self::G1, _) => &[Staging],
+                (Self::G2, Cdc) => &[Lock],
+                // G3 Cdc: the lock plus an empty staging MARKER, for G1 readers
+                (Self::G2, _) | (Self::G3, _) => &[Lock, Staging],
+            }
+        }
+
+        pub(crate) const fn scans(self) -> &'static [Artifact] {
+            match self {
+                Self::G0 => &[],
+                Self::G1 => &[Staging],
+                Self::G2 | Self::G3 => &[Lock, Staging],
+            }
+        }
+
+        /// The whole-word tables it hides from table discovery.
+        pub(crate) const fn excludes(self) -> &'static [&'static str] {
+            match self {
+                Self::G0 | Self::G1 => &[STATE_TABLE],
+                Self::G2 | Self::G3 => &[STATE_TABLE, CDC_PENDING_TABLE, crate::lease::LEASE_TABLE],
+            }
+        }
+    }
+
+    /// Writer/kind pairs the CURRENT scan cannot see, each one documented in
+    /// failure-modes.md#upgrading-and-rolling-back with the order that avoids it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const KNOWN_HOLES: &[(Generation, LandKind)] = &[(Generation::G1, Cdc)];
+
+    /// What rolling back to a generation replicates as if it were user data:
+    /// the current bookkeeping tables it does not know to hide.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const ROLLBACK_LEAKS: &[(Generation, &[&str])] =
+        &[(Generation::G1, &[CDC_PENDING_TABLE, crate::lease::LEASE_TABLE])];
+
+    /// The ONLY place a marker set is chosen. `guard::announce` creates exactly
+    /// these, empty. A bulk run's staging is not a marker: the sink's own
+    /// `prepare` creates it, with data.
+    pub(crate) const fn markers(kind: LandKind) -> &'static [Artifact] {
+        match kind {
+            Cdc => &[Lock, Staging],
+            _ => &[Lock],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,7 +1265,7 @@ mod tests {
     // ── run identity ──────────────────────────────────────────────────────
 
     fn peer(kind: LandKind, src: &str) -> PeerRun {
-        let id = RunId::mint(kind, src);
+        let id = RunId::mint_token(kind, src);
         parse_peer(&artifact_ident_run("t", Artifact::Staging, PG_IDENT_MAX, &id),
                    Artifact::Staging)
             .expect("a name this module minted must parse")
@@ -1147,51 +1311,56 @@ mod tests {
     /// The point of the whole 0.56.0 change is the FIRST case — a peer that has
     /// announced itself and not yet created any staging object. The 0.55.x scan
     /// looked only at staging, so that peer was invisible and both runs went.
+    /// The verdict the old `guard_verdict` wrapper gave: the first blocker of a
+    /// scan over the guarded kinds, as the error a sink would raise.
+    fn verdict(run: &RunId, names: &[&str]) -> crate::error::Result<()> {
+        let scan = blockers("orders", PG_IDENT_MAX, run, GUARDED, names.iter().map(|n| (*n, *n)));
+        match scan.blockers.first() {
+            None => Ok(()),
+            Some(b) => Err(blocker_error("public.orders", b, now_unix(), None)),
+        }
+    }
+
     #[test]
     fn a_scan_sees_a_peer_that_has_only_announced_itself() {
-        let mine = RunId::mint(LandKind::Swap, "postgres://h:5432/db");
-        let peer_run = RunId::mint(LandKind::Incremental, "postgres://other:5432/db");
+        let mine = RunId::mint_token(LandKind::Swap, "postgres://h:5432/db");
+        let peer_run = RunId::mint_token(LandKind::Incremental, "postgres://other:5432/db");
         let their_lock = artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &peer_run);
         let their_staging =
             artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &peer_run);
 
         // A lock ALONE refuses. This is the new capability; drop Artifact::Lock
         // from GUARDED and only this assertion fails.
-        let e = guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
-                              [their_lock.as_str()])
+        let e = verdict(&mine, &[their_lock.as_str()])
             .expect_err("a replace must yield to a peer that has announced itself");
         assert!(format!("{e}").contains("locked:"), "{e}");
         // …and so does staging alone, exactly as before.
-        assert!(guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
-                              [their_staging.as_str()]).is_err());
+        assert!(verdict(&mine, &[their_staging.as_str()]).is_err());
 
         // This run's OWN announcement is not a peer — it is the thing the scan
         // is taken after. If it were, every run would refuse itself.
         let my_lock = artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &mine);
         let my_staging = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &mine);
-        guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
-                      [my_lock.as_str(), my_staging.as_str()])
+        verdict(&mine, &[my_lock.as_str(), my_staging.as_str()])
             .expect("a run must not refuse itself");
 
         // FAN-IN survives the lock: two appends from DIFFERENT sources share a
         // table on purpose, and each one announces. Delete this and "refuse
         // anything with a lock beside it" passes everything above.
-        let fanin = RunId::mint(LandKind::Incremental, "postgres://h:5432/db");
-        guard_verdict("public.orders", "orders", PG_IDENT_MAX, &fanin,
-                      [their_lock.as_str()])
+        let fanin = RunId::mint_token(LandKind::Incremental, "postgres://h:5432/db");
+        verdict(&fanin, &[their_lock.as_str()])
             .expect("two appends from different sources must both proceed");
 
         // A sibling table's lock is not this table's business.
         let sibling = artifact_ident_run("orders_archive", Artifact::Lock, PG_IDENT_MAX, &peer_run);
-        guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine, [sibling.as_str()])
+        verdict(&mine, &[sibling.as_str()])
             .expect("a prefix-sharing sibling is a different destination");
 
         // An un-tokenized name still refuses with the LEGACY message, whichever
         // kind it is: an apitap that predates the lock is loading into it.
         for legacy in [artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX),
                        artifact_ident("orders", Artifact::Lock, PG_IDENT_MAX)] {
-            let e = guard_verdict("public.orders", "orders", PG_IDENT_MAX, &mine,
-                                  [legacy.as_str()])
+            let e = verdict(&mine, &[legacy.as_str()])
                 .expect_err("an un-tokenized artifact is refused, never collected");
             assert!(format!("{e}").contains("older than 0.55.0")
                     || format!("{e}").contains("legacy"), "{legacy}: {e}");
@@ -1204,7 +1373,7 @@ mod tests {
     fn the_lock_artifact_obeys_the_artifact_contract() {
         assert!(Artifact::ALL.contains(&Artifact::Lock));
         assert!(Artifact::Lock.reserved(), "__apitap_lock is namespaced, so reserve it");
-        let run = RunId::mint(LandKind::Swap, "postgres://h:5432/db");
+        let run = RunId::mint_token(LandKind::Swap, "postgres://h:5432/db");
         for &lim in &[PG_IDENT_MAX, MY_IDENT_MAX, ROOMY] {
             let name = artifact_ident_run("orders", Artifact::Lock, lim, &run);
             assert!(name.len() <= lim, "{lim}: {} bytes", name.len());
@@ -1240,7 +1409,7 @@ mod tests {
         use crate::Mode;
 
         fn hash_of(mode: Mode, url: &str) -> String {
-            let id = mint_run(mode, url);
+            let id = mint_run(mode, url).expect("a bulk mode mints");
             parse_peer(
                 &artifact_ident_run("t", Artifact::Staging, PG_IDENT_MAX, &id),
                 Artifact::Staging,
@@ -1288,7 +1457,7 @@ mod tests {
     fn a_minted_token_round_trips_through_the_name() {
         for &a in Artifact::ALL {
             for &lim in &[PG_IDENT_MAX, MY_IDENT_MAX, ROOMY] {
-                let id = RunId::mint(LandKind::Incremental, "postgres://h/db::orders");
+                let id = RunId::mint_token(LandKind::Incremental, "postgres://h/db::orders");
                 let name = artifact_ident_run("orders", a, lim, &id);
                 assert!(name.len() <= lim, "{:?} at {lim}: {} bytes", a, name.len());
                 let p = parse_peer(&name, a).expect("must parse");
@@ -1308,7 +1477,7 @@ mod tests {
             for &lim in &[PG_IDENT_MAX, MY_IDENT_MAX] {
                 for n in [1usize, 30, 31, 32, 46, 47, 63, 64, 200] {
                     let bare = "t".repeat(n);
-                    let id = RunId::mint(LandKind::Swap, "s");
+                    let id = RunId::mint_token(LandKind::Swap, "s");
                     let name = artifact_ident_run(&bare, a, lim, &id);
                     assert!(name.len() <= lim, "{:?} bare={n} lim={lim}: {}", a, name.len());
                     assert_ne!(name, bare, "never equal to its own table");
@@ -1328,7 +1497,7 @@ mod tests {
     fn two_runs_never_mint_the_same_name() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50_000 {
-            let id = RunId::mint(LandKind::Swap, "postgres://h/db::orders");
+            let id = RunId::mint_token(LandKind::Swap, "postgres://h/db::orders");
             let name = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &id);
             assert!(seen.insert(name.clone()), "collision: {name}");
         }
@@ -1342,7 +1511,7 @@ mod tests {
             for n in [5usize, 40, 100] {
                 let bare = "x".repeat(n);
                 let (head, suffix) = artifact_match(&bare, a, PG_IDENT_MAX);
-                let id = RunId::mint(LandKind::Cdc, "s");
+                let id = RunId::mint_token(LandKind::Cdc, "s");
                 let name = artifact_ident_run(&bare, a, PG_IDENT_MAX, &id);
                 assert!(name.starts_with(&head), "head {head} vs {name}");
                 assert!(name.ends_with(suffix), "suffix {suffix} vs {name}");
@@ -1404,7 +1573,7 @@ mod tests {
     /// only one end lets a run reap a DIFFERENT table's workspace.
     #[test]
     fn a_siblings_artifact_is_never_mistaken_for_ours() {
-        let run = RunId::mint(LandKind::Swap, "s");
+        let run = RunId::mint_token(LandKind::Swap, "s");
         let now = now_unix();
         for &a in Artifact::ALL {
             // `orders` and `orders_items` share a prefix, which is entirely
@@ -1425,7 +1594,7 @@ mod tests {
     /// refuses itself.
     #[test]
     fn a_run_recognises_its_own_artifacts_however_old_they_are() {
-        let run = RunId::mint(LandKind::Swap, "s");
+        let run = RunId::mint_token(LandKind::Swap, "s");
         let mine = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &run);
         // Far past any horizon: ownership is checked before age, on purpose.
         let much_later = now_unix() + 10_000_000;
@@ -1442,8 +1611,8 @@ mod tests {
     /// have.
     #[test]
     fn a_foreign_artifact_is_never_collected_on_age_alone() {
-        let ours = RunId::mint(LandKind::Swap, "a");
-        let theirs = RunId::mint(LandKind::Swap, "b");
+        let ours = RunId::mint_token(LandKind::Swap, "a");
+        let theirs = RunId::mint_token(LandKind::Swap, "b");
         let name = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &theirs);
         for at in [now_unix(), now_unix() + 10_000_000] {
             assert!(matches!(
@@ -1467,7 +1636,7 @@ mod tests {
     /// the same rule: nothing is collected on a guess.
     #[test]
     fn the_pre_token_name_is_refused_not_collected() {
-        let run = RunId::mint(LandKind::Swap, "s");
+        let run = RunId::mint_token(LandKind::Swap, "s");
         for &a in Artifact::ALL {
             let legacy = artifact_ident("orders", a, PG_IDENT_MAX);
             assert_eq!(classify(&legacy, "orders", a, PG_IDENT_MAX, &run, now_unix()),
@@ -1483,7 +1652,7 @@ mod tests {
     /// Anything else beside the table is none of our business.
     #[test]
     fn an_unrelated_name_is_left_alone() {
-        let run = RunId::mint(LandKind::Swap, "s");
+        let run = RunId::mint_token(LandKind::Swap, "s");
         let now = now_unix();
         for name in ["orders", "orders_backup", "orders__apitap_stagingX",
                      "totally_unrelated", "__apitap_staging"] {
@@ -1535,30 +1704,170 @@ mod tests {
         assert!(msg.contains("Nothing for you to do"), "{msg}");
     }
 
-    /// A lock may be collected; a staging object and a pre-lease name may not,
-    /// at any age. This is the line between "self-healing" and "silent
-    /// truncation" and it is one function.
+    /// What a DRAIN announces may be collected — its lock AND its staging
+    /// marker, both empty by construction. What a bulk run leaves may not, at
+    /// any age: its staging holds data, its lock carries no lease. Neither may
+    /// a pre-lease name. This is the line between "self-healing" and "silent
+    /// truncation", and it is one function.
+    ///
+    /// Until 0.57.0 this said "only a lock": a drain wrote no staging, so a
+    /// Cdc-token staging object could not exist. It does now (the marker a
+    /// 0.55.1 reader needs), so that assertion is deliberately reversed here.
     #[test]
-    fn only_a_lock_is_ever_collectable() {
-        let mine = RunId::mint(LandKind::Swap, "postgres://h:5432/db");
-        let peer = RunId::mint(LandKind::Cdc, "postgres://other:5432/db");
-        let lock = artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &peer);
-        let staging = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &peer);
-        let legacy = artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX);
+    fn only_a_drains_markers_are_collectable() {
+        let mine = RunId::mint_bulk(BulkKind::Swap, "postgres://h:5432/db");
+        let drain = RunId::mint_drain("postgres://other:5432/db");
+        let swap = RunId::mint_bulk(BulkKind::Swap, "postgres://other:5432/db");
+        let app = RunId::mint_bulk(BulkKind::Incremental, "postgres://other:5432/db");
+        let name = |a, r: &RunId| artifact_ident_run("orders", a, PG_IDENT_MAX, r);
+        let cases = [
+            (name(Artifact::Lock, &drain), Some(drain.token().to_string())),
+            (name(Artifact::Staging, &drain), Some(drain.token().to_string())),
+            (name(Artifact::Lock, &swap), None),
+            (name(Artifact::Staging, &swap), None),
+            (name(Artifact::Staging, &app), None),
+            (artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX), None),
+        ];
+        for (n, want) in &cases {
+            let scan = blockers("orders", PG_IDENT_MAX, &mine, GUARDED, [(n.as_str(), n.as_str())]);
+            assert_eq!(scan.blockers.len(), 1, "{n} must block a replace: {scan:?}");
+            let got = collectable(&scan.blockers[0]).map(str::to_string);
+            assert_eq!(&got, want, "{n}");
+        }
+        // The token handed back is the PEER's, never this run's: the claim is
+        // made against the row the dead run wrote.
+        assert_ne!(cases[0].1.as_deref(), Some(mine.token()));
+    }
 
-        let bs = blockers("orders", PG_IDENT_MAX, &mine,
-                          [lock.as_str(), staging.as_str(), legacy.as_str()]);
-        assert_eq!(bs.len(), 3, "{bs:?}");
-        let collectable_names: Vec<&str> =
-            bs.iter().filter(|b| collectable(b).is_some()).map(|b| b.name()).collect();
-        assert_eq!(collectable_names, vec![lock.as_str()],
-                   "only the lock — staging is being written INTO, and the \
-                    un-tokenized name predates every liveness record");
-        // …and the token it hands back is the PEER's, not this run's: the claim
-        // is made against the row the dead run wrote.
-        let tok = bs.iter().find_map(collectable).expect("the lock is collectable");
-        assert_eq!(tok, peer.token());
-        assert_ne!(tok, mine.token());
+    /// A leftover is "mine" only by EXACT token, and a lock is never one: a
+    /// run's own lock is its announcement, and deleting it mid-scan would
+    /// un-announce the run. A different run of the same table is a peer.
+    #[test]
+    fn mine_leftovers_is_exact_token() {
+        let run = RunId::mint_bulk(BulkKind::Swap, "postgres://h:5432/db");
+        let other = RunId::mint_bulk(BulkKind::Swap, "postgres://h:5432/db");
+        let kinds = [Artifact::Lock, Artifact::Staging, Artifact::Old];
+        let n = |a, r: &RunId| artifact_ident_run("orders", a, MY_IDENT_MAX, r);
+        let (my_staging, my_old, my_lock) =
+            (n(Artifact::Staging, &run), n(Artifact::Old, &run), n(Artifact::Lock, &run));
+        let their_staging = n(Artifact::Staging, &other);
+        let listed = [&my_staging, &my_old, &my_lock, &their_staging];
+        let scan = blockers("orders", MY_IDENT_MAX, &run, &kinds,
+                            listed.iter().map(|x| (x.as_str(), x.as_str())));
+        assert_eq!(scan.mine_leftovers, vec![my_staging.clone(), my_old.clone()],
+                   "own staging and own Old are leftovers; own lock is not");
+        assert_eq!(scan.blockers.len(), 1, "the other run's staging blocks: {scan:?}");
+        assert_eq!(scan.blockers[0].name(), their_staging);
+    }
+
+    /// The listing's RAW name is what gets refused and dropped; the CANONICAL
+    /// one is what gets classified. They differ on BigQuery (`_N` workers).
+    #[test]
+    fn a_blocker_carries_the_raw_name_it_was_listed_as() {
+        let run = RunId::mint_bulk(BulkKind::Swap, "s");
+        let peer = RunId::mint_bulk(BulkKind::Swap, "t");
+        let canonical = artifact_ident_run("orders", Artifact::Staging, ROOMY, &peer);
+        let raw = format!("{canonical}_3");
+        let scan = blockers("orders", ROOMY, &run, GUARDED, [(canonical.as_str(), raw.as_str())]);
+        assert_eq!(scan.blockers.len(), 1);
+        assert_eq!(scan.blockers[0].name(), raw);
+    }
+
+    // ── compatibility across releases ────────────────────────────────────
+
+    use compat::{Generation, KNOWN_HOLES, ROLLBACK_LEAKS};
+
+    fn meets(a: &[Artifact], b: &[Artifact]) -> bool {
+        a.iter().any(|x| b.contains(x))
+    }
+
+    /// Every supported older reader must see a run of every kind this release
+    /// can start — or a rolling upgrade runs two writers over one table.
+    #[test]
+    fn every_supported_reader_sees_a_current_run() {
+        // <0.55.0 is refused as Legacy, never coexisted with, so it is no reader
+        // this table has to satisfy — and it scans nothing.
+        assert!(!Generation::SUPPORTED.contains(&Generation::G0));
+        assert!(Generation::G0.scans().is_empty());
+        for &reader in Generation::SUPPORTED {
+            for kind in [LandKind::Swap, LandKind::Incremental, LandKind::Cdc] {
+                assert!(meets(Generation::CURRENT.announces(kind), reader.scans()),
+                        "a {} reader scans {:?} and cannot see a current {kind:?} run, \
+                         which announces {:?}", reader.versions(), reader.scans(),
+                        Generation::CURRENT.announces(kind));
+            }
+        }
+    }
+
+    /// The current scan sees every supported writer, except the holes this
+    /// table declares — and a declared hole really is a writer that leaves
+    /// nothing to see, not a stale excuse.
+    #[test]
+    fn current_scans_every_supported_writer_or_the_hole_is_declared() {
+        for &writer in Generation::SUPPORTED {
+            for kind in [LandKind::Swap, LandKind::Incremental, LandKind::Cdc] {
+                let seen = meets(writer.announces(kind), Generation::CURRENT.scans());
+                assert!(seen || KNOWN_HOLES.contains(&(writer, kind)),
+                        "a {} {kind:?} run announces {:?}, which the current scan \
+                         {:?} cannot see, and no hole is declared",
+                        writer.versions(), writer.announces(kind), Generation::CURRENT.scans());
+            }
+        }
+        for &(g, k) in KNOWN_HOLES {
+            assert!(g.announces(k).is_empty(),
+                    "({}, {k:?}) is declared a hole but announces {:?} — a hole that \
+                     closed must leave KNOWN_HOLES", g.versions(), g.announces(k));
+        }
+    }
+
+    /// What `guard::announce` creates for a run is its whole announcement minus
+    /// what `prepare` creates with data: the bulk run's staging. A drain has no
+    /// prepare that makes staging, so its markers are the whole announcement.
+    #[test]
+    fn markers_are_announced_minus_prepare() {
+        for kind in [LandKind::Swap, LandKind::Incremental, LandKind::Cdc] {
+            let rest: Vec<Artifact> = Generation::CURRENT.announces(kind).iter()
+                .filter(|a| !compat::markers(kind).contains(a)).copied().collect();
+            let want: &[Artifact] = if kind == LandKind::Cdc { &[] } else { &[Artifact::Staging] };
+            assert_eq!(rest, want, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn guarded_is_the_current_scan_set() {
+        assert_eq!(GUARDED, Generation::CURRENT.scans());
+    }
+
+    /// The whole-word tables the current release hides are exactly OWN_TABLES,
+    /// and what a rollback to 0.55.1 leaks is derived, not remembered.
+    #[test]
+    fn own_tables_is_the_current_exclusion_and_rollback_leaks_are_derived() {
+        assert_eq!(OWN_TABLES, Generation::CURRENT.excludes());
+        for &(g, leaks) in ROLLBACK_LEAKS {
+            let derived: Vec<&str> = OWN_TABLES.iter()
+                .filter(|t| !g.excludes().contains(t)).copied().collect();
+            assert_eq!(derived, leaks, "rolling back to {}", g.versions());
+        }
+    }
+
+    #[test]
+    fn own_tables_are_frozen_at_three_names() {
+        assert_eq!(OWN_TABLES, &["_apitap_state", "_apitap_cdc_pending", "_apitap_lease"],
+                   "every whole-word bookkeeping table is replicated as user data by every \
+                    older generation on rollback; adding one updates ROLLBACK_LEAKS and \
+                    failure-modes.md#upgrading-and-rolling-back in the same commit.");
+        assert_eq!(OWN_TABLES.len(), 3);
+    }
+
+    /// A token says what it is, and a bulk constructor cannot say Cdc.
+    #[test]
+    fn a_token_reads_back_its_kind() {
+        assert_eq!(RunId::mint_bulk(BulkKind::Swap, "s").kind(), LandKind::Swap);
+        assert_eq!(RunId::mint_bulk(BulkKind::Incremental, "s").kind(), LandKind::Incremental);
+        assert_eq!(RunId::mint_drain("s").kind(), LandKind::Cdc);
+        let r = RunId::mint_drain("s");
+        assert!(r.is_self(r.token()));
+        assert!(!r.is_self(RunId::mint_drain("s").token()));
     }
 
     /// The lease's own arithmetic, which decides whether a lock may go.

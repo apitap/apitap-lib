@@ -129,19 +129,27 @@ struct SinkCfg {
 /// Credentials, query and scheme alias are exactly how one server gets spelled
 /// two ways, never how two servers differ. The table is deliberately NOT in
 /// here: two runs of different tables never share an artifact name anyway.
-pub(crate) fn mint_run(mode: crate::Mode, src_url: &str) -> crate::naming::RunId {
-    crate::naming::RunId::mint(land_kind(mode), &super::source_origin(src_url))
+pub(crate) fn mint_run(mode: crate::Mode, src_url: &str) -> Result<crate::naming::RunId> {
+    Ok(crate::naming::RunId::mint_bulk(land_kind(mode)?, &super::source_origin(src_url)))
 }
 
 
 /// How this run's mode lands rows, which is what decides whether a concurrent
 /// run of the same table can be allowed to proceed.
-fn land_kind(mode: crate::Mode) -> crate::naming::LandKind {
-    use crate::naming::LandKind;
+///
+/// `log_based` never reaches the bulk dispatcher (`transfer` routes it to the
+/// CDC lane first), and it must not: a Cdc token names only EMPTY markers, which
+/// is what makes a dead drain's objects collectable. A bulk run minting one
+/// would have its staging — which holds data — collected by the next run. So
+/// the arm is an error, not a mapping.
+fn land_kind(mode: crate::Mode) -> Result<crate::naming::BulkKind> {
+    use crate::naming::BulkKind;
     match mode {
-        crate::Mode::Replace => LandKind::Swap,
-        crate::Mode::Append | crate::Mode::Merge => LandKind::Incremental,
-        crate::Mode::LogBased => LandKind::Cdc,
+        crate::Mode::Replace => Ok(BulkKind::Swap),
+        crate::Mode::Append | crate::Mode::Merge => Ok(BulkKind::Incremental),
+        crate::Mode::LogBased => Err(Error::InvalidInput(
+            "log_based reached the bulk dispatcher".into(),
+        )),
     }
 }
 
@@ -349,7 +357,7 @@ async fn one<S: SrcScheme, D: DstScheme>(
         pg_overlap,
         ch_ddl,
         budget: parallel,
-        run: mint_run(opts.mode, src_url),
+        run: mint_run(opts.mode, src_url)?,
     };
     let src = S::connect(src_url, parallel + 1).await?;
     let sink = D::connect(dst_url, dest_table, parallel, &cfg).await?;
@@ -376,7 +384,7 @@ async fn many<S: SrcScheme, D: DstScheme>(
         pg_overlap,
         ch_ddl,
         budget,
-        run: mint_run(opts.mode, src_url),
+        run: mint_run(opts.mode, src_url)?,
     };
     let src = S::connect(src_url, budget + 8).await?;
     let jobs = jobs_for(&src, &sel, D::BARE_DEST).await?;
@@ -637,6 +645,25 @@ pub(crate) async fn multi(
 mod tests {
     use super::*;
     use crate::plan::{Delta, Lane, TablePlan, WireFormat};
+
+    /// The bulk dispatcher cannot mint a drain's identity. A Cdc token names
+    /// only empty markers, and that is what lets a dead drain's objects be
+    /// collected; a bulk run holding one would have its staging collected
+    /// under it by the next run.
+    #[test]
+    fn mint_bulk_never_yields_cdc() {
+        use crate::naming::{BulkKind, LandKind};
+        assert!(land_kind(crate::Mode::LogBased).is_err());
+        assert!(mint_run(crate::Mode::LogBased, "postgres://h/db").is_err());
+        assert_eq!(land_kind(crate::Mode::Replace).unwrap(), BulkKind::Swap);
+        assert_eq!(land_kind(crate::Mode::Append).unwrap(), BulkKind::Incremental);
+        assert_eq!(land_kind(crate::Mode::Merge).unwrap(), BulkKind::Incremental);
+        for (mode, want) in [(crate::Mode::Replace, LandKind::Swap),
+                             (crate::Mode::Append, LandKind::Incremental),
+                             (crate::Mode::Merge, LandKind::Incremental)] {
+            assert_eq!(mint_run(mode, "postgres://h/db").unwrap().kind(), want, "{mode:?}");
+        }
+    }
 
     /// A Source that only answers catalog() — jobs_for touches nothing else.
     struct FakeCatalog(Vec<(&'static str, i64)>);

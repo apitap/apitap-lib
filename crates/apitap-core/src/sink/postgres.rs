@@ -76,7 +76,8 @@ pub(crate) async fn check_peers(
     let dest = format!("{schema}.{bare}");
     let now = crate::naming::now_unix();
     for b in crate::naming::blockers(
-        bare, crate::naming::PG_IDENT_MAX, run, found.iter().map(String::as_str))
+        bare, crate::naming::PG_IDENT_MAX, run, GUARDED,
+        found.iter().map(|n| (n.as_str(), n.as_str()))).blockers
     {
         // Staging and the un-tokenized pre-0.55.0 name are never collectable at
         // any age — `classify`'s severity argument has full force on an object
