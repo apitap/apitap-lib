@@ -68,9 +68,9 @@ pub(crate) struct MySqlSink {
     /// two replaces of one table raced for one `__apitap_old` slot, and the
     /// pre-drop that papered over it could delete a live peer's outgoing table.
     old: String,
-    /// This run's announcement that it is working on this table, written before
-    /// the peer scan and dropped in `finalize`/`discard` — see `announce`.
-    lock: String,
+    /// This run's announcement on this table, from `prepare` until the staging
+    /// it protects exists (or the run ends first). See `crate::guard`.
+    announced: Mutex<Option<crate::guard::Announced>>,
     /// This run's identity — it is IN both artifact names above, and it is what
     /// `prepare` compares a live peer's leftovers against.
     run: crate::naming::RunId,
@@ -233,6 +233,105 @@ pub(crate) async fn lease_close(pool: &Pool, db: &str, key: &str, token: &str) {
                 (key, token),
             )
             .await;
+    }
+}
+
+/// The guard's view of a MySQL destination: the URL's database, spelled.
+///
+/// It scans `[Lock, Staging, Old]` in BOTH lanes: `__apitap_old` is where a
+/// replace parks the outgoing table between its two RENAMEs, and a run that
+/// died there has left a live-looking peer that the CDC lane could not see in
+/// 0.56.0 (it scanned the two guarded kinds only).
+pub(crate) struct MyGuard {
+    shared: MySqlShared,
+}
+
+impl MyGuard {
+    pub(crate) fn new(shared: MySqlShared) -> Self {
+        MyGuard { shared }
+    }
+
+    fn fq(&self, table: &str) -> String {
+        format!("{}.{}", my_ident(&self.shared.db), my_ident(table))
+    }
+
+    async fn exec(&self, sql: &str) -> Result<()> {
+        let mut conn = self.shared.conn().await?;
+        conn.query_drop(sql)
+            .await
+            .map_err(|e| Error::Transfer(format!("mysql exec [{sql}]: {e}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::guard::GuardStore for MyGuard {
+    fn limit(&self) -> usize {
+        crate::naming::MY_IDENT_MAX
+    }
+
+    fn dest_label(&self, bare: &str) -> String {
+        format!("{}.{bare}", self.shared.db)
+    }
+
+    fn scan_kinds(&self) -> &'static [crate::naming::Artifact] {
+        use crate::naming::Artifact::*;
+        &[Lock, Staging, Old]
+    }
+
+    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        // `_` and `%` are LIKE wildcards and every suffix is full of the first.
+        // MySQL does not enable backslash escaping under NO_BACKSLASH_ESCAPES,
+        // so the escape character is declared explicitly — the same convention
+        // `naming::sql_exclusion` uses for this dialect.
+        let esc = |v: &str| v.replace('|', "||").replace('_', "|_").replace('%', "|%");
+        let mut out = Vec::new();
+        let mut conn = self.shared.conn().await?;
+        for &a in kinds {
+            // The token sits BETWEEN the head and the suffix, so the pattern is
+            // head + wildcard + suffix — not a prefix.
+            let (head, suffix) = crate::naming::artifact_match(bare, a, crate::naming::MY_IDENT_MAX);
+            let found: Vec<String> = conn
+                .exec(
+                    // BASE TABLE only, the way the Postgres scan is
+                    // `relkind = 'r'`: every artifact here is a real table, and
+                    // a VIEW that happens to match is somebody else's object.
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = ? AND table_type = 'BASE TABLE' \
+                       AND table_name LIKE ? ESCAPE '|'",
+                    (self.shared.db.as_str(), format!("{}%{}", esc(&head), esc(suffix))),
+                )
+                .await
+                .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
+            out.extend(found.into_iter().map(crate::guard::Listed::same));
+        }
+        Ok(out)
+    }
+
+    /// MySQL has no zero-column table, so a marker carries one it never reads.
+    /// MEMORY, because nothing in it needs to survive a restart.
+    async fn create_marker(&self, raw: &str) -> Result<()> {
+        self.exec(&format!("CREATE TABLE IF NOT EXISTS {} (t TINYINT) ENGINE=MEMORY", self.fq(raw)))
+            .await
+    }
+
+    async fn drop_object(&self, raw: &str) -> Result<()> {
+        self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(raw))).await
+    }
+
+    async fn lease_get(&self, key: &str, token: &str) -> Result<Option<crate::lease::Lease>> {
+        lease_get(&self.shared.pool, &self.shared.db, key, token).await
+    }
+
+    async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
+        Ok(if lease_claim(&self.shared.pool, &self.shared.db, key, token).await? {
+            crate::guard::Claim::Taken
+        } else {
+            crate::guard::Claim::Refused
+        })
+    }
+
+    async fn lease_close(&self, proof: crate::guard::Released) {
+        lease_close(&self.shared.pool, &self.shared.db, &proof.key, &proof.token).await
     }
 }
 
@@ -462,8 +561,7 @@ impl MySqlSink {
                 bare, crate::naming::Artifact::Staging, crate::naming::MY_IDENT_MAX, run),
             old: crate::naming::artifact_ident_run(
                 bare, crate::naming::Artifact::Old, crate::naming::MY_IDENT_MAX, run),
-            lock: crate::naming::artifact_ident_run(
-                bare, crate::naming::Artifact::Lock, crate::naming::MY_IDENT_MAX, run),
+            announced: Mutex::new(None),
             run: run.clone(),
             bare: bare.to_string(),
             cols: Vec::new(),
@@ -519,159 +617,28 @@ impl MySqlSink {
             .await
     }
 
-    /// Collect dead artifacts and refuse live peers.
-    ///
-    /// This one catalog SELECT REPLACES the two unconditional `DROP TABLE IF
-    /// EXISTS` statements `prepare` used to open with. Those were the defect:
-    /// they destroyed whatever object was there, including a concurrent run's,
-    /// and this run's swap then published the empty replacement over the
-    /// destination while reporting its own row count.
-    ///
-    /// Liveness is read from the NAME, not the catalog. MySQL does keep a
-    /// `create_time` per table, but Postgres keeps nothing of the sort,
-    /// ClickHouse spells it `metadata_modification_time` and the object stores
-    /// have their own — so the one place an age is readable on EVERY engine is
-    /// the token. One rule everywhere beats five clever ones.
-    ///
-    /// BOTH per-run artifacts are swept, because MySQL has two: staging, and
-    /// the `__apitap_old` slot `finalize`'s first RENAME parks the outgoing
-    /// table in. That slot used to be pre-dropped here as a special case — a
-    /// crash between the two RENAMEs stranded a FIXED name, and the next
-    /// replace's RENAME collided with it (error 1050). Now that the token is in
-    /// that name too, nothing can pre-exist for this run, and a stranded table
-    /// is simply another orphan the age gate collects.
-    async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{parse_peer, Artifact};
-        let mine = parse_peer(
-            &crate::naming::artifact_ident_run(
-                &self.bare, Artifact::Staging, crate::naming::MY_IDENT_MAX, &self.run),
-            Artifact::Staging,
-        )
-        .expect("a name this process minted parses");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // `_` and `%` are LIKE wildcards and every suffix is full of the first.
-        // MySQL does not enable backslash escaping under NO_BACKSLASH_ESCAPES,
-        // so the escape character is declared explicitly — the same convention
-        // `naming::sql_exclusion` uses for this dialect.
-        let esc = |v: &str| v.replace('|', "||").replace('_', "|_").replace('%', "|%");
-        // Lock FIRST: a peer that has only announced itself, and not yet
-        // created staging, is exactly the case the staging-only scan missed.
-        for art in [Artifact::Lock, Artifact::Staging, Artifact::Old] {
-            // The token sits BETWEEN the head and the suffix, so the pattern is
-            // head + wildcard + suffix — not a prefix.
-            let (head, suffix) =
-                crate::naming::artifact_match(&self.bare, art, crate::naming::MY_IDENT_MAX);
-            let pattern = format!("{}%{}", esc(&head), esc(suffix));
-            let found: Vec<String> = {
-                let mut conn = self.deadline_conn().await?;
-                conn.query_map(
-                    format!(
-                        // BASE TABLE only, the way the Postgres sweep is
-                        // `relkind = 'r'`: every artifact here is a real table,
-                        // and a VIEW that happens to match the pattern is
-                        // somebody else's object that `DROP TABLE` cannot even
-                        // remove.
-                        "SELECT table_name FROM information_schema.tables \
-                         WHERE table_schema = '{}' AND table_type = 'BASE TABLE' \
-                           AND table_name LIKE '{}' ESCAPE '|'",
-                        sql_lit(&self.db),
-                        sql_lit(&pattern)
-                    ),
-                    |n: String| n,
-                )
-                .await
-                .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?
-            };
-            for name in found {
-                // LIKE is a coarse filter. It has no length anchor, so the
-                // pattern for `orders` also matches `orders_2024`'s artifacts —
-                // a prefix-sharing sibling that is a DIFFERENT destination, whose
-                // live staging would refuse this run and whose orphan this run
-                // would drop. `naming::classify` owns that boundary, along with
-                // the ordering (is it ours? is it MINE? only then, is it dead?)
-                // that six sinks each got wrong in their own way.
-                match crate::naming::classify(
-                    &name,
-                    &self.bare,
-                    art,
-                    crate::naming::MY_IDENT_MAX,
-                    &self.run,
-                    now,
-                ) {
-                    // A sibling's, or a table apitap never made. Deleting a
-                    // stranger's table is how this whole defect started.
-                    crate::naming::Found::Foreign => {}
-                    // This run's own leftover — one RunId per dispatch. Never
-                    // the lock: that one is this run's announcement, and the
-                    // scan we are inside is the check it exists to make
-                    // meaningful. Dropping it here would erase the announcement
-                    // a concurrent peer is about to look for.
-                    crate::naming::Found::Mine if art == Artifact::Lock => {}
-                    crate::naming::Found::Mine => self.drop_artifact(&name).await?,
-                    // The run that spawned this one: not a peer, not ours to delete.
-                    crate::naming::Found::Parent => {}
-                    // The pre-token name an older apitap wrote: nothing living
-                    // mints it, which is the only thing collection can prove.
-                    // A pre-0.55.0 name: refuse, never delete. See Found::Legacy.
-                    crate::naming::Found::Legacy => {
-                        return Err(crate::naming::legacy_error(
-                            &format!("{}.{}", self.db, self.bare), &name));
-                    }
-                    crate::naming::Found::Live(peer) => {
-                        if crate::naming::peer_blocks(&mine, &peer) {
-                            // A dead DRAIN's lock must not wedge a bulk run
-                            // either: the two lanes only see each other because
-                            // they read and write the same artifact, and a bulk
-                            // run refusing over a lock the CDC lane would
-                            // collect is a matrix row claimed and not enforced.
-                            let key = format!("{}.{}", self.db, self.bare);
-                            let lease = if art == Artifact::Lock {
-lease_get(&self.pool, &self.db, &key, &peer.token).await?
-                            } else {
-                                None
-                            };
-                            if lease.as_ref().is_some_and(|l| l.lapsed())
-                                && lease_claim(&self.pool, &self.db, &key, &peer.token).await?
-                            {
-                                self.drop_artifact(&name).await?;
-                                eprintln!(
-                                    "apitap: {key}: collected {name} — the run that wrote \
-                                     it stopped renewing its claim on this destination's \
-                                     own clock. Resuming."
-                                );
-                                continue;
-                            }
-                            return Err(crate::naming::locked_error(
-                                &key, &name, &mine, &peer, now, lease.as_ref(),
-                            ));
-                        }
-                    }
-                }
+    /// This destination as the guard sees it — the same `MySqlShared` the CDC
+    /// lane holds, so both read and write the same markers and lease rows.
+    fn guard(&self) -> MyGuard {
+        MyGuard::new(MySqlShared {
+            pool: self.pool.clone(),
+            registry: self.registry.clone(),
+            next_id: self.next_id.clone(),
+            db: self.db.clone(),
+            tls_hint: self.tls_hint.clone(),
+        })
+    }
+
+    /// Take the announcement back, if this run still holds one. Best-effort by
+    /// contract: a failure to drop a marker must not fail a finished run, and
+    /// what it leaves is a name the next run refuses, saying how to clear it.
+    async fn release(&self) {
+        let a = self.announced.lock().expect("announcement").take();
+        if let Some(a) = a {
+            if let Err(a) = crate::guard::release(&self.guard(), a).await {
+                a.abandon();
             }
         }
-        Ok(())
-    }
-
-    /// This run's announcement, written BEFORE the scan — see the Postgres
-    /// sink's `announce` for why the order is the whole property.
-    async fn announce(&self) -> Result<()> {
-        // MySQL has no zero-column table, so the lock carries one it never
-        // reads. Nothing looks inside; only the name is the message.
-        self.exec(&format!(
-            "CREATE TABLE IF NOT EXISTS {} (t TINYINT) ENGINE=MEMORY",
-            self.fq(&self.lock)
-        ))
-        .await
-    }
-
-    /// Best-effort: a failure to drop the lock must not fail a finished run.
-    async fn release(&self) {
-        let _ = self
-            .exec(&format!("DROP TABLE IF EXISTS {}", self.fq(&self.lock)))
-            .await;
     }
 
     async fn scalar(&self, sql: &str) -> Result<Option<String>> {
@@ -915,8 +882,10 @@ impl crate::sink::Sink for MySqlSink {
         // only on a scan taken AFTER its own announcement, so a concurrent
         // pair cannot both miss each other. `pipeline::run` releases the
         // announcement again if anything here fails; see `announce`.
-        self.announce().await?;
-        self.reap_and_check_peers().await?;
+        let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
+        *self.announced.lock().expect("announcement") = Some(a);
+        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::DeleteLeftovers)
+            .await?;
         self.exec(&format!(
             "CREATE TABLE {} ({}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
             self.fq(&self.staging),

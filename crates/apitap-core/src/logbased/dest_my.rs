@@ -756,3 +756,22 @@ fn key_pred(pk_cols: &[String], key: &[Vec<u8>], pk_oids: &[u32]) -> Result<Stri
         .collect::<Result<Vec<_>>>()?
         .join(" AND "))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guard::GuardStore;
+
+    /// The drain's lease key and the guard's refusal name are ONE string, or a
+    /// collector reads a lease row the drain never writes.
+    #[test]
+    fn lease_key_is_dest_label() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let d = MyDest::connect("mysql://root:x@127.0.0.1:1/bench").unwrap();
+            let g = crate::sink::mysql::MyGuard::new(d.shared.clone());
+            for t in ["orders", "bench.orders", "Mixed Case"] {
+                assert_eq!(d.lease_key(t), g.dest_label(bare(t)), "{t}");
+            }
+        });
+    }
+}
