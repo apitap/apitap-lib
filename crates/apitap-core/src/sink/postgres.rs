@@ -156,11 +156,7 @@ impl crate::guard::GuardStore for PgGuard {
     }
 
     async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
-        Ok(if lease_claim(&self.pool, &self.schema, key, token).await? {
-            crate::guard::Claim::Taken
-        } else {
-            crate::guard::Claim::Refused
-        })
+        lease_claim(&self.pool, &self.schema, key, token).await
     }
 
     async fn lease_close(&self, proof: crate::guard::Released) {
@@ -273,7 +269,7 @@ pub(crate) async fn lease_renew(
     sqlx::query(&format!(
         "UPDATE {t} SET expires_at = now() + make_interval(secs => $3) \
          WHERE ctid IN (SELECT ctid FROM {t} \
-                         WHERE token = $2 AND dest_key = ANY($1) \
+                         WHERE token = $2 AND dest_key = ANY($1) AND NOT collected \
                          FOR UPDATE SKIP LOCKED)",
         t = lease_table(schema)
     ))
@@ -314,7 +310,7 @@ pub(crate) async fn lease_get(
     Ok(row.map(|(expires_in, collected)| crate::lease::Lease { expires_in, collected }))
 }
 
-/// Take a lapsed lease, so its lock may be dropped. `false` = do not collect.
+/// Take a lapsed lease, so its lock may be dropped.
 ///
 /// `FOR UPDATE NOWAIT` rather than a plain UPDATE: a row locked right now is
 /// held by its owner's apply transaction, which is affirmative evidence that
@@ -323,38 +319,57 @@ pub(crate) async fn lease_get(
 /// never waits.
 ///
 /// The predicate is `(lapsed OR collected)` and the second disjunct is
-/// deliberate: two collectors racing one dead lock must BOTH succeed. Collecting
-/// is not proceeding — each then meets the other's lock, written before either
-/// scanned, and at least one yields. Tightening this to `AND NOT collected`
-/// looks like an improvement and is a regression: the second collector would
-/// refuse over a lock that no longer exists.
+/// deliberate: two collectors racing one dead lock must BOTH succeed, and a
+/// collection that died half way must be finishable. Collecting is not
+/// proceeding — each collector then meets the other's lock, written before
+/// either scanned, and at least one yields. `RETURNING` says whether the row
+/// was taken; when it was not, one more read tells a missing row (`Absent`)
+/// from a live one (`Refused`).
 pub(crate) async fn lease_claim(
     pool: &PgPool,
     schema: &str,
     key: &str,
     token: &str,
-) -> Result<bool> {
+) -> Result<crate::guard::Claim> {
+    use crate::guard::Claim;
     let r = sqlx::query(&format!(
         "UPDATE {t} SET collected = true \
          WHERE ctid IN (SELECT ctid FROM {t} \
                          WHERE dest_key = $1 AND token = $2 \
                            AND (expires_at <= now() OR collected) \
-                         FOR UPDATE NOWAIT)",
+                         FOR UPDATE NOWAIT) \
+         RETURNING 1",
         t = lease_table(schema)
     ))
     .bind(key)
     .bind(token)
-    .execute(pool)
+    .fetch_optional(pool)
     .await;
     match r {
-        Ok(d) => Ok(d.rows_affected() > 0),
-        // 55P03 lock_not_available: the owner holds it. Alive; refuse.
+        Ok(Some(_)) => Ok(Claim::Taken),
+        Ok(None) => Ok(match lease_get(pool, schema, key, token).await? {
+            None => Claim::Absent,
+            Some(_) => Claim::Refused,
+        }),
         // 55P03 lock_not_available: the owner holds it. Alive; refuse.
         Err(e) if e.as_database_error().and_then(|d| d.code())
-                    .is_some_and(|c| c == "55P03") => Ok(false),
-        Err(e) if no_lease_table(&e) => Ok(false),
+                    .is_some_and(|c| c == "55P03") => Ok(Claim::Refused),
+        Err(e) if no_lease_table(&e) => Ok(Claim::Absent),
         Err(e) => Err(Error::Transfer(format!("lease claim: {e}"))),
     }
+}
+
+/// This run's keys whose row exists and is not collected. Expiry ignored.
+#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
+pub(crate) async fn lease_unclaimed(pool: &PgPool, schema: &str, token: &str) -> Result<Vec<String>> {
+    sqlx::query_scalar(&format!(
+        "SELECT dest_key FROM {} WHERE token = $1 AND NOT collected",
+        lease_table(schema)
+    ))
+    .bind(token)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::Transfer(format!("lease read: {e}")))
 }
 
 /// Drop this run's own lease. Called ONLY after the lock DROP is observed to

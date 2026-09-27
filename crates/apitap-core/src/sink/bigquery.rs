@@ -700,16 +700,24 @@ impl BqConn {
     /// group's concurrent transactions racing on the shared `_apitap_state`
     /// table can abort with "concurrent update"; rate/backend errors are
     /// retryable too. A crashed retry is safe — the window replays idempotently.
+    ///
+    /// Never retries a script that raised `LOST_MARK`: its own fence found the
+    /// lease collected, which no retry can change, and "aborted" in the same
+    /// message must not make it look transient.
     pub(crate) async fn cdc_script(&self, sql: &str) -> Result<()> {
         let mut attempt = 0u32;
         loop {
             match self.cdc_script_once(sql).await {
                 Ok(()) => return Ok(()),
-                Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
-                    attempt += 1;
-                    let ms = 200u64 << attempt; // 400, 800, 1600, 3200, 6400
-                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                }
+                Err(Error::Transfer(m)) => match script_error_class(&m) {
+                    ScriptErr::Lost => return Err(crate::lease::no_longer_holds(&[])),
+                    ScriptErr::Retry if attempt < 5 => {
+                        attempt += 1;
+                        let ms = 200u64 << attempt; // 400, 800, 1600, 3200, 6400
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    _ => return Err(Error::Transfer(m)),
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -888,6 +896,27 @@ fn throttled_or_transient(r: &reqwest::Response) -> bool {
 /// concurrent group apply meets these far more often than a serial one did.
 /// Deliberately narrow — never retry a syntax/type/permission error, and never
 /// `resourcesExceeded` (the query itself is too big; retrying just burns time).
+#[derive(Debug, PartialEq, Eq)]
+enum ScriptErr {
+    /// The script's lease fence fired: this run no longer holds the table.
+    Lost,
+    Retry,
+    Fail,
+}
+
+/// `Lost` is decided FIRST: a fence failure raised inside a transaction comes
+/// back with BigQuery's "Transaction … aborted" around it, which `retryable`
+/// would take for a transient conflict.
+fn script_error_class(msg: &str) -> ScriptErr {
+    if msg.contains(crate::lease::LOST_MARK) {
+        ScriptErr::Lost
+    } else if retryable(msg) {
+        ScriptErr::Retry
+    } else {
+        ScriptErr::Fail
+    }
+}
+
 fn retryable(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("concurrent update")
@@ -972,7 +1001,16 @@ mod staging_name_tests {
 
 #[cfg(test)]
 mod retry_tests {
-    use super::retryable;
+    use super::{retryable, script_error_class, ScriptErr};
+
+    #[test]
+    fn lost_mark_is_never_retried() {
+        let m = "Error in script: apitap-lease-lost: the lease was collected. \
+                 Transaction was aborted due to an error";
+        assert_eq!(script_error_class(m), ScriptErr::Lost);
+        assert_eq!(script_error_class("Transaction is aborted due to concurrent update"), ScriptErr::Retry);
+        assert_eq!(script_error_class("Syntax error: Unexpected identifier"), ScriptErr::Fail);
+    }
 
     #[test]
     fn classifies_transient_vs_permanent() {
