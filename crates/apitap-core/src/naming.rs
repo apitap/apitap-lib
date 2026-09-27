@@ -48,6 +48,9 @@ pub(crate) enum Artifact {
     ChangelogTmp,
     /// The delete-marker sidecar the ClickHouse CDC apply keeps.
     CdcDelete,
+    /// BigQuery's CDC staging table for one window's rows — tokenized by run,
+    /// so two drains that share a dataset never load into one table.
+    CdcStaging,
     /// The view that derives current state from a changelog table.
     Current,
     /// A run's declaration that it is working on this table — written FIRST,
@@ -75,6 +78,7 @@ impl Artifact {
         Artifact::New,
         Artifact::ChangelogTmp,
         Artifact::CdcDelete,
+        Artifact::CdcStaging,
         Artifact::Current,
         Artifact::Lock,
     ];
@@ -108,6 +112,9 @@ impl Artifact {
             Artifact::New => "__apitap_new",
             Artifact::ChangelogTmp => "__apitap_cl",
             Artifact::CdcDelete => "__apitap_cdc_del",
+            // Not a suffix of `__apitap_cdc_del`, nor it of this: the
+            // ALL-driven tests pin that the two never share a name.
+            Artifact::CdcStaging => "__apitap_cdc",
             Artifact::Current => "__current",
             Artifact::Lock => "__apitap_lock",
         }
@@ -880,8 +887,34 @@ pub(crate) fn artifact_ident_run(
     limit: usize,
     run: &RunId,
 ) -> String {
+    artifact_ident_tok(bare, artifact, limit, run.token())
+}
+
+/// [`artifact_ident_run`] for a token that is not this process's run — the
+/// dead run whose scratch a collector sweeps, or the run a store method was
+/// handed by token.
+pub(crate) fn artifact_ident_tok(bare: &str, artifact: Artifact, limit: usize, token: &str) -> String {
     let (head, suffix) = artifact_match(bare, artifact, limit);
-    format!("{head}{}{suffix}", run.token())
+    format!("{head}{token}{suffix}")
+}
+
+/// BigQuery's per-run fence table is `_apitap_fence<token>`. Tokens begin with
+/// `_`, so every one reads `_apitap_fence_…` — which is the prefix discovery
+/// hides. A prefix and not a suffix because the table belongs to a RUN, not to
+/// a destination table: one fence covers every table the drain holds.
+// The BigQuery store creates it; until that lands only the tests name it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const FENCE_PREFIX: &str = "_apitap_fence";
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn fence_ident(token: &str) -> String {
+    format!("{FENCE_PREFIX}{token}")
+}
+
+/// Does `name` look like a run's fence table? The prefix plus the token's own
+/// leading `_`, so `_apitap_fencepost` stays a user's table.
+fn is_fence(name: &str) -> bool {
+    name.strip_prefix("_apitap_fence").is_some_and(|rest| rest.starts_with('_'))
 }
 
 /// The two fixed parts of every name this table+artifact can produce: the head
@@ -932,6 +965,7 @@ pub(crate) fn artifact_match(bare: &str, artifact: Artifact, limit: usize) -> (S
 /// question the same way and neither can fall behind [`Artifact::ALL`].
 pub(crate) fn is_artifact(name: &str) -> bool {
     OWN_TABLES.contains(&name)
+        || is_fence(name)
         || Artifact::ALL
             .iter()
             .filter(|a| a.reserved())
@@ -963,6 +997,11 @@ pub(crate) fn sql_exclusion(col: &str, dialect: Dialect) -> String {
     for t in OWN_TABLES {
         out.push_str(&format!(" AND {col} <> '{t}'"));
     }
+    // The per-run fence tables, by prefix (see `is_fence`).
+    out.push_str(&match dialect {
+        Dialect::Postgres => format!(" AND {col} NOT LIKE '\\_apitap\\_fence\\_%'"),
+        Dialect::MySql => format!(" AND {col} NOT LIKE '|_apitap|_fence|_%' ESCAPE '|'"),
+    });
     out
 }
 
@@ -1403,6 +1442,35 @@ mod tests {
                 .expect_err("an un-tokenized artifact is refused, never collected");
             assert!(format!("{e}").contains("older than 0.55.0")
                     || format!("{e}").contains("legacy"), "{legacy}: {e}");
+        }
+    }
+
+    /// A BigQuery fence table is apitap's: discovery hides it and the namespace
+    /// reservation refuses it — and a user's `_apitap_fencepost` is left alone.
+    #[test]
+    fn a_fence_table_is_an_artifact_and_discovery_hides_it() {
+        let tok = RunId::mint_drain("s").token().to_string();
+        let fence = fence_ident(&tok);
+        assert!(fence.starts_with("_apitap_fence_"), "{fence}");
+        assert!(is_artifact(&fence), "{fence}");
+        assert!(is_artifact("_apitap_fence_0abcdefl123wxyz"));
+        assert!(!is_artifact("_apitap_fencepost"), "only the prefix plus a token's own `_`");
+        for d in [Dialect::Postgres, Dialect::MySql] {
+            let clause = sql_exclusion("table_name", d);
+            assert!(clause.contains("apitap") && clause.contains("fence"), "{d:?}: {clause}");
+        }
+        assert!(sql_exclusion("t", Dialect::Postgres).contains(r"NOT LIKE '\_apitap\_fence\_%'"));
+        assert!(sql_exclusion("t", Dialect::MySql).contains("NOT LIKE '|_apitap|_fence|_%' ESCAPE '|'"));
+    }
+
+    /// The tokenized name the stores build for someone else's token is the
+    /// same name that run built for itself.
+    #[test]
+    fn a_name_built_from_a_token_is_the_runs_own_name() {
+        let run = RunId::mint_drain("s");
+        for &a in Artifact::ALL {
+            assert_eq!(artifact_ident_tok("orders", a, ROOMY, run.token()),
+                       artifact_ident_run("orders", a, ROOMY, &run), "{a:?}");
         }
     }
 
