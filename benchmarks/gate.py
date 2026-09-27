@@ -122,6 +122,8 @@ LEGS = [
         proves={"guard.bulk-vs-bulk": ("my",), "guard.drain-vs-bulk": ("my",)}),
     leg("e2e_guard_matrix.py",     "the guard asks ClickHouse the same questions", argv=["ch"],
         proves={"guard.bulk-vs-bulk": ("ch",), "guard.drain-vs-bulk": ("ch",)}),
+    leg("e2e_guard_matrix.py",     "the guard asks S3 (MinIO) the same questions", {"iceberg"}, ["s3"],
+        proves={"guard.bulk-vs-bulk": ("s3",)}),
 
     leg("e2e_bq_cdc.py",           "CDC into BigQuery via staging + MERGE", {"bq"}),
     leg("e2e_bq_guard.py",         "a BigQuery bulk run meets a drain's announcement", {"bq"},

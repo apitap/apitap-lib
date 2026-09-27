@@ -471,62 +471,72 @@ pub(crate) struct GcsSink {
     names: Arc<Vec<String>>,
     delivered: Arc<Vec<Delivered>>,
     next_part: Arc<AtomicU64>,
+    /// This run's announcement, held for the whole run: a run's segment comes
+    /// into existence only with its first part, so a lock dropped early would
+    /// leave the run invisible to a peer's scan until the first bytes land.
+    announced: std::sync::Mutex<Option<crate::guard::Announced>>,
 }
 
-/// What one key found under the staging prefix is, to this run.
-enum Staged {
-    /// Directly under the staging prefix, with no run segment — the layout
-    /// apitap used before run tokens existed. That prefix is apitap's own
-    /// name for this table and nothing else writes there, so it is reapable
-    /// for the same reason the SQL sinks reap the one exact legacy identifier.
-    Legacy,
-    /// Under some run's token segment.
-    Run {
-        seg: String,
-        peer: crate::naming::PeerRun,
-    },
-    /// A segment no apitap minted. Not ours; never touched.
-    Foreign,
+/// The guard's view of a GCS destination: one staging root, spelled. The key
+/// layout is S3's (`crate::sink::s3::segment_listed`), and so is the absence of
+/// a lease store: a dead run's lock here says "nothing collects it".
+pub(crate) struct GcsGuard {
+    conn: GcsConn,
+    root: String,
 }
 
-/// Read the run identity out of a key found under `root`.
-///
-/// Note the token sits in a path SEGMENT here, not inside an identifier the
-/// way the SQL sinks carry it — an object store has a path and no identifier
-/// length limit, and a segment is what keeps `finalize`'s list-and-compose
-/// confined to one run's own parts. So `parse_peer` — which reads a token
-/// sitting immediately before an artifact suffix — is handed the name that
-/// segment stands for.
-fn classify(root: &str, key: &str) -> Staged {
-    let Some(rest) = key.strip_prefix(root) else {
-        return Staged::Foreign;
-    };
-    let Some((seg, tail)) = rest.split_once('/') else {
-        return Staged::Legacy;
-    };
-    // The lock directory is a SIBLING of the run segments, not one of them:
-    // `finalize` composes every object under this run's own segment into the
-    // published file, so an announcement written in there would end up inside
-    // the data. Its entries are bare run tokens.
-    if seg == crate::naming::Artifact::Lock.suffix() {
-        return match crate::naming::parse_peer(
-            &format!("{tail}{}", crate::naming::Artifact::Staging.suffix()),
-            crate::naming::Artifact::Staging,
-        ) {
-            Some(peer) => Staged::Run { seg: tail.to_string(), peer },
-            None => Staged::Foreign,
-        };
+impl GcsGuard {
+    pub(crate) fn new(conn: GcsConn, root: String) -> Self {
+        GcsGuard { conn, root }
     }
-    match crate::naming::parse_peer(
-        &format!("{seg}{}", crate::naming::Artifact::Staging.suffix()),
-        crate::naming::Artifact::Staging,
-    ) {
-        Some(peer) => Staged::Run {
-            seg: seg.to_string(),
-            peer,
-        },
-        None => Staged::Foreign,
+}
+
+#[async_trait::async_trait]
+impl crate::guard::GuardStore for GcsGuard {
+    fn limit(&self) -> usize {
+        crate::naming::ROOMY
     }
+
+    fn dest_label(&self, bare: &str) -> String {
+        format!("gcs://{}/{}{bare}", self.conn.bucket, self.conn.prefix)
+    }
+
+    async fn list(&self, bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        let keys = self.conn.list(&self.root).await?;
+        let url = format!("gcs://{}/{}", self.conn.bucket, self.root);
+        Ok(crate::sink::s3::segment_listed(
+            &self.root,
+            bare,
+            &keys,
+            &format!("the objects under gcs://{}/{}", self.conn.bucket, self.conn.prefix),
+            &|seg| format!("the objects under {url}{seg}/"),
+        ))
+    }
+
+    /// Zero bytes: the key is the whole message.
+    async fn create_marker(&self, raw: &str) -> Result<()> {
+        let key = crate::sink::s3::lock_key_of(&self.root, raw)
+            .ok_or_else(|| Error::Transfer(format!("gcs: {raw} is not a lock name")))?;
+        self.conn.simple_upload(&key, Vec::new()).await
+    }
+
+    async fn drop_object(&self, raw: &str) -> Result<()> {
+        match crate::sink::s3::lock_key_of(&self.root, raw) {
+            Some(key) => self.conn.delete(&key).await,
+            None if raw.starts_with(&self.root) => self.conn.delete(raw).await,
+            None => Err(Error::Transfer(format!("gcs: cannot drop {raw}"))),
+        }
+    }
+
+    async fn lease_get(&self, _key: &str, _token: &str) -> Result<Option<crate::lease::Lease>> {
+        Ok(None)
+    }
+
+    async fn lease_claim(&self, _key: &str, _token: &str) -> Result<crate::guard::Claim> {
+        Ok(crate::guard::Claim::Absent)
+    }
+
+    async fn lease_close(&self, _proof: crate::guard::Released) {}
 }
 
 impl GcsSink {
@@ -575,120 +585,24 @@ impl GcsSink {
             names: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
             next_part: Arc::new(AtomicU64::new(0)),
+            announced: std::sync::Mutex::new(None),
         })
     }
 
-    /// Reap dead runs' staging parts and refuse a live peer.
-    ///
-    /// This REPLACES the unconditional "delete everything under staging" the
-    /// sink opened with — that statement was the defect, not a safeguard.
-    ///
-    /// Liveness comes from the token, not from object metadata: an object's
-    /// update time is when it was last WRITTEN, which for a slow run's first
-    /// part can be an hour before that run finishes, and would age a live peer
-    /// out from under itself. One rule on every engine beats five clever ones.
-    /// Where this run announces itself: `<staging_root>__apitap_lock/<token>`.
-    ///
-    /// Deliberately beside the run segments rather than inside this run's own —
-    /// `finalize` lists `self.staging` and composes everything it finds there
-    /// into the published object.
-    fn lock_key(&self) -> String {
-        format!("{}{}/{}", self.staging_root,
-                crate::naming::Artifact::Lock.suffix(), self.run.token())
+    /// This destination as the guard sees it: the table's staging root.
+    fn guard(&self) -> GcsGuard {
+        GcsGuard::new(self.conn.clone(), self.staging_root.clone())
     }
 
-    /// This run's announcement, written BEFORE the scan — see the Postgres
-    /// sink's `announce` for why the order is the entire property.
-    ///
-    /// Held for the whole run, unlike the SQL sinks, which hand the job over to
-    /// their staging table at the end of `prepare`. Here `prepare` creates
-    /// nothing — a run's staging segment comes into existence with its first
-    /// part object — so a lock dropped early would leave the run invisible to a
-    /// peer's scan until the first bytes land.
-    async fn announce(&self) -> Result<()> {
-        // Zero bytes: the key is the whole message.
-        self.conn.simple_upload(&self.lock_key(), Vec::new()).await
-    }
-
-    /// Best-effort: a failure to delete the lock must not fail a finished run.
+    /// Take the announcement back, if this run still holds one. Best-effort by
+    /// contract: a failure to delete the lock must not fail a finished run.
     async fn release(&self) {
-        let _ = self.conn.delete(&self.lock_key()).await;
-    }
-
-    async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{parse_peer, Artifact};
-        let mine = parse_peer(
-            &format!("{}{}", self.run.token(), Artifact::Staging.suffix()),
-            Artifact::Staging,
-        )
-        .expect("a token this process minted parses");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Nothing is deleted until the whole listing has been judged: a live
-        // peer anywhere in it means this run does not get to touch the prefix
-        // at all.
-        let mut dead: Vec<String> = Vec::new();
-        for key in self.conn.list(&self.staging_root).await? {
-            let what = classify(&self.staging_root, &key);
-            match what {
-                Staged::Foreign => {}
-                // A pre-0.55.0 key: refuse, never delete. It used to go onto
-                // `dead`, but an apitap older than 0.55.0 writes exactly this
-                // layout WHILE IT LOADS — the two versions meet during any
-                // rolling upgrade — and deleting a live old run's parts here is
-                // silent: it re-creates the prefix, composes what remains, and
-                // reports a full row count over a short object. See
-                // naming::Found::Legacy.
-                Staged::Legacy => {
-                    return Err(crate::naming::legacy_error(
-                        &format!("gcs://{}/{}{}", self.conn.bucket, self.conn.prefix, self.bare),
-                        &format!("the objects under gcs://{}/{}", self.conn.bucket, self.conn.prefix),
-                    ));
-                }
-                Staged::Run { seg, peer } => {
-                    // Our own segment is not a peer of itself.
-                    if seg == self.run.token() {
-                        continue;
-                    }
-                    // NOT aged out. The token is when that RUN started, not
-                    // when the object was written, so on a long multi-table load
-                    // the two are hours apart — and a wrongly deleted segment is
-                    // SILENT here: the next finalize re-creates the prefix and
-                    // the run reports a full row count over a truncated table.
-                    // `naming::classify` carries the full argument.
-                    if crate::naming::peer_blocks(&mine, &peer) {
-                        return Err(crate::naming::locked_error(
-                            &format!(
-                                "gcs://{}/{}{}",
-                                self.conn.bucket, self.conn.prefix, self.bare
-                            ),
-                            &format!(
-                                "the objects under gcs://{}/{}{seg}/",
-                                self.conn.bucket, self.conn.prefix
-                            ),
-                            &mine,
-                            &peer,
-                            now,
-                            // No lease to read on this path — this sink keeps its own
-                            // classify loop and never collects. See `naming::collectable`.
-                            None,
-                        ));
-                    }
-                }
+        let a = self.announced.lock().expect("announcement").take();
+        if let Some(a) = a {
+            if let Err(a) = crate::guard::release(&self.guard(), a).await {
+                a.abandon();
             }
         }
-        // No separate sweep of the pre-token PREFIX is needed:
-        // `artifact_match`'s head and `artifact_ident`'s name agree for every
-        // table name that can exist here. They only diverge past ~990 bytes of
-        // name, and a key that long is already over the 1024-byte object-name
-        // limit GCS enforces — such a run could never have written a staging
-        // object to reap.
-        for key in &dead {
-            self.conn.delete(key).await?;
-        }
-        Ok(())
     }
 
     fn ext(&self) -> &'static str {
@@ -755,8 +669,10 @@ impl crate::sink::Sink for GcsSink {
         // only on a scan taken AFTER its own announcement, so a concurrent
         // pair cannot both miss each other. `pipeline::run` releases the
         // announcement again if anything here fails; see `announce`.
-        self.announce().await?;
-        self.reap_and_check_peers().await?;
+        let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
+        *self.announced.lock().expect("announcement") = Some(a);
+        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::Keep)
+            .await?;
         if self.conn.format == GcsFormat::Csv {
             // The header is its own tiny gzip member, named to sort BEFORE the
             // part files so finalize's sorted compose puts it first —
@@ -1062,12 +978,15 @@ mod tests {
     /// forever, and a foreign object misread as either deletes a user's data.
     #[test]
     fn a_staging_key_is_classified_by_its_run_segment() {
+        use crate::sink::s3::{classify, Staged};
         let root = "e2e/events__apitap_staging/";
         let id = crate::naming::RunId::mint_bulk(crate::naming::BulkKind::Swap, "gcs://b/e2e");
         let tok = id.token().to_string();
         match classify(root, &format!("{root}{tok}/part-00000.parquet")) {
-            Staged::Run { seg, peer } => {
+            Staged::Run { seg } => {
                 assert_eq!(seg, tok);
+                let peer = crate::naming::parse_peer(
+                    &format!("{seg}__apitap_staging"), crate::naming::Artifact::Staging).unwrap();
                 assert_eq!(peer.kind, crate::naming::LandKind::Swap);
             }
             _ => panic!("a token segment must read as a run"),

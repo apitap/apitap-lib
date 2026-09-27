@@ -113,15 +113,6 @@ fn xml_tags(body: &str, tag: &str) -> Vec<String> {
     out
 }
 
-/// The (key, upload_id) pairs on one ListMultipartUploads page — each
-/// `<Upload>` element holds both, alongside owner/date noise we don't need.
-fn parse_uploads(body: &str) -> Vec<(String, String)> {
-    xml_tags(body, "Upload")
-        .iter()
-        .filter_map(|u| Some((xml_tag(u, "Key")?, xml_tag(u, "UploadId")?)))
-        .collect()
-}
-
 impl S3Conn {
     pub(crate) async fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("s3 url", url, e))?;
@@ -513,50 +504,6 @@ impl S3Conn {
         }
     }
 
-    /// Incomplete multipart uploads under a prefix, as (key, upload_id)
-    /// pairs. These are invisible to [`Self::list`] — no object exists until
-    /// CompleteMultipartUpload — but their parts are stored (and billed) all
-    /// the same, so a sweep has to ask for them by name.
-    pub(crate) async fn list_multipart_uploads(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<(String, String)>> {
-        let uri = if self.path_style {
-            format!("/{}", enc_seg(&self.bucket))
-        } else {
-            "/".to_string()
-        };
-        let mut out = Vec::new();
-        let mut markers: Option<(String, String)> = None;
-        loop {
-            let mut q = vec![
-                ("uploads".to_string(), String::new()),
-                ("prefix".to_string(), prefix.to_string()),
-            ];
-            if let Some((k, id)) = &markers {
-                q.push(("key-marker".to_string(), k.clone()));
-                q.push(("upload-id-marker".to_string(), id.clone()));
-            }
-            let r = self
-                .request(reqwest::Method::GET, &uri, &q, Vec::new(), &payload_hash(b""), &[])
-                .await?;
-            let body = Self::check(r, "list multipart uploads").await?;
-            out.extend(parse_uploads(&body));
-            if xml_tag(&body, "IsTruncated").as_deref() != Some("true") {
-                return Ok(out);
-            }
-            markers = match (
-                xml_tag(&body, "NextKeyMarker"),
-                xml_tag(&body, "NextUploadIdMarker"),
-            ) {
-                (Some(k), Some(id)) => Some((k, id)),
-                // Truncated but no continuation markers: looping again would
-                // spin forever on the same page — hand back what we have.
-                _ => return Ok(out),
-            };
-        }
-    }
-
     pub(crate) async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let uri = if self.path_style {
             format!("/{}", enc_seg(&self.bucket))
@@ -638,20 +585,21 @@ pub(crate) struct S3Sink {
     names: Arc<Vec<String>>,
     delivered: Arc<Vec<Delivered>>,
     next_part: Arc<AtomicU64>,
+    /// This run's announcement, held for the whole run: a run's segment comes
+    /// into existence only with its first part, so a lock dropped early would
+    /// leave the run invisible to a peer's scan until the first bytes land.
+    announced: std::sync::Mutex<Option<crate::guard::Announced>>,
 }
 
 /// What one key found under the staging prefix is, to this run.
-enum Staged {
+pub(crate) enum Staged {
     /// Directly under the staging prefix, with no run segment — the layout
     /// apitap used before run tokens existed. That prefix is apitap's own
     /// name for this table and nothing else writes there, so it is reapable
     /// for the same reason the SQL sinks reap the one exact legacy identifier.
     Legacy,
-    /// Under some run's token segment.
-    Run {
-        seg: String,
-        peer: crate::naming::PeerRun,
-    },
+    /// Under some run's token segment (or, for a lock, named by that token).
+    Run { seg: String },
     /// A segment no apitap minted. Not ours; never touched.
     Foreign,
 }
@@ -664,7 +612,7 @@ enum Staged {
 /// and the multipart abort sweep, to one run's own uploads. So `parse_peer` —
 /// which reads a token sitting immediately before an artifact suffix — is
 /// handed the name that segment stands for.
-fn classify(root: &str, key: &str) -> Staged {
+pub(crate) fn classify(root: &str, key: &str) -> Staged {
     let Some(rest) = key.strip_prefix(root) else {
         return Staged::Foreign;
     };
@@ -680,7 +628,7 @@ fn classify(root: &str, key: &str) -> Staged {
             &format!("{tail}{}", crate::naming::Artifact::Staging.suffix()),
             crate::naming::Artifact::Staging,
         ) {
-            Some(peer) => Staged::Run { seg: tail.to_string(), peer },
+            Some(_) => Staged::Run { seg: tail.to_string() },
             None => Staged::Foreign,
         };
     }
@@ -688,12 +636,127 @@ fn classify(root: &str, key: &str) -> Staged {
         &format!("{seg}{}", crate::naming::Artifact::Staging.suffix()),
         crate::naming::Artifact::Staging,
     ) {
-        Some(peer) => Staged::Run {
-            seg: seg.to_string(),
-            peer,
-        },
+        Some(_) => Staged::Run { seg: seg.to_string() },
         None => Staged::Foreign,
     }
+}
+
+/// The object stores' spelling of a guard listing, shared by S3 and GCS.
+///
+/// A run lives in a path SEGMENT under the staging root, and its lock in the
+/// `__apitap_lock/` sibling of the segments, so each key becomes the canonical
+/// name the run would have minted for a table (which `naming` classifies) and
+/// a raw spelling for the refusal: the lock's own key, or, for a segment, the
+/// sentence an operator needs to clear it. One entry per canonical name — a
+/// segment holds many parts. `run_raw(seg)` spells a segment's remedy.
+pub(crate) fn segment_listed(
+    root: &str,
+    bare: &str,
+    keys: &[String],
+    legacy_raw: &str,
+    run_raw: &dyn Fn(&str) -> String,
+) -> Vec<crate::guard::Listed> {
+    use crate::naming::{artifact_ident, artifact_ident_tok, Artifact, ROOMY};
+    let lock_dir = format!("{}/", Artifact::Lock.suffix());
+    let mut out: Vec<crate::guard::Listed> = Vec::new();
+    for key in keys {
+        let l = match classify(root, key) {
+            Staged::Foreign => continue,
+            Staged::Legacy => crate::guard::Listed {
+                canonical: artifact_ident(bare, Artifact::Staging, ROOMY),
+                raw: legacy_raw.to_string(),
+            },
+            Staged::Run { seg, .. } if key[root.len()..].starts_with(&lock_dir) => crate::guard::Listed {
+                canonical: artifact_ident_tok(bare, Artifact::Lock, ROOMY, &seg),
+                raw: key.clone(),
+            },
+            Staged::Run { seg, .. } => crate::guard::Listed {
+                canonical: artifact_ident_tok(bare, Artifact::Staging, ROOMY, &seg),
+                raw: run_raw(&seg),
+            },
+        };
+        if !out.iter().any(|o| o.canonical == l.canonical) {
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// The key a lock NAME stands for: `<root>__apitap_lock/<token>`. The guard
+/// speaks in names (`<head><token>__apitap_lock`); an object store keeps the
+/// lock beside the run segments, never inside one — `finalize` copies
+/// everything under the run's own segment into the published directory.
+pub(crate) fn lock_key_of(root: &str, name: &str) -> Option<String> {
+    let suffix = crate::naming::Artifact::Lock.suffix();
+    let head = name.strip_suffix(suffix)?;
+    let tok = head.get(head.len().checked_sub(crate::naming::RUN_TOKEN_LEN)?..)?;
+    Some(format!("{root}{suffix}/{tok}"))
+}
+
+/// The guard's view of an S3 destination: one staging root, spelled.
+///
+/// No lease store: a dead run's lock here says "nothing collects it", exactly
+/// as before. The object stores keep their own leftovers (`Mine::Keep`).
+pub(crate) struct S3Guard {
+    conn: S3Conn,
+    root: String,
+}
+
+impl S3Guard {
+    pub(crate) fn new(conn: S3Conn, root: String) -> Self {
+        S3Guard { conn, root }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::guard::GuardStore for S3Guard {
+    fn limit(&self) -> usize {
+        crate::naming::ROOMY
+    }
+
+    fn dest_label(&self, bare: &str) -> String {
+        format!("s3://{}/{}{bare}", self.conn.bucket, self.conn.prefix)
+    }
+
+    async fn list(&self, bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        let keys = self.conn.list(&self.root).await?;
+        let url = format!("s3://{}/{}", self.conn.bucket, self.root);
+        Ok(segment_listed(
+            &self.root,
+            bare,
+            &keys,
+            &format!("the objects under s3://{}/{}", self.conn.bucket, self.conn.prefix),
+            &|seg| format!(
+                "the objects and multipart uploads under {url}{seg}/ \
+                 (`aws s3 rm --recursive`, `aws s3api abort-multipart-upload`)"
+            ),
+        ))
+    }
+
+    /// Zero bytes: the key is the whole message.
+    async fn create_marker(&self, raw: &str) -> Result<()> {
+        let key = lock_key_of(&self.root, raw)
+            .ok_or_else(|| Error::Transfer(format!("s3: {raw} is not a lock name")))?;
+        self.conn.put_object(&key, Vec::new()).await
+    }
+
+    async fn drop_object(&self, raw: &str) -> Result<()> {
+        match lock_key_of(&self.root, raw) {
+            Some(key) => self.conn.delete(&key).await,
+            None if raw.starts_with(&self.root) => self.conn.delete(raw).await,
+            None => Err(Error::Transfer(format!("s3: cannot drop {raw}"))),
+        }
+    }
+
+    async fn lease_get(&self, _key: &str, _token: &str) -> Result<Option<crate::lease::Lease>> {
+        Ok(None)
+    }
+
+    async fn lease_claim(&self, _key: &str, _token: &str) -> Result<crate::guard::Claim> {
+        Ok(crate::guard::Claim::Absent)
+    }
+
+    async fn lease_close(&self, _proof: crate::guard::Released) {}
 }
 
 impl S3Sink {
@@ -733,149 +796,24 @@ impl S3Sink {
             names: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
             next_part: Arc::new(AtomicU64::new(0)),
+            announced: std::sync::Mutex::new(None),
         })
     }
 
-    /// Reap dead runs' staging parts and uploads, and refuse a live peer.
-    ///
-    /// This REPLACES the unconditional "delete everything under staging,
-    /// abort every upload under it" the sink opened with — those statements
-    /// were the defect, not a safeguard. The abort in particular was the
-    /// sharper half: aborting a live peer's multipart upload kills a transfer
-    /// mid-flight, and leaves no object behind to show what happened.
-    ///
-    /// Liveness comes from the token, not from object metadata: an object's
-    /// LastModified is when it was last WRITTEN, which for a slow run's first
-    /// part can be an hour before that run finishes, and would age a live peer
-    /// out from under itself. One rule on every engine beats five clever ones.
-    /// Where this run announces itself: `<staging_root>__apitap_lock/<token>`.
-    ///
-    /// Beside the run segments, never inside this run's own: `finalize` lists
-    /// `self.staging` and copies everything it finds there into the published
-    /// directory.
-    fn lock_key(&self) -> String {
-        format!("{}{}/{}", self.staging_root,
-                crate::naming::Artifact::Lock.suffix(), self.run.token())
+    /// This destination as the guard sees it: the table's staging root.
+    fn guard(&self) -> S3Guard {
+        S3Guard::new(self.conn.clone(), self.staging_root.clone())
     }
 
-    /// This run's announcement, written BEFORE the scan — see the Postgres
-    /// sink's `announce` for why the order is the entire property.
-    ///
-    /// Held for the whole run, unlike the SQL sinks, which hand the job over to
-    /// their staging table at the end of `prepare`. Here `prepare` creates
-    /// nothing — a run's staging segment comes into existence with its first
-    /// part object — so a lock dropped early would leave the run invisible to a
-    /// peer's scan until the first bytes land.
-    async fn announce(&self) -> Result<()> {
-        // Zero bytes: the key is the whole message.
-        self.conn.put_object(&self.lock_key(), Vec::new()).await
-    }
-
-    /// Best-effort: a failure to delete the lock must not fail a finished run.
+    /// Take the announcement back, if this run still holds one. Best-effort by
+    /// contract: a failure to delete the lock must not fail a finished run.
     async fn release(&self) {
-        let _ = self.conn.delete(&self.lock_key()).await;
-    }
-
-    async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{parse_peer, Artifact};
-        let mine = parse_peer(
-            &format!("{}{}", self.run.token(), Artifact::Staging.suffix()),
-            Artifact::Staging,
-        )
-        .expect("a token this process minted parses");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Whether a key belongs to a run this one may clean up after. Shared
-        // by the object sweep and the upload sweep so the two can never
-        // disagree about which segments are dead.
-        //
-        // ONLY the untokenized legacy layout qualifies. A foreign run's segment
-        // is never collected on age, however old its token reads: the token is
-        // when that RUN started, not when the object was written, so on a long
-        // multi-table load the two are hours apart — and here a wrongly deleted
-        // segment is SILENT. The next `finalize` re-creates the prefix and the
-        // run reports a full row count over a truncated table, which is the
-        // exact defect this mechanism exists to remove. `naming::classify` has
-        // the long version of the argument.
-        // NOTHING is reapable any more, and the empty set is the point.
-        //
-        // `Legacy` was `true` here until 0.55.1 — the pre-token layout puts
-        // parts directly under the prefix, and this deleted them. But an apitap
-        // older than 0.55.0 writes exactly that layout WHILE IT LOADS, and the
-        // two versions meet during any rolling upgrade. Deleting a live old
-        // run's parts here is silent: its next PutObject re-creates the prefix,
-        // its finalize copies what remains into place, and it reports a full
-        // row count over a truncated object set. That is the defect 0.55.0
-        // exists to remove. A legacy key is refused below instead.
-        let reapable = |key: &str| match classify(&self.staging_root, key) {
-            Staged::Foreign | Staged::Legacy | Staged::Run { .. } => false,
-        };
-        // Nothing is deleted until the whole listing has been judged: a live
-        // peer anywhere in it means this run does not get to touch the prefix
-        // at all.
-        let objects = self.conn.list(&self.staging_root).await?;
-        for key in &objects {
-            let what = classify(&self.staging_root, key);
-            // A pre-0.55.0 key: refuse, never delete. See naming::Found::Legacy
-            // — the argument is the same, and here the wrong guess is silent.
-            if matches!(what, Staged::Legacy) {
-                return Err(crate::naming::legacy_error(
-                    &format!("s3://{}/{}{}", self.conn.bucket, self.conn.prefix, self.bare),
-                    &format!("the objects under s3://{}/{}", self.conn.bucket, self.conn.prefix),
-                ));
-            }
-            let Staged::Run { seg, peer } = what else {
-                continue;
-            };
-            // Our own segment is not a peer of itself.
-            if seg == self.run.token() {
-                continue;
-            }
-            if crate::naming::peer_blocks(&mine, &peer) {
-                return Err(crate::naming::locked_error(
-                    &format!("s3://{}/{}{}", self.conn.bucket, self.conn.prefix, self.bare),
-                    &format!(
-                        "the objects and multipart uploads under s3://{}/{}{seg}/ \
-                         (`aws s3 rm --recursive`, `aws s3api abort-multipart-upload`)",
-                        self.conn.bucket, self.conn.prefix
-                    ),
-                    &mine,
-                    &peer,
-                    now,
-                    // No lease to read on this path — this sink keeps its own
-                    // classify loop and never collects. See `naming::collectable`.
-                    None,
-                        ));
+        let a = self.announced.lock().expect("announcement").take();
+        if let Some(a) = a {
+            if let Err(a) = crate::guard::release(&self.guard(), a).await {
+                a.abandon();
             }
         }
-        // No separate sweep of the pre-token PREFIX is needed:
-        // `artifact_match`'s head and `artifact_ident`'s name agree for every
-        // table name that can exist here. They only diverge past ~990 bytes of
-        // name, and a key that long is already over the 1024-byte object-key
-        // limit S3 enforces — such a run could never have written a staging
-        // object to reap.
-        for key in &objects {
-            if reapable(key.as_str()) {
-                self.conn.delete(key).await?;
-            }
-        }
-        // A killed run's multipart UPLOADS are invisible to the sweep above —
-        // no object exists until CompleteMultipartUpload, but the parts are
-        // stored and billed, and nothing else ever removes them (no bucket
-        // lifecycle rule can be assumed). They are swept by the SAME rule, so
-        // a peer that is merely slow keeps its uploads. Best-effort: an
-        // S3-compatible store with patchy ListMultipartUploads support must
-        // not fail a run that would otherwise succeed.
-        if let Ok(uploads) = self.conn.list_multipart_uploads(&self.staging_root).await {
-            for (key, id) in uploads {
-                if reapable(key.as_str()) {
-                    let _ = self.conn.abort_multipart(&key, &id).await;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -916,8 +854,10 @@ impl crate::sink::Sink for S3Sink {
         // only on a scan taken AFTER its own announcement, so a concurrent
         // pair cannot both miss each other. `pipeline::run` releases the
         // announcement again if anything here fails; see `announce`.
-        self.announce().await?;
-        self.reap_and_check_peers().await?;
+        let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
+        *self.announced.lock().expect("announcement") = Some(a);
+        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::Keep)
+            .await?;
         Ok(())
     }
 
@@ -1132,40 +1072,49 @@ mod tests {
         assert!(!e.to_string().contains("S3CRET"), "leaked: {e}");
     }
 
+    /// The object stores' guard listing: a peer's segment is ONE blocker named
+    /// by the sentence that clears it, a peer's lock is refused by its key, and
+    /// this run's own lock and segment are its own. And a lock name maps to the
+    /// lock directory, never into a run segment (`finalize` copies those).
     #[test]
-    fn multipart_upload_listing_parses_keys_and_ids() {
-        // The markers echo request state and must not be mistaken for
-        // uploads; each <Upload> carries key + id amid noise we skip.
-        let body = "<ListMultipartUploadsResult><Bucket>b</Bucket>\
-                    <KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker>\
-                    <IsTruncated>false</IsTruncated>\
-                    <Upload><Key>a/part-00000.parquet</Key><UploadId>id1</UploadId>\
-                    <Initiated>2026-08-23T00:00:00Z</Initiated></Upload>\
-                    <Upload><Key>a/part-00001.parquet</Key><UploadId>id2</UploadId></Upload>\
-                    </ListMultipartUploadsResult>";
-        assert_eq!(
-            parse_uploads(body),
-            vec![
-                ("a/part-00000.parquet".to_string(), "id1".to_string()),
-                ("a/part-00001.parquet".to_string(), "id2".to_string()),
-            ]
-        );
-        assert_eq!(xml_tag(body, "IsTruncated").as_deref(), Some("false"));
+    fn an_object_store_listing_is_spelled_for_the_guard() {
+        use crate::naming::{blockers, BulkKind, RunId, GUARDED, ROOMY};
+        let root = "lake/orders__apitap_staging/";
+        let run = RunId::mint_bulk(BulkKind::Swap, "s3://b/lake");
+        let peer = RunId::mint_bulk(BulkKind::Swap, "s3://b/lake");
+        let keys: Vec<String> = vec![
+            format!("{root}{}/part-00000.parquet", peer.token()),
+            format!("{root}{}/part-00001.parquet", peer.token()),
+            format!("{root}__apitap_lock/{}", run.token()),
+            format!("{root}{}/part-00000.parquet", run.token()),
+            format!("{root}notes/keep.txt"),
+        ];
+        let listed = segment_listed(root, "orders", &keys, "legacy", &|seg| format!("under {seg}/"));
+        assert_eq!(listed.len(), 3, "one entry per segment, the foreign key skipped: {listed:?}");
+        let scan = blockers("orders", ROOMY, &run, GUARDED,
+                            listed.iter().map(|l| (l.canonical.as_str(), l.raw.as_str())));
+        assert_eq!(scan.blockers.len(), 1, "{scan:?}");
+        assert_eq!(scan.blockers[0].name(), format!("under {}/", peer.token()));
+        let name = crate::naming::artifact_ident_run("orders", crate::naming::Artifact::Lock, ROOMY, &run);
+        assert_eq!(lock_key_of(root, &name).unwrap(), format!("{root}__apitap_lock/{}", run.token()));
+        assert!(lock_key_of(root, "orders__apitap_staging").is_none());
     }
 
-    /// The classifier gates BOTH sweeps — objects and multipart uploads — so
-    /// each misreading has a price: a run segment read as legacy deletes a
-    /// live peer's parts and aborts its uploads (the defect), a legacy key
-    /// read as foreign leaks storage forever, and a foreign key read as
-    /// either destroys something a user put there.
+    /// The classifier decides what the guard sees, so each misreading has a
+    /// price: a run segment read as legacy refuses every later run over a
+    /// healthy peer, a legacy key read as foreign lets a run proceed beside an
+    /// old apitap still loading there, and a foreign key read as either blames
+    /// something a user put there.
     #[test]
     fn a_staging_key_is_classified_by_its_run_segment() {
         let root = "lake/events__apitap_staging/";
         let id = crate::naming::RunId::mint_bulk(crate::naming::BulkKind::Swap, "s3://b/lake");
         let tok = id.token().to_string();
         match classify(root, &format!("{root}{tok}/part-00000.parquet")) {
-            Staged::Run { seg, peer } => {
+            Staged::Run { seg } => {
                 assert_eq!(seg, tok);
+                let peer = crate::naming::parse_peer(
+                    &format!("{seg}__apitap_staging"), crate::naming::Artifact::Staging).unwrap();
                 assert_eq!(peer.kind, crate::naming::LandKind::Swap);
             }
             _ => panic!("a token segment must read as a run"),

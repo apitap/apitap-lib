@@ -12,10 +12,10 @@ takes every answer from the server's own catalog:
   B  a live DRAIN's lock with a live lease behind it refuses a drain BY TYPE,
      and is left in place                                 (guard.drain-vs-bulk)
 
-    python benchmarks/e2e_guard_matrix.py <bq|my|ch>
+    python benchmarks/e2e_guard_matrix.py <bq|my|ch|s3>
 
 Rig: `apitap-bench-pg-src` :5544 as the source; MySQL :3307, ClickHouse :8124,
-or the gate's BigQuery dataset (BQ_SA) as the destination.
+the gate's BigQuery dataset (BQ_SA), or the bench MinIO (:9100) as the destination.
 """
 import sys
 
@@ -158,7 +158,39 @@ class Ch:
                 _rig.clickhouse(f"ALTER TABLE `{t}` DELETE WHERE {w} SETTINGS mutations_sync = 1")
 
 
-E = {"bq": Bq, "my": My, "ch": Ch}[ENGINE]()
+class S3:
+    """No lease store and no CDC lane on an object store: case A only. A run
+    lives in a SEGMENT under the table's staging root; the plant is one part
+    of a live-looking replace's segment."""
+    prefix = "gm"
+    url = _rig.s3_url(prefix)
+    staging_decoration = None
+    root = f"{prefix}/{T}__apitap_staging/"
+
+    def names(self):
+        return _rig.s3_list(f"{self.prefix}/{T}")
+
+    def plant(self, name):
+        _rig.s3_put(name, b"PAR1")
+
+    def unplant(self, name):
+        _rig.s3_delete(name)
+
+    def count(self):
+        import duckdb
+        d = duckdb.connect()
+        d.execute(f"SET s3_endpoint='{_rig.S3_ENDPOINT}'; SET s3_use_ssl=false; SET s3_url_style='path'; "
+                  "SET s3_access_key_id='bench'; SET s3_secret_access_key='benchbench'; "
+                  f"SET s3_region='{_rig.S3_REGION}';")
+        return str(d.execute(f"SELECT count(*) FROM read_parquet('s3://{_rig.S3_BUCKET}/"
+                             f"{self.prefix}/{T}/*.parquet')").fetchone()[0])
+
+    def clean(self):
+        for k in _rig.s3_list(f"{self.prefix}/"):
+            _rig.s3_delete(k)
+
+
+E = {"bq": Bq, "my": My, "ch": Ch, "s3": S3}[ENGINE]()
 _SLOTS = set(_rig.psql("SELECT slot_name FROM pg_replication_slots", _rig.PG_SRC).split())
 
 
@@ -179,7 +211,10 @@ _rig.psql(f"CREATE TABLE {T} (id int PRIMARY KEY, v text)", _rig.PG_SRC)
 _rig.psql(f"INSERT INTO {T} SELECT g, 'v'||g FROM generate_series(1,100) g", _rig.PG_SRC)
 try:
     print("== A. a live replace's staging refuses a replace, and stays ==")
-    staging = f"{T}{_rig.fresh_token('r')}__apitap_staging{E.staging_decoration}"
+    if ENGINE == "s3":
+        staging = f"{E.root}{_rig.fresh_token('r')}/part-00000.parquet"
+    else:
+        staging = f"{T}{_rig.fresh_token('r')}__apitap_staging{E.staging_decoration}"
     E.plant(staging)
     e = refusal(lambda: apitap.transfer(PG, E.url, table=T, mode="replace"))
     case("the replace is refused BY TYPE", bool(e) and e.startswith("LockedError"),
@@ -190,15 +225,17 @@ try:
     case("CONTROL: with the plant gone, the replace runs", e is None, e or "ran")
     case("and landed every row", E.count() == "100", f"{E.count()}")
 
-    print("== B. a live drain's lock (and lease) refuses a drain, and stays ==")
-    tok = _rig.fresh_token("l", "live")
-    lock = f"{T}{tok}__apitap_lock"
-    E.plant(lock)
-    E.live_lease(tok)
-    e = refusal(lambda: apitap.transfer(PG, E.url, table=T, mode="log_based"))
-    case("the drain is refused BY TYPE", bool(e) and e.startswith("LockedError"),
-         (e or "it was ALLOWED")[:170])
-    case("and the plant is still listed", lock in E.names(), f"{E.names()}")
+    # B needs a CDC lane into the engine, which an object store does not have.
+    if hasattr(E, "live_lease"):
+        print("== B. a live drain's lock (and lease) refuses a drain, and stays ==")
+        tok = _rig.fresh_token("l", "live")
+        lock = f"{T}{tok}__apitap_lock"
+        E.plant(lock)
+        E.live_lease(tok)
+        e = refusal(lambda: apitap.transfer(PG, E.url, table=T, mode="log_based"))
+        case("the drain is refused BY TYPE", bool(e) and e.startswith("LockedError"),
+             (e or "it was ALLOWED")[:170])
+        case("and the plant is still listed", lock in E.names(), f"{E.names()}")
 finally:
     print("== cleanup ==")
     E.clean()

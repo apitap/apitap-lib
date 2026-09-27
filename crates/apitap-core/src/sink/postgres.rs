@@ -28,8 +28,8 @@ pub(crate) struct PgParts {
 
 impl PgParts {
     /// `"schema"."bare"`, quoted. The CDC data statements take it when they
-    /// move onto the resolved schema (handoff §3 step 19); until then, tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// move onto the resolved schema (handoff §3 step 19).
+    #[allow(dead_code)]
     pub(crate) fn qualified(&self) -> String {
         quote_ident_path(&format!("{}.{}", self.schema, self.bare))
     }

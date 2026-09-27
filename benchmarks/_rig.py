@@ -305,3 +305,70 @@ def fresh_token(letter, tail="beef"):
         s = d[n % 36] + s
         n //= 36
     return f"_{s}{letter}000{tail}"
+
+
+# ── S3 (the bench MinIO) ─────────────────────────────────────────────────
+
+S3_ENDPOINT = "127.0.0.1:9100"
+S3_BUCKET = "apitap-bench"
+S3_REGION = "us-east-1"
+_S3_KEY, _S3_SECRET = "bench", "benchbench"
+
+
+def s3_url(prefix):
+    return (f"s3://{S3_BUCKET}/{prefix}?format=parquet&endpoint=http://{S3_ENDPOINT}"
+            f"&region={S3_REGION}&access_key_id={_S3_KEY}&secret_access_key={_S3_SECRET}")
+
+
+def _s3(method, key="", query=None, body=b""):
+    """One SigV4-signed, path-style request — enough S3 to plant, list and
+    delete what a leg needs, with nothing to install."""
+    import datetime
+    import hashlib
+    import hmac
+    import urllib.parse
+    import requests
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+    path = f"/{S3_BUCKET}" + (f"/{urllib.parse.quote(key, safe='/~')}" if key else "")
+    q = "&".join(f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
+                 for k, v in sorted((query or {}).items()))
+    payload = hashlib.sha256(body).hexdigest()
+    hdrs = {"host": S3_ENDPOINT, "x-amz-content-sha256": payload, "x-amz-date": amz}
+    signed = ";".join(sorted(hdrs))
+    canon = "\n".join([method, path, q, "".join(f"{k}:{hdrs[k]}\n" for k in sorted(hdrs)),
+                       signed, payload])
+    scope = f"{day}/{S3_REGION}/s3/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz, scope, hashlib.sha256(canon.encode()).hexdigest()])
+    k = ("AWS4" + _S3_SECRET).encode()
+    for part in (day, S3_REGION, "s3", "aws4_request"):
+        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+    sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    hdrs["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={_S3_KEY}/{scope}, "
+                             f"SignedHeaders={signed}, Signature={sig}")
+    r = requests.request(method, f"http://{S3_ENDPOINT}{path}" + (f"?{q}" if q else ""),
+                         headers=hdrs, data=body)
+    if r.status_code >= 400 and not (method == "DELETE" and r.status_code == 404):
+        raise RuntimeError(f"S3 {method} {key}: {r.status_code} {r.text[:300]}")
+    return r
+
+
+def s3_put(key, body=b""):
+    _s3("PUT", key, body=body)
+
+
+def s3_delete(key):
+    _s3("DELETE", key)
+
+
+def s3_list(prefix):
+    import re
+    keys, token = [], None
+    while True:
+        q = {"list-type": "2", "prefix": prefix, **({"continuation-token": token} if token else {})}
+        text = _s3("GET", query=q).text
+        keys += re.findall(r"<Key>([^<]+)</Key>", text)
+        m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", text)
+        if not m:
+            return keys
+        token = m.group(1)
