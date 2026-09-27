@@ -150,28 +150,49 @@ pub(crate) async fn lease_open(pool: &Pool, db: &str, keys: &[String], token: &s
 /// in-transaction. Without that, one member of a group whose window runs long
 /// would block the renewal and every OTHER member's lease would expire under a
 /// live, healthy group.
+/// `innodb_lock_wait_timeout = 1` for this connection, CHECKED: a renewal or
+/// claim that silently kept the server default (50 s) would queue behind a
+/// live apply's row lock instead of stepping around it.
+async fn short_lock_wait(conn: &mut mysql_async::Conn) -> Result<()> {
+    conn.query_drop("SET SESSION innodb_lock_wait_timeout = 1")
+        .await
+        .map_err(|e| Error::Transfer(format!("mysql: SET SESSION innodb_lock_wait_timeout: {e}")))
+}
+
+/// Never over a collected row: a renewal that could clear nothing but could
+/// extend a collected row's `expires_at` is harmless today, and would not be
+/// the day something reads expiry beside the flag.
 pub(crate) async fn lease_renew(pool: &Pool, db: &str, keys: &[String], token: &str) -> Result<u64> {
     let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
-    let _ = conn.query_drop("SET SESSION innodb_lock_wait_timeout = 1").await;
+    short_lock_wait(&mut conn).await?;
     let mut done = 0u64;
     for k in keys {
         match conn
             .exec_drop(
                 format!(
                     "UPDATE {} SET expires_at = UTC_TIMESTAMP(6) + INTERVAL ? SECOND \
-                     WHERE dest_key = ? AND token = ?",
+                     WHERE dest_key = ? AND token = ? AND collected = 0",
                     lease_t(db)
                 ),
                 (crate::lease::ttl_secs(), k, token),
             )
             .await
         {
-            Ok(()) => done += 1,
+            Ok(()) => done += conn.affected_rows(),
             Err(e) if e.to_string().contains("1205") => {}
             Err(e) => return Err(Error::Transfer(format!("lease renew: {e}"))),
         }
     }
     Ok(done)
+}
+
+/// This run's keys whose row exists and is not collected. Expiry ignored.
+#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
+pub(crate) async fn lease_unclaimed(pool: &Pool, db: &str, token: &str) -> Result<Vec<String>> {
+    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    conn.exec(format!("SELECT dest_key FROM {} WHERE token = ? AND collected = 0", lease_t(db)), (token,))
+        .await
+        .map_err(|e| Error::Transfer(format!("lease read: {e}")))
 }
 
 pub(crate) async fn lease_get(
@@ -203,26 +224,56 @@ pub(crate) async fn lease_get(
     }))
 }
 
-pub(crate) async fn lease_claim(pool: &Pool, db: &str, key: &str, token: &str) -> Result<bool> {
+/// Decided by a READ of the locked row, never by `affected_rows`.
+///
+/// 0.56.0 claimed with `UPDATE … SET collected = 1 WHERE … (lapsed OR
+/// collected = 1)` and read success from `affected_rows` — which counts
+/// CHANGED rows, so re-claiming a row that already said 1 reported 0, and a
+/// collection that died half way was refused for ever. Now: lock the row
+/// (`FOR UPDATE`, 1 s wait), look at it, and decide.
+pub(crate) async fn lease_claim(pool: &Pool, db: &str, key: &str, token: &str)
+    -> Result<crate::guard::Claim>
+{
+    use crate::guard::Claim;
     let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
-    let _ = conn.query_drop("SET SESSION innodb_lock_wait_timeout = 1").await;
-    match conn
-        .exec_drop(
+    short_lock_wait(&mut conn).await?;
+    let t = lease_t(db);
+    conn.query_drop("START TRANSACTION").await.map_err(|e| Error::Transfer(format!("lease claim: {e}")))?;
+    let row: std::result::Result<Option<(i8, i8)>, mysql_async::Error> = conn
+        .exec_first(
             format!(
-                "UPDATE {} SET collected = 1 WHERE dest_key = ? AND token = ? \
-                 AND (expires_at <= UTC_TIMESTAMP(6) OR collected = 1)",
-                lease_t(db)
+                "SELECT collected, expires_at <= UTC_TIMESTAMP(6) FROM {t} \
+                 WHERE dest_key = ? AND token = ? FOR UPDATE"
             ),
             (key, token),
         )
-        .await
-    {
-        Ok(()) => Ok(conn.affected_rows() > 0),
+        .await;
+    let (verdict, write) = match row {
         // 1205: the owner holds the row inside an apply — alive, so refuse.
-        Err(e) if e.to_string().contains("1205") => Ok(false),
-        Err(mysql_async::Error::Server(e)) if e.code == 1146 => Ok(false),
-        Err(e) => Err(Error::Transfer(format!("lease claim: {e}"))),
+        Err(e) if e.to_string().contains("1205") => (Claim::Refused, false),
+        // 1146: no lease store = nothing is leased.
+        Err(mysql_async::Error::Server(e)) if e.code == 1146 => (Claim::Absent, false),
+        Err(e) => {
+            let _ = conn.query_drop("ROLLBACK").await;
+            return Err(Error::Transfer(format!("lease claim: {e}")));
+        }
+        Ok(None) => (Claim::Absent, false),
+        Ok(Some((collected, _))) if collected != 0 => (Claim::Taken, false),
+        Ok(Some((_, lapsed))) if lapsed != 0 => (Claim::Taken, true),
+        Ok(Some(_)) => (Claim::Refused, false),
+    };
+    if write {
+        if let Err(e) = conn
+            .exec_drop(format!("UPDATE {t} SET collected = 1 WHERE dest_key = ? AND token = ?"), (key, token))
+            .await
+        {
+            let _ = conn.query_drop("ROLLBACK").await;
+            return Err(Error::Transfer(format!("lease claim: {e}")));
+        }
     }
+    let end = if verdict == Claim::Taken { "COMMIT" } else { "ROLLBACK" };
+    conn.query_drop(end).await.map_err(|e| Error::Transfer(format!("lease claim: {e}")))?;
+    Ok(verdict)
 }
 
 pub(crate) async fn lease_close(pool: &Pool, db: &str, key: &str, token: &str) {
@@ -323,11 +374,7 @@ impl crate::guard::GuardStore for MyGuard {
     }
 
     async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
-        Ok(if lease_claim(&self.shared.pool, &self.shared.db, key, token).await? {
-            crate::guard::Claim::Taken
-        } else {
-            crate::guard::Claim::Refused
-        })
+        lease_claim(&self.shared.pool, &self.shared.db, key, token).await
     }
 
     async fn lease_close(&self, proof: crate::guard::Released) {

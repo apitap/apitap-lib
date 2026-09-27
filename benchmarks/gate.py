@@ -129,7 +129,7 @@ LEGS = [
                 "collect.claim-then-crash": ("pg",)}),
     leg("e2e_guard_matrix.py",     "the guard asks MySQL the same questions", argv=["my"],
         proves={"guard.bulk-vs-bulk": ("my",), "guard.drain-vs-bulk": ("my",),
-                "guard.no-lease-no-collect": ("my",)}),
+                "guard.no-lease-no-collect": ("my",), "collect.claim-then-crash": ("my",)}),
     leg("e2e_guard_matrix.py",     "the guard asks ClickHouse the same questions", argv=["ch"],
         proves={"guard.bulk-vs-bulk": ("ch",), "guard.drain-vs-bulk": ("ch",),
                 "guard.no-lease-no-collect": ("ch",), "collect.claim-then-crash": ("ch",)}),

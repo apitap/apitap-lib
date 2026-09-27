@@ -323,11 +323,11 @@ class Ice:
 
 E = {"pg": Pg, "bq": Bq, "my": My, "ch": Ch, "s3": S3, "ice": Ice}[ENGINE]()
 
-# Engines whose claim cannot yet take an already-collected row: MySQL's claim
-# counts CHANGED rows, and setting `collected = 1` on a row that already says 1
-# changes nothing — so a collection that died half way is refused for ever.
-# Fixed by the MySQL claim-by-read (handoff §3 step 17), which adds `my` here.
-FINISHES_A_COLLECTION = {"pg", "ch", "bq"}
+# Engines whose claim takes an already-collected row. Every store with a lease
+# row: MySQL joined in 0.57.0 — its claim counted CHANGED rows, and setting
+# `collected = 1` on a row that already said 1 changed nothing, so a collection
+# that died half way was refused for ever. It now decides by reading the row.
+FINISHES_A_COLLECTION = {"pg", "my", "ch", "bq"}
 _SLOTS = set(_rig.psql("SELECT slot_name FROM pg_replication_slots", _rig.PG_SRC).split())
 
 
