@@ -942,7 +942,7 @@ mod staging_name_tests {
 
     /// A run of `orders` lists by the head `orders`, which also brings back a
     /// neighbouring destination's tables. Anchoring on both ends is what stops
-    /// it reaping them — the same check `reap_and_check_peers` applies.
+    /// it reaping them — the same check the guard's scan applies.
     #[test]
     fn a_neighbours_staging_is_not_mistaken_for_ours() {
         let (head, suffix) = artifact_match("orders", Artifact::Staging, ROOMY);
@@ -1514,9 +1514,9 @@ pub(crate) struct BqSink {
     /// `<staging_table>_<i>`. The run's token is inside it, so no other run can
     /// ever hand a table to this run's `finalize`.
     staging_table: String,
-    /// This run's announcement that it is working on this table, created before
-    /// the peer scan and deleted in `finalize`/`discard` — see `announce`.
-    lock_table: String,
+    /// This run's announcement, held for the whole run (see `prepare`): unlike
+    /// the SQL sinks, BigQuery's `prepare` creates no staging for a peer to see.
+    announced: std::sync::Mutex<Option<crate::guard::Announced>>,
     /// This run's identity: it is IN `staging_table`, and it is what `prepare`
     /// compares a live peer's staging against.
     run: crate::naming::RunId,
@@ -1599,8 +1599,7 @@ impl BqSink {
                 crate::naming::ROOMY,
                 run,
             ),
-            lock_table: crate::naming::artifact_ident_run(
-                bare, crate::naming::Artifact::Lock, crate::naming::ROOMY, run),
+            announced: std::sync::Mutex::new(None),
             run: run.clone(),
             job_config: Value::Null,
             staging_registry: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1634,125 +1633,27 @@ impl BqSink {
     /// the age lives in the token on every engine — one rule beats five clever
     /// ones. It costs nothing here either: this is the same single listing the
     /// sweep already made.
-    /// This run's announcement, written BEFORE the scan — see the Postgres
-    /// sink's `announce` for why that order is the entire property.
+    /// This destination as the guard sees it.
     ///
-    /// Held for the whole run, unlike the SQL sinks, which hand the job over to
-    /// their staging table at the end of `prepare`. BigQuery's `prepare` creates
-    /// nothing: the first load job of each worker creates its own staging table
-    /// (`createDisposition: CREATE_IF_NEEDED`), so between `prepare` and the
-    /// first landed row there would be nothing at all for a peer's scan to see.
-    async fn announce(&self) -> Result<()> {
-        self.conn.table_create(&self.lock_table, &lock_schema_fields()).await
+    /// The announcement is held for the whole run, unlike the SQL sinks, which
+    /// hand the job over to their staging table at the end of `prepare`.
+    /// BigQuery's `prepare` creates nothing: the first load job of each worker
+    /// creates its own staging table (`createDisposition: CREATE_IF_NEEDED`), so
+    /// between `prepare` and the first landed row there would be nothing at all
+    /// for a peer's scan to see.
+    fn guard(&self) -> BqGuard {
+        BqGuard::new(self.conn.clone())
     }
 
-    /// Best-effort: a failure to delete the lock must not fail a finished run.
+    /// Take the announcement back, if this run still holds one. Best-effort by
+    /// contract: a failure to delete a marker must not fail a finished run.
     async fn release(&self) {
-        let _ = self.conn.table_delete(&self.lock_table).await;
-    }
-
-    async fn reap_and_check_peers(&self) -> Result<()> {
-        use crate::naming::{parse_peer, Artifact, GUARDED, ROOMY};
-        // `final_table` IS the bare name: `bind` strips the dataset qualifier,
-        // and a BigQuery table id is unqualified within its dataset.
-        let (head, _) =
-            crate::naming::artifact_match(&self.final_table, Artifact::Staging, ROOMY);
-        // Minted from the run, not read back off `staging_table` — the same
-        // call `bind` made, so what this run compares peers against and what it
-        // writes into cannot drift apart.
-        let mine: Vec<(Artifact, _)> = GUARDED
-            .iter()
-            .map(|&a| {
-                let n = crate::naming::artifact_ident_run(&self.final_table, a, ROOMY, &self.run);
-                (a, parse_peer(&n, a).expect("a name this process minted parses"))
-            })
-            .collect();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // The token sits BETWEEN head and suffix, so the listing can only be
-        // narrowed to `head` — wider than the old `<bare>__apitap_staging`
-        // prefix, which is why every candidate below is anchored on BOTH ends
-        // before it is touched. Without that, a run of `orders` would reap
-        // `orders_archive`'s live staging. One listing serves both guarded
-        // kinds: they share the head, and only the suffix differs.
-        let listed = self.conn.tables_with_prefix(&head).await?;
-        for (artifact, mine) in &mine {
-          let suffix = crate::naming::artifact_match(&self.final_table, *artifact, ROOMY).1;
-          for name in &listed {
-            // A worker table carries a `_N` index the token does not; strip it
-            // first so what reaches `classify` is the name a run actually mints.
-            // (Only staging is ever sharded that way; for a lock this is the
-            // plain ends-with test.)
-            let Some(base) = staging_base(name, suffix) else {
-                continue;
-            };
-            // Everything after this — both anchors, the exact token width, "is
-            // it mine", and the refusal to age anything out — is
-            // `naming::classify`. It is not re-derived here because it WAS, and
-            // the review found the same class of mistake in six sinks that each
-            // wrote their own copy.
-            match crate::naming::classify(
-                base,
-                &self.final_table,
-                *artifact,
-                ROOMY,
-                &self.run,
-                now,
-            ) {
-                // Another destination's staging: not ours to judge.
-                crate::naming::Found::Foreign => {}
-                // Ours — one RunId per dispatch — so this is a leftover of THIS
-                // run and safe to delete. Never the lock: that one IS this run's
-                // announcement, and this scan is the check it makes meaningful.
-                crate::naming::Found::Mine if *artifact == Artifact::Lock => {}
-                crate::naming::Found::Mine => self.conn.table_delete(name).await?,
-                // The run that spawned this one: not a peer, not ours to delete.
-                crate::naming::Found::Parent => {}
-                // The pre-token name an older apitap wrote. Nothing living mints
-                // it; that is the whole of what collection can prove here.
-                // A pre-0.55.0 name: refuse, never delete. Silent truncation
-                // lives on this branch — CREATE_IF_NEEDED would re-create it
-                // under the older run and publish a short table. See
-                // Found::Legacy.
-                crate::naming::Found::Legacy => {
-                    return Err(crate::naming::legacy_error(
-                        &format!("{}.{}", self.conn.dataset, self.final_table), name));
-                }
-                crate::naming::Found::Live(peer) => {
-                    if crate::naming::peer_blocks(mine, &peer) {
-                        // A dead DRAIN's lock must not wedge a bulk run either:
-                        // the two lanes only see each other because they read
-                        // and write the same artifact.
-                        let key = format!("{}.{}", self.conn.dataset, self.final_table);
-                        let lease = if *artifact == Artifact::Lock {
-                            crate::logbased::dest_bq::lease_get(&self.conn, &key, &peer.token)
-                                .await?
-                        } else {
-                            None
-                        };
-                        if lease.as_ref().is_some_and(|l| l.lapsed())
-                            && crate::logbased::dest_bq::lease_claim(
-                                &self.conn, &key, &peer.token).await?
-                        {
-                            let _ = self.conn.table_delete(name).await;
-                            eprintln!(
-                                "apitap: {key}: collected {name} — the run that wrote it \
-                                 stopped renewing its claim on this destination's own \
-                                 clock. Resuming."
-                            );
-                            continue;
-                        }
-                        return Err(crate::naming::locked_error(
-                            &key, name, mine, &peer, now, lease.as_ref(),
-                        ));
-                    }
-                }
+        let a = self.announced.lock().expect("announcement").take();
+        if let Some(a) = a {
+            if let Err(a) = crate::guard::release(&self.guard(), a).await {
+                a.abandon();
             }
-          }
         }
-        Ok(())
     }
 
     async fn ensure_state_table(&self) -> Result<()> {
@@ -1927,6 +1828,166 @@ impl BqSink {
 /// The minted staging name inside a listed table id, or `None` when the id is
 /// not a staging table of any table at all.
 ///
+/// Read one lease row. Shared by both lanes: a drain and a bulk run only see
+/// each other's liveness because they read and write the same rows.
+pub(crate) async fn lease_get(conn: &BqConn, key: &str, token: &str)
+    -> Result<Option<crate::lease::Lease>>
+{
+    let sql = format!(
+        "SELECT TIMESTAMP_DIFF(expires_at, CURRENT_TIMESTAMP(), SECOND) AS e, collected AS c \
+         FROM {t} WHERE dest_key = '{k}' AND token = '{tok}'",
+        t = conn.fq(crate::lease::LEASE_TABLE), k = sql_str(key), tok = sql_str(token));
+    let rows = match conn.cdc_query(&sql).await {
+        Ok(r) => r,
+        // No lease store = nothing is leased, never an error.
+        Err(Error::Transfer(m))
+            if m.contains("404") || m.contains("Not found") || m.contains("was not found") =>
+        {
+            return Ok(None)
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(r) = rows.first() else { return Ok(None) };
+    Ok(Some(crate::lease::Lease {
+        expires_in: r.first().cloned().flatten().and_then(|v| v.parse().ok()).unwrap_or(0),
+        collected: matches!(r.get(1).cloned().flatten().as_deref(), Some("true") | Some("1")),
+    }))
+}
+
+/// Take a lapsed lease. `false` = do not collect.
+pub(crate) async fn lease_claim(conn: &BqConn, key: &str, token: &str) -> Result<bool> {
+    match lease_get(conn, key, token).await? {
+        Some(l) if l.lapsed() => {
+            conn.cdc_script(&format!(
+                "UPDATE {t} SET collected = TRUE WHERE dest_key = '{k}' AND token = '{tok}'",
+                t = conn.fq(crate::lease::LEASE_TABLE),
+                k = sql_str(key), tok = sql_str(token)))
+                .await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The owner's own close. Best-effort: the run is over either way.
+pub(crate) async fn lease_close(conn: &BqConn, key: &str, token: &str) {
+    let _ = conn
+        .cdc_script(&format!(
+            "DELETE FROM {t} WHERE dest_key = '{k}' AND token = '{tok}'",
+            t = conn.fq(crate::lease::LEASE_TABLE), k = sql_str(key), tok = sql_str(token)))
+        .await;
+}
+
+/// The guard's view of a BigQuery destination: the URL's dataset, spelled.
+///
+/// Its listing is the one place a name is decorated: every bulk worker writes
+/// its own `<staging>_<i>` table, so a raw id is listed together with the
+/// canonical name a run actually mints (`staging_base`). Classification reads
+/// the canonical name; refusal, deletion and the operator's message use the
+/// raw one. 0.56.0's CDC twin of the bulk scan classified raw ids, so a bulk
+/// run's workers were foreign to a drain and it proceeded beside them.
+pub(crate) struct BqGuard {
+    conn: BqConn,
+}
+
+impl BqGuard {
+    pub(crate) fn new(conn: BqConn) -> Self {
+        BqGuard { conn }
+    }
+
+    /// The (canonical, raw) pairs of a dataset listing, for the kinds scanned.
+    /// Pure, so the decoration rule is tested without a dataset.
+    pub(crate) fn listed(names: &[String], bare: &str, kinds: &[crate::naming::Artifact])
+        -> Vec<crate::guard::Listed>
+    {
+        let mut out = Vec::new();
+        for raw in names {
+            for &a in kinds {
+                let (head, suffix) = crate::naming::artifact_match(bare, a, crate::naming::ROOMY);
+                if !raw.starts_with(&head) {
+                    continue;
+                }
+                if let Some(base) = staging_base(raw, suffix) {
+                    out.push(crate::guard::Listed { canonical: base.to_string(), raw: raw.clone() });
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::guard::GuardStore for BqGuard {
+    fn limit(&self) -> usize {
+        crate::naming::ROOMY
+    }
+
+    fn dest_label(&self, bare: &str) -> String {
+        format!("{}.{bare}", self.conn.dataset)
+    }
+
+    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        // One listing per distinct head. The token sits BETWEEN head and
+        // suffix, so the listing can only be narrowed to the head — which is
+        // why every candidate is anchored on both ends (`staging_base`, then
+        // `naming::classify`) before it is touched.
+        let mut heads: Vec<String> = kinds
+            .iter()
+            .map(|&a| crate::naming::artifact_match(bare, a, crate::naming::ROOMY).0)
+            .collect();
+        heads.sort();
+        heads.dedup();
+        let mut names = Vec::new();
+        for h in &heads {
+            names.extend(self.conn.tables_with_prefix(h).await?);
+        }
+        names.sort();
+        names.dedup();
+        Ok(Self::listed(&names, bare, kinds))
+    }
+
+    /// BigQuery has no zero-column table; nothing ever reads this one.
+    async fn create_marker(&self, raw: &str) -> Result<()> {
+        let exists = |m: &str| m.contains("409") || m.contains("Already Exists");
+        match self.conn.table_create(raw, &lock_schema_fields()).await {
+            Ok(()) => Ok(()),
+            // Idempotent, like the SQL engines' IF NOT EXISTS.
+            Err(Error::Transfer(m)) if exists(&m) => Ok(()),
+            // A first run into a dataset that does not exist yet.
+            Err(Error::Transfer(m)) if m.contains("404") => {
+                self.conn.ensure_dataset().await?;
+                match self.conn.table_create(raw, &lock_schema_fields()).await {
+                    Err(Error::Transfer(m)) if exists(&m) => Ok(()),
+                    r => r,
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `table_delete` maps a 404 to `Ok`: gone is gone.
+    async fn drop_object(&self, raw: &str) -> Result<()> {
+        self.conn.table_delete(raw).await
+    }
+
+    async fn lease_get(&self, key: &str, token: &str) -> Result<Option<crate::lease::Lease>> {
+        lease_get(&self.conn, key, token).await
+    }
+
+    async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
+        Ok(if lease_claim(&self.conn, key, token).await? {
+            crate::guard::Claim::Taken
+        } else {
+            crate::guard::Claim::Refused
+        })
+    }
+
+    async fn lease_close(&self, proof: crate::guard::Released) {
+        lease_close(&self.conn, &proof.key, &proof.token).await
+    }
+}
+
 /// This sink gives every worker its OWN table — BigQuery rate-limits table
 /// update operations per table, and one shared staging tripped
 /// `rateLimitExceeded` at 10M rows — so what is on disk is `<minted>_<i>`, not
@@ -2014,8 +2075,11 @@ impl crate::sink::Sink for BqSink {
         // only on a scan taken AFTER its own announcement, so a concurrent
         // pair cannot both miss each other. `pipeline::run` releases the
         // announcement again if anything here fails; see `announce`.
-        self.announce().await?;
-        self.reap_and_check_peers().await?;
+        let a = crate::guard::announce(&self.guard(), &self.final_table, &self.run).await?;
+        *self.announced.lock().expect("announcement") = Some(a);
+        crate::guard::check_peers(&self.guard(), &self.final_table, &self.run,
+                                  crate::guard::Mine::DeleteLeftovers)
+            .await?;
         if let Some(cursor) = plan.cursor.as_deref() {
             if let Some(idx) = plan.cols.iter().position(|c| c.name == cursor) {
                 let numeric = matches!(
@@ -2608,5 +2672,38 @@ mod ident_tests {
         assert!(bq_ident("column", "back\\slash").is_err());
         assert!(bq_ident("dataset", "").is_err());
         assert!(bq_ident("column", &"x".repeat(1025)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::naming::{artifact_ident_run, blockers, Artifact, BulkKind, RunId, GUARDED, ROOMY};
+
+    /// G8. A worker table is classified by the name its run minted and deleted
+    /// by the name it has on disk. Classify the raw `_3` id instead — 0.56.0's
+    /// CDC scan did — and a peer's workers are Foreign (nobody refuses) while
+    /// this run's own retried worker is never cleaned up.
+    #[test]
+    fn bq_listing_classifies_canonical_deletes_raw() {
+        let run = RunId::mint_bulk(BulkKind::Swap, "postgres://h/db::orders");
+        let peer = RunId::mint_bulk(BulkKind::Swap, "postgres://other/db::orders");
+        let mine = artifact_ident_run("orders", Artifact::Staging, ROOMY, &run);
+        let theirs = artifact_ident_run("orders", Artifact::Staging, ROOMY, &peer);
+        let names = vec![
+            format!("{theirs}_3"),
+            format!("{mine}_3"),
+            "orders_2024".to_string(),
+            "orders".to_string(),
+        ];
+        let listed = BqGuard::listed(&names, "orders", GUARDED);
+        assert!(listed.contains(&crate::guard::Listed {
+            canonical: theirs.clone(), raw: format!("{theirs}_3") }), "{listed:?}");
+        assert_eq!(listed.len(), 2, "a user's orders_2024 is no candidate: {listed:?}");
+        let scan = blockers("orders", ROOMY, &run, GUARDED,
+                            listed.iter().map(|l| (l.canonical.as_str(), l.raw.as_str())));
+        assert_eq!(scan.blockers.len(), 1, "{scan:?}");
+        assert_eq!(scan.blockers[0].name(), format!("{theirs}_3"), "refused by its raw name");
+        assert_eq!(scan.mine_leftovers, vec![format!("{mine}_3")], "deleted by its raw name");
     }
 }

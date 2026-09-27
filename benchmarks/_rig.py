@@ -273,3 +273,35 @@ def live_leases_bq(table):
         f"SELECT token FROM `{BQ_PROJECT}.{BQ_DATASET}._apitap_lease` "
         f"WHERE ENDS_WITH(dest_key, '.{table}') AND NOT collected "
         "AND expires_at > CURRENT_TIMESTAMP()")]
+
+
+def bq_create_table(name, fields=None):
+    """Plant an object the way apitap's BigQuery markers are made (INT64 `t`)."""
+    import requests
+    body = {"tableReference": {"projectId": BQ_PROJECT, "datasetId": BQ_DATASET, "tableId": name},
+            "schema": {"fields": fields or [{"name": "t", "type": "INT64"}]}}
+    r = requests.post(
+        f"https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/datasets/{BQ_DATASET}/tables",
+        headers={"Authorization": f"Bearer {_bq_token()}"}, json=body)
+    if r.status_code >= 400 and r.status_code != 409:
+        raise RuntimeError(f"BQ create {name}: {r.text[:300]}")
+
+
+def bq_delete_table(name):
+    import requests
+    r = requests.delete(
+        f"https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/datasets/{BQ_DATASET}/tables/{name}",
+        headers={"Authorization": f"Bearer {_bq_token()}"})
+    if r.status_code >= 400 and r.status_code != 404:
+        raise RuntimeError(f"BQ delete {name}: {r.text[:300]}")
+
+
+def fresh_token(letter, tail="beef"):
+    """A token started NOW, of kind `letter` — a live-looking peer, not an
+    ancient one (nothing ages out, but a plant should look like a real run)."""
+    d = "0123456789abcdefghijklmnopqrstuvwxyz"
+    n, s = int(time.time()), ""
+    for _ in range(7):
+        s = d[n % 36] + s
+        n //= 36
+    return f"_{s}{letter}000{tail}"

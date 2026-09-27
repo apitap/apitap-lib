@@ -118,7 +118,16 @@ LEGS = [
 
     leg("e2e_review_gate.py",      "the findings of the 0.42.0 review, as proofs"),
 
+    leg("e2e_guard_matrix.py",     "the guard asks MySQL the same questions", argv=["my"],
+        proves={"guard.bulk-vs-bulk": ("my",), "guard.drain-vs-bulk": ("my",)}),
+    leg("e2e_guard_matrix.py",     "the guard asks ClickHouse the same questions", argv=["ch"],
+        proves={"guard.bulk-vs-bulk": ("ch",), "guard.drain-vs-bulk": ("ch",)}),
+
     leg("e2e_bq_cdc.py",           "CDC into BigQuery via staging + MERGE", {"bq"}),
+    leg("e2e_bq_guard.py",         "a BigQuery bulk run meets a drain's announcement", {"bq"},
+        proves={"bq.bulk-meets-cdc-lock": ("bq",), "guard.no-lease-no-collect": ("bq",)}),
+    leg("e2e_guard_matrix.py",     "the guard asks BigQuery the same questions", {"bq"}, ["bq"],
+        proves={"guard.bulk-vs-bulk": ("bq",), "guard.drain-vs-bulk": ("bq",)}),
     leg("e2e_changelog_bq.py",     "changelog=True on BigQuery", {"bq"}),
     leg("e2e_changelog_group.py",  "changelog partition/order overrides", {"bq"}),
     leg("e2e_changelog_percolumn.py", "per-column changelog config", {"bq"}),
