@@ -140,7 +140,13 @@ case("a finished run leaves no lock and no lease",
 print("== a drain killed OUTRIGHT leaves its lock — and its lease ==")
 # A real kill, not a plant. A plant cannot prove a live run writes one, and the
 # whole mechanism rests on it doing so.
-pg(f"INSERT INTO {T} SELECT g, 'w'||g FROM generate_series(201,40000) g")
+# Many source transactions, not one: a window never splits a transaction, and
+# a one-window drain applies 40k rows in ~0.1 s on an idle box — its key table
+# lived for less than one catalog poll, and the kill below missed it. Spread
+# over many windows, the run (and its key table) lasts seconds.
+backlog = 200_000
+pg(" ".join(f"BEGIN; INSERT INTO {T} SELECT g, 'w'||g FROM generate_series({lo},{lo + 999}) g; COMMIT;"
+            for lo in range(201, backlog + 1, 1000)))
 wm_before = watermark()
 p = subprocess.Popen(
     [sys.executable, "-c",
@@ -203,7 +209,8 @@ ch(f"DROP TABLE IF EXISTS `{STALE}`")
 
 print("== a LIVE drain's lease is never collectable ==")
 # The failure this mechanism must not have: eating a healthy run.
-pg(f"INSERT INTO {T} SELECT g, 'z'||g FROM generate_series(40001,90000) g")
+pg(" ".join(f"BEGIN; INSERT INTO {T} SELECT g, 'z'||g FROM generate_series({lo},{lo + 999}) g; COMMIT;"
+            for lo in range(backlog + 201, backlog + 50_201, 1000)))
 p = subprocess.Popen(
     [sys.executable, "-c",
      f"import apitap; apitap.transfer({PG!r}, {CH!r}, table={T!r}, mode='log_based')"],
