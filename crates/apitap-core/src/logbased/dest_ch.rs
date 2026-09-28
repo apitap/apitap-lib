@@ -10,10 +10,11 @@
 //!
 //! And no row lock, so no fence to hold: every statement that writes carries
 //! its own ownership predicate instead (`store::owner_pred` — this run's lease
-//! row exists, is not collected, and has more than half its TTL left), and is
-//! bounded server-side to that same half. An evicted drain lands at most the
-//! one statement already executing; its watermark INSERT then writes no row,
-//! and the drain stops. Every statement that reaches the server is in
+//! row exists, is not collected, and has more than half its TTL left, measured
+//! against a deadline pinned for the unit so the fence never reopens inside
+//! it), and is bounded server-side to that same half. An evicted drain lands
+//! at most the one statement already executing; its watermark INSERT then
+//! writes no row, and the drain stops. Every statement that reaches the server is in
 //! `mod store`; the apply bodies write through the `ChUnit` they are handed.
 
 use crate::error::{Error, Result};
@@ -714,6 +715,55 @@ mod store {
         s: &'a ChStore,
         keys: Vec<String>,
         token: String,
+        pin: Pin,
+    }
+
+    /// A unit's time fence, pinned. Every statement of the unit carries
+    /// `now + margin < e0` (`pinned_pred`) besides the live `owner_pred`.
+    ///
+    /// The live margin alone is not monotone: it dips while renewals fail or
+    /// the process is stopped, and comes back with the next renewal. A
+    /// statement evaluated in the dip writes nothing and says nothing — an
+    /// `INSERT … WHERE false` succeeds — so a later statement, the watermark
+    /// INSERT included, could pass after an earlier one was fenced out, and
+    /// record a window that never landed. Against a fixed `e0` the fence only
+    /// ever closes: the first statement that fails it fails every statement
+    /// after it, the watermark writes no row, and the window replays.
+    ///
+    /// Renewals only raise `expires_at`, so while the rows stay unclaimed the
+    /// live `expires_at` is at least `e0`, and the pinned test is at least as
+    /// strict as the live one.
+    struct Pin {
+        /// The lowest `expires_at` among the unit's rows, epoch micros by the
+        /// SERVER clock, as of the last read that proved no gap.
+        e0: u64,
+        /// When it was pinned and what it leaves (`e0 - now - margin`), by the
+        /// client clock. Only WHEN to re-pin is decided with these, never
+        /// whether a statement may write.
+        at: std::time::Instant,
+        budget: std::time::Duration,
+    }
+
+    pub(super) fn pinned_pred(e0: u64, margin_us: u64) -> String {
+        format!("toUnixTimestamp64Micro(now64(6)) + {margin_us} < {e0}")
+    }
+
+    /// The verdict of a pin read: the server's `now`, the lowest live
+    /// `expires_at` among the unit's unclaimed rows and how many of its keys
+    /// those are, against the deadline the unit carried until now (`prev`,
+    /// none at open). `Some(new e0)` only when every row is still unclaimed
+    /// with more than the margin left AND the read itself still passes the old
+    /// deadline — which proves every earlier statement (each started before
+    /// this read) passed it too. Otherwise one of them may have been fenced
+    /// out without a word, and the unit must not go on to a watermark.
+    pub(super) fn repin(now: u64, e: u64, owned: usize, keys: usize, margin_us: u64, prev: Option<u64>) -> Option<u64> {
+        let live = owned == keys && now.saturating_add(margin_us) < e;
+        let continuous = prev.map_or(true, |p| now.saturating_add(margin_us) < p);
+        (live && continuous).then_some(e)
+    }
+
+    fn margin_us() -> u64 {
+        owned_margin_secs() * 1_000_000
     }
 
     /// The ownership predicate a statement carries: this run's lease row
@@ -1018,24 +1068,62 @@ mod store {
             is_shape_ok(has.trim() != "0", changelog, "ClickHouse", dest_table)
         }
 
-        /// Owner = the row exists, is not collected, and has more than the
-        /// margin left — the same test `owner_pred` makes server-side.
-        async fn owner(&self, keys: &[String], token: &str) -> Result<()> {
-            let margin = owned_margin_secs() as i64;
-            for k in keys {
-                match crate::sink::clickhouse::lease_get(&self.ch, k, token).await? {
-                    Some(l) if !l.collected && l.expires_in > margin => {}
-                    _ => return Err(no_longer_holds(keys)),
-                }
+        /// Pin (or re-pin, with the deadline carried so far) the unit's time
+        /// fence: one read of every key's row, decided by `repin`. Owner = the
+        /// row exists, is not collected, and has more than the margin left —
+        /// the same test `owner_pred` makes server-side.
+        async fn pin(&self, keys: &[String], token: &str, prev: Option<u64>) -> Result<Pin> {
+            let inlist = keys.iter().map(|k| format!("'{}'", ch_str(k))).collect::<Vec<_>>().join(", ");
+            let body = match self
+                .ch
+                .read(&format!(
+                    "SELECT toUnixTimestamp64Micro(now64(6)), toUnixTimestamp64Micro(min(e)), count() \
+                     FROM (SELECT argMax(expires_at, seq) AS e FROM `{t}` \
+                           WHERE token = '{tok}' AND dest_key IN ({inlist}) \
+                           GROUP BY dest_key HAVING argMax(collected, seq) = 0) \
+                     FORMAT TabSeparated",
+                    t = crate::lease::LEASE_TABLE,
+                    tok = ch_str(token),
+                ))
+                .await
+            {
+                Ok(b) => b,
+                // No lease store: no row, so not an owner.
+                Err(Error::Transfer(m)) if m.contains("UNKNOWN_TABLE") => String::new(),
+                Err(e) => return Err(e),
+            };
+            let mut f = body.trim().split('\t').map(|v| v.trim().parse::<u64>().unwrap_or(0));
+            let (now, e, owned) = (f.next().unwrap_or(0), f.next().unwrap_or(0), f.next().unwrap_or(0));
+            let distinct = keys.iter().collect::<HashSet<_>>().len();
+            match repin(now, e, owned as usize, distinct, margin_us(), prev) {
+                Some(e0) => Ok(Pin {
+                    e0,
+                    at: std::time::Instant::now(),
+                    budget: std::time::Duration::from_micros(e0 - now - margin_us()),
+                }),
+                None => Err(no_longer_holds(keys)),
             }
-            Ok(())
         }
     }
 
     impl ChUnit<'_> {
         fn pred(&self) -> String {
             let m = owned_margin_secs();
-            self.keys.iter().map(|k| owner_pred(k, &self.token, m)).collect::<Vec<_>>().join(" AND ")
+            let mut p: Vec<String> = self.keys.iter().map(|k| owner_pred(k, &self.token, m)).collect();
+            p.push(pinned_pred(self.pin.e0, margin_us()));
+            p.join(" AND ")
+        }
+
+        /// Keep the pinned deadline ahead of the unit: once half of what it
+        /// left is spent (or on `force`), re-pin — and only across no gap.
+        /// Sub-second in the common case, where a window is far shorter than
+        /// half a TTL and this never reads at all.
+        async fn keep(&mut self, force: bool) -> Result<()> {
+            if !force && self.pin.at.elapsed() < self.pin.budget / 2 {
+                return Ok(());
+            }
+            self.pin = self.s.pin(&self.keys, &self.token, Some(self.pin.e0)).await?;
+            Ok(())
         }
 
         async fn exec_owned(&self, sql: &str) -> Result<String> {
@@ -1069,6 +1157,7 @@ mod store {
         /// run's INSERT writes no row.
         pub(crate) async fn insert_owned(&mut self, table: &str, cols: &[String], body: Vec<u8>) -> Result<()> {
             self.s.note("insert");
+            self.keep(false).await?;
             let s = structure(cols, &self.s.types(table).await?)?;
             let sql = insert_owned_sql(table, cols, &s, &self.pred());
             let st = owned_settings();
@@ -1086,6 +1175,7 @@ mod store {
 
         pub(crate) async fn delete_owned(&mut self, table: &str, where_sql: &str) -> Result<()> {
             self.s.note("delete");
+            self.keep(false).await?;
             let sql = format!(
                 "DELETE FROM {} WHERE ({where_sql}) AND {}{}",
                 ch_ident(table),
@@ -1099,6 +1189,7 @@ mod store {
         /// only a statement with a WHERE can carry the predicate.
         pub(crate) async fn clear_owned(&mut self, table: &str) -> Result<()> {
             self.s.note("clear");
+            self.keep(false).await?;
             let sql = format!("DELETE FROM {} WHERE {}{}", ch_ident(table), self.pred(), self.delete_mode(table));
             self.exec_owned(&sql).await.map(|_| ())
         }
@@ -1185,6 +1276,7 @@ mod store {
         pub(crate) async fn mark_pending_owned(&mut self, dest_table: &str, source_id: &str, lsn: u64) -> Result<()> {
             self.s.note("mark_pending");
             self.s.ensure_pending_table().await?;
+            self.keep(false).await?;
             let sql = format!(
                 "INSERT INTO {PENDING} (dest_table, source_id, lsn) SELECT '{}', '{}', {lsn} WHERE {}",
                 ch_str(dest_table),
@@ -1235,10 +1327,10 @@ mod store {
                      SETTINGS allow_nullable_key = 1 AS SELECT {sel} FROM {ft}"
                 ))
                 .await?;
-            self.s.owner(&self.keys, &self.token).await?;
+            self.keep(true).await?;
             self.exec_owned(&format!("EXCHANGE TABLES {tq} AND {ft}")).await?;
             self.s.forget_shape(table);
-            if self.s.owner(&self.keys, &self.token).await.is_err() {
+            if self.keep(true).await.is_err() {
                 return Err(Error::Locked(format!(
                     "{}: this drain lost its claim right after rebuilding {table} as a changelog; \
                      the replaced table is kept as {tmp} for the run that collected it",
@@ -1294,20 +1386,23 @@ mod store {
             (Box::new(self.ch_guard()), dest_table.to_string())
         }
 
-        /// No transaction to open: the unit is its keys, checked once here so
-        /// an evicted run stops before its first statement rather than sending
-        /// a window of statements that each write nothing.
+        /// No transaction to open: the unit is its keys and its pinned
+        /// deadline, read once here so an evicted run stops before its first
+        /// statement rather than sending a window of statements that each
+        /// write nothing.
         async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<ChUnit<'a>> {
-            self.owner(keys, token).await?;
-            Ok(ChUnit { s: self, keys: keys.to_vec(), token: token.to_string() })
+            let pin = self.pin(keys, token, None).await?;
+            Ok(ChUnit { s: self, keys: keys.to_vec(), token: token.to_string(), pin })
         }
 
         /// The watermark, written only by an owner: the state INSERT carries
-        /// the predicate and must write exactly one row. A window whose
-        /// statements an eviction emptied therefore never moves the cursor.
-        async fn close_unit<'a>(&'a self, u: ChUnit<'a>, _token: &str, marks: Vec<Watermark>) -> Result<()> {
+        /// the predicate — the pinned deadline included — and must write
+        /// exactly one row. A window whose statements an eviction or a lapse
+        /// emptied therefore never moves the cursor.
+        async fn close_unit<'a>(&'a self, mut u: ChUnit<'a>, _token: &str, marks: Vec<Watermark>) -> Result<()> {
             self.ensure_state_table().await?;
             for m in &marks {
+                u.keep(false).await?;
                 match m {
                     Watermark::Set { table, source_id, lsn, rows } => {
                         // Before the state table's first row for a fresh
@@ -1567,8 +1662,9 @@ fn render_residue_row(
 #[cfg(test)]
 mod tests {
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
-    use super::store::{insert_owned_sql, owner_pred, structure};
+    use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, structure};
     use super::*;
+    use crate::lease::{owned_margin_secs, ttl_secs};
     use crate::logbased::changelog::Changes;
     use crate::wire::pgoutput::Tuple;
     use std::collections::HashMap;
@@ -1599,15 +1695,20 @@ mod tests {
         assert!(structure(&["nope".to_string()], &types).is_err());
     }
 
-    /// A ClickHouse stand-in on a local port: answers the reads a changelog
-    /// window makes, reports one written row for every write.
-    async fn mock_ch() -> String {
+    type Answer = Arc<dyn Fn(&str) -> (String, u64) + Send + Sync>;
+
+    /// A ClickHouse stand-in on a local port. `answer` sees each request's SQL
+    /// — the POST body, or the `query` URL parameter of an INSERT whose body
+    /// is its rows — and returns the response body and the `written_rows` the
+    /// summary header reports.
+    async fn mock_with(answer: Answer) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
                 let Ok((mut s, _)) = l.accept().await else { return };
+                let answer = answer.clone();
                 tokio::spawn(async move {
                     let mut buf: Vec<u8> = Vec::new();
                     let mut tmp = [0u8; 8192];
@@ -1621,7 +1722,8 @@ mod tests {
                                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
                             }
                         };
-                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let head_raw = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let head = head_raw.to_ascii_lowercase();
                         let len: usize = head
                             .lines()
                             .find_map(|l| l.strip_prefix("content-length:"))
@@ -1635,21 +1737,17 @@ mod tests {
                         }
                         let body = String::from_utf8_lossy(&buf[end..end + len]).to_string();
                         buf.drain(..end + len);
-                        let answer = if body.contains("dateDiff('second'") {
-                            // Past any margin: TTL 300 by default, margin 150.
-                            "1000\t0\t1\n"
-                        } else if body.contains("SELECT engine FROM system.tables") {
-                            "MergeTree\n"
-                        } else if body.contains("SELECT name, type FROM system.columns") {
-                            "id\tInt32\nv\tNullable(String)\n_apitap_op\tString\n_apitap_lsn\tUInt64\n\
-                             _apitap_seq\tUInt32\n_apitap_at\tDateTime64(3)\n"
-                        } else {
-                            ""
-                        };
+                        let path = head_raw.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        let url_query = reqwest::Url::parse(&format!("http://x{path}"))
+                            .ok()
+                            .and_then(|u| u.query_pairs().find(|(k, _)| k == "query").map(|(_, v)| v.into_owned()))
+                            .unwrap_or_default();
+                        let sql = if url_query.is_empty() { body } else { url_query };
+                        let (out, written) = answer(&sql);
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
-                             X-ClickHouse-Summary: {{\"written_rows\":\"1\"}}\r\n\r\n{answer}",
-                            answer.len()
+                             X-ClickHouse-Summary: {{\"written_rows\":\"{written}\"}}\r\n\r\n{out}",
+                            out.len()
                         );
                         if s.write_all(resp.as_bytes()).await.is_err() {
                             return;
@@ -1659,6 +1757,28 @@ mod tests {
             }
         });
         format!("clickhouse://default:x@127.0.0.1:{port}/default")
+    }
+
+    const T0: u64 = 1_000_000_000_000_000;
+
+    /// Answers the reads a changelog window makes, reports one written row
+    /// for every write, and a lease with a whole TTL of life.
+    async fn mock_ch() -> String {
+        mock_with(Arc::new(|sql: &str| {
+            let out = if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000)
+            } else if sql.contains("SELECT engine FROM system.tables") {
+                "MergeTree\n".to_string()
+            } else if sql.contains("SELECT name, type FROM system.columns") {
+                "id\tInt32\nv\tNullable(String)\n_apitap_op\tString\n_apitap_lsn\tUInt64\n\
+                 _apitap_seq\tUInt32\n_apitap_at\tDateTime64(3)\n"
+                    .to_string()
+            } else {
+                String::new()
+            };
+            (out, 1)
+        }))
+        .await
     }
 
     /// A changelog window: read (is a previous attempt pending?), mark the
@@ -1690,6 +1810,91 @@ mod tests {
             s.close_unit(u, "_tok", vec![mark]).await.unwrap();
             let _ = Arc::new(Mutex::new(()));
             assert_eq!(*s.ops.lock().unwrap(), ["read", "mark_pending", "insert", "state"]);
+        });
+    }
+
+    /// A re-pin extends the deadline only across no gap: a read that itself
+    /// fails the OLD deadline cannot prove the statements before it passed,
+    /// however much life the renewed row has now.
+    #[test]
+    fn repin_extends_only_a_continuous_deadline() {
+        let m = 150_000_000;
+        let (e0, far) = (T0 + 300_000_000, T0 + 900_000_000);
+        // Open: owned with more than the margin; not owned; too little life.
+        assert_eq!(repin(T0, e0, 1, 1, m, None), Some(e0));
+        assert_eq!(repin(T0, e0, 0, 1, m, None), None);
+        assert_eq!(repin(T0 + 200_000_000, e0, 1, 1, m, None), None);
+        // Inside the old deadline, a renewed row moves it forward.
+        assert_eq!(repin(T0 + 100_000_000, far, 1, 1, m, Some(e0)), Some(far));
+        // Past it, the renewal does not help: something may have been skipped.
+        assert_eq!(repin(T0 + 200_000_000, far, 1, 1, m, Some(e0)), None);
+        // One key of two claimed.
+        assert_eq!(repin(T0, far, 1, 2, m, Some(e0)), None);
+        assert!(pinned_pred(e0, m).contains(&format!("+ {m} < {e0}")));
+    }
+
+    /// The fence closes for good inside a unit. A statement sent while the
+    /// lease has less than the margin left writes nothing — and says nothing,
+    /// an INSERT whose WHERE is false succeeds — and a renewal then restores
+    /// the margin. The watermark INSERT must still write no row: against the
+    /// live margin alone it would, recording a window whose rows never landed.
+    #[test]
+    fn a_fenced_statement_fails_the_close() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        fn num_after(sql: &str, pat: &str) -> Option<u64> {
+            let at = sql.find(pat)? + pat.len();
+            let rest = &sql[at..];
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let now = Arc::new(AtomicU64::new(T0));
+            let live = Arc::new(AtomicU64::new(T0 + ttl_secs() * 1_000_000));
+            let written = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
+            let (n2, l2, w2) = (now.clone(), live.clone(), written.clone());
+            let url = mock_with(Arc::new(move |sql: &str| {
+                let (now, live) = (n2.load(SeqCst), l2.load(SeqCst));
+                if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                    return (format!("{now}\t{live}\t1\n"), 0);
+                }
+                if sql.contains("SELECT name, type FROM system.columns") {
+                    return ("id\tInt32\nv\tNullable(String)\n".into(), 0);
+                }
+                if sql.contains("SELECT engine FROM system.tables") {
+                    return ("MergeTree\n".into(), 0);
+                }
+                if !sql.contains("argMax(collected, seq) = 0") {
+                    return (String::new(), 0);
+                }
+                // The fence as the server evaluates it, at `now`: the live
+                // margin, and the pinned deadline where the statement has one.
+                let live_ok = num_after(sql, "INTERVAL ").map_or(true, |m| live > now + m * 1_000_000);
+                let pinned_ok = match (
+                    num_after(sql, "toUnixTimestamp64Micro(now64(6)) + "),
+                    sql.find("toUnixTimestamp64Micro(now64(6)) + ").and_then(|i| num_after(&sql[i..], " < ")),
+                ) {
+                    (Some(x), Some(e0)) => now + x < e0,
+                    _ => true,
+                };
+                let w = u64::from(live_ok && pinned_ok);
+                w2.lock().unwrap().push((sql.split_whitespace().take(3).collect::<Vec<_>>().join(" "), w));
+                (String::new(), w)
+            }))
+            .await;
+            let s = ChStore::connect(&url).unwrap();
+            let keys = vec![s.lease_key("t")];
+            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+            // Stopped for longer than the margin allows, short of the TTL: no
+            // claim is possible, but this statement is fenced out.
+            now.store(T0 + (ttl_secs() - owned_margin_secs() / 2) * 1_000_000, SeqCst);
+            u.insert_owned("t", &["id".to_string(), "v".to_string()], b"1\ta\n".to_vec()).await.unwrap();
+            // The keeper's tick lands on resume: a whole TTL again.
+            live.store(now.load(SeqCst) + ttl_secs() * 1_000_000, SeqCst);
+            let mark = Watermark::Set { table: "t".into(), source_id: "sid".into(), lsn: 20, rows: 1 };
+            let r = s.close_unit(u, "_tok", vec![mark]).await;
+            let w = written.lock().unwrap().clone();
+            assert_eq!(w.first().map(|x| x.1), Some(0), "the insert was not fenced out: {w:?}");
+            assert!(matches!(r, Err(Error::Locked(_))), "a window whose insert wrote nothing was recorded: {r:?} {w:?}");
         });
     }
 
