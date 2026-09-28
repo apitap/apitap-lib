@@ -142,10 +142,15 @@ impl GuardStore for NoGuard {
 /// Give back every announcement this drain holds: its markers, and only then
 /// — with the proof that every marker is gone — its lease. A lease closed while
 /// its lock stands is the permanent wedge; `Released` makes it unwritable.
-async fn give_back(held: Vec<(Box<dyn GuardStore>, crate::guard::Announced)>) {
-    for (g, a) in held {
+async fn give_back(held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)>, token: &str) {
+    for (g, bare, a) in held {
         match crate::guard::release(&*g, a).await {
-            Ok(proof) => g.lease_close(proof).await,
+            Ok(proof) => {
+                // Its run-scoped scratch (ClickHouse's key table) goes with the
+                // markers, before the lease: nothing else would ever drop it.
+                let _ = g.sweep_run(&bare, token).await;
+                g.lease_close(proof).await
+            }
             Err(a) => a.abandon(),
         }
     }
@@ -373,7 +378,7 @@ impl Dest {
         }
         match self {
             Dest::Pg(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
-            Dest::Ch(d) => d.write_state(dest_table, source_id, lsn, rows).await,
+            Dest::Ch(d) => d.bootstrap_finish(dest_table, source_id, lsn, rows).await,
             Dest::My(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
             Dest::Ice(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
             Dest::Bq(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
@@ -930,13 +935,13 @@ async fn run_group(
     // overlapping groups each pass the member the other had not reached yet.
     // A group that fails either loop gives back what it holds — markers first,
     // then the leases, through the proof `guard::release` hands back.
-    let mut held: Vec<(Box<dyn GuardStore>, crate::guard::Announced)> = Vec::new();
+    let mut held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)> = Vec::new();
     for c in &ctxs {
         let (g, bare) = dest.guard(&c.dest_table);
         match crate::guard::announce(&*g, &bare, &run).await {
-            Ok(a) => held.push((g, a)),
+            Ok(a) => held.push((g, bare, a)),
             Err(e) => {
-                give_back(held).await;
+                give_back(held, run.token()).await;
                 return Err(e);
             }
         }
@@ -944,7 +949,7 @@ async fn run_group(
     for c in &ctxs {
         let (g, bare) = dest.guard(&c.dest_table);
         if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, crate::guard::Mine::Keep).await {
-            give_back(held).await;
+            give_back(held, run.token()).await;
             return Err(e);
         }
     }
@@ -1032,7 +1037,7 @@ async fn run_group(
     // Markers, then leases — and a lease only for a member whose every marker
     // is observed gone (`give_back`). Dropping a lease while its lock survives
     // would wedge the table for ever.
-    give_back(held).await;
+    give_back(held, run.token()).await;
     out
 }
 
@@ -1142,13 +1147,13 @@ async fn run_group_mysql(
     // overlapping groups each pass the member the other had not reached yet.
     // A group that fails either loop gives back what it holds — markers first,
     // then the leases, through the proof `guard::release` hands back.
-    let mut held: Vec<(Box<dyn GuardStore>, crate::guard::Announced)> = Vec::new();
+    let mut held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)> = Vec::new();
     for c in &ctxs {
         let (g, bare) = dest.guard(&c.dest_table);
         match crate::guard::announce(&*g, &bare, &run).await {
-            Ok(a) => held.push((g, a)),
+            Ok(a) => held.push((g, bare, a)),
             Err(e) => {
-                give_back(held).await;
+                give_back(held, run.token()).await;
                 return Err(e);
             }
         }
@@ -1156,7 +1161,7 @@ async fn run_group_mysql(
     for c in &ctxs {
         let (g, bare) = dest.guard(&c.dest_table);
         if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, crate::guard::Mine::Keep).await {
-            give_back(held).await;
+            give_back(held, run.token()).await;
             return Err(e);
         }
     }
@@ -1310,7 +1315,7 @@ async fn run_group_mysql(
     // Markers, then leases — and a lease only for a member whose every marker
     // is observed gone (`give_back`). Dropping a lease while its lock survives
     // would wedge the table for ever.
-    give_back(held).await;
+    give_back(held, run.token()).await;
     out
 }
 

@@ -7,16 +7,27 @@
 //! between insert and state write converges on the re-run, exactly like the
 //! slot re-drain does. Deletes are lightweight `DELETE FROM` joined against
 //! a key table (synchronous on the issuing replica by default).
+//!
+//! And no row lock, so no fence to hold: every statement that writes carries
+//! its own ownership predicate instead (`store::owner_pred` — this run's lease
+//! row exists, is not collected, and has more than half its TTL left), and is
+//! bounded server-side to that same half. An evicted drain lands at most the
+//! one statement already executing; its watermark INSERT then writes no row,
+//! and the drain stops. Every statement that reaches the server is in
+//! `mod store`; the apply bodies write through the `ChUnit` they are handed.
 
 use crate::error::{Error, Result};
+use crate::lease::{Fence, LeaseStore, Watermark};
 use crate::logbased::collapse::ResidueOp;
 use crate::logbased::drain::DrainOutcome;
 use crate::logbased::rowtext::{
     ch_key_literal, pk_indices, render_ch_key, render_ch_row, render_ch_row_cells,
     render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
 };
-use crate::sink::clickhouse::{ch_ident, ch_str, ChConn};
+use crate::sink::clickhouse::{ch_ident, ch_str};
 use crate::wire::pgoutput::Cell;
+
+pub(crate) use store::{ChStore, ChUnit};
 
 const STATE_CURSOR: &str = "_lsn";
 
@@ -25,8 +36,8 @@ const STATE_CURSOR: &str = "_lsn";
 // every captured operation is INSERTed with the meta columns below, nothing is
 // ever updated or deleted, and `<table>__current` derives the current state.
 // ClickHouse is built for exactly this shape — no mutations, no part rewrites.
-/// The changelog append's intent marker — see `ensure_pending_table`. The bare
-/// name lives in `naming` so table discovery excludes it along with
+/// The changelog append's intent marker — see `ChStore::ensure_pending_table`.
+/// The bare name lives in `naming` so table discovery excludes it along with
 /// `_apitap_state`; this is only its quoted spelling.
 const PENDING: &str = "`_apitap_cdc_pending`";
 const _: () = assert!(
@@ -46,145 +57,39 @@ pub(crate) const CL_AT: &str = "_apitap_at";
 pub(crate) const CL_BASELINE: &str = "B";
 
 pub(crate) struct ChDest {
-    ch: ChConn,
-    /// This run's token, set once by `set_run`. ClickHouse cannot FENCE — it has
-    /// no transaction and no row lock — so the apply CHECKS instead, and the
-    /// difference is stated rather than glossed. See `lease_claim`.
+    store: ChStore,
+    /// This run's token, until the Tenure opens units itself: each entry
+    /// below is a shim that opens one unit, writes through it, and closes it.
     run_token: std::sync::Mutex<Option<String>>,
-    /// DDL this connection has already issued. `CREATE TABLE IF NOT EXISTS` is
-    /// idempotent but not free: it is a full HTTP round trip against a window
-    /// that only has ~7 of them, repeated for every window of every table. The
-    /// first window creates; the rest remember. A dropped-out-from-under-us
-    /// table would resurface as a loud error on the next statement, which is
-    /// the same failure the unconditional CREATE would have hidden.
-    ensured: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Once-per-run verdict of `patch_ok` (None = not probed yet).
-    patch: std::sync::Mutex<Option<bool>>,
 }
 
 impl ChDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self {
-            ch: ChConn::parse(url)?,
-            run_token: std::sync::Mutex::new(None),
-            ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
-            patch: std::sync::Mutex::new(None),
-        })
-    }
-
-    /// True the FIRST time this connection is asked about `key`.
-    fn first_time(&self, key: &str) -> bool {
-        self.ensured.lock().unwrap().insert(key.to_string())
-    }
-
-    /// Patch-part deletes (`lightweight_delete_mode='lightweight_update'`)
-    /// turn the per-window DELETE from a part REWRITE into a patch-part
-    /// write. Probed once per run: server >= 25.7 required (the setting does
-    /// not exist below), and correctness of OUR predicate shape — including
-    /// parts born before the ALTER — was verified against 25.8.29 (see the
-    /// r3 ledger; the #87265 shape returns exact counts and MutatePart=0).
-    /// 24.8 LTS destinations keep today's rewrite path untouched.
-    /// `APITAP_PATCH_DELETE=0` is the kill switch (and the A/B lever).
-    async fn patch_ok(&self) -> bool {
-        if std::env::var("APITAP_PATCH_DELETE").as_deref() == Ok("0") {
-            return false;
-        }
-        {
-            let g = self.patch.lock().unwrap();
-            if let Some(v) = *g {
-                return v;
-            }
-        }
-        let ok = match self.ch.exec("SELECT version()").await {
-            Ok(body) => {
-                let mut it = body.trim().split('.');
-                let maj: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                let min: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                maj > 25 || (maj == 25 && min >= 7)
-            }
-            Err(_) => false,
-        };
-        *self.patch.lock().unwrap() = Some(ok);
-        ok
+        Ok(Self { store: ChStore::connect(url)?, run_token: Default::default() })
     }
 
     /// Default the created table's ORDER BY to the PK so the per-window
     /// key-join delete probes the sorting key instead of scanning.
-    pub(crate) fn tweak_bootstrap_opts(
-        &self,
-        o2: &mut crate::TransferOptions,
-        pk_cols: &[String],
-    ) {
+    pub(crate) fn tweak_bootstrap_opts(&self, o2: &mut crate::TransferOptions, pk_cols: &[String]) {
         if o2.order_by.is_none() {
             o2.order_by = Some(pk_cols.join(", "));
         }
-    }
-
-    async fn ensure_state_table(&self) -> Result<()> {
-        if !self.first_time("\u{1}state") {
-            return Ok(());
-        }
-        self.ch
-            .exec(
-                "CREATE TABLE IF NOT EXISTS `_apitap_state` (\
-                   dest_table String, source_id String, cursor_col String, \
-                   watermark String, mode String, last_rows UInt64, \
-                   synced_at DateTime64(6, 'UTC') DEFAULT now64(6)) \
-                 ENGINE = ReplacingMergeTree(synced_at) ORDER BY (dest_table, source_id)",
-            )
-            .await?;
-        Ok(())
     }
 
     pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
         *self.run_token.lock().expect("run token") = Some(run.token().to_string());
     }
 
-    /// The check, at the two points where it is worth paying for.
-    ///
-    /// Not a fence: between this returning Ok and the next statement landing,
-    /// a collector could still take the lease. What it bounds is HOW MUCH an
-    /// evicted drain can write — one window, whose rows carry that window's
-    /// start LSN and are therefore an exact duplicate a replay already collapses.
-    async fn check_still_mine(&self, dest_table: &str) -> Result<()> {
-        let Some(token) = self.run_token.lock().expect("run token").clone() else {
-            return Ok(());
-        };
-        self.lease_still_mine(dest_table, &token).await
-    }
-
     pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        format!("{}.{dest_table}", self.ch.database())
+        self.store.lease_key(dest_table)
     }
 
-    /// All of these delegate to the bulk sink's free functions, for the reason
-    /// `announce`/`check_peers`/`release` do: a drain and a bulk run can only
-    /// see each other's liveness if both read and write the same rows.
-    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        for k in keys {
-            crate::sink::clickhouse::lease_write(
-                &self.ch, k, run.token(), crate::lease::ttl_secs() as i64, 0).await?;
-        }
-        Ok(())
+    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
+        self.store.lease_open(keys, run.token()).await
     }
 
-    /// Predicated: never over a collected or missing row (see
-    /// `sink::clickhouse::lease_renew`).
-    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId)
-        -> Result<u64>
-    {
-        crate::sink::clickhouse::lease_renew(&self.ch, keys, run.token()).await
-    }
-
-    /// Does this run still hold its claim? A check, not a fence — see
-    /// `sink::clickhouse::lease_claim`. Owner = the row exists and is not
-    /// collected (`lease::owner_verdict`); a lapse nobody claimed is still ours.
-    pub(crate) async fn lease_still_mine(&self, dest_table: &str, token: &str) -> Result<()> {
-        let key = self.lease_key(dest_table);
-        let row = crate::sink::clickhouse::lease_get(&self.ch, &key, token).await?;
-        crate::lease::owner_verdict(row.as_ref(), &[key])
+    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
+        self.store.lease_renew(keys, run.token()).await
     }
 
     /// This destination as the guard sees it — the same `ChGuard` the bulk
@@ -192,178 +97,60 @@ impl ChDest {
     /// destination outright. The table is addressed by `dest_table` as given
     /// (the lease key is too), because this lane cannot address a dotted name.
     pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::clickhouse::ChGuard, String) {
-        (crate::sink::clickhouse::ChGuard::new(self.ch.clone(), None), dest_table.to_string())
+        (self.store.ch_guard(), dest_table.to_string())
     }
 
-    /// The changelog append's intent marker: "a window starting at `lsn` is
-    /// being appended to `dest_table`".
-    ///
-    /// Its own table rather than a row in `_apitap_state`, because that one is
-    /// `ReplacingMergeTree ORDER BY (dest_table, source_id)` — a second row for
-    /// the same pair does not sit beside the watermark, it REPLACES it.
-    async fn ensure_pending_table(&self) -> Result<()> {
-        if !self.first_time("\u{1}pending") {
-            return Ok(());
-        }
-        self.ch
-            .exec(&format!(
-                "CREATE TABLE IF NOT EXISTS {PENDING} (\
-                   dest_table String, source_id String, lsn UInt64, \
-                   at DateTime64(6, 'UTC') DEFAULT now64(6)) \
-                 ENGINE = ReplacingMergeTree(at) ORDER BY (dest_table, source_id)"
-            ))
-            .await?;
-        Ok(())
+    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        self.store.read_state(dest_table, source_id).await
     }
 
-    /// The window start the last append ATTEMPT was made at, if any.
-    async fn pending_window(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
-        self.ensure_pending_table().await?;
-        let body = self
-            .ch
-            .exec(&format!(
-                "SELECT toString(argMax(lsn, at)) FROM {PENDING} \
-                 WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
-                ch_str(dest_table),
-                ch_str(source_id),
-            ))
-            .await?;
-        Ok(body.trim().parse::<u64>().ok())
-    }
-
-    async fn mark_pending(&self, dest_table: &str, source_id: &str, lsn: u64) -> Result<()> {
-        self.ensure_pending_table().await?;
-        self.ch
-            .exec(&format!(
-                "INSERT INTO {PENDING} (dest_table, source_id, lsn) VALUES ('{}', '{}', {lsn})",
-                ch_str(dest_table),
-                ch_str(source_id),
-            ))
-            .await?;
-        Ok(())
-    }
-
-    /// How much of a window stamped `lsn` is already in the table, and whether
-    /// what is there is an unbroken prefix `seq = 0..n-1`.
-    ///
-    /// It matters because a torn INSERT is what we are recovering from: rows go
-    /// out in `seq` order and ClickHouse commits the blocks it received, so the
-    /// survivor is normally a prefix — but `count = max(seq) + 1` is the only
-    /// thing that PROVES it, and without the proof resuming at `count` would
-    /// silently drop the events in the hole.
-    async fn appended_prefix(&self, dest_table: &str, lsn: u64) -> Result<Option<usize>> {
-        let body = self
-            .ch
-            .exec(&format!(
-                // Baseline rows are excluded, and they have to be: the bootstrap
-                // stamps them with its consistent point, and the FIRST window
-                // after a bootstrap starts at exactly that point. Counted in,
-                // they made `count == max(seq) + 1` false on every first replay
-                // and the prefix looked torn when it was intact (measured).
-                "SELECT count(), ifNull(max({CL_SEQ}), 0) FROM {} \
-                 WHERE {CL_LSN} = {lsn} AND {CL_OP} != '{b}' \
-                 FORMAT TabSeparated",
-                ch_ident(dest_table),
-                b = ch_str(CL_BASELINE),
-            ))
-            .await?;
-        let mut f = body.trim().split('\t');
-        let n: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
-        let max_seq: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
-        if n == 0 {
-            return Ok(Some(0));
-        }
-        Ok(if n == max_seq + 1 { Some(n) } else { None })
-    }
-
-    /// Refuse a clustered (Replicated*) destination table, loudly, before the
-    /// CDC apply touches it.
-    ///
-    /// Every object this file creates for itself — the `_apitap_state`
-    /// watermark, the per-window `__apitap_cdc_del` key table, the changelog
-    /// rebuild and its `__current` view — is node-local DDL, no ON CLUSTER.
-    /// The bootstrap rides the bulk sink, which DOES thread on_cluster, so on
-    /// a cluster the destination table would exist on every node while
-    /// apitap's sidecars existed only on whichever node the balancer happened
-    /// to route. A later drain lands where they are missing — or reads a
-    /// stale node-local watermark and silently skips a window, the one
-    /// failure the state table exists to prevent. Until this file can emit
-    /// cluster-wide DDL (and survive a balancer BETWEEN statements — the
-    /// apply order assumes every step sees the previous step's writes), a
-    /// clustered destination is refused rather than silently diverged.
-    ///
-    /// The verdict comes from the destination itself, not from the run's
-    /// options: the bulk sink only accepts on_cluster with a Replicated*
-    /// engine, and a pre-created Replicated table diverges exactly the same
-    /// way with no options passed at all — so the table's ENGINE is the fact
-    /// to ask for. Memoized per table, but only once the table has actually
-    /// been SEEN: a table that does not exist yet passes (there is nothing to
-    /// diverge from), and is asked again by the first state write after the
-    /// bootstrap has created it.
-    async fn refuse_clustered(&self, dest_table: &str) -> Result<()> {
-        let key = format!("\u{1}cluster\u{1}{dest_table}");
-        if self.ensured.lock().unwrap().contains(&key) {
-            return Ok(());
-        }
-        let eng = self
-            .ch
-            .exec(&format!(
-                "SELECT engine FROM system.tables WHERE database = currentDatabase() \
-                 AND name = '{t}'",
-                t = ch_str(dest_table),
-            ))
-            .await?;
-        ch_engine_ok(dest_table, eng.trim())?;
-        if !eng.trim().is_empty() {
-            self.ensured.lock().unwrap().insert(key);
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn read_state(
+    pub(crate) async fn validate_changelog_ddl(
         &self,
         dest_table: &str,
-        source_id: &str,
-    ) -> Result<Option<u64>> {
-        // Run admission: read_state is the FIRST thing a run asks this
-        // destination, for every table — the moment to notice a clustered
-        // target and refuse before a bootstrap or a drain moves any data.
-        self.refuse_clustered(dest_table).await?;
-        let sql = format!(
-            "SELECT watermark, cursor_col, mode FROM `_apitap_state` FINAL \
-             WHERE dest_table = '{}' AND source_id = '{}' \
-             FORMAT TabSeparated",
-            ch_str(dest_table),
-            ch_str(source_id)
-        );
-        let body = match self.ch.exec(&sql).await {
-            Ok(b) => b,
-            // No state table at all = fresh destination.
-            Err(Error::Transfer(m))
-                if m.contains("UNKNOWN_TABLE") || m.contains("doesn't exist") =>
-            {
-                return Ok(None)
-            }
-            Err(e) => return Err(e),
-        };
-        let Some(line) = body.lines().next() else { return Ok(None) };
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 3 {
-            return Err(Error::Transfer(format!(
-                "log_based: malformed state row from ClickHouse: {line:?}"
-            )));
-        }
-        if f[2] != "log_based" || f[1] != STATE_CURSOR {
-            return Err(Error::InvalidInput(format!(
-                "log_based: state row for this table tracks cursor '{}' in mode \
-                 '{}', not an LSN — it was written by another mode. Use a \
-                 different dest_table or delete the state row",
-                f[1], f[2]
-            )));
-        }
-        f[0].parse::<u64>()
-            .map(Some)
-            .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{}'", f[0])))
+        partition_by: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<()> {
+        self.store.validate_changelog_ddl(dest_table, partition_by, order_by).await
+    }
+
+    pub(crate) async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
+        self.store.precheck_mode(dest_table, changelog).await
+    }
+
+    async fn unit(&self, dest_table: &str) -> Result<(ChUnit<'_>, String)> {
+        let token = self
+            .run_token
+            .lock()
+            .expect("run token")
+            .clone()
+            .ok_or_else(|| Error::Transfer("internal: a CDC write outside a run".into()))?;
+        let u = self.store.open_unit(&[self.store.lease_key(dest_table)], &token).await?;
+        Ok((u, token))
+    }
+
+    /// Remove this table's watermark row (a failed group bootstrap must leave
+    /// nothing behind, or the next run refuses the group as torn).
+    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
+        let (u, token) = self.unit(dest_table).await?;
+        let mark = Watermark::Clear { table: dest_table.into(), source_id: source_id.into() };
+        self.store.close_unit(u, &token, vec![mark]).await
+    }
+
+    /// The source-identity marker: an ordinary state row under a reserved
+    /// `source_id`, so nothing about the state table has to change.
+    pub(crate) async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
+        let (u, token) = self.unit(dest_table).await?;
+        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn: value, rows: 0 };
+        self.store.close_unit(u, &token, vec![mark]).await
+    }
+
+    /// After a replica bootstrap: the state row, and the scratch names older
+    /// releases left untokenized.
+    pub(crate) async fn bootstrap_finish(&self, dest_table: &str, source_id: &str, lsn: u64, rows: u64) -> Result<()> {
+        let (mut u, token) = self.unit(dest_table).await?;
+        u.drop_legacy_scratch(dest_table).await?;
+        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
+        self.store.close_unit(u, &token, vec![mark]).await
     }
 
     /// changelog=true, once, right after the bootstrap's bulk load: rebuild the
@@ -379,6 +166,7 @@ impl ChDest {
     /// Data columns become Nullable on the way: a `D` record carries only the
     /// key and a `T` carries no row at all, so partial rows are inherent to a
     /// changelog.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn changelog_bootstrap_finish(
         &self,
         dest_table: &str,
@@ -389,19 +177,20 @@ impl ChDest {
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
-        // The rebuild below DROPs and RENAMEs the destination table itself —
-        // on a cluster that would tear it down on ONE node. Refused first.
-        self.refuse_clustered(dest_table).await?;
-        let ft = ch_ident(dest_table);
+        let (mut u, token) = self.unit(dest_table).await?;
+        // The rebuild below EXCHANGEs the destination table itself — on a
+        // cluster that would swap it on ONE node. Refused first.
+        u.refuse_clustered(dest_table).await?;
+        u.drop_legacy_scratch(dest_table).await?;
+        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
         // Already a changelog (a re-bootstrap of a table we own)? Leave it.
         //
         // "Already" means ALL FOUR meta columns, never just `_apitap_op`: a
         // source table that legitimately owns a column by that name would
         // otherwise skip the rebuild here and then fail on every window
         // forever, with the slot pinning WAL the whole time.
-        let has = self
-            .ch
-            .exec(&format!(
+        let has = u
+            .read(&format!(
                 "SELECT count() FROM system.columns WHERE database = currentDatabase() \
                  AND table = '{t}' AND name IN ('{a}', '{b}', '{c}', '{d}')",
                 t = ch_str(dest_table),
@@ -413,7 +202,7 @@ impl ChDest {
             .await?;
         match has.trim() {
             "0" => {}
-            "4" => return self.write_state(dest_table, source_id, lsn, rows).await,
+            "4" => return self.store.close_unit(u, &token, vec![mark]).await,
             n => {
                 return Err(Error::InvalidInput(format!(
                     "log_based changelog: ClickHouse target {dest_table} already has {n} of \
@@ -425,31 +214,13 @@ impl ChDest {
         }
 
         // Existing columns, in order, so the rebuild can widen them to Nullable.
-        let desc = self
-            .ch
-            .exec(&format!(
-                // TabSeparatedRaw, not TabSeparated: TSV escapes single quotes,
-                // so a `DateTime64(6, 'UTC')` column comes back as
-                // `DateTime64(6, \'UTC\')` and lands verbatim inside the CAST
-                // below — a syntax error on every table with a tz-aware column.
-                "SELECT name, type FROM system.columns WHERE database = currentDatabase() \
-                 AND table = '{t}' ORDER BY position FORMAT TabSeparatedRaw",
-                t = ch_str(dest_table),
-            ))
-            .await?;
-        let mut cols: Vec<(String, String)> = Vec::new();
-        for line in desc.lines().filter(|l| !l.is_empty()) {
-            let mut it = line.splitn(2, '\t');
-            let (Some(n), Some(ty)) = (it.next(), it.next()) else { continue };
-            cols.push((n.to_string(), ty.to_string()));
-        }
+        let cols = u.columns(dest_table).await?;
         if cols.is_empty() {
             return Err(Error::Transfer(format!(
                 "log_based changelog: ClickHouse table {dest_table} has no columns — \
                  the bootstrap must run first"
             )));
         }
-
         let part = ch_partition_expr(partition_by);
         let order = order_by.map(str::to_string).unwrap_or_else(|| {
             let mut k: Vec<String> = pk_cols.iter().map(|c| ch_ident(c)).collect();
@@ -468,266 +239,17 @@ impl ChDest {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let tmp = ch_ident(&crate::naming::artifact_ident(
-            dest_table, crate::naming::Artifact::ChangelogTmp, crate::naming::ROOMY));
-        self.ch.exec(&format!("DROP TABLE IF EXISTS {tmp}")).await?;
-        self.ch
-            .exec(&format!(
-                // allow_nullable_key: a changelog's rows are partial by nature —
-                // a TRUNCATE record carries no row at all, so even the key
-                // columns are Nullable. Without this ClickHouse refuses the
-                // sorting key outright (ILLEGAL_COLUMN 44).
-                "CREATE TABLE {tmp} ENGINE = MergeTree PARTITION BY {part} ORDER BY ({order}) \
-                 SETTINGS allow_nullable_key = 1 AS \
-                 SELECT {sel}, \
-                 CAST('{op}' AS String) AS {CL_OP}, \
-                 CAST({lsn} AS UInt64) AS {CL_LSN}, \
-                 CAST(0 AS UInt32) AS {CL_SEQ}, \
-                 now64(3) AS {CL_AT} \
-                 FROM {ft}",
-                op = ch_str(CL_BASELINE),
-            ))
-            .await?;
-        self.ch.exec(&format!("DROP TABLE {ft}")).await?;
-        self.ch
-            .exec(&format!("RENAME TABLE {tmp} TO {}", ch_ident(dest_table)))
-            .await?;
-        self.ensure_current_view(dest_table, pk_cols).await?;
-        self.write_state(dest_table, source_id, lsn, rows).await
+        let sel = format!(
+            "{sel}, CAST('{op}' AS String) AS {CL_OP}, CAST({lsn} AS UInt64) AS {CL_LSN}, \
+             CAST(0 AS UInt32) AS {CL_SEQ}, now64(3) AS {CL_AT}",
+            op = ch_str(CL_BASELINE),
+        );
+        u.changelog_rebuild(dest_table, &sel, &part, &order).await?;
+        u.current_view(dest_table, pk_cols).await?;
+        self.store.close_unit(u, &token, vec![mark]).await
     }
 
-    /// Ask ClickHouse itself whether these clauses resolve against the table's
-    /// real columns. `SELECT <expr> FROM t LIMIT 0` reads no data and returns
-    /// the same `UNKNOWN_IDENTIFIER` the CREATE would, so a typo or a column
-    /// only some members of a group own is caught before anything is written.
-    pub(crate) async fn validate_changelog_ddl(
-        &self,
-        dest_table: &str,
-        partition_by: Option<&str>,
-        order_by: Option<&str>,
-    ) -> Result<()> {
-        let ft = ch_ident(dest_table);
-        // partition_by is checked in its EXPANDED form — a bare column name is a
-        // month, not a raw key — so validation and DDL can never disagree.
-        let pb = partition_by.map(|_| ch_partition_expr(partition_by));
-        for (what, expr) in [("partition_by", pb.as_deref()), ("order_by", order_by)] {
-            let Some(expr) = expr else { continue };
-            // The meta columns exist only after the rebuild, so a clause that
-            // uses them is checked against them explicitly.
-            let probe = format!(
-                "SELECT {expr} FROM (SELECT *, CAST('B' AS String) AS {CL_OP}, \
-                 CAST(0 AS UInt64) AS {CL_LSN}, CAST(0 AS UInt32) AS {CL_SEQ}, \
-                 now64(3) AS {CL_AT} FROM {ft} LIMIT 0) LIMIT 0 FORMAT TabSeparatedRaw"
-            );
-            if let Err(e) = self.ch.exec(&probe).await {
-                return Err(Error::InvalidInput(format!(
-                    "log_based changelog: {what}={expr:?} does not resolve against \
-                     {dest_table}. In a multi-table run every table gets this same \
-                     clause unless you pass a dict — give {what} per table, e.g. \
-                     {what}={{\"orders\": \"…\", \"events\": \"…\"}}. ClickHouse said: {e}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Remove this table's watermark row (a failed group bootstrap must leave
-    /// nothing behind, or the next run refuses the group as torn).
-    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        self.ch
-            .exec(&format!(
-                "ALTER TABLE `_apitap_state` DELETE WHERE dest_table = '{t}' \
-                 AND source_id = '{s}' SETTINGS mutations_sync = 1",
-                t = ch_str(dest_table),
-                s = ch_str(source_id),
-            ))
-            .await
-            .map(|_| ())
-    }
-
-    /// `<table>__current`: the current state derived from the log.
-    ///
-    /// Three things it has to get right, in this order:
-    /// 1. **TRUNCATE.** A `T` record means everything logged before it is gone,
-    ///    so the view first drops every row at or below the newest `T`.
-    /// 2. **Latest version per key.** Ordering is the PAIR `(lsn, seq)`, never
-    ///    `lsn` alone: one window stamps its end-LSN on every row it lands, so
-    ///    `seq` is what orders events inside a window.
-    /// 3. **Deletes.** A key whose newest record is `D` is gone — filtered AFTER
-    ///    the pick, not before, or the delete would be skipped and the previous
-    ///    version would resurrect.
-    ///
-    /// Baseline (`B`) rows carry the slot's consistent-point LSN, so any later
-    /// change outranks them.
-    async fn ensure_current_view(&self, dest_table: &str, pk_cols: &[String]) -> Result<()> {
-        let keys = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
-        let view = ch_ident(&format!("{dest_table}__current"));
-        let t = ch_ident(dest_table);
-        self.ch
-            .exec(&format!(
-                "CREATE OR REPLACE VIEW {view} AS SELECT * FROM ( \
-                   SELECT * FROM {t} \
-                   WHERE ({CL_LSN}, {CL_SEQ}) > ( \
-                     SELECT ifNull(max(({CL_LSN}, {CL_SEQ})), (toUInt64(0), toUInt32(0))) \
-                     FROM {t} WHERE {CL_OP} = '{tr}' \
-                   ) \
-                   ORDER BY {CL_LSN} DESC, {CL_SEQ} DESC, {CL_OP} = '{base}' ASC \
-                   LIMIT 1 BY {keys} \
-                 ) WHERE {CL_OP} != '{del}'",
-                tr = ch_str("T"),
-                del = ch_str("D"),
-                // The tie-break, and it became load-bearing in 0.56.0: a window
-                // is stamped with the watermark it was drained FROM, and the
-                // FIRST window after a bootstrap starts exactly where the
-                // baseline snapshot was taken. So a baseline row and that
-                // window's first event for the same key can carry the identical
-                // (lsn, seq) — every baseline row is written with seq 0 — and
-                // without this the winner of that tie is arbitrary. A real
-                // change always outranks the snapshot it changed.
-                base = ch_str(CL_BASELINE),
-            ))
-            .await?;
-        Ok(())
-    }
-
-    /// The destination's SHAPE must match the mode, checked ONCE at run start
-    /// on a table that already has state (a fresh bootstrap builds the right
-    /// shape by construction).
-    ///
-    /// Both directions are damage: a replica window landing on a changelog
-    /// deletes the window's keys and inserts current images ON TOP of the
-    /// history, destroying the log it found; a changelog window landing on a
-    /// replica has nowhere to put its meta columns. Neither can be caught in
-    /// the apply path — an empty drain never calls apply at all, and by the
-    /// time a non-empty one does, the run has already committed to the mode.
-    pub(crate) async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
-        let has = self
-            .ch
-            .exec(&format!(
-                "SELECT count() FROM system.columns WHERE database = currentDatabase() \
-                 AND table = '{t}' AND name = '{c}'",
-                t = ch_str(dest_table),
-                c = ch_str(CL_OP),
-            ))
-            .await?;
-        is_shape_ok(has.trim() != "0", changelog, "ClickHouse", dest_table)
-    }
-
-    /// The source-identity marker: an ordinary state row under a reserved
-    /// `source_id`, so nothing about the state table has to change.
-    pub(crate) async fn write_marker(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-        value: u64,
-    ) -> Result<()> {
-        self.write_state(dest_table, source_id, value, 0).await
-    }
-
-    pub(crate) async fn write_state(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-        lsn: u64,
-        rows: u64,
-    ) -> Result<()> {
-        // Before the state table's node-local CREATE — this is the first
-        // destination write on a fresh bootstrap (the table did not exist at
-        // run admission, so the engine gets asked here, post-creation).
-        self.refuse_clustered(dest_table).await?;
-        self.ensure_state_table().await?;
-        self.ch
-            .exec(&format!(
-                "INSERT INTO `_apitap_state` \
-                 (dest_table, source_id, cursor_col, watermark, mode, last_rows) \
-                 VALUES ('{}', '{}', '{STATE_CURSOR}', '{lsn}', 'log_based', {rows})",
-                ch_str(dest_table),
-                ch_str(source_id),
-            ))
-            .await?;
-        Ok(())
-    }
-
-    /// Apply one collapsed window. State is written LAST — a re-run of the
-    /// same window is idempotent (see module docs).
-    /// changelog=true apply: ONE plain INSERT of every captured operation.
-    ///
-    /// No delete-set, no key table, no DELETE, no TRUNCATE — ClickHouse never
-    /// writes a mutation, so the destination never rewrites parts.
-    ///
-    /// **Replay.** The INSERT and the watermark are two round-trips and
-    /// ClickHouse has no transaction to hold them together, so a window CAN be
-    /// re-drained after its rows landed: the process dies in between, or a
-    /// sibling table in the same group fails its apply and the next run restarts
-    /// from the group minimum. Two things make that safe, and until 0.56.0
-    /// neither did.
-    ///
-    /// 1. The stamp is `outcome.start_lsn` — the watermark the window was
-    ///    drained FROM, the one position that is identical on a replay. It used
-    ///    to be `end_lsn`, which a re-drain recomputes from whatever has arrived
-    ///    since, so the same event came back under a different `_apitap_lsn`
-    ///    every time. The doc here claimed the opposite ("the SAME (lsn, seq)")
-    ///    and that claim was simply false; `(lsn, seq)` is a real event identity
-    ///    now, and a consumer can de-duplicate on it.
-    /// 2. `_apitap_cdc_pending` records the window we are ABOUT to append. If
-    ///    the next attempt opens on the same start, the rows already in the
-    ///    table at that stamp are counted and skipped — so the ordinary replay
-    ///    appends nothing twice at all, rather than appending a duplicate that
-    ///    is merely identifiable.
-    /// One readback per window: the current value of every masked column, for
-    /// every key that needs one, from `<table>__current`. The view filters the
-    /// base table by key first, so this probes the sorting key rather than
-    /// scanning the log.
-    async fn read_current(
-        &self,
-        dest_table: &str,
-        pk_cols: &[String],
-        pk_oids: &[u32],
-        keys: &[crate::logbased::changelog::CKey],
-        cols: &[usize],
-        wal_cols: &[String],
-    ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>>
-    {
-        let view = ch_ident(&format!("{dest_table}__current"));
-        let sel = pk_cols
-            .iter()
-            .map(|c| ch_ident(c))
-            .chain(cols.iter().map(|&i| ch_ident(&wal_cols[i])))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut preds = Vec::with_capacity(keys.len());
-        for k in keys {
-            preds.push(format!("({})", key_pred(pk_cols, k, pk_oids)?));
-        }
-        let body = self
-            .ch
-            .exec(&format!(
-                "SELECT {sel} FROM {view} WHERE {} FORMAT TabSeparated",
-                preds.join(" OR ")
-            ))
-            .await?;
-        let np = pk_cols.len();
-        let mut out = std::collections::HashMap::with_capacity(keys.len());
-        for line in body.lines().filter(|l| !l.is_empty()) {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != np + cols.len() {
-                return Err(Error::Transfer(
-                    "log_based changelog: masked readback column count mismatch".into(),
-                ));
-            }
-            let key: crate::logbased::changelog::CKey = f[..np]
-                .iter()
-                .map(|x| tsv_unescape(x).unwrap_or_default())
-                .collect();
-            let vals = f[np..]
-                .iter()
-                .map(|x| tsv_unescape(x).map(bytes::Bytes::from))
-                .collect();
-            out.insert(key, vals);
-        }
-        Ok(out)
-    }
-
+    /// changelog=true apply — see `apply_changelog_unit`.
     pub(crate) async fn apply_changelog(
         &self,
         dest_table: &str,
@@ -736,150 +258,15 @@ impl ChDest {
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
-        // Memoized no-op in steady state; here so no window ever writes to a
-        // table that turned Replicated under us mid-run.
-        self.refuse_clustered(dest_table).await?;
-        let Some(c) = outcome.changes.get(qualified_src) else {
-            self.write_state(dest_table, source_id, outcome.end_lsn, 0).await?;
-            return Ok(0);
-        };
-        let wal_cols = outcome
-            .wal_cols
-            .get(qualified_src)
-            .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
-        let oids = outcome
-            .wal_oids
-            .get(qualified_src)
-            .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
-        for name in wal_cols {
-            if matches!(name.as_str(), CL_OP | CL_LSN | CL_SEQ | CL_AT) {
-                return Err(Error::InvalidInput(format!(
-                    "log_based changelog: source column '{name}' collides with a reserved \
-                     changelog column — rename it at the source or alias it in a view"
-                )));
-            }
-        }
-        if c.events.is_empty() {
-            self.write_state(dest_table, source_id, outcome.end_lsn, 0).await?;
-            return Ok(0);
-        }
-
-        // Unchanged-TOAST cells must be rebuilt before anything is written —
-        // writing them as NULL would silently blank the column for every reader
-        // of `__current`. Costs one extra query per window, and only when the
-        // window actually carries a masked cell.
-        let patched = if c.masked {
-            let pk_idx = pk_indices(pk_cols, wal_cols)?;
-            let (keys, cols) = c.mask_plan(&pk_idx);
-            let base = if keys.is_empty() || cols.is_empty() {
-                std::collections::HashMap::new()
-            } else {
-                let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
-                self.read_current(dest_table, pk_cols, &pk_oids, &keys, &cols, wal_cols).await?
-            };
-            c.resolve_masked(&pk_idx, &cols, &base, wal_cols)?
-        } else {
-            std::collections::HashMap::new()
-        };
-
-        let ft = ch_ident(dest_table);
-        let collist = wal_cols
-            .iter()
-            .map(|k| ch_ident(k))
-            .chain([CL_OP.to_string(), CL_LSN.to_string(), CL_SEQ.to_string(), CL_AT.to_string()])
-            .collect::<Vec<_>>()
-            .join(", ");
-        // The window's START, not its end: see the replay note on this method.
-        let lsn = outcome.start_lsn;
-        // Did a previous attempt at THIS window already append? Only asked when
-        // the marker names the same start — on the ordinary path it names the
-        // previous window's, and the count below (which scans `_apitap_lsn`, a
-        // sorting-key SUFFIX, so it prunes nothing) is never run.
-        let mut skip = 0usize;
-        if !c.events.is_empty() && self.pending_window(dest_table, source_id).await? == Some(lsn) {
-            match self.appended_prefix(dest_table, lsn).await? {
-                Some(n) => skip = n.min(c.events.len()),
-                // Not a prefix: the surviving rows have a hole in them, so there
-                // is no safe place to resume. Re-append the whole window — the
-                // stamps are stable, so the overlap is an exact `(lsn, seq)`
-                // duplicate that `__current` and any consumer can collapse,
-                // which is the bad-but-honest outcome rather than a silent gap.
-                None => {
-                    eprintln!(
-                        "apitap: {dest_table}: a previous append of the window at lsn {lsn} \
-                         left an incomplete run of rows, so it cannot be resumed part-way. \
-                         Re-appending the whole window; rows carrying a repeated \
-                         ({CL_LSN}, {CL_SEQ}) are duplicates of each other and may be \
-                         de-duplicated on that pair."
-                    );
-                }
-            }
-        }
-        if skip >= c.events.len() {
-            // Everything already landed; only the watermark was missing.
-            self.write_state(dest_table, source_id, outcome.end_lsn, c.count).await?;
-            return Ok(c.count);
-        }
-        if !c.events.is_empty() {
-            self.mark_pending(dest_table, source_id, lsn).await?;
-        }
-        // ONE stamp for the window. It is the PARTITION/retention key, never an
-        // ordering key — `(lsn, seq)` orders. Sent explicitly rather than left
-        // to a default: the rebuild materialised `_apitap_at` as a plain column,
-        // so a NULL would land as the epoch and pile the whole log into a 1970
-        // partition.
-        let at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-        let mut buf = Vec::with_capacity(4 << 20);
-        for (seq, ev) in c.events.iter().enumerate().skip(skip) {
-            match patched.get(&seq).or(ev.row.as_ref()) {
-                Some(row) => {
-                    // A delete's old image carries the key and NULLs elsewhere —
-                    // that IS the delete record, so it renders like any row.
-                    render_ch_row_trim(row, oids, wal_cols.len(), &mut buf)?;
-                }
-                // TRUNCATE has no row: every data column is \N.
-                None => {
-                    for i in 0..wal_cols.len() {
-                        if i > 0 {
-                            buf.push(b'\t');
-                        }
-                        buf.extend_from_slice(b"\\N");
-                    }
-                }
-            }
-            buf.push(b'\t');
-            buf.extend_from_slice(ev.op.code().as_bytes());
-            buf.push(b'\t');
-            buf.extend_from_slice(lsn.to_string().as_bytes());
-            buf.push(b'\t');
-            buf.extend_from_slice(seq.to_string().as_bytes());
-            buf.push(b'\t');
-            buf.extend_from_slice(at.as_bytes());
-            buf.push(b'\n');
-        }
-        // Before the data: cheap, and it catches the common case where this
-        // drain was collected while it was idle or between windows.
-        self.check_still_mine(dest_table).await?;
-        let t_write = std::time::Instant::now();
-        self.ch
-            .insert_stream(
-                &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
-                reqwest::Body::from(buf),
-            )
-            .await?;
-        // And again before the WATERMARK, but only when the write itself took
-        // longer than a renewal interval — i.e. only on the windows where the
-        // lease could plausibly have lapsed while this ran. A fast window pays
-        // one extra round trip per window; a slow one pays two, and a slow one
-        // is the dangerous one. Moving the cursor is the act that would make an
-        // evicted drain's damage permanent, so it is the act worth checking.
-        if t_write.elapsed().as_secs() >= crate::lease::renew_secs() {
-            self.check_still_mine(dest_table).await?;
-        }
-        self.write_state(dest_table, source_id, outcome.end_lsn, c.count).await?;
-        Ok(c.count)
+        let (mut u, token) = self.unit(dest_table).await?;
+        let (n, mark) =
+            apply_changelog_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id).await?;
+        self.store.close_unit(u, &token, vec![mark]).await?;
+        Ok(n)
     }
 
+    /// Apply one collapsed window. State is written LAST — a re-run of the
+    /// same window is idempotent (see module docs).
     pub(crate) async fn apply(
         &self,
         dest_table: &str,
@@ -888,271 +275,1090 @@ impl ChDest {
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
-        // Does this run still hold the table? A check, not a fence — see
-        // `check_still_mine`.
-        self.check_still_mine(dest_table).await?;
-        // Same guard as apply_changelog: before the window's first DDL.
-        self.refuse_clustered(dest_table).await?;
-        let Some(c) = outcome.tables.get(qualified_src) else {
-            // Foreign-table traffic only: nothing for our table, still advance.
-            self.write_state(dest_table, source_id, outcome.end_lsn, 0).await?;
-            return Ok(0);
-        };
-        let wal_cols = outcome
-            .wal_cols
-            .get(qualified_src)
-            .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
-        let oids = outcome
-            .wal_oids
-            .get(qualified_src)
-            .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
-        let ft = ch_ident(dest_table);
-        let pk_idx = pk_indices(pk_cols, wal_cols)?;
-        let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
-        let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
-        let collist = wal_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
+        let (mut u, token) = self.unit(dest_table).await?;
+        let (n, mark) = apply_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id).await?;
+        self.store.close_unit(u, &token, vec![mark]).await?;
+        Ok(n)
+    }
+}
 
-        if c.truncate {
-            self.ch.exec(&format!("TRUNCATE TABLE {ft}")).await?;
+/// `<table>__current`: the current state derived from the log.
+///
+/// Three things it has to get right, in this order:
+/// 1. **TRUNCATE.** A `T` record means everything logged before it is gone,
+///    so the view first drops every row at or below the newest `T`.
+/// 2. **Latest version per key.** Ordering is the PAIR `(lsn, seq)`, never
+///    `lsn` alone: one window stamps one LSN on every row it lands, so `seq`
+///    is what orders events inside a window.
+/// 3. **Deletes.** A key whose newest record is `D` is gone — filtered AFTER
+///    the pick, not before, or the delete would be skipped and the previous
+///    version would resurrect.
+///
+/// Baseline (`B`) rows carry the slot's consistent-point LSN, so any later
+/// change outranks them.
+fn current_view_sql(dest_table: &str, pk_cols: &[String]) -> String {
+    let keys = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+    let view = ch_ident(&format!("{dest_table}__current"));
+    let t = ch_ident(dest_table);
+    format!(
+        "CREATE OR REPLACE VIEW {view} AS SELECT * FROM ( \
+           SELECT * FROM {t} \
+           WHERE ({CL_LSN}, {CL_SEQ}) > ( \
+             SELECT ifNull(max(({CL_LSN}, {CL_SEQ})), (toUInt64(0), toUInt32(0))) \
+             FROM {t} WHERE {CL_OP} = '{tr}' \
+           ) \
+           ORDER BY {CL_LSN} DESC, {CL_SEQ} DESC, {CL_OP} = '{base}' ASC \
+           LIMIT 1 BY {keys} \
+         ) WHERE {CL_OP} != '{del}'",
+        tr = ch_str("T"),
+        del = ch_str("D"),
+        // The tie-break, and it became load-bearing in 0.56.0: a window is
+        // stamped with the watermark it was drained FROM, and the FIRST window
+        // after a bootstrap starts exactly where the baseline snapshot was
+        // taken. So a baseline row and that window's first event for the same
+        // key can carry the identical (lsn, seq) — every baseline row is
+        // written with seq 0 — and without this the winner of that tie is
+        // arbitrary. A real change always outranks the snapshot it changed.
+        base = ch_str(CL_BASELINE),
+    )
+}
+
+/// One readback per window: the current value of every masked column, for
+/// every key that needs one, from `<table>__current`. The view filters the
+/// base table by key first, so this probes the sorting key rather than
+/// scanning the log.
+async fn read_current(
+    u: &mut ChUnit<'_>,
+    dest_table: &str,
+    pk_cols: &[String],
+    pk_oids: &[u32],
+    keys: &[crate::logbased::changelog::CKey],
+    cols: &[usize],
+    wal_cols: &[String],
+) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
+    let view = ch_ident(&format!("{dest_table}__current"));
+    let sel = pk_cols
+        .iter()
+        .map(|c| ch_ident(c))
+        .chain(cols.iter().map(|&i| ch_ident(&wal_cols[i])))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut preds = Vec::with_capacity(keys.len());
+    for k in keys {
+        preds.push(format!("({})", key_pred(pk_cols, k, pk_oids)?));
+    }
+    let body = u.read(&format!("SELECT {sel} FROM {view} WHERE {} FORMAT TabSeparated", preds.join(" OR "))).await?;
+    let np = pk_cols.len();
+    let mut out = std::collections::HashMap::with_capacity(keys.len());
+    for line in body.lines().filter(|l| !l.is_empty()) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != np + cols.len() {
+            return Err(Error::Transfer("log_based changelog: masked readback column count mismatch".into()));
         }
+        let key: crate::logbased::changelog::CKey = f[..np].iter().map(|x| tsv_unescape(x).unwrap_or_default()).collect();
+        let vals = f[np..].iter().map(|x| tsv_unescape(x).map(bytes::Bytes::from)).collect();
+        out.insert(key, vals);
+    }
+    Ok(out)
+}
 
-        // Clear the delete-set ∪ every upsert key first, so the insert phase
-        // is a plain bulk INSERT (same move as the pg apply).
-        if !c.deletes.is_empty() || !c.upserts.is_empty() {
-            let del = ch_ident(&crate::naming::artifact_ident(
-                dest_table, crate::naming::Artifact::CdcDelete, crate::naming::ROOMY));
-            // The key table is built ONCE per run and truncated per window. The
-            // old DROP → CREATE → … → DROP cycle spent three HTTP round trips of
-            // pure ceremony on every window of every table, and at ~20k events
-            // per window that ceremony is a real slice of the apply: the whole
-            // window is only ~7 round trips. TRUNCATE leaves the same empty
-            // table the CREATE did, so a replayed window still sees exactly the
-            // state it expects.
-            //
-            // The first-time path DROPs before creating rather than relying on
-            // IF NOT EXISTS. `AS SELECT {pklist} FROM {ft} WHERE 0` freezes the
-            // key table's COLUMN SET and TYPES at creation, and the per-window
-            // insert names its columns explicitly — so if the source primary key
-            // gains a column (or a PK column changes type), an inherited table
-            // from an earlier run would make every window fail forever with a
-            // ClickHouse error naming an internal table. The old per-window DROP
-            // healed that on the next window; memoizing the DDL took the healing
-            // away with it. One DROP per run restores it and still costs one
-            // round trip per run instead of three per window.
-            let patch = self.patch_ok().await;
-            if self.first_time(&del) {
-                self.ch.exec(&format!("DROP TABLE IF EXISTS {del}")).await?;
-                self.ch
-                    .exec(&format!(
-                        "CREATE TABLE {del} ENGINE = MergeTree \
-                         ORDER BY tuple() AS SELECT {pklist} FROM {ft} WHERE 0"
-                    ))
-                    .await?;
-                if patch {
-                    // Materializes block columns for parts written from here
-                    // on; the probe showed pre-ALTER parts patch correctly too.
-                    self.ch
-                        .exec(&format!(
-                            "ALTER TABLE {ft} MODIFY SETTING \
-                             enable_block_number_column=1, enable_block_offset_column=1"
-                        ))
-                        .await?;
+/// changelog=true apply: ONE plain INSERT of every captured operation.
+///
+/// No delete-set, no key table, no DELETE, no TRUNCATE — ClickHouse never
+/// writes a mutation, so the destination never rewrites parts.
+///
+/// **Replay.** The INSERT and the watermark are two round-trips and ClickHouse
+/// has no transaction to hold them together, so a window CAN be re-drained
+/// after its rows landed: the process dies in between, or a sibling table in
+/// the same group fails its apply and the next run restarts from the group
+/// minimum. Two things make that safe.
+///
+/// 1. The stamp is `outcome.start_lsn` — the watermark the window was drained
+///    FROM, the one position that is identical on a replay, so `(lsn, seq)`
+///    is a real event identity a consumer can de-duplicate on.
+/// 2. `_apitap_cdc_pending` records the window we are ABOUT to append. If the
+///    next attempt opens on the same start, the rows already in the table at
+///    that stamp are counted and skipped — so the ordinary replay appends
+///    nothing twice at all.
+async fn apply_changelog_unit(
+    u: &mut ChUnit<'_>,
+    dest_table: &str,
+    qualified_src: &str,
+    pk_cols: &[String],
+    outcome: &DrainOutcome,
+    source_id: &str,
+) -> Result<(u64, Watermark)> {
+    let set = |rows: u64| Watermark::Set {
+        table: dest_table.to_string(),
+        source_id: source_id.to_string(),
+        lsn: outcome.end_lsn,
+        rows,
+    };
+    // Memoized no-op in steady state; here so no window ever writes to a
+    // table that turned Replicated under us mid-run.
+    u.refuse_clustered(dest_table).await?;
+    let Some(c) = outcome.changes.get(qualified_src) else {
+        return Ok((0, set(0)));
+    };
+    let wal_cols = outcome
+        .wal_cols
+        .get(qualified_src)
+        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+    let oids = outcome
+        .wal_oids
+        .get(qualified_src)
+        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
+    for name in wal_cols {
+        if matches!(name.as_str(), CL_OP | CL_LSN | CL_SEQ | CL_AT) {
+            return Err(Error::InvalidInput(format!(
+                "log_based changelog: source column '{name}' collides with a reserved \
+                 changelog column — rename it at the source or alias it in a view"
+            )));
+        }
+    }
+    if c.events.is_empty() {
+        return Ok((0, set(0)));
+    }
+
+    // Unchanged-TOAST cells must be rebuilt before anything is written —
+    // writing them as NULL would silently blank the column for every reader of
+    // `__current`. Costs one extra query per window, and only when the window
+    // actually carries a masked cell.
+    let patched = if c.masked {
+        let pk_idx = pk_indices(pk_cols, wal_cols)?;
+        let (keys, cols) = c.mask_plan(&pk_idx);
+        let base = if keys.is_empty() || cols.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
+            read_current(u, dest_table, pk_cols, &pk_oids, &keys, &cols, wal_cols).await?
+        };
+        c.resolve_masked(&pk_idx, &cols, &base, wal_cols)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let cols: Vec<String> = wal_cols
+        .iter()
+        .cloned()
+        .chain([CL_OP, CL_LSN, CL_SEQ, CL_AT].map(String::from))
+        .collect();
+    // The window's START, not its end: see the replay note above.
+    let lsn = outcome.start_lsn;
+    // Did a previous attempt at THIS window already append? Only asked when the
+    // marker names the same start — on the ordinary path it names the previous
+    // window's, and the count below (which scans `_apitap_lsn`, a sorting-key
+    // SUFFIX, so it prunes nothing) is never run.
+    let mut skip = 0usize;
+    if u.pending_window(dest_table, source_id).await? == Some(lsn) {
+        match u.appended_prefix(dest_table, lsn).await? {
+            Some(n) => skip = n.min(c.events.len()),
+            // Not a prefix: the surviving rows have a hole in them, so there is
+            // no safe place to resume. Re-append the whole window — the stamps
+            // are stable, so the overlap is an exact `(lsn, seq)` duplicate
+            // that `__current` and any consumer can collapse, which is the
+            // bad-but-honest outcome rather than a silent gap.
+            None => {
+                eprintln!(
+                    "apitap: {dest_table}: a previous append of the window at lsn {lsn} \
+                     left an incomplete run of rows, so it cannot be resumed part-way. \
+                     Re-appending the whole window; rows carrying a repeated \
+                     ({CL_LSN}, {CL_SEQ}) are duplicates of each other and may be \
+                     de-duplicated on that pair."
+                );
+            }
+        }
+    }
+    if skip >= c.events.len() {
+        // Everything already landed; only the watermark was missing.
+        return Ok((c.count, set(c.count)));
+    }
+    u.mark_pending_owned(dest_table, source_id, lsn).await?;
+    // ONE stamp for the window. It is the PARTITION/retention key, never an
+    // ordering key — `(lsn, seq)` orders. Sent explicitly rather than left to a
+    // default: the rebuild materialised `_apitap_at` as a plain column, so a
+    // NULL would land as the epoch and pile the whole log into a 1970 partition.
+    let at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let mut buf = Vec::with_capacity(4 << 20);
+    for (seq, ev) in c.events.iter().enumerate().skip(skip) {
+        match patched.get(&seq).or(ev.row.as_ref()) {
+            // A delete's old image carries the key and NULLs elsewhere — that
+            // IS the delete record, so it renders like any row.
+            Some(row) => render_ch_row_trim(row, oids, wal_cols.len(), &mut buf)?,
+            // TRUNCATE has no row: every data column is \N.
+            None => {
+                for i in 0..wal_cols.len() {
+                    if i > 0 {
+                        buf.push(b'\t');
+                    }
+                    buf.extend_from_slice(b"\\N");
                 }
             }
-            self.ch.exec(&format!("TRUNCATE TABLE {del}")).await?;
-            let mut buf = Vec::with_capacity(1 << 20);
-            for key in &c.deletes {
-                let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-                render_ch_key(&refs, &pk_oids, &mut buf)?;
+        }
+        buf.push(b'\t');
+        buf.extend_from_slice(ev.op.code().as_bytes());
+        buf.push(b'\t');
+        buf.extend_from_slice(lsn.to_string().as_bytes());
+        buf.push(b'\t');
+        buf.extend_from_slice(seq.to_string().as_bytes());
+        buf.push(b'\t');
+        buf.extend_from_slice(at.as_bytes());
+        buf.push(b'\n');
+    }
+    u.insert_owned(dest_table, &cols, buf).await?;
+    Ok((c.count, set(c.count)))
+}
+
+/// Apply one collapsed window through the unit, and name the watermark its
+/// close writes. A window with no traffic for this table writes nothing but
+/// that mark.
+async fn apply_unit(
+    u: &mut ChUnit<'_>,
+    dest_table: &str,
+    qualified_src: &str,
+    pk_cols: &[String],
+    outcome: &DrainOutcome,
+    source_id: &str,
+) -> Result<(u64, Watermark)> {
+    let set = |rows: u64| Watermark::Set {
+        table: dest_table.to_string(),
+        source_id: source_id.to_string(),
+        lsn: outcome.end_lsn,
+        rows,
+    };
+    // Before the window's first DDL: a table that turned Replicated mid-run.
+    u.refuse_clustered(dest_table).await?;
+    let Some(c) = outcome.tables.get(qualified_src) else {
+        // Foreign-table traffic only: nothing for our table, still advance.
+        return Ok((0, set(0)));
+    };
+    let wal_cols = outcome
+        .wal_cols
+        .get(qualified_src)
+        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+    let oids = outcome
+        .wal_oids
+        .get(qualified_src)
+        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
+    let ft = ch_ident(dest_table);
+    let pk_idx = pk_indices(pk_cols, wal_cols)?;
+    let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
+    let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
+
+    if c.truncate {
+        u.clear_owned(dest_table).await?;
+    }
+
+    // Clear the delete-set ∪ every upsert key first, so the insert phase is a
+    // plain bulk INSERT (same move as the pg apply).
+    if !c.deletes.is_empty() || !c.upserts.is_empty() {
+        let kt = u.key_table_reset(dest_table, pk_cols).await?;
+        let mut buf = Vec::with_capacity(1 << 20);
+        for key in &c.deletes {
+            let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+            render_ch_key(&refs, &pk_oids, &mut buf)?;
+        }
+        for row in &c.upserts {
+            render_ch_key(&row_key_refs(row, &pk_idx), &pk_oids, &mut buf)?;
+        }
+        u.insert_owned(&kt, pk_cols, buf).await?;
+        let kq = ch_ident(&kt);
+        let pred = if pk_cols.len() == 1 {
+            format!("{pklist} IN (SELECT {pklist} FROM {kq})")
+        } else {
+            format!("({pklist}) IN (SELECT {pklist} FROM {kq})")
+        };
+        u.delete_owned(dest_table, &pred).await?;
+    }
+
+    if !c.upserts.is_empty() {
+        let mut buf = Vec::with_capacity(4 << 20);
+        for row in &c.upserts {
+            render_ch_row(row, oids, &mut buf)?;
+        }
+        u.insert_owned(dest_table, wal_cols, buf).await?;
+    }
+
+    // Residue tail: serial, ordered. Masked TOAST updates read the missing
+    // columns back from the destination, then delete + reinsert the patched
+    // row (ClickHouse has no cheap row UPDATE).
+    for op in &c.residue {
+        match op {
+            ResidueOp::MaskedUpdate { key, row } => {
+                let mut full = row.clone();
+                let missing: Vec<usize> = full
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
+                    .map(|(i, _)| i)
+                    .collect();
+                let pred = key_pred(pk_cols, key, &pk_oids)?;
+                if !missing.is_empty() {
+                    let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
+                    let body = u.read(&format!("SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated")).await?;
+                    let Some(line) = body.lines().next() else {
+                        return Err(Error::Transfer(
+                            "log_based: masked update for a row missing at the destination — \
+                             window replay out of order?"
+                                .into(),
+                        ));
+                    };
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    if fields.len() != missing.len() {
+                        return Err(Error::Transfer("log_based: masked-update readback column count mismatch".into()));
+                    }
+                    for (&i, f) in missing.iter().zip(fields.iter()) {
+                        // Readback is already destination-dialect: escape it
+                        // straight back out, no OID translation.
+                        full[i] = match tsv_unescape(f) {
+                            None => Cell::Null,
+                            Some(v) => Cell::Text(bytes::Bytes::from(v)),
+                        };
+                    }
+                }
+                u.delete_owned(dest_table, &pred).await?;
+                let mut buf = Vec::new();
+                render_residue_row(&full, oids, &missing, &mut buf)?;
+                u.insert_owned(dest_table, wal_cols, buf).await?;
             }
-            for row in &c.upserts {
-                render_ch_key(&row_key_refs(row, &pk_idx), &pk_oids, &mut buf)?;
+            ResidueOp::Upsert { row } => {
+                let key: Vec<Vec<u8>> = row_key_refs_cells(row, &pk_idx).into_iter().map(|k| k.to_vec()).collect();
+                let pred = key_pred(pk_cols, &key, &pk_oids)?;
+                u.delete_owned(dest_table, &pred).await?;
+                let mut buf = Vec::new();
+                render_ch_row_cells(row, oids, &mut buf)?;
+                u.insert_owned(dest_table, wal_cols, buf).await?;
+            }
+            ResidueOp::Delete { key } => {
+                let pred = key_pred(pk_cols, key, &pk_oids)?;
+                u.delete_owned(dest_table, &pred).await?;
+            }
+            ResidueOp::Rekey { old_key, row, .. } => {
+                // ClickHouse has no cheap row UPDATE, so the move is a readback
+                // + delete + insert like MaskedUpdate — except the readback
+                // addresses the OLD key. That is the whole difference: the row
+                // still exists there, and it is the only place the TOASTed
+                // value can be found.
+                let mut full = row.clone();
+                let missing: Vec<usize> = full
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
+                    .map(|(i, _)| i)
+                    .collect();
+                let old_pred = key_pred(pk_cols, old_key, &pk_oids)?;
+                if !missing.is_empty() {
+                    let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
+                    let body =
+                        u.read(&format!("SELECT {sel} FROM {ft} WHERE {old_pred} FORMAT TabSeparated")).await?;
+                    match body.lines().next() {
+                        Some(line) => {
+                            let fields: Vec<&str> = line.split('\t').collect();
+                            if fields.len() != missing.len() {
+                                return Err(Error::Transfer("log_based: re-key readback column count mismatch".into()));
+                            }
+                            for (&i, f) in missing.iter().zip(fields.iter()) {
+                                full[i] = match tsv_unescape(f) {
+                                    None => Cell::Null,
+                                    Some(v) => Cell::Text(bytes::Bytes::from(v)),
+                                };
+                            }
+                        }
+                        // The old key is not there. On a replayed window that is
+                        // the expected shape — the move already happened and the
+                        // row sits at the new key — so skip rather than fail.
+                        None => continue,
+                    }
+                }
+                u.delete_owned(dest_table, &old_pred).await?;
+                let mut buf = Vec::new();
+                render_residue_row(&full, oids, &missing, &mut buf)?;
+                u.insert_owned(dest_table, wal_cols, buf).await?;
+            }
+        }
+    }
+    Ok((c.events, set(c.events)))
+}
+
+/// Everything that reaches the server. See the module doc.
+mod store {
+    use super::{ch_engine_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, PENDING, STATE_CURSOR};
+    use crate::error::{Error, Result};
+    use crate::guard::GuardStore;
+    use crate::lease::{no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark};
+    use crate::naming::{artifact_ident, artifact_ident_tok, Artifact, ROOMY};
+    use crate::sink::clickhouse::{ch_ident, ch_str, ChConn, ChGuard};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    pub(crate) struct ChStore {
+        ch: ChConn,
+        /// DDL this connection has already issued. `CREATE TABLE IF NOT
+        /// EXISTS` is idempotent but not free: it is a full HTTP round trip
+        /// against a window that only has ~7 of them, repeated for every
+        /// window of every table. The first window creates; the rest remember.
+        ensured: Mutex<HashSet<String>>,
+        /// Once-per-run verdict of `patch_ok` (None = not probed yet).
+        patch: Mutex<Option<bool>>,
+        /// Column types per table, for `input()` structures. Invalidated by
+        /// every op that changes a table's shape.
+        structures: Mutex<HashMap<String, HashMap<String, String>>>,
+        #[cfg(test)]
+        pub(super) ops: Mutex<Vec<&'static str>>,
+    }
+
+    /// One unit: a set of lease keys and the run that holds them. ClickHouse
+    /// has no transaction to open, so the unit is the predicate every write
+    /// carries.
+    pub(crate) struct ChUnit<'a> {
+        s: &'a ChStore,
+        keys: Vec<String>,
+        token: String,
+    }
+
+    /// The ownership predicate a statement carries: this run's lease row
+    /// exists, is not collected, and has more than `margin` seconds of life.
+    /// The margin is what makes a predicate evaluated at the statement's START
+    /// good for its whole run: the statement is bounded to the same margin
+    /// server-side (`owned_settings`), and a claim needs the row LAPSED.
+    pub(super) fn owner_pred(key: &str, tok: &str, margin: u64) -> String {
+        format!(
+            "1 IN (SELECT toUInt8(count() > 0 AND argMax(collected, seq) = 0 AND \
+             argMax(expires_at, seq) > now64(6) + INTERVAL {margin} SECOND) \
+             FROM `{t}` WHERE dest_key = '{k}' AND token = '{tok}')",
+            t = crate::lease::LEASE_TABLE,
+            k = ch_str(key),
+            tok = ch_str(tok),
+        )
+    }
+
+    /// Every owned statement ends before its predicate could go stale.
+    fn owned_settings() -> Vec<(&'static str, String)> {
+        let m = owned_margin_secs().to_string();
+        vec![("max_execution_time", m.clone()), ("http_receive_timeout", m)]
+    }
+
+    /// `input()`'s structure for `cols`, typed from the table. Quoted as a
+    /// string literal: a type carries quotes of its own (`DateTime64(6, 'UTC')`,
+    /// `Enum8('a' = 1)`).
+    pub(super) fn structure(cols: &[String], types: &HashMap<String, String>) -> Result<String> {
+        cols.iter()
+            .map(|c| {
+                types
+                    .get(c)
+                    .map(|t| format!("{} {t}", ch_ident(c)))
+                    .ok_or_else(|| Error::Transfer(format!("log_based: column {c} is not in the destination table")))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|v| v.join(", "))
+    }
+
+    pub(super) fn insert_owned_sql(table: &str, cols: &[String], structure: &str, pred: &str) -> String {
+        let cl = cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+        format!(
+            "INSERT INTO {t} ({cl}) SELECT {cl} FROM input('{s}') WHERE {pred} FORMAT TabSeparated",
+            t = ch_ident(table),
+            s = ch_str(structure),
+        )
+    }
+
+    impl ChStore {
+        pub(crate) fn connect(url: &str) -> Result<Self> {
+            Ok(Self {
+                ch: ChConn::parse(url)?,
+                ensured: Default::default(),
+                patch: Default::default(),
+                structures: Default::default(),
+                #[cfg(test)]
+                ops: Default::default(),
+            })
+        }
+
+        fn note(&self, _op: &'static str) {
+            #[cfg(test)]
+            self.ops.lock().unwrap().push(_op);
+        }
+
+        pub(crate) fn ch_guard(&self) -> ChGuard {
+            ChGuard::new(self.ch.clone(), None)
+        }
+
+        /// True the FIRST time this connection is asked about `key`.
+        fn first_time(&self, key: &str) -> bool {
+            self.ensured.lock().unwrap().insert(key.to_string())
+        }
+
+        fn patched(&self, table: &str) -> bool {
+            self.ensured.lock().unwrap().contains(&format!("\u{1}patch\u{1}{table}"))
+        }
+
+        /// Patch-part deletes (`lightweight_delete_mode='lightweight_update'`)
+        /// turn the per-window DELETE from a part REWRITE into a patch-part
+        /// write. Probed once per run: server >= 25.7 required (the setting
+        /// does not exist below), and correctness of OUR predicate shape —
+        /// including parts born before the ALTER — was verified against
+        /// 25.8.29. 24.8 LTS destinations keep the rewrite path untouched.
+        /// `APITAP_PATCH_DELETE=0` is the kill switch (and the A/B lever).
+        async fn patch_ok(&self) -> bool {
+            if std::env::var("APITAP_PATCH_DELETE").as_deref() == Ok("0") {
+                return false;
+            }
+            if let Some(v) = *self.patch.lock().unwrap() {
+                return v;
+            }
+            let ok = match self.ch.read("SELECT version()").await {
+                Ok(body) => {
+                    let mut it = body.trim().split('.');
+                    let maj: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    let min: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    maj > 25 || (maj == 25 && min >= 7)
+                }
+                Err(_) => false,
+            };
+            *self.patch.lock().unwrap() = Some(ok);
+            ok
+        }
+
+        async fn ensure_state_table(&self) -> Result<()> {
+            if !self.first_time("\u{1}state") {
+                return Ok(());
             }
             self.ch
-                .insert_stream(
-                    &format!("INSERT INTO {del} ({pklist}) FORMAT TabSeparated"),
-                    reqwest::Body::from(buf),
+                .exec(
+                    "CREATE TABLE IF NOT EXISTS `_apitap_state` (\
+                       dest_table String, source_id String, cursor_col String, \
+                       watermark String, mode String, last_rows UInt64, \
+                       synced_at DateTime64(6, 'UTC') DEFAULT now64(6)) \
+                     ENGINE = ReplacingMergeTree(synced_at) ORDER BY (dest_table, source_id)",
                 )
                 .await?;
-            let pred = if pk_cols.len() == 1 {
-                format!("{pklist} IN (SELECT {pklist} FROM {del})")
-            } else {
-                format!("({pklist}) IN (SELECT {pklist} FROM {del})")
+            Ok(())
+        }
+
+        /// The changelog append's intent marker: "a window starting at `lsn` is
+        /// being appended to `dest_table`". Its own table rather than a row in
+        /// `_apitap_state`, because that one is `ReplacingMergeTree ORDER BY
+        /// (dest_table, source_id)` — a second row for the same pair does not
+        /// sit beside the watermark, it REPLACES it.
+        async fn ensure_pending_table(&self) -> Result<()> {
+            if !self.first_time("\u{1}pending") {
+                return Ok(());
+            }
+            self.ch
+                .exec(&format!(
+                    "CREATE TABLE IF NOT EXISTS {PENDING} (\
+                       dest_table String, source_id String, lsn UInt64, \
+                       at DateTime64(6, 'UTC') DEFAULT now64(6)) \
+                     ENGINE = ReplacingMergeTree(at) ORDER BY (dest_table, source_id)"
+                ))
+                .await?;
+            Ok(())
+        }
+
+        /// Refuse a clustered (Replicated*) destination table, loudly, before
+        /// the CDC apply touches it.
+        ///
+        /// Every object this file creates for itself — the `_apitap_state`
+        /// watermark, the per-run key table, the changelog rebuild and its
+        /// `__current` view — is node-local DDL, no ON CLUSTER. The bootstrap
+        /// rides the bulk sink, which DOES thread on_cluster, so on a cluster
+        /// the destination table would exist on every node while apitap's
+        /// sidecars existed only on whichever node the balancer routed. A later
+        /// drain lands where they are missing — or reads a stale node-local
+        /// watermark and silently skips a window. The verdict comes from the
+        /// table's ENGINE, not the run's options: a pre-created Replicated
+        /// table diverges exactly the same way with no options passed at all.
+        /// Memoized per table once the table has been SEEN: a table that does
+        /// not exist yet passes, and is asked again by the first state write.
+        pub(super) async fn refuse_clustered(&self, dest_table: &str) -> Result<()> {
+            let key = format!("\u{1}cluster\u{1}{dest_table}");
+            if self.ensured.lock().unwrap().contains(&key) {
+                return Ok(());
+            }
+            let eng = self
+                .ch
+                .read(&format!(
+                    "SELECT engine FROM system.tables WHERE database = currentDatabase() AND name = '{t}'",
+                    t = ch_str(dest_table),
+                ))
+                .await?;
+            ch_engine_ok(dest_table, eng.trim())?;
+            if !eng.trim().is_empty() {
+                self.ensured.lock().unwrap().insert(key);
+            }
+            Ok(())
+        }
+
+        /// The table's columns, in order, with their types.
+        async fn columns(&self, table: &str) -> Result<Vec<(String, String)>> {
+            // TabSeparatedRaw, not TabSeparated: TSV escapes single quotes, so a
+            // `DateTime64(6, 'UTC')` column would come back as
+            // `DateTime64(6, \'UTC\')` and land verbatim in a CAST or input().
+            let desc = self
+                .ch
+                .read(&format!(
+                    "SELECT name, type FROM system.columns WHERE database = currentDatabase() \
+                     AND table = '{t}' ORDER BY position FORMAT TabSeparatedRaw",
+                    t = ch_str(table),
+                ))
+                .await?;
+            let mut cols = Vec::new();
+            for line in desc.lines().filter(|l| !l.is_empty()) {
+                let mut it = line.splitn(2, '\t');
+                let (Some(n), Some(ty)) = (it.next(), it.next()) else { continue };
+                cols.push((n.to_string(), ty.to_string()));
+            }
+            Ok(cols)
+        }
+
+        async fn types(&self, table: &str) -> Result<HashMap<String, String>> {
+            if let Some(t) = self.structures.lock().unwrap().get(table) {
+                return Ok(t.clone());
+            }
+            let t: HashMap<String, String> = self.columns(table).await?.into_iter().collect();
+            self.structures.lock().unwrap().insert(table.to_string(), t.clone());
+            Ok(t)
+        }
+
+        fn forget_shape(&self, table: &str) {
+            self.structures.lock().unwrap().remove(table);
+        }
+
+        pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+            // Run admission: read_state is the FIRST thing a run asks this
+            // destination, for every table — the moment to notice a clustered
+            // target and refuse before a bootstrap or a drain moves any data.
+            self.refuse_clustered(dest_table).await?;
+            let sql = format!(
+                "SELECT watermark, cursor_col, mode FROM `_apitap_state` FINAL \
+                 WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparated",
+                ch_str(dest_table),
+                ch_str(source_id)
+            );
+            let body = match self.ch.read(&sql).await {
+                Ok(b) => b,
+                // No state table at all = fresh destination.
+                Err(Error::Transfer(m)) if m.contains("UNKNOWN_TABLE") || m.contains("doesn't exist") => {
+                    return Ok(None)
+                }
+                Err(e) => return Err(e),
             };
-            let mode = if patch {
+            let Some(line) = body.lines().next() else { return Ok(None) };
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() != 3 {
+                return Err(Error::Transfer(format!("log_based: malformed state row from ClickHouse: {line:?}")));
+            }
+            if f[2] != "log_based" || f[1] != STATE_CURSOR {
+                return Err(Error::InvalidInput(format!(
+                    "log_based: state row for this table tracks cursor '{}' in mode \
+                     '{}', not an LSN — it was written by another mode. Use a \
+                     different dest_table or delete the state row",
+                    f[1], f[2]
+                )));
+            }
+            f[0].parse::<u64>()
+                .map(Some)
+                .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{}'", f[0])))
+        }
+
+        /// Ask ClickHouse itself whether these clauses resolve against the
+        /// table's real columns. `SELECT <expr> FROM t LIMIT 0` reads no data
+        /// and returns the same `UNKNOWN_IDENTIFIER` the CREATE would, so a
+        /// typo or a column only some members of a group own is caught before
+        /// anything is written.
+        pub(crate) async fn validate_changelog_ddl(
+            &self,
+            dest_table: &str,
+            partition_by: Option<&str>,
+            order_by: Option<&str>,
+        ) -> Result<()> {
+            let ft = ch_ident(dest_table);
+            // partition_by is checked in its EXPANDED form — a bare column name
+            // is a month, not a raw key — so validation and DDL can never
+            // disagree.
+            let pb = partition_by.map(|_| ch_partition_expr(partition_by));
+            for (what, expr) in [("partition_by", pb.as_deref()), ("order_by", order_by)] {
+                let Some(expr) = expr else { continue };
+                // The meta columns exist only after the rebuild, so a clause
+                // that uses them is checked against them explicitly.
+                let probe = format!(
+                    "SELECT {expr} FROM (SELECT *, CAST('{b}' AS String) AS {CL_OP}, \
+                     CAST(0 AS UInt64) AS {CL_LSN}, CAST(0 AS UInt32) AS {CL_SEQ}, \
+                     now64(3) AS {CL_AT} FROM {ft} LIMIT 0) LIMIT 0 FORMAT TabSeparatedRaw",
+                    b = ch_str(CL_BASELINE),
+                );
+                if let Err(e) = self.ch.read(&probe).await {
+                    return Err(Error::InvalidInput(format!(
+                        "log_based changelog: {what}={expr:?} does not resolve against \
+                         {dest_table}. In a multi-table run every table gets this same \
+                         clause unless you pass a dict — give {what} per table, e.g. \
+                         {what}={{\"orders\": \"…\", \"events\": \"…\"}}. ClickHouse said: {e}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        /// The destination's SHAPE must match the mode, checked ONCE at run
+        /// start on a table that already has state (a fresh bootstrap builds
+        /// the right shape by construction). Both directions are damage: a
+        /// replica window landing on a changelog destroys the log it found; a
+        /// changelog window landing on a replica has nowhere to put its meta
+        /// columns.
+        pub(crate) async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
+            let has = self
+                .ch
+                .read(&format!(
+                    "SELECT count() FROM system.columns WHERE database = currentDatabase() \
+                     AND table = '{t}' AND name = '{c}'",
+                    t = ch_str(dest_table),
+                    c = ch_str(CL_OP),
+                ))
+                .await?;
+            is_shape_ok(has.trim() != "0", changelog, "ClickHouse", dest_table)
+        }
+
+        /// Owner = the row exists, is not collected, and has more than the
+        /// margin left — the same test `owner_pred` makes server-side.
+        async fn owner(&self, keys: &[String], token: &str) -> Result<()> {
+            let margin = owned_margin_secs() as i64;
+            for k in keys {
+                match crate::sink::clickhouse::lease_get(&self.ch, k, token).await? {
+                    Some(l) if !l.collected && l.expires_in > margin => {}
+                    _ => return Err(no_longer_holds(keys)),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl ChUnit<'_> {
+        fn pred(&self) -> String {
+            let m = owned_margin_secs();
+            self.keys.iter().map(|k| owner_pred(k, &self.token, m)).collect::<Vec<_>>().join(" AND ")
+        }
+
+        async fn exec_owned(&self, sql: &str) -> Result<String> {
+            let st = owned_settings();
+            let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            self.s.ch.exec_with(sql, &st).await
+        }
+
+        async fn written_owned(&self, sql: &str) -> Result<Option<u64>> {
+            let st = owned_settings();
+            let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            self.s.ch.exec_written(sql, &st).await
+        }
+
+        /// A read the server refuses to let write.
+        pub(crate) async fn read(&mut self, sql: &str) -> Result<String> {
+            self.s.note("read");
+            self.s.ch.read(sql).await
+        }
+
+        pub(crate) async fn refuse_clustered(&self, dest_table: &str) -> Result<()> {
+            self.s.refuse_clustered(dest_table).await
+        }
+
+        pub(crate) async fn columns(&self, table: &str) -> Result<Vec<(String, String)>> {
+            self.s.columns(table).await
+        }
+
+        /// `body` (TabSeparated rows of `cols`) into `table`, through
+        /// `input()` so the statement can carry the predicate: an evicted
+        /// run's INSERT writes no row.
+        pub(crate) async fn insert_owned(&mut self, table: &str, cols: &[String], body: Vec<u8>) -> Result<()> {
+            self.s.note("insert");
+            let s = structure(cols, &self.s.types(table).await?)?;
+            let sql = insert_owned_sql(table, cols, &s, &self.pred());
+            let st = owned_settings();
+            let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            self.s.ch.insert_stream_with(&sql, reqwest::Body::from(body), &st).await
+        }
+
+        fn delete_mode(&self, table: &str) -> &'static str {
+            if self.s.patched(table) {
                 " SETTINGS lightweight_delete_mode='lightweight_update'"
             } else {
                 ""
-            };
-            self.ch
-                .exec(&format!("DELETE FROM {ft} WHERE {pred}{mode}"))
-                .await?;
-        }
-
-        if !c.upserts.is_empty() {
-            let mut buf = Vec::with_capacity(4 << 20);
-            for row in &c.upserts {
-                render_ch_row(row, oids, &mut buf)?;
             }
-            self.ch
-                .insert_stream(
-                    &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
-                    reqwest::Body::from(buf),
-                )
-                .await?;
         }
 
-        // Residue tail: serial, ordered. Masked TOAST updates read the
-        // missing columns back from the destination, then delete + reinsert
-        // the patched row (ClickHouse has no cheap row UPDATE).
-        for op in &c.residue {
-            match op {
-                ResidueOp::MaskedUpdate { key, row } => {
-                    let mut full = row.clone();
-                    let missing: Vec<usize> = full
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
-                        .map(|(i, _)| i)
-                        .collect();
-                    let pred = key_pred(pk_cols, key, &pk_oids)?;
-                    if !missing.is_empty() {
-                        let sel = missing
-                            .iter()
-                            .map(|&i| ch_ident(&wal_cols[i]))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let body = self
-                            .ch
-                            .exec(&format!(
-                                "SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated"
-                            ))
-                            .await?;
-                        let Some(line) = body.lines().next() else {
-                            return Err(Error::Transfer(
-                                "log_based: masked update for a row missing at the \
-                                 destination — window replay out of order?"
-                                    .into(),
-                            ));
-                        };
-                        let fields: Vec<&str> = line.split('\t').collect();
-                        if fields.len() != missing.len() {
-                            return Err(Error::Transfer(
-                                "log_based: masked-update readback column count \
-                                 mismatch"
-                                    .into(),
-                            ));
-                        }
-                        for (&i, f) in missing.iter().zip(fields.iter()) {
-                            // Readback is already destination-dialect: escape it
-                            // straight back out, no OID translation.
-                            full[i] = match tsv_unescape(f) {
-                                None => Cell::Null,
-                                Some(v) => Cell::Text(bytes::Bytes::from(v)),
-                            };
-                            // Mark: this cell must NOT be re-translated.
-                        }
+        pub(crate) async fn delete_owned(&mut self, table: &str, where_sql: &str) -> Result<()> {
+            self.s.note("delete");
+            let sql = format!(
+                "DELETE FROM {} WHERE ({where_sql}) AND {}{}",
+                ch_ident(table),
+                self.pred(),
+                self.delete_mode(table)
+            );
+            self.exec_owned(&sql).await.map(|_| ())
+        }
+
+        /// A WAL TRUNCATE. A `DELETE` rather than `TRUNCATE TABLE`, because
+        /// only a statement with a WHERE can carry the predicate.
+        pub(crate) async fn clear_owned(&mut self, table: &str) -> Result<()> {
+            self.s.note("clear");
+            let sql = format!("DELETE FROM {} WHERE {}{}", ch_ident(table), self.pred(), self.delete_mode(table));
+            self.exec_owned(&sql).await.map(|_| ())
+        }
+
+        /// This run's key table for `table`, empty and shaped like its key.
+        ///
+        /// Tokenized, so two runs never share one, and a collected run's is
+        /// swept by its collector. Built ONCE per run and truncated per window:
+        /// DROP → CREATE per window spent three round trips of ceremony on a
+        /// window that only has ~7. The first time DROPs before creating rather
+        /// than relying on IF NOT EXISTS — `AS SELECT … WHERE 0` freezes the
+        /// key's columns and types at creation.
+        pub(crate) async fn key_table_reset(&mut self, table: &str, pk_cols: &[String]) -> Result<String> {
+            self.s.note("key_reset");
+            let kt = artifact_ident_tok(table, Artifact::CdcDelete, ROOMY, &self.token);
+            let (kq, ft) = (ch_ident(&kt), ch_ident(table));
+            if self.s.first_time(&format!("\u{1}kt\u{1}{kt}")) {
+                let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
+                self.s.ch.exec(&format!("DROP TABLE IF EXISTS {kq}")).await?;
+                self.s
+                    .ch
+                    .exec(&format!("CREATE TABLE {kq} ENGINE = MergeTree ORDER BY tuple() AS SELECT {pklist} FROM {ft} WHERE 0"))
+                    .await?;
+                if self.s.patch_ok().await {
+                    // Materializes block columns for parts written from here
+                    // on; the probe showed pre-ALTER parts patch correctly too.
+                    self.s
+                        .ch
+                        .exec(&format!(
+                            "ALTER TABLE {ft} MODIFY SETTING enable_block_number_column=1, enable_block_offset_column=1"
+                        ))
+                        .await?;
+                    self.s.first_time(&format!("\u{1}patch\u{1}{table}"));
+                }
+            } else {
+                self.s.ch.exec(&format!("TRUNCATE TABLE {kq}")).await?;
+            }
+            self.s.forget_shape(&kt);
+            Ok(kt)
+        }
+
+        /// The window start the last append ATTEMPT was made at, if any.
+        pub(crate) async fn pending_window(&mut self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+            self.s.ensure_pending_table().await?;
+            let body = self
+                .read(&format!(
+                    "SELECT toString(argMax(lsn, at)) FROM {PENDING} \
+                     WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
+                    ch_str(dest_table),
+                    ch_str(source_id),
+                ))
+                .await?;
+            Ok(body.trim().parse::<u64>().ok())
+        }
+
+        /// How much of a window stamped `lsn` is already in the table, and
+        /// whether what is there is an unbroken prefix `seq = 0..n-1`. Rows go
+        /// out in `seq` order and ClickHouse commits the blocks it received, so
+        /// the survivor of a torn INSERT is normally a prefix — but `count =
+        /// max(seq) + 1` is the only thing that PROVES it.
+        pub(crate) async fn appended_prefix(&mut self, dest_table: &str, lsn: u64) -> Result<Option<usize>> {
+            let body = self
+                .read(&format!(
+                    // Baseline rows are excluded: the bootstrap stamps them with
+                    // its consistent point, and the FIRST window after a
+                    // bootstrap starts at exactly that point.
+                    "SELECT count(), ifNull(max({CL_SEQ}), 0) FROM {} \
+                     WHERE {CL_LSN} = {lsn} AND {CL_OP} != '{b}' FORMAT TabSeparated",
+                    ch_ident(dest_table),
+                    b = ch_str(CL_BASELINE),
+                ))
+                .await?;
+            let mut f = body.trim().split('\t');
+            let n: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let max_seq: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            if n == 0 {
+                return Ok(Some(0));
+            }
+            Ok(if n == max_seq + 1 { Some(n) } else { None })
+        }
+
+        /// The changelog's intent marker for the window at `lsn`, written only
+        /// by an owner: exactly one row, or this run no longer holds the table.
+        pub(crate) async fn mark_pending_owned(&mut self, dest_table: &str, source_id: &str, lsn: u64) -> Result<()> {
+            self.s.note("mark_pending");
+            self.s.ensure_pending_table().await?;
+            let sql = format!(
+                "INSERT INTO {PENDING} (dest_table, source_id, lsn) SELECT '{}', '{}', {lsn} WHERE {}",
+                ch_str(dest_table),
+                ch_str(source_id),
+                self.pred()
+            );
+            match self.written_owned(&sql).await? {
+                Some(1) => Ok(()),
+                Some(_) => Err(no_longer_holds(&self.keys)),
+                // A proxy stripped the summary header: ask the table.
+                None => {
+                    let body = self
+                        .s
+                        .ch
+                        .read(&format!(
+                            "SELECT toString(argMax(lsn, at)) FROM {PENDING} \
+                             WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
+                            ch_str(dest_table),
+                            ch_str(source_id),
+                        ))
+                        .await?;
+                    if body.trim().parse::<u64>().ok() == Some(lsn) {
+                        Ok(())
+                    } else {
+                        Err(no_longer_holds(&self.keys))
                     }
-                    self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
-                    let mut buf = Vec::new();
-                    render_residue_row(&full, oids, &missing, &mut buf)?;
-                    self.ch
-                        .insert_stream(
-                            &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
-                            reqwest::Body::from(buf),
-                        )
-                        .await?;
                 }
-                ResidueOp::Upsert { row } => {
-                    let key: Vec<Vec<u8>> = row_key_refs_cells(row, &pk_idx)
-                        .into_iter()
-                        .map(|k| k.to_vec())
-                        .collect();
-                    let pred = key_pred(pk_cols, &key, &pk_oids)?;
-                    self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
-                    let mut buf = Vec::new();
-                    render_ch_row_cells(row, oids, &mut buf)?;
-                    self.ch
-                        .insert_stream(
-                            &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
-                            reqwest::Body::from(buf),
-                        )
-                        .await?;
-                }
-                ResidueOp::Delete { key } => {
-                    let pred = key_pred(pk_cols, key, &pk_oids)?;
-                    self.ch.exec(&format!("DELETE FROM {ft} WHERE {pred}")).await?;
-                }
-                ResidueOp::Rekey { old_key, row, .. } => {
-                    // ClickHouse has no cheap row UPDATE, so the move is a
-                    // readback + delete + insert like MaskedUpdate — except the
-                    // readback addresses the OLD key. That is the whole
-                    // difference: the row still exists there, and it is the
-                    // only place the TOASTed value can be found.
-                    let mut full = row.clone();
-                    let missing: Vec<usize> = full
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
-                        .map(|(i, _)| i)
-                        .collect();
-                    let old_pred = key_pred(pk_cols, old_key, &pk_oids)?;
-                    if !missing.is_empty() {
-                        let sel = missing
-                            .iter()
-                            .map(|&i| ch_ident(&wal_cols[i]))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let body = self
-                            .ch
-                            .exec(&format!(
-                                "SELECT {sel} FROM {ft} WHERE {old_pred} FORMAT TabSeparated"
-                            ))
-                            .await?;
-                        match body.lines().next() {
-                            Some(line) => {
-                                let fields: Vec<&str> = line.split('\t').collect();
-                                if fields.len() != missing.len() {
-                                    return Err(Error::Transfer(
-                                        "log_based: re-key readback column count mismatch"
-                                            .into(),
-                                    ));
-                                }
-                                for (&i, f) in missing.iter().zip(fields.iter()) {
-                                    full[i] = match tsv_unescape(f) {
-                                        None => Cell::Null,
-                                        Some(v) => Cell::Text(bytes::Bytes::from(v)),
-                                    };
-                                }
-                            }
+            }
+        }
+
+        /// Rebuild `table` as `SELECT {sel} FROM table` with a new layout,
+        /// swapped in atomically. Non-destructive until the swap, and the swap
+        /// is taken only by an owner; a run evicted right after it leaves the
+        /// old table under its run-scoped name for its collector to sweep.
+        pub(crate) async fn changelog_rebuild(&mut self, table: &str, sel: &str, part: &str, order: &str) -> Result<()> {
+            self.s.note("rebuild");
+            let tmp = artifact_ident_tok(table, Artifact::ChangelogTmp, ROOMY, &self.token);
+            let (tq, ft) = (ch_ident(&tmp), ch_ident(table));
+            self.s.ch.exec(&format!("DROP TABLE IF EXISTS {tq}")).await?;
+            self.s
+                .ch
+                .exec(&format!(
+                    // allow_nullable_key: a changelog's rows are partial by
+                    // nature — a TRUNCATE record carries no row at all, so even
+                    // the key columns are Nullable. Without this ClickHouse
+                    // refuses the sorting key outright (ILLEGAL_COLUMN 44).
+                    "CREATE TABLE {tq} ENGINE = MergeTree PARTITION BY {part} ORDER BY ({order}) \
+                     SETTINGS allow_nullable_key = 1 AS SELECT {sel} FROM {ft}"
+                ))
+                .await?;
+            self.s.owner(&self.keys, &self.token).await?;
+            self.exec_owned(&format!("EXCHANGE TABLES {tq} AND {ft}")).await?;
+            self.s.forget_shape(table);
+            if self.s.owner(&self.keys, &self.token).await.is_err() {
+                return Err(Error::Locked(format!(
+                    "{}: this drain lost its claim right after rebuilding {table} as a changelog; \
+                     the replaced table is kept as {tmp} for the run that collected it",
+                    self.keys.join(", ")
+                )));
+            }
+            self.s.ch.exec(&format!("DROP TABLE {tq}")).await.map(|_| ())
+        }
+
+        pub(crate) async fn current_view(&mut self, table: &str, pk_cols: &[String]) -> Result<()> {
+            self.s.note("view");
+            self.s.ch.exec(&current_view_sql(table, pk_cols)).await.map(|_| ())
+        }
+
+        /// The scratch names releases before 0.57.0 used, untokenized. Only a
+        /// bootstrap drops them: while a table bootstraps the guard excludes
+        /// every live drain, so nothing else can be using them.
+        pub(crate) async fn drop_legacy_scratch(&mut self, table: &str) -> Result<()> {
+            for a in [Artifact::CdcDelete, Artifact::ChangelogTmp] {
+                self.s.ch.exec(&format!("DROP TABLE IF EXISTS {}", ch_ident(&artifact_ident(table, a, ROOMY)))).await?;
+            }
+            Ok(())
+        }
+    }
+
+    impl LeaseStore for ChStore {
+        fn lease_key(&self, dest_table: &str) -> String {
+            format!("{}.{dest_table}", self.ch.database())
+        }
+
+        async fn lease_open(&self, keys: &[String], token: &str) -> Result<()> {
+            for k in keys {
+                crate::sink::clickhouse::lease_write(&self.ch, k, token, ttl_secs() as i64, 0).await?;
+            }
+            Ok(())
+        }
+
+        async fn lease_renew(&self, keys: &[String], token: &str) -> Result<u64> {
+            crate::sink::clickhouse::lease_renew(&self.ch, keys, token).await
+        }
+
+        async fn lease_unclaimed(&self, token: &str) -> Result<Vec<String>> {
+            crate::sink::clickhouse::lease_unclaimed(&self.ch, token).await
+        }
+
+        async fn close_run(&self, _token: &str) {}
+    }
+
+    impl Fence for ChStore {
+        type Unit<'a> = ChUnit<'a>;
+
+        fn guard(&self, dest_table: &str) -> (Box<dyn GuardStore + '_>, String) {
+            (Box::new(self.ch_guard()), dest_table.to_string())
+        }
+
+        /// No transaction to open: the unit is its keys, checked once here so
+        /// an evicted run stops before its first statement rather than sending
+        /// a window of statements that each write nothing.
+        async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<ChUnit<'a>> {
+            self.owner(keys, token).await?;
+            Ok(ChUnit { s: self, keys: keys.to_vec(), token: token.to_string() })
+        }
+
+        /// The watermark, written only by an owner: the state INSERT carries
+        /// the predicate and must write exactly one row. A window whose
+        /// statements an eviction emptied therefore never moves the cursor.
+        async fn close_unit<'a>(&'a self, u: ChUnit<'a>, _token: &str, marks: Vec<Watermark>) -> Result<()> {
+            self.ensure_state_table().await?;
+            for m in &marks {
+                match m {
+                    Watermark::Set { table, source_id, lsn, rows } => {
+                        // Before the state table's first row for a fresh
+                        // bootstrap: the table did not exist at run admission.
+                        self.refuse_clustered(table).await?;
+                        self.note("state");
+                        let sql = format!(
+                            "INSERT INTO `_apitap_state` \
+                             (dest_table, source_id, cursor_col, watermark, mode, last_rows) \
+                             SELECT '{dt}', '{sid}', '{STATE_CURSOR}', '{lsn}', 'log_based', {rows} WHERE {p}",
+                            dt = ch_str(table),
+                            sid = ch_str(source_id),
+                            p = u.pred(),
+                        );
+                        match u.written_owned(&sql).await? {
+                            Some(1) => {}
+                            Some(_) => return Err(no_longer_holds(&u.keys)),
+                            // A proxy stripped the summary header. A window is
+                            // only sent when its end is past the watermark, so
+                            // the value itself says whether this row landed.
                             None => {
-                                // The old key is not there. On a replayed
-                                // window that is the expected shape — the move
-                                // already happened and the row sits at the new
-                                // key — so skip rather than fail. Deleting the
-                                // old key below would be a no-op either way.
-                                continue;
+                                let now = self
+                                    .ch
+                                    .read(&format!(
+                                        "SELECT argMax(watermark, synced_at) FROM `_apitap_state` \
+                                         WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
+                                        ch_str(table),
+                                        ch_str(source_id),
+                                    ))
+                                    .await?;
+                                if now.trim() != lsn.to_string() {
+                                    return Err(no_longer_holds(&u.keys));
+                                }
                             }
                         }
                     }
-                    self.ch.exec(&format!("DELETE FROM {ft} WHERE {old_pred}")).await?;
-                    let mut buf = Vec::new();
-                    render_residue_row(&full, oids, &missing, &mut buf)?;
-                    self.ch
-                        .insert_stream(
-                            &format!("INSERT INTO {ft} ({collist}) FORMAT TabSeparated"),
-                            reqwest::Body::from(buf),
-                        )
+                    Watermark::Clear { table, source_id } => {
+                        self.note("clear_state");
+                        u.exec_owned(&format!(
+                            "ALTER TABLE `_apitap_state` DELETE WHERE dest_table = '{}' \
+                             AND source_id = '{}' AND {} SETTINGS mutations_sync = 1",
+                            ch_str(table),
+                            ch_str(source_id),
+                            u.pred(),
+                        ))
                         .await?;
+                    }
                 }
             }
+            Ok(())
         }
-
-        // Before the cursor moves: an evicted drain that has already written a
-        // window must at least not claim it.
-        self.check_still_mine(dest_table).await?;
-        self.write_state(dest_table, source_id, outcome.end_lsn, c.events).await?;
-        Ok(c.events)
     }
 }
 
@@ -1361,6 +1567,131 @@ fn render_residue_row(
 #[cfg(test)]
 mod tests {
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
+    use super::store::{insert_owned_sql, owner_pred, structure};
+    use super::*;
+    use crate::logbased::changelog::Changes;
+    use crate::wire::pgoutput::Tuple;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn owner_pred_requires_a_row_and_margin() {
+        let p = owner_pred("default.t", "_tok", 150);
+        assert!(p.contains("count() > 0"), "{p}");
+        assert!(p.contains("argMax(collected, seq) = 0"), "{p}");
+        assert!(p.contains("argMax(expires_at, seq) > now64(6) + INTERVAL 150 SECOND"), "{p}");
+        assert!(p.contains("dest_key = 'default.t' AND token = '_tok'"), "{p}");
+    }
+
+    #[test]
+    fn input_structure_escapes_quotes() {
+        let cols = vec!["ts".to_string(), "e".to_string()];
+        let types: HashMap<String, String> = [
+            ("ts".to_string(), "DateTime64(6, 'UTC')".to_string()),
+            ("e".to_string(), "Enum8('a' = 1)".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let sql = insert_owned_sql("t", &cols, &structure(&cols, &types).unwrap(), "1");
+        assert!(sql.contains("\\'UTC\\'"), "{sql}");
+        assert!(sql.contains("\\'a\\'"), "{sql}");
+        assert!(sql.starts_with("INSERT INTO `t` (`ts`, `e`) SELECT `ts`, `e` FROM input('"), "{sql}");
+        assert!(structure(&["nope".to_string()], &types).is_err());
+    }
+
+    /// A ClickHouse stand-in on a local port: answers the reads a changelog
+    /// window makes, reports one written row for every write.
+    async fn mock_ch() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    loop {
+                        let end = loop {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                            match s.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        while buf.len() < end + len {
+                            match s.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        }
+                        let body = String::from_utf8_lossy(&buf[end..end + len]).to_string();
+                        buf.drain(..end + len);
+                        let answer = if body.contains("dateDiff('second'") {
+                            // Past any margin: TTL 300 by default, margin 150.
+                            "1000\t0\t1\n"
+                        } else if body.contains("SELECT engine FROM system.tables") {
+                            "MergeTree\n"
+                        } else if body.contains("SELECT name, type FROM system.columns") {
+                            "id\tInt32\nv\tNullable(String)\n_apitap_op\tString\n_apitap_lsn\tUInt64\n\
+                             _apitap_seq\tUInt32\n_apitap_at\tDateTime64(3)\n"
+                        } else {
+                            ""
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                             X-ClickHouse-Summary: {{\"written_rows\":\"1\"}}\r\n\r\n{answer}",
+                            answer.len()
+                        );
+                        if s.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("clickhouse://default:x@127.0.0.1:{port}/default")
+    }
+
+    /// A changelog window: read (is a previous attempt pending?), mark the
+    /// attempt, insert, and only then the watermark. The mark before the
+    /// insert is what lets a replay count what already landed.
+    #[test]
+    fn unit_order_mark_insert_state() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let s = ChStore::connect(&mock_ch().await).unwrap();
+            let mut ch = Changes::default();
+            ch.insert(Tuple::from_cells(&[
+                Cell::Text(bytes::Bytes::from_static(b"1")),
+                Cell::Text(bytes::Bytes::from_static(b"a")),
+            ]));
+            let outcome = DrainOutcome {
+                tables: Default::default(),
+                changes: [("public.t".to_string(), ch)].into_iter().collect(),
+                end_lsn: 20,
+                start_lsn: 10,
+                wal_cols: [("public.t".to_string(), vec!["id".to_string(), "v".to_string()])].into_iter().collect(),
+                wal_oids: [("public.t".to_string(), vec![23, 25])].into_iter().collect(),
+                hit_budget: false,
+            };
+            let keys = vec![s.lease_key("t")];
+            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+            let (n, mark) =
+                apply_changelog_unit(&mut u, "t", "public.t", &["id".to_string()], &outcome, "sid").await.unwrap();
+            assert_eq!(n, 1);
+            s.close_unit(u, "_tok", vec![mark]).await.unwrap();
+            let _ = Arc::new(Mutex::new(()));
+            assert_eq!(*s.ops.lock().unwrap(), ["read", "mark_pending", "insert", "state"]);
+        });
+    }
 
     #[test]
     fn a_replicated_destination_is_refused_not_silently_diverged() {

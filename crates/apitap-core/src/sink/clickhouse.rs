@@ -355,6 +355,17 @@ impl crate::guard::GuardStore for ChGuard {
     async fn lease_close(&self, proof: crate::guard::Released) {
         lease_close(&self.ch, &proof.key, &proof.token).await
     }
+
+    /// A run's run-scoped CDC scratch: its key table, and a changelog rebuild
+    /// it left half way. Exact token, never lineage; a bulk token has none,
+    /// and the drops are IF EXISTS.
+    async fn sweep_run(&self, bare: &str, token: &str) -> Result<()> {
+        use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
+        for a in [Artifact::CdcDelete, Artifact::ChangelogTmp] {
+            self.drop_object(&artifact_ident_tok(bare, a, ROOMY, token)).await?;
+        }
+        Ok(())
+    }
 }
 
 /// `written_rows` out of an `X-ClickHouse-Summary` header — a flat JSON object

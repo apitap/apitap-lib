@@ -151,9 +151,14 @@ deadline = time.monotonic() + 20
 while time.monotonic() < deadline and not locks():
     time.sleep(0.05)
 had_lock = bool(locks())
+# Killed once its run-scoped key table exists, so the collector has one to sweep.
+dead = _rig.token_of(locks()[0]) if had_lock else None
+KEYS = f"{T}{dead}__apitap_cdc_del"
+_rig.wait_for(lambda: KEYS in ch(f"SELECT name FROM system.tables WHERE name = '{KEYS}'"), 20, step=0.05)
 p.kill()
 p.wait()
 case("the killed drain left a lock", had_lock, f"{locks() or 'none'}")
+case("…and its run-scoped key table", KEYS in ch(f"SELECT name FROM system.tables WHERE name = '{KEYS}'"), KEYS)
 # Since 0.57.0 a drain also announces an empty staging MARKER, because a 0.55.1
 # bulk run scans for staging only and would not see the lock.
 case("…and its staging marker", bool(_rig.markers_ch(T)), f"{_rig.markers_ch(T) or 'none'}")
@@ -174,6 +179,8 @@ case("the next run proceeds", e is None, e or "collected and drained")
 case("and the dead run's lock is gone", locks() == [], f"{locks() or 'none'}")
 case("and so is its marker — one claim collects both", _rig.markers_ch(T) == [],
      f"{_rig.markers_ch(T) or 'none'}")
+case("and its key table — the collector sweeps the dead run's scratch",
+     ch(f"SELECT count() FROM system.tables WHERE name = '{KEYS}'") == "0", KEYS)
 wm_after = watermark()
 case("it RESUMED — the watermark moved on from where the kill left it",
      wm_after != "" and wm_after != wm_before, f"{wm_before} -> {wm_after}")
@@ -216,9 +223,12 @@ else:
          e is not None and "LockedError" in e, (e or "it was ALLOWED")[:120])
     case("and the refusal says to wait, not to remove",
          bool(e) and "nothing for you to do" in e, (e or "")[-160:])
+    scratch = ch("SELECT name FROM system.tables WHERE database = currentDatabase() "
+                 f"AND startsWith(name, '{T}') AND endsWith(name, '__apitap_cdc_del')").split()
     case("the live drain finished normally and cleaned up after itself",
-         p.returncode == 0 and locks() == [] and leases() == [],
-         f"rc={p.returncode}, locks {locks() or 'none'}, leases {leases() or 'none'}")
+         p.returncode == 0 and locks() == [] and leases() == [] and not scratch,
+         f"rc={p.returncode}, locks {locks() or 'none'}, leases {leases() or 'none'}, "
+         f"key tables {scratch or 'none'}")
 
 print("== cleanup ==")
 clean()

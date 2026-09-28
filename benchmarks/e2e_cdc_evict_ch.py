@@ -208,9 +208,9 @@ try:
     c, u = dest_counts()
     total = int(ma(f"SELECT COUNT(*) FROM {T}"))
     case("dest == source, no duplicates", c == total and u == total, f"dest {c}/{u} of {total}")
-    # Asserted from the statement predicate on (handoff §3 step 21): until
-    # then the one statement A had in flight still lands its own watermark.
-    print(f"      watermark: B left {wm_b}, now {watermark()}", flush=True)
+    # The one statement A had in flight may land (it carries its window's
+    # start LSN, and the replay appends nothing for it); its watermark may not.
+    case("the watermark is still B's", watermark() == wm_b, f"B left {wm_b}, now {watermark()}")
 
     print("== stale ==", flush=True)
     s_tok = _rig.fresh_token("l", "5ta1")
