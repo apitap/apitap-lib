@@ -716,6 +716,13 @@ mod store {
         keys: Vec<String>,
         token: String,
         pin: Pin,
+        /// An owned statement was sent since the pin: the next re-pin owes
+        /// the proof that it ran under the pinned deadline (`repin`'s
+        /// continuity). With none sent there is nothing to prove, and a
+        /// re-pin is a fresh one — the changelog rebuild's CTAS is unfenced
+        /// and unbounded, and a CTAS longer than the pin's budget used to fail
+        /// a live claim on every run.
+        owed: bool,
     }
 
     /// A unit's time fence, pinned. Every statement of the unit carries
@@ -764,6 +771,17 @@ mod store {
 
     fn margin_us() -> u64 {
         owned_margin_secs() * 1_000_000
+    }
+
+    /// Whether a unit re-reads its pin before its next statement: when forced,
+    /// or once an EIGHTH of the pin's budget is spent. Early, so an owned
+    /// statement starts with most of the budget ahead of it: the re-pin after
+    /// it must still pass the old deadline, and a statement that started with
+    /// half the budget left (the rule until this) could not run past that half
+    /// without failing a live claim — a lightweight DELETE of a minute at TTL
+    /// 300 replayed its window for ever. Short windows still never re-read.
+    pub(super) fn repin_due(elapsed: std::time::Duration, budget: std::time::Duration, force: bool) -> bool {
+        force || elapsed >= budget / 8
     }
 
     /// The ownership predicate a statement carries: this run's lease row
@@ -1114,25 +1132,36 @@ mod store {
             p.join(" AND ")
         }
 
-        /// Keep the pinned deadline ahead of the unit: once half of what it
-        /// left is spent (or on `force`), re-pin — and only across no gap.
-        /// Sub-second in the common case, where a window is far shorter than
-        /// half a TTL and this never reads at all.
+        /// Keep the pinned deadline ahead of the unit (`repin_due`), and move
+        /// it only across no gap: when an owned statement was sent since the
+        /// pin, the re-read must itself pass the old deadline. When none was,
+        /// nothing written can have been fenced out, and the re-pin is fresh.
+        ///
+        /// The residual: one owned statement longer than the budget it started
+        /// with fails the next re-pin although it may have run whole. Nothing
+        /// finer is a proof — a mutation evaluates its predicate part by part,
+        /// so a statement that STARTED inside the deadline may still have
+        /// skipped its last parts — so the unit refuses and the window
+        /// replays, loudly.
         async fn keep(&mut self, force: bool) -> Result<()> {
-            if !force && self.pin.at.elapsed() < self.pin.budget / 2 {
+            if !repin_due(self.pin.at.elapsed(), self.pin.budget, force) {
                 return Ok(());
             }
-            self.pin = self.s.pin(&self.keys, &self.token, Some(self.pin.e0)).await?;
+            let prev = self.owed.then_some(self.pin.e0);
+            self.pin = self.s.pin(&self.keys, &self.token, prev).await?;
+            self.owed = false;
             Ok(())
         }
 
-        async fn exec_owned(&self, sql: &str) -> Result<String> {
+        async fn exec_owned(&mut self, sql: &str) -> Result<String> {
+            self.owed = true;
             let st = owned_settings();
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
             self.s.ch.exec_with(sql, &st).await
         }
 
-        async fn written_owned(&self, sql: &str) -> Result<Option<u64>> {
+        async fn written_owned(&mut self, sql: &str) -> Result<Option<u64>> {
+            self.owed = true;
             let st = owned_settings();
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
             self.s.ch.exec_written(sql, &st).await
@@ -1162,6 +1191,7 @@ mod store {
             let sql = insert_owned_sql(table, cols, &s, &self.pred());
             let st = owned_settings();
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            self.owed = true;
             self.s.ch.insert_stream_with(&sql, reqwest::Body::from(body), &st).await
         }
 
@@ -1311,6 +1341,12 @@ mod store {
         /// swapped in atomically. Non-destructive until the swap, and the swap
         /// is taken only by an owner; a run evicted right after it leaves the
         /// old table under its run-scoped name for its collector to sweep.
+        ///
+        /// The CTAS writes only this run's temp, so it is neither fenced nor
+        /// bounded, and it may take minutes on a large table. The check before
+        /// the EXCHANGE is therefore a FRESH pin (nothing owned ran before it
+        /// in this unit — see `keep`): a live claim passes however long the
+        /// copy took, and a claim taken meanwhile still refuses the swap.
         pub(crate) async fn changelog_rebuild(&mut self, table: &str, sel: &str, part: &str, order: &str) -> Result<()> {
             self.s.note("rebuild");
             let tmp = artifact_ident_tok(table, Artifact::ChangelogTmp, ROOMY, &self.token);
@@ -1392,7 +1428,7 @@ mod store {
         /// write nothing.
         async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<ChUnit<'a>> {
             let pin = self.pin(keys, token, None).await?;
-            Ok(ChUnit { s: self, keys: keys.to_vec(), token: token.to_string(), pin })
+            Ok(ChUnit { s: self, keys: keys.to_vec(), token: token.to_string(), pin, owed: false })
         }
 
         /// The watermark, written only by an owner: the state INSERT carries
@@ -1896,6 +1932,70 @@ mod tests {
             assert_eq!(w.first().map(|x| x.1), Some(0), "the insert was not fenced out: {w:?}");
             assert!(matches!(r, Err(Error::Locked(_))), "a window whose insert wrote nothing was recorded: {r:?} {w:?}");
         });
+    }
+
+    /// The changelog rebuild's CTAS copies the whole table into this run's
+    /// temp, unfenced and unbounded. A copy longer than the pin's budget —
+    /// three minutes here, against 150 s at TTL 300 — while the keeper renews
+    /// the lease must still swap: nothing owned ran before it, so nothing can
+    /// have been fenced out. A claim taken meanwhile must still refuse it.
+    #[test]
+    fn a_slow_rebuild_keeps_a_live_claim() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let now = Arc::new(AtomicU64::new(T0));
+            let live = Arc::new(AtomicU64::new(T0 + ttl_secs() * 1_000_000));
+            let (claimed, claim_in_copy) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+            let (n2, l2, c2, cc2, s2) = (now.clone(), live.clone(), claimed.clone(), claim_in_copy.clone(), sent.clone());
+            let url = mock_with(Arc::new(move |sql: &str| {
+                if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                    let owned = u64::from(!c2.load(SeqCst));
+                    return (format!("{}\t{}\t{owned}\n", n2.load(SeqCst), l2.load(SeqCst)), 0);
+                }
+                s2.lock().unwrap().push(sql.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
+                if sql.starts_with("CREATE TABLE") && sql.contains(" AS SELECT ") {
+                    // The copy takes three minutes; the keeper renews under
+                    // it — unless a collector claims the row meanwhile.
+                    let t = n2.fetch_add(180_000_000, SeqCst) + 180_000_000;
+                    l2.store(t + ttl_secs() * 1_000_000, SeqCst);
+                    c2.store(cc2.load(SeqCst), SeqCst);
+                }
+                (String::new(), 0)
+            }))
+            .await;
+            let s = ChStore::connect(&url).unwrap();
+            let keys = vec![s.lease_key("t")];
+
+            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+            let r = u.changelog_rebuild("t", "`id`", "tuple()", "`id`").await;
+            let log = sent.lock().unwrap().clone();
+            assert!(r.is_ok(), "a live claim failed after a slow copy: {r:?} {log:?}");
+            assert!(log.iter().any(|l| l == "EXCHANGE TABLES"), "{log:?}");
+
+            // The same copy, with the claim collected while it ran: no swap.
+            sent.lock().unwrap().clear();
+            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+            claim_in_copy.store(true, SeqCst);
+            let r = u.changelog_rebuild("t", "`id`", "tuple()", "`id`").await;
+            let log = sent.lock().unwrap().clone();
+            assert!(matches!(r, Err(Error::Locked(_))), "a collected claim swapped: {r:?} {log:?}");
+            assert!(!log.iter().any(|l| l == "EXCHANGE TABLES"), "{log:?}");
+        });
+    }
+
+    /// A unit re-reads its pin early — an eighth of the budget — so an owned
+    /// statement starts with most of the budget ahead of it; short windows
+    /// never re-read at all.
+    #[test]
+    fn a_pin_is_renewed_early() {
+        use super::store::repin_due;
+        use std::time::Duration;
+        let b = Duration::from_secs(120);
+        assert!(!repin_due(Duration::from_secs(1), b, false), "a short window re-read its pin");
+        assert!(repin_due(Duration::from_secs(1), b, true));
+        assert!(repin_due(Duration::from_secs(15), b, false));
+        assert!(repin_due(Duration::from_secs(40), b, false), "a statement could start with a third of the budget gone");
     }
 
     #[test]
