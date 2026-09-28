@@ -27,11 +27,11 @@ pub(crate) struct PgParts {
 }
 
 impl PgParts {
-    /// `"schema"."bare"`, quoted. The CDC data statements take it when they
-    /// move onto the resolved schema (handoff §3 step 19).
-    #[allow(dead_code)]
+    /// `"schema"."bare"`, each half quoted on its own, so a dot inside either
+    /// name stays a character. Every CDC data statement addresses the table
+    /// by this, never by the name as the user wrote it.
     pub(crate) fn qualified(&self) -> String {
-        quote_ident_path(&format!("{}.{}", self.schema, self.bare))
+        format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.bare))
     }
 
     /// The lease key and the refusal's name: unquoted `schema.bare`.
@@ -495,17 +495,6 @@ impl PgSink {
                 a.abandon();
             }
         }
-    }
-
-    async fn drop_staging(&self, name: &str) -> Result<()> {
-        sqlx::query(&format!(
-            "DROP TABLE IF EXISTS {}",
-            quote_ident_path(&format!("{}.{}", self.schema, name))
-        ))
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| Error::Transfer(format!("reap staging {name}: {e}")))
     }
 
     /// Bind one destination table onto an existing pool. All per-table state
@@ -1098,14 +1087,12 @@ impl crate::sink::Sink for PgSink {
         Ok(loaded)
     }
 
-    /// Drop this run's staging table. See [`crate::sink::Sink::discard`].
-    ///
-    /// `staging_t` is already schema-qualified and quoted, so this does not go
-    /// through `drop_staging` (which takes a bare name and qualifies it).
     async fn release_lock(&self) {
         self.release().await;
     }
 
+    /// Drop this run's staging table. See [`crate::sink::Sink::discard`].
+    /// `staging_t` is already schema-qualified and quoted.
     async fn discard(&self) -> Result<()> {
         let r = sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
             .execute(&self.pool)

@@ -224,20 +224,20 @@ impl Drop for Keeper {
 // switch, only the tests below use what follows.
 
 /// What a script names when its fence found the run's claim gone (BigQuery).
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) const LOST_MARK: &str = "apitap-lease-lost";
 
 /// The time fence where no row lock exists (ClickHouse statements, BigQuery
 /// DDL): an owner may write only while more than half its TTL is left, and a
 /// statement is bounded server-side to the same half, so it ends before any
 /// peer can claim the lease.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) fn owned_margin_secs() -> u64 {
     ttl_secs() / 2
 }
 
 /// The refusal a drain gives when its claim is gone. Nothing was written.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) fn no_longer_holds(keys: &[String]) -> Error {
     Error::Locked(format!(
         "{}: this drain no longer holds the table — another run collected its claim, so it is \
@@ -255,7 +255,7 @@ pub(crate) fn no_longer_holds(keys: &[String]) -> Error {
 /// not an owner — 0.56.0 read "no row" as "nothing to fence against" and wrote,
 /// which is exactly what a collector that deleted the row would have wanted to
 /// stop.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) fn owner_verdict(row: Option<&Lease>, keys: &[String]) -> Result<()> {
     match row {
         Some(l) if !l.collected => Ok(()),
@@ -265,13 +265,13 @@ pub(crate) fn owner_verdict(row: Option<&Lease>, keys: &[String]) -> Result<()> 
 
 /// The watermark a unit writes when it closes — the only place one is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) enum Watermark {
     Set { table: String, source_id: String, lsn: u64, rows: u64 },
     Clear { table: String, source_id: String },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 impl Watermark {
     pub(crate) fn table(&self) -> &str {
         match self {
@@ -283,7 +283,7 @@ impl Watermark {
 /// The lease rows of one destination: open, renew, and who still holds what.
 /// Liveness questions a COLLECTOR asks (get, claim, close) are the guard's
 /// (`crate::guard::GuardStore`), so there is one spelling of each.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) trait LeaseStore: Send + Sync + 'static {
     fn lease_key(&self, dest_table: &str) -> String;
     /// Open this run's rows (and on BigQuery its per-run fence table).
@@ -302,7 +302,7 @@ pub(crate) trait LeaseStore: Send + Sync + 'static {
 }
 
 /// A destination that can fence a unit of writes on its own lease row.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) trait Fence: LeaseStore {
     type Unit<'a>: Send
     where
@@ -326,7 +326,7 @@ pub(crate) trait Fence: LeaseStore {
 
 /// One open unit of writes. Only `Tenure::open` makes one, and `release`
 /// cannot pass it: it carries a read guard `release` waits for.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) struct Held<'t, F: Fence + 't> {
     pub(crate) unit: F::Unit<'t>,
     tables: Vec<String>,
@@ -335,7 +335,7 @@ pub(crate) struct Held<'t, F: Fence + 't> {
 
 /// This run's ownership of a group of destination tables, as a value: every
 /// CDC write goes through a unit it opens, and nothing else can open one.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) struct Tenure<F: Fence> {
     dest: std::sync::Arc<F>,
     run: RunId,
@@ -348,7 +348,7 @@ pub(crate) struct Tenure<F: Fence> {
     keeper: std::sync::Mutex<Option<Keeper>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 impl<F: Fence> Tenure<F> {
     /// Lease first, then announce every member, then check every member — the
     /// order that makes a dead run collectable and two live ones unable to
@@ -473,7 +473,7 @@ impl<F: Fence> Drop for Tenure<F> {
 
 /// Markers first; for each member whose markers are all gone, its scratch and
 /// then its lease. `true` when every member was given back.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // wired at the Tenure switch (step 24)
 async fn give_back<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announced)>, token: &str) -> bool {
     let mut all = true;
     for (t, a) in held {

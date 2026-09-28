@@ -18,6 +18,8 @@ back to itself.
   leg 2  a claim never queues behind an apply    — `NOWAIT`, measured in seconds
   leg 3  one stuck member does not expire its    — `SKIP LOCKED` in the keeper;
          siblings                                  this is the panel's one FATAL trace
+  leg 4  two apply lanes cannot starve the       — the keeper has its own connection
+         keeper
 
 Rig: `apitap-bench-pg-src` on :5544, `apitap-bench-pg-dst` on :5545.
 """
@@ -297,6 +299,60 @@ else:
          sib[0] if sib else "no row")
     stuck.wait(TTL + 40)
     p.kill(); p.wait()
+clean()
+
+print("== leg 4: two apply lanes cannot starve the keeper ==")
+# The apply pool has two connections. With `APITAP_CDC_APPLY_LANES=2` both can
+# be inside a unit at once, and in 0.56.0 the keeper renewed on that same pool:
+# a group applying slowly left it no connection. Every destination insert here
+# sleeps 5 ms, so each window's unit holds its connection for seconds — but
+# well under the TTL — and the question is whether every row of the run stays
+# alive between them.
+seed(T, 200)
+seed(T2, 200)
+r = sh([sys.executable, "-c",
+        "import apitap; apitap.transfer("
+        f"{SRC!r}, {DST!r}, tables=[{T!r}, {T2!r}], mode='log_based')"])
+case("group bootstrapped", r.returncode == 0, r.stderr.strip()[-160:])
+dst("CREATE OR REPLACE FUNCTION fence_slow() RETURNS trigger LANGUAGE plpgsql AS "
+    "$$ BEGIN PERFORM pg_sleep(0.005); RETURN NEW; END $$")
+for t in (T, T2):
+    dst(f"CREATE TRIGGER fence_slow BEFORE INSERT ON {t} FOR EACH ROW EXECUTE FUNCTION fence_slow()")
+    # Units well under the 30 s TTL, at 5 ms a row: fat rows, so the 1 MiB
+    # window floor holds ~2000 of them, and one source transaction per 1000
+    # rows, because a window never splits a transaction.
+    for lo in range(201, 30001, 1000):
+        src(f"INSERT INTO {t} SELECT g, repeat('w', 500) FROM generate_series({lo}, {lo + 999}) g")
+p = subprocess.Popen(
+    [sys.executable, "-c",
+     "import apitap; apitap.transfer("
+     f"{SRC!r}, {DST!r}, tables=[{T!r}, {T2!r}], mode='log_based')"],
+    env=dict(os.environ, APITAP_CDC_WINDOW_BYTES="1048576", APITAP_CDC_APPLY_LANES="2"),
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+if not wait_for(lambda: len(lease_rows(T)) > 0 and len(lease_rows(T2)) > 0, 40):
+    p.kill(); p.wait()
+    case("(rig) leg 4 could not be staged", False, "the group's leases never appeared")
+else:
+    tok = lease_rows(T)[0].split("|")[0]
+    worst = []
+    for _ in range(3):
+        time.sleep(10)
+        worst.append(float(dst("SELECT COALESCE(max(EXTRACT(EPOCH FROM (now() - expires_at))), 0) "
+                               f"FROM _apitap_lease WHERE token = '{tok}'") or 0))
+    moving = p.poll() is None
+    case("(rig) the drain was still applying through all three samples", moving,
+         f"rc={p.poll()}, dest {dst(f'SELECT count(*) FROM {T}')} of 30000")
+    # More than half the TTL, not merely "not lapsed": the keeper renews every
+    # tenth of it, and a held row is renewed by its own unit's close, so a
+    # healthy run never lets a row fall under half — the margin ClickHouse and
+    # BigQuery demand before they write. 0.56.0, renewing on the apply pool,
+    # sank to ~9 s of 30 here without lapsing.
+    case("every row of the run kept more than half its TTL", all(w < -TTL / 2 for w in worst),
+         "seconds past expiry of the worst row: " + ", ".join(f"{w:.1f}" for w in worst))
+    p.kill(); p.wait()
+for t in (T, T2):
+    dst(f"DROP TRIGGER IF EXISTS fence_slow ON {t}")
+dst("DROP FUNCTION IF EXISTS fence_slow()")
 clean()
 
 print("\n   ===== CDC FENCE E2E: " + ("ALL GREEN" if ok else "FAILED") + " =====")

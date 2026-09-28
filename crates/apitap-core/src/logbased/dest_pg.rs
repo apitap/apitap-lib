@@ -1,159 +1,50 @@
 //! log_based apply into Postgres — the reference destination: one
-//! transaction carries truncate → deletes → plain bulk insert → residue →
-//! watermark, and the slot is only confirmed after that commit.
+//! transaction carries fence → truncate → deletes → plain bulk insert →
+//! residue → watermark → renewal, and the slot is only confirmed after that
+//! commit.
+//!
+//! Every statement that reaches a connection is in `mod store`. The apply body
+//! below writes through the `PgUnit` it is handed — a transaction whose first
+//! statement took this run's lease row `FOR UPDATE` — and cannot reach the
+//! pool at all, so a write outside a fence is not expressible here.
 
 use crate::error::{Error, Result};
+use crate::lease::{Fence, LeaseStore, Watermark};
 use crate::logbased::collapse::ResidueOp;
 use crate::logbased::drain::DrainOutcome;
 use crate::logbased::rowtext::{copy_escape, pk_indices, render_copy_row, row_key_refs};
 use crate::wire::pgoutput::Cell;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor, PgPool};
+use sqlx::Executor;
+
+pub(crate) use store::{PgStore, PgUnit};
 
 const STATE_CURSOR: &str = "_lsn";
 
-/// The schema half of a lease key. Keys are `PgParts::label()`, always
-/// qualified, so this never guesses.
-fn key_schema(key: &str) -> String {
-    crate::sink::postgres::PgParts::split(key).map(|p| p.schema).unwrap_or_else(|| "public".into())
-}
-
 pub(crate) struct PgDest {
-    pool: PgPool,
-    /// This run's token, set once by `set_run`. The apply path needs it to
-    /// FENCE itself — see `fence_tx` — and threading a `&RunId` through every
-    /// apply signature on five destinations to deliver one string was the
-    /// alternative.
+    store: PgStore,
+    /// This run's token, until the Tenure opens units itself: each entry
+    /// below is a shim that opens one unit, writes through it, and closes it.
     run_token: std::sync::Mutex<Option<String>>,
-    /// Where each destination table lives, resolved once per run by
-    /// `resolve_names` — the SAME rule the bulk lane uses, so the lock, the
-    /// scan, the lease and the fence all agree under any `search_path`.
-    parts: std::sync::Mutex<std::collections::HashMap<String, crate::sink::postgres::PgParts>>,
 }
 
 impl PgDest {
+    pub(crate) async fn connect(url: &str) -> Result<Self> {
+        Ok(Self { store: PgStore::connect(url).await?, run_token: Default::default() })
+    }
+
     pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
         *self.run_token.lock().expect("run token") = Some(run.token().to_string());
     }
 
-    fn token(&self) -> Option<String> {
-        self.run_token.lock().expect("run token").clone()
-    }
-
     /// Resolve every member's schema once, before a lease key is taken.
     pub(crate) async fn resolve_names(&self, tables: &[String]) -> Result<()> {
-        for t in tables {
-            let p = crate::sink::postgres::resolve_parts(&self.pool, t).await?;
-            self.parts.lock().expect("parts").insert(t.clone(), p);
-        }
-        Ok(())
-    }
-
-    /// The resolved parts of `dest_table`. A table the run did not resolve can
-    /// only be a qualified one written as such (every member is resolved before
-    /// its first lease key), so the fallback is the name as written.
-    fn parts_of(&self, dest_table: &str) -> crate::sink::postgres::PgParts {
-        if let Some(p) = self.parts.lock().expect("parts").get(dest_table) {
-            return p.clone();
-        }
-        debug_assert!(dest_table.contains('.'), "{dest_table}: lease key before resolve_names");
-        crate::sink::postgres::PgParts::split(dest_table).unwrap_or_else(|| {
-            crate::sink::postgres::PgParts { schema: "public".into(), bare: dest_table.into() }
-        })
+        self.store.resolve_names(tables).await
     }
 
     /// This destination as the guard sees it for one member — the bulk sink's
     /// `PgGuard`, in the schema that member resolved to — and its bare name.
     pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::postgres::PgGuard, String) {
-        let parts = self.parts_of(dest_table);
-        (crate::sink::postgres::PgGuard::new(self.pool.clone(), parts.schema), parts.bare)
-    }
-
-    /// FENCE: the first statement of every transaction this drain uses to write.
-    ///
-    /// A lapsed lease means "this run stopped renewing", and a run that is
-    /// merely PARTITIONED from its destination also stops renewing — so a lapse
-    /// alone cannot be allowed to authorise a collection while the victim is
-    /// still able to write. This closes that: the apply transaction takes its
-    /// own lease row `FOR UPDATE` before it touches any data and renews it in
-    /// the same transaction, and a collector's claim is an `UPDATE` of that same
-    /// row with `NOWAIT`. So either
-    ///
-    /// * this transaction takes the row first — the collector gets 55P03 at once
-    ///   and refuses, and this run is the only writer; or
-    /// * the collector takes it first and the lease really was lapsed — this
-    ///   returns zero rows, the transaction rolls back having written nothing,
-    ///   and the collector is the only writer.
-    ///
-    /// The interleaving that would hurt — fence passes, claim succeeds, then
-    /// this run writes — cannot happen, because the fence and the write are one
-    /// transaction holding one row lock for its whole duration.
-    ///
-    /// No lease (a run that never opened one, or an older destination) is not an
-    /// error: there is nothing to fence against, and refusing here would break
-    /// every path that writes state outside a leased drain.
-    async fn fence_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        dest_table: &str,
-    ) -> Result<()> {
-        let Some(token) = self.token() else { return Ok(()) };
-        let parts = self.parts_of(dest_table);
-        let key = parts.label();
-        let t = crate::sink::postgres::lease_table(&parts.schema);
-        let held: Option<(i32,)> = match sqlx::query_as(&format!(
-            "SELECT 1 FROM {t} WHERE dest_key = $1 AND token = $2 \
-               AND NOT collected AND expires_at > now() FOR UPDATE"
-        ))
-        .bind(&key)
-        .bind(&token)
-        .fetch_optional(&mut **tx)
-        .await
-        {
-            Ok(r) => r,
-            // No lease store: nothing to fence against. By SQLSTATE and by
-            // message — sqlx renders the server's text, not the code.
-            Err(e) if e.as_database_error().and_then(|d| d.code())
-                        .is_some_and(|c| c == "42P01")
-                      || e.to_string().contains("does not exist") => return Ok(()),
-            Err(e) => return Err(db_err(e)),
-        };
-        if held.is_none() {
-            // Either this run never opened a lease for this table, or its lease
-            // was collected. Distinguishing the two costs a second query and
-            // changes nothing: in both cases this transaction must not write.
-            let any: Option<(i32,)> = sqlx::query_as(&format!(
-                "SELECT 1 FROM {t} WHERE dest_key = $1 AND token = $2"
-            ))
-            .bind(&key)
-            .bind(&token)
-            .fetch_optional(&mut **tx)
-            .await
-            .unwrap_or(None);
-            if any.is_none() {
-                return Ok(());
-            }
-            return Err(Error::Locked(format!(
-                "{key}: this drain no longer holds the table — its claim lapsed and \
-                 another run collected it, so it is not allowed to write. Nothing was \
-                 written. Re-run; the other run either finished or will be collected \
-                 in turn."
-            )));
-        }
-        // Renew inside the same transaction: a long apply must not let its own
-        // lease expire while it holds the row (the keeper skips a locked row on
-        // purpose, because THIS is what renews it).
-        sqlx::query(&format!(
-            "UPDATE {t} SET expires_at = now() + make_interval(secs => $3) \
-             WHERE dest_key = $1 AND token = $2"
-        ))
-        .bind(&key)
-        .bind(&token)
-        .bind(crate::lease::ttl_secs() as f64)
-        .execute(&mut **tx)
-        .await
-        .map(|_| ())
-        .map_err(db_err)
+        self.store.pg_guard(dest_table)
     }
 
     /// The lease key — the SAME schema-qualified string the peer scan and the
@@ -161,66 +52,43 @@ impl PgDest {
     /// schema, so a bare key would put `sales.orders` and `hr.orders` in one key
     /// space and let a run in one schema collect a live drain in the other.
     pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        self.parts_of(dest_table).label()
+        self.store.lease_key(dest_table)
     }
 
-    /// All four delegate to the bulk sink's free functions, for the same reason
-    /// `announce`/`check_peers`/`release` do: both lanes must read and write the
-    /// same rows in the same table.
-    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId)
-        -> Result<()>
-    {
-        // Every key in a group shares a schema in practice, but not by
-        // construction — so group by schema rather than assume.
-        let mut by_schema: std::collections::HashMap<String, Vec<String>> = Default::default();
-        for k in keys {
-            by_schema.entry(key_schema(k)).or_default().push(k.clone());
-        }
-        for (schema, ks) in by_schema {
-            crate::sink::postgres::lease_open(&self.pool, &schema, &ks, run.token()).await?;
-        }
-        Ok(())
+    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
+        self.store.lease_open(keys, run.token()).await
     }
 
-    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId)
-        -> Result<u64>
-    {
-        let mut by_schema: std::collections::HashMap<String, Vec<String>> = Default::default();
-        for k in keys {
-            by_schema.entry(key_schema(k)).or_default().push(k.clone());
-        }
-        let mut n = 0;
-        for (schema, ks) in by_schema {
-            n += crate::sink::postgres::lease_renew(&self.pool, &schema, &ks, run.token()).await?;
-        }
-        Ok(n)
+    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
+        self.store.lease_renew(keys, run.token()).await
     }
 
-    pub(crate) async fn connect(url: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(url)
-            .await
-            .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))?;
-        Ok(Self { pool, run_token: std::sync::Mutex::new(None), parts: Default::default() })
+    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        self.store.read_state(dest_table, source_id).await
     }
 
-    /// The bootstrap's replace path lands data without constraints; the
-    /// drain's apply needs the identity — add it, then write the state row.
+    /// One unit over `dest_table`, for the shims below.
+    async fn unit(&self, dest_table: &str) -> Result<(PgUnit, String)> {
+        let token = self
+            .run_token
+            .lock()
+            .expect("run token")
+            .clone()
+            .ok_or_else(|| Error::Transfer("internal: a CDC write outside a run".into()))?;
+        let u = self.store.open_unit(&[self.store.lease_key(dest_table)], &token).await?;
+        Ok((u, token))
+    }
+
     /// Remove this table's watermark row — a failed group bootstrap must leave
     /// no state, or the next run refuses the group as torn.
     pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
-        sqlx::query("DELETE FROM _apitap_state WHERE dest_table IN ($1, $2) AND source_id = $3")
-            .bind(bare)
-            .bind(qualified)
-            .bind(source_id)
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Transfer(format!("log_based: clear state: {e}")))
+        let (u, token) = self.unit(dest_table).await?;
+        let mark = Watermark::Clear { table: dest_table.into(), source_id: source_id.into() };
+        self.store.close_unit(u, &token, vec![mark]).await
     }
 
+    /// The bootstrap's full load lands data without constraints; the drain's
+    /// apply needs the identity — add it, then write the state row, in one unit.
     pub(crate) async fn bootstrap_finish(
         &self,
         dest_table: &str,
@@ -229,160 +97,22 @@ impl PgDest {
         lsn: u64,
         rows: u64,
     ) -> Result<()> {
-        // The bootstrap's full load lands into a PK-less table on purpose (the
-        // constraint would slow the COPY), so the identity is added here. But
-        // "here" is not always a PK-less table: a destination previously built
-        // by a user-run replace carries the PK its DDL gave it, and a blind
-        // ADD PRIMARY KEY then fails with "multiple primary keys" AFTER the
-        // full load — a wasted bootstrap for a constraint that was already
-        // right. Ask the catalog first: an equal PK is the job already done; a
-        // DIFFERENT one is a real conflict the user has to resolve, refused
-        // with both spellings on the table.
-        let existing: Vec<String> = sqlx::query_scalar(
-            "SELECT a.attname FROM pg_index i \
-             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-             WHERE i.indrelid = $1::regclass AND i.indisprimary \
-               AND array_position(i.indkey, a.attnum) < i.indnkeyatts \
-             ORDER BY array_position(i.indkey, a.attnum)",
-        )
-        .bind(dest_table)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        if existing.is_empty() {
-            let pklist =
-                pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-            sqlx::query(&format!(
-                "ALTER TABLE {} ADD PRIMARY KEY ({pklist})",
-                quote_table(dest_table)
-            ))
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        } else if existing != pk_cols {
-            return Err(Error::InvalidInput(format!(
-                "log_based: {dest_table} already has PRIMARY KEY ({}) but the \
-                 source's key is ({}) — the drain would apply updates against \
-                 the wrong identity. Drop the destination table (or its \
-                 constraint) and re-run.",
-                existing.join(", "),
-                pk_cols.join(", "),
-            )));
-        }
-        self.ensure_state_table().await?;
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        upsert_state_tx(&mut tx, dest_table, source_id, lsn, rows).await?;
-        tx.commit().await.map_err(db_err)
+        let (mut u, token) = self.unit(dest_table).await?;
+        add_primary_key(&mut u, dest_table, pk_cols).await?;
+        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
+        self.store.close_unit(u, &token, vec![mark]).await
     }
 
     /// Write a bare state row — used for the source-identity marker, which
     /// is an ordinary row under a reserved `source_id` rather than a column
     /// the state table would have to grow.
-    pub(crate) async fn write_marker(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-        value: u64,
-    ) -> Result<()> {
-        self.ensure_state_table().await?;
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        upsert_state_tx(&mut tx, dest_table, source_id, value, 0).await?;
-        tx.commit().await.map_err(db_err)
+    pub(crate) async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
+        let (u, token) = self.unit(dest_table).await?;
+        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn: value, rows: 0 };
+        self.store.close_unit(u, &token, vec![mark]).await
     }
 
-    async fn ensure_state_table(&self) -> Result<()> {
-        self.pool
-            .execute(
-                "CREATE TABLE IF NOT EXISTS _apitap_state (\
-                   dest_table  text NOT NULL, \
-                   source_id   text NOT NULL, \
-                   cursor_col  text NOT NULL, \
-                   watermark   text, \
-                   mode        text NOT NULL, \
-                   last_rows   bigint NOT NULL DEFAULT 0, \
-                   synced_at   timestamptz NOT NULL DEFAULT now(), \
-                   PRIMARY KEY (dest_table, source_id))",
-            )
-            .await
-            .map(|_| ())
-            .or_else(|e| match &e {
-                // IF NOT EXISTS is not atomic: two first-runs bootstrapping
-                // into a fresh destination at once can both pass the existence
-                // check, and the loser raises 42P07 (duplicate_table) or 23505
-                // on pg_type's unique index. The table exists either way,
-                // which is the only thing this function promises. The bulk
-                // sink has carried the same tolerance for a long time; a group
-                // bootstrap fanning out per-table workers hits this window far
-                // more often than a human ever would.
-                sqlx::Error::Database(d)
-                    if matches!(d.code().as_deref(), Some("42P07") | Some("23505")) =>
-                {
-                    Ok(())
-                }
-                _ => Err(db_err(e)),
-            })?;
-        Ok(())
-    }
-
-    pub(crate) async fn read_state(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-    ) -> Result<Option<u64>> {
-        // Both spellings, because the bulk lane keys the same table as
-        // schema.bare where this lane keys it bare — see `naming::pg_state_keys`.
-        //
-        // And deliberately NOT filtered on mode. It used to be
-        // `AND mode = 'log_based'`, which reads like a safety check and is the
-        // opposite: a row written by the cursor lane was simply invisible, so a
-        // table that had been append-ed and was then pointed at log_based saw
-        // NO state, decided it was a fresh destination, and quietly ran a full
-        // bootstrap — discarding the incremental history and leaving two rows
-        // for one table in two vocabularies. Read the row whatever wrote it,
-        // and refuse below if it is not ours; that is the same shape the bulk
-        // lane's read now has, and the two directions have to match or the
-        // guard only works when you approach it from one side.
-        let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
-        let row: Option<(Option<String>, String, String)> = sqlx::query_as(
-            "SELECT watermark, cursor_col, mode FROM _apitap_state \
-             WHERE dest_table IN ($1, $2) AND source_id = $3 \
-             ORDER BY (dest_table = $1) DESC LIMIT 1",
-        )
-        .bind(bare)
-        .bind(qualified)
-        .bind(source_id)
-        .fetch_optional(&self.pool)
-        .await
-        .or_else(|e| match &e {
-            // No state table at all = fresh destination.
-            sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(None),
-            _ => Err(db_err(e)),
-        })?;
-        match row {
-            None => Ok(None),
-            Some((wm, cursor, mode)) => {
-                if mode != "log_based" || cursor != STATE_CURSOR {
-                    return Err(Error::InvalidInput(format!(
-                        "log_based: {dest_table} is managed by mode='{mode}' — its \
-                         state watermark tracks cursor '{cursor}', not an LSN, so a \
-                         CDC drain cannot resume from it. Keep using that mode, or \
-                         clear this table's _apitap_state rows (both the bare and \
-                         the schema-qualified spelling) to hand it to CDC, which \
-                         then re-bootstraps with a full load."
-                    )));
-                }
-                let wm = wm.ok_or_else(|| {
-                    Error::Transfer("log_based: state row has NULL watermark".into())
-                })?;
-                wm.parse::<u64>()
-                    .map(Some)
-                    .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{wm}'")))
-            }
-        }
-    }
-
-    /// Apply one collapsed window for one table in ONE destination transaction
-    /// (truncate → deletes → upserts → residue → watermark).
+    /// Apply one collapsed window for one table in ONE destination transaction.
     pub(crate) async fn apply(
         &self,
         dest_table: &str,
@@ -391,196 +121,583 @@ impl PgDest {
         outcome: &DrainOutcome,
         source_id: &str,
     ) -> Result<u64> {
-        let dst = &self.pool;
-        let Some(c) = outcome.tables.get(qualified_src) else {
-            // Foreign-table traffic only: nothing for our table, still advance.
-            self.ensure_state_table().await?;
-            let mut tx = dst.begin().await.map_err(db_err)?;
-            self.fence_tx(&mut tx, dest_table).await?;
-            upsert_state_tx(&mut tx, dest_table, source_id, outcome.end_lsn, 0).await?;
-            tx.commit().await.map_err(db_err)?;
-            return Ok(0);
-        };
-        let wal_cols = outcome
-            .wal_cols
-            .get(qualified_src)
-            .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+        let (mut u, token) = self.unit(dest_table).await?;
+        let (n, mark) = apply_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id).await?;
+        self.store.close_unit(u, &token, vec![mark]).await?;
+        Ok(n)
+    }
+}
 
-        self.ensure_state_table().await?;
-        let ft = quote_table(dest_table);
-        let collist = wal_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+/// The bootstrap's full load lands into a PK-less table on purpose (the
+/// constraint would slow the COPY), so the identity is added here. But "here"
+/// is not always a PK-less table: a destination previously built by a
+/// user-run replace carries the PK its DDL gave it, and a blind ADD PRIMARY
+/// KEY then fails with "multiple primary keys" AFTER the full load — a wasted
+/// bootstrap for a constraint that was already right. Ask the catalog first:
+/// an equal PK is the job already done; a DIFFERENT one is a real conflict the
+/// user has to resolve, refused with both spellings on the table.
+async fn add_primary_key(u: &mut PgUnit, dest_table: &str, pk_cols: &[String]) -> Result<()> {
+    let ft = u.table(0).qualified();
+    let existing: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE i.indrelid = $1::regclass AND i.indisprimary \
+           AND array_position(i.indkey, a.attnum) < i.indnkeyatts \
+         ORDER BY array_position(i.indkey, a.attnum)",
+    )
+    .bind(&ft)
+    .fetch_all(&mut **u.tx())
+    .await
+    .map_err(db_err)?;
+    if existing.is_empty() {
         let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        u.tx().execute(format!("ALTER TABLE {ft} ADD PRIMARY KEY ({pklist})").as_str()).await.map_err(db_err)?;
+    } else if existing != pk_cols {
+        return Err(Error::InvalidInput(format!(
+            "log_based: {dest_table} already has PRIMARY KEY ({}) but the \
+             source's key is ({}) — the drain would apply updates against \
+             the wrong identity. Drop the destination table (or its \
+             constraint) and re-run.",
+            existing.join(", "),
+            pk_cols.join(", "),
+        )));
+    }
+    Ok(())
+}
 
-        let mut tx = dst.begin().await.map_err(db_err)?;
-        // FIRST statement of the transaction that writes data — see `fence_tx`.
-        self.fence_tx(&mut tx, dest_table).await?;
+/// Apply one collapsed window for one table (truncate → deletes → upserts →
+/// residue) inside the unit, and name the watermark its close writes. A window
+/// with no traffic for this table writes nothing but that mark.
+async fn apply_unit(
+    u: &mut PgUnit,
+    dest_table: &str,
+    qualified_src: &str,
+    pk_cols: &[String],
+    outcome: &DrainOutcome,
+    source_id: &str,
+) -> Result<(u64, Watermark)> {
+    let set = |rows: u64| Watermark::Set {
+        table: dest_table.to_string(),
+        source_id: source_id.to_string(),
+        lsn: outcome.end_lsn,
+        rows,
+    };
+    let Some(c) = outcome.tables.get(qualified_src) else {
+        // Foreign-table traffic only: nothing for our table, still advance.
+        return Ok((0, set(0)));
+    };
+    let wal_cols = outcome
+        .wal_cols
+        .get(qualified_src)
+        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
 
-        if c.truncate {
-            tx.execute(format!("TRUNCATE {ft}").as_str()).await.map_err(db_err)?;
-        }
+    let ft = u.table(0).qualified();
+    let collist = wal_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+    let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+    let tx = u.tx();
 
-        // Delete phase covers the delete-set UNION every upsert's key: clearing
-        // the way first turns 450K index-probing ON CONFLICT upserts into 450K
-        // plain inserts (ape-dts's rdb_merge trick — measured 5x here).
-        let pk_idx = pk_indices(pk_cols, wal_cols)?;
-        let clear_keys = !c.deletes.is_empty() || !c.upserts.is_empty();
-        if clear_keys {
-            tx.execute(
-                format!(
-                    "CREATE TEMP TABLE _ap_del ON COMMIT DROP AS \
-                     SELECT {pklist} FROM {ft} WHERE false"
-                )
-                .as_str(),
+    if c.truncate {
+        tx.execute(format!("TRUNCATE {ft}").as_str()).await.map_err(db_err)?;
+    }
+
+    // Delete phase covers the delete-set UNION every upsert's key: clearing
+    // the way first turns 450K index-probing ON CONFLICT upserts into 450K
+    // plain inserts (ape-dts's rdb_merge trick — measured 5x here).
+    let pk_idx = pk_indices(pk_cols, wal_cols)?;
+    let clear_keys = !c.deletes.is_empty() || !c.upserts.is_empty();
+    if clear_keys {
+        tx.execute(
+            format!(
+                "CREATE TEMP TABLE _ap_del ON COMMIT DROP AS \
+                 SELECT {pklist} FROM {ft} WHERE false"
             )
+            .as_str(),
+        )
+        .await
+        .map_err(db_err)?;
+        let mut copy = tx
+            .copy_in_raw(&format!("COPY _ap_del ({pklist}) FROM STDIN"))
             .await
             .map_err(db_err)?;
-            let mut copy = tx
-                .copy_in_raw(&format!("COPY _ap_del ({pklist}) FROM STDIN"))
-                .await
-                .map_err(db_err)?;
-            let mut buf = Vec::with_capacity(4 << 20);
-            for key in &c.deletes {
-                let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-                render_key_row(&refs, &mut buf);
-                if buf.len() > 4 << 20 {
-                    // send(&buf) keeps the 4 MiB capacity — mem::take would
-                    // regrow it from zero every chunk on the timed path.
-                    copy.send(&buf[..]).await.map_err(db_err)?;
-                    buf.clear();
-                }
-            }
-            for row in &c.upserts {
-                render_key_row(&row_key_refs(row, &pk_idx), &mut buf);
-                if buf.len() > 4 << 20 {
-                    copy.send(&buf[..]).await.map_err(db_err)?;
-                    buf.clear();
-                }
-            }
-            if !buf.is_empty() {
+        let mut buf = Vec::with_capacity(4 << 20);
+        for key in &c.deletes {
+            let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+            render_key_row(&refs, &mut buf);
+            if buf.len() > 4 << 20 {
+                // send(&buf) keeps the 4 MiB capacity — mem::take would
+                // regrow it from zero every chunk on the timed path.
                 copy.send(&buf[..]).await.map_err(db_err)?;
+                buf.clear();
             }
-            copy.finish().await.map_err(db_err)?;
-            let join = pk_cols
-                .iter()
-                .map(|k| format!("{ft}.{k} = _ap_del.{k}", k = quote_ident(k)))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            tx.execute(format!("DELETE FROM {ft} USING _ap_del WHERE {join}").as_str())
-                .await
-                .map_err(db_err)?;
         }
-
-        // Upsert phase: COPY into a temp twin, then one plain INSERT.
-        if !c.upserts.is_empty() {
-            tx.execute(
-                format!(
-                    "CREATE TEMP TABLE _ap_up ON COMMIT DROP AS \
-                     SELECT {collist} FROM {ft} WHERE false"
-                )
-                .as_str(),
-            )
-            .await
-            .map_err(db_err)?;
-            let mut copy = tx
-                .copy_in_raw(&format!("COPY _ap_up ({collist}) FROM STDIN"))
-                .await
-                .map_err(db_err)?;
-            let mut buf = Vec::with_capacity(4 << 20);
-            for row in &c.upserts {
-                render_copy_row(row, &mut buf)?;
-                if buf.len() > 4 << 20 {
-                    copy.send(&buf[..]).await.map_err(db_err)?;
-                    buf.clear();
-                }
-            }
-            if !buf.is_empty() {
+        for row in &c.upserts {
+            render_key_row(&row_key_refs(row, &pk_idx), &mut buf);
+            if buf.len() > 4 << 20 {
                 copy.send(&buf[..]).await.map_err(db_err)?;
+                buf.clear();
             }
-            copy.finish().await.map_err(db_err)?;
-            // No ON CONFLICT: the delete phase already removed every one of
-            // these keys, so this is a straight bulk insert.
-            tx.execute(
-                format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up").as_str(),
-            )
+        }
+        if !buf.is_empty() {
+            copy.send(&buf[..]).await.map_err(db_err)?;
+        }
+        copy.finish().await.map_err(db_err)?;
+        let join = pk_cols
+            .iter()
+            .map(|k| format!("{ft}.{k} = _ap_del.{k}", k = quote_ident(k)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        tx.execute(format!("DELETE FROM {ft} USING _ap_del WHERE {join}").as_str())
             .await
             .map_err(db_err)?;
+    }
+
+    // Upsert phase: COPY into a temp twin, then one plain INSERT.
+    if !c.upserts.is_empty() {
+        tx.execute(
+            format!(
+                "CREATE TEMP TABLE _ap_up ON COMMIT DROP AS \
+                 SELECT {collist} FROM {ft} WHERE false"
+            )
+            .as_str(),
+        )
+        .await
+        .map_err(db_err)?;
+        let mut copy = tx
+            .copy_in_raw(&format!("COPY _ap_up ({collist}) FROM STDIN"))
+            .await
+            .map_err(db_err)?;
+        let mut buf = Vec::with_capacity(4 << 20);
+        for row in &c.upserts {
+            render_copy_row(row, &mut buf)?;
+            if buf.len() > 4 << 20 {
+                copy.send(&buf[..]).await.map_err(db_err)?;
+                buf.clear();
+            }
+        }
+        if !buf.is_empty() {
+            copy.send(&buf[..]).await.map_err(db_err)?;
+        }
+        copy.finish().await.map_err(db_err)?;
+        // No ON CONFLICT: the delete phase already removed every one of
+        // these keys, so this is a straight bulk insert.
+        tx.execute(
+            format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up").as_str(),
+        )
+        .await
+        .map_err(db_err)?;
+    }
+
+    // Residue tail: serial, ordered (masked updates and their followers).
+    for op in &c.residue {
+        let sql = match op {
+            ResidueOp::MaskedUpdate { key, row } => {
+                let sets = wal_cols
+                    .iter()
+                    .zip(row.iter())
+                    .filter(|(cname, cell)| {
+                        !matches!(cell, Cell::UnchangedToast) && !pk_cols.contains(cname)
+                    })
+                    .map(|(cname, cell)| {
+                        format!("{} = {}", quote_ident(cname), cell_literal(cell))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if sets.is_empty() {
+                    continue;
+                }
+                format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, key))
+            }
+            ResidueOp::Upsert { row } => {
+                let vals = row.iter().map(cell_literal).collect::<Vec<_>>().join(", ");
+                let updates = wal_cols
+                    .iter()
+                    .filter(|cname| !pk_cols.contains(cname))
+                    .map(|cname| format!("{q} = EXCLUDED.{q}", q = quote_ident(cname)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let action = if updates.is_empty() {
+                    "DO NOTHING".to_string()
+                } else {
+                    format!("DO UPDATE SET {updates}")
+                };
+                format!(
+                    "INSERT INTO {ft} ({collist}) VALUES ({vals}) \
+                     ON CONFLICT ({pklist}) {action}"
+                )
+            }
+            ResidueOp::Delete { key } => {
+                format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key))
+            }
+            ResidueOp::Rekey { old_key, row, .. } => {
+                // Move the row rather than delete-and-reinsert. The columns
+                // this UPDATE does not name keep their values, and the one
+                // that matters here — the TOASTed cell the source did not
+                // resend — is exactly such a column.
+                //
+                // The PK columns ARE included, unlike MaskedUpdate: moving
+                // the key is the entire point.
+                let sets = wal_cols
+                    .iter()
+                    .zip(row.iter())
+                    .filter(|(_, cell)| !matches!(cell, Cell::UnchangedToast))
+                    .map(|(cname, cell)| {
+                        format!("{} = {}", quote_ident(cname), cell_literal(cell))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if sets.is_empty() {
+                    // Unreachable: the key changed, so at least one PK
+                    // column carries a real value.
+                    continue;
+                }
+                // Idempotent on replay by construction: once the move has
+                // been applied the old key is gone, so a re-applied window
+                // matches zero rows and changes nothing.
+                format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, old_key))
+            }
+        };
+        tx.execute(sql.as_str()).await.map_err(db_err)?;
+    }
+
+    Ok((c.events, set(c.events)))
+}
+
+/// Everything that holds a connection. See the module doc.
+mod store {
+    use super::{db_err, upsert_state_tx, STATE_CURSOR};
+    use crate::error::{Error, Result};
+    use crate::guard::GuardStore;
+    use crate::lease::{no_longer_holds, Fence, LeaseStore, Watermark};
+    use crate::sink::postgres::{lease_table, PgGuard, PgParts};
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::{Executor, PgPool, Postgres};
+    use std::collections::{BTreeMap, HashMap};
+
+    /// The schema half of a lease key. Keys are `PgParts::label()`, always
+    /// qualified, so this never guesses.
+    fn key_schema(key: &str) -> String {
+        PgParts::split(key).map(|p| p.schema).unwrap_or_else(|| "public".into())
+    }
+
+    /// Every key in a group shares a schema in practice, but not by
+    /// construction — so group by schema rather than assume.
+    fn by_schema(keys: &[String]) -> BTreeMap<String, Vec<String>> {
+        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for k in keys {
+            m.entry(key_schema(k)).or_default().push(k.clone());
+        }
+        m
+    }
+
+    pub(crate) struct PgStore {
+        /// The apply lanes' connections.
+        pool: PgPool,
+        /// The keeper's own connection. On the two-connection apply pool, two
+        /// lanes each holding a unit left the keeper nothing to renew with,
+        /// and the members waiting their turn lapsed under a live run.
+        keeper_pool: PgPool,
+        /// Where each destination table lives, resolved once per run by
+        /// `resolve_names` — the SAME rule the bulk lane uses, so the lock, the
+        /// scan, the lease and the fence all agree under any `search_path`.
+        parts: std::sync::Mutex<HashMap<String, PgParts>>,
+        state_ready: std::sync::atomic::AtomicBool,
+    }
+
+    /// One fenced transaction. Dropped without `close_unit`, it rolls back.
+    pub(crate) struct PgUnit {
+        tx: sqlx::Transaction<'static, Postgres>,
+        parts: Vec<PgParts>,
+    }
+
+    impl PgUnit {
+        pub(crate) fn tx(&mut self) -> &mut sqlx::Transaction<'static, Postgres> {
+            &mut self.tx
         }
 
-        // Residue tail: serial, ordered (masked updates and their followers).
-        for op in &c.residue {
-            let sql = match op {
-                ResidueOp::MaskedUpdate { key, row } => {
-                    let sets = wal_cols
-                        .iter()
-                        .zip(row.iter())
-                        .filter(|(cname, cell)| {
-                            !matches!(cell, Cell::UnchangedToast) && !pk_cols.contains(cname)
-                        })
-                        .map(|(cname, cell)| {
-                            format!("{} = {}", quote_ident(cname), cell_literal(cell))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if sets.is_empty() {
-                        continue;
-                    }
-                    format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, key))
-                }
-                ResidueOp::Upsert { row } => {
-                    let vals = row.iter().map(cell_literal).collect::<Vec<_>>().join(", ");
-                    let updates = wal_cols
-                        .iter()
-                        .filter(|cname| !pk_cols.contains(cname))
-                        .map(|cname| format!("{q} = EXCLUDED.{q}", q = quote_ident(cname)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let action = if updates.is_empty() {
-                        "DO NOTHING".to_string()
-                    } else {
-                        format!("DO UPDATE SET {updates}")
-                    };
-                    format!(
-                        "INSERT INTO {ft} ({collist}) VALUES ({vals}) \
-                         ON CONFLICT ({pklist}) {action}"
-                    )
-                }
-                ResidueOp::Delete { key } => {
-                    format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key))
-                }
-                ResidueOp::Rekey { old_key, row, .. } => {
-                    // Move the row rather than delete-and-reinsert. The columns
-                    // this UPDATE does not name keep their values, and the one
-                    // that matters here — the TOASTed cell the source did not
-                    // resend — is exactly such a column.
-                    //
-                    // The PK columns ARE included, unlike MaskedUpdate: moving
-                    // the key is the entire point.
-                    let sets = wal_cols
-                        .iter()
-                        .zip(row.iter())
-                        .filter(|(_, cell)| !matches!(cell, Cell::UnchangedToast))
-                        .map(|(cname, cell)| {
-                            format!("{} = {}", quote_ident(cname), cell_literal(cell))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if sets.is_empty() {
-                        // Unreachable: the key changed, so at least one PK
-                        // column carries a real value.
-                        continue;
-                    }
-                    // Idempotent on replay by construction: once the move has
-                    // been applied the old key is gone, so a re-applied window
-                    // matches zero rows and changes nothing.
-                    format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, old_key))
-                }
+        /// The i-th member of the unit, as resolved: `qualified()` is the only
+        /// spelling a data statement uses.
+        pub(crate) fn table(&self, i: usize) -> &PgParts {
+            &self.parts[i]
+        }
+    }
+
+    impl PgStore {
+        pub(crate) async fn connect(url: &str) -> Result<Self> {
+            let connect = |n: u32| async move {
+                PgPoolOptions::new()
+                    .max_connections(n)
+                    .connect(url)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))
             };
-            tx.execute(sql.as_str()).await.map_err(db_err)?;
+            Ok(Self {
+                pool: connect(2).await?,
+                keeper_pool: connect(1).await?,
+                parts: Default::default(),
+                state_ready: Default::default(),
+            })
         }
 
-        upsert_state_tx(&mut tx, dest_table, source_id, outcome.end_lsn, c.events).await?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(c.events)
+        #[cfg(test)]
+        pub(crate) fn lazy(url: &str) -> Self {
+            let lazy = || PgPoolOptions::new().connect_lazy(url).unwrap();
+            Self { pool: lazy(), keeper_pool: lazy(), parts: Default::default(), state_ready: Default::default() }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn pin(&self, table: &str, p: PgParts) {
+            self.parts.lock().expect("parts").insert(table.to_string(), p);
+        }
+
+        pub(crate) async fn resolve_names(&self, tables: &[String]) -> Result<()> {
+            for t in tables {
+                let p = crate::sink::postgres::resolve_parts(&self.pool, t).await?;
+                self.parts.lock().expect("parts").insert(t.clone(), p);
+            }
+            Ok(())
+        }
+
+        /// The resolved parts of `dest_table`. A table the run did not resolve
+        /// can only be a qualified one written as such (every member is
+        /// resolved before its first lease key), so the fallback is the name
+        /// as written.
+        fn parts_of(&self, dest_table: &str) -> PgParts {
+            if let Some(p) = self.parts.lock().expect("parts").get(dest_table) {
+                return p.clone();
+            }
+            debug_assert!(dest_table.contains('.'), "{dest_table}: lease key before resolve_names");
+            PgParts::split(dest_table)
+                .unwrap_or_else(|| PgParts { schema: "public".into(), bare: dest_table.into() })
+        }
+
+        pub(crate) fn pg_guard(&self, dest_table: &str) -> (PgGuard, String) {
+            let parts = self.parts_of(dest_table);
+            (PgGuard::new(self.pool.clone(), parts.schema), parts.bare)
+        }
+
+        /// Created outside any unit: IF NOT EXISTS is not atomic, and the
+        /// loser of a race raises inside whatever transaction it is in.
+        async fn ensure_state_table(&self) -> Result<()> {
+            if self.state_ready.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+            self.pool
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS _apitap_state (\
+                       dest_table  text NOT NULL, \
+                       source_id   text NOT NULL, \
+                       cursor_col  text NOT NULL, \
+                       watermark   text, \
+                       mode        text NOT NULL, \
+                       last_rows   bigint NOT NULL DEFAULT 0, \
+                       synced_at   timestamptz NOT NULL DEFAULT now(), \
+                       PRIMARY KEY (dest_table, source_id))",
+                )
+                .await
+                .map(|_| ())
+                .or_else(|e| match &e {
+                    // IF NOT EXISTS is not atomic: two first-runs bootstrapping
+                    // into a fresh destination at once can both pass the
+                    // existence check, and the loser raises 42P07
+                    // (duplicate_table) or 23505 on pg_type's unique index. The
+                    // table exists either way, which is the only thing this
+                    // function promises.
+                    sqlx::Error::Database(d)
+                        if matches!(d.code().as_deref(), Some("42P07") | Some("23505")) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(db_err(e)),
+                })?;
+            self.state_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+            // Both spellings, because the bulk lane keys the same table as
+            // schema.bare where this lane keys it bare — see
+            // `naming::pg_state_keys`.
+            //
+            // And deliberately NOT filtered on mode. A row written by the
+            // cursor lane used to be simply invisible, so a table that had been
+            // append-ed and was then pointed at log_based saw NO state, decided
+            // it was a fresh destination, and quietly ran a full bootstrap.
+            // Read the row whatever wrote it, and refuse below if it is not
+            // ours; the bulk lane's read has the same shape.
+            let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
+            let row: Option<(Option<String>, String, String)> = sqlx::query_as(
+                "SELECT watermark, cursor_col, mode FROM _apitap_state \
+                 WHERE dest_table IN ($1, $2) AND source_id = $3 \
+                 ORDER BY (dest_table = $1) DESC LIMIT 1",
+            )
+            .bind(bare)
+            .bind(qualified)
+            .bind(source_id)
+            .fetch_optional(&self.pool)
+            .await
+            .or_else(|e| match &e {
+                // No state table at all = fresh destination.
+                sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(None),
+                _ => Err(db_err(e)),
+            })?;
+            match row {
+                None => Ok(None),
+                Some((wm, cursor, mode)) => {
+                    if mode != "log_based" || cursor != STATE_CURSOR {
+                        return Err(Error::InvalidInput(format!(
+                            "log_based: {dest_table} is managed by mode='{mode}' — its \
+                             state watermark tracks cursor '{cursor}', not an LSN, so a \
+                             CDC drain cannot resume from it. Keep using that mode, or \
+                             clear this table's _apitap_state rows (both the bare and \
+                             the schema-qualified spelling) to hand it to CDC, which \
+                             then re-bootstraps with a full load."
+                        )));
+                    }
+                    let wm = wm.ok_or_else(|| {
+                        Error::Transfer("log_based: state row has NULL watermark".into())
+                    })?;
+                    wm.parse::<u64>()
+                        .map(Some)
+                        .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{wm}'")))
+                }
+            }
+        }
+
+        /// The schemas this run's keys can live in.
+        fn schemas(&self) -> Vec<String> {
+            let mut v: Vec<String> =
+                self.parts.lock().expect("parts").values().map(|p| p.schema.clone()).collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+    }
+
+    impl LeaseStore for PgStore {
+        fn lease_key(&self, dest_table: &str) -> String {
+            self.parts_of(dest_table).label()
+        }
+
+        async fn lease_open(&self, keys: &[String], token: &str) -> Result<()> {
+            for (schema, ks) in by_schema(keys) {
+                crate::sink::postgres::lease_open(&self.pool, &schema, &ks, token).await?;
+            }
+            Ok(())
+        }
+
+        async fn lease_renew(&self, keys: &[String], token: &str) -> Result<u64> {
+            let mut n = 0;
+            for (schema, ks) in by_schema(keys) {
+                n += crate::sink::postgres::lease_renew(&self.keeper_pool, &schema, &ks, token).await?;
+            }
+            Ok(n)
+        }
+
+        async fn lease_unclaimed(&self, token: &str) -> Result<Vec<String>> {
+            let mut out = Vec::new();
+            for schema in self.schemas() {
+                out.extend(crate::sink::postgres::lease_unclaimed(&self.keeper_pool, &schema, token).await?);
+            }
+            Ok(out)
+        }
+
+        async fn close_run(&self, _token: &str) {}
+    }
+
+    impl Fence for PgStore {
+        type Unit<'a> = PgUnit;
+
+        fn guard(&self, dest_table: &str) -> (Box<dyn GuardStore + '_>, String) {
+            let (g, bare) = self.pg_guard(dest_table);
+            (Box::new(g), bare)
+        }
+
+        /// FENCE: the first statement of every transaction this drain writes
+        /// with takes its own lease row `FOR UPDATE`, and a collector's claim
+        /// is an `UPDATE … NOWAIT` of that same row. Either this transaction
+        /// takes the row first — the collector gets 55P03 and refuses, and this
+        /// run is the only writer — or the collector took it first, this finds
+        /// the row collected, and the transaction ends having written nothing.
+        /// The interleaving that would hurt (fence passes, claim succeeds, this
+        /// run writes) cannot happen: fence and writes are one transaction
+        /// holding one row lock throughout.
+        ///
+        /// No row is not an owner: 0.56.0 read "no lease" as "nothing to fence
+        /// against" and wrote. Expiry is not part of it either — a lapse nobody
+        /// claimed is still this run's, and the close renews it.
+        async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<PgUnit> {
+            self.ensure_state_table().await?;
+            let mut tx = self.pool.begin().await.map_err(db_err)?;
+            // Sorted, so two lanes never take two rows in opposite orders.
+            let mut sorted: Vec<&String> = keys.iter().collect();
+            sorted.sort();
+            for k in sorted {
+                let held: Option<(i32,)> = match sqlx::query_as(&format!(
+                    "SELECT 1 FROM {} WHERE dest_key = $1 AND token = $2 AND NOT collected FOR UPDATE",
+                    lease_table(&key_schema(k))
+                ))
+                .bind(k)
+                .bind(token)
+                .fetch_optional(&mut *tx)
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) if e.as_database_error().and_then(|d| d.code()).is_some_and(|c| c == "42P01") => None,
+                    Err(e) => return Err(db_err(e)),
+                };
+                if held.is_none() {
+                    return Err(no_longer_holds(keys));
+                }
+            }
+            let parts = keys
+                .iter()
+                .map(|k| PgParts::split(k).unwrap_or_else(|| PgParts { schema: "public".into(), bare: k.clone() }))
+                .collect();
+            Ok(PgUnit { tx, parts })
+        }
+
+        /// Every mark, then the renewal — `clock_timestamp()`, not `now()`,
+        /// which is the transaction's START and would hand a long apply a
+        /// lease that expires the moment it commits — then COMMIT. A renewal
+        /// that touches no row means the claim is gone: roll back.
+        async fn close_unit<'a>(&'a self, mut u: PgUnit, token: &str, marks: Vec<Watermark>) -> Result<()> {
+            for m in &marks {
+                match m {
+                    Watermark::Set { table, source_id, lsn, rows } => {
+                        upsert_state_tx(&mut u.tx, table, source_id, *lsn, *rows).await?
+                    }
+                    Watermark::Clear { table, source_id } => {
+                        let (bare, qualified) = crate::naming::pg_state_keys(table);
+                        sqlx::query("DELETE FROM _apitap_state WHERE dest_table IN ($1, $2) AND source_id = $3")
+                            .bind(bare)
+                            .bind(qualified)
+                            .bind(source_id)
+                            .execute(&mut *u.tx)
+                            .await
+                            .map_err(db_err)?;
+                    }
+                }
+            }
+            let mut keys: Vec<String> = u.parts.iter().map(|p| p.label()).collect();
+            keys.sort();
+            for k in &keys {
+                let r = sqlx::query(&format!(
+                    "UPDATE {} SET expires_at = clock_timestamp() + make_interval(secs => $3) \
+                     WHERE dest_key = $1 AND token = $2 AND NOT collected",
+                    lease_table(&key_schema(k))
+                ))
+                .bind(k)
+                .bind(token)
+                .bind(crate::lease::ttl_secs() as f64)
+                .execute(&mut *u.tx)
+                .await
+                .map_err(db_err)?;
+                if r.rows_affected() != 1 {
+                    return Err(no_longer_holds(&keys));
+                }
+            }
+            u.tx.commit().await.map_err(db_err)
+        }
     }
 }
 
@@ -596,37 +713,6 @@ pub(crate) fn quote_ident(s: &str) -> String {
 
 pub(crate) fn quote_table(t: &str) -> String {
     t.split('.').map(quote_ident).collect::<Vec<_>>().join(".")
-}
-
-async fn upsert_state_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    dest_table: &str,
-    source_id: &str,
-    lsn: u64,
-    rows: u64,
-) -> Result<()> {
-    // The spelling this lane has always written, unchanged: every "clear the
-    // state row" message, every runbook and every fixture names it. The
-    // dual-spelling READ above is what reaches the bulk lane's row; nothing
-    // needs to move on disk for that to work.
-    let (bare, _qualified) = crate::naming::pg_state_keys(dest_table);
-    sqlx::query(
-        "INSERT INTO _apitap_state \
-           (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
-         VALUES ($1, $2, $3, $4, 'log_based', $5, now()) \
-         ON CONFLICT (dest_table, source_id) DO UPDATE SET \
-           cursor_col = EXCLUDED.cursor_col, watermark = EXCLUDED.watermark, \
-           mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()",
-    )
-    .bind(bare)
-    .bind(source_id)
-    .bind(STATE_CURSOR)
-    .bind(lsn.to_string())
-    .bind(rows as i64)
-    .execute(&mut **tx)
-    .await
-    .map_err(db_err)?;
-    Ok(())
 }
 
 fn render_key_row(key: &[&[u8]], out: &mut Vec<u8>) {
@@ -663,6 +749,37 @@ fn key_pred(pk_cols: &[String], key: &[Vec<u8>]) -> String {
         .join(" AND ")
 }
 
+async fn upsert_state_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dest_table: &str,
+    source_id: &str,
+    lsn: u64,
+    rows: u64,
+) -> Result<()> {
+    // The spelling this lane has always written, unchanged: every "clear the
+    // state row" message, every runbook and every fixture names it. The
+    // dual-spelling READ above is what reaches the bulk lane's row; nothing
+    // needs to move on disk for that to work.
+    let (bare, _qualified) = crate::naming::pg_state_keys(dest_table);
+    sqlx::query(
+        "INSERT INTO _apitap_state \
+           (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
+         VALUES ($1, $2, $3, $4, 'log_based', $5, now()) \
+         ON CONFLICT (dest_table, source_id) DO UPDATE SET \
+           cursor_col = EXCLUDED.cursor_col, watermark = EXCLUDED.watermark, \
+           mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()",
+    )
+    .bind(bare)
+    .bind(source_id)
+    .bind(STATE_CURSOR)
+    .bind(lsn.to_string())
+    .bind(rows as i64)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,15 +794,16 @@ mod tests {
     #[test]
     fn lease_key_is_dest_label() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let pool = PgPoolOptions::new().connect_lazy("postgres://u@127.0.0.1:1/db").unwrap();
-            let d = PgDest { pool: pool.clone(), run_token: Default::default(), parts: Default::default() };
+            let url = "postgres://u@127.0.0.1:1/db";
+            let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy(url).unwrap();
+            let d = PgStore::lazy(url);
             let cases = [
                 ("orders", PgParts { schema: "cdcdest".into(), bare: "orders".into() }),
                 ("events", PgParts { schema: "public".into(), bare: "events".into() }),
                 ("Mixed Case", PgParts { schema: "postgres".into(), bare: "Mixed Case".into() }),
             ];
             for (t, p) in &cases {
-                d.parts.lock().unwrap().insert(t.to_string(), p.clone());
+                d.pin(t, p.clone());
                 assert_eq!(d.lease_key(t), PgGuard::new(pool.clone(), p.schema.clone()).dest_label(&p.bare),
                            "{t}");
             }
@@ -693,5 +811,11 @@ mod tests {
             assert_eq!(d.lease_key("sales.orders"),
                        PgGuard::new(pool.clone(), "sales").dest_label("orders"));
         });
+    }
+
+    #[test]
+    fn qualified_quotes_each_half() {
+        let p = PgParts { schema: "my.schema".into(), bare: "a\"b".into() };
+        assert_eq!(p.qualified(), "\"my.schema\".\"a\"\"b\"");
     }
 }
