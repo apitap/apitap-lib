@@ -109,36 +109,6 @@ pub(crate) fn precheck_changelog(dst_url: &str, opts: &TransferOptions) -> Resul
     Ok(())
 }
 
-/// The guard for a destination that has none: Iceberg drains (see
-/// `Dest::guard`). Announces nothing, sees nothing, holds no lease.
-struct NoGuard;
-
-#[async_trait::async_trait]
-impl GuardStore for NoGuard {
-    fn limit(&self) -> usize {
-        crate::naming::ROOMY
-    }
-    fn dest_label(&self, bare: &str) -> String {
-        bare.to_string()
-    }
-    async fn list(&self, _bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
-        Ok(Vec::new())
-    }
-    async fn create_marker(&self, _raw: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn drop_object(&self, _raw: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn lease_get(&self, _key: &str, _token: &str) -> Result<Option<crate::lease::Lease>> {
-        Ok(None)
-    }
-    async fn lease_claim(&self, _key: &str, _token: &str) -> Result<crate::guard::Claim> {
-        Ok(crate::guard::Claim::Absent)
-    }
-    async fn lease_close(&self, _proof: crate::guard::Released) {}
-}
-
 /// Give back every announcement this drain holds: its markers, and only then
 /// — with the proof that every marker is gone — its lease. A lease closed while
 /// its lock stands is the permanent wedge; `Released` makes it unwritable.
@@ -218,7 +188,10 @@ impl Dest {
                 let (g, b) = d.guard(dest_table);
                 (Box::new(g), b)
             }
-            Dest::Ice(_) => (Box::new(NoGuard), dest_table.to_string()),
+            Dest::Ice(d) => {
+                let (g, b) = d.guard(dest_table);
+                (Box::new(g), b)
+            }
         }
     }
 
@@ -241,15 +214,18 @@ impl Dest {
             Dest::My(d) => d.set_run(run),
             Dest::Ch(d) => d.set_run(run),
             Dest::Bq(d) => d.set_run(run),
-            Dest::Ice(_) => {}
+            Dest::Ice(d) => d.set_run(run),
         }
     }
 
     /// Drop what the run holds that is not tied to one table — BigQuery's
-    /// per-run fence table. Nothing elsewhere.
+    /// per-run fence table, Iceberg's note of the keys it opened. Nothing
+    /// elsewhere.
     async fn close_run(&self, token: &str) {
-        if let Dest::Bq(d) = self {
-            d.close_run(token).await
+        match self {
+            Dest::Bq(d) => d.close_run(token).await,
+            Dest::Ice(d) => d.close_run(token).await,
+            Dest::Pg(_) | Dest::My(_) | Dest::Ch(_) => {}
         }
     }
 
@@ -265,7 +241,7 @@ impl Dest {
             Dest::My(d) => d.lease_open(keys, run).await,
             Dest::Ch(d) => d.lease_open(keys, run).await,
             Dest::Bq(d) => d.lease_open(keys, run).await,
-            Dest::Ice(_) => Ok(()),
+            Dest::Ice(d) => d.lease_open(keys, run).await,
         }
     }
 
@@ -275,7 +251,7 @@ impl Dest {
             Dest::My(d) => d.lease_renew(keys, run).await,
             Dest::Ch(d) => d.lease_renew(keys, run).await,
             Dest::Bq(d) => d.lease_renew(keys, run).await,
-            Dest::Ice(_) => Ok(0),
+            Dest::Ice(d) => d.lease_renew(keys, run).await,
         }
     }
 
@@ -287,7 +263,7 @@ impl Dest {
             Dest::My(d) => d.lease_key(dest_table),
             Dest::Ch(d) => d.lease_key(dest_table),
             Dest::Bq(d) => d.lease_key(dest_table),
-            Dest::Ice(_) => dest_table.to_string(),
+            Dest::Ice(d) => d.lease_key(dest_table),
         }
     }
 

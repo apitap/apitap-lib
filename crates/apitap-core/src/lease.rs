@@ -357,7 +357,9 @@ impl<F: Fence> Tenure<F> {
         Self::acquire_every(dest, tables, run, std::time::Duration::from_secs(renew_secs())).await
     }
 
-    async fn acquire_every(
+    /// `acquire` with the keeper's period given, so a store's tests can watch
+    /// its keeper tick in milliseconds.
+    pub(crate) async fn acquire_every(
         dest: std::sync::Arc<F>,
         tables: &[String],
         run: RunId,
