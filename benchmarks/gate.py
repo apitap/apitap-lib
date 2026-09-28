@@ -159,6 +159,8 @@ LEGS = [
                 "guard.no-lease-no-collect": ("bq",), "fence.evicted-writes-nothing": ("bq",)}),
     leg("e2e_bq_multi_drain.py",   "four drains in one dataset, and a transaction past the TTL", {"bq"},
         proves={"bq.multi-drain-one-dataset": ("bq",)}),
+    leg("e2e_bq_state_compact.py", "a state compaction never erases a row a sibling committed", {"bq"},
+        proves={"bq.multi-drain-one-dataset": ("bq",)}),
     leg("e2e_cdc_lease_bq.py",     "a 0.56.0 BigQuery victim beside this collector: the residual",
         {"bq", "mariadb", "wheel-0560"}, ["0560"], proves={"compat.bq-0560-victim": ("bq@0560",)}),
 

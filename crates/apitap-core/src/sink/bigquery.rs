@@ -22,8 +22,8 @@
 //! the process. Incremental state lives in `<dataset>._apitap_state`, APPENDED
 //! as one row per run right after the copy job commits (load jobs only — DML is
 //! rejected on sandbox projects); readers resolve the newest row per key, and a
-//! state read that finds the history bloated folds it back down with a
-//! WRITE_TRUNCATE load (see `compact_state`). The watermark is
+//! state read that finds the history bloated deletes the rows a newer row of
+//! their own key supersedes (see `compact_state`). The watermark is
 //! `greatest(state, data)`, so a crash between the two costs a bounded
 //! re-read, never a skip.
 
@@ -55,17 +55,15 @@ const ROTATE_SECS: u64 = 6;
 const ROTATE_HARD_BYTES: u64 = 96 * 1024 * 1024;
 const STATE_TABLE: &str = "_apitap_state";
 
-/// The `_apitap_state` schema, defined ONCE. The bulk sink and the CDC lane
-/// both create the table from it, and state compaction REWRITES the whole
-/// table while passing it explicitly (a WRITE_TRUNCATE load replaces the
-/// table's schema with the load's) — a second, drifted copy of these fields
-/// would let a compaction silently retype or drop a column under every lane.
 /// The lock table's schema. BigQuery has no zero-column table, and nothing ever
 /// reads this one — only the table's NAME is the message.
 fn lock_schema_fields() -> Value {
     serde_json::json!([{ "name": "t", "type": "INT64" }])
 }
 
+/// The `_apitap_state` schema, defined ONCE: the bulk sink and the CDC lane
+/// both create the table from it, and a second, drifted copy of these fields
+/// would let one lane create a table the other cannot write.
 fn state_schema_fields() -> Value {
     json!([
         {"name": "dest_table", "type": "STRING", "mode": "REQUIRED"},
@@ -413,33 +411,14 @@ impl BqConn {
     /// Free-tier safe: the state machinery must never need DML (sandbox projects
     /// reject it), so state rows are APPENDED and readers take the newest.
     async fn load_rows(&self, table: &str, ndjson: Vec<u8>) -> Result<()> {
-        self.load_rows_job(table, ndjson, "WRITE_APPEND", None).await
-    }
-
-    /// The disposition-aware body of [`load_rows`]. `WRITE_TRUNCATE` is used
-    /// by state compaction only, and then always WITH an explicit `schema`:
-    /// a truncate replaces the table's schema with the load's, so leaving it
-    /// to the destination's current shape would make the rewrite depend on
-    /// what it is about to destroy.
-    async fn load_rows_job(
-        &self,
-        table: &str,
-        ndjson: Vec<u8>,
-        disposition: &str,
-        schema: Option<Value>,
-    ) -> Result<()> {
         // BigQuery rate-limits table update operations (5 per 10 s per table),
         // and its own guidance for that class is to retry with backoff. This
         // path keeps its payload, so a failed job is simply run again — no
         // partial state to reason about, because a load job that fails writes
-        // nothing (true for WRITE_TRUNCATE too: the truncate and its rows
-        // commit atomically or not at all).
+        // nothing.
         let mut attempt = 0u32;
         loop {
-            match self
-                .load_rows_once(table, &ndjson, disposition, schema.as_ref())
-                .await
-            {
+            match self.load_rows_once(table, &ndjson).await {
                 Ok(()) => return Ok(()),
                 Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
                     attempt += 1;
@@ -451,25 +430,16 @@ impl BqConn {
         }
     }
 
-    async fn load_rows_once(
-        &self,
-        table: &str,
-        ndjson: &[u8],
-        disposition: &str,
-        schema: Option<&Value>,
-    ) -> Result<()> {
-        let mut load = json!({
+    async fn load_rows_once(&self, table: &str, ndjson: &[u8]) -> Result<()> {
+        let load = json!({
             "destinationTable": {
                 "projectId": self.project, "datasetId": self.dataset,
                 "tableId": table,
             },
             "sourceFormat": "NEWLINE_DELIMITED_JSON",
-            "writeDisposition": disposition,
+            "writeDisposition": "WRITE_APPEND",
             "maxBadRecords": 0,
         });
-        if let Some(fields) = schema {
-            load["schema"] = json!({ "fields": fields });
-        }
         let config = json!({ "configuration": { "load": load } });
         let boundary = "apitap_state_boundary";
         let mut body = Vec::new();
@@ -587,7 +557,7 @@ impl BqConn {
     /// forever, and every read scans the whole history. 512 is deliberately
     /// lazy — at one row per run that is over a year of daily schedules and
     /// weeks of hourly ones, a scan of 512 tiny rows still costs nothing, and
-    /// the compaction is one free load job — so triggering rarely beats
+    /// the compaction is one small DML statement — so triggering rarely beats
     /// triggering precisely, and the exact number is not load-bearing.
     const STATE_COMPACT_ROWS: u64 = 512;
 
@@ -599,34 +569,40 @@ impl BqConn {
     pub(crate) async fn compact_state_if_bloated(&self) {
         if let Err(e) = self.compact_state().await {
             crate::progress::note(&format!(
-                "_apitap_state compaction skipped (next run retries): {e}"
+                "_apitap_state compaction skipped (readers are unaffected; the next \
+                 read retries): {e}"
             ));
         }
     }
 
-    /// Rewrite `_apitap_state` down to the newest row per
-    /// (dest_table, source_id).
+    /// Delete the `_apitap_state` rows that a newer row of their own
+    /// (dest_table, source_id) supersedes — and nothing else.
     ///
-    /// DELETE is not available — DML is rejected on the sandbox projects the
-    /// append-only design exists for — but a load job with WRITE_TRUNCATE is
-    /// the same free, sandbox-safe machinery the appends already ride, and it
-    /// commits the truncate and the replacement rows atomically. Rewriting is
-    /// safe where deleting is not because the content is DERIVED: readers
-    /// only ever resolve the newest row per key (the `*` barrier comparison
-    /// included — a stale key's newest row stays older than the barrier and
-    /// stays ignored), so a table holding exactly those rows answers every
-    /// read identically to the full history.
+    /// Never a rewrite. The table is shared by every run that writes into the
+    /// dataset: sibling drains commit their watermark rows into it inside
+    /// their fenced scripts, bulk runs append theirs, and any of them may
+    /// commit while this runs. 0.56.0 compacted by SELECTing the newest row
+    /// per key and loading exactly those back with WRITE_TRUNCATE, which
+    /// erased every row committed between the SELECT and the load — and for
+    /// a Postgres-source drain that is not "one window replays": the drain
+    /// has already confirmed that window to its slot, so its next run finds
+    /// the watermark BEHIND the slot and refuses until someone clears state
+    /// and re-bootstraps.
     ///
-    /// Concurrency is tolerated rather than locked out:
-    ///   - two compactions racing derive the same newest-per-key content, and
-    ///     load-job commits serialize per table — the loser overwrites the
-    ///     winner with an identical payload;
-    ///   - an append landing between this SELECT and the truncate committing
-    ///     is lost, regressing that key's watermark by at most one run. The
-    ///     design already budgets exactly that: bulk append takes
-    ///     greatest(state, data) (a bounded re-read, never a skip) and a CDC
-    ///     window replays idempotently — the same tolerance a crash between
-    ///     data commit and state write has always demanded.
+    /// A DELETE decides on its own snapshot and removes only the rows it saw
+    /// superseded there. A row appended meanwhile is not in that snapshot,
+    /// and BigQuery never lets an INSERT conflict with a DELETE, so it
+    /// survives. A key's newest row is never matched (nothing of its key is
+    /// newer in any snapshot that holds it), so every reader — newest row per
+    /// key, after the newest `*` barrier — answers the same before and after,
+    /// and two compactions racing cannot between them remove a key's last row.
+    ///
+    /// What it costs: it is DML, so a sandbox project refuses it; there the
+    /// table keeps its history (one row per bulk run — a sandbox cannot run
+    /// CDC, whose every apply is DML) and readers are unaffected. Outside a
+    /// script, it can meet a transaction that also deletes state rows (the
+    /// `Watermark::Clear` arm): BigQuery queues a standalone DML behind the
+    /// transaction or cancels the transaction, and `cdc_script` retries it.
     async fn compact_state(&self) -> Result<()> {
         let Some(meta) = self.table_get(STATE_TABLE).await? else {
             return Ok(());
@@ -640,50 +616,12 @@ impl BqConn {
         if rows <= Self::STATE_COMPACT_ROWS {
             return Ok(());
         }
-        // The server renders the NDJSON lines itself: TO_JSON_STRING handles
-        // NULLs and escaping, and synced_at is formatted at full microsecond
-        // precision (the writers' own format) — a truncated timestamp could
-        // reorder a replace barrier against the state row it must sort under.
-        // The window function ranks the RAW synced_at in an inner query so
-        // the formatting alias cannot shadow the column it orders by.
-        let sql = format!(
-            "SELECT TO_JSON_STRING(t) FROM ( \
-               SELECT dest_table, source_id, cursor_col, watermark, mode, last_rows, \
-                      FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E6SZ', synced_at) AS synced_at \
-               FROM ( \
-                 SELECT *, ROW_NUMBER() OVER \
-                   (PARTITION BY dest_table, source_id ORDER BY synced_at DESC) AS rn \
-                 FROM {state} \
-               ) WHERE rn = 1 \
-             ) t",
-            state = self.state_fq(),
-        );
-        let mut ndjson = Vec::new();
-        let mut kept = 0u64;
-        for row in self.query(&sql).await? {
-            if let Some(line) = row.into_iter().next().flatten() {
-                ndjson.extend_from_slice(line.as_bytes());
-                ndjson.push(b'\n');
-                kept += 1;
-            }
-        }
-        // An empty result from a table we just measured as non-empty means
-        // the read went wrong, not that the state vanished — truncating on it
-        // would erase every watermark. Refuse.
-        if ndjson.is_empty() {
-            return Err(Error::Transfer(
-                "state compaction read returned nothing for a non-empty table".into(),
-            ));
-        }
-        self.load_rows_job(
-            STATE_TABLE,
-            ndjson,
-            "WRITE_TRUNCATE",
-            Some(state_schema_fields()),
-        )
-        .await?;
+        let job = self.query_job(&compact_state_sql(&self.state_fq())).await?;
+        let gone = job["statistics"]["query"]["numDmlAffectedRows"]
+            .as_str()
+            .unwrap_or("?");
         crate::progress::note(&format!(
-            "_apitap_state compacted: {rows} rows -> {kept} (newest per source)"
+            "_apitap_state compacted: {rows} rows, {gone} superseded row(s) deleted"
         ));
         Ok(())
     }
@@ -720,6 +658,12 @@ impl BqConn {
     }
 
     async fn cdc_script_once(&self, sql: &str) -> Result<()> {
+        self.query_job(sql).await.map(|_| ())
+    }
+
+    /// One query job (a statement or a script), polled to DONE; the finished
+    /// job's resource, whose statistics say what a DML statement changed.
+    async fn query_job(&self, sql: &str) -> Result<Value> {
         let mut body = json!({
             "configuration": {"query": {"query": sql, "useLegacySql": false}}
         });
@@ -735,10 +679,10 @@ impl BqConn {
             .await?;
         let job_id = v["jobReference"]["jobId"]
             .as_str()
-            .ok_or_else(|| Error::Transfer("bigquery CDC job missing jobId".into()))?
+            .ok_or_else(|| Error::Transfer("bigquery query job missing jobId".into()))?
             .to_string();
         let loc = v["jobReference"]["location"].as_str().map(str::to_string);
-        self.poll_job(&job_id, loc.as_deref()).await.map(|_| ())
+        self.poll_job(&job_id, loc.as_deref()).await
     }
 
     /// Load one CDC window's NDJSON into its staging table with WRITE_TRUNCATE
@@ -865,6 +809,24 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
 
 pub(crate) fn sql_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// The state compaction: every row of `state` older than the newest row of
+/// its own (dest_table, source_id). Strictly older — a key's newest row, and
+/// any row tied with it, is never matched — which is what makes it safe beside
+/// concurrent writers (see `BqConn::compact_state`). The newest time per key is
+/// aggregated first, so the delete is one equality join, linear in the table,
+/// where a row-to-row "a newer row exists" test is quadratic in a key's history.
+fn compact_state_sql(state: &str) -> String {
+    format!(
+        "DELETE FROM {state} x WHERE EXISTS ( \
+           SELECT 1 FROM ( \
+             SELECT dest_table, source_id, MAX(synced_at) AS newest \
+             FROM {state} GROUP BY dest_table, source_id \
+           ) y \
+           WHERE y.dest_table = x.dest_table AND y.source_id = x.source_id \
+             AND x.synced_at < y.newest)"
+    )
 }
 
 /// A response worth PUTting again: a transient backend failure, or a throttle.
@@ -2545,6 +2507,27 @@ impl BqSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compaction deletes only rows older than their OWN key's newest:
+    /// widen the comparison to `<=` and every key loses its newest row too;
+    /// drop a key column and one source's rows are deleted for another's.
+    /// Its safety beside concurrent writers is asked of BigQuery by
+    /// `e2e_bq_state_compact.py`; this pins the predicate that argument rests on.
+    #[test]
+    fn state_compaction_deletes_only_superseded_rows() {
+        let sql = compact_state_sql("`p.d._apitap_state`");
+        let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.starts_with("DELETE FROM `p.d._apitap_state` x WHERE EXISTS ("), "{flat}");
+        for part in [
+            "MAX(synced_at) AS newest FROM `p.d._apitap_state` GROUP BY dest_table, source_id",
+            "y.dest_table = x.dest_table",
+            "y.source_id = x.source_id",
+            "x.synced_at < y.newest",
+        ] {
+            assert!(flat.contains(part), "missing {part:?} in {flat}");
+        }
+        assert!(!flat.contains("<="), "{flat}");
+    }
 
     fn t(d: Delivered, raw: &[u8]) -> String {
         let mut out = Vec::new();
