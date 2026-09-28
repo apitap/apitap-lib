@@ -34,6 +34,7 @@ SRC = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_
 DST = os.environ.get("PGD_URL", "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst")
 T = "fence_demo"
 T2 = "fence_demo_two"
+T3 = "fence_demo_three"
 TTL = 30
 os.environ["APITAP_LEASE_TTL_SECS"] = str(TTL)
 
@@ -113,7 +114,7 @@ def drop_our_slots():
 
 
 def clean():
-    for t in (T, T2):
+    for t in (T, T2, T3):
         src(f"DROP TABLE IF EXISTS {t} CASCADE")
         src(f"DROP PUBLICATION IF EXISTS apitap_pub_{t}")
         dst(f"DROP TABLE IF EXISTS {t} CASCADE")
@@ -302,53 +303,71 @@ else:
 clean()
 
 print("== leg 4: two apply lanes cannot starve the keeper ==")
-# The apply pool has two connections. With `APITAP_CDC_APPLY_LANES=2` both can
-# be inside a unit at once, and in 0.56.0 the keeper renewed on that same pool:
-# a group applying slowly left it no connection. Every destination insert here
-# sleeps 5 ms, so each window's unit holds its connection for seconds — but
-# well under the TTL — and the question is whether every row of the run stays
-# alive between them.
-seed(T, 200)
-seed(T2, 200)
+# The apply pool has two connections, and `APITAP_CDC_APPLY_LANES=2` lets two
+# members hold both at once. A member queued behind them has no unit and no
+# connection, so between its own closes only the keeper renews its row — and in
+# 0.56.0 the keeper renewed on that same pool.
+#
+# Three members, two lanes. Every source transaction writes 1000 fat rows to T
+# and to T2 (1.2 MB, so each is a window of its own), and a trigger sleeps 22 ms
+# per destination insert: each window holds both lanes for ~22 s, under the
+# TTL. T3 has no traffic and is last in line, so its row is renewed once per
+# window by its own close, and in between by the keeper alone. It is sampled
+# every quarter second.
+#
+# Only T3 is asked. A row whose own unit is applying is not renewed until that
+# unit's close, and may run low meanwhile — harmlessly, because a claim needs
+# the row lock (`NOWAIT`) and the unit holds it. An earlier version asked every
+# row with 5 ms units: each member's close renewed its row every few seconds
+# whoever else held the pool, so it stayed green with the keeper put back on the
+# apply pool (seen on a mutant wheel), and could not tell the two apart.
+for t in (T, T2, T3):
+    seed(t, 200)
 r = sh([sys.executable, "-c",
         "import apitap; apitap.transfer("
-        f"{SRC!r}, {DST!r}, tables=[{T!r}, {T2!r}], mode='log_based')"])
+        f"{SRC!r}, {DST!r}, tables=[{T!r}, {T2!r}, {T3!r}], mode='log_based')"])
 case("group bootstrapped", r.returncode == 0, r.stderr.strip()[-160:])
 dst("CREATE OR REPLACE FUNCTION fence_slow() RETURNS trigger LANGUAGE plpgsql AS "
-    "$$ BEGIN PERFORM pg_sleep(0.005); RETURN NEW; END $$")
+    "$$ BEGIN PERFORM pg_sleep(0.022); RETURN NEW; END $$")
 for t in (T, T2):
     dst(f"CREATE TRIGGER fence_slow BEFORE INSERT ON {t} FOR EACH ROW EXECUTE FUNCTION fence_slow()")
-    # Units well under the 30 s TTL, at 5 ms a row: fat rows, so the 1 MiB
-    # window floor holds ~2000 of them, and one source transaction per 1000
-    # rows, because a window never splits a transaction.
-    for lo in range(201, 30001, 1000):
-        src(f"INSERT INTO {t} SELECT g, repeat('w', 500) FROM generate_series({lo}, {lo + 999}) g")
+for lo in range(201, 4201, 1000):
+    rows = f"SELECT g, repeat('w', 500) FROM generate_series({lo}, {lo + 999}) g"
+    src(f"BEGIN; INSERT INTO {T} {rows}; INSERT INTO {T2} {rows}; COMMIT;")
 p = subprocess.Popen(
     [sys.executable, "-c",
      "import apitap; apitap.transfer("
-     f"{SRC!r}, {DST!r}, tables=[{T!r}, {T2!r}], mode='log_based')"],
+     f"{SRC!r}, {DST!r}, tables=[{T!r}, {T2!r}, {T3!r}], mode='log_based')"],
     env=dict(os.environ, APITAP_CDC_WINDOW_BYTES="1048576", APITAP_CDC_APPLY_LANES="2"),
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-if not wait_for(lambda: len(lease_rows(T)) > 0 and len(lease_rows(T2)) > 0, 40):
+if not wait_for(lambda: all(lease_rows(t) for t in (T, T2, T3)), 40):
     p.kill(); p.wait()
     case("(rig) leg 4 could not be staged", False, "the group's leases never appeared")
 else:
-    tok = lease_rows(T)[0].split("|")[0]
-    worst = []
-    for _ in range(3):
-        time.sleep(10)
-        worst.append(float(dst("SELECT COALESCE(max(EXTRACT(EPOCH FROM (now() - expires_at))), 0) "
-                               f"FROM _apitap_lease WHERE token = '{tok}'") or 0))
+    tok = lease_rows(T3)[0].split("|")[0]
+    lives, busy = [], 0
+    end = time.monotonic() + 50
+    while time.monotonic() < end and p.poll() is None:
+        life, ins = dst(
+            "SELECT round(EXTRACT(EPOCH FROM (expires_at - clock_timestamp()))::numeric, 1) || '|' || "
+            "(SELECT count(*) FROM pg_stat_activity WHERE state = 'active' "
+            "AND query LIKE 'INSERT INTO %fence_demo%_ap_up%') "
+            f"FROM _apitap_lease WHERE dest_key = 'public.{T3}' AND token = '{tok}'").split("|")
+        lives.append(float(life))
+        busy = max(busy, int(ins))
+        time.sleep(0.25)
     moving = p.poll() is None
-    case("(rig) the drain was still applying through all three samples", moving,
-         f"rc={p.poll()}, dest {dst(f'SELECT count(*) FROM {T}')} of 30000")
+    case("(rig) the drain was still applying when sampling ended", moving and len(lives) > 50,
+         f"rc={p.poll()}, {len(lives)} samples, dest {dst(f'SELECT count(*) FROM {T}')} of 4200")
+    case("(rig) both apply lanes were inside a slow insert at once", busy == 2,
+         f"at most {busy} applying INSERT(s) seen together")
     # More than half the TTL, not merely "not lapsed": the keeper renews every
-    # tenth of it, and a held row is renewed by its own unit's close, so a
-    # healthy run never lets a row fall under half — the margin ClickHouse and
-    # BigQuery demand before they write. 0.56.0, renewing on the apply pool,
-    # sank to ~9 s of 30 here without lapsing.
-    case("every row of the run kept more than half its TTL", all(w < -TTL / 2 for w in worst),
-         "seconds past expiry of the worst row: " + ", ".join(f"{w:.1f}" for w in worst))
+    # tenth of it, so a queued member never falls far below a whole TTL — and
+    # half is the margin ClickHouse and BigQuery demand before they write. On
+    # the apply pool the keeper waits out both units, and T3 sinks to about
+    # TTL minus one window.
+    case("the queued member kept more than half its TTL", bool(lives) and min(lives) > TTL / 2,
+         f"lowest life of {T3}'s row: {min(lives) if lives else 'no sample'} s of {TTL}")
     p.kill(); p.wait()
 for t in (T, T2):
     dst(f"DROP TRIGGER IF EXISTS fence_slow ON {t}")
