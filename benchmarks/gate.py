@@ -150,6 +150,11 @@ LEGS = [
     leg("e2e_guard_matrix.py",     "the guard asks BigQuery the same questions", {"bq"}, ["bq"],
         proves={"guard.bulk-vs-bulk": ("bq",), "guard.drain-vs-bulk": ("bq",),
                 "collect.claim-then-crash": ("bq",)}),
+    leg("e2e_cdc_lease_bq.py",     "a BigQuery drain's lease and fence, asked of BigQuery", {"bq", "mariadb"},
+        proves={"lease.killed-drain-self-heals": ("bq",), "lease.live-never-collected": ("bq",),
+                "guard.no-lease-no-collect": ("bq",), "fence.evicted-writes-nothing": ("bq",)}),
+    leg("e2e_bq_multi_drain.py",   "four drains in one dataset, and a transaction past the TTL", {"bq"},
+        proves={"bq.multi-drain-one-dataset": ("bq",)}),
 
     leg("e2e_rolling_upgrade.py",  "0.55.1 beside this release, Postgres", {"wheel-0551"}, ["0551", "pg"],
         proves={"compat.old-bulk-refused-by-new-drain": ("pg@0551",),

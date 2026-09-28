@@ -142,17 +142,27 @@ impl GuardStore for NoGuard {
 /// Give back every announcement this drain holds: its markers, and only then
 /// — with the proof that every marker is gone — its lease. A lease closed while
 /// its lock stands is the permanent wedge; `Released` makes it unwritable.
-async fn give_back(held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)>, token: &str) {
+/// Once every member is given back, the run's own objects go too (BigQuery's
+/// fence table).
+async fn give_back(dest: &Dest, held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)>, token: &str) {
+    let mut all = true;
     for (g, bare, a) in held {
         match crate::guard::release(&*g, a).await {
             Ok(proof) => {
-                // Its run-scoped scratch (ClickHouse's key table) goes with the
-                // markers, before the lease: nothing else would ever drop it.
+                // Its run-scoped scratch (ClickHouse's key table, BigQuery's
+                // staging) goes with the markers, before the lease: nothing
+                // else would ever drop it.
                 let _ = g.sweep_run(&bare, token).await;
                 g.lease_close(proof).await
             }
-            Err(a) => a.abandon(),
+            Err(a) => {
+                a.abandon();
+                all = false;
+            }
         }
+    }
+    if all {
+        dest.close_run(token).await;
     }
 }
 
@@ -230,9 +240,16 @@ impl Dest {
             Dest::Pg(d) => d.set_run(run),
             Dest::My(d) => d.set_run(run),
             Dest::Ch(d) => d.set_run(run),
-            // BigQuery's apply is one script inside one transaction; it carries
-            // no run token because its check rides that script, not a field.
-            Dest::Bq(_) | Dest::Ice(_) => {}
+            Dest::Bq(d) => d.set_run(run),
+            Dest::Ice(_) => {}
+        }
+    }
+
+    /// Drop what the run holds that is not tied to one table — BigQuery's
+    /// per-run fence table. Nothing elsewhere.
+    async fn close_run(&self, token: &str) {
+        if let Dest::Bq(d) = self {
+            d.close_run(token).await
         }
     }
 
@@ -941,7 +958,7 @@ async fn run_group(
         match crate::guard::announce(&*g, &bare, &run).await {
             Ok(a) => held.push((g, bare, a)),
             Err(e) => {
-                give_back(held, run.token()).await;
+                give_back(&dest, held, run.token()).await;
                 return Err(e);
             }
         }
@@ -949,7 +966,7 @@ async fn run_group(
     for c in &ctxs {
         let (g, bare) = dest.guard(&c.dest_table);
         if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, crate::guard::Mine::Keep).await {
-            give_back(held, run.token()).await;
+            give_back(&dest, held, run.token()).await;
             return Err(e);
         }
     }
@@ -1037,7 +1054,7 @@ async fn run_group(
     // Markers, then leases — and a lease only for a member whose every marker
     // is observed gone (`give_back`). Dropping a lease while its lock survives
     // would wedge the table for ever.
-    give_back(held, run.token()).await;
+    give_back(&dest, held, run.token()).await;
     out
 }
 
@@ -1153,7 +1170,7 @@ async fn run_group_mysql(
         match crate::guard::announce(&*g, &bare, &run).await {
             Ok(a) => held.push((g, bare, a)),
             Err(e) => {
-                give_back(held, run.token()).await;
+                give_back(&dest, held, run.token()).await;
                 return Err(e);
             }
         }
@@ -1161,7 +1178,7 @@ async fn run_group_mysql(
     for c in &ctxs {
         let (g, bare) = dest.guard(&c.dest_table);
         if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, crate::guard::Mine::Keep).await {
-            give_back(held, run.token()).await;
+            give_back(&dest, held, run.token()).await;
             return Err(e);
         }
     }
@@ -1315,7 +1332,7 @@ async fn run_group_mysql(
     // Markers, then leases — and a lease only for a member whose every marker
     // is observed gone (`give_back`). Dropping a lease while its lock survives
     // would wedge the table for ever.
-    give_back(held, run.token()).await;
+    give_back(&dest, held, run.token()).await;
     out
 }
 

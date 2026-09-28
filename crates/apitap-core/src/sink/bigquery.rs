@@ -563,10 +563,6 @@ impl BqConn {
         Ok(self.table_get(STATE_TABLE).await?.is_some())
     }
 
-    pub(crate) async fn cdc_delete_table(&self, table: &str) -> Result<()> {
-        self.table_delete(table).await
-    }
-
     /// A read query (small results only): the barrier-aware state SELECT.
     pub(crate) async fn cdc_query(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         self.query(sql).await
@@ -1863,9 +1859,108 @@ impl BqSink {
     }
 }
 
-/// The minted staging name inside a listed table id, or `None` when the id is
-/// not a staging table of any table at all.
+/// The lease table, created on first use. DML, and legitimately: CDC into
+/// BigQuery already requires a billing project because the apply itself is
+/// row-level DML. The bulk lane's "state machinery never needs DML" promise is
+/// untouched — bulk locks carry no lease.
+pub(crate) async fn ensure_lease_table(conn: &BqConn) -> Result<()> {
+    conn.ensure_dataset().await?;
+    if conn.table_get(crate::lease::LEASE_TABLE).await?.is_some() {
+        return Ok(());
+    }
+    match conn
+        .table_create(
+            crate::lease::LEASE_TABLE,
+            &json!([
+                {"name": "dest_key",   "type": "STRING"},
+                {"name": "token",      "type": "STRING"},
+                {"name": "expires_at", "type": "TIMESTAMP"},
+                {"name": "collected",  "type": "BOOL"}
+            ]),
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        // Two first-runs race the CREATE; whoever loses is fine.
+        Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A run's fence table, fully qualified. See [`lease_open`].
+pub(crate) fn fence_fq(conn: &BqConn, token: &str) -> String {
+    conn.fq(&crate::naming::fence_ident(token))
+}
+
+/// Open a drain's lease rows AND its fence table, `_apitap_fence<token>`: one
+/// row, `claimed = FALSE`, that every apply script of this run updates as its
+/// first statement and a collector marks claimed. It is the run's own table,
+/// never the shared `_apitap_lease`, so a sibling drain's keeper — which
+/// writes `_apitap_lease` on every tick — never conflicts with this run's
+/// scripts, and this run's keeper never has to go quiet during a long MERGE.
 ///
+/// One script, idempotent under `cdc_script`'s whole-script retry. A failure
+/// takes the fence back (best-effort): lease rows without a lock are inert, a
+/// fence table without a run is a leak.
+pub(crate) async fn lease_open(conn: &BqConn, keys: &[String], token: &str) -> Result<()> {
+    ensure_lease_table(conn).await?;
+    let rows = keys
+        .iter()
+        .map(|k| {
+            format!(
+                "('{}','{}', TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {} SECOND), FALSE)",
+                sql_str(k),
+                sql_str(token),
+                crate::lease::ttl_secs()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fence = fence_fq(conn, token);
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {fence} (claimed BOOL, n INT64);\n\
+         INSERT INTO {fence} (claimed, n) SELECT FALSE, 0 FROM UNNEST([1]) \
+           WHERE NOT EXISTS (SELECT 1 FROM {fence});\n\
+         DELETE FROM {t} WHERE token = '{tok}';\n\
+         INSERT INTO {t} (dest_key, token, expires_at, collected) VALUES {rows};",
+        t = conn.fq(crate::lease::LEASE_TABLE),
+        tok = sql_str(token),
+    );
+    if let Err(e) = conn.cdc_script(&sql).await {
+        let _ = conn.table_delete(&crate::naming::fence_ident(token)).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Renew every row this run still owns, in one statement. Never a collected
+/// row: a renewal must not be able to un-claim what a collector took.
+pub(crate) async fn lease_renew(conn: &BqConn, token: &str) -> Result<u64> {
+    conn.cdc_script(&format!(
+        "UPDATE {t} SET expires_at = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {ttl} SECOND) \
+         WHERE token = '{tok}' AND NOT collected",
+        t = conn.fq(crate::lease::LEASE_TABLE),
+        ttl = crate::lease::ttl_secs(),
+        tok = sql_str(token),
+    ))
+    .await
+    .map(|_| 1)
+}
+
+/// This run's keys whose row exists and is not collected. Expiry ignored:
+/// only a CLAIM evicts.
+#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
+pub(crate) async fn lease_unclaimed(conn: &BqConn, token: &str) -> Result<Vec<String>> {
+    let rows = conn
+        .cdc_query(&format!(
+            "SELECT dest_key FROM {t} WHERE token = '{tok}' AND NOT collected",
+            t = conn.fq(crate::lease::LEASE_TABLE),
+            tok = sql_str(token),
+        ))
+        .await?;
+    Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+}
+
 /// Read one lease row. Shared by both lanes: a drain and a bulk run only see
 /// each other's liveness because they read and write the same rows.
 pub(crate) async fn lease_get(conn: &BqConn, key: &str, token: &str)
@@ -1892,19 +1987,53 @@ pub(crate) async fn lease_get(conn: &BqConn, key: &str, token: &str)
     }))
 }
 
-/// Take a lapsed lease. `false` = do not collect.
-pub(crate) async fn lease_claim(conn: &BqConn, key: &str, token: &str) -> Result<bool> {
-    match lease_get(conn, key, token).await? {
-        Some(l) if l.lapsed() => {
-            conn.cdc_script(&format!(
-                "UPDATE {t} SET collected = TRUE WHERE dest_key = '{k}' AND token = '{tok}'",
-                t = conn.fq(crate::lease::LEASE_TABLE),
-                k = sql_str(key), tok = sql_str(token)))
-                .await?;
-            Ok(true)
-        }
-        _ => Ok(false),
+/// Claim a lapsed lease and fence the run that held it.
+///
+/// 1. Take the row, lapsed or already taken, in one server-side statement.
+/// 2. Decide by READING it: no row is `Absent`, a row still uncollected (its
+///    owner renewed in time) is `Refused`.
+/// 3. Mark the victim's fence claimed. Standalone DML, so BigQuery queues it
+///    behind a victim transaction that has already updated the fence, and it
+///    returns only after that one ended: whatever the victim committed, it
+///    committed as the owner, before the collector reads a watermark. A
+///    victim script that starts later finds the fence claimed and rolls back
+///    whole. A missing fence is fine — a 0.56.0 victim never had one, and a
+///    re-entered claim already deleted it.
+/// 4. Delete the fence, so a victim script fails on it even if it somehow
+///    raced step 3.
+///
+/// Re-entrant: an already-collected row is `Taken` and re-runs steps 3-4.
+pub(crate) async fn lease_claim(conn: &BqConn, key: &str, token: &str) -> Result<crate::guard::Claim> {
+    use crate::guard::Claim;
+    let taken = conn
+        .cdc_script(&format!(
+            "UPDATE {t} SET collected = TRUE WHERE dest_key = '{k}' AND token = '{tok}' \
+             AND (expires_at <= CURRENT_TIMESTAMP() OR collected);",
+            t = conn.fq(crate::lease::LEASE_TABLE),
+            k = sql_str(key),
+            tok = sql_str(token),
+        ))
+        .await;
+    match taken {
+        Ok(()) => {}
+        Err(Error::Transfer(m)) if m.contains("Not found") => return Ok(Claim::Absent),
+        Err(e) => return Err(e),
     }
+    match lease_get(conn, key, token).await? {
+        None => return Ok(Claim::Absent),
+        Some(l) if !l.collected => return Ok(Claim::Refused),
+        Some(_) => {}
+    }
+    match conn
+        .cdc_script(&format!("UPDATE {} SET claimed = TRUE WHERE TRUE;", fence_fq(conn, token)))
+        .await
+    {
+        Ok(()) => {}
+        Err(Error::Transfer(m)) if m.contains("Not found") => {}
+        Err(e) => return Err(e),
+    }
+    conn.table_delete(&crate::naming::fence_ident(token)).await?;
+    Ok(Claim::Taken)
 }
 
 /// The owner's own close. Best-effort: the run is over either way.
@@ -2014,15 +2143,24 @@ impl crate::guard::GuardStore for BqGuard {
     }
 
     async fn lease_claim(&self, key: &str, token: &str) -> Result<crate::guard::Claim> {
-        Ok(if lease_claim(&self.conn, key, token).await? {
-            crate::guard::Claim::Taken
-        } else {
-            crate::guard::Claim::Refused
-        })
+        lease_claim(&self.conn, key, token).await
     }
 
     async fn lease_close(&self, proof: crate::guard::Released) {
         lease_close(&self.conn, &proof.key, &proof.token).await
+    }
+
+    /// A drain's run-scoped scratch: its CDC staging and its changelog/cluster
+    /// rebuild temp, under that exact token. Both only ever hold what the WAL
+    /// or the bootstrap can reproduce — a window replays, a bootstrap that did
+    /// not finish is redone — so dropping them loses nothing. A bulk token has
+    /// neither; the deletes are 404-tolerant.
+    async fn sweep_run(&self, bare: &str, token: &str) -> Result<()> {
+        use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
+        for a in [Artifact::CdcStaging, Artifact::ChangelogTmp] {
+            self.conn.table_delete(&artifact_ident_tok(bare, a, ROOMY, token)).await?;
+        }
+        Ok(())
     }
 }
 

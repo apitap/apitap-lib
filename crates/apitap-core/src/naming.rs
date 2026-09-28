@@ -900,11 +900,8 @@ pub(crate) fn artifact_ident_tok(bare: &str, artifact: Artifact, limit: usize, t
 /// `_`, so every one reads `_apitap_fence_…` — which is the prefix discovery
 /// hides. A prefix and not a suffix because the table belongs to a RUN, not to
 /// a destination table: one fence covers every table the drain holds.
-// The BigQuery store creates it; until that lands only the tests name it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const FENCE_PREFIX: &str = "_apitap_fence";
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fence_ident(token: &str) -> String {
     format!("{FENCE_PREFIX}{token}")
 }
