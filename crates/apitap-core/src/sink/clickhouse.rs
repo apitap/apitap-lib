@@ -175,7 +175,6 @@ pub(crate) async fn lease_renew(ch: &ChConn, keys: &[String], token: &str) -> Re
 
 /// This run's keys whose row exists and is not collected. Expiry ignored:
 /// only a CLAIM evicts.
-#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
 pub(crate) async fn lease_unclaimed(ch: &ChConn, token: &str) -> Result<Vec<String>> {
     let body = ch
         .read(&format!(
@@ -359,12 +358,19 @@ impl crate::guard::GuardStore for ChGuard {
     /// A run's run-scoped CDC scratch: its key table, and a changelog rebuild
     /// it left half way. Exact token, never lineage; a bulk token has none,
     /// and the drops are IF EXISTS.
+    ///
+    /// Every drop is attempted and the first failure reported: stopping at
+    /// the first would leave the rest for a sweep that may never come again.
     async fn sweep_run(&self, bare: &str, token: &str) -> Result<()> {
         use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
+        let mut first = Ok(());
         for a in [Artifact::CdcDelete, Artifact::ChangelogTmp] {
-            self.drop_object(&artifact_ident_tok(bare, a, ROOMY, token)).await?;
+            let r = self.drop_object(&artifact_ident_tok(bare, a, ROOMY, token)).await;
+            if first.is_ok() {
+                first = r;
+            }
         }
-        Ok(())
+        first
     }
 }
 
@@ -2181,6 +2187,60 @@ impl Loader for ChLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run's scratch is swept by the owner's release and by its collector,
+    /// and nothing else ever names the token: one drop failing must not leave
+    /// the other table unattempted.
+    #[test]
+    fn sweep_attempts_every_drop() {
+        use crate::guard::GuardStore;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let s2 = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut c, _)) = l.accept().await {
+                    let s3 = s2.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16384];
+                        let mut got = Vec::new();
+                        // One request per connection: read until the body is in.
+                        loop {
+                            let Ok(n) = c.read(&mut buf).await else { return };
+                            if n == 0 { return; }
+                            got.extend_from_slice(&buf[..n]);
+                            let t = String::from_utf8_lossy(&got).to_string();
+                            if let Some(h) = t.find("\r\n\r\n") {
+                                let len = t[..h].to_ascii_lowercase().lines()
+                                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                    .unwrap_or(0);
+                                if got.len() >= h + 4 + len { break; }
+                            }
+                        }
+                        let body = String::from_utf8_lossy(&got).to_string();
+                        let first = {
+                            let mut v = s3.lock().unwrap();
+                            v.push(body.clone());
+                            v.len() == 1
+                        };
+                        let resp = if first {
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nCode: 999. DB::Exception: x"
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        };
+                        let _ = c.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+            let g = ChGuard::new(ChConn::parse(&format!("clickhouse://default:x@127.0.0.1:{port}/default")).unwrap(), None);
+            let r = g.sweep_run("t", "_tok").await;
+            let drops = seen.lock().unwrap().iter().filter(|b| b.contains("DROP TABLE IF EXISTS")).count();
+            assert!(r.is_err(), "the failed drop is reported");
+            assert_eq!(drops, 2, "the second drop was never attempted");
+        });
+    }
 
     #[test]
     fn claim_seq_outranks_every_renewal() {

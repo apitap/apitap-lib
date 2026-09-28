@@ -27,7 +27,7 @@
 //! DML and the first MERGE will fail loudly.
 
 use crate::error::{Error, Result};
-use crate::lease::{Fence, LeaseStore, Watermark};
+use crate::lease::Watermark;
 use crate::logbased::collapse::Key;
 use crate::logbased::drain::DrainOutcome;
 use crate::logbased::resolve::{resolve_window, Fin};
@@ -89,21 +89,10 @@ const CL_BASELINE: &str = "B";
 
 /// One CDC member: (destination table, qualified source, key columns,
 /// source id) — the shape `run.rs` hands a group in.
-type Member = (String, String, Vec<String>, String);
+pub(crate) type Member = (String, String, Vec<String>, String);
 
 pub(crate) struct BqDest {
     store: BqStore,
-    /// This run's token, until the Tenure opens units itself: each entry
-    /// below is a shim that opens one unit, writes through it, and closes it.
-    run_token: std::sync::Mutex<Option<String>>,
-    /// Every close of one run updates the same fence row, and BigQuery
-    /// cancels one of two transactions that do ("concurrent update against
-    /// table _apitap_fence…"): a group bootstrap finishing eight members at
-    /// once lost them all after cdc_script's retries. Serialized, they queue.
-    /// Only the commit — the units' bodies still run side by side. The
-    /// Tenure's commit gate (`Fence::serial_commit`) takes this over at the
-    /// switch.
-    commit_gate: tokio::sync::Mutex<()>,
 }
 
 /// `dest_table` may arrive schema-qualified; the BigQuery dataset comes from the
@@ -114,38 +103,14 @@ fn bare(dest_table: &str) -> &str {
 
 impl BqDest {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: BqStore::connect(url).await?, run_token: Default::default(), commit_gate: Default::default() })
+        Ok(Self { store: BqStore::connect(url).await? })
     }
 
-    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
-        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
-    }
-
-    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        self.store.lease_key(dest_table)
-    }
-
-    /// The lease rows, and this run's fence table with them — before the
-    /// lock, inside "lease before lock".
-    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
-        self.store.lease_open(keys, run.token()).await
-    }
-
-    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
-        self.store.lease_renew(keys, run.token()).await
-    }
-
-    /// The run's fence table goes once every member was given back.
-    pub(crate) async fn close_run(&self, token: &str) {
-        self.store.close_run(token).await
-    }
-
-    /// This destination as the guard sees it — the same `BqGuard` the bulk
-    /// sink uses, raw/canonical listing included, so a bulk run's `_N` worker
-    /// tables are seen by a drain (0.56.0's CDC twin classified the raw ids,
-    /// and a drain proceeded beside them).
-    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::bigquery::BqGuard, String) {
-        (self.store.bq_guard(), bare(dest_table).to_string())
+    /// The store: the lease and its fence table, the guard, and the units a
+    /// run's tenure takes. One run's closes are serialized by the tenure
+    /// (`Fence::serial_commit`): each updates the same fence row.
+    pub(crate) fn store(&self) -> &BqStore {
+        &self.store
     }
 
     pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
@@ -195,146 +160,52 @@ impl BqDest {
         Ok(())
     }
 
-    /// One unit over `tables`, for the shims below.
-    async fn unit(&self, tables: &[&str]) -> Result<(BqUnit<'_>, String)> {
-        let token = self
-            .run_token
-            .lock()
-            .expect("run token")
-            .clone()
-            .ok_or_else(|| Error::Transfer("internal: a CDC write outside a run".into()))?;
-        let keys: Vec<String> = tables.iter().map(|t| self.store.lease_key(t)).collect();
-        let u = self.store.open_unit(&keys, &token).await?;
-        Ok((u, token))
-    }
-
-    /// Close a unit — one run's closes one at a time (`commit_gate`).
-    async fn close(&self, u: BqUnit<'_>, token: &str, marks: Vec<Watermark>) -> Result<()> {
-        let _g = if self.store.serial_commit() { Some(self.commit_gate.lock().await) } else { None };
-        self.store.close_unit(u, token, marks).await
-    }
-
-    /// Remove this table's watermark rows — the state table is append-only with
-    /// a `synced_at` tiebreak, so every row for the pair has to go.
-    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        let (u, token) = self.unit(&[dest_table]).await?;
-        let mark = Watermark::Clear { table: dest_table.into(), source_id: source_id.into() };
-        self.close(u, &token, vec![mark]).await
-    }
-
-    /// The source-identity marker: an ordinary state row under a reserved
-    /// `source_id`, so nothing about the state table has to change.
-    pub(crate) async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
-        let (u, token) = self.unit(&[dest_table]).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn: value, rows: 0 };
-        self.close(u, &token, vec![mark]).await
-    }
-
     /// The bootstrap's replace just (re)created the target and wrote a `*`
-    /// barrier. CLUSTER the target on its PK (so every window's MERGE prunes to
-    /// the touched blocks instead of full-scanning — the MERGE is the dominant
-    /// per-window cost), drop what older releases left, then stamp the slot's
-    /// LSN as the CDC watermark with a server-clock timestamp so it sorts AFTER
-    /// that barrier.
+    /// barrier. Inside the unit whose close stamps the slot's LSN (with a
+    /// server-clock timestamp, so it sorts AFTER that barrier): drop what older
+    /// releases left, and CLUSTER the target on its PK, so every window's MERGE
+    /// prunes to the touched blocks instead of full-scanning — the MERGE is the
+    /// dominant per-window cost.
     pub(crate) async fn bootstrap_finish(
         &self,
+        u: &mut BqUnit<'_>,
         dest_table: &str,
-        source_id: &str,
         pk_cols: &[String],
-        lsn: u64,
         rows: u64,
     ) -> Result<()> {
-        let (mut u, token) = self.unit(&[dest_table]).await?;
-        bootstrap_unit(&mut u, dest_table, pk_cols, rows).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
-        self.close(u, &token, vec![mark]).await
+        bootstrap_unit(u, dest_table, pk_cols, rows).await
     }
 
     /// changelog=true, once, right after the bootstrap's bulk load — see
     /// `changelog_bootstrap_unit`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn changelog_bootstrap_finish(
         &self,
+        u: &mut BqUnit<'_>,
         dest_table: &str,
-        source_id: &str,
         pk_cols: &[String],
         lsn: u64,
-        rows: u64,
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
-        let (mut u, token) = self.unit(&[dest_table]).await?;
-        changelog_bootstrap_unit(&mut u, dest_table, pk_cols, lsn, partition_by, order_by).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
-        self.close(u, &token, vec![mark]).await
+        changelog_bootstrap_unit(u, dest_table, pk_cols, lsn, partition_by, order_by).await
     }
 
-    /// Apply ONE table's changelog window.
-    pub(crate) async fn apply_changelog(
-        &self,
-        dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
-        source_id: &str,
-    ) -> Result<u64> {
-        let one = [(
-            dest_table.to_string(),
-            qualified_src.to_string(),
-            pk_cols.to_vec(),
-            source_id.to_string(),
-        )];
-        Ok(self.apply_group_changelog(&one, outcome, 1).await?[0])
-    }
-
-    /// A whole group's changelog window in one unit — see
-    /// `apply_group_changelog_unit`.
-    pub(crate) async fn apply_group_changelog(
-        &self,
-        ctxs: &[Member],
-        outcome: &DrainOutcome,
-        lanes: usize,
-    ) -> Result<Vec<u64>> {
-        let tables: Vec<&str> = ctxs.iter().map(|c| c.0.as_str()).collect();
-        let (mut u, token) = self.unit(&tables).await?;
-        let applied = apply_group_changelog_unit(&mut u, ctxs, outcome, lanes).await?;
-        let (rows, marks): (Vec<u64>, Vec<Watermark>) = applied.into_iter().unzip();
-        self.close(u, &token, marks).await?;
-        Ok(rows)
-    }
-
-    /// Apply ONE table's window. Kept for the single-table paths; it is
-    /// `apply_group` over a one-element group.
-    pub(crate) async fn apply(
-        &self,
-        dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
-        source_id: &str,
-    ) -> Result<u64> {
-        let one = [(
-            dest_table.to_string(),
-            qualified_src.to_string(),
-            pk_cols.to_vec(),
-            source_id.to_string(),
-        )];
-        Ok(self.apply_group(&one, outcome, 1).await?[0])
-    }
-
-    /// A whole group's replica window in one unit — see `apply_group_unit`.
+    /// A whole group's window in one unit — see `apply_group_unit` and
+    /// `apply_group_changelog_unit`. Each member's watermark comes back for
+    /// the unit's close, which commits it in that member's own group.
     pub(crate) async fn apply_group(
         &self,
+        u: &mut BqUnit<'_>,
         ctxs: &[Member],
         outcome: &DrainOutcome,
         lanes: usize,
-    ) -> Result<Vec<u64>> {
-        let tables: Vec<&str> = ctxs.iter().map(|c| c.0.as_str()).collect();
-        let (mut u, token) = self.unit(&tables).await?;
-        let applied = apply_group_unit(&mut u, ctxs, outcome, lanes).await?;
-        let (rows, marks): (Vec<u64>, Vec<Watermark>) = applied.into_iter().unzip();
-        self.close(u, &token, marks).await?;
-        Ok(rows)
+        changelog: bool,
+    ) -> Result<Vec<(u64, Watermark)>> {
+        if changelog {
+            apply_group_changelog_unit(u, ctxs, outcome, lanes).await
+        } else {
+            apply_group_unit(u, ctxs, outcome, lanes).await
+        }
     }
 }
 

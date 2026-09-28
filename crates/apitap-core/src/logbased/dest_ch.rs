@@ -18,7 +18,7 @@
 //! `mod store`; the apply bodies write through the `ChUnit` they are handed.
 
 use crate::error::{Error, Result};
-use crate::lease::{Fence, LeaseStore, Watermark};
+use crate::lease::Watermark;
 use crate::logbased::collapse::ResidueOp;
 use crate::logbased::drain::DrainOutcome;
 use crate::logbased::rowtext::{
@@ -59,14 +59,16 @@ pub(crate) const CL_BASELINE: &str = "B";
 
 pub(crate) struct ChDest {
     store: ChStore,
-    /// This run's token, until the Tenure opens units itself: each entry
-    /// below is a shim that opens one unit, writes through it, and closes it.
-    run_token: std::sync::Mutex<Option<String>>,
 }
 
 impl ChDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: ChStore::connect(url)?, run_token: Default::default() })
+        Ok(Self { store: ChStore::connect(url)? })
+    }
+
+    /// The store: the lease, the guard and the units a run's tenure takes.
+    pub(crate) fn store(&self) -> &ChStore {
+        &self.store
     }
 
     /// Default the created table's ORDER BY to the PK so the per-window
@@ -75,30 +77,6 @@ impl ChDest {
         if o2.order_by.is_none() {
             o2.order_by = Some(pk_cols.join(", "));
         }
-    }
-
-    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
-        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
-    }
-
-    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        self.store.lease_key(dest_table)
-    }
-
-    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
-        self.store.lease_open(keys, run.token()).await
-    }
-
-    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
-        self.store.lease_renew(keys, run.token()).await
-    }
-
-    /// This destination as the guard sees it — the same `ChGuard` the bulk
-    /// sink uses, with no cluster clause: the CDC lane refuses a clustered
-    /// destination outright. The table is addressed by `dest_table` as given
-    /// (the lease key is too), because this lane cannot address a dotted name.
-    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::clickhouse::ChGuard, String) {
-        (self.store.ch_guard(), dest_table.to_string())
     }
 
     pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
@@ -118,40 +96,10 @@ impl ChDest {
         self.store.precheck_mode(dest_table, changelog).await
     }
 
-    async fn unit(&self, dest_table: &str) -> Result<(ChUnit<'_>, String)> {
-        let token = self
-            .run_token
-            .lock()
-            .expect("run token")
-            .clone()
-            .ok_or_else(|| Error::Transfer("internal: a CDC write outside a run".into()))?;
-        let u = self.store.open_unit(&[self.store.lease_key(dest_table)], &token).await?;
-        Ok((u, token))
-    }
-
-    /// Remove this table's watermark row (a failed group bootstrap must leave
-    /// nothing behind, or the next run refuses the group as torn).
-    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Clear { table: dest_table.into(), source_id: source_id.into() };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
-    /// The source-identity marker: an ordinary state row under a reserved
-    /// `source_id`, so nothing about the state table has to change.
-    pub(crate) async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn: value, rows: 0 };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
-    /// After a replica bootstrap: the state row, and the scratch names older
-    /// releases left untokenized.
-    pub(crate) async fn bootstrap_finish(&self, dest_table: &str, source_id: &str, lsn: u64, rows: u64) -> Result<()> {
-        let (mut u, token) = self.unit(dest_table).await?;
-        u.drop_legacy_scratch(dest_table).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
-        self.store.close_unit(u, &token, vec![mark]).await
+    /// After a replica bootstrap, inside the unit whose close writes the state
+    /// row: drop the scratch names older releases left untokenized.
+    pub(crate) async fn bootstrap_finish(&self, u: &mut ChUnit<'_>, dest_table: &str) -> Result<()> {
+        u.drop_legacy_scratch(dest_table).await
     }
 
     /// changelog=true, once, right after the bootstrap's bulk load: rebuild the
@@ -170,20 +118,17 @@ impl ChDest {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn changelog_bootstrap_finish(
         &self,
+        u: &mut ChUnit<'_>,
         dest_table: &str,
-        source_id: &str,
         pk_cols: &[String],
         lsn: u64,
-        rows: u64,
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
-        let (mut u, token) = self.unit(dest_table).await?;
         // The rebuild below EXCHANGEs the destination table itself — on a
         // cluster that would swap it on ONE node. Refused first.
         u.refuse_clustered(dest_table).await?;
         u.drop_legacy_scratch(dest_table).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
         // Already a changelog (a re-bootstrap of a table we own)? Leave it.
         //
         // "Already" means ALL FOUR meta columns, never just `_apitap_op`: a
@@ -203,7 +148,7 @@ impl ChDest {
             .await?;
         match has.trim() {
             "0" => {}
-            "4" => return self.store.close_unit(u, &token, vec![mark]).await,
+            "4" => return Ok(()),
             n => {
                 return Err(Error::InvalidInput(format!(
                     "log_based changelog: ClickHouse target {dest_table} already has {n} of \
@@ -246,40 +191,34 @@ impl ChDest {
             op = ch_str(CL_BASELINE),
         );
         u.changelog_rebuild(dest_table, &sel, &part, &order).await?;
-        u.current_view(dest_table, pk_cols).await?;
-        self.store.close_unit(u, &token, vec![mark]).await
+        u.current_view(dest_table, pk_cols).await
     }
 
     /// changelog=true apply — see `apply_changelog_unit`.
     pub(crate) async fn apply_changelog(
         &self,
+        u: &mut ChUnit<'_>,
         dest_table: &str,
         qualified_src: &str,
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
-    ) -> Result<u64> {
-        let (mut u, token) = self.unit(dest_table).await?;
-        let (n, mark) =
-            apply_changelog_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id).await?;
-        self.store.close_unit(u, &token, vec![mark]).await?;
-        Ok(n)
+    ) -> Result<(u64, Watermark)> {
+        apply_changelog_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
     }
 
-    /// Apply one collapsed window. State is written LAST — a re-run of the
-    /// same window is idempotent (see module docs).
+    /// Apply one collapsed window. The state is written LAST, by the unit's
+    /// close — a re-run of the same window is idempotent (see module docs).
     pub(crate) async fn apply(
         &self,
+        u: &mut ChUnit<'_>,
         dest_table: &str,
         qualified_src: &str,
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
-    ) -> Result<u64> {
-        let (mut u, token) = self.unit(dest_table).await?;
-        let (n, mark) = apply_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id).await?;
-        self.store.close_unit(u, &token, vec![mark]).await?;
-        Ok(n)
+    ) -> Result<(u64, Watermark)> {
+        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
     }
 }
 
@@ -1700,7 +1639,7 @@ mod tests {
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
     use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, structure};
     use super::*;
-    use crate::lease::{owned_margin_secs, ttl_secs};
+    use crate::lease::{owned_margin_secs, ttl_secs, Fence, LeaseStore};
     use crate::logbased::changelog::Changes;
     use crate::wire::pgoutput::Tuple;
     use std::collections::HashMap;

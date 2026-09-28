@@ -360,7 +360,6 @@ pub(crate) async fn lease_claim(
 }
 
 /// This run's keys whose row exists and is not collected. Expiry ignored.
-#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
 pub(crate) async fn lease_unclaimed(pool: &PgPool, schema: &str, token: &str) -> Result<Vec<String>> {
     sqlx::query_scalar(&format!(
         "SELECT dest_key FROM {} WHERE token = $1 AND NOT collected",

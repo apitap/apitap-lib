@@ -21,8 +21,15 @@ table) before it proceeds. Scratch is per run: staging is `<T><token>__apitap_cd
      finishes; resumed, A exits non-zero ("no longer holds"), the state rows
      for the table are exactly what B left, A's row never reads unclaimed
      again, and the table has one row per key and the source's count
+  7. (argv `0560`, needs APITAP_PY_0560) the same with A on the 0.56.0 wheel:
+     B collects it, and A — which has no fence to read — commits after the
+     claim anyway. The leg asserts that it does and prints it: the documented
+     residual (`compat.bq-0560-victim`, "stop every 0.56.0 BigQuery drain
+     before a 0.57.0 run of the same dataset"). Case 6 is its other side: a
+     0.57.0 A never writes.
 
-    python benchmarks/e2e_cdc_lease_bq.py
+    python benchmarks/e2e_cdc_lease_bq.py          # cases 1-6
+    python benchmarks/e2e_cdc_lease_bq.py 0560     # case 7
 
 Rig: pg-src :5544, MariaDB :3309, BigQuery dataset `apitap_cdc_e2e` (BQ_SA).
 TTL 30. RED: 0.56.0 — no fence table, untokenized staging, and in case 6 A
@@ -47,6 +54,10 @@ TTL = 30
 os.environ["APITAP_LEASE_TTL_SECS"] = str(TTL)
 ok = True
 seen_tokens = set()
+COMPAT = sys.argv[1:] == ["0560"]
+OLD_PY = os.environ.get("APITAP_PY_0560")
+if COMPAT and not OLD_PY:
+    _rig.rig_fail("case 7 needs APITAP_PY_0560 (a venv python holding apitap==0.56.0)")
 
 
 def case(name, passed, detail=""):
@@ -158,8 +169,8 @@ def pg_backlog(lo, n):
                 "COMMIT;" for a in range(lo, lo + n, 500)))
 
 
-def spawn(src, table):
-    return subprocess.Popen([sys.executable, "-c",
+def spawn(src, table, py=sys.executable):
+    return subprocess.Popen([py, "-c",
                              f"import apitap; apitap.transfer({src!r}, {BQ!r}, table={table!r}, mode='log_based')"],
                             env=dict(os.environ, APITAP_CDC_WINDOW_BYTES="262144"),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -176,101 +187,11 @@ def drain():
     return apitap.transfer(PG, BQ, table=T, mode="log_based")
 
 
-a = None
-try:
-    print("== reset and bootstrap (pg -> BigQuery) ==", flush=True)
-    clean_pg()
-    clean_bq(T)
-    pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text)")
-    pg(f"INSERT INTO {T} SELECT g, 'v'||g FROM generate_series(1,200) g")
-    drain()
-    case("bootstrapped", dest_counts(T)[0] == 200, f"{dest_counts(T)[0]} rows")
-    case("a finished run leaves no lock and no live lease",
-         _rig.locks_bq(T) == [] and _rig.live_leases_bq(T) == [],
-         f"locks {_rig.locks_bq(T) or 'none'}, leases {_rig.live_leases_bq(T) or 'none'}")
-
-    print("== 1. a drain killed OUTRIGHT leaves its lock, lease, fence and staging ==", flush=True)
-    pg_backlog(201, 20_000)
-    wm_before = watermark(T)
-    p = spawn(PG, T)
-    if not _rig.wait_for(lambda: lock_token(T) is not None, 60, step=0.5):
-        _rig.rig_fail("the drain never announced its lock")
-    dead = lock_token(T)
-    # Killed once its staging exists: the collector must have one to sweep.
-    # (0.56.0's untokenized staging counts as "loading" too, so the leg runs on
-    # through its RED instead of stopping at the rig check.)
-    def staged():
-        return bool({staging(T, dead), f"{T}__apitap_cdc"} & set(_rig.bq_tables()))
-    if not _rig.wait_for(lambda: p.poll() is not None or staged(), 120, step=0.5) or p.poll() is not None:
-        _rig.rig_fail(f"the drain finished (rc={p.poll()}) before its staging could be seen — raise the backlog")
-    p.kill()
-    p.wait()
-    names = _rig.bq_tables()
-    case("the killed drain left a lock", bool(_rig.locks_bq(T)), f"{_rig.locks_bq(T) or 'none'}")
-    case("…and its staging marker", bool(_rig.markers_bq(T)), f"{_rig.markers_bq(T) or 'none'}")
-    row = lease_row(T, dead)
-    case("…and a live lease row", row is not None and not row[0] and row[1] > 0, f"{row}")
-    case("…and its fence table", fence(dead) in names, fence(dead))
-    case("…and its run-scoped staging", staging(T, dead) in names, staging(T, dead))
-
-    print("== 2. the immediate re-run is refused ==", flush=True)
-    e = refusal(drain)
-    case("refused by type while the lease is fresh",
-         e is not None and "LockedError" in e, (e or "it was ALLOWED")[:120])
-    case("and the refusal names a deadline instead of a chore",
-         bool(e) and "nothing for you to do" in e, (e or "")[-160:])
-
-    print(f"== 3. after the {TTL}s TTL it collects itself ==", flush=True)
-    time.sleep(TTL + 3)
-    e = refusal(drain)
-    case("the next run proceeds", e is None, e or "collected and drained")
-    names = _rig.bq_tables()
-    case("the dead run's lock is gone", _rig.locks_bq(T) == [], f"{_rig.locks_bq(T) or 'none'}")
-    case("and its marker — one claim collects both", _rig.markers_bq(T) == [], f"{_rig.markers_bq(T) or 'none'}")
-    row = lease_row(T, dead)
-    case("its lease row reads collected — a collector never deletes it", row is not None and row[0], f"{row}")
-    case("its fence table is gone", fence(dead) not in names, fence(dead))
-    case("its staging is swept", staging(T, dead) not in names, staging(T, dead))
-    wm_after = watermark(T)
-    case("it RESUMED — the watermark moved on", wm_after and wm_after != wm_before, f"{wm_before} -> {wm_after}")
-    src = pg(f"SELECT count(*)||'|'||count(DISTINCT id)||'|'||coalesce(sum(id::bigint),0) FROM {T}")
-    dst = "|".join(map(str, dest_counts(T)))
-    case("and the destination caught up exactly, one row per key", src == dst, f"src {src} vs dst {dst}")
-
-    print("== 4. a lock with NO lease is never collected, at any age ==", flush=True)
-    stale = f"{T}_0000000l000abcd__apitap_lock"
-    _rig.bq_create_table(stale)
-    e = refusal(drain)
-    case("refused", e is not None and "LockedError" in e, (e or "it was ALLOWED")[:120])
-    case("and the refusal says nothing collects it", bool(e) and "nothing collects it on its own" in e,
-         (e or "")[-150:])
-    case("and it is still there", stale in _rig.locks_bq(T), f"{_rig.locks_bq(T)}")
-    _rig.bq_delete_table(stale)
-
-    print("== 5. a LIVE drain's lease is never collectable ==", flush=True)
-    pg_backlog(20_201, 20_000)
-    p = spawn(PG, T)
-    live = _rig.wait_for(lambda: p.poll() is not None or lock_token(T) is not None, 60, step=0.5) \
-        and p.poll() is None
-    if not live:
-        _rig.rig_fail(f"a live drain was not observable (rc={p.poll()})")
-    ltok = lock_token(T)
-    e = refusal(lambda: apitap.transfer(PG, BQ, table=T, dest_table=T, mode="replace"))
-    row = lease_row(T, ltok)
-    case("a replace is refused beside a LIVE drain", e is not None and "LockedError" in e,
-         (e or "it was ALLOWED")[:120])
-    case("and the refusal says to wait, not to remove", bool(e) and "nothing for you to do" in e, (e or "")[-160:])
-    case("the live drain's lease is uncollected and ahead of now", row is not None and not row[0] and row[1] > 0,
-         f"{row}")
-    _, err = p.communicate(timeout=900)
-    names = _rig.bq_tables()
-    case("it finished normally", p.returncode == 0, f"rc={p.returncode} {err.strip()[-160:]}")
-    case("and left no lock, live lease, staging or fence",
-         _rig.locks_bq(T) == [] and _rig.live_leases_bq(T) == []
-         and staging(T, ltok) not in names and fence(ltok) not in names,
-         f"locks {_rig.locks_bq(T) or 'none'}, leases {_rig.live_leases_bq(T) or 'none'}")
-
-    print("== 6. an evicted drain writes nothing more (MariaDB -> BigQuery) ==", flush=True)
+def evict(a_py, old, label):
+    """Case 6, or with `old` case 7: drain A on `a_py` is paused past the TTL,
+    collected by B on this wheel, then resumed."""
+    global a
+    print(f"== {label} ==", flush=True)
     ma(f"DROP TABLE IF EXISTS {E}")
     clean_bq(E)
     ma(f"CREATE TABLE {E} (id INT PRIMARY KEY, v VARCHAR(120))")
@@ -282,7 +203,7 @@ try:
     ma("; ".join(f"INSERT INTO {E} SELECT seq, REPEAT('w', 100) FROM seq_{lo}_to_{lo + 1999}"
                  for lo in range(201, 60_201, 2000)))
     n0 = state_rows(E)
-    a = spawn(MA, E)
+    a = spawn(MA, E, a_py)
     if not _rig.wait_for(lambda: a.poll() is not None or state_rows(E) > n0, 300, step=1):
         _rig.rig_fail("drain A never landed a window")
     if a.poll() is not None:
@@ -299,7 +220,8 @@ try:
     n1 = state_rows(E)
     row = lease_row(E, atok)
     case("A's row reads collected", row is not None and row[0], f"{row}")
-    case("A's fence table is gone", fence(atok) not in _rig.bq_tables(), fence(atok))
+    if not old:
+        case("A's fence table is gone", fence(atok) not in _rig.bq_tables(), fence(atok))
     _rig.resume(a)
     # Until A exits and a little after: its row never reads unclaimed again.
     # (A's own release deletes its row on the way out; gone is not unclaimed.)
@@ -317,17 +239,126 @@ try:
     except subprocess.TimeoutExpired:
         a.kill()
         _, a_err = a.communicate()
-    case("A's row never reads unclaimed after the claim", not live_again, f"{live_again or 'never'}")
-    case("A exits non-zero", a.returncode not in (0, None), f"rc={a.returncode}")
-    case("and says it no longer holds the table", "no longer holds" in a_err,
-         (a_err.strip().splitlines() or [""])[-1][:160])
+    if not old:
+        case("A's row never reads unclaimed after the claim", not live_again, f"{live_again or 'never'}")
+        case("A exits non-zero", a.returncode not in (0, None), f"rc={a.returncode}")
+        case("and says it no longer holds the table", "no longer holds" in a_err,
+             (a_err.strip().splitlines() or [""])[-1][:160])
+    else:
+        print(f"      the 0.56.0 A exited rc={a.returncode}: "
+              f"{(a_err.strip().splitlines() or [''])[-1][:160]}", flush=True)
     a = None
     n2 = state_rows(E)
+    if old:
+        case("the documented residual: a 0.56.0 A, which has no fence to read, commits after the claim",
+             n2 > n1, f"n1 {n1}, n2 {n2} — stop every 0.56.0 BigQuery drain before a 0.57.0 run "
+             "of the same dataset (compat.bq-0560-victim)")
+        return
     case("A committed nothing after the claim: the state rows are B's", n2 == n1, f"n1 {n1}, n2 {n2}")
     c, u, _ = dest_counts(E)
     total = int(ma(f"SELECT COUNT(*) FROM {E}"))
     case("one row per key, and the source's count", c == u == total, f"dest {c}/{u} of {total}")
     case("A's staging is not left behind", staging(E, atok) not in _rig.bq_tables(), staging(E, atok))
+
+
+a = None
+try:
+    if not COMPAT:
+        print("== reset and bootstrap (pg -> BigQuery) ==", flush=True)
+        clean_pg()
+        clean_bq(T)
+        pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text)")
+        pg(f"INSERT INTO {T} SELECT g, 'v'||g FROM generate_series(1,200) g")
+        drain()
+        case("bootstrapped", dest_counts(T)[0] == 200, f"{dest_counts(T)[0]} rows")
+        case("a finished run leaves no lock and no live lease",
+             _rig.locks_bq(T) == [] and _rig.live_leases_bq(T) == [],
+             f"locks {_rig.locks_bq(T) or 'none'}, leases {_rig.live_leases_bq(T) or 'none'}")
+
+        print("== 1. a drain killed OUTRIGHT leaves its lock, lease, fence and staging ==", flush=True)
+        pg_backlog(201, 20_000)
+        wm_before = watermark(T)
+        p = spawn(PG, T)
+        if not _rig.wait_for(lambda: lock_token(T) is not None, 60, step=0.5):
+            _rig.rig_fail("the drain never announced its lock")
+        dead = lock_token(T)
+        # Killed once its staging exists: the collector must have one to sweep.
+        # (0.56.0's untokenized staging counts as "loading" too, so the leg runs on
+        # through its RED instead of stopping at the rig check.)
+        def staged():
+            return bool({staging(T, dead), f"{T}__apitap_cdc"} & set(_rig.bq_tables()))
+        if not _rig.wait_for(lambda: p.poll() is not None or staged(), 120, step=0.5) or p.poll() is not None:
+            _rig.rig_fail(f"the drain finished (rc={p.poll()}) before its staging could be seen — raise the backlog")
+        p.kill()
+        p.wait()
+        names = _rig.bq_tables()
+        case("the killed drain left a lock", bool(_rig.locks_bq(T)), f"{_rig.locks_bq(T) or 'none'}")
+        case("…and its staging marker", bool(_rig.markers_bq(T)), f"{_rig.markers_bq(T) or 'none'}")
+        row = lease_row(T, dead)
+        case("…and a live lease row", row is not None and not row[0] and row[1] > 0, f"{row}")
+        case("…and its fence table", fence(dead) in names, fence(dead))
+        case("…and its run-scoped staging", staging(T, dead) in names, staging(T, dead))
+
+        print("== 2. the immediate re-run is refused ==", flush=True)
+        e = refusal(drain)
+        case("refused by type while the lease is fresh",
+             e is not None and "LockedError" in e, (e or "it was ALLOWED")[:120])
+        case("and the refusal names a deadline instead of a chore",
+             bool(e) and "nothing for you to do" in e, (e or "")[-160:])
+
+        print(f"== 3. after the {TTL}s TTL it collects itself ==", flush=True)
+        time.sleep(TTL + 3)
+        e = refusal(drain)
+        case("the next run proceeds", e is None, e or "collected and drained")
+        names = _rig.bq_tables()
+        case("the dead run's lock is gone", _rig.locks_bq(T) == [], f"{_rig.locks_bq(T) or 'none'}")
+        case("and its marker — one claim collects both", _rig.markers_bq(T) == [], f"{_rig.markers_bq(T) or 'none'}")
+        row = lease_row(T, dead)
+        case("its lease row reads collected — a collector never deletes it", row is not None and row[0], f"{row}")
+        case("its fence table is gone", fence(dead) not in names, fence(dead))
+        case("its staging is swept", staging(T, dead) not in names, staging(T, dead))
+        wm_after = watermark(T)
+        case("it RESUMED — the watermark moved on", wm_after and wm_after != wm_before, f"{wm_before} -> {wm_after}")
+        src = pg(f"SELECT count(*)||'|'||count(DISTINCT id)||'|'||coalesce(sum(id::bigint),0) FROM {T}")
+        dst = "|".join(map(str, dest_counts(T)))
+        case("and the destination caught up exactly, one row per key", src == dst, f"src {src} vs dst {dst}")
+
+        print("== 4. a lock with NO lease is never collected, at any age ==", flush=True)
+        stale = f"{T}_0000000l000abcd__apitap_lock"
+        _rig.bq_create_table(stale)
+        e = refusal(drain)
+        case("refused", e is not None and "LockedError" in e, (e or "it was ALLOWED")[:120])
+        case("and the refusal says nothing collects it", bool(e) and "nothing collects it on its own" in e,
+             (e or "")[-150:])
+        case("and it is still there", stale in _rig.locks_bq(T), f"{_rig.locks_bq(T)}")
+        _rig.bq_delete_table(stale)
+
+        print("== 5. a LIVE drain's lease is never collectable ==", flush=True)
+        pg_backlog(20_201, 20_000)
+        p = spawn(PG, T)
+        live = _rig.wait_for(lambda: p.poll() is not None or lock_token(T) is not None, 60, step=0.5) \
+            and p.poll() is None
+        if not live:
+            _rig.rig_fail(f"a live drain was not observable (rc={p.poll()})")
+        ltok = lock_token(T)
+        e = refusal(lambda: apitap.transfer(PG, BQ, table=T, dest_table=T, mode="replace"))
+        row = lease_row(T, ltok)
+        case("a replace is refused beside a LIVE drain", e is not None and "LockedError" in e,
+             (e or "it was ALLOWED")[:120])
+        case("and the refusal says to wait, not to remove", bool(e) and "nothing for you to do" in e, (e or "")[-160:])
+        case("the live drain's lease is uncollected and ahead of now", row is not None and not row[0] and row[1] > 0,
+             f"{row}")
+        _, err = p.communicate(timeout=900)
+        names = _rig.bq_tables()
+        case("it finished normally", p.returncode == 0, f"rc={p.returncode} {err.strip()[-160:]}")
+        case("and left no lock, live lease, staging or fence",
+             _rig.locks_bq(T) == [] and _rig.live_leases_bq(T) == []
+             and staging(T, ltok) not in names and fence(ltok) not in names,
+             f"locks {_rig.locks_bq(T) or 'none'}, leases {_rig.live_leases_bq(T) or 'none'}")
+
+        evict(sys.executable, False, "6. an evicted drain writes nothing more (MariaDB -> BigQuery)")
+    else:
+        evict(OLD_PY, True, "7. a 0.56.0 victim beside a 0.57.0 collector (MariaDB -> BigQuery)")
 finally:
     print("== cleanup ==", flush=True)
     if a is not None and a.poll() is None:

@@ -187,7 +187,6 @@ pub(crate) async fn lease_renew(pool: &Pool, db: &str, keys: &[String], token: &
 }
 
 /// This run's keys whose row exists and is not collected. Expiry ignored.
-#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
 pub(crate) async fn lease_unclaimed(pool: &Pool, db: &str, token: &str) -> Result<Vec<String>> {
     let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
     conn.exec(format!("SELECT dest_key FROM {} WHERE token = ? AND collected = 0", lease_t(db)), (token,))

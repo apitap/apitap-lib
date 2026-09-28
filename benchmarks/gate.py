@@ -117,6 +117,10 @@ LEGS = [
     leg("e2e_cdc_fence.py",        "an evicted drain writes nothing more",
         proves={"fence.evicted-writes-nothing": ("pg",), "keeper.skips-own-held-row": ("pg",),
                 "lease.killed-drain-self-heals": ("pg",)}),
+    leg("e2e_cdc_apply_orphan.py", "a drain that loses its source joins its apply before letting go",
+        {"cpu>0.6"}, proves={"cdc.apply-joined-on-error": ("pg",)}),
+    leg("e2e_slots.py",            "slots=N: each group holds its own tenure",
+        proves={"slots.groups-independent": ("pg",)}),
     leg("e2e_my_liveness.py",      "a dead binlog peer is noticed"),
 
     leg("e2e_ch_source.py",        "ClickHouse -> ClickHouse, RowBinary relayed"),
@@ -155,6 +159,8 @@ LEGS = [
                 "guard.no-lease-no-collect": ("bq",), "fence.evicted-writes-nothing": ("bq",)}),
     leg("e2e_bq_multi_drain.py",   "four drains in one dataset, and a transaction past the TTL", {"bq"},
         proves={"bq.multi-drain-one-dataset": ("bq",)}),
+    leg("e2e_cdc_lease_bq.py",     "a 0.56.0 BigQuery victim beside this collector: the residual",
+        {"bq", "mariadb", "wheel-0560"}, ["0560"], proves={"compat.bq-0560-victim": ("bq@0560",)}),
 
     leg("e2e_rolling_upgrade.py",  "0.55.1 beside this release, Postgres", {"wheel-0551"}, ["0551", "pg"],
         proves={"compat.old-bulk-refused-by-new-drain": ("pg@0551",),

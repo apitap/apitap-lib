@@ -9,9 +9,12 @@
 //! from the source, BigQuery masks the column and lets its MERGE keep the target
 //! value).
 
+use crate::error::{Error, Result};
 use crate::logbased::collapse::{Collapsed, Key, ResidueOp};
-use crate::logbased::rowtext::{row_key_refs, row_key_refs_cells};
+use crate::logbased::dest_pg::{quote_ident, quote_table};
+use crate::logbased::rowtext::{row_key_refs, row_key_refs_cells, BYTEA_OID};
 use crate::wire::pgoutput::{Cell, Tuple};
+use sqlx::Row as _;
 use std::collections::HashMap;
 
 /// One key's final state after replaying the residue tail over the set-phase
@@ -115,6 +118,98 @@ pub(crate) fn resolve_window<'a>(c: &'a Collapsed, pk_idx: &[usize]) -> Vec<(Key
         }
     }
     order
+}
+
+/// The source a window was drained from, for the one read a destination may
+/// make of it: filling a TOAST hole the WAL did not carry, which Iceberg cannot
+/// read back from its own immutable files. Only reads — a destination module
+/// holds one without holding anything it could write through (see
+/// `lease::tests::no_connection_types_outside_store`).
+pub(crate) struct Source<'a>(pub(crate) &'a sqlx::PgPool);
+
+impl Source<'_> {
+    /// Fill each remaining TOAST hole from the source's CURRENT row (see module
+    /// docs for why the destination can't be read back). A key whose source row
+    /// is already gone stays delete-set-only; its WAL delete arrives in a later
+    /// window.
+    pub(crate) async fn refetch_masked(
+        &self,
+        finals: &mut [(Key, Fin<'_>)],
+        qualified_src: &str,
+        pk: &str,
+        wal_cols: &[String],
+        oids: &[u32],
+    ) -> Result<()> {
+        if !finals.iter().any(|(_, f)| matches!(f, Fin::Refetch(_))) {
+            return Ok(());
+        }
+        let dbg = std::env::var("APITAP_DEBUG").is_ok();
+        let sel = wal_cols
+            .iter()
+            .zip(oids.iter())
+            .map(|(c, &oid)| {
+                let q = quote_ident(c);
+                // bytea's ::text honors bytea_output — force the WAL's \x-hex form.
+                if oid == BYTEA_OID {
+                    format!("'\\x' || encode({q}, 'hex')")
+                } else {
+                    format!("{q}::text")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {sel} FROM {} WHERE {}::text = $1",
+            quote_table(qualified_src),
+            quote_ident(pk)
+        );
+        // One tx pins the session UTC so timestamptz::text matches the WAL's
+        // +00-suffixed rendering (SET LOCAL dies with the tx).
+        let mut tx = self.0.begin().await.map_err(db_err)?;
+        sqlx::query("SET LOCAL TimeZone = 'UTC'")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for (key, fin) in finals.iter_mut() {
+            let Fin::Refetch(cells) = fin else { continue };
+            let ktext = String::from_utf8(key[0].clone())
+                .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+            let row = sqlx::query(&sql)
+                .bind(&ktext)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            match row {
+                Some(r) => {
+                    for (i, cell) in cells.iter_mut().enumerate() {
+                        if matches!(cell, Cell::UnchangedToast) {
+                            let v: Option<String> = r.try_get(i).map_err(db_err)?;
+                            *cell = match v {
+                                None => Cell::Null,
+                                Some(s) => Cell::Text(bytes::Bytes::from(s)),
+                            };
+                        }
+                    }
+                    *fin = Fin::Owned(std::mem::take(cells));
+                }
+                None => {
+                    if dbg {
+                        eprintln!(
+                            "[log_based] TOAST refetch: {qualified_src} key '{ktext}' is \
+                             gone on the source — dropping the row image"
+                        );
+                    }
+                    *fin = Fin::Gone;
+                }
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+}
+
+fn db_err(e: sqlx::Error) -> Error {
+    Error::Transfer(format!("log_based: source refetch: {e}"))
 }
 
 #[cfg(test)]

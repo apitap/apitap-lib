@@ -119,35 +119,16 @@ pub(crate) struct Keeper {
 }
 
 impl Keeper {
-    /// `renew` is called every [`renew_secs`]; it returns how many rows it
-    /// actually touched, which the keeper only logs.
-    pub(crate) fn spawn<F, Fut>(renew: F) -> Keeper
-    where
-        F: Fn() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<u64>> + Send,
-    {
-        Self::every(std::time::Duration::from_secs(renew_secs()), move || {
-            let fut = renew();
-            async move {
-                // A failed renewal is NOT a reason to kill a drain: a blip on
-                // the destination would then end a run that is perfectly
-                // healthy, and there are nine more ticks before the lease
-                // lapses. Note it and try again.
-                if let Err(e) = fut.await {
-                    if std::env::var("APITAP_DEBUG").is_ok() {
-                        eprintln!("[lease] renewal failed, retrying next tick: {e}");
-                    }
-                }
-            }
-        })
-    }
-
     /// The tenure's keeper: renew, then ask the destination which of this
     /// run's rows still exist uncollected. A key missing from that answer was
     /// CLAIMED (or deleted) by someone else — that, and never expiry, is an
     /// eviction. A lapsed lease that nobody has claimed is still this run's:
     /// the next renewal revives it, and every write is fenced on the row
     /// anyway.
+    ///
+    /// A failed renewal is NOT a reason to stop a drain: a blip on the
+    /// destination would then end a run that is perfectly healthy, and there
+    /// are nine more ticks before the lease lapses. It is noted and retried.
     fn for_tenure<F: Fence>(
         dest: std::sync::Arc<F>,
         keys: Vec<String>,
@@ -220,24 +201,22 @@ impl Drop for Keeper {
 // Ownership as a value
 // ───────────────────────────────────────────────────────────────────────────
 //
-// Wired into the CDC lane engine by engine (handoff §3 steps 16-24); until the
-// switch, only the tests below use what follows.
+// Every CDC write goes through a unit a `Tenure` opened (logbased/run.rs), and
+// each destination's `mod store` is the only code holding a connection it
+// could write through (`no_connection_types_outside_store`).
 
 /// What a script names when its fence found the run's claim gone (BigQuery).
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) const LOST_MARK: &str = "apitap-lease-lost";
 
 /// The time fence where no row lock exists (ClickHouse statements, BigQuery
 /// DDL): an owner may write only while more than half its TTL is left, and a
 /// statement is bounded server-side to the same half, so it ends before any
 /// peer can claim the lease.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) fn owned_margin_secs() -> u64 {
     ttl_secs() / 2
 }
 
 /// The refusal a drain gives when its claim is gone. Nothing was written.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) fn no_longer_holds(keys: &[String]) -> Error {
     Error::Locked(format!(
         "{}: this drain no longer holds the table — another run collected its claim, so it is \
@@ -255,7 +234,6 @@ pub(crate) fn no_longer_holds(keys: &[String]) -> Error {
 /// not an owner — 0.56.0 read "no row" as "nothing to fence against" and wrote,
 /// which is exactly what a collector that deleted the row would have wanted to
 /// stop.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) fn owner_verdict(row: Option<&Lease>, keys: &[String]) -> Result<()> {
     match row {
         Some(l) if !l.collected => Ok(()),
@@ -265,13 +243,11 @@ pub(crate) fn owner_verdict(row: Option<&Lease>, keys: &[String]) -> Result<()> 
 
 /// The watermark a unit writes when it closes — the only place one is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) enum Watermark {
     Set { table: String, source_id: String, lsn: u64, rows: u64 },
     Clear { table: String, source_id: String },
 }
 
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 impl Watermark {
     pub(crate) fn table(&self) -> &str {
         match self {
@@ -283,7 +259,6 @@ impl Watermark {
 /// The lease rows of one destination: open, renew, and who still holds what.
 /// Liveness questions a COLLECTOR asks (get, claim, close) are the guard's
 /// (`crate::guard::GuardStore`), so there is one spelling of each.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) trait LeaseStore: Send + Sync + 'static {
     fn lease_key(&self, dest_table: &str) -> String;
     /// Open this run's rows (and on BigQuery its per-run fence table).
@@ -302,7 +277,6 @@ pub(crate) trait LeaseStore: Send + Sync + 'static {
 }
 
 /// A destination that can fence a unit of writes on its own lease row.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) trait Fence: LeaseStore {
     type Unit<'a>: Send
     where
@@ -326,7 +300,6 @@ pub(crate) trait Fence: LeaseStore {
 
 /// One open unit of writes. Only `Tenure::open` makes one, and `release`
 /// cannot pass it: it carries a read guard `release` waits for.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) struct Held<'t, F: Fence + 't> {
     pub(crate) unit: F::Unit<'t>,
     tables: Vec<String>,
@@ -335,11 +308,9 @@ pub(crate) struct Held<'t, F: Fence + 't> {
 
 /// This run's ownership of a group of destination tables, as a value: every
 /// CDC write goes through a unit it opens, and nothing else can open one.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 pub(crate) struct Tenure<F: Fence> {
     dest: std::sync::Arc<F>,
     run: RunId,
-    tables: Vec<String>,
     announced: std::sync::Mutex<Vec<(String, crate::guard::Announced)>>,
     evicted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     closing: std::sync::atomic::AtomicBool,
@@ -348,7 +319,6 @@ pub(crate) struct Tenure<F: Fence> {
     keeper: std::sync::Mutex<Option<Keeper>>,
 }
 
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
 impl<F: Fence> Tenure<F> {
     /// Lease first, then announce every member, then check every member — the
     /// order that makes a dead run collectable and two live ones unable to
@@ -368,12 +338,14 @@ impl<F: Fence> Tenure<F> {
         let keys: Vec<String> = tables.iter().map(|t| dest.lease_key(t)).collect();
         dest.lease_open(&keys, run.token()).await?;
         let mut held: Vec<(String, crate::guard::Announced)> = Vec::new();
+        // A refusal gives back what it holds, the run's own objects included:
+        // a refused BigQuery drain would otherwise leave its fence table.
         for t in tables {
             let (g, bare) = dest.guard(t);
             match crate::guard::announce(&*g, &bare, &run).await {
                 Ok(a) => held.push((t.clone(), a)),
                 Err(e) => {
-                    give_back(&*dest, held, run.token()).await;
+                    give_back_run(&*dest, held, run.token()).await;
                     return Err(e);
                 }
             }
@@ -381,7 +353,7 @@ impl<F: Fence> Tenure<F> {
         for t in tables {
             let (g, bare) = dest.guard(t);
             if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, Mine::Keep).await {
-                give_back(&*dest, held, run.token()).await;
+                give_back_run(&*dest, held, run.token()).await;
                 return Err(e);
             }
         }
@@ -390,7 +362,6 @@ impl<F: Fence> Tenure<F> {
         Ok(Tenure {
             dest,
             run,
-            tables: tables.to_vec(),
             announced: std::sync::Mutex::new(held),
             evicted,
             closing: std::sync::atomic::AtomicBool::new(false),
@@ -437,9 +408,14 @@ impl<F: Fence> Tenure<F> {
         r
     }
 
-    /// Give the table back: wait for every open unit, stop the keeper, drop
-    /// the markers, and close each lease only with the proof that its markers
-    /// are gone.
+    /// The destination this tenure fences.
+    pub(crate) fn dest(&self) -> &F {
+        &self.dest
+    }
+
+    /// Give the table back: wait for every open unit, stop the keeper, then
+    /// per member its scratch, its markers, and its lease only with the proof
+    /// that its markers are gone (`give_back`).
     pub(crate) async fn release(&self) {
         self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
         let _all = self.units.write().await;
@@ -450,14 +426,9 @@ impl<F: Fence> Tenure<F> {
             self.dest.note("keeper_stop");
         }
         let held = std::mem::take(&mut *self.announced.lock().expect("announced"));
-        if give_back(&*self.dest, held, self.run.token()).await {
-            self.dest.close_run(self.run.token()).await;
-        }
+        give_back_run(&*self.dest, held, self.run.token()).await;
     }
 
-    pub(crate) fn tables(&self) -> &[String] {
-        &self.tables
-    }
 }
 
 impl<F: Fence> Drop for Tenure<F> {
@@ -473,18 +444,35 @@ impl<F: Fence> Drop for Tenure<F> {
     }
 }
 
-/// Markers first; for each member whose markers are all gone, its scratch and
-/// then its lease. `true` when every member was given back.
-#[allow(dead_code)] // wired at the Tenure switch (step 24)
+/// Per member: its run-scoped scratch first, then its markers, then — with
+/// the proof that every marker is gone — its lease. `true` when every member
+/// was given back.
+///
+/// Scratch before markers, the order the collector uses (`guard::check_peers`)
+/// and for the same reason. The scratch (ClickHouse's key table, BigQuery's
+/// staging, a changelog temp) is named by this run's token and is not a
+/// marker: once the markers and the lease are gone, no run will ever name the
+/// token again, and nothing reaps on age — a failed drop would leak it for
+/// ever. So a failed sweep keeps the member's markers AND its lease, loudly:
+/// after the TTL the next run collects the member like a dead drain's, and its
+/// sweep retries the drop. (The handoff's §0 L5 swept between markers and
+/// lease and ignored a failed sweep.)
 async fn give_back<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announced)>, token: &str) -> bool {
     let mut all = true;
     for (t, a) in held {
         let (g, bare) = dest.guard(&t);
+        if let Err(e) = g.sweep_run(&bare, token).await {
+            eprintln!(
+                "apitap: {}: could not drop this run's scratch ({e}); its claim is kept so the \
+                 next run collects it after the TTL and retries the drop",
+                g.dest_label(&bare)
+            );
+            a.abandon();
+            all = false;
+            continue;
+        }
         match crate::guard::release(&*g, a).await {
-            Ok(proof) => {
-                let _ = g.sweep_run(&bare, token).await;
-                g.lease_close(proof).await;
-            }
+            Ok(proof) => g.lease_close(proof).await,
             Err(a) => {
                 a.abandon();
                 all = false;
@@ -492,6 +480,14 @@ async fn give_back<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announce
         }
     }
     all
+}
+
+/// `give_back`, and once every member went, the run's own objects (BigQuery's
+/// fence table). A member kept for its collector keeps the fence with it.
+async fn give_back_run<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announced)>, token: &str) {
+    if give_back(dest, held, token).await {
+        dest.close_run(token).await;
+    }
 }
 
 #[cfg(test)]
@@ -504,8 +500,9 @@ mod tests {
 
     type Log = Arc<Mutex<Vec<String>>>;
 
-    /// The guard side of the fake: no peers, and every call logged.
-    struct FakeGuard(Log);
+    /// The guard side of the fake: no peers, and every call logged. The flag
+    /// makes `sweep_run` fail.
+    struct FakeGuard(Log, bool);
 
     #[async_trait::async_trait]
     impl GuardStore for FakeGuard {
@@ -536,6 +533,9 @@ mod tests {
         }
         async fn sweep_run(&self, _b: &str, _t: &str) -> Result<()> {
             self.0.lock().unwrap().push("sweep_run".into());
+            if self.1 {
+                return Err(Error::Transfer("sweep: injected".into()));
+            }
             Ok(())
         }
     }
@@ -552,6 +552,7 @@ mod tests {
         in_close: AtomicUsize,
         max_in_close: AtomicUsize,
         close_waits: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        sweep_fails: bool,
     }
 
     impl FakeFence {
@@ -587,7 +588,7 @@ mod tests {
     impl Fence for FakeFence {
         type Unit<'a> = ();
         fn guard(&self, t: &str) -> (Box<dyn GuardStore + '_>, String) {
-            (Box::new(FakeGuard(self.log.clone())), t.to_string())
+            (Box::new(FakeGuard(self.log.clone(), self.sweep_fails)), t.to_string())
         }
         fn serial_commit(&self) -> bool {
             self.serial
@@ -661,11 +662,194 @@ mod tests {
             let at = |e: &str| ev.iter().position(|x| x == e).unwrap_or_else(|| panic!("{e} missing: {ev:?}"));
             assert!(at("open_unit") < at("close_unit"), "{ev:?}");
             assert!(at("close_unit") < at("keeper_stop"), "release passed an open unit: {ev:?}");
-            assert!(at("keeper_stop") < at("drop_marker"), "{ev:?}");
-            assert!(at("drop_marker") < at("sweep_run"), "{ev:?}");
-            assert!(at("sweep_run") < at("lease_close"), "{ev:?}");
+            assert!(at("keeper_stop") < at("sweep_run"), "{ev:?}");
+            assert!(at("sweep_run") < at("drop_marker"), "scratch goes before the markers: {ev:?}");
+            assert!(at("drop_marker") < at("lease_close"), "{ev:?}");
             assert!(at("lease_close") < at("close_run"), "{ev:?}");
         });
+    }
+
+    /// A member whose scratch would not drop keeps its markers and its lease,
+    /// so the next run collects it after the TTL and its sweep retries the
+    /// drop. Given back anyway, nothing would ever name the token again.
+    #[test]
+    fn a_failed_sweep_keeps_markers_and_lease() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence { sweep_fails: true, ..Default::default() });
+            let t = tenure(f.clone(), SLOW).await;
+            t.release().await;
+            let ev = f.events();
+            assert!(ev.iter().any(|e| e == "sweep_run"), "{ev:?}");
+            for kept in ["drop_marker", "lease_close", "close_run"] {
+                assert!(!ev.iter().any(|e| e == kept), "{kept} after a failed sweep: {ev:?}");
+            }
+        });
+    }
+
+    /// I1: the only writable handle is a unit. Outside each destination's
+    /// `mod store` there is no connection type a write could go through, and
+    /// no transaction statement a body could open or end one with.
+    #[test]
+    fn no_connection_types_outside_store() {
+        const FILES: &[(&str, &str)] = &[
+            ("dest_pg.rs", include_str!("logbased/dest_pg.rs")),
+            ("dest_my.rs", include_str!("logbased/dest_my.rs")),
+            ("dest_ch.rs", include_str!("logbased/dest_ch.rs")),
+            ("dest_bq.rs", include_str!("logbased/dest_bq.rs")),
+            ("dest_ice.rs", include_str!("logbased/dest_ice.rs")),
+        ];
+        const TYPES: &[&str] = &["PgPool", "MySqlShared", "mysql_async::Pool", "ChConn", "BqConn"];
+        const STATEMENTS: &[&str] = &["COMMIT", "START TRANSACTION", "ROLLBACK"];
+        for (name, src) in FILES {
+            let (code, strings) = outside_store(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for t in TYPES {
+                assert!(!has_word(&code, t), "{name}: {t} outside mod store");
+            }
+            for st in STATEMENTS {
+                // As a STATEMENT: the literal's first word, or the first after a
+                // `;`. `ON COMMIT DROP` is a clause of a temp table inside a
+                // unit, and prose ("the commit") is not SQL at all.
+                for lit in &strings {
+                    // Source text, escapes unprocessed: `\n` and a line
+                    // continuation are whitespace to SQL.
+                    let sql = lit.replace("\\\n", " ").replace("\\n", " ").replace("\\t", " ").replace("\\r", " ");
+                    let opens = sql.split(';').any(|stmt| {
+                        let t = stmt.trim_start();
+                        t.starts_with(st) && !t[st.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                    assert!(!opens, "{name}: {st} outside mod store: {lit:?}");
+                }
+            }
+        }
+    }
+
+    /// `word` in `hay`, not as part of a longer identifier.
+    fn has_word(hay: &str, word: &str) -> bool {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        hay.match_indices(word).any(|(i, _)| {
+            !hay[..i].chars().next_back().is_some_and(ident) && !hay[i + word.len()..].chars().next().is_some_and(ident)
+        })
+    }
+
+    /// The file with its one `mod store { … }` block — and its `mod tests`,
+    /// which spells statements to assert on them — cut out, as (code with
+    /// comments and literals blanked, the string literals). Braces are matched
+    /// on code only, so a `{` inside a format string or a comment counts for
+    /// nothing.
+    fn outside_store(src: &str) -> std::result::Result<(String, Vec<String>), String> {
+        #[derive(PartialEq)]
+        enum K { Code, Str }
+        // Lex into (kind, text) runs.
+        let b = src.as_bytes();
+        let mut runs: Vec<(K, String)> = vec![(K::Code, String::new())];
+        let push = |runs: &mut Vec<(K, String)>, k: K, t: &str| match runs.last_mut() {
+            Some((lk, lt)) if *lk == k && k == K::Code => lt.push_str(t),
+            _ => runs.push((k, t.to_string())),
+        };
+        let mut i = 0;
+        while i < b.len() {
+            let rest = &src[i..];
+            if rest.starts_with("//") {
+                let end = rest.find('\n').map_or(src.len(), |n| i + n);
+                push(&mut runs, K::Code, " ");
+                i = end;
+            } else if rest.starts_with("/*") {
+                let (mut depth, mut j) = (0usize, i);
+                while j < b.len() {
+                    if src[j..].starts_with("/*") { depth += 1; j += 2; }
+                    else if src[j..].starts_with("*/") { depth -= 1; j += 2; if depth == 0 { break; } }
+                    else { j += 1; }
+                }
+                push(&mut runs, K::Code, " ");
+                i = j;
+            } else if rest.starts_with("r\"") || rest.starts_with("r#") || rest.starts_with("br\"") || rest.starts_with("br#") {
+                let start = if rest.starts_with('b') { i + 2 } else { i + 1 };
+                let hashes = src[start..].bytes().take_while(|&c| c == b'#').count();
+                if b.get(start + hashes) != Some(&b'"') {
+                    push(&mut runs, K::Code, &src[i..i + 1]);
+                    i += 1;
+                    continue;
+                }
+                let close = format!("\"{}", "#".repeat(hashes));
+                let body = start + hashes + 1;
+                let end = src[body..].find(&close).ok_or("unterminated raw string")? + body;
+                push(&mut runs, K::Str, &src[body..end]);
+                push(&mut runs, K::Code, " \"\" ");
+                i = end + close.len();
+            } else if b[i] == b'"' || rest.starts_with("b\"") {
+                let mut j = if b[i] == b'b' { i + 2 } else { i + 1 };
+                let body = j;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                push(&mut runs, K::Str, &src[body..j.min(b.len())]);
+                push(&mut runs, K::Code, " \"\" ");
+                i = j + 1;
+            } else if b[i] == b'\'' {
+                // A char literal ('x', '\n', '\''), or a lifetime ('a).
+                let lit = if b.get(i + 1) == Some(&b'\\') {
+                    // Past the escaped character, so '\'' ends where it should.
+                    src[i + 3..].find('\'').map(|n| i + 3 + n + 1)
+                } else {
+                    let c = src[i + 1..].chars().next().map_or(0, char::len_utf8);
+                    (b.get(i + 1 + c) == Some(&b'\'')).then_some(i + 2 + c)
+                };
+                match lit {
+                    Some(end) => { push(&mut runs, K::Code, " ' ' "); i = end; }
+                    None => { push(&mut runs, K::Code, "'"); i += 1; }
+                }
+            } else {
+                let c = rest.chars().next().unwrap();
+                push(&mut runs, K::Code, &rest[..c.len_utf8()]);
+                i += c.len_utf8();
+            }
+        }
+        // Cut `mod store { … }` by matching braces in code only.
+        let mut out = String::new();
+        let mut strings = Vec::new();
+        let (mut cutting, mut depth, mut found) = (false, 0i64, 0);
+        for (k, t) in runs {
+            if k == K::Str {
+                if !cutting { strings.push(t); }
+                continue;
+            }
+            let mut code = t.as_str();
+            loop {
+                if !cutting {
+                    let next = ["mod store {", "mod tests {"]
+                        .iter()
+                        .filter_map(|m| code.find(m).map(|at| (at, *m)))
+                        .min();
+                    match next {
+                        Some((at, m)) => {
+                            out.push_str(&code[..at]);
+                            cutting = true;
+                            found += usize::from(m == "mod store {");
+                            depth = 1;
+                            code = &code[at + m.len()..];
+                        }
+                        _ => { out.push_str(code); break; }
+                    }
+                } else {
+                    let mut end = None;
+                    for (n, ch) in code.char_indices() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => { depth -= 1; if depth == 0 { end = Some(n + 1); break; } }
+                            _ => {}
+                        }
+                    }
+                    match end {
+                        Some(e) => { cutting = false; code = &code[e..]; }
+                        None => break,
+                    }
+                }
+            }
+        }
+        if found != 1 || cutting {
+            return Err(format!("expected one closed `mod store {{ … }}`, found {found} (open: {cutting})"));
+        }
+        Ok((out, strings))
     }
 
     #[test]

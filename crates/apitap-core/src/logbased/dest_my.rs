@@ -14,7 +14,7 @@
 
 use crate::dialect::mysql::my_ident;
 use crate::error::{Error, Result};
-use crate::lease::{Fence, LeaseStore, Watermark};
+use crate::lease::Watermark;
 use crate::logbased::collapse::ResidueOp;
 use crate::logbased::drain::DrainOutcome;
 use crate::logbased::rowtext::{
@@ -37,65 +37,26 @@ fn bare(dest_table: &str) -> &str {
 
 pub(crate) struct MyDest {
     store: MyStore,
-    /// This run's token, until the Tenure opens units itself: each entry
-    /// below is a shim that opens one unit, writes through it, and closes it.
-    run_token: std::sync::Mutex<Option<String>>,
 }
 
 impl MyDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: MyStore::connect(url)?, run_token: Default::default() })
+        Ok(Self { store: MyStore::connect(url)? })
     }
 
-    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
-        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
-    }
-
-    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        self.store.lease_key(dest_table)
-    }
-
-    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
-        self.store.lease_open(keys, run.token()).await
-    }
-
-    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
-        self.store.lease_renew(keys, run.token()).await
-    }
-
-    /// This destination as the guard sees it — the same `MyGuard` the bulk
-    /// sink uses, so a drain and a bulk run write and read the same markers
-    /// and lease rows — and the bare name the guard spells the table with.
-    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::mysql::MyGuard, String) {
-        (self.store.my_guard(), bare(dest_table).to_string())
+    /// The store: the lease, the guard and the units a run's tenure takes.
+    pub(crate) fn store(&self) -> &MyStore {
+        &self.store
     }
 
     pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
         self.store.read_state(dest_table, source_id).await
     }
 
-    async fn unit(&self, dest_table: &str) -> Result<(MyTx, String)> {
-        let token = self
-            .run_token
-            .lock()
-            .expect("run token")
-            .clone()
-            .ok_or_else(|| Error::Transfer("internal: a CDC write outside a run".into()))?;
-        let u = self.store.open_unit(&[self.store.lease_key(dest_table)], &token).await?;
-        Ok((u, token))
-    }
-
     /// The bootstrap's replace path may or may not have carried the PK into
-    /// the created table — ensure it, then write the state row.
-    pub(crate) async fn bootstrap_finish(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-        pk_cols: &[String],
-        lsn: u64,
-        rows: u64,
-    ) -> Result<()> {
-        let (mut u, token) = self.unit(dest_table).await?;
+    /// the created table — ensure it, inside the unit whose close writes the
+    /// state row.
+    pub(crate) async fn bootstrap_finish(&self, u: &mut MyTx, dest_table: &str, pk_cols: &[String]) -> Result<()> {
         let has_pk: Option<u64> = u
             .catalog_first(
                 "SELECT COUNT(*) FROM information_schema.table_constraints \
@@ -109,41 +70,21 @@ impl MyDest {
             let ft = u.fq(bare(dest_table));
             u.owned_ddl(&format!("ALTER TABLE {ft} ADD PRIMARY KEY ({pklist})")).await?;
         }
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
-        self.store.close_unit(u, &token, vec![mark]).await
+        Ok(())
     }
 
-    /// Remove this table's watermark row — a failed group bootstrap must leave
-    /// no state, or the next run refuses the group as torn.
-    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Clear { table: dest_table.into(), source_id: source_id.into() };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
-    /// Write a bare state row — the source-identity marker rides in an
-    /// ordinary row under a reserved `source_id`, so the state table needs no
-    /// new column and older deployments need no migration.
-    pub(crate) async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn: value, rows: 0 };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
-    /// Apply one collapsed window in ONE InnoDB transaction (see module docs
-    /// for the TRUNCATE).
+    /// Apply one collapsed window through the unit (see module docs for the
+    /// TRUNCATE); its close writes the watermark named here.
     pub(crate) async fn apply(
         &self,
+        u: &mut MyTx,
         dest_table: &str,
         qualified_src: &str,
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
-    ) -> Result<u64> {
-        let (mut u, token) = self.unit(dest_table).await?;
-        let (n, mark) = apply_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id).await?;
-        self.store.close_unit(u, &token, vec![mark]).await?;
-        Ok(n)
+    ) -> Result<(u64, Watermark)> {
+        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
     }
 }
 
@@ -337,7 +278,9 @@ mod store {
     use crate::dialect::mysql::my_ident;
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
-    use crate::lease::{no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark};
+    use crate::lease::{
+        no_longer_holds, owned_margin_secs, owner_verdict, ttl_secs, Fence, Lease, LeaseStore, Watermark,
+    };
     use crate::sink::mysql::{lease_t, sql_lit, MyGuard, MySqlShared, MySqlSink};
     use mysql_async::prelude::Queryable;
 
@@ -764,9 +707,9 @@ mod store {
             })
         }
 
-        /// Every mark, then per key the renewal and a READ of the row — the
-        /// verdict is never an affected-row count — then COMMIT, then the
-        /// twins go.
+        /// Every mark, then per key the renewal and a READ of the row, judged
+        /// by `owner_verdict` — never by an affected-row count — then COMMIT,
+        /// then the twins go.
         async fn close_unit<'a>(&'a self, mut u: MyTx, _token: &str, marks: Vec<Watermark>) -> Result<()> {
             u.begin().await?;
             let state = self.fq("_apitap_state");
@@ -796,14 +739,18 @@ mod store {
                     )
                     .await
                     .map_err(my_err("lease renew"))?;
-                let c: Option<(i32,)> = u
+                let row: Option<(i32, i64)> = u
                     .conn()
-                    .exec_first(format!("SELECT collected FROM {lease} WHERE dest_key = ? AND token = ?"), (k, &token))
+                    .exec_first(
+                        format!(
+                            "SELECT collected, TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), expires_at) \
+                             FROM {lease} WHERE dest_key = ? AND token = ?"
+                        ),
+                        (k, &token),
+                    )
                     .await
                     .map_err(my_err("lease read"))?;
-                if c.map(|(c,)| c) != Some(0) {
-                    return Err(no_longer_holds(&keys));
-                }
+                owner_verdict(row.map(|(c, e)| Lease { expires_in: e, collected: c != 0 }).as_ref(), &keys)?;
             }
             u.conn().query_drop("COMMIT").await.map_err(my_err("commit"))?;
             u.in_tx = false;
@@ -909,9 +856,10 @@ mod tests {
     /// collector reads a lease row the drain never writes.
     #[test]
     fn lease_key_is_dest_label() {
+        use crate::lease::LeaseStore;
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let d = MyDest::connect("mysql://root:x@127.0.0.1:1/bench").unwrap();
-            let g = d.store.my_guard();
+            let d = MyStore::connect("mysql://root:x@127.0.0.1:1/bench").unwrap();
+            let g = d.my_guard();
             for t in ["orders", "bench.orders", "Mixed Case"] {
                 assert_eq!(d.lease_key(t), g.dest_label(bare(t)), "{t}");
             }

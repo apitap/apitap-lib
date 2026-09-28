@@ -9,7 +9,7 @@
 //! pool at all, so a write outside a fence is not expressible here.
 
 use crate::error::{Error, Result};
-use crate::lease::{Fence, LeaseStore, Watermark};
+use crate::lease::Watermark;
 use crate::logbased::collapse::ResidueOp;
 use crate::logbased::drain::DrainOutcome;
 use crate::logbased::rowtext::{copy_escape, pk_indices, render_copy_row, row_key_refs};
@@ -22,18 +22,16 @@ const STATE_CURSOR: &str = "_lsn";
 
 pub(crate) struct PgDest {
     store: PgStore,
-    /// This run's token, until the Tenure opens units itself: each entry
-    /// below is a shim that opens one unit, writes through it, and closes it.
-    run_token: std::sync::Mutex<Option<String>>,
 }
 
 impl PgDest {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: PgStore::connect(url).await?, run_token: Default::default() })
+        Ok(Self { store: PgStore::connect(url).await? })
     }
 
-    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
-        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
+    /// The store: the lease, the guard and the units a run's tenure takes.
+    pub(crate) fn store(&self) -> &PgStore {
+        &self.store
     }
 
     /// Resolve every member's schema once, before a lease key is taken.
@@ -41,90 +39,29 @@ impl PgDest {
         self.store.resolve_names(tables).await
     }
 
-    /// This destination as the guard sees it for one member — the bulk sink's
-    /// `PgGuard`, in the schema that member resolved to — and its bare name.
-    pub(crate) fn guard(&self, dest_table: &str) -> (crate::sink::postgres::PgGuard, String) {
-        self.store.pg_guard(dest_table)
-    }
-
-    /// The lease key — the SAME schema-qualified string the peer scan and the
-    /// refusal already use. Never the bare name: the scan is scoped to one
-    /// schema, so a bare key would put `sales.orders` and `hr.orders` in one key
-    /// space and let a run in one schema collect a live drain in the other.
-    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        self.store.lease_key(dest_table)
-    }
-
-    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
-        self.store.lease_open(keys, run.token()).await
-    }
-
-    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
-        self.store.lease_renew(keys, run.token()).await
-    }
-
     pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
         self.store.read_state(dest_table, source_id).await
     }
 
-    /// One unit over `dest_table`, for the shims below.
-    async fn unit(&self, dest_table: &str) -> Result<(PgUnit, String)> {
-        let token = self
-            .run_token
-            .lock()
-            .expect("run token")
-            .clone()
-            .ok_or_else(|| Error::Transfer("internal: a CDC write outside a run".into()))?;
-        let u = self.store.open_unit(&[self.store.lease_key(dest_table)], &token).await?;
-        Ok((u, token))
-    }
-
-    /// Remove this table's watermark row — a failed group bootstrap must leave
-    /// no state, or the next run refuses the group as torn.
-    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Clear { table: dest_table.into(), source_id: source_id.into() };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
     /// The bootstrap's full load lands data without constraints; the drain's
-    /// apply needs the identity — add it, then write the state row, in one unit.
-    pub(crate) async fn bootstrap_finish(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-        pk_cols: &[String],
-        lsn: u64,
-        rows: u64,
-    ) -> Result<()> {
-        let (mut u, token) = self.unit(dest_table).await?;
-        add_primary_key(&mut u, dest_table, pk_cols).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
-        self.store.close_unit(u, &token, vec![mark]).await
+    /// apply needs the identity — add it, inside the unit whose close writes
+    /// the state row.
+    pub(crate) async fn bootstrap_finish(&self, u: &mut PgUnit, dest_table: &str, pk_cols: &[String]) -> Result<()> {
+        add_primary_key(u, dest_table, pk_cols).await
     }
 
-    /// Write a bare state row — used for the source-identity marker, which
-    /// is an ordinary row under a reserved `source_id` rather than a column
-    /// the state table would have to grow.
-    pub(crate) async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn: value, rows: 0 };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
-    /// Apply one collapsed window for one table in ONE destination transaction.
+    /// Apply one collapsed window for one table inside the unit — one
+    /// destination transaction with the watermark its close writes.
     pub(crate) async fn apply(
         &self,
+        u: &mut PgUnit,
         dest_table: &str,
         qualified_src: &str,
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
-    ) -> Result<u64> {
-        let (mut u, token) = self.unit(dest_table).await?;
-        let (n, mark) = apply_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id).await?;
-        self.store.close_unit(u, &token, vec![mark]).await?;
-        Ok(n)
+    ) -> Result<(u64, Watermark)> {
+        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
     }
 }
 
@@ -784,6 +721,7 @@ async fn upsert_state_tx(
 mod tests {
     use super::*;
     use crate::guard::GuardStore;
+    use crate::lease::LeaseStore;
     use crate::sink::postgres::{PgGuard, PgParts};
 
     /// The drain's lease key and the guard's refusal name are ONE string. If

@@ -19,27 +19,21 @@
 //! the store is the one `Unguarded` one: it opens units without a fence.
 
 use crate::error::{Error, Result};
-use crate::lease::{Fence, LeaseStore, Watermark};
-use crate::logbased::collapse::Key;
-use crate::logbased::dest_pg::{quote_ident, quote_table};
+use crate::lease::Watermark;
 use crate::logbased::drain::DrainOutcome;
-use crate::logbased::resolve::{resolve_window, Fin};
-use crate::logbased::rowtext::{decode_bytea, pk_indices, strip_utc_offset, BYTEA_OID};
+use crate::logbased::resolve::{resolve_window, Fin, Source};
+use crate::logbased::rowtext::{decode_bytea, pk_indices, strip_utc_offset};
 use crate::plan::Delivered;
 use crate::sink::iceberg::CdcWindow;
 use crate::wire::bqparquet::ParquetEncoder;
 use crate::wire::pgcopy as pgc;
 use crate::wire::pgoutput::Cell;
-use sqlx::{PgPool, Row as _};
 use std::collections::HashSet;
 
-pub(crate) use store::{IceStore, IceUnit, Unguarded};
+pub(crate) use store::{IceStore, IceUnit};
 
 pub(crate) struct IceDest {
     store: IceStore,
-    /// This run's token, until the Tenure opens units itself: each entry
-    /// below is a shim that opens one unit, writes through it, and closes it.
-    run_token: std::sync::Mutex<Option<String>>,
 }
 
 /// `dest_table` may arrive schema-qualified; the iceberg namespace comes from
@@ -61,108 +55,40 @@ fn single_pk(pk_cols: &[String]) -> Result<&str> {
 
 impl IceDest {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: IceStore::connect(url).await?, run_token: Default::default() })
+        Ok(Self { store: IceStore::connect(url).await? })
     }
 
-    pub(crate) fn set_run(&self, run: &crate::naming::RunId) {
-        *self.run_token.lock().expect("run token") = Some(run.token().to_string());
+    /// The store: the one `Unguarded` one — see the module doc.
+    pub(crate) fn store(&self) -> &IceStore {
+        &self.store
     }
 
-    /// The guard of a destination that has none: announces nothing, sees
-    /// nothing, holds no lease.
-    pub(crate) fn guard(&self, dest_table: &str) -> (Unguarded, String) {
-        (Unguarded, dest_table.to_string())
-    }
-
-    pub(crate) fn lease_key(&self, dest_table: &str) -> String {
-        self.store.lease_key(dest_table)
-    }
-
-    pub(crate) async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
-        self.store.lease_open(keys, run.token()).await
-    }
-
-    pub(crate) async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
-        self.store.lease_renew(keys, run.token()).await
-    }
-
-    pub(crate) async fn close_run(&self, token: &str) {
-        self.store.close_run(token).await
-    }
-
-    pub(crate) async fn read_state(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-    ) -> Result<Option<u64>> {
+    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
         self.store.read_state(dest_table, source_id).await
     }
 
-    /// One unit over `dest_table`, for the shims below.
-    async fn unit(&self, dest_table: &str) -> Result<(IceUnit<'_>, String)> {
-        let token = self
-            .run_token
-            .lock()
-            .expect("run token")
-            .clone()
-            .ok_or_else(|| Error::Transfer("internal: a CDC write outside a run".into()))?;
-        let u = self.store.open_unit(&[self.store.lease_key(dest_table)], &token).await?;
-        Ok((u, token))
-    }
-
-    /// Remove this table's watermark properties — a failed group bootstrap must
-    /// leave no state, or the next run refuses the group as torn.
-    pub(crate) async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Clear { table: dest_table.into(), source_id: source_id.into() };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
     /// The bootstrap's replace just created the table (and cleared every
-    /// apitap watermark property) — stamp the slot's LSN as state. No
-    /// snapshot: the data is already committed.
-    pub(crate) async fn bootstrap_finish(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-        pk_cols: &[String],
-        lsn: u64,
-        rows: u64,
-    ) -> Result<()> {
-        single_pk(pk_cols)?;
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows };
-        self.store.close_unit(u, &token, vec![mark]).await
+    /// apitap watermark property): nothing to add, and no snapshot — the data
+    /// is already committed. The unit's close stamps the slot's LSN. Refused
+    /// here if the key cannot be an equality delete's.
+    pub(crate) fn bootstrap_finish(&self, pk_cols: &[String]) -> Result<()> {
+        single_pk(pk_cols).map(|_| ())
     }
 
-    /// The source-identity marker: the same watermark row machinery under a
-    /// reserved `source_id`.
-    pub(crate) async fn write_marker(
-        &self,
-        dest_table: &str,
-        source_id: &str,
-        value: u64,
-    ) -> Result<()> {
-        let (u, token) = self.unit(dest_table).await?;
-        let mark = Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn: value, rows: 0 };
-        self.store.close_unit(u, &token, vec![mark]).await
-    }
-
-    /// Apply one collapsed window for one table as ONE catalog commit.
+    /// Render one collapsed window for one table and stage it in the unit,
+    /// whose close commits it WITH its watermark as ONE catalog commit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn apply(
         &self,
+        u: &mut IceUnit<'_>,
         dest_table: &str,
         qualified_src: &str,
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
-        src: &PgPool,
-    ) -> Result<u64> {
-        let (mut u, token) = self.unit(dest_table).await?;
-        let (n, mark) =
-            apply_unit(&mut u, dest_table, qualified_src, pk_cols, outcome, source_id, src).await?;
-        self.store.close_unit(u, &token, vec![mark]).await?;
-        Ok(n)
+        src: &Source<'_>,
+    ) -> Result<(u64, Watermark)> {
+        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id, src).await
     }
 }
 
@@ -177,7 +103,7 @@ async fn apply_unit(
     pk_cols: &[String],
     outcome: &DrainOutcome,
     source_id: &str,
-    src: &PgPool,
+    src: &Source<'_>,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
@@ -216,7 +142,7 @@ async fn apply_unit(
     // Replay the residue tail over the set-phase upserts into one final
     // per-key state; unresolved TOAST holes go back to the source.
     let mut finals = resolve_window(c, &pk_idx);
-    refetch_masked(&mut finals, qualified_src, pk, wal_cols, oids, src).await?;
+    src.refetch_masked(&mut finals, qualified_src, pk, wal_cols, oids).await?;
 
     // Delete-set: every touched key (deleted or re-landed). A TRUNCATE
     // window starts from an empty manifest list — nothing old to delete.
@@ -317,87 +243,9 @@ async fn apply_unit(
 }
 
 // ── residue resolution ──────────────────────────────────────────────────────
-// `resolve_window` + `Fin` now live in `crate::logbased::resolve` (shared with
-// the BigQuery apply path). Iceberg fills leftover TOAST holes from the source.
-
-/// Fill each remaining TOAST hole from the source's CURRENT row (see module
-/// docs for why the destination can't be read back). A key whose source row
-/// is already gone stays delete-set-only; its WAL delete arrives in a later
-/// window.
-async fn refetch_masked(
-    finals: &mut [(Key, Fin<'_>)],
-    qualified_src: &str,
-    pk: &str,
-    wal_cols: &[String],
-    oids: &[u32],
-    src: &PgPool,
-) -> Result<()> {
-    if !finals.iter().any(|(_, f)| matches!(f, Fin::Refetch(_))) {
-        return Ok(());
-    }
-    let dbg = std::env::var("APITAP_DEBUG").is_ok();
-    let sel = wal_cols
-        .iter()
-        .zip(oids.iter())
-        .map(|(c, &oid)| {
-            let q = quote_ident(c);
-            // bytea's ::text honors bytea_output — force the WAL's \x-hex form.
-            if oid == BYTEA_OID {
-                format!("'\\x' || encode({q}, 'hex')")
-            } else {
-                format!("{q}::text")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT {sel} FROM {} WHERE {}::text = $1",
-        quote_table(qualified_src),
-        quote_ident(pk)
-    );
-    // One tx pins the session UTC so timestamptz::text matches the WAL's
-    // +00-suffixed rendering (SET LOCAL dies with the tx).
-    let mut tx = src.begin().await.map_err(db_err)?;
-    sqlx::query("SET LOCAL TimeZone = 'UTC'")
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-    for (key, fin) in finals.iter_mut() {
-        let Fin::Refetch(cells) = fin else { continue };
-        let ktext = String::from_utf8(key[0].clone())
-            .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
-        let row = sqlx::query(&sql)
-            .bind(&ktext)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        match row {
-            Some(r) => {
-                for (i, cell) in cells.iter_mut().enumerate() {
-                    if matches!(cell, Cell::UnchangedToast) {
-                        let v: Option<String> = r.try_get(i).map_err(db_err)?;
-                        *cell = match v {
-                            None => Cell::Null,
-                            Some(s) => Cell::Text(bytes::Bytes::from(s)),
-                        };
-                    }
-                }
-                *fin = Fin::Owned(std::mem::take(cells));
-            }
-            None => {
-                if dbg {
-                    eprintln!(
-                        "[log_based] TOAST refetch: {qualified_src} key '{ktext}' is \
-                         gone on the source — dropping the row image"
-                    );
-                }
-                *fin = Fin::Gone;
-            }
-        }
-    }
-    tx.commit().await.map_err(db_err)?;
-    Ok(())
-}
+// `resolve_window` + `Fin` live in `crate::logbased::resolve` (shared with the
+// BigQuery apply path), and so does `Source`, the read-only handle Iceberg
+// fills its leftover TOAST holes through.
 
 // ── cell encoding ───────────────────────────────────────────────────────────
 
@@ -472,10 +320,6 @@ fn parse_int_key(k: &[u8]) -> Result<i64> {
                 String::from_utf8_lossy(k)
             ))
         })
-}
-
-fn db_err(e: sqlx::Error) -> Error {
-    Error::Transfer(format!("log_based: source refetch: {e}"))
 }
 
 /// Everything that reaches the catalog. See the module doc.

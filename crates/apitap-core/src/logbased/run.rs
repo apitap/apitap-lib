@@ -15,13 +15,16 @@
 
 use crate::error::{Error, Result};
 use crate::guard::GuardStore;
-use crate::logbased::dest_bq::BqDest;
-use crate::logbased::dest_ch::ChDest;
-use crate::logbased::dest_ice::IceDest;
-use crate::logbased::dest_my::MyDest;
-use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest};
+use crate::lease::{Fence, LeaseStore, Tenure, Watermark};
+use crate::logbased::dest_bq::{BqDest, BqUnit};
+use crate::logbased::dest_ch::{ChDest, ChUnit};
+use crate::logbased::dest_ice::{IceDest, IceUnit};
+use crate::logbased::dest_my::{MyDest, MyTx};
+use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest, PgUnit};
 use crate::logbased::drain::{drain, DrainOutcome, DrainSession};
 use crate::logbased::mysource;
+use crate::logbased::resolve::Source;
+use std::sync::Arc;
 use crate::wire::pgoutput::lsn_from_string;
 use crate::wire::walsender::Walsender;
 use crate::{Mode, MultiReport, TableResult, TransferOptions, TransferReport};
@@ -109,40 +112,140 @@ pub(crate) fn precheck_changelog(dst_url: &str, opts: &TransferOptions) -> Resul
     Ok(())
 }
 
-/// Give back every announcement this drain holds: its markers, and only then
-/// — with the proof that every marker is gone — its lease. A lease closed while
-/// its lock stands is the permanent wedge; `Released` makes it unwritable.
-/// Once every member is given back, the run's own objects go too (BigQuery's
-/// fence table).
-async fn give_back(dest: &Dest, held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)>, token: &str) {
-    let mut all = true;
-    for (g, bare, a) in held {
-        match crate::guard::release(&*g, a).await {
-            Ok(proof) => {
-                // Its run-scoped scratch (ClickHouse's key table, BigQuery's
-                // staging) goes with the markers, before the lease: nothing
-                // else would ever drop it.
-                let _ = g.sweep_run(&bare, token).await;
-                g.lease_close(proof).await
-            }
-            Err(a) => {
-                a.abandon();
-                all = false;
-            }
-        }
-    }
-    if all {
-        dest.close_run(token).await;
-    }
-}
-
 /// One destination engine for the log_based apply path.
-enum Dest {
+///
+/// It is also the run's `Fence` (below): every write the lane makes goes
+/// through a `Unit` a `Tenure` opened over it, and the parent modules
+/// (`dest_pg` … `dest_ice`) write only through the unit they are handed.
+pub(crate) enum Dest {
     Pg(PgDest),
     Ch(ChDest),
     My(MyDest),
     Ice(IceDest),
     Bq(BqDest),
+}
+
+/// One open unit of writes, whichever store fenced it.
+pub(crate) enum Unit<'a> {
+    Pg(PgUnit),
+    My(MyTx),
+    Ch(ChUnit<'a>),
+    Bq(BqUnit<'a>),
+    Ice(IceUnit<'a>),
+}
+
+fn mismatch() -> Error {
+    Error::Transfer("internal: unit/dest mismatch".into())
+}
+
+impl LeaseStore for Dest {
+    /// The lease key for one destination table — the SAME string the peer
+    /// scan and the refusal already use, schema-qualified.
+    fn lease_key(&self, dest_table: &str) -> String {
+        match self {
+            Dest::Pg(d) => d.store().lease_key(dest_table),
+            Dest::My(d) => d.store().lease_key(dest_table),
+            Dest::Ch(d) => d.store().lease_key(dest_table),
+            Dest::Bq(d) => d.store().lease_key(dest_table),
+            Dest::Ice(d) => d.store().lease_key(dest_table),
+        }
+    }
+
+    async fn lease_open(&self, keys: &[String], token: &str) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.store().lease_open(keys, token).await,
+            Dest::My(d) => d.store().lease_open(keys, token).await,
+            Dest::Ch(d) => d.store().lease_open(keys, token).await,
+            Dest::Bq(d) => d.store().lease_open(keys, token).await,
+            Dest::Ice(d) => d.store().lease_open(keys, token).await,
+        }
+    }
+
+    async fn lease_renew(&self, keys: &[String], token: &str) -> Result<u64> {
+        match self {
+            Dest::Pg(d) => d.store().lease_renew(keys, token).await,
+            Dest::My(d) => d.store().lease_renew(keys, token).await,
+            Dest::Ch(d) => d.store().lease_renew(keys, token).await,
+            Dest::Bq(d) => d.store().lease_renew(keys, token).await,
+            Dest::Ice(d) => d.store().lease_renew(keys, token).await,
+        }
+    }
+
+    async fn lease_unclaimed(&self, token: &str) -> Result<Vec<String>> {
+        match self {
+            Dest::Pg(d) => d.store().lease_unclaimed(token).await,
+            Dest::My(d) => d.store().lease_unclaimed(token).await,
+            Dest::Ch(d) => d.store().lease_unclaimed(token).await,
+            Dest::Bq(d) => d.store().lease_unclaimed(token).await,
+            Dest::Ice(d) => d.store().lease_unclaimed(token).await,
+        }
+    }
+
+    /// Drop what the run holds that is not tied to one table — BigQuery's
+    /// per-run fence table, Iceberg's note of the keys it opened. Nothing
+    /// elsewhere.
+    async fn close_run(&self, token: &str) {
+        match self {
+            Dest::Pg(d) => d.store().close_run(token).await,
+            Dest::My(d) => d.store().close_run(token).await,
+            Dest::Ch(d) => d.store().close_run(token).await,
+            Dest::Bq(d) => d.store().close_run(token).await,
+            Dest::Ice(d) => d.store().close_run(token).await,
+        }
+    }
+}
+
+impl Fence for Dest {
+    type Unit<'a> = Unit<'a>;
+
+    /// This destination as the guard sees it for one member, and the bare name
+    /// the guard spells that member with — the SAME adapter the bulk sink
+    /// uses, which is the only way a drain and a bulk run can see each other.
+    ///
+    /// Iceberg is the exception and is not guarded: its claims live in object
+    /// storage under the table's location, which only the bulk sink resolves.
+    /// An Iceberg CDC bootstrap still rides the bulk sink, so the expensive half
+    /// is covered; its incremental windows are not (stated in usage.md).
+    fn guard(&self, dest_table: &str) -> (Box<dyn GuardStore + '_>, String) {
+        match self {
+            Dest::Pg(d) => d.store().guard(dest_table),
+            Dest::My(d) => d.store().guard(dest_table),
+            Dest::Ch(d) => d.store().guard(dest_table),
+            Dest::Bq(d) => d.store().guard(dest_table),
+            Dest::Ice(d) => d.store().guard(dest_table),
+        }
+    }
+
+    fn serial_commit(&self) -> bool {
+        match self {
+            Dest::Pg(d) => d.store().serial_commit(),
+            Dest::My(d) => d.store().serial_commit(),
+            Dest::Ch(d) => d.store().serial_commit(),
+            Dest::Bq(d) => d.store().serial_commit(),
+            Dest::Ice(d) => d.store().serial_commit(),
+        }
+    }
+
+    async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<Unit<'a>> {
+        Ok(match self {
+            Dest::Pg(d) => Unit::Pg(d.store().open_unit(keys, token).await?),
+            Dest::My(d) => Unit::My(d.store().open_unit(keys, token).await?),
+            Dest::Ch(d) => Unit::Ch(d.store().open_unit(keys, token).await?),
+            Dest::Bq(d) => Unit::Bq(d.store().open_unit(keys, token).await?),
+            Dest::Ice(d) => Unit::Ice(d.store().open_unit(keys, token).await?),
+        })
+    }
+
+    async fn close_unit<'a>(&'a self, u: Unit<'a>, token: &str, marks: Vec<Watermark>) -> Result<()> {
+        match (self, u) {
+            (Dest::Pg(d), Unit::Pg(u)) => d.store().close_unit(u, token, marks).await,
+            (Dest::My(d), Unit::My(u)) => d.store().close_unit(u, token, marks).await,
+            (Dest::Ch(d), Unit::Ch(u)) => d.store().close_unit(u, token, marks).await,
+            (Dest::Bq(d), Unit::Bq(u)) => d.store().close_unit(u, token, marks).await,
+            (Dest::Ice(d), Unit::Ice(u)) => d.store().close_unit(u, token, marks).await,
+            _ => Err(mismatch()),
+        }
+    }
 }
 
 impl Dest {
@@ -160,41 +263,6 @@ impl Dest {
         }
     }
 
-    /// This destination as the guard sees it for one member, and the bare name
-    /// the guard spells that member with. Every announce, scan and collection
-    /// of the CDC lane goes through `crate::guard` over the SAME adapter the
-    /// bulk sink uses — that is the only way a drain and a bulk run can see
-    /// each other, and it is why the four hand-written CDC loops are gone.
-    ///
-    /// Iceberg is the exception and is not guarded: its claims live in object
-    /// storage under the table's location, which only the bulk sink resolves.
-    /// An Iceberg CDC bootstrap still rides the bulk sink, so the expensive half
-    /// is covered; its incremental windows are not (stated in usage.md).
-    fn guard(&self, dest_table: &str) -> (Box<dyn GuardStore>, String) {
-        match self {
-            Dest::Pg(d) => {
-                let (g, b) = d.guard(dest_table);
-                (Box::new(g), b)
-            }
-            Dest::My(d) => {
-                let (g, b) = d.guard(dest_table);
-                (Box::new(g), b)
-            }
-            Dest::Ch(d) => {
-                let (g, b) = d.guard(dest_table);
-                (Box::new(g), b)
-            }
-            Dest::Bq(d) => {
-                let (g, b) = d.guard(dest_table);
-                (Box::new(g), b)
-            }
-            Dest::Ice(d) => {
-                let (g, b) = d.guard(dest_table);
-                (Box::new(g), b)
-            }
-        }
-    }
-
     /// Pin where each member lives before any lease key is taken. Postgres
     /// resolves an unqualified name against the live `search_path` exactly as
     /// the bulk lane does (`sink::postgres::resolve_parts`); the others name
@@ -203,67 +271,6 @@ impl Dest {
         match self {
             Dest::Pg(d) => d.resolve_names(tables).await,
             Dest::My(_) | Dest::Ch(_) | Dest::Bq(_) | Dest::Ice(_) => Ok(()),
-        }
-    }
-
-    /// Tell every destination this run's identity, once, so the apply path can
-    /// FENCE itself without a `&RunId` threaded through five apply signatures.
-    fn set_run(&self, run: &crate::naming::RunId) {
-        match self {
-            Dest::Pg(d) => d.set_run(run),
-            Dest::My(d) => d.set_run(run),
-            Dest::Ch(d) => d.set_run(run),
-            Dest::Bq(d) => d.set_run(run),
-            Dest::Ice(d) => d.set_run(run),
-        }
-    }
-
-    /// Drop what the run holds that is not tied to one table — BigQuery's
-    /// per-run fence table, Iceberg's note of the keys it opened. Nothing
-    /// elsewhere.
-    async fn close_run(&self, token: &str) {
-        match self {
-            Dest::Bq(d) => d.close_run(token).await,
-            Dest::Ice(d) => d.close_run(token).await,
-            Dest::Pg(_) | Dest::My(_) | Dest::Ch(_) => {}
-        }
-    }
-
-    /// Open one lease per member, BEFORE the announce loop.
-    ///
-    /// Before, and not after: a lock with no lease is uncollectable by the rule
-    /// that "no record of liveness means refuse", so writing one first would
-    /// create a permanent orphan in exactly the window this mechanism exists to
-    /// remove. A lease with no lock is inert.
-    async fn lease_open(&self, keys: &[String], run: &crate::naming::RunId) -> Result<()> {
-        match self {
-            Dest::Pg(d) => d.lease_open(keys, run).await,
-            Dest::My(d) => d.lease_open(keys, run).await,
-            Dest::Ch(d) => d.lease_open(keys, run).await,
-            Dest::Bq(d) => d.lease_open(keys, run).await,
-            Dest::Ice(d) => d.lease_open(keys, run).await,
-        }
-    }
-
-    async fn lease_renew(&self, keys: &[String], run: &crate::naming::RunId) -> Result<u64> {
-        match self {
-            Dest::Pg(d) => d.lease_renew(keys, run).await,
-            Dest::My(d) => d.lease_renew(keys, run).await,
-            Dest::Ch(d) => d.lease_renew(keys, run).await,
-            Dest::Bq(d) => d.lease_renew(keys, run).await,
-            Dest::Ice(d) => d.lease_renew(keys, run).await,
-        }
-    }
-
-    /// The lease key for one destination table — the SAME string the peer scan
-    /// and the refusal already use, schema-qualified.
-    fn lease_key(&self, dest_table: &str) -> String {
-        match self {
-            Dest::Pg(d) => d.lease_key(dest_table),
-            Dest::My(d) => d.lease_key(dest_table),
-            Dest::Ch(d) => d.lease_key(dest_table),
-            Dest::Bq(d) => d.lease_key(dest_table),
-            Dest::Ice(d) => d.lease_key(dest_table),
         }
     }
 
@@ -306,31 +313,6 @@ impl Dest {
         }
     }
 
-    /// Record which SOURCE SERVER a table's watermark belongs to. Stored as
-    /// an ordinary state row under a reserved `source_id`, so no destination's
-    /// state table has to grow a column and no deployment has to migrate.
-    async fn write_marker(&self, dest_table: &str, source_id: &str, value: u64) -> Result<()> {
-        match self {
-            Dest::Pg(d) => d.write_marker(dest_table, source_id, value).await,
-            Dest::Ch(d) => d.write_marker(dest_table, source_id, value).await,
-            Dest::My(d) => d.write_marker(dest_table, source_id, value).await,
-            Dest::Ice(d) => d.write_marker(dest_table, source_id, value).await,
-            Dest::Bq(d) => d.write_marker(dest_table, source_id, value).await,
-        }
-    }
-
-    /// Remove this table's watermark, so a failed group bootstrap really does
-    /// leave "no state" the way its error message says it does.
-    async fn clear_state(&self, dest_table: &str, source_id: &str) -> Result<()> {
-        match self {
-            Dest::Pg(d) => d.clear_state(dest_table, source_id).await,
-            Dest::Ch(d) => d.clear_state(dest_table, source_id).await,
-            Dest::My(d) => d.clear_state(dest_table, source_id).await,
-            Dest::Bq(d) => d.clear_state(dest_table, source_id).await,
-            Dest::Ice(d) => d.clear_state(dest_table, source_id).await,
-        }
-    }
-
     /// Destination-specific knobs for the bootstrap's full load.
     fn tweak_bootstrap_opts(&self, o2: &mut TransferOptions, pk_cols: &[String]) {
         match self {
@@ -339,10 +321,13 @@ impl Dest {
         }
     }
 
-    /// After the bootstrap's full load landed: add identity where the engine
-    /// needs one, then write the state row.
+    /// After the bootstrap's full load landed, inside `u`: add identity where
+    /// the engine needs one (or rebuild the table as a changelog). Returns the
+    /// watermark the unit's close writes — the slot's LSN.
+    #[allow(clippy::too_many_arguments)]
     async fn bootstrap_finish(
         &self,
+        u: &mut Unit<'_>,
         dest_table: &str,
         source_id: &str,
         pk_cols: &[String],
@@ -351,100 +336,86 @@ impl Dest {
         changelog: bool,
         partition_by: Option<&str>,
         order_by: Option<&str>,
-    ) -> Result<()> {
-        if changelog {
-            return match self {
-                Dest::Ch(d) => {
-                    d.changelog_bootstrap_finish(
-                        dest_table, source_id, pk_cols, lsn, rows, partition_by, order_by,
-                    )
-                    .await
-                }
-                Dest::Bq(d) => {
-                    d.changelog_bootstrap_finish(
-                        dest_table, source_id, pk_cols, lsn, rows, partition_by, order_by,
-                    )
-                    .await
-                }
-                _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
-            };
+    ) -> Result<Watermark> {
+        match (self, u, changelog) {
+            (Dest::Ch(d), Unit::Ch(u), true) => {
+                d.changelog_bootstrap_finish(u, dest_table, pk_cols, lsn, partition_by, order_by).await?
+            }
+            (Dest::Bq(d), Unit::Bq(u), true) => {
+                d.changelog_bootstrap_finish(u, dest_table, pk_cols, lsn, partition_by, order_by).await?
+            }
+            (_, _, true) => return Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
+            (Dest::Pg(d), Unit::Pg(u), false) => d.bootstrap_finish(u, dest_table, pk_cols).await?,
+            (Dest::Ch(d), Unit::Ch(u), false) => d.bootstrap_finish(u, dest_table).await?,
+            (Dest::My(d), Unit::My(u), false) => d.bootstrap_finish(u, dest_table, pk_cols).await?,
+            (Dest::Ice(d), Unit::Ice(_), false) => d.bootstrap_finish(pk_cols)?,
+            (Dest::Bq(d), Unit::Bq(u), false) => d.bootstrap_finish(u, dest_table, pk_cols, rows).await?,
+            _ => return Err(mismatch()),
         }
-        match self {
-            Dest::Pg(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
-            Dest::Ch(d) => d.bootstrap_finish(dest_table, source_id, lsn, rows).await,
-            Dest::My(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
-            Dest::Ice(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
-            Dest::Bq(d) => d.bootstrap_finish(dest_table, source_id, pk_cols, lsn, rows).await,
-        }
+        Ok(Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows })
     }
 
-    /// Apply for sources that carry no Postgres pool (the MySQL binlog
-    /// path). Iceberg is refused at the gate, so the three engines that
-    /// need nothing from the source are all that reach this.
-    async fn apply_no_src(
-        &self,
-        dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
-        source_id: &str,
-        changelog: bool,
-    ) -> Result<u64> {
-        if changelog {
-            return match self {
-                Dest::Ch(d) => {
-                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
-                        .await
-                }
-                Dest::Bq(d) => {
-                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
-                        .await
-                }
-                _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
-            };
-        }
-        match self {
-            Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::My(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::Bq(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::Ice(_) => Err(Error::InvalidInput(
-                "log_based: iceberg needs a Postgres source in this release".into(),
-            )),
-        }
-    }
-
+    /// Apply one table's window inside `u`, and name the watermark the unit's
+    /// close writes. `src` is the Postgres source, for the one destination
+    /// that reads it back (Iceberg's TOAST refetch); the MySQL binlog path has
+    /// none, and Iceberg is refused before it.
+    #[allow(clippy::too_many_arguments)]
     async fn apply(
         &self,
+        u: &mut Unit<'_>,
         dest_table: &str,
         qualified_src: &str,
         pk_cols: &[String],
         outcome: &DrainOutcome,
         source_id: &str,
-        src: &PgPool,
+        src: Option<&PgPool>,
         changelog: bool,
-    ) -> Result<u64> {
-        if changelog {
-            return match self {
-                Dest::Ch(d) => {
-                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
-                        .await
-                }
-                Dest::Bq(d) => {
-                    d.apply_changelog(dest_table, qualified_src, pk_cols, outcome, source_id)
-                        .await
-                }
-                _ => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
-            };
-        }
-        match self {
-            Dest::Pg(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::Ch(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::My(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::Bq(d) => d.apply(dest_table, qualified_src, pk_cols, outcome, source_id).await,
-            Dest::Ice(d) => {
-                d.apply(dest_table, qualified_src, pk_cols, outcome, source_id, src).await
+    ) -> Result<(u64, Watermark)> {
+        match (self, u, changelog) {
+            (Dest::Ch(d), Unit::Ch(u), true) => {
+                d.apply_changelog(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
             }
+            // A group of one: the per-member path (the MySQL source's windows).
+            (Dest::Bq(_), Unit::Bq(u), _) => {
+                let one = [(dest_table.to_string(), qualified_src.to_string(), pk_cols.to_vec(), source_id.to_string())];
+                let mut v = self.apply_group(u, &one, outcome, 1, changelog).await?;
+                v.pop().ok_or_else(mismatch)
+            }
+            (_, _, true) => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
+            (Dest::Pg(d), Unit::Pg(u), false) => {
+                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+            }
+            (Dest::Ch(d), Unit::Ch(u), false) => {
+                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+            }
+            (Dest::My(d), Unit::My(u), false) => {
+                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+            }
+            (Dest::Ice(d), Unit::Ice(u), false) => {
+                let src = src.ok_or_else(|| {
+                    Error::InvalidInput("log_based: iceberg needs a Postgres source in this release".into())
+                })?;
+                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id, &Source(src)).await
+            }
+            _ => Err(mismatch()),
+        }
+    }
+
+    /// BigQuery: a whole group's window in ONE unit. A MERGE carries ~7.3 s of
+    /// fixed job overhead, so paying it once per GROUP instead of once per
+    /// TABLE is the biggest lever the profile found; the unit's close commits
+    /// every member's statements with its own watermark.
+    async fn apply_group(
+        &self,
+        u: &mut BqUnit<'_>,
+        members: &[crate::logbased::dest_bq::Member],
+        outcome: &DrainOutcome,
+        lanes: usize,
+        changelog: bool,
+    ) -> Result<Vec<(u64, Watermark)>> {
+        match self {
+            Dest::Bq(d) => d.apply_group(u, members, outcome, lanes, changelog).await,
+            _ => Err(mismatch()),
         }
     }
 
@@ -717,47 +688,47 @@ async fn run_sloted(
     }
     let elapsed_all = started.elapsed().as_millis() as u64;
 
-    let mut by_table = std::collections::HashMap::new();
-    let mut first_err = None;
+    // A failed group fails ITS tables, each named in the report, and nothing
+    // else: every group holds its own tenure over its own members, so one
+    // group evicted, refused or broken leaves the others' windows and
+    // watermarks standing. The caller sees the partial failure the way every
+    // multi-table run reports one (`MultiTransferError`, whose report lists
+    // each table's outcome) instead of one error that hid what succeeded.
+    let mut by_table: HashMap<String, std::result::Result<(u64, usize), String>> = HashMap::new();
     for (gi, out) in outcomes.into_iter().enumerate() {
         match out {
             Ok(v) => {
                 for (t, r) in groups[gi].iter().zip(v) {
-                    by_table.insert(t.clone(), r);
+                    by_table.insert(t.clone(), Ok(r));
                 }
             }
             Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(Error::Transfer(format!(
-                        "slot group {}/{n} ({} tables) failed: {e} — the other \
-                         groups own independent slots and watermarks, their \
-                         committed progress is durable, and a retry resumes \
-                         every group from its own state",
-                        gi + 1,
-                        groups[gi].len(),
-                    )));
+                let why = format!(
+                    "slot group {}/{n} ({}) failed: {e} — the other groups own \
+                     independent slots and watermarks, their committed progress is \
+                     durable, and a retry resumes every group from its own state",
+                    gi + 1,
+                    groups[gi].join(", "),
+                );
+                for t in &groups[gi] {
+                    by_table.insert(t.clone(), Err(why.clone()));
                 }
             }
         }
     }
-    if let Some(e) = first_err {
-        return Err(e);
-    }
+    let ok = || by_table.values().filter_map(|r| r.as_ref().ok());
     Ok(MultiReport {
-        rows: by_table.values().map(|(r, _)| *r).sum(),
+        rows: ok().map(|(r, _)| *r).sum(),
         elapsed_ms: elapsed_all,
-        budget: by_table.values().map(|(_, p)| *p).max().unwrap_or(1),
+        budget: ok().map(|(_, p)| *p).max().unwrap_or(1),
         tables: tables
             .iter()
             .map(|t| {
-                let (rows, parallel) = by_table[t];
-                TableResult {
-                    table: t.clone(),
-                    rows,
-                    elapsed_ms: elapsed_all,
-                    parallel,
-                    error: None,
-                }
+                let (rows, parallel, error) = match &by_table[t] {
+                    Ok((r, p)) => (*r, *p, None),
+                    Err(e) => (0, 1, Some(e.clone())),
+                };
+                TableResult { table: t.clone(), rows, elapsed_ms: elapsed_all, parallel, error }
             })
             .collect(),
     })
@@ -904,68 +875,26 @@ async fn run_group(
     let qualified_all: Vec<&str> = ctxs.iter().map(|c| c.qualified.as_str()).collect();
     ensure_publication(&src, &publication, &qualified_all).await?;
 
-    // ANNOUNCE, THEN CHECK — before the bootstrap decision, before a watermark
-    // is read, before a row moves. Same artifact, same minting call and same
-    // verdict a bulk run uses, because the matrix's `log_based | anything |
-    // refused` row is only true if the two lanes can actually see each other.
-    // 0.55.0 asserted that row while a drain wrote and read nothing at all.
+    // THE TENURE — before the bootstrap decision, before a watermark is read,
+    // before a row moves. Lease first, then every member announced, then every
+    // member checked, with the same artifact, minting call and verdict a bulk
+    // run uses: the matrix's `log_based | anything | refused` row is only true
+    // if the two lanes can actually see each other. 0.55.0 asserted that row
+    // while a drain wrote and read nothing at all.
     //
-    // Every member is announced before ANY member is checked: a group that
-    // announced table by table while checking as it went would let two
-    // overlapping groups each pass the member the other had not reached yet.
+    // From here every write is a unit the tenure opens, and nothing else can
+    // open one; its keeper renews the lease off the window path and stops the
+    // run the moment a peer claims it.
     let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
-    dest.set_run(&run);
     let members: Vec<String> = ctxs.iter().map(|c| c.dest_table.clone()).collect();
     dest.resolve_names(&members).await?;
-    // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
-    // record of liveness means refuse" — so writing one first would create a
-    // permanent orphan in exactly the window this exists to close. A lease with
-    // no lock is inert.
-    let lease_keys: Vec<String> = ctxs.iter().map(|c| dest.lease_key(&c.dest_table)).collect();
-    dest.lease_open(&lease_keys, &run).await?;
-    // Every member is announced before ANY member is checked: a group that
-    // announced table by table while checking as it went would let two
-    // overlapping groups each pass the member the other had not reached yet.
-    // A group that fails either loop gives back what it holds — markers first,
-    // then the leases, through the proof `guard::release` hands back.
-    let mut held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)> = Vec::new();
-    for c in &ctxs {
-        let (g, bare) = dest.guard(&c.dest_table);
-        match crate::guard::announce(&*g, &bare, &run).await {
-            Ok(a) => held.push((g, bare, a)),
-            Err(e) => {
-                give_back(&dest, held, run.token()).await;
-                return Err(e);
-            }
-        }
-    }
-    for c in &ctxs {
-        let (g, bare) = dest.guard(&c.dest_table);
-        if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, crate::guard::Mine::Keep).await {
-            give_back(&dest, held, run.token()).await;
-            return Err(e);
-        }
-    }
+    let tenure = Arc::new(Tenure::acquire(dest.clone(), &members, run).await?);
 
-    // The scan has passed, so this run holds the table. Keep the claim alive
-    // from a task that is NOT on the window path: a renewal that could block
-    // behind an apply is a renewal that fails exactly when a long window makes
-    // it matter most.
-    let mut keeper = {
-        let d = dest.clone();
-        let keys = lease_keys.clone();
-        let r = run.clone();
-        crate::lease::Keeper::spawn(move || {
-            let (d, keys, r) = (d.clone(), keys.clone(), r.clone());
-            async move { d.lease_renew(&keys, &r).await }
-        })
-    };
-
-    // Everything from here is inside one arm, so the announcement is taken
-    // back on EVERY exit. Without it, a run refused between the scan and the
-    // drain — a torn group, a mode mismatch, an unreadable watermark — left
-    // its own lock behind and every later run of the table was refused over a
-    // drain that never started. `e2e_state_contract.py` caught exactly that.
+    // Everything from here is inside one arm, so the tenure is given back on
+    // EVERY exit. Without it, a run refused between the scan and the drain — a
+    // torn group, a mode mismatch, an unreadable watermark — left its own lock
+    // behind and every later run of the table was refused over a drain that
+    // never started. `e2e_state_contract.py` caught exactly that.
     let out = async {
         // Per-table watermarks: all absent = fresh bootstrap; all present = drain
         // from the group minimum; a mix is a torn group — refuse loudly.
@@ -999,19 +928,19 @@ async fn run_group(
         if have.is_empty() {
             // The full load is a nested run (`transfer_within`): its own Swap
             // token names this run as parent, so its guard classifies our lock
-            // and marker as `Found::Parent` and proceeds. The lock and lease stay
-            // held, renewed by the keeper, through the load and `bootstrap_finish`;
-            // the exit arm below is the only release. (0.56.0 released them here
-            // and let the bulk lock cover the load, which left the table free
-            // between the two and after the load, while the drain still owned
-            // its slot and its watermark.)
-            bootstrap_group(src_url, dst_url, opts, &dest, &src, &slot, &ctxs, &run).await
+            // and marker as `Found::Parent` and proceeds. The tenure — lock,
+            // lease and keeper — stays held through the load and every
+            // `bootstrap_finish`; the release below is the only one. (0.56.0
+            // released them here and let the bulk lock cover the load, which
+            // left the table free between the two and after the load, while
+            // the drain still owned its slot and its watermark.)
+            bootstrap_group(src_url, dst_url, opts, &tenure, &src, &slot, &ctxs).await
         } else {
             let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
             drain_group(
                 src_url,
                 &src,
-                dest.clone(),
+                tenure.clone(),
                 &slot,
                 &publication,
                 &ctxs,
@@ -1023,14 +952,12 @@ async fn run_group(
         }
     }
     .await;
-    // Stop AND JOIN the keeper before anything is released. On ClickHouse a
-    // renewal is an INSERT, so a tick still in flight would resurrect the row
-    // after it was closed and leave a lock nothing can ever collect.
-    keeper.stop().await;
-    // Markers, then leases — and a lease only for a member whose every marker
-    // is observed gone (`give_back`). Dropping a lease while its lock survives
-    // would wedge the table for ever.
-    give_back(&dest, held, run.token()).await;
+    // Waits for every open unit, stops AND JOINS the keeper (on ClickHouse a
+    // renewal in flight would resurrect a closed row), then per member its
+    // scratch, its markers, and its lease only once its markers are observed
+    // gone — dropping a lease while its lock survives would wedge the table
+    // for ever.
+    tenure.release().await;
     out
 }
 
@@ -1112,66 +1039,29 @@ async fn run_group_mysql(
         }
     }
 
-    /// Record the source server for every table that did not have one yet.
-    /// Called only after the run's own state is durable, so nothing that
-    /// clears state rows can run after it.
-    async fn stamp(dest: &Dest, adopt: &[(String, String)], server: u64) -> Result<()> {
+    /// Record the source server for every table that did not have one yet —
+    /// a unit per table, whose close writes the marker as an ordinary state
+    /// row under a reserved `source_id`. Called only after the run's own state
+    /// is durable, so nothing that clears state rows can run after it.
+    async fn stamp(tenure: &Tenure<Dest>, adopt: &[(String, String)], server: u64) -> Result<()> {
         for (table, marker) in adopt {
-            dest.write_marker(table, marker, server).await?;
+            let h = tenure.open(&[table.as_str()]).await?;
+            let mark = Watermark::Set { table: table.clone(), source_id: marker.clone(), lsn: server, rows: 0 };
+            tenure.close(h, vec![mark]).await?;
         }
         Ok(())
     }
 
-    // ANNOUNCE, THEN CHECK — the MySQL twin of the Postgres path above, for the
-    // same reason and with the same artifact. Every member is announced before
-    // ANY member is checked.
+    // THE TENURE — the MySQL twin of the Postgres path above, for the same
+    // reason and with the same artifact.
     let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
-    dest.set_run(&run);
     let members: Vec<String> = ctxs.iter().map(|c| c.dest_table.clone()).collect();
     dest.resolve_names(&members).await?;
-    // LEASE FIRST, then the lock. A lock with no lease is uncollectable — "no
-    // record of liveness means refuse" — so writing one first would create a
-    // permanent orphan in exactly the window this exists to close. A lease with
-    // no lock is inert.
-    let lease_keys: Vec<String> = ctxs.iter().map(|c| dest.lease_key(&c.dest_table)).collect();
-    dest.lease_open(&lease_keys, &run).await?;
-    // Every member is announced before ANY member is checked: a group that
-    // announced table by table while checking as it went would let two
-    // overlapping groups each pass the member the other had not reached yet.
-    // A group that fails either loop gives back what it holds — markers first,
-    // then the leases, through the proof `guard::release` hands back.
-    let mut held: Vec<(Box<dyn GuardStore>, String, crate::guard::Announced)> = Vec::new();
-    for c in &ctxs {
-        let (g, bare) = dest.guard(&c.dest_table);
-        match crate::guard::announce(&*g, &bare, &run).await {
-            Ok(a) => held.push((g, bare, a)),
-            Err(e) => {
-                give_back(&dest, held, run.token()).await;
-                return Err(e);
-            }
-        }
-    }
-    for c in &ctxs {
-        let (g, bare) = dest.guard(&c.dest_table);
-        if let Err(e) = crate::guard::check_peers(&*g, &bare, &run, crate::guard::Mine::Keep).await {
-            give_back(&dest, held, run.token()).await;
-            return Err(e);
-        }
-    }
+    let tenure = Tenure::acquire(dest.clone(), &members, run).await?;
 
-    let mut keeper = {
-        let d = dest.clone();
-        let keys = lease_keys.clone();
-        let r = run.clone();
-        crate::lease::Keeper::spawn(move || {
-            let (d, keys, r) = (d.clone(), keys.clone(), r.clone());
-            async move { d.lease_renew(&keys, &r).await }
-        })
-    };
-
-    // Everything from here is inside one arm so the announcement is taken
-    // back on EVERY exit — a drain that fails for any reason must not leave
-    // its lock behind for the next run to refuse over.
+    // Everything from here is inside one arm so the tenure is given back on
+    // EVERY exit — a drain that fails for any reason must not leave its lock
+    // behind for the next run to refuse over.
     let out = async {
         // State arbitration mirrors the Postgres path: all-absent bootstraps,
         // all-present drains, a mix is a torn group.
@@ -1200,11 +1090,11 @@ async fn run_group_mysql(
 
         if present == 0 {
             // The full load is a nested run, exactly as on the Postgres path:
-            // the drain keeps its lock and lease through the load and
-            // `bootstrap_finish`, and the exit arm is the only release.
+            // the tenure is held through the load and every finish, and the
+            // release below is the only one.
             let su = src_url.to_string();
             let du = dst_url.to_string();
-            let run_c = run.clone();
+            let run_c = tenure.run().clone();
             let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, o2| {
                 let (su, du, r) = (su.clone(), du.clone(), run_c.clone());
                 async move {
@@ -1221,20 +1111,23 @@ async fn run_group_mysql(
             }
             for (c, (rows, _)) in ctxs.iter().zip(&out) {
                 let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
-                if let Err(e) = dest
-                    .bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
-                        opts.changelog, pb, ob)
-                    .await
-                {
+                let finished = async {
+                    let mut h = tenure.open(&[c.dest_table.as_str()]).await?;
+                    let m = dest
+                        .bootstrap_finish(&mut h.unit, &c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
+                            opts.changelog, pb, ob)
+                        .await?;
+                    tenure.close(h, vec![m]).await
+                }
+                .await;
+                if let Err(e) = finished {
                     // Same rollback as the Postgres group: a half-written group is
                     // worse than no group, because the next run refuses it.
-                    for c in ctxs.iter() {
-                        let _ = dest.clear_state(&c.dest_table, &c.source_id).await;
-                    }
+                    clear_group(&tenure, ctxs.iter().map(|c| (c.dest_table.as_str(), c.source_id.as_str()))).await;
                     return Err(e);
                 }
             }
-            stamp(&dest, &adopt, server).await?;
+            stamp(&tenure, &adopt, server).await?;
             return Ok(out);
         }
 
@@ -1267,20 +1160,18 @@ async fn run_group_mysql(
             budget,
             opts.changelog,
             |outcome| {
-                let dest = &dest;
-                let ctxs = &ctxs;
-                let rows_applied = &rows_applied;
+                let (dest, tenure, ctxs, rows_applied) = (&dest, &tenure, &ctxs, &rows_applied);
                 async move {
                     let end = outcome.end_lsn;
                     for (c, acc) in ctxs.iter().zip(rows_applied.iter()) {
                         // Every member applies — a table with no traffic in this
-                        // window still advances its watermark.
-                        let n = dest
-                            .apply_no_src(
-                                &c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id,
-                                opts.changelog,
-                            )
+                        // window still advances its watermark. One unit each.
+                        let mut h = tenure.open(&[c.dest_table.as_str()]).await?;
+                        let (n, m) = dest
+                            .apply(&mut h.unit, &c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id,
+                                None, opts.changelog)
                             .await?;
+                        tenure.close(h, vec![m]).await?;
                         acc.set(acc.get() + n);
                         crate::progress::add_rows(n);
                     }
@@ -1297,32 +1188,40 @@ async fn run_group_mysql(
         )
         .await?;
 
-        stamp(&dest, &adopt, server).await?;
+        stamp(&tenure, &adopt, server).await?;
         Ok::<Vec<(u64, usize)>, Error>(rows_applied.iter().map(|a| (a.get(), 1)).collect())
     }
     .await;
-    // Stop AND JOIN the keeper before anything is released. On ClickHouse a
-    // renewal is an INSERT, so a tick still in flight would resurrect the row
-    // after it was closed and leave a lock nothing can ever collect.
-    keeper.stop().await;
-    // Markers, then leases — and a lease only for a member whose every marker
-    // is observed gone (`give_back`). Dropping a lease while its lock survives
-    // would wedge the table for ever.
-    give_back(&dest, held, run.token()).await;
+    // Waits for every open unit, stops and joins the keeper, then per member
+    // its scratch, its markers and — only once they are gone — its lease.
+    tenure.release().await;
     out
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Remove every member's watermark, so a failed group bootstrap really does
+/// leave "no state" the way its error message says it does: a member that DID
+/// write its watermark must lose it, or the group is torn. Best-effort, each a
+/// unit of its own; a member the tenure can no longer open (evicted) is left to
+/// the run that collected it.
+async fn clear_group<'a>(tenure: &Tenure<Dest>, members: impl Iterator<Item = (&'a str, &'a str)>) {
+    for (table, source_id) in members {
+        if let Ok(h) = tenure.open(&[table]).await {
+            let mark = Watermark::Clear { table: table.into(), source_id: source_id.into() };
+            let _ = tenure.close(h, vec![mark]).await;
+        }
+    }
+}
+
 async fn bootstrap_group(
     src_url: &str,
     dst_url: &str,
     opts: &TransferOptions,
-    dest: &Dest,
+    tenure: &Tenure<Dest>,
     src: &PgPool,
     slot: &str,
     ctxs: &[TableCtx],
-    run: &crate::naming::RunId,
 ) -> Result<Vec<(u64, usize)>> {
+    let (dest, run) = (tenure.dest(), tenure.run());
     // A slot with no matching state is a leftover from an aborted bootstrap —
     // start fresh (refuse if something is actively draining it).
     let stale: Option<(bool,)> =
@@ -1436,23 +1335,26 @@ async fn bootstrap_group(
         }
     }
 
+    // Each finish is a unit of its own: its DDL and its watermark, fenced, and
+    // the watermark written only by the unit's close. BigQuery's closes queue
+    // on the tenure's commit gate (every one updates the run's fence row).
     let fins: Vec<Result<()>> = futures::stream::iter(ctxs.iter().zip(&out).map(|(c, (rows, _))| {
-        let dest = &dest;
         async move {
             let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
-            dest.bootstrap_finish(&c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows,
-                opts.changelog, pb, ob).await
+            let mut h = tenure.open(&[c.dest_table.as_str()]).await?;
+            let m = dest
+                .bootstrap_finish(&mut h.unit, &c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows,
+                    opts.changelog, pb, ob)
+                .await?;
+            tenure.close(h, vec![m]).await
         }
     }))
     .buffered(concurrency)
     .collect()
     .await;
     if let Some(e) = fins.into_iter().find_map(Result::err) {
-        // Make the rollback the message promises real: a member that DID write
-        // its watermark must lose it, or the group is torn.
-        for c in ctxs.iter() {
-            let _ = dest.clear_state(&c.dest_table, &c.source_id).await;
-        }
+        // Make the rollback the message promises real.
+        clear_group(tenure, ctxs.iter().map(|c| (c.dest_table.as_str(), c.source_id.as_str()))).await;
         drop_slot().await;
         return Err(e);
     }
@@ -1465,10 +1367,10 @@ async fn bootstrap_group(
 async fn drain_group(
     src_url: &str,
     src: &PgPool,
-    // Shared, not owned: the apply task runs off the drain's clock and needs a
-    // handle of its own, while the caller keeps one to release its
-    // announcement when the drain is over.
-    dest: std::sync::Arc<Dest>,
+    // Shared, not owned: the apply task runs off the drain's clock and opens
+    // its units through a handle of its own, while the caller keeps one to
+    // release the tenure when the drain is over.
+    tenure: Arc<Tenure<Dest>>,
     slot: &str,
     publication: &str,
     ctxs: &[TableCtx],
@@ -1541,7 +1443,6 @@ async fn drain_group(
         key_cols.insert(c.qualified.clone(), c.pk_cols.clone());
     }
 
-    let dbg = std::env::var("APITAP_DEBUG").is_ok();
     // Two windows are resident under overlap (one applying, one draining) —
     // the budget halves so peak memory stays at the single-window ceiling.
     // The cap matters on BIG boxes too: overlap only pays while windows
@@ -1550,110 +1451,107 @@ async fn drain_group(
     // With `slots=N` this pipeline is one of N in the SAME process/cgroup, so
     // the per-window budget shards by N (floor 1 MiB) to keep the process's
     // recorded memory ceiling intact.
-    let budget = (dest.cdc_window_bytes() / budget_denom.max(1)).max(1 << 20);
+    let budget = (tenure.dest().cdc_window_bytes() / budget_denom.max(1)).max(1 << 20);
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
 
     // Overlapped windows (ape-dts's daemon trick, batch-shaped): the drain
-    // task keeps the walsender and decodes window N+1 WHILE a spawned apply
+    // loop keeps the walsender and decodes window N+1 WHILE a spawned apply
     // task lands window N. The slot is confirmed only after the apply task
     // reports a window fully committed (watch channel carries the last
     // committed end_lsn back) — never past unapplied WAL, exactly like the
     // serial loop, just off the clock.
-    let (win_tx, mut win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(1);
-    let (applied_tx, mut applied_rx) = tokio::sync::watch::channel::<u64>(wm);
-    let actxs: Vec<(String, String, Vec<String>, String)> = ctxs
+    let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(1);
+    let (applied_tx, applied_rx) = tokio::sync::watch::channel::<u64>(wm);
+    let members: Vec<crate::logbased::dest_bq::Member> = ctxs
         .iter()
         .map(|c| {
             (c.dest_table.clone(), c.qualified.clone(), c.pk_cols.clone(), c.source_id.clone())
         })
         .collect();
-    let apool = src.clone();
-    let clog = changelog;
-    let apply_task: tokio::task::JoinHandle<Result<Vec<u64>>> = tokio::spawn(async move {
-        let mut rows_per = vec![0u64; actxs.len()];
-        while let Some(o) = win_rx.recv().await {
-            let t_apply = std::time::Instant::now();
-            let lanes = dest.apply_lanes();
-            if let Dest::Bq(d) = &*dest {
-                // BigQuery: stage every table concurrently (one load job each),
-                // then commit the whole group's MERGEs + watermarks in as few
-                // script jobs as possible. A MERGE carries ~7.3 s of fixed job
-                // overhead, so paying it once per GROUP instead of once per
-                // TABLE is the biggest lever the profile found.
-                let applied = if clog {
-                    d.apply_group_changelog(&actxs, &o, lanes).await?
-                } else {
-                    d.apply_group(&actxs, &o, lanes).await?
-                };
-                for (i, n) in applied.into_iter().enumerate() {
-                    rows_per[i] += n;
-                }
-            } else if lanes > 1 && actxs.len() > 1 {
-                // BigQuery apply is one job round-trip per table (I/O, ~0 local
-                // CPU) — applying a group's tables SERIALLY made a 10-table
-                // window pay 10× the round-trip. Run them through a BOUNDED
-                // pool: `lanes` applies in flight, the rest queued, each
-                // completion pulling the next. Unbounded would melt a 100-table
-                // group against BigQuery's job limits and make every
-                // transaction contend on the shared state rows. The targets are
-                // distinct tables; the shared `_apitap_state` INSERT is covered
-                // by cdc_script's concurrent-update retry.
-                use futures::stream::{StreamExt as _, TryStreamExt as _};
-                // Indices, not references: a closure taking `&(..)` and
-                // returning an async block trips higher-ranked lifetime
-                // inference ("FnOnce is not general enough").
-                let (dref, aref, oref, cref) = (&dest, &apool, &o, &actxs);
-                let applied: Vec<(usize, u64)> = futures::stream::iter(0..cref.len())
-                    .map(|i| async move {
-                        let (dt, q, pk, sid) = &cref[i];
-                        dref.apply(dt, q, pk, oref, sid, aref, clog).await.map(|n| (i, n))
-                    })
-                    .buffer_unordered(lanes)
-                    .try_collect()
-                    .await?;
-                for (i, n) in applied {
-                    rows_per[i] += n;
-                }
-            } else {
-                for (i, (dest_table, qualified, pk_cols, source_id)) in actxs.iter().enumerate() {
-                    rows_per[i] +=
-                        dest.apply(dest_table, qualified, pk_cols, &o, source_id, &apool, clog).await?;
-                }
-            }
-            if std::env::var("APITAP_DEBUG").is_ok() {
-                let events: u64 = o.tables.values().map(|c| c.events).sum();
-                eprintln!(
-                    "[log_based] applied lsn={} events={events} in {:.1}s",
-                    o.end_lsn,
-                    t_apply.elapsed().as_secs_f64(),
-                );
-            }
-            // Receiver may be gone on a drain-side abort — nothing to do.
-            let _ = applied_tx.send(o.end_lsn);
-        }
-        Ok(rows_per)
-    });
+    let apply = AbortOnDrop::spawn(apply_windows(tenure, src.clone(), members, changelog, win_rx, applied_tx));
+    let drained = run_overlapped(
+        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog),
+        apply,
+    )
+    .await;
+    ws.stop_replication().await.ok();
+    Ok(drained?.into_iter().map(|r| (r, 1)).collect())
+}
 
+/// A spawned task that cannot outlive its owner: dropped before it was
+/// joined — the owner's future cancelled, or a panic unwinding past it — it
+/// is aborted. A detached apply task is exactly what let 0.56.0 commit windows
+/// after its run had raised and released the table.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T: Send + 'static> AbortOnDrop<T> {
+    fn spawn<F: std::future::Future<Output = T> + Send + 'static>(f: F) -> Self {
+        AbortOnDrop(Some(tokio::spawn(f)))
+    }
+
+    /// Wait for the task. The handle stays inside until it finishes, so a
+    /// join that is itself cancelled still aborts the task on drop.
+    async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        self.0.as_mut().expect("joined once").await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort(); // a finished task: a no-op
+        }
+    }
+}
+
+/// Run a drain loop beside the apply task it feeds, and JOIN that task on
+/// every path before returning — the drain's own error included.
+///
+/// `drain` owns the window sender, so its end (whatever the outcome) closes
+/// the channel, and the apply task lands what it already has and returns.
+/// Only then does this return, so whatever releases the table afterwards
+/// (`Tenure::release`, which also waits for every open unit) comes after the
+/// last write. 0.56.0 had a `?` between spawn and join: a failed standby
+/// status returned past the join, the run released its lock and raised, and
+/// the apply task went on committing windows beside the next owner.
+async fn run_overlapped<D>(drain: D, apply: AbortOnDrop<Result<Vec<u64>>>) -> Result<Vec<u64>>
+where
+    D: std::future::Future<Output = Result<()>>,
+{
+    let drained = drain.await;
+    let joined = apply.join().await;
+    drained?;
+    match joined {
+        Ok(r) => r,
+        Err(j) => Err(Error::Transfer(format!("log_based: apply task panicked: {j}"))),
+    }
+}
+
+/// The drain side: decode windows off the walsender and hand each to the
+/// apply task, confirming a window to the slot only once the apply reported
+/// it committed. Owns `win_tx`: returning — Ok or Err — closes the channel.
+#[allow(clippy::too_many_arguments)]
+async fn drain_loop(
+    ws: &mut Walsender,
+    win_tx: tokio::sync::mpsc::Sender<DrainOutcome>,
+    mut applied_rx: tokio::sync::watch::Receiver<u64>,
+    wm: u64,
+    stop_line: u64,
+    key_cols: &HashMap<String, Vec<String>>,
+    budget: usize,
+    changelog: bool,
+) -> Result<()> {
+    let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let mut sess = DrainSession::default();
     let mut cur = wm;
     let mut windows = 0u32;
     // The previous window's end_lsn: sent to the applier, not yet confirmed.
     let mut pending: Option<u64> = None;
-    let mut drain_err: Option<Error> = None;
     loop {
         let t_drain = std::time::Instant::now();
-        let outcome = match drain(
-            &mut ws, &mut sess, cur, stop_line, &key_cols, 3600, budget, &applied_rx, changelog,
-        )
-        .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                drain_err = Some(e);
-                break;
-            }
-        };
+        let outcome =
+            drain(ws, &mut sess, cur, stop_line, key_cols, 3600, budget, &applied_rx, changelog).await?;
         windows += 1;
         if dbg {
             let events: u64 = outcome.tables.values().map(|c| c.events).sum();
@@ -1667,11 +1565,9 @@ async fn drain_group(
         }
         let end = outcome.end_lsn;
         let hit = outcome.hit_budget;
-        if end > cur {
-            if win_tx.send(outcome).await.is_err() {
-                // Apply task died — its JoinHandle carries the real error.
-                break;
-            }
+        if end > cur && win_tx.send(outcome).await.is_err() {
+            // Apply task died — its JoinHandle carries the real error.
+            break;
         }
         // Confirm the PREVIOUS window once applied (bounds resident windows
         // to two and keeps the slot's confirmed LSN strictly behind commits).
@@ -1689,33 +1585,93 @@ async fn drain_group(
             break;
         }
     }
-    drop(win_tx);
-    // Wait for the final in-flight window, confirm, then collect the applier.
-    if drain_err.is_none() {
-        if let Some(p) = pending {
-            if applied_rx.wait_for(|&a| a >= p).await.is_ok() {
-                ws.standby_status(p, false).await?;
+    // Wait for the final in-flight window, then confirm it. A caught-up drain
+    // reports its end_lsn AT the caught-up point, so that window already
+    // carried it to the destination; nothing extra to send — see the note in
+    // `drain`, and the seven gate legs that went red when this was a bare
+    // confirmation.
+    if let Some(p) = pending {
+        if applied_rx.wait_for(|&a| a >= p).await.is_ok() {
+            ws.standby_status(p, false).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The apply side: every window lands in units the tenure opens, so an
+/// evicted or winding-down run writes nothing more, and `Tenure::release`
+/// cannot pass a unit still open here.
+async fn apply_windows(
+    tenure: Arc<Tenure<Dest>>,
+    src: PgPool,
+    members: Vec<crate::logbased::dest_bq::Member>,
+    changelog: bool,
+    mut win_rx: tokio::sync::mpsc::Receiver<DrainOutcome>,
+    applied_tx: tokio::sync::watch::Sender<u64>,
+) -> Result<Vec<u64>> {
+    let t = &*tenure;
+    let dest = t.dest();
+    let mut rows_per = vec![0u64; members.len()];
+    while let Some(o) = win_rx.recv().await {
+        let t_apply = std::time::Instant::now();
+        let lanes = dest.apply_lanes();
+        if let Dest::Bq(_) = dest {
+            // BigQuery: stage every table concurrently (one load job each),
+            // then commit the whole group's MERGEs + watermarks in as few
+            // script jobs as possible — one unit over the group.
+            let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
+            let mut h = t.open(&tables).await?;
+            let Unit::Bq(u) = &mut h.unit else { return Err(mismatch()) };
+            let applied = dest.apply_group(u, &members, &o, lanes, changelog).await?;
+            let (rows, marks): (Vec<u64>, Vec<Watermark>) = applied.into_iter().unzip();
+            t.close(h, marks).await?;
+            for (i, n) in rows.into_iter().enumerate() {
+                rows_per[i] += n;
+            }
+        } else if lanes > 1 && members.len() > 1 {
+            // A BOUNDED pool of per-table units: `lanes` in flight, the rest
+            // queued, each completion pulling the next. Unbounded would melt a
+            // 100-table group against the destination's limits and make every
+            // transaction contend on the shared state rows.
+            use futures::stream::{StreamExt as _, TryStreamExt as _};
+            // Indices, not references: a closure taking `&(..)` and
+            // returning an async block trips higher-ranked lifetime
+            // inference ("FnOnce is not general enough").
+            let (sref, oref, mref) = (&src, &o, &members);
+            let applied: Vec<(usize, u64)> = futures::stream::iter(0..mref.len())
+                .map(|i| async move {
+                    let (dt, q, pk, sid) = &mref[i];
+                    let mut h = t.open(&[dt.as_str()]).await?;
+                    let (n, m) = dest.apply(&mut h.unit, dt, q, pk, oref, sid, Some(sref), changelog).await?;
+                    t.close(h, vec![m]).await?;
+                    Ok::<_, Error>((i, n))
+                })
+                .buffer_unordered(lanes)
+                .try_collect()
+                .await?;
+            for (i, n) in applied {
+                rows_per[i] += n;
+            }
+        } else {
+            for (i, (dt, q, pk, sid)) in members.iter().enumerate() {
+                let mut h = t.open(&[dt.as_str()]).await?;
+                let (n, m) = dest.apply(&mut h.unit, dt, q, pk, &o, sid, Some(&src), changelog).await?;
+                t.close(h, vec![m]).await?;
+                rows_per[i] += n;
             }
         }
-        // A caught-up drain now reports its end_lsn AT the caught-up point, so
-        // the window above already carried it to the destination and confirmed
-        // it. Nothing extra to send here — see the note in `drain`, and the
-        // seven gate legs that went red when this was a bare confirmation.
-    }
-    let joined = apply_task.await;
-    ws.stop_replication().await.ok();
-    if let Some(e) = drain_err {
-        return Err(e);
-    }
-    let rows_per = match joined {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(e),
-        Err(j) => {
-            return Err(Error::Transfer(format!("log_based: apply task panicked: {j}")))
+        if std::env::var("APITAP_DEBUG").is_ok() {
+            let events: u64 = o.tables.values().map(|c| c.events).sum();
+            eprintln!(
+                "[log_based] applied lsn={} events={events} in {:.1}s",
+                o.end_lsn,
+                t_apply.elapsed().as_secs_f64(),
+            );
         }
-    };
-
-    Ok(rows_per.into_iter().map(|r| (r, 1)).collect())
+        // Receiver may be gone on a drain-side abort — nothing to do.
+        let _ = applied_tx.send(o.end_lsn);
+    }
+    Ok(rows_per)
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1960,5 +1916,61 @@ fn human_bytes(n: u64) -> String {
         format!("{:.0} MB", f / (K * K))
     } else {
         format!("{:.1} GB", f / (K * K * K))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// The drain fails after handing over two windows while the apply task is
+    /// still landing them. `run_overlapped` must not return — and so must not
+    /// let the run release its table — before that task finished: a detached
+    /// apply commits beside the next owner.
+    #[test]
+    fn overlapped_loop_joins_apply_on_error() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+            let finished = Arc::new(Mutex::new(None::<Instant>));
+            let f2 = finished.clone();
+            let apply = AbortOnDrop::spawn(async move {
+                let mut n = 0u64;
+                while rx.recv().await.is_some() {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    n += 1;
+                }
+                *f2.lock().unwrap() = Some(Instant::now());
+                Ok(vec![n])
+            });
+            let drain = async move {
+                for w in 0..2 {
+                    tx.send(w).await.map_err(|_| Error::Transfer("apply gone".into()))?;
+                }
+                Err(Error::Transfer("the walsender went away".into()))
+            };
+            let r = run_overlapped(drain, apply).await;
+            let returned = Instant::now();
+            assert!(matches!(&r, Err(Error::Transfer(m)) if m.contains("walsender")), "{r:?}");
+            let done = finished.lock().unwrap().expect("the apply task was left running past the return");
+            assert!(returned >= done, "returned before the apply task finished");
+        });
+    }
+
+    /// Dropping the owner aborts the task instead of detaching it.
+    #[test]
+    fn a_dropped_apply_is_aborted() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let ran = Arc::new(Mutex::new(false));
+            let r2 = ran.clone();
+            let apply = AbortOnDrop::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                *r2.lock().unwrap() = true;
+            });
+            drop(apply);
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert!(!*ran.lock().unwrap(), "a dropped apply task ran on");
+        });
     }
 }

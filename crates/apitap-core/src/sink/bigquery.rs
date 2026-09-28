@@ -1949,7 +1949,6 @@ pub(crate) async fn lease_renew(conn: &BqConn, token: &str) -> Result<u64> {
 
 /// This run's keys whose row exists and is not collected. Expiry ignored:
 /// only a CLAIM evicts.
-#[allow(dead_code)] // the tenure keeper's question; wired at the Tenure switch
 pub(crate) async fn lease_unclaimed(conn: &BqConn, token: &str) -> Result<Vec<String>> {
     let rows = conn
         .cdc_query(&format!(
@@ -2155,12 +2154,19 @@ impl crate::guard::GuardStore for BqGuard {
     /// or the bootstrap can reproduce — a window replays, a bootstrap that did
     /// not finish is redone — so dropping them loses nothing. A bulk token has
     /// neither; the deletes are 404-tolerant.
+    ///
+    /// Every delete is attempted and the first failure reported: stopping at
+    /// the first would leave the rest for a sweep that may never come again.
     async fn sweep_run(&self, bare: &str, token: &str) -> Result<()> {
         use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
+        let mut first = Ok(());
         for a in [Artifact::CdcStaging, Artifact::ChangelogTmp] {
-            self.conn.table_delete(&artifact_ident_tok(bare, a, ROOMY, token)).await?;
+            let r = self.conn.table_delete(&artifact_ident_tok(bare, a, ROOMY, token)).await;
+            if first.is_ok() {
+                first = r;
+            }
         }
-        Ok(())
+        first
     }
 }
 
