@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::lease::Watermark;
 use crate::logbased::changelog::Changes;
 use crate::logbased::collapse::{Collapsed, ResidueOp};
-use crate::logbased::replay::WindowId;
+use crate::logbased::replay::{Ask, MarkerRow, Memo, ReplayPlan, WindowId};
 use crate::logbased::rowtext::{
     ch_key_literal, render_ch_key, render_ch_row, render_ch_row_cells,
     render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
@@ -61,11 +61,16 @@ pub(crate) const CL_BASELINE: &str = "B";
 
 pub(crate) struct ChDest {
     store: ChStore,
+    /// What this run knows of each changelog table's stamps (`Memo`).
+    memo: Memo,
+    /// A changelog table's plan between its apply and its unit's close: the
+    /// memo learns a marker only once the unit that wrote it closed.
+    staged: std::sync::Mutex<std::collections::HashMap<(String, String), ReplayPlan>>,
 }
 
 impl ChDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: ChStore::connect(url)? })
+        Ok(Self { store: ChStore::connect(url)?, memo: Memo::default(), staged: Default::default() })
     }
 
     /// The store: the lease, the guard and the units a run's tenure takes.
@@ -122,16 +127,22 @@ impl ChDest {
     /// Data columns become Nullable on the way: a `D` record carries only the
     /// key and a `T` carries no row at all, so partial rows are inherent to a
     /// changelog.
+    ///
+    /// The table's `_apitap_cdc_pending` rows go in the same unit (brief
+    /// R-B2): they describe the stream the bootstrap replaced, and a marker
+    /// past the new stream's start would refuse every window as a rewind.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn changelog_bootstrap_finish(
         &self,
         u: &mut ChUnit<'_>,
         dest_table: &str,
+        source_id: &str,
         pk_cols: &[String],
         lsn: u64,
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
+        self.memo.forget(dest_table, source_id);
         // The rebuild below EXCHANGEs the destination table itself — on a
         // cluster that would swap it on ONE node. Refused first.
         u.refuse_clustered(dest_table).await?;
@@ -155,7 +166,7 @@ impl ChDest {
             .await?;
         match has.trim() {
             "0" => {}
-            "4" => return Ok(()),
+            "4" => return u.clear_pending_owned(dest_table, source_id).await,
             n => {
                 return Err(Error::InvalidInput(format!(
                     "log_based changelog: ClickHouse target {dest_table} already has {n} of \
@@ -198,10 +209,15 @@ impl ChDest {
             op = ch_str(CL_BASELINE),
         );
         u.changelog_rebuild(dest_table, &sel, &part, &order).await?;
-        u.current_view(dest_table, pk_cols).await
+        u.current_view(dest_table, pk_cols).await?;
+        // After the rebuild, never before it: the copy is unfenced and may
+        // outlast the unit's pin, and the swap's fresh pin is only fresh while
+        // no owned statement ran ahead of it in the unit (`ChUnit::keep`).
+        u.clear_pending_owned(dest_table, source_id).await
     }
 
-    /// changelog=true apply — see `apply_changelog_unit`.
+    /// changelog=true apply — see `apply_changelog_unit`. The plan waits in
+    /// `staged` for the unit's close (`settle`).
     pub(crate) async fn apply_changelog(
         &self,
         u: &mut ChUnit<'_>,
@@ -210,7 +226,23 @@ impl ChDest {
         id: &WindowId,
         source_id: &str,
     ) -> Result<(u64, Watermark)> {
-        apply_changelog_unit(u, dest_table, w, id, source_id).await
+        let (n, mark, plan) = apply_changelog_unit(u, &self.memo, dest_table, w, id, source_id).await?;
+        self.staged.lock().unwrap().insert((dest_table.to_string(), source_id.to_string()), plan);
+        Ok((n, mark))
+    }
+
+    /// The unit that held this table's window is closed: `ok` when it
+    /// committed. Only then does the memo take the marker the window wrote
+    /// (brief §0 L14); any failure, the apply's or the close's, makes the
+    /// table unknown again, and its next window probes.
+    pub(crate) fn settle(&self, dest_table: &str, source_id: &str, ok: bool) {
+        let key = (dest_table.to_string(), source_id.to_string());
+        let plan = self.staged.lock().unwrap().remove(&key);
+        match (ok, plan) {
+            (true, Some(p)) => self.memo.committed(dest_table, source_id, &p),
+            (true, None) => {}
+            (false, _) => self.memo.forget(dest_table, source_id),
+        }
     }
 
     /// Apply one collapsed window. The state is written LAST, by the unit's
@@ -307,57 +339,127 @@ async fn read_current(
     Ok(out)
 }
 
-/// changelog=true apply: ONE plain INSERT of every captured operation.
+/// One write of a changelog window, in the only order they run: the trim,
+/// the marker, the rows. The watermark is not a step — the unit's close
+/// writes it — and the marker is never after the rows: a replay can only
+/// count what landed at a stamp against a marker that was there first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChStep {
+    /// Delete this stamp's non-baseline rows with `_apitap_seq >=` this.
+    Trim(u32),
+    Mark(MarkerRow),
+    Append,
+}
+
+fn changelog_steps(plan: &ReplayPlan) -> Vec<ChStep> {
+    let mut v = Vec::with_capacity(3);
+    v.extend(plan.trim_from().map(ChStep::Trim));
+    v.extend(plan.marker().map(ChStep::Mark));
+    if !plan.to_append().is_empty() {
+        v.push(ChStep::Append);
+    }
+    v
+}
+
+/// The plan for this table's share of the window: ask the memo, read what it
+/// asks for (the first window of a run probes; a replay, or a start another
+/// writer's rows reach, counts the stamp), then `replay_plan`.
+async fn plan_of(
+    u: &mut ChUnit<'_>,
+    memo: &Memo,
+    dest_table: &str,
+    source_id: &str,
+    id: &WindowId,
+    events: usize,
+) -> Result<ReplayPlan> {
+    let mut ask = memo.ask(dest_table, source_id, id);
+    if ask == Ask::Probe {
+        let (pending, ceiling) = u.probe(dest_table, source_id).await?;
+        memo.probed(dest_table, source_id, pending, ceiling);
+        ask = memo.ask(dest_table, source_id, id);
+    }
+    let f = match ask {
+        Ask::Facts { base } => Some(u.facts(dest_table, id.start(), base).await?),
+        Ask::Nothing | Ask::Probe => None,
+    };
+    memo.plan(dest_table, source_id, f.as_ref(), id, events)
+}
+
+/// changelog=true apply: ONE plain INSERT of the window's operations, plus —
+/// only on a replay — one DELETE of rows at its own stamp.
 ///
-/// No delete-set, no key table, no DELETE, no TRUNCATE — ClickHouse never
-/// writes a mutation, so the destination never rewrites parts.
+/// No delete-set, no key table, no TRUNCATE: the log's parts are rewritten
+/// only when a replay trims them.
 ///
 /// **Replay.** The INSERT and the watermark are two round-trips and ClickHouse
 /// has no transaction to hold them together, so a window CAN be re-drained
 /// after its rows landed: the process dies in between, or a sibling table in
 /// the same group fails its apply and the next run restarts from the group
-/// minimum. Two things make that safe.
-///
-/// 1. The stamp is the window's START — the watermark it was drained
-///    FROM, the one position that is identical on a replay, so `(lsn, seq)`
-///    is a real event identity a consumer can de-duplicate on.
-/// 2. `_apitap_cdc_pending` records the window we are ABOUT to append. If the
-///    next attempt opens on the same start, the rows already in the table at
-///    that stamp are counted and skipped — so the ordinary replay appends
-///    nothing twice at all.
+/// minimum. The stamp is the window's START, the one position a re-drain
+/// reproduces, so `(lsn, seq)` is an event's identity; `_apitap_cdc_pending`
+/// records each attempt (start, seq base, end, events) before its rows; and
+/// `replay_plan` decides from both what this attempt trims, marks and
+/// appends. After it, the stamp holds exactly this window's events, each once
+/// (brief §2.B §4 D1-D2).
 async fn apply_changelog_unit(
     u: &mut ChUnit<'_>,
+    memo: &Memo,
     dest_table: &str,
     w: Option<&TableWindow<Changes>>,
     id: &WindowId,
     source_id: &str,
-) -> Result<(u64, Watermark)> {
-    let set = |rows: u64| Watermark::Set {
-        table: dest_table.to_string(),
-        source_id: source_id.to_string(),
-        lsn: id.end(),
-        rows,
-    };
+) -> Result<(u64, Watermark, ReplayPlan)> {
     // Memoized no-op in steady state; here so no window ever writes to a
     // table that turned Replicated under us mid-run.
     u.refuse_clustered(dest_table).await?;
-    let Some(w) = w else {
-        return Ok((0, set(0)));
-    };
-    let (c, l) = (w.body(), w.layout());
-    let (wal_cols, oids) = (l.cols(), l.oids());
-    for name in wal_cols {
-        if matches!(name.as_str(), CL_OP | CL_LSN | CL_SEQ | CL_AT) {
-            return Err(Error::InvalidInput(format!(
-                "log_based changelog: source column '{name}' collides with a reserved \
-                 changelog column — rename it at the source or alias it in a view"
-            )));
+    if let Some(w) = w {
+        for name in w.layout().cols() {
+            if matches!(name.as_str(), CL_OP | CL_LSN | CL_SEQ | CL_AT) {
+                return Err(Error::InvalidInput(format!(
+                    "log_based changelog: source column '{name}' collides with a reserved \
+                     changelog column — rename it at the source or alias it in a view"
+                )));
+            }
         }
     }
-    if c.events.is_empty() {
-        return Ok((0, set(0)));
+    // A member this window does not carry still runs the rule: an earlier
+    // attempt at this start may have appended rows for it.
+    let events = w.map_or(0, |w| w.body().events.len());
+    let plan = plan_of(u, memo, dest_table, source_id, id, events).await?;
+    let rows = w.map_or(0, |w| w.body().count);
+    let mark = Watermark::Set {
+        table: dest_table.to_string(),
+        source_id: source_id.to_string(),
+        lsn: plan.watermark(),
+        rows,
+    };
+    for step in changelog_steps(&plan) {
+        match step {
+            ChStep::Trim(from) => u.trim_owned(dest_table, plan.stamp(), from).await?,
+            ChStep::Mark(m) => u.mark_pending_owned(dest_table, source_id, &m).await?,
+            ChStep::Append => {
+                let w = w.ok_or_else(|| Error::Transfer(format!("log_based: {dest_table}: internal: rows to append from no window")))?;
+                let (cols, buf) = changelog_body(u, dest_table, w, &plan).await?;
+                u.insert_owned(dest_table, &cols, buf).await?;
+            }
+        }
     }
+    Ok((rows, mark, plan))
+}
 
+/// The TabSeparated rows `plan` appends, and their column list.
+///
+/// Built after the trim, so the masked readback never sees rows the trim
+/// removes: a torn attempt's rows are this window's own events, and a masked
+/// cell read from one of them would be a LATER value of the row.
+async fn changelog_body(
+    u: &mut ChUnit<'_>,
+    dest_table: &str,
+    w: &TableWindow<Changes>,
+    plan: &ReplayPlan,
+) -> Result<(Vec<String>, Vec<u8>)> {
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, oids) = (l.cols(), l.oids());
     // Unchanged-TOAST cells must be rebuilt before anything is written —
     // writing them as NULL would silently blank the column for every reader of
     // `__current`. Costs one extra query per window, and only when the window
@@ -379,52 +481,24 @@ async fn apply_changelog_unit(
         .cloned()
         .chain([CL_OP, CL_LSN, CL_SEQ, CL_AT].map(String::from))
         .collect();
-    // The window's START, not its end: see the replay note above.
-    let lsn = id.start();
-    // Did a previous attempt at THIS window already append? Only asked when the
-    // marker names the same start — on the ordinary path it names the previous
-    // window's, and the count below (which scans `_apitap_lsn`, a sorting-key
-    // SUFFIX, so it prunes nothing) is never run.
-    let mut skip = 0usize;
-    if u.pending_window(dest_table, source_id).await? == Some(lsn) {
-        match u.appended_prefix(dest_table, lsn).await? {
-            Some(n) => skip = n.min(c.events.len()),
-            // Not a prefix: the surviving rows have a hole in them, so there is
-            // no safe place to resume. Re-append the whole window — the stamps
-            // are stable, so the overlap is an exact `(lsn, seq)` duplicate
-            // that `__current` and any consumer can collapse, which is the
-            // bad-but-honest outcome rather than a silent gap.
-            None => {
-                eprintln!(
-                    "apitap: {dest_table}: a previous append of the window at lsn {lsn} \
-                     left an incomplete run of rows, so it cannot be resumed part-way. \
-                     Re-appending the whole window; rows carrying a repeated \
-                     ({CL_LSN}, {CL_SEQ}) are duplicates of each other and may be \
-                     de-duplicated on that pair."
-                );
-            }
-        }
-    }
-    if skip >= c.events.len() {
-        // Everything already landed; only the watermark was missing.
-        return Ok((c.count, set(c.count)));
-    }
-    u.mark_pending_owned(dest_table, source_id, lsn).await?;
-    // ONE stamp for the window. It is the PARTITION/retention key, never an
-    // ordering key — `(lsn, seq)` orders. Sent explicitly rather than left to a
-    // default: the rebuild materialised `_apitap_at` as a plain column, so a
+    // The stamp is the window's START: see the replay note above.
+    let stamp = plan.stamp().to_string();
+    // ONE `_apitap_at` for the window. It is the PARTITION/retention key, never
+    // an ordering key — `(lsn, seq)` orders. Sent explicitly rather than left to
+    // a default: the rebuild materialised `_apitap_at` as a plain column, so a
     // NULL would land as the epoch and pile the whole log into a 1970 partition.
     let at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let mut buf = Vec::with_capacity(4 << 20);
-    for (seq, ev) in c.events.iter().enumerate().skip(skip) {
-        match patched.get(&seq).or(ev.row.as_ref()) {
+    let range = plan.to_append();
+    for (i, ev) in c.events.iter().enumerate().take(range.end).skip(range.start) {
+        match patched.get(&i).or(ev.row.as_ref()) {
             // A delete's old image carries the key and NULLs elsewhere — that
             // IS the delete record, so it renders like any row.
             Some(row) => render_ch_row_trim(row, oids, wal_cols.len(), &mut buf)?,
             // TRUNCATE has no row: every data column is \N.
             None => {
-                for i in 0..wal_cols.len() {
-                    if i > 0 {
+                for k in 0..wal_cols.len() {
+                    if k > 0 {
                         buf.push(b'\t');
                     }
                     buf.extend_from_slice(b"\\N");
@@ -434,15 +508,14 @@ async fn apply_changelog_unit(
         buf.push(b'\t');
         buf.extend_from_slice(ev.op.code().as_bytes());
         buf.push(b'\t');
-        buf.extend_from_slice(lsn.to_string().as_bytes());
+        buf.extend_from_slice(stamp.as_bytes());
         buf.push(b'\t');
-        buf.extend_from_slice(seq.to_string().as_bytes());
+        buf.extend_from_slice(plan.seq_of(i).to_string().as_bytes());
         buf.push(b'\t');
         buf.extend_from_slice(at.as_bytes());
         buf.push(b'\n');
     }
-    u.insert_owned(dest_table, &cols, buf).await?;
-    Ok((c.count, set(c.count)))
+    Ok((cols, buf))
 }
 
 /// Apply one collapsed window through the unit, and name the watermark its
@@ -614,6 +687,7 @@ mod store {
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark};
+    use crate::logbased::replay::{parse_ceiling, parse_facts, parse_pending, MarkerRow, Pending, StampFacts};
     use crate::naming::{artifact_ident, artifact_ident_tok, Artifact, ROOMY};
     use crate::sink::clickhouse::{ch_ident, ch_str, ChConn, ChGuard};
     use std::collections::{HashMap, HashSet};
@@ -830,23 +904,39 @@ mod store {
             Ok(())
         }
 
-        /// The changelog append's intent marker: "a window starting at `lsn` is
-        /// being appended to `dest_table`". Its own table rather than a row in
-        /// `_apitap_state`, because that one is `ReplacingMergeTree ORDER BY
-        /// (dest_table, source_id)` — a second row for the same pair does not
-        /// sit beside the watermark, it REPLACES it.
+        /// The changelog append's intent marker: "a window starting at `lsn`,
+        /// drained to `end_lsn`, is appending its `events` from `seq_base`".
+        /// Its own table rather than a row in `_apitap_state`, because that one
+        /// is `ReplacingMergeTree ORDER BY (dest_table, source_id)` — a second
+        /// row for the same pair does not sit beside the watermark, it
+        /// REPLACES it.
+        ///
+        /// 0.56.0 created it with `lsn` alone: the three columns are added in
+        /// place, and the rows it wrote read `events = 0`, which is how
+        /// `replay::parse_pending` knows them for 0.56.0's (base 0, no count).
+        /// Remembered only once both statements answered.
         async fn ensure_pending_table(&self) -> Result<()> {
-            if !self.first_time("\u{1}pending") {
+            let key = "\u{1}pending";
+            if self.ensured.lock().unwrap().contains(key) {
                 return Ok(());
             }
             self.ch
                 .exec(&format!(
                     "CREATE TABLE IF NOT EXISTS {PENDING} (\
                        dest_table String, source_id String, lsn UInt64, \
+                       seq_base UInt32 DEFAULT 0, end_lsn UInt64 DEFAULT 0, events UInt64 DEFAULT 0, \
                        at DateTime64(6, 'UTC') DEFAULT now64(6)) \
                      ENGINE = ReplacingMergeTree(at) ORDER BY (dest_table, source_id)"
                 ))
                 .await?;
+            self.ch
+                .exec(&format!(
+                    "ALTER TABLE {PENDING} ADD COLUMN IF NOT EXISTS seq_base UInt32 DEFAULT 0, \
+                     ADD COLUMN IF NOT EXISTS end_lsn UInt64 DEFAULT 0, \
+                     ADD COLUMN IF NOT EXISTS events UInt64 DEFAULT 0"
+                ))
+                .await?;
+            self.ensured.lock().unwrap().insert(key.to_string());
             Ok(())
         }
 
@@ -1117,6 +1207,10 @@ mod store {
 
         pub(crate) async fn delete_owned(&mut self, table: &str, where_sql: &str) -> Result<()> {
             self.s.note("delete");
+            self.delete_where(table, where_sql).await
+        }
+
+        async fn delete_where(&mut self, table: &str, where_sql: &str) -> Result<()> {
             self.keep(false).await?;
             let sql = format!(
                 "DELETE FROM {} WHERE ({where_sql}) AND {}{}",
@@ -1125,6 +1219,18 @@ mod store {
                 self.delete_mode(table)
             );
             self.exec_owned(&sql).await.map(|_| ())
+        }
+
+        /// A changelog replay's trim: this stamp's non-baseline rows from
+        /// `from` up. A lightweight DELETE, and the log's parts are rewritten
+        /// only here — on a replay, never on an ordinary window.
+        pub(crate) async fn trim_owned(&mut self, table: &str, stamp: u64, from: u32) -> Result<()> {
+            self.s.note("trim");
+            let w = format!(
+                "{CL_LSN} = {stamp} AND {CL_OP} != '{b}' AND {CL_SEQ} >= {from}",
+                b = ch_str(CL_BASELINE)
+            );
+            self.delete_where(table, &w).await
         }
 
         /// A WAL TRUNCATE. A `DELETE` rather than `TRUNCATE TABLE`, because
@@ -1173,79 +1279,114 @@ mod store {
             Ok(kt)
         }
 
-        /// The window start the last append ATTEMPT was made at, if any.
-        pub(crate) async fn pending_window(&mut self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        /// The run's first look at a changelog table: the newest marker (ranked
+        /// by `(lsn, at)`, not `at` alone — marker starts only rise for a
+        /// table, so a clock stepping back cannot pick an older one here) and
+        /// the log's highest non-baseline stamp, which bounds every row an
+        /// earlier run can have left (`replay::Memo`). The ceiling scans
+        /// `_apitap_lsn` once per table per run.
+        pub(crate) async fn probe(&mut self, dest_table: &str, source_id: &str) -> Result<(Option<Pending>, Option<u64>)> {
             self.s.ensure_pending_table().await?;
+            let t = ch_ident(dest_table);
             let body = self
                 .read(&format!(
-                    "SELECT toString(argMax(lsn, at)) FROM {PENDING} \
-                     WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
-                    ch_str(dest_table),
-                    ch_str(source_id),
+                    "SELECT count(), toString(argMax(lsn, (lsn, at))), toString(argMax(seq_base, (lsn, at))), \
+                     toString(argMax(events, (lsn, at))), \
+                     (SELECT toString(count()) FROM {t} WHERE {CL_OP} != '{b}'), \
+                     (SELECT toString(max({CL_LSN})) FROM {t} WHERE {CL_OP} != '{b}') \
+                     FROM {PENDING} WHERE dest_table = '{dt}' AND source_id = '{sid}' FORMAT TabSeparatedRaw",
+                    b = ch_str(CL_BASELINE),
+                    dt = ch_str(dest_table),
+                    sid = ch_str(source_id),
                 ))
                 .await?;
-            Ok(body.trim().parse::<u64>().ok())
+            let f: Vec<&str> = body.trim_end_matches('\n').split('\t').collect();
+            let [n, lsn, base, events, rows, top] = f[..] else {
+                return Err(Error::Transfer(format!("log_based changelog: {dest_table}: unreadable probe {body:?}")));
+            };
+            Ok((parse_pending(n, lsn, base, events)?, parse_ceiling(rows, top)?))
         }
 
-        /// How much of a window stamped `lsn` is already in the table, and
-        /// whether what is there is an unbroken prefix `seq = 0..n-1`. Rows go
-        /// out in `seq` order and ClickHouse commits the blocks it received, so
-        /// the survivor of a torn INSERT is normally a prefix — but `count =
-        /// max(seq) + 1` is the only thing that PROVES it.
-        pub(crate) async fn appended_prefix(&mut self, dest_table: &str, lsn: u64) -> Result<Option<usize>> {
+        /// What is at `stamp` already: every non-baseline row, the ones from
+        /// `base` up, and how many distinct seqs. Baseline rows are excluded:
+        /// the bootstrap stamps them with its consistent point, and the FIRST
+        /// window after a bootstrap starts at exactly that point. Asked only on
+        /// a replay, or where another writer's rows can be (`Memo::ask`).
+        pub(crate) async fn facts(&mut self, dest_table: &str, stamp: u64, base: u32) -> Result<StampFacts> {
             let body = self
                 .read(&format!(
-                    // Baseline rows are excluded: the bootstrap stamps them with
-                    // its consistent point, and the FIRST window after a
-                    // bootstrap starts at exactly that point.
-                    "SELECT count(), ifNull(max({CL_SEQ}), 0) FROM {} \
-                     WHERE {CL_LSN} = {lsn} AND {CL_OP} != '{b}' FORMAT TabSeparated",
-                    ch_ident(dest_table),
+                    "SELECT count(), if(count() = 0, -1, toInt64(max({CL_SEQ}))), \
+                     countIf({CL_SEQ} >= {base}), \
+                     if(countIf({CL_SEQ} >= {base}) = 0, -1, toInt64(maxIf({CL_SEQ}, {CL_SEQ} >= {base}))), \
+                     uniqExact({CL_SEQ}) \
+                     FROM {t} WHERE {CL_LSN} = {stamp} AND {CL_OP} != '{b}' FORMAT TabSeparatedRaw",
+                    t = ch_ident(dest_table),
                     b = ch_str(CL_BASELINE),
                 ))
                 .await?;
-            let mut f = body.trim().split('\t');
-            let n: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
-            let max_seq: usize = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
-            if n == 0 {
-                return Ok(Some(0));
-            }
-            Ok(if n == max_seq + 1 { Some(n) } else { None })
+            parse_facts(&body.trim_end_matches('\n').split('\t').collect::<Vec<_>>())
         }
 
-        /// The changelog's intent marker for the window at `lsn`, written only
-        /// by an owner: exactly one row, or this run no longer holds the table.
-        pub(crate) async fn mark_pending_owned(&mut self, dest_table: &str, source_id: &str, lsn: u64) -> Result<()> {
+        /// The changelog's intent marker for one attempt, written only by an
+        /// owner: exactly one row, or this run no longer holds the table.
+        pub(crate) async fn mark_pending_owned(&mut self, dest_table: &str, source_id: &str, m: &MarkerRow) -> Result<()> {
             self.s.note("mark_pending");
             self.s.ensure_pending_table().await?;
             self.keep(false).await?;
             let sql = format!(
-                "INSERT INTO {PENDING} (dest_table, source_id, lsn) SELECT '{}', '{}', {lsn} WHERE {}",
+                "INSERT INTO {PENDING} (dest_table, source_id, lsn, seq_base, end_lsn, events) \
+                 SELECT '{}', '{}', {}, {}, {}, {} WHERE {}",
                 ch_str(dest_table),
                 ch_str(source_id),
+                m.start,
+                m.seq_base,
+                m.end,
+                m.events,
                 self.pred()
             );
             match self.written_owned(&sql).await? {
                 Some(1) => Ok(()),
                 Some(_) => Err(no_longer_holds(&self.keys)),
-                // A proxy stripped the summary header: ask the table.
+                // A proxy stripped the summary header: ask the table. A
+                // fenced-out marker is caught here or, at the latest, by the
+                // watermark INSERT, which the same pinned deadline fences.
                 None => {
                     let body = self
                         .s
                         .ch
                         .read(&format!(
-                            "SELECT toString(argMax(lsn, at)) FROM {PENDING} \
-                             WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
+                            "SELECT toString(argMax(lsn, (lsn, at))), toString(argMax(end_lsn, (lsn, at))) \
+                             FROM {PENDING} WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparatedRaw",
                             ch_str(dest_table),
                             ch_str(source_id),
                         ))
                         .await?;
-                    if body.trim().parse::<u64>().ok() == Some(lsn) {
+                    if body.trim() == format!("{}\t{}", m.start, m.end) {
                         Ok(())
                     } else {
                         Err(no_longer_holds(&self.keys))
                     }
                 }
+            }
+        }
+
+        /// Every marker of a table's stream, for whoever drops its state: a
+        /// failed bootstrap's rollback (`Watermark::Clear`), and the changelog
+        /// bootstrap that starts a new stream (brief R-B2). A destination that
+        /// never had a changelog has no marker table, and nothing to clear.
+        pub(crate) async fn clear_pending_owned(&mut self, dest_table: &str, source_id: &str) -> Result<()> {
+            self.s.note("clear_pending");
+            self.keep(false).await?;
+            let sql = format!(
+                "ALTER TABLE {PENDING} DELETE WHERE dest_table = '{}' AND source_id = '{}' AND {} \
+                 SETTINGS mutations_sync = 1",
+                ch_str(dest_table),
+                ch_str(source_id),
+                self.pred(),
+            );
+            match self.exec_owned(&sql).await {
+                Err(Error::Transfer(m)) if m.contains("UNKNOWN_TABLE") => Ok(()),
+                r => r.map(|_| ()),
             }
         }
 
@@ -1397,6 +1538,9 @@ mod store {
                             u.pred(),
                         ))
                         .await?;
+                        // The markers go with the state (brief R-B2): a
+                        // marker past the next stream's start is a rewind.
+                        u.clear_pending_owned(table, source_id).await?;
                     }
                 }
             }
@@ -1710,11 +1854,16 @@ mod tests {
     const T0: u64 = 1_000_000_000_000_000;
 
     /// Answers the reads a changelog window makes, reports one written row
-    /// for every write, and a lease with a whole TTL of life.
-    async fn mock_ch() -> String {
-        mock_with(Arc::new(|sql: &str| {
+    /// for every write, and a lease with a whole TTL of life. `probe` and
+    /// `facts` are the replay reads' rows.
+    async fn mock_ch_with(probe: &'static str, facts: &'static str) -> String {
+        mock_with(Arc::new(move |sql: &str| {
             let out = if sql.contains("toUnixTimestamp64Micro(min(e))") {
                 format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000)
+            } else if sql.contains("argMax(seq_base, (lsn, at))") {
+                probe.to_string()
+            } else if sql.contains("uniqExact(_apitap_seq)") {
+                facts.to_string()
             } else if sql.contains("SELECT engine FROM system.tables") {
                 "MergeTree\n".to_string()
             } else if sql.contains("SELECT name, type FROM system.columns") {
@@ -1729,27 +1878,101 @@ mod tests {
         .await
     }
 
-    /// A changelog window: read (is a previous attempt pending?), mark the
+    /// No marker, no event in the log yet.
+    async fn mock_ch() -> String {
+        mock_ch_with("0\t0\t0\t0\t0\t0\n", "").await
+    }
+
+    fn one_insert_window() -> TableWindow<Changes> {
+        let mut ch = Changes::new(Layout::for_test(&["id", "v"], &[23, 25], &["id"]));
+        ch.insert(Tuple::from_cells(&[
+            Cell::Text(bytes::Bytes::from_static(b"1")),
+            Cell::Text(bytes::Bytes::from_static(b"a")),
+        ]));
+        ch.seal("public.t").unwrap()
+    }
+
+    /// A changelog window: read (the run's first look: the probe), mark the
     /// attempt, insert, and only then the watermark. The mark before the
     /// insert is what lets a replay count what already landed.
     #[test]
     fn unit_order_mark_insert_state() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let s = ChStore::connect(&mock_ch().await).unwrap();
-            let mut ch = Changes::new(Layout::for_test(&["id", "v"], &[23, 25], &["id"]));
-            ch.insert(Tuple::from_cells(&[
-                Cell::Text(bytes::Bytes::from_static(b"1")),
-                Cell::Text(bytes::Bytes::from_static(b"a")),
-            ]));
-            let w = ch.seal("public.t").unwrap();
+            let w = one_insert_window();
             let keys = vec![s.lease_key("t")];
             let mut u = s.open_unit(&keys, "_tok").await.unwrap();
-            let (n, mark) =
-                apply_changelog_unit(&mut u, "t", Some(&w), &WindowId::new(10, 20), "sid").await.unwrap();
+            let (n, mark, _) =
+                apply_changelog_unit(&mut u, &Memo::default(), "t", Some(&w), &WindowId::new(10, 20), "sid")
+                    .await
+                    .unwrap();
             assert_eq!(n, 1);
             s.close_unit(u, "_tok", vec![mark]).await.unwrap();
             let _ = Arc::new(Mutex::new(()));
             assert_eq!(*s.ops.lock().unwrap(), ["read", "mark_pending", "insert", "state"]);
+        });
+    }
+
+    /// D8: a changelog window writes in one order — the trim, the marker, the
+    /// rows — for every rule, and the watermark is the unit's close, never a
+    /// step. A marker after the rows (the attack's "marker in close_unit")
+    /// lets a kill between them leave rows no marker names, which the next
+    /// run reads as another writer's and numbers above: every event twice.
+    #[test]
+    fn changelog_steps_order() {
+        use crate::logbased::replay::{replay_plan, Landed, Pending, StampFacts};
+        use ChStep::{Append, Mark, Trim};
+        let id = WindowId::new(100, 200);
+        let at = |count: u64, max: Option<u32>| {
+            let l = Landed { count, max_seq: max };
+            StampFacts { all: l, from_base: l, distinct_seq: count }
+        };
+        let torn = StampFacts {
+            all: Landed { count: 2, max_seq: Some(4) },
+            from_base: Landed { count: 2, max_seq: Some(4) },
+            distinct_seq: 2,
+        };
+        let mark = |seq_base, events| Mark(MarkerRow { start: 100, seq_base, end: 200, events });
+        let here = Some(Pending::recorded(100, 0));
+        let cases: Vec<(&str, Option<Pending>, Option<StampFacts>, usize, Vec<ChStep>)> = vec![
+            ("R1, another writer's rows", None, Some(at(3, Some(2))), 5, vec![mark(3, 5), Append]),
+            ("R1, nothing at the stamp", None, None, 5, vec![mark(0, 5), Append]),
+            ("R2 torn", here, Some(torn), 5, vec![Trim(0), mark(0, 5), Append]),
+            ("R2 intact, resumed", here, Some(at(2, Some(1))), 5, vec![mark(0, 5), Append]),
+            ("R2 intact, all landed", here, Some(at(5, Some(4))), 5, vec![]),
+            ("R2 shorter replay", here, Some(at(8, Some(7))), 5, vec![Trim(5)]),
+            ("R2 absent member", here, Some(at(8, Some(7))), 0, vec![Trim(0)]),
+            ("R2 torn, absent member", here, Some(torn), 0, vec![Trim(0)]),
+            ("absent, no attempt here", None, None, 0, vec![]),
+        ];
+        for (what, p, f, n_ev, want) in cases {
+            let steps = changelog_steps(&replay_plan("t", p, f.as_ref(), &id, n_ev).unwrap());
+            assert_eq!(steps, want, "{what}");
+            let pos = |pred: fn(&ChStep) -> bool| steps.iter().position(pred);
+            if let (Some(m), Some(a)) = (pos(|s| matches!(s, Mark(_))), pos(|s| matches!(s, Append))) {
+                assert!(m < a, "{what}: the marker after the rows: {steps:?}");
+            }
+            if let Some(t) = pos(|s| matches!(s, Trim(_))) {
+                assert_eq!(t, 0, "{what}: the trim after a write: {steps:?}");
+            }
+        }
+
+        // The executor runs them in that order, reads first, and writes no
+        // state: a torn replay of the window at 10, marked at 10 by 0.57.0.
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let url = mock_ch_with("1\t10\t0\t3\t2\t10\n", "2\t4\t2\t4\t2\n").await;
+            let s = ChStore::connect(&url).unwrap();
+            let w = one_insert_window();
+            let keys = vec![s.lease_key("t")];
+            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+            let (_, mark, plan) =
+                apply_changelog_unit(&mut u, &Memo::default(), "t", Some(&w), &WindowId::new(10, 20), "sid")
+                    .await
+                    .unwrap();
+            assert_eq!(plan.trim_from(), Some(0));
+            assert_eq!(*s.ops.lock().unwrap(), ["read", "read", "trim", "mark_pending", "insert"]);
+            s.close_unit(u, "_tok", vec![mark]).await.unwrap();
+            assert_eq!(s.ops.lock().unwrap().last(), Some(&"state"));
         });
     }
 

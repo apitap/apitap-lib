@@ -13,9 +13,7 @@
 //! `replay_plan` is the only place that decides what a window appends at a
 //! stamp, under which seq, what it trims first and whether it leaves a marker.
 //! The destinations spell its inputs in SQL (`StampFacts`, `Pending`) and
-//! execute its steps; nothing else writes at a stamp. Until step 31 wires the
-//! ClickHouse apply to it, nothing outside the tests calls it.
-#![cfg_attr(not(test), allow(dead_code))]
+//! execute its steps; nothing else writes at a stamp.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
@@ -68,10 +66,6 @@ impl Pending {
 
     pub(crate) fn legacy(start: u64) -> Self {
         Self { start, seq_base: None }
-    }
-
-    pub(crate) fn start(&self) -> u64 {
-        self.start
     }
 
     /// The base the facts are counted from: a legacy attempt numbered from 0.
@@ -740,7 +734,7 @@ mod tests {
         assert_eq!(pending_rule("1", "812", "0", "0").unwrap(), Some(Pending::legacy(812)));
         let p = pending_rule("3", "812", "7", "100").unwrap();
         assert_eq!(p, Some(Pending::recorded(812, 7)));
-        assert_eq!(p.map(|p| p.start()), Some(812));
+        assert_eq!(p.map(|p| p.start), Some(812));
         for bad in [("1", "x", "0", "4"), ("1", "812", "-3", "4"), ("1", "812", "7", ""), ("n", "812", "7", "4"),
                     ("1", "812", "4294967296", "4")] {
             assert!(pending_rule(bad.0, bad.1, bad.2, bad.3).is_err(), "{bad:?} read as a marker or as none");

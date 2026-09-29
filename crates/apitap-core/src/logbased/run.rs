@@ -345,7 +345,7 @@ impl Dest {
     ) -> Result<Watermark> {
         match (self, u, changelog) {
             (Dest::Ch(d), Unit::Ch(u), true) => {
-                d.changelog_bootstrap_finish(u, dest_table, pk_cols, lsn, partition_by, order_by).await?
+                d.changelog_bootstrap_finish(u, dest_table, source_id, pk_cols, lsn, partition_by, order_by).await?
             }
             (Dest::Bq(d), Unit::Bq(u), true) => {
                 d.changelog_bootstrap_finish(u, dest_table, pk_cols, lsn, partition_by, order_by).await?
@@ -399,6 +399,17 @@ impl Dest {
                 d.apply(u, dest_table, qualified, w, &o.id, source_id, &Source(src)).await
             }
             _ => Err(mismatch()),
+        }
+    }
+
+    /// The unit that held `dest_table`'s window is closed, `ok` when it
+    /// committed: a changelog destination's replay memo learns the marker the
+    /// window wrote only now, and forgets the table on any failure (brief §0
+    /// L14). BigQuery's changelog takes its plan in its own group unit.
+    fn settle(&self, dest_table: &str, source_id: &str, ok: bool) {
+        match self {
+            Dest::Ch(d) => d.settle(dest_table, source_id, ok),
+            Dest::Pg(_) | Dest::My(_) | Dest::Bq(_) | Dest::Ice(_) => {}
         }
     }
 
@@ -1160,17 +1171,14 @@ async fn run_group_mysql(
             budget,
             opts.changelog,
             |outcome| {
-                let (dest, tenure, ctxs, rows_applied) = (&dest, &tenure, &ctxs, &rows_applied);
+                let (tenure, ctxs, rows_applied) = (&tenure, &ctxs, &rows_applied);
                 async move {
                     let end = outcome.id.end();
                     for (c, acc) in ctxs.iter().zip(rows_applied.iter()) {
                         // Every member applies — a table with no traffic in this
                         // window still advances its watermark. One unit each.
-                        let mut h = tenure.open(&[c.dest_table.as_str()]).await?;
-                        let (n, m) = dest
-                            .apply(&mut h.unit, &c.dest_table, &c.qualified, &c.source_id, &outcome, None)
+                        let n = apply_member(tenure, &c.dest_table, &c.qualified, &c.source_id, &outcome, None)
                             .await?;
-                        tenure.close(h, vec![m]).await?;
                         acc.set(acc.get() + n);
                         crate::progress::add_rows(n);
                     }
@@ -1637,9 +1645,7 @@ async fn apply_windows(
             let applied: Vec<(usize, u64)> = futures::stream::iter(0..mref.len())
                 .map(|i| async move {
                     let (dt, q, sid) = &mref[i];
-                    let mut h = t.open(&[dt.as_str()]).await?;
-                    let (n, m) = dest.apply(&mut h.unit, dt, q, sid, oref, Some(sref)).await?;
-                    t.close(h, vec![m]).await?;
+                    let n = apply_member(t, dt, q, sid, oref, Some(sref)).await?;
                     Ok::<_, Error>((i, n))
                 })
                 .buffer_unordered(lanes)
@@ -1650,10 +1656,7 @@ async fn apply_windows(
             }
         } else {
             for (i, (dt, q, sid)) in members.iter().enumerate() {
-                let mut h = t.open(&[dt.as_str()]).await?;
-                let (n, m) = dest.apply(&mut h.unit, dt, q, sid, &o, Some(&src)).await?;
-                t.close(h, vec![m]).await?;
-                rows_per[i] += n;
+                rows_per[i] += apply_member(t, dt, q, sid, &o, Some(&src)).await?;
             }
         }
         if std::env::var("APITAP_DEBUG").is_ok() {
@@ -1668,6 +1671,30 @@ async fn apply_windows(
         let _ = applied_tx.send(o.id.end());
     }
     Ok(rows_per)
+}
+
+/// One member's window in a unit of its own: open, apply, close — and then
+/// tell the destination whether that unit committed (`Dest::settle`), on
+/// every path, so a changelog's replay memo never holds a marker whose unit
+/// failed.
+async fn apply_member(
+    t: &Tenure<Dest>,
+    dest_table: &str,
+    qualified: &str,
+    source_id: &str,
+    o: &DrainOutcome,
+    src: Option<&PgPool>,
+) -> Result<u64> {
+    let dest = t.dest();
+    let r = async {
+        let mut h = t.open(&[dest_table]).await?;
+        let (n, m) = dest.apply(&mut h.unit, dest_table, qualified, source_id, o, src).await?;
+        t.close(h, vec![m]).await?;
+        Ok(n)
+    }
+    .await;
+    dest.settle(dest_table, source_id, r.is_ok());
+    r
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
