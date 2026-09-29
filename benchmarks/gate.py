@@ -201,7 +201,8 @@ LEGS = [
         proves={"compat.old-bulk-refused-by-new-drain": ("ch@0560",)}),
     leg("e2e_rolling_upgrade.py",  "0.56.0 beside this release, BigQuery", {"wheel-0560", "bq"}, ["0560", "bq"],
         proves={"compat.old-bulk-refused-by-new-drain": ("bq@0560",)}),
-    leg("e2e_changelog_bq.py",     "changelog=True on BigQuery", {"bq"}),
+    leg("e2e_changelog_bq.py",     "changelog=True on BigQuery", {"bq"},
+        proves={"bq.job-identity": ("bq",), "leg.e2e_changelog_bq": (_claims.LEG_ENGINE,)}),
     leg("e2e_changelog_group.py",  "changelog partition/order overrides", {"bq"}),
     leg("e2e_changelog_percolumn.py", "per-column changelog config", {"bq"}),
 ]

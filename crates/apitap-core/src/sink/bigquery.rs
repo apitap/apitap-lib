@@ -93,6 +93,9 @@ pub(crate) struct BqConn {
     pub project: String,
     pub dataset: String,
     location: Option<String>,
+    /// Where this connection's jobs run: `location` when the URL names one,
+    /// else the dataset's own, asked once (see `job_location`).
+    job_loc: Arc<tokio::sync::OnceCell<String>>,
 }
 
 /// Vet one BigQuery identifier before it is pasted between backticks.
@@ -207,6 +210,7 @@ impl BqConn {
             project,
             dataset,
             location,
+            job_loc: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -487,15 +491,29 @@ impl BqConn {
     /// Poll a load/copy job to DONE; adaptive backoff (dense early — small jobs
     /// finish in seconds; cheap 2s cadence after).
     async fn poll_job(&self, job_id: &str, location: Option<&str>) -> Result<Value> {
+        self.poll(job_id, location).await.map_err(ScriptErr::into_error)
+    }
+
+    /// `poll_job`, saying WHERE it failed — which is what decides whether the
+    /// job may be asked about again under its id (see `next_try`):
+    ///   * the GET itself failed (`Transport`): the job's fate is unknown, and
+    ///     it may well have committed;
+    ///   * the job is DONE with an error (`Failed`): it committed nothing;
+    ///   * 30 minutes and not DONE (`Failed`): not retried under any id — the
+    ///     job may still commit, and a second one would run beside it.
+    async fn poll(&self, job_id: &str, location: Option<&str>) -> std::result::Result<Value, ScriptErr> {
         let loc = location
             .map(|l| format!("?location={l}"))
             .unwrap_or_default();
         let url = format!("{BQ_BASE}/projects/{}/jobs/{job_id}{loc}", self.project);
         for i in 0..900u32 {
-            let v = self.api(reqwest::Method::GET, url.clone(), None).await?;
+            let v = self
+                .api(reqwest::Method::GET, url.clone(), None)
+                .await
+                .map_err(ScriptErr::transport)?;
             if v["status"]["state"].as_str() == Some("DONE") {
                 if let Some(err) = v["status"]["errorResult"].as_object() {
-                    return Err(Error::Transfer(format!(
+                    return Err(ScriptErr::Failed(format!(
                         "bigquery job {job_id} failed: {}",
                         serde_json::to_string(err).unwrap_or_default()
                     )));
@@ -505,9 +523,73 @@ impl BqConn {
             let ms = if i < 24 { 500 } else { 2_000 };
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
-        Err(Error::Transfer(format!(
+        Err(ScriptErr::Failed(format!(
             "bigquery job {job_id} still running after 30 minutes"
         )))
+    }
+
+    /// The location every job of this connection is submitted under. A job
+    /// submitted under a client id must name it: `jobs.get` finds a job only in
+    /// its own location, and the 409 path below has to find the job its id
+    /// already names. The URL's `location` when given, else the dataset's —
+    /// one GET per connection (its clones share the answer).
+    async fn job_location(&self) -> Result<String> {
+        if let Some(l) = &self.location {
+            return Ok(l.clone());
+        }
+        self.job_loc
+            .get_or_try_init(|| async {
+                let url = format!(
+                    "{BQ_BASE}/projects/{}/datasets/{}",
+                    self.project, self.dataset
+                );
+                let v = self.api(reqwest::Method::GET, url, None).await?;
+                v["location"].as_str().map(str::to_string).ok_or_else(|| {
+                    Error::Transfer(format!(
+                        "bigquery dataset {}.{} reports no location",
+                        self.project, self.dataset
+                    ))
+                })
+            })
+            .await
+            .cloned()
+    }
+
+    /// Submit `sql` as one query job under `job_id` and poll it to DONE.
+    ///
+    /// The id is the client's, so asking again is safe: a POST whose answer
+    /// was lost, or whose poll failed, is re-POSTed under the SAME id, and
+    /// BigQuery answers 409 when the first one landed. That job is then
+    /// adopted — polled, never run again — but only if it is this query: an
+    /// id is 128 random bits, and a job under it with other text is not ours
+    /// to report on (`adopt_existing`).
+    async fn run_job(&self, sql: &str, job_id: &str) -> std::result::Result<Value, ScriptErr> {
+        let loc = self.job_location().await.map_err(ScriptErr::transport)?;
+        let body = script_body(sql, &self.project, job_id, &loc);
+        let url = format!("{BQ_BASE}/projects/{}/jobs", self.project);
+        match self.api(reqwest::Method::POST, url, Some(&body)).await {
+            Ok(_) => {}
+            Err(Error::Transfer(m)) if m.contains("bigquery 409 ") => {
+                let job = self
+                    .api(reqwest::Method::GET, self.job_url(job_id, &loc), None)
+                    .await
+                    .map_err(ScriptErr::transport)?;
+                if !adopt_existing(&job, sql) {
+                    return Err(ScriptErr::Failed(format!(
+                        "bigquery job id {job_id} belongs to another query"
+                    )));
+                }
+            }
+            Err(e) => return Err(ScriptErr::transport(e)),
+        }
+        self.poll(job_id, Some(&loc)).await
+    }
+
+    fn job_url(&self, job_id: &str, location: &str) -> String {
+        format!(
+            "{BQ_BASE}/projects/{}/jobs/{job_id}?location={location}",
+            self.project
+        )
     }
 
     // ── log_based (CDC) helpers ─────────────────────────────────────────────
@@ -633,56 +715,55 @@ impl BqConn {
     /// Retries transient failures: BigQuery serializes DML per table, so a
     /// group's concurrent transactions racing on the shared `_apitap_state`
     /// table can abort with "concurrent update"; rate/backend errors are
-    /// retryable too. A crashed retry is safe — the window replays idempotently.
+    /// retryable too.
+    ///
+    /// A script runs AT MOST ONCE per attempt that could have committed. It
+    /// is submitted under a client job id (`fresh_job_id`), and `next_try`
+    /// decides, from where an attempt failed, whether the next one keeps it:
+    /// a lost POST or a failed poll says nothing about the job, which may
+    /// have committed its window, so the same id is asked again and the job
+    /// is adopted (`run_job`). 0.56.0 let the server mint the id and re-POSTed
+    /// the script on a 503 from the poll: a committed changelog window was
+    /// appended a second time (audit §3.12). Only a job that finished with a
+    /// retryable error, which committed nothing, is run again under a new id.
     ///
     /// Never retries a script that raised `LOST_MARK`: its own fence found the
     /// lease collected, which no retry can change, and "aborted" in the same
     /// message must not make it look transient.
     pub(crate) async fn cdc_script(&self, sql: &str) -> Result<()> {
+        let mut id = fresh_job_id();
         let mut attempt = 0u32;
         loop {
-            match self.cdc_script_once(sql).await {
+            let e = match self.cdc_script_once(sql, &id).await {
                 Ok(()) => return Ok(()),
-                Err(Error::Transfer(m)) => match script_error_class(&m) {
-                    ScriptErr::Lost => return Err(crate::lease::no_longer_holds(&[])),
-                    ScriptErr::Retry if attempt < 5 => {
-                        attempt += 1;
-                        let ms = 200u64 << attempt; // 400, 800, 1600, 3200, 6400
-                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                Err(e) => e,
+            };
+            if script_error_class(e.message()) == ErrClass::Lost {
+                return Err(crate::lease::no_longer_holds(&[]));
+            }
+            match next_try(&e, attempt) {
+                Some(retry) => {
+                    attempt += 1;
+                    if retry == Retry::NewId {
+                        id = fresh_job_id();
                     }
-                    _ => return Err(Error::Transfer(m)),
-                },
-                Err(e) => return Err(e),
+                    let ms = 200u64 << attempt; // 400, 800, 1600, 3200, 6400
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+                None => return Err(e.into_error()),
             }
         }
     }
 
-    async fn cdc_script_once(&self, sql: &str) -> Result<()> {
-        self.query_job(sql).await.map(|_| ())
+    async fn cdc_script_once(&self, sql: &str, job_id: &str) -> std::result::Result<(), ScriptErr> {
+        self.run_job(sql, job_id).await.map(|_| ())
     }
 
     /// One query job (a statement or a script), polled to DONE; the finished
     /// job's resource, whose statistics say what a DML statement changed.
+    /// One attempt, under an id of its own.
     async fn query_job(&self, sql: &str) -> Result<Value> {
-        let mut body = json!({
-            "configuration": {"query": {"query": sql, "useLegacySql": false}}
-        });
-        if let Some(loc) = &self.location {
-            body["jobReference"] = json!({"projectId": self.project, "location": loc});
-        }
-        let v = self
-            .api(
-                reqwest::Method::POST,
-                format!("{BQ_BASE}/projects/{}/jobs", self.project),
-                Some(&body),
-            )
-            .await?;
-        let job_id = v["jobReference"]["jobId"]
-            .as_str()
-            .ok_or_else(|| Error::Transfer("bigquery query job missing jobId".into()))?
-            .to_string();
-        let loc = v["jobReference"]["location"].as_str().map(str::to_string);
-        self.poll_job(&job_id, loc.as_deref()).await
+        self.run_job(sql, &fresh_job_id()).await.map_err(ScriptErr::into_error)
     }
 
     /// Load one CDC window's NDJSON into its staging table with WRITE_TRUNCATE
@@ -696,16 +777,27 @@ impl BqConn {
     ) -> Result<()> {
         // As `load_rows`: the payload is here, a failed load job wrote
         // nothing, and WRITE_TRUNCATE makes a repeat identical to a first try.
+        // It is still submitted under a client id and asked again under it
+        // after a lost answer, like a script (`cdc_script`): not because a
+        // second load could do harm, but so that one rule covers every job
+        // this lane runs.
+        let mut id = fresh_job_id();
         let mut attempt = 0u32;
         loop {
-            match self.cdc_load_ndjson_once(table, fields, &ndjson).await {
+            let e = match self.cdc_load_ndjson_once(table, fields, &ndjson, &id).await {
                 Ok(()) => return Ok(()),
-                Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
+                Err(e) => e,
+            };
+            match next_try(&e, attempt) {
+                Some(retry) => {
                     attempt += 1;
+                    if retry == Retry::NewId {
+                        id = fresh_job_id();
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
                         .await;
                 }
-                Err(e) => return Err(e),
+                None => return Err(e.into_error()),
             }
         }
     }
@@ -715,8 +807,11 @@ impl BqConn {
         table: &str,
         fields: &Value,
         ndjson: &[u8],
-    ) -> Result<()> {
+        job_id: &str,
+    ) -> std::result::Result<(), ScriptErr> {
+        let loc = self.job_location().await.map_err(ScriptErr::transport)?;
         let config = json!({
+            "jobReference": {"projectId": self.project, "jobId": job_id, "location": loc},
             "configuration": { "load": {
                 "destinationTable": {
                     "projectId": self.project, "datasetId": self.dataset, "tableId": table,
@@ -744,7 +839,7 @@ impl BqConn {
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(self.bearer().await?)
+            .bearer_auth(self.bearer().await.map_err(ScriptErr::transport)?)
             .header(
                 "Content-Type",
                 format!("multipart/related; boundary={boundary}"),
@@ -752,23 +847,28 @@ impl BqConn {
             .body(body)
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("bigquery cdc staging load: {e}")))?;
+            .map_err(|e| ScriptErr::Transport(format!("bigquery cdc staging load: {e}")))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Error::Transfer(format!(
+        if status == reqwest::StatusCode::CONFLICT {
+            // The id already names a job: this load's earlier POST landed.
+            // Adopted only if it loads this very table.
+            let job = self
+                .api(reqwest::Method::GET, self.job_url(job_id, &loc), None)
+                .await
+                .map_err(ScriptErr::transport)?;
+            if !adopt_existing_load(&job, &self.project, &self.dataset, table) {
+                return Err(ScriptErr::Failed(format!(
+                    "bigquery job id {job_id} belongs to another job"
+                )));
+            }
+        } else if !status.is_success() {
+            return Err(ScriptErr::Transport(format!(
                 "bigquery cdc staging load {status}: {}",
                 text.trim()
             )));
         }
-        let v: Value = serde_json::from_str(&text)
-            .map_err(|e| Error::Transfer(format!("bigquery cdc staging load response: {e}")))?;
-        let job_id = v["jobReference"]["jobId"]
-            .as_str()
-            .ok_or_else(|| Error::Transfer("bigquery cdc staging load missing jobId".into()))?
-            .to_string();
-        let loc = v["jobReference"]["location"].as_str().map(str::to_string);
-        self.poll_job(&job_id, loc.as_deref()).await.map(|_| ())
+        self.poll(job_id, Some(&loc)).await.map(|_| ())
     }
 
     /// A credential-free connection for unit tests (SQL-shape assertions only —
@@ -782,6 +882,7 @@ impl BqConn {
             project: project.to_string(),
             dataset: dataset.to_string(),
             location: None,
+            job_loc: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 }
@@ -846,6 +947,105 @@ fn throttled_or_transient(r: &reqwest::Response) -> bool {
     r.status().is_server_error() || c == 429 || c == 403
 }
 
+/// A client job id: `apitap_cdc_` and 32 hex digits of a v4 UUID (43
+/// characters, all of BigQuery's `[a-zA-Z0-9_-]`). 128 random bits: two runs
+/// minting the same one is not a case to design for, and `adopt_existing`
+/// still refuses a job whose text is not this one's.
+fn fresh_job_id() -> String {
+    format!("apitap_cdc_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The `jobs.insert` body of one query job under a client id. It always
+/// names the location: a job under a client id is found again by
+/// `jobs.get`, which looks in one location only.
+fn script_body(sql: &str, project: &str, job_id: &str, location: &str) -> Value {
+    json!({
+        "jobReference": {"projectId": project, "jobId": job_id, "location": location},
+        "configuration": {"query": {"query": sql, "useLegacySql": false}},
+    })
+}
+
+/// Whether the job a 409 names is the one this attempt submitted: the same
+/// query text, to the byte. Anything else is refused, never polled as ours.
+fn adopt_existing(job: &Value, sql: &str) -> bool {
+    job["configuration"]["query"]["query"].as_str() == Some(sql)
+}
+
+/// `adopt_existing` for a staging load, which has no text: the same
+/// destination table.
+fn adopt_existing_load(job: &Value, project: &str, dataset: &str, table: &str) -> bool {
+    let d = &job["configuration"]["load"]["destinationTable"];
+    d["projectId"].as_str() == Some(project)
+        && d["datasetId"].as_str() == Some(dataset)
+        && d["tableId"].as_str() == Some(table)
+}
+
+/// Where one attempt at a job failed.
+#[derive(Debug)]
+enum ScriptErr {
+    /// No verdict on the job: the POST or a poll failed on the way (a lost
+    /// connection, a 5xx). The job may have run — and committed.
+    Transport(String),
+    /// The job finished with an error (which committed nothing), or cannot
+    /// be ours, or is still running after the poll's deadline.
+    Failed(String),
+}
+
+impl ScriptErr {
+    fn transport(e: Error) -> Self {
+        match e {
+            Error::Transfer(m) => ScriptErr::Transport(m),
+            other => ScriptErr::Transport(other.to_string()),
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            ScriptErr::Transport(m) | ScriptErr::Failed(m) => m,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            ScriptErr::Transport(m) | ScriptErr::Failed(m) => Error::Transfer(m),
+        }
+    }
+}
+
+/// What the next attempt at a job is submitted under.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    /// The same id: this asks about the job the failed attempt may have
+    /// started, and runs it only if it never started.
+    SameId,
+    /// A new id: the job is DONE and committed nothing, so it runs again.
+    NewId,
+}
+
+/// Whether, and how, a job is tried again after `attempt` retries.
+///
+/// A `Transport` failure keeps its id: re-POSTing it either starts the job
+/// (the first POST never landed) or answers 409, and the job is adopted.
+/// Besides `retryable`'s classes, a request that never got an answer at all
+/// ("error sending request": a connection lost mid-request, a timeout) is
+/// retried here, because under a client id it is safe to — it is exactly
+/// the lost POST or lost poll a job id exists for. A `Failed` job is run
+/// again only if its error is transient, under a new id. `LOST_MARK` is
+/// never retried under any id.
+fn next_try(e: &ScriptErr, attempt: u32) -> Option<Retry> {
+    if attempt >= 5 {
+        return None;
+    }
+    match e {
+        ScriptErr::Transport(m) => match script_error_class(m) {
+            ErrClass::Retry => Some(Retry::SameId),
+            ErrClass::Fail if m.contains("error sending request") => Some(Retry::SameId),
+            _ => None,
+        },
+        ScriptErr::Failed(m) => (script_error_class(m) == ErrClass::Retry).then_some(Retry::NewId),
+    }
+}
+
 /// A BigQuery error worth retrying with backoff: DML serialization conflicts
 /// (concurrent transactions on the shared state table), rate limits, and the
 /// transient backend classes Google's own error text tells you to retry —
@@ -855,7 +1055,7 @@ fn throttled_or_transient(r: &reqwest::Response) -> bool {
 /// Deliberately narrow — never retry a syntax/type/permission error, and never
 /// `resourcesExceeded` (the query itself is too big; retrying just burns time).
 #[derive(Debug, PartialEq, Eq)]
-enum ScriptErr {
+enum ErrClass {
     /// The script's lease fence fired: this run no longer holds the table.
     Lost,
     Retry,
@@ -865,13 +1065,13 @@ enum ScriptErr {
 /// `Lost` is decided FIRST: a fence failure raised inside a transaction comes
 /// back with BigQuery's "Transaction … aborted" around it, which `retryable`
 /// would take for a transient conflict.
-fn script_error_class(msg: &str) -> ScriptErr {
+fn script_error_class(msg: &str) -> ErrClass {
     if msg.contains(crate::lease::LOST_MARK) {
-        ScriptErr::Lost
+        ErrClass::Lost
     } else if retryable(msg) {
-        ScriptErr::Retry
+        ErrClass::Retry
     } else {
-        ScriptErr::Fail
+        ErrClass::Fail
     }
 }
 
@@ -959,15 +1159,73 @@ mod staging_name_tests {
 
 #[cfg(test)]
 mod retry_tests {
-    use super::{retryable, script_error_class, ScriptErr};
+    use super::{
+        adopt_existing, adopt_existing_load, fresh_job_id, next_try, retryable, script_body,
+        script_error_class, ErrClass, Retry, ScriptErr,
+    };
 
     #[test]
     fn lost_mark_is_never_retried() {
         let m = "Error in script: apitap-lease-lost: the lease was collected. \
                  Transaction was aborted due to an error";
-        assert_eq!(script_error_class(m), ScriptErr::Lost);
-        assert_eq!(script_error_class("Transaction is aborted due to concurrent update"), ScriptErr::Retry);
-        assert_eq!(script_error_class("Syntax error: Unexpected identifier"), ScriptErr::Fail);
+        assert_eq!(script_error_class(m), ErrClass::Lost);
+        assert_eq!(script_error_class("Transaction is aborted due to concurrent update"), ErrClass::Retry);
+        assert_eq!(script_error_class("Syntax error: Unexpected identifier"), ErrClass::Fail);
+        // Under neither id, wherever it surfaced.
+        assert_eq!(next_try(&ScriptErr::Failed(m.into()), 0), None);
+        assert_eq!(next_try(&ScriptErr::Transport(m.into()), 0), None);
+    }
+
+    /// D10 (audit §3.12): a script is submitted under a client job id, and a
+    /// retry keeps that id unless the job is known to have committed nothing.
+    /// 0.56.0 sent no id — the server minted one per POST — so a poll that
+    /// failed after the job committed re-POSTed the script as a NEW job and
+    /// appended a committed changelog window a second time.
+    #[test]
+    fn job_identity() {
+        let id = fresh_job_id();
+        let body = script_body("SELECT 1", "proj", &id, "EU");
+        let r = &body["jobReference"];
+        let got = r["jobId"].as_str().expect("the body names its job id");
+        assert_eq!(got, id);
+        assert!(
+            got.len() == 43
+                && got.starts_with("apitap_cdc_")
+                && got["apitap_cdc_".len()..].chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "{got}: not apitap_cdc_ + 32 hex digits"
+        );
+        assert_eq!(r["projectId"], "proj");
+        assert_eq!(r["location"], "EU", "a client id is found again only in its location");
+        assert_eq!(body["configuration"]["query"]["query"], "SELECT 1");
+        assert_eq!(body["configuration"]["query"]["useLegacySql"], false);
+        assert_ne!(fresh_job_id(), fresh_job_id(), "two scripts, two ids");
+
+        // Where an attempt failed decides the id of the next.
+        let t = |m: &str| next_try(&ScriptErr::Transport(m.into()), 0);
+        let f = |m: &str| next_try(&ScriptErr::Failed(m.into()), 0);
+        assert_eq!(t("bigquery 503 Service Unavailable on https://x/jobs/j: backendError"), Some(Retry::SameId));
+        assert_eq!(
+            t("bigquery GET https://x/jobs/j: error sending request for url (https://x/jobs/j)"),
+            Some(Retry::SameId),
+            "a poll that got no answer asks about the same job again"
+        );
+        assert_eq!(t("bigquery 400 Bad Request on https://x/jobs: Syntax error"), None);
+        assert_eq!(f("bigquery job j failed: Transaction is aborted due to concurrent update"), Some(Retry::NewId));
+        assert_eq!(f("bigquery job j failed: Syntax error: Unexpected identifier"), None);
+        assert_eq!(f("bigquery job j still running after 30 minutes"), None, "it may still commit");
+        assert_eq!(f("bigquery job id j belongs to another query"), None);
+        assert_eq!(next_try(&ScriptErr::Transport("503 ".into()), 5), None, "bounded");
+        assert_eq!(next_try(&ScriptErr::Transport("503 ".into()), 4), Some(Retry::SameId));
+
+        // A 409 is adopted only for this very job.
+        let job = serde_json::json!({"configuration": {"query": {"query": "SELECT 1"}}});
+        assert!(adopt_existing(&job, "SELECT 1"));
+        assert!(!adopt_existing(&job, "SELECT 2"), "another query's job is never ours");
+        assert!(!adopt_existing(&serde_json::json!({}), "SELECT 1"));
+        let load = serde_json::json!({"configuration": {"load": {"destinationTable":
+            {"projectId": "p", "datasetId": "d", "tableId": "t_stg"}}}});
+        assert!(adopt_existing_load(&load, "p", "d", "t_stg"));
+        assert!(!adopt_existing_load(&load, "p", "d", "other_stg"));
     }
 
     #[test]
