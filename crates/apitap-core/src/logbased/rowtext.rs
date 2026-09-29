@@ -104,18 +104,6 @@ pub(crate) fn render_copy_row(row: &Tuple, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Indices of the PK columns within the WAL column order.
-pub(crate) fn pk_indices(pk_cols: &[String], wal_cols: &[String]) -> Result<Vec<usize>> {
-    pk_cols
-        .iter()
-        .map(|k| {
-            wal_cols.iter().position(|c| c == k).ok_or_else(|| {
-                Error::Transfer(format!("log_based: PK column '{k}' not in WAL columns"))
-            })
-        })
-        .collect()
-}
-
 /// Borrow an upsert row's key cells (key cells are `Text` by construction).
 pub(crate) fn row_key_refs<'a>(row: &'a Tuple, pk_idx: &[usize]) -> Vec<&'a [u8]> {
     pk_idx

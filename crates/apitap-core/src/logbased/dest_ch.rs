@@ -19,12 +19,14 @@
 
 use crate::error::{Error, Result};
 use crate::lease::Watermark;
-use crate::logbased::collapse::ResidueOp;
-use crate::logbased::drain::DrainOutcome;
+use crate::logbased::changelog::Changes;
+use crate::logbased::collapse::{Collapsed, ResidueOp};
+use crate::logbased::replay::WindowId;
 use crate::logbased::rowtext::{
-    ch_key_literal, pk_indices, render_ch_key, render_ch_row, render_ch_row_cells,
+    ch_key_literal, render_ch_key, render_ch_row, render_ch_row_cells,
     render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
 };
+use crate::logbased::window::TableWindow;
 use crate::sink::clickhouse::{ch_ident, ch_str};
 use crate::wire::pgoutput::Cell;
 
@@ -204,12 +206,11 @@ impl ChDest {
         &self,
         u: &mut ChUnit<'_>,
         dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
+        w: Option<&TableWindow<Changes>>,
+        id: &WindowId,
         source_id: &str,
     ) -> Result<(u64, Watermark)> {
-        apply_changelog_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+        apply_changelog_unit(u, dest_table, w, id, source_id).await
     }
 
     /// Apply one collapsed window. The state is written LAST, by the unit's
@@ -218,12 +219,11 @@ impl ChDest {
         &self,
         u: &mut ChUnit<'_>,
         dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
+        w: Option<&TableWindow<Collapsed>>,
+        id: &WindowId,
         source_id: &str,
     ) -> Result<(u64, Watermark)> {
-        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+        apply_unit(u, dest_table, w, id, source_id).await
     }
 }
 
@@ -318,7 +318,7 @@ async fn read_current(
 /// the same group fails its apply and the next run restarts from the group
 /// minimum. Two things make that safe.
 ///
-/// 1. The stamp is `outcome.start_lsn` — the watermark the window was drained
+/// 1. The stamp is the window's START — the watermark it was drained
 ///    FROM, the one position that is identical on a replay, so `(lsn, seq)`
 ///    is a real event identity a consumer can de-duplicate on.
 /// 2. `_apitap_cdc_pending` records the window we are ABOUT to append. If the
@@ -328,31 +328,24 @@ async fn read_current(
 async fn apply_changelog_unit(
     u: &mut ChUnit<'_>,
     dest_table: &str,
-    qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
+    w: Option<&TableWindow<Changes>>,
+    id: &WindowId,
     source_id: &str,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
         source_id: source_id.to_string(),
-        lsn: outcome.end_lsn,
+        lsn: id.end(),
         rows,
     };
     // Memoized no-op in steady state; here so no window ever writes to a
     // table that turned Replicated under us mid-run.
     u.refuse_clustered(dest_table).await?;
-    let Some(c) = outcome.changes.get(qualified_src) else {
+    let Some(w) = w else {
         return Ok((0, set(0)));
     };
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
-    let oids = outcome
-        .wal_oids
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, oids) = (l.cols(), l.oids());
     for name in wal_cols {
         if matches!(name.as_str(), CL_OP | CL_LSN | CL_SEQ | CL_AT) {
             return Err(Error::InvalidInput(format!(
@@ -370,15 +363,13 @@ async fn apply_changelog_unit(
     // `__current`. Costs one extra query per window, and only when the window
     // actually carries a masked cell.
     let patched = if c.masked {
-        let pk_idx = pk_indices(pk_cols, wal_cols)?;
-        let (keys, cols) = c.mask_plan(&pk_idx);
+        let (keys, cols) = c.mask_plan();
         let base = if keys.is_empty() || cols.is_empty() {
             std::collections::HashMap::new()
         } else {
-            let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
-            read_current(u, dest_table, pk_cols, &pk_oids, &keys, &cols, wal_cols).await?
+            read_current(u, dest_table, l.key_cols(), &l.key_oids(), &keys, &cols, wal_cols).await?
         };
-        c.resolve_masked(&pk_idx, &cols, &base, wal_cols)?
+        c.resolve_masked(&cols, &base)?
     } else {
         std::collections::HashMap::new()
     };
@@ -389,7 +380,7 @@ async fn apply_changelog_unit(
         .chain([CL_OP, CL_LSN, CL_SEQ, CL_AT].map(String::from))
         .collect();
     // The window's START, not its end: see the replay note above.
-    let lsn = outcome.start_lsn;
+    let lsn = id.start();
     // Did a previous attempt at THIS window already append? Only asked when the
     // marker names the same start — on the ordinary path it names the previous
     // window's, and the count below (which scans `_apitap_lsn`, a sorting-key
@@ -456,38 +447,30 @@ async fn apply_changelog_unit(
 
 /// Apply one collapsed window through the unit, and name the watermark its
 /// close writes. A window with no traffic for this table writes nothing but
-/// that mark.
+/// that mark. Columns, types and keys are the window's own layout.
 async fn apply_unit(
     u: &mut ChUnit<'_>,
     dest_table: &str,
-    qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
+    w: Option<&TableWindow<Collapsed>>,
+    id: &WindowId,
     source_id: &str,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
         source_id: source_id.to_string(),
-        lsn: outcome.end_lsn,
+        lsn: id.end(),
         rows,
     };
     // Before the window's first DDL: a table that turned Replicated mid-run.
     u.refuse_clustered(dest_table).await?;
-    let Some(c) = outcome.tables.get(qualified_src) else {
+    let Some(w) = w else {
         // Foreign-table traffic only: nothing for our table, still advance.
         return Ok((0, set(0)));
     };
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
-    let oids = outcome
-        .wal_oids
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, oids, pk_cols, pk_idx) = (l.cols(), l.oids(), l.key_cols(), l.key_idx());
     let ft = ch_ident(dest_table);
-    let pk_idx = pk_indices(pk_cols, wal_cols)?;
-    let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
+    let pk_oids = l.key_oids();
     let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
 
     if c.truncate {
@@ -504,7 +487,7 @@ async fn apply_unit(
             render_ch_key(&refs, &pk_oids, &mut buf)?;
         }
         for row in &c.upserts {
-            render_ch_key(&row_key_refs(row, &pk_idx), &pk_oids, &mut buf)?;
+            render_ch_key(&row_key_refs(row, pk_idx), &pk_oids, &mut buf)?;
         }
         u.insert_owned(&kt, pk_cols, buf).await?;
         let kq = ch_ident(&kt);
@@ -567,7 +550,7 @@ async fn apply_unit(
                 u.insert_owned(dest_table, wal_cols, buf).await?;
             }
             ResidueOp::Upsert { row } => {
-                let key: Vec<Vec<u8>> = row_key_refs_cells(row, &pk_idx).into_iter().map(|k| k.to_vec()).collect();
+                let key: Vec<Vec<u8>> = row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect();
                 let pred = key_pred(pk_cols, &key, &pk_oids)?;
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
@@ -1630,7 +1613,7 @@ mod tests {
     use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, structure};
     use super::*;
     use crate::lease::{owned_margin_secs, ttl_secs, Fence, LeaseStore};
-    use crate::logbased::changelog::Changes;
+    use crate::logbased::window::Layout;
     use crate::wire::pgoutput::Tuple;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1753,24 +1736,16 @@ mod tests {
     fn unit_order_mark_insert_state() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let s = ChStore::connect(&mock_ch().await).unwrap();
-            let mut ch = Changes::default();
+            let mut ch = Changes::new(Layout::for_test(&["id", "v"], &[23, 25], &["id"]));
             ch.insert(Tuple::from_cells(&[
                 Cell::Text(bytes::Bytes::from_static(b"1")),
                 Cell::Text(bytes::Bytes::from_static(b"a")),
             ]));
-            let outcome = DrainOutcome {
-                tables: Default::default(),
-                changes: [("public.t".to_string(), ch)].into_iter().collect(),
-                end_lsn: 20,
-                start_lsn: 10,
-                wal_cols: [("public.t".to_string(), vec!["id".to_string(), "v".to_string()])].into_iter().collect(),
-                wal_oids: [("public.t".to_string(), vec![23, 25])].into_iter().collect(),
-                hit_budget: false,
-            };
+            let w = ch.seal("public.t").unwrap();
             let keys = vec![s.lease_key("t")];
             let mut u = s.open_unit(&keys, "_tok").await.unwrap();
             let (n, mark) =
-                apply_changelog_unit(&mut u, "t", "public.t", &["id".to_string()], &outcome, "sid").await.unwrap();
+                apply_changelog_unit(&mut u, "t", Some(&w), &WindowId::new(10, 20), "sid").await.unwrap();
             assert_eq!(n, 1);
             s.close_unit(u, "_tok", vec![mark]).await.unwrap();
             let _ = Arc::new(Mutex::new(()));

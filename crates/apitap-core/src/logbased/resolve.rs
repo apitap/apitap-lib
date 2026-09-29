@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::logbased::collapse::{Collapsed, Key, ResidueOp};
 use crate::logbased::dest_pg::{quote_ident, quote_table};
 use crate::logbased::rowtext::{row_key_refs, row_key_refs_cells, BYTEA_OID};
+use crate::logbased::window::TableWindow;
 use crate::wire::pgoutput::{Cell, Tuple};
 use sqlx::Row as _;
 use std::collections::HashMap;
@@ -97,8 +98,10 @@ impl<'a> Resolved<'a> {
     }
 }
 
-/// Fold a collapsed window into one entry per key (see `Resolved`).
-pub(crate) fn resolve_window<'a>(c: &'a Collapsed, pk_idx: &[usize]) -> Resolved<'a> {
+/// Fold a collapsed window into one entry per key (see `Resolved`), keyed as
+/// the window's layout says.
+pub(crate) fn resolve_window<'a>(w: &'a TableWindow<Collapsed>) -> Resolved<'a> {
+    let (c, pk_idx) = (w.body(), w.layout().key_idx());
     fn put<'a>(
         order: &mut Vec<(Key, Fin<'a>)>,
         index: &mut HashMap<Key, usize>,
@@ -288,6 +291,7 @@ fn db_err(e: sqlx::Error) -> Error {
 mod tests {
     use super::*;
     use crate::logbased::collapse::{gen, Collapser, DeleteSet};
+    use crate::logbased::window::Layout;
     use std::collections::HashSet;
 
     fn t(s: &str) -> Cell {
@@ -312,6 +316,12 @@ mod tests {
                 Image::Delete => format!("{}:delete", s(&k[0])),
             })
             .collect()
+    }
+
+    /// Seal `c` as a window of `(id, v)` keyed on id, the shape every
+    /// hand-built window here has.
+    fn sealed(c: Collapsed) -> TableWindow<Collapsed> {
+        TableWindow::seal("t", Layout::for_test(&["id", "v"], &[], &["id"]), c).expect("rows fit")
     }
 
     fn hole(k: &str) -> Vec<Cell> {
@@ -340,7 +350,7 @@ mod tests {
         };
         // Finals in first-touch order, the masked update patched from its
         // in-window base, then the key the window only deleted.
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["1:row=a", "2:delete", "3:row=c", "9:delete"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:row=a", "2:delete", "3:row=c", "9:delete"]);
     }
 
     #[test]
@@ -349,7 +359,7 @@ mod tests {
             residue: vec![ResidueOp::MaskedUpdate { key: key1("7"), row: hole("7") }],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["7:masked"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["7:masked"]);
 
         let c2 = Collapsed {
             residue: vec![
@@ -359,7 +369,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&c2, &[0])), ["7:delete"]);
+        assert_eq!(shape(&resolve_window(&sealed(c2))), ["7:delete"]);
 
         let c3 = Collapsed {
             residue: vec![
@@ -368,7 +378,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&c3, &[0])), ["7:row=z"]);
+        assert_eq!(shape(&resolve_window(&sealed(c3))), ["7:row=z"]);
     }
 
     #[test]
@@ -376,18 +386,18 @@ mod tests {
         // A move with a hole and nothing in the window for the old key: the
         // hole is still at key 1 on the destination.
         let c = Collapsed { residue: vec![rekey("1", "9")], ..Default::default() };
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["1:delete", "9:masked<-1"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:delete", "9:masked<-1"]);
 
         // A chain 1→9→5 still points at 1: 9 never held the row there.
         let c = Collapsed { residue: vec![rekey("1", "9"), rekey("9", "5")], ..Default::default() };
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["1:delete", "9:delete", "5:masked<-1"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:delete", "9:delete", "5:masked<-1"]);
 
         // A masked update at a key the row was moved to: still at 1.
         let c = Collapsed {
             residue: vec![rekey("1", "9"), ResidueOp::MaskedUpdate { key: key1("9"), row: hole("9") }],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["1:delete", "9:masked<-1"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:delete", "9:masked<-1"]);
 
         // A plain masked update never moved; a masked row moved later came
         // from the key it was masked at.
@@ -395,12 +405,12 @@ mod tests {
             residue: vec![ResidueOp::MaskedUpdate { key: key1("1"), row: hole("1") }],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["1:masked"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:masked"]);
         let c = Collapsed {
             residue: vec![ResidueOp::MaskedUpdate { key: key1("1"), row: hole("1") }, rekey("1", "9")],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["1:delete", "9:masked<-1"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:delete", "9:masked<-1"]);
 
         // A move whose old key the window already holds whole is no hole at all.
         let c = Collapsed {
@@ -408,7 +418,7 @@ mod tests {
             residue: vec![rekey("1", "9")],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&c, &[0])), ["1:delete", "9:row=full"]);
+        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:delete", "9:row=full"]);
     }
 
     #[test]
@@ -419,10 +429,10 @@ mod tests {
         for _ in 0..5000 {
             let len = 1 + rng.below(12) as usize;
             let evs = gen::events(&mut rng, 6, len);
-            let mut cl = Collapser::new(vec![0]);
+            let mut cl = Collapser::new(gen::layout());
             gen::feed(&mut cl, &evs);
-            let c = cl.finish();
-            let r = resolve_window(&c, &[0]);
+            let w = cl.seal("t").expect("rows fit");
+            let (c, r) = (w.body(), resolve_window(&w));
             let keys: Vec<&Key> = r.rows().map(|(k, _)| k).collect();
             let unique: HashSet<&Key> = keys.iter().copied().collect();
             assert_eq!(keys.len(), unique.len(), "a key twice: {keys:?} from {evs:?}");

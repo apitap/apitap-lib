@@ -21,7 +21,8 @@ use crate::logbased::dest_ch::{ChDest, ChUnit};
 use crate::logbased::dest_ice::{IceDest, IceUnit};
 use crate::logbased::dest_my::{MyDest, MyTx};
 use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest, PgUnit};
-use crate::logbased::drain::{drain, DrainOutcome, DrainSession};
+use crate::logbased::drain::{drain, DrainSession};
+use crate::logbased::window::{DrainOutcome, Slice};
 use crate::logbased::mysource;
 use crate::logbased::resolve::Source;
 use crate::naming::CdcWatermark;
@@ -361,46 +362,41 @@ impl Dest {
     }
 
     /// Apply one table's window inside `u`, and name the watermark the unit's
-    /// close writes. `src` is the Postgres source, for the one destination
-    /// that reads it back (Iceberg's TOAST refetch); the MySQL binlog path has
-    /// none, and Iceberg is refused before it.
-    #[allow(clippy::too_many_arguments)]
+    /// close writes. The window's lane decides the path: a changelog body goes
+    /// to a changelog apply, a replica body to a replica apply, and the table's
+    /// columns and keys are the ones its window carries. `src` is the Postgres
+    /// source, for the one destination that reads it back (Iceberg's TOAST
+    /// refetch); the MySQL binlog path has none, and Iceberg is refused before
+    /// it.
     async fn apply(
         &self,
         u: &mut Unit<'_>,
         dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
+        qualified: &str,
         source_id: &str,
+        o: &DrainOutcome,
         src: Option<&PgPool>,
-        changelog: bool,
     ) -> Result<(u64, Watermark)> {
-        match (self, u, changelog) {
-            (Dest::Ch(d), Unit::Ch(u), true) => {
-                d.apply_changelog(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+        match (self, u, o.slice(qualified)) {
+            (Dest::Ch(d), Unit::Ch(u), Slice::Changelog(w)) => {
+                d.apply_changelog(u, dest_table, w, &o.id, source_id).await
             }
-            // A group of one: the per-member path (the MySQL source's windows).
+            // A group of one, in either lane: the per-member path (the MySQL
+            // source's windows).
             (Dest::Bq(_), Unit::Bq(u), _) => {
-                let one = [(dest_table.to_string(), qualified_src.to_string(), pk_cols.to_vec(), source_id.to_string())];
-                let mut v = self.apply_group(u, &one, outcome, 1, changelog).await?;
+                let one = [(dest_table.to_string(), qualified.to_string(), source_id.to_string())];
+                let mut v = self.apply_group(u, &one, o, 1).await?;
                 v.pop().ok_or_else(mismatch)
             }
-            (_, _, true) => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
-            (Dest::Pg(d), Unit::Pg(u), false) => {
-                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
-            }
-            (Dest::Ch(d), Unit::Ch(u), false) => {
-                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
-            }
-            (Dest::My(d), Unit::My(u), false) => {
-                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
-            }
-            (Dest::Ice(d), Unit::Ice(u), false) => {
+            (_, _, Slice::Changelog(_)) => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
+            (Dest::Pg(d), Unit::Pg(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
+            (Dest::Ch(d), Unit::Ch(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
+            (Dest::My(d), Unit::My(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
+            (Dest::Ice(d), Unit::Ice(u), Slice::Replica(w)) => {
                 let src = src.ok_or_else(|| {
                     Error::InvalidInput("log_based: iceberg needs a Postgres source in this release".into())
                 })?;
-                d.apply(u, dest_table, qualified_src, pk_cols, outcome, source_id, &Source(src)).await
+                d.apply(u, dest_table, qualified, w, &o.id, source_id, &Source(src)).await
             }
             _ => Err(mismatch()),
         }
@@ -416,10 +412,9 @@ impl Dest {
         members: &[crate::logbased::dest_bq::Member],
         outcome: &DrainOutcome,
         lanes: usize,
-        changelog: bool,
     ) -> Result<Vec<(u64, Watermark)>> {
         match self {
-            Dest::Bq(d) => d.apply_group(u, members, outcome, lanes, changelog).await,
+            Dest::Bq(d) => d.apply_group(u, members, outcome, lanes).await,
             _ => Err(mismatch()),
         }
     }
@@ -1167,14 +1162,13 @@ async fn run_group_mysql(
             |outcome| {
                 let (dest, tenure, ctxs, rows_applied) = (&dest, &tenure, &ctxs, &rows_applied);
                 async move {
-                    let end = outcome.end_lsn;
+                    let end = outcome.id.end();
                     for (c, acc) in ctxs.iter().zip(rows_applied.iter()) {
                         // Every member applies — a table with no traffic in this
                         // window still advances its watermark. One unit each.
                         let mut h = tenure.open(&[c.dest_table.as_str()]).await?;
                         let (n, m) = dest
-                            .apply(&mut h.unit, &c.dest_table, &c.qualified, &c.pk_cols, &outcome, &c.source_id,
-                                None, opts.changelog)
+                            .apply(&mut h.unit, &c.dest_table, &c.qualified, &c.source_id, &outcome, None)
                             .await?;
                         tenure.close(h, vec![m]).await?;
                         acc.set(acc.get() + n);
@@ -1470,11 +1464,9 @@ async fn drain_group(
     let (applied_tx, applied_rx) = tokio::sync::watch::channel::<u64>(wm);
     let members: Vec<crate::logbased::dest_bq::Member> = ctxs
         .iter()
-        .map(|c| {
-            (c.dest_table.clone(), c.qualified.clone(), c.pk_cols.clone(), c.source_id.clone())
-        })
+        .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
         .collect();
-    let apply = AbortOnDrop::spawn(apply_windows(tenure, src.clone(), members, changelog, win_rx, applied_tx));
+    let apply = AbortOnDrop::spawn(apply_windows(tenure, src.clone(), members, win_rx, applied_tx));
     let drained = run_overlapped(
         drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog),
         apply,
@@ -1559,16 +1551,16 @@ async fn drain_loop(
             drain(ws, &mut sess, cur, stop_line, key_cols, 3600, budget, &applied_rx, changelog).await?;
         windows += 1;
         if dbg {
-            let events: u64 = outcome.tables.values().map(|c| c.events).sum();
             eprintln!(
-                "[log_based] window={windows} tables={} drain={:.1}s events={events} \
+                "[log_based] window={windows} tables={} drain={:.1}s events={} \
                  budget_hit={}",
-                outcome.tables.len(),
+                outcome.tables(),
                 t_drain.elapsed().as_secs_f64(),
+                outcome.events(),
                 outcome.hit_budget,
             );
         }
-        let end = outcome.end_lsn;
+        let end = outcome.id.end();
         let hit = outcome.hit_budget;
         if end > cur && win_tx.send(outcome).await.is_err() {
             // Apply task died — its JoinHandle carries the real error.
@@ -1610,7 +1602,6 @@ async fn apply_windows(
     tenure: Arc<Tenure<Dest>>,
     src: PgPool,
     members: Vec<crate::logbased::dest_bq::Member>,
-    changelog: bool,
     mut win_rx: tokio::sync::mpsc::Receiver<DrainOutcome>,
     applied_tx: tokio::sync::watch::Sender<u64>,
 ) -> Result<Vec<u64>> {
@@ -1627,7 +1618,7 @@ async fn apply_windows(
             let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
             let mut h = t.open(&tables).await?;
             let Unit::Bq(u) = &mut h.unit else { return Err(mismatch()) };
-            let applied = dest.apply_group(u, &members, &o, lanes, changelog).await?;
+            let applied = dest.apply_group(u, &members, &o, lanes).await?;
             let (rows, marks): (Vec<u64>, Vec<Watermark>) = applied.into_iter().unzip();
             t.close(h, marks).await?;
             for (i, n) in rows.into_iter().enumerate() {
@@ -1645,9 +1636,9 @@ async fn apply_windows(
             let (sref, oref, mref) = (&src, &o, &members);
             let applied: Vec<(usize, u64)> = futures::stream::iter(0..mref.len())
                 .map(|i| async move {
-                    let (dt, q, pk, sid) = &mref[i];
+                    let (dt, q, sid) = &mref[i];
                     let mut h = t.open(&[dt.as_str()]).await?;
-                    let (n, m) = dest.apply(&mut h.unit, dt, q, pk, oref, sid, Some(sref), changelog).await?;
+                    let (n, m) = dest.apply(&mut h.unit, dt, q, sid, oref, Some(sref)).await?;
                     t.close(h, vec![m]).await?;
                     Ok::<_, Error>((i, n))
                 })
@@ -1658,23 +1649,23 @@ async fn apply_windows(
                 rows_per[i] += n;
             }
         } else {
-            for (i, (dt, q, pk, sid)) in members.iter().enumerate() {
+            for (i, (dt, q, sid)) in members.iter().enumerate() {
                 let mut h = t.open(&[dt.as_str()]).await?;
-                let (n, m) = dest.apply(&mut h.unit, dt, q, pk, &o, sid, Some(&src), changelog).await?;
+                let (n, m) = dest.apply(&mut h.unit, dt, q, sid, &o, Some(&src)).await?;
                 t.close(h, vec![m]).await?;
                 rows_per[i] += n;
             }
         }
         if std::env::var("APITAP_DEBUG").is_ok() {
-            let events: u64 = o.tables.values().map(|c| c.events).sum();
             eprintln!(
-                "[log_based] applied lsn={} events={events} in {:.1}s",
-                o.end_lsn,
+                "[log_based] applied lsn={} events={} in {:.1}s",
+                o.id.end(),
+                o.events(),
                 t_apply.elapsed().as_secs_f64(),
             );
         }
         // Receiver may be gone on a drain-side abort — nothing to do.
-        let _ = applied_tx.send(o.end_lsn);
+        let _ = applied_tx.send(o.id.end());
     }
     Ok(rows_per)
 }

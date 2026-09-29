@@ -20,9 +20,11 @@
 
 use crate::error::{Error, Result};
 use crate::lease::Watermark;
-use crate::logbased::drain::DrainOutcome;
+use crate::logbased::collapse::Collapsed;
+use crate::logbased::replay::WindowId;
 use crate::logbased::resolve::{resolve_window, Image, Source};
-use crate::logbased::rowtext::{decode_bytea, pk_indices, strip_utc_offset};
+use crate::logbased::rowtext::{decode_bytea, strip_utc_offset};
+use crate::logbased::window::TableWindow;
 use crate::plan::Delivered;
 use crate::sink::iceberg::CdcWindow;
 use crate::wire::bqparquet::ParquetEncoder;
@@ -88,49 +90,43 @@ impl IceDest {
         u: &mut IceUnit<'_>,
         dest_table: &str,
         qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
+        w: Option<&TableWindow<Collapsed>>,
+        id: &WindowId,
         source_id: &str,
         src: &Source<'_>,
     ) -> Result<(u64, Watermark)> {
-        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id, src).await
+        apply_unit(u, dest_table, qualified_src, w, id, source_id, src).await
     }
 }
 
 /// Render one collapsed window for one table — final row images as a data
 /// file, every touched key as a delete — stage it in the unit, and name the
 /// watermark its close commits it with. A window with nothing to write stages
-/// nothing, and its close commits the watermark alone.
+/// nothing, and its close commits the watermark alone. `qualified_src` names
+/// the source table the TOAST refetch reads.
 async fn apply_unit(
     u: &mut IceUnit<'_>,
     dest_table: &str,
     qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
+    w: Option<&TableWindow<Collapsed>>,
+    id: &WindowId,
     source_id: &str,
     src: &Source<'_>,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
         source_id: source_id.to_string(),
-        lsn: outcome.end_lsn,
+        lsn: id.end(),
         rows,
     };
-    let Some(c) = outcome.tables.get(qualified_src) else {
+    let Some(w) = w else {
         // Foreign-table traffic only: nothing for our table, still advance.
         return Ok((0, set(0)));
     };
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
-    let oids = outcome
-        .wal_oids
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
-    let pk = single_pk(pk_cols)?;
-    let pk_idx = pk_indices(pk_cols, wal_cols)?;
-    let pk_i = pk_idx[0];
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, oids) = (l.cols(), l.oids());
+    let pk = single_pk(l.key_cols())?;
+    let pk_i = l.key_idx()[0];
     let key_int = match oids[pk_i] {
         20 | 21 | 23 => true,
         25 | 1043 | 2950 => false,
@@ -146,7 +142,7 @@ async fn apply_unit(
 
     // Replay the residue tail over the set-phase upserts into one entry per
     // key; unresolved TOAST holes go back to the source.
-    let mut r = resolve_window(c, &pk_idx);
+    let mut r = resolve_window(w);
     src.refetch_masked(&mut r, qualified_src, pk, wal_cols, oids).await?;
 
     // Delete-set: every touched key (deleted or re-landed), each once. A
@@ -170,7 +166,7 @@ async fn apply_unit(
     let n_rows = r.rows().filter(|(_, image)| !matches!(image, Image::Delete)).count() as u64;
     let data = if n_rows > 0 {
         let mut enc = ParquetEncoder::new_ext(
-            wal_cols.clone(),
+            wal_cols.to_vec(),
             bound.delivered().to_vec(),
             None,
             Some(bound.field_ids().to_vec()),
@@ -236,7 +232,7 @@ async fn apply_unit(
             delete_ints: del_ints,
             delete_texts: del_texts,
             truncate: c.truncate,
-            end_lsn: outcome.end_lsn,
+            end_lsn: id.end(),
         },
     )?;
     Ok((c.events, set(c.events)))

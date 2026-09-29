@@ -13,7 +13,7 @@
 //! pool the MySQL path does not carry and is refused loudly.
 
 use crate::error::{Error, Result};
-use crate::logbased::drain::DrainOutcome;
+use crate::logbased::window::DrainOutcome;
 use crate::logbased::mysource::{
     self, drain_binlog, fetch_schema, master_position, pack_pos, MySession,
 };
@@ -275,8 +275,8 @@ where
         )
         .await?;
         let hit_budget = o.hit_budget;
-        let end = o.end_lsn;
-        if end == watermark && o.tables.is_empty() && o.changes.is_empty() {
+        let end = o.id.end();
+        if end == watermark && o.is_empty() {
             break;
         }
         watermark = apply_window(o).await?;

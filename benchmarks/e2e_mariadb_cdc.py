@@ -11,10 +11,14 @@ Shape mirrors a real deployment (MariaDB 10.6 → ClickHouse): a money table
 with DECIMAL/TIMESTAMP/VARBINARY/unicode columns, seeded, bootstrapped, then
 every operation class replayed and digest-verified against the source.
 
+A TRUNCATE with no rows after it in its window (T1 a/b/c) is _trunc_only.py's,
+run here against MariaDB and from e2e_mysql84.py against MySQL 8.4.
+
 Rig: `apitap-bench-mariadb` on :3309 (root/bench), `apitap-bench-ch` on :8124.
 """
 import subprocess
 import apitap
+import _trunc_only
 
 MA = "mysql://root:bench@127.0.0.1:3309/bench"
 CH = "clickhouse://default:bench@127.0.0.1:8124/default"
@@ -245,6 +249,21 @@ else:
 ma(f"DROP TABLE IF EXISTS bench.{TT}")
 ch(f"DROP TABLE IF EXISTS {TT}")
 ch(f"DELETE FROM _apitap_state WHERE dest_table = '{TT}'")
+
+# ── a TRUNCATE with NOTHING after it in its window (T1, claim truncate.only-window) ──
+# The case above hides it: its window carries rows of the table after the wipe,
+# and those rows are what carried the table's column layout. See _trunc_only.py.
+ok &= _trunc_only.run(MA, CH, ma, ch, "ma")
+
+print("== cleanup ==")
+for t in (T, TC):
+    ma(f"DROP TABLE IF EXISTS bench.{t}")
+    ch(f"DROP VIEW IF EXISTS {t}__current")
+    ch(f"DROP TABLE IF EXISTS {t}")
+    for meta in ("_apitap_state", "_apitap_cdc_pending"):
+        if ch(f"SELECT count() FROM system.tables WHERE database = currentDatabase() "
+              f"AND name = '{meta}'") == "1":
+            ch(f"ALTER TABLE {meta} DELETE WHERE dest_table='{t}' SETTINGS mutations_sync=1")
 
 print("\n" + ("MARIADB CDC E2E: ALL GREEN" if ok else "MARIADB CDC E2E: FAILED"))
 raise SystemExit(0 if ok else 1)

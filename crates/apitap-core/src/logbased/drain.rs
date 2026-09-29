@@ -2,49 +2,25 @@
 //! the stop-line, collapsing per table — transactions land atomically (a
 //! tx's events buffer until its Commit; a drain can therefore stop ONLY at
 //! commit boundaries, and `end_lsn` is always a `Commit.end_lsn`).
+//!
+//! The window it returns is a [`DrainOutcome`]: one sealed body per table,
+//! each with the column layout its rows are in, and the window's identity —
+//! `start` (the watermark it was drained FROM, the one position a re-drain
+//! reproduces, and so the changelog's stamp) and `end` (the last complete
+//! commit, the only valid next watermark).
 
 use crate::error::{Error, Result};
 use crate::logbased::changelog::Changes;
-use crate::logbased::collapse::{Collapsed, Collapser};
-use crate::wire::pgoutput::{self, PgoMessage, Relation, Tuple};
+use crate::logbased::collapse::Collapser;
+use crate::logbased::replay::WindowId;
+use crate::logbased::window::{Bodies, DrainOutcome, Layout};
+use crate::wire::pgoutput::{self, PgoMessage, Tuple};
 use crate::wire::walsender::{WalEvent, Walsender};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) struct DrainOutcome {
-    /// Collapsed window per "schema.table". Empty in changelog mode.
-    pub tables: HashMap<String, Collapsed>,
-    /// RAW captured window per "schema.table" — every operation in WAL order,
-    /// populated instead of `tables` when the run is `changelog=true`. See
-    /// [`crate::logbased::changelog`].
-    pub changes: HashMap<String, Changes>,
-    /// The last collapsed transaction's `Commit.end_lsn` — the ONLY valid
-    /// new watermark. Equal to the start watermark when nothing arrived.
-    pub end_lsn: u64,
-    /// The watermark this window was drained FROM — the only position in the
-    /// window that is the same on a replay.
-    ///
-    /// `end_lsn` is not: a re-drain of the same window reads whatever has
-    /// arrived since and stops at a new boundary, so it is a different number
-    /// every time. The changelog destinations stamp `_apitap_lsn` with THIS
-    /// instead, which is what makes `(lsn, seq)` an event identity a consumer
-    /// can de-duplicate on. Until 0.56.0 they stamped `end_lsn` and the module
-    /// doc claimed the replay carried "the SAME (lsn, seq)" — it did not.
-    pub start_lsn: u64,
-    /// Column names per table in WAL order (from Relation messages) — the
-    /// apply layer aligns them to the destination plan by name.
-    pub wal_cols: HashMap<String, Vec<String>>,
-    /// Column type OIDs per table, parallel to `wal_cols` — non-Postgres
-    /// destinations translate type-specific text forms (bytea, bool).
-    pub wal_oids: HashMap<String, Vec<u32>>,
-    /// The drain stopped at the memory budget, not the stop-line: the caller
-    /// applies this window, confirms the LSN, and drains again.
-    pub hit_budget: bool,
-}
-
 struct RelState {
     table: Arc<str>,
-    key_idx: Vec<usize>,
     tracked: bool,
 }
 
@@ -59,11 +35,15 @@ pub(crate) struct DrainSession {
     /// the schema `pgoutput::decode` needs to render `binary 'true'` tuples
     /// back to text. Unused (empty lookups) on text-mode streams.
     rel_oids: pgoutput::RelOids,
-    /// Key-column indices by "schema.table" — later windows build their
-    /// collapsers from this (no Relation message re-arrives for them).
-    key_idx: HashMap<String, Vec<usize>>,
-    wal_cols: HashMap<String, Vec<String>>,
-    wal_oids: HashMap<String, Vec<u32>>,
+    /// Column layout by "schema.table", from the latest Relation — later
+    /// windows build their bodies from this (no Relation message re-arrives
+    /// for them), and every body carries the one it was built with.
+    layouts: HashMap<String, Arc<Layout>>,
+    /// A committed transaction the previous window did not take, and its
+    /// commit's end: a Relation inside it changed the layout of a table the
+    /// window already held a body for, and one window never spans a layout
+    /// change. It opens the next window, whose bodies start from the new one.
+    carry: Option<(TxOps, u64)>,
     /// proto v2 streamed transactions in flight, by xid: the server ships a
     /// big transaction WHILE decoding it; its ops buffer here until Stream
     /// Commit makes them real (Abort drops them). May span windows — a
@@ -101,6 +81,9 @@ fn op_bytes(op: &StreamOp) -> usize {
     }
 }
 
+/// One transaction's row ops, in WAL order, each with its table.
+type TxOps = Vec<(Arc<str>, StreamOp)>;
+
 /// Buffered op of a streamed (not-yet-committed) transaction.
 pub(crate) enum StreamOp {
     Insert(Tuple),
@@ -118,6 +101,12 @@ pub(crate) enum StreamOp {
 /// with `hit_budget` set (a single transaction larger than the budget still
 /// buffers whole — Postgres only ships a v1-protocol transaction after its
 /// commit, so sub-transaction spilling buys nothing upstream).
+///
+/// It also stops, `hit_budget` set, before a transaction whose Relation
+/// changed the layout of a table the window already holds: that transaction
+/// opens the next window, so no window spans a layout change. A transaction
+/// that changes a table's columns between two of its OWN row changes cannot be
+/// split that way, and its window fails `TableWindow::seal`, loudly.
 pub(crate) async fn drain(
     ws: &mut Walsender,
     sess: &mut DrainSession,
@@ -134,7 +123,7 @@ pub(crate) async fn drain(
     let mut changelogs: HashMap<String, Changes> = HashMap::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
     // if the drain aborts mid-transaction.
-    let mut tx_buf: Vec<(Arc<str>, StreamOp)> = Vec::new();
+    let mut tx_buf: TxOps = Vec::new();
     let mut end_lsn = start_lsn;
     // Approximate bytes buffered across tx_buf + collapsers. Collapse dedup
     // (last-write-wins) makes true memory smaller — the count is conservative.
@@ -143,8 +132,25 @@ pub(crate) async fn drain(
     let dbg_stream = std::env::var("APITAP_DEBUG").is_ok();
 
     let mut in_stream: Option<u32> = None;
+    // A Relation in the transaction being read changed the layout of a table
+    // this window already holds a body for: the transaction goes to the next
+    // window at its commit (see `DrainSession::carry`).
+    let mut relayout = false;
+
+    // The transaction the previous window stopped short of opens this one,
+    // under the layout its Relation announced.
+    let mut carried_to_stop = false;
+    if let Some((ops, e)) = sess.carry.take() {
+        buf_bytes += ops.iter().map(|(_, o)| op_bytes(o)).sum::<usize>();
+        flush_ops(ops, &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+        end_lsn = e;
+        carried_to_stop = e >= stop_line;
+    }
 
     loop {
+        if carried_to_stop {
+            break;
+        }
         if std::time::Instant::now() > deadline || crate::shutdown::requested() {
             // Wall-clock stop, or a SIGTERM. Both leave the drain at the same
             // place: whatever transaction is mid-flight is discarded, and
@@ -217,7 +223,14 @@ pub(crate) async fn drain(
                 match msg {
                 PgoMessage::Begin { .. } => tx_buf.clear(),
                 PgoMessage::Commit { end_lsn: e, .. } => {
-                    flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
+                    if relayout {
+                        // The window ends at the previous commit; this one
+                        // opens the next, whose bodies take the new layout.
+                        sess.carry = Some((std::mem::take(&mut tx_buf), e));
+                        hit_budget = true;
+                        break;
+                    }
+                    flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
                     end_lsn = e;
                     if e >= stop_line {
                         break;
@@ -238,9 +251,14 @@ pub(crate) async fn drain(
                     // window's collapsers, so the charge moves with them.
                     let n: usize = ops.iter().map(|(_, o, _)| op_bytes(o)).sum();
                     sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
-                    buf_bytes += n;
                     let ops = ops.into_iter().map(|(t, o, _)| (t, o));
-                    flush_ops(ops, &mut collapsers, &mut changelogs, &sess.key_idx, changelog)?;
+                    if relayout {
+                        sess.carry = Some((ops.collect(), e));
+                        hit_budget = true;
+                        break;
+                    }
+                    buf_bytes += n;
+                    flush_ops(ops, &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
                     end_lsn = e;
                     if e >= stop_line {
                         break;
@@ -295,19 +313,21 @@ pub(crate) async fn drain(
                         r.rel_id,
                         Arc::new(r.cols.iter().map(|c| c.type_oid).collect()),
                     );
-                    let st = rel_state(&r, key_cols)?;
-                    if st.tracked {
-                        sess.key_idx.insert(st.table.to_string(), st.key_idx.clone());
-                        sess.wal_cols.insert(
-                            st.table.to_string(),
-                            r.cols.iter().map(|c| c.name.clone()).collect(),
-                        );
-                        sess.wal_oids.insert(
-                            st.table.to_string(),
-                            r.cols.iter().map(|c| c.type_oid).collect(),
-                        );
+                    let table = format!("{}.{}", r.namespace, r.name);
+                    let layout = Layout::from_relation(&r, key_cols)?;
+                    let tracked = layout.is_some();
+                    if let Some(new) = layout {
+                        // pgoutput re-sends a Relation on every relcache
+                        // invalidation, and most change nothing (an ANALYZE,
+                        // a GRANT): only a different layout replaces the one
+                        // the window's bodies were built with, and only then
+                        // does a window holding a body of the table end.
+                        if sess.layouts.get(&table).map_or(true, |old| **old != new) {
+                            relayout |= collapsers.contains_key(&table) || changelogs.contains_key(&table);
+                            sess.layouts.insert(table.clone(), Arc::new(new));
+                        }
                     }
-                    sess.rels.insert(r.rel_id, st);
+                    sess.rels.insert(r.rel_id, RelState { table: table.as_str().into(), tracked });
                 }
                 PgoMessage::Insert { rel_id, new } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
@@ -389,27 +409,27 @@ pub(crate) async fn drain(
     }
 
     Ok(DrainOutcome {
-        tables: collapsers
-            .into_iter()
-            .map(|(t, c)| (t, c.finish()))
-            .collect(),
-        changes: changelogs,
-        end_lsn,
-        start_lsn,
-        wal_cols: sess.wal_cols.clone(),
-        wal_oids: sess.wal_oids.clone(),
+        bodies: Bodies::seal(changelog, collapsers, changelogs)?,
+        id: WindowId::new(start_lsn, end_lsn),
         hit_budget,
+    })
+}
+
+/// The layout a table's first op of the window builds its body with.
+fn layout_of(layouts: &HashMap<String, Arc<Layout>>, table: &str) -> Result<Arc<Layout>> {
+    layouts.get(table).cloned().ok_or_else(|| {
+        Error::Transfer(format!("log_based: no column layout for {table} — decoder invariant broken"))
     })
 }
 
 /// Land one committed transaction's buffered ops in the per-window
 /// collapsers (lazy: the Relation may have arrived in an earlier window —
-/// the session's key_idx remembers).
+/// the session's layouts remember).
 fn flush_ops(
     ops: impl IntoIterator<Item = (Arc<str>, StreamOp)>,
     collapsers: &mut HashMap<String, Collapser>,
     changelogs: &mut HashMap<String, Changes>,
-    key_idx: &HashMap<String, Vec<usize>>,
+    layouts: &HashMap<String, Arc<Layout>>,
     changelog: bool,
 ) -> Result<()> {
     for (table, op) in ops {
@@ -417,23 +437,20 @@ fn flush_ops(
         // bypassed entirely (it exists to reduce a window to one image per key,
         // which is the opposite of an audit trail).
         if changelog {
-            let ki = key_idx
-                .get(table.as_ref())
-                .expect("session key_idx exists for tracked table");
-            let c = changelogs.entry(table.to_string()).or_default();
+            if !changelogs.contains_key(table.as_ref()) {
+                changelogs.insert(table.to_string(), Changes::new(layout_of(layouts, &table)?));
+            }
+            let c = changelogs.get_mut(table.as_ref()).expect("changelog just ensured");
             match op {
                 StreamOp::Insert(row) => c.insert(row),
-                StreamOp::Update(old, row) => c.update(old.as_ref(), row, ki),
+                StreamOp::Update(old, row) => c.update(old.as_ref(), row),
                 StreamOp::Delete(old) => c.delete(old),
                 StreamOp::Truncate => c.truncate(),
             }
             continue;
         }
         if !collapsers.contains_key(table.as_ref()) {
-            let ki = key_idx
-                .get(table.as_ref())
-                .expect("session key_idx exists for tracked table");
-            collapsers.insert(table.to_string(), Collapser::new(ki.clone()));
+            collapsers.insert(table.to_string(), Collapser::new(layout_of(layouts, &table)?));
         }
         let c = collapsers.get_mut(table.as_ref()).expect("collapser just ensured");
         match op {
@@ -444,50 +461,6 @@ fn flush_ops(
         }
     }
     Ok(())
-}
-
-fn rel_state(r: &Relation, key_cols: &HashMap<String, Vec<String>>) -> Result<RelState> {
-    let table_s = format!("{}.{}", r.namespace, r.name);
-    let table: Arc<str> = table_s.as_str().into();
-    let Some(want) = key_cols.get(&table_s) else {
-        return Ok(RelState { table, key_idx: Vec::new(), tracked: false });
-    };
-    if r.replica_identity == b'n' {
-        return Err(Error::InvalidInput(format!(
-            "log_based: table {table_s} has REPLICA IDENTITY NOTHING — updates and \
-             deletes carry no key. Run: ALTER TABLE {table_s} REPLICA IDENTITY \
-             DEFAULT (with a primary key) or FULL"
-        )));
-    }
-    let key_idx = want
-        .iter()
-        .map(|k| {
-            r.cols
-                .iter()
-                .position(|c| &c.name == k)
-                .ok_or_else(|| {
-                    Error::Transfer(format!(
-                        "log_based: key column '{k}' not in WAL relation for {table_s}"
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // With REPLICA IDENTITY DEFAULT/USING INDEX, old images only carry the
-    // flagged key columns — our chosen key must be covered by them.
-    if r.replica_identity != b'f' {
-        for &i in &key_idx {
-            if !r.cols[i].key {
-                return Err(Error::InvalidInput(format!(
-                    "log_based: key column '{}' of {table_s} is not part of the \
-                     source's REPLICA IDENTITY — old images won't carry it. \
-                     Use the source PK as the key, or ALTER TABLE {table_s} \
-                     REPLICA IDENTITY FULL",
-                    r.cols[i].name
-                )));
-            }
-        }
-    }
-    Ok(RelState { table, key_idx, tracked: true })
 }
 
 fn tracked(rels: &HashMap<u32, RelState>, rel_id: u32) -> Result<Option<Arc<str>>> {

@@ -15,12 +15,13 @@
 use crate::dialect::mysql::my_ident;
 use crate::error::{Error, Result};
 use crate::lease::Watermark;
-use crate::logbased::collapse::ResidueOp;
-use crate::logbased::drain::DrainOutcome;
+use crate::logbased::collapse::{Collapsed, ResidueOp};
+use crate::logbased::replay::WindowId;
 use crate::logbased::rowtext::{
-    bytea_hex, pk_indices, render_my_key, render_my_row, row_key_refs, strip_utc_offset,
+    bytea_hex, render_my_key, render_my_row, row_key_refs, strip_utc_offset,
     BOOL_OID, BYTEA_OID, TIMESTAMPTZ_OID, TIMETZ_OID,
 };
+use crate::logbased::window::TableWindow;
 use crate::sink::mysql::sql_lit;
 use crate::wire::pgoutput::Cell;
 use std::collections::HashMap;
@@ -84,48 +85,39 @@ impl MyDest {
         &self,
         u: &mut MyTx,
         dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
+        w: Option<&TableWindow<Collapsed>>,
+        id: &WindowId,
         source_id: &str,
     ) -> Result<(u64, Watermark)> {
-        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+        apply_unit(u, dest_table, w, id, source_id).await
     }
 }
 
 /// Apply one collapsed window for one table through the unit, and name the
 /// watermark its close writes. A window with no traffic for this table writes
-/// nothing but that mark.
+/// nothing but that mark. Columns, types and keys are the window's own layout.
 async fn apply_unit(
     u: &mut MyTx,
     dest_table: &str,
-    qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
+    w: Option<&TableWindow<Collapsed>>,
+    id: &WindowId,
     source_id: &str,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
         source_id: source_id.to_string(),
-        lsn: outcome.end_lsn,
+        lsn: id.end(),
         rows,
     };
-    let Some(c) = outcome.tables.get(qualified_src) else {
+    let Some(w) = w else {
         // Foreign-table traffic only: nothing for our table, still advance.
         return Ok((0, set(0)));
     };
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
-    let oids = outcome
-        .wal_oids
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, oids, pk_cols, pk_idx) = (l.cols(), l.oids(), l.key_cols(), l.key_idx());
     let table = bare(dest_table);
     let ft = u.fq(table);
-    let pk_idx = pk_indices(pk_cols, wal_cols)?;
-    let pk_oids: Vec<u32> = pk_idx.iter().map(|&i| oids[i]).collect();
+    let pk_oids = l.key_oids();
 
     // O(1) under the fence — see the module doc and `MyTx::owned_ddl`.
     if c.truncate {
@@ -168,7 +160,7 @@ async fn apply_unit(
             render_my_key(&refs, &pk_oids, &mut body)?;
         }
         for row in &c.upserts {
-            render_my_key(&row_key_refs(row, &pk_idx), &pk_oids, &mut body)?;
+            render_my_key(&row_key_refs(row, pk_idx), &pk_oids, &mut body)?;
         }
         u.load(body, |id| load_sql(id, "_ap_del", pk_cols, &pk_oids), "load keys").await?;
         u.no_warnings("key load").await?;

@@ -545,6 +545,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_cdc_retention --> `e2e_cdc_retention.py` | a schedule paused past retention is refused |
 | <!-- claim: leg.e2e_toast_rekey --> `e2e_toast_rekey.py` | a key-changing UPDATE keeps its TOAST cols |
 | <!-- claim: leg.e2e_partitioned --> `e2e_partitioned.py` | a partitioned table replicates at all |
+| <!-- claim: leg.e2e_relayout --> `e2e_relayout.py` | one window never spans a source table's column change |
 | <!-- claim: leg.e2e_my_liveness --> `e2e_my_liveness.py` | a dead binlog peer is noticed |
 | <!-- claim: leg.e2e_ch_source --> `e2e_ch_source.py` | ClickHouse -> ClickHouse, RowBinary relayed |
 | <!-- claim: leg.e2e_ch_cluster --> `e2e_ch_cluster.py` | a replicated destination is refused, not scattered |

@@ -10,9 +10,10 @@
 
 use crate::error::{Error, Result};
 use crate::lease::Watermark;
-use crate::logbased::collapse::ResidueOp;
-use crate::logbased::drain::DrainOutcome;
-use crate::logbased::rowtext::{copy_escape, pk_indices, render_copy_row, row_key_refs};
+use crate::logbased::collapse::{Collapsed, ResidueOp};
+use crate::logbased::replay::WindowId;
+use crate::logbased::rowtext::{copy_escape, render_copy_row, row_key_refs};
+use crate::logbased::window::TableWindow;
 use crate::wire::pgoutput::Cell;
 use sqlx::Executor;
 
@@ -61,12 +62,11 @@ impl PgDest {
         &self,
         u: &mut PgUnit,
         dest_table: &str,
-        qualified_src: &str,
-        pk_cols: &[String],
-        outcome: &DrainOutcome,
+        w: Option<&TableWindow<Collapsed>>,
+        id: &WindowId,
         source_id: &str,
     ) -> Result<(u64, Watermark)> {
-        apply_unit(u, dest_table, qualified_src, pk_cols, outcome, source_id).await
+        apply_unit(u, dest_table, w, id, source_id).await
     }
 }
 
@@ -109,29 +109,28 @@ async fn add_primary_key(u: &mut PgUnit, dest_table: &str, pk_cols: &[String]) -
 
 /// Apply one collapsed window for one table (truncate → deletes → upserts →
 /// residue) inside the unit, and name the watermark its close writes. A window
-/// with no traffic for this table writes nothing but that mark.
+/// with no traffic for this table writes nothing but that mark. Columns and
+/// keys are the window's own layout: the key names are the ones the collapser
+/// keyed its rows by.
 async fn apply_unit(
     u: &mut PgUnit,
     dest_table: &str,
-    qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
+    w: Option<&TableWindow<Collapsed>>,
+    id: &WindowId,
     source_id: &str,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
         source_id: source_id.to_string(),
-        lsn: outcome.end_lsn,
+        lsn: id.end(),
         rows,
     };
-    let Some(c) = outcome.tables.get(qualified_src) else {
+    let Some(w) = w else {
         // Foreign-table traffic only: nothing for our table, still advance.
         return Ok((0, set(0)));
     };
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, pk_cols, pk_idx) = (l.cols(), l.key_cols(), l.key_idx());
 
     let ft = u.table(0).qualified();
     let collist = wal_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
@@ -145,7 +144,6 @@ async fn apply_unit(
     // Delete phase covers the delete-set UNION every upsert's key: clearing
     // the way first turns 450K index-probing ON CONFLICT upserts into 450K
     // plain inserts (ape-dts's rdb_merge trick — measured 5x here).
-    let pk_idx = pk_indices(pk_cols, wal_cols)?;
     let clear_keys = !c.deletes.is_empty() || !c.upserts.is_empty();
     if clear_keys {
         tx.execute(
@@ -173,7 +171,7 @@ async fn apply_unit(
             }
         }
         for row in &c.upserts {
-            render_key_row(&row_key_refs(row, &pk_idx), &mut buf);
+            render_key_row(&row_key_refs(row, pk_idx), &mut buf);
             if buf.len() > 4 << 20 {
                 copy.send(&buf[..]).await.map_err(db_err)?;
                 buf.clear();

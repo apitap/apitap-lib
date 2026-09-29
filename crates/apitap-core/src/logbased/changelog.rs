@@ -12,8 +12,10 @@
 //! BELOW that budget, it never raised the ceiling.
 
 use crate::error::{Error, Result};
+use crate::logbased::window::{Layout, TableWindow};
 use crate::wire::pgoutput::{Cell, Cellv, Tuple};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A row's replica-identity key, owned — only used to line an event up with the
 /// value a masked column still holds.
@@ -59,7 +61,7 @@ pub(crate) struct Change {
 }
 
 /// One table's captured window, in WAL order.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Changes {
     pub events: Vec<Change>,
     /// Row events consumed (for reporting) — matches `Collapsed::events`.
@@ -68,9 +70,23 @@ pub(crate) struct Changes {
     /// them before writing. Tracked here so the overwhelmingly common window —
     /// no TOAST at all — pays nothing for the machinery below.
     pub masked: bool,
+    /// The table's columns: its keys decide where a re-key moved a row from
+    /// and which row a masked cell belongs to, and the sealed window carries
+    /// it to the applies.
+    layout: Arc<Layout>,
 }
 
 impl Changes {
+    pub(crate) fn new(layout: Arc<Layout>) -> Self {
+        Self { events: Vec::new(), count: 0, masked: false, layout }
+    }
+
+    /// The window this accumulated, with its layout.
+    pub(crate) fn seal(self, table: &str) -> Result<TableWindow<Changes>> {
+        let layout = self.layout.clone();
+        TableWindow::seal(table, layout, self)
+    }
+
     /// O(cols) once, and only until the first masked row is seen.
     fn note_mask(&mut self, row: &Tuple) {
         if !self.masked {
@@ -89,10 +105,11 @@ impl Changes {
     /// replaying the log sees the old key die before the new one appears —
     /// the same ordering the collapsed path encodes as delete-then-upsert —
     /// and its `U` names the old key in `moved_from`.
-    pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple, pk_idx: &[usize]) {
+    pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple) {
         self.count += 1;
         self.note_mask(&row);
         let mut moved_from = None;
+        let pk_idx = self.layout.key_idx();
         if let Some(old) = old {
             let from = key_of(old, pk_idx);
             if from != key_of(&row, pk_idx) {
@@ -112,7 +129,8 @@ impl Changes {
     /// missing — the shopping list for ONE readback per window. A moved row's
     /// cells are read at the key it came from (`moved_from`), and a `D` image
     /// is never rebuilt (see `resolve_masked`), so it asks for nothing.
-    pub(crate) fn mask_plan(&self, pk_idx: &[usize]) -> (Vec<CKey>, Vec<usize>) {
+    pub(crate) fn mask_plan(&self) -> (Vec<CKey>, Vec<usize>) {
+        let pk_idx = self.layout.key_idx();
         let mut keys: Vec<CKey> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut cols = std::collections::BTreeSet::new();
@@ -170,11 +188,10 @@ impl Changes {
     /// a torn window, not a NULL. It is refused loudly.
     pub(crate) fn resolve_masked(
         &self,
-        pk_idx: &[usize],
         cols: &[usize],
         base: &HashMap<CKey, Vec<Option<bytes::Bytes>>>,
-        names: &[String],
     ) -> Result<HashMap<usize, Tuple>> {
+        let (pk_idx, names) = (self.layout.key_idx(), self.layout.cols());
         let mut carry: HashMap<CKey, HashMap<usize, Option<bytes::Bytes>>> = HashMap::new();
         let mut truncated = false;
         let mut out = HashMap::new();
@@ -287,13 +304,21 @@ mod tests {
     fn row(cells: &[Cell]) -> Tuple {
         Tuple::from_cells(cells)
     }
+    /// `(id, v)`, keyed on id.
+    fn two() -> Changes {
+        Changes::new(Layout::for_test(&["id", "v"], &[], &["id"]))
+    }
+    /// `(id, title, body)`, keyed on id; `body` is the TOASTed column.
+    fn three() -> Changes {
+        Changes::new(Layout::for_test(&["id", "title", "body"], &[], &["id"]))
+    }
 
     #[test]
     fn every_operation_is_kept_in_order() {
-        let mut c = Changes::default();
+        let mut c = two();
         c.insert(row(&[t("1"), t("a")]));
-        c.update(None, row(&[t("1"), t("a2")]), &[0]);
-        c.update(None, row(&[t("1"), t("a3")]), &[0]);
+        c.update(None, row(&[t("1"), t("a2")]));
+        c.update(None, row(&[t("1"), t("a3")]));
         c.delete(row(&[t("1"), Cell::Null]));
         // Collapse would leave ONE delete. The changelog keeps all four.
         assert_eq!(c.count, 4);
@@ -306,8 +331,8 @@ mod tests {
 
     #[test]
     fn pk_change_emits_delete_of_the_old_identity_first() {
-        let mut c = Changes::default();
-        c.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("9"), t("a")]), &[0]);
+        let mut c = two();
+        c.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("9"), t("a")]));
         let ops: Vec<ChangeOp> = c.events.iter().map(|e| e.op).collect();
         assert_eq!(ops, vec![ChangeOp::Delete, ChangeOp::Update]);
         // …but it is ONE source event.
@@ -319,8 +344,8 @@ mod tests {
 
     #[test]
     fn same_key_update_does_not_emit_a_delete() {
-        let mut c = Changes::default();
-        c.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("1"), t("z")]), &[0]);
+        let mut c = two();
+        c.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("1"), t("z")]));
         assert_eq!(c.events.len(), 1);
         assert_eq!(c.events[0].op, ChangeOp::Update);
         assert_eq!(c.events[0].moved_from, None);
@@ -331,13 +356,12 @@ mod tests {
     /// rebuilt rows' `body` by event index, or the error's text; `base` is the
     /// destination's `body` per key.
     fn bodies(c: &Changes, base: &[(&str, &str)]) -> std::result::Result<Vec<(usize, String)>, String> {
-        let names = vec!["id".to_string(), "title".to_string(), "body".to_string()];
-        let (_, cols) = c.mask_plan(&[0]);
+        let (_, cols) = c.mask_plan();
         let base: HashMap<CKey, Vec<Option<bytes::Bytes>>> = base
             .iter()
             .map(|(k, v)| (vec![k.as_bytes().to_vec()], vec![Some(bytes::Bytes::copy_from_slice(v.as_bytes()))]))
             .collect();
-        let fixed = c.resolve_masked(&[0], &cols, &base, &names).map_err(|e| e.to_string())?;
+        let fixed = c.resolve_masked(&cols, &base).map_err(|e| e.to_string())?;
         let mut out: Vec<(usize, String)> = fixed
             .iter()
             .map(|(i, r)| {
@@ -366,17 +390,17 @@ mod tests {
 
         // (a) the window carried key 1's body (a full old image, as under
         // REPLICA IDENTITY FULL); (b) only the destination holds it, at key 1.
-        let mut a = Changes::default();
+        let mut a = three();
         a.insert(big());
-        a.update(Some(&big()), masked("9", "b"), &[0]);
-        let mut b = Changes::default();
-        b.update(Some(&key_only("1")), masked("9", "b"), &[0]);
+        a.update(Some(&big()), masked("9", "b"));
+        let mut b = three();
+        b.update(Some(&key_only("1")), masked("9", "b"));
         assert_eq!(
             [bodies(&a, &[]), bodies(&b, &[("1", "OLD")])],
             [Ok(vec![(2, "BIG".to_string())]), Ok(vec![(1, "OLD".to_string())])]
         );
         // …so the window's one readback asks for key 1, not 9.
-        assert_eq!(b.mask_plan(&[0]), (vec![vec![b"1".to_vec()]], vec![2]));
+        assert_eq!(b.mask_plan(), (vec![vec![b"1".to_vec()]], vec![2]));
 
         // (c) a value at the NEW key is not this row's past: nothing holds the
         // body where the row was, so the window is torn.
@@ -384,29 +408,29 @@ mod tests {
 
         // (d) the D half's key-only image does not blank the carry its U half
         // reads next.
-        let mut d = Changes::default();
+        let mut d = three();
         d.insert(big());
-        d.update(Some(&key_only("1")), masked("9", "b"), &[0]);
+        d.update(Some(&key_only("1")), masked("9", "b"));
         assert_eq!(bodies(&d, &[]), Ok(vec![(2, "BIG".to_string())]));
 
         // (e) after an in-window TRUNCATE, neither the destination's row nor
         // what the window carried before it is this row's.
-        let mut e = Changes::default();
+        let mut e = three();
         e.truncate();
-        e.update(None, masked("1", "c"), &[0]);
+        e.update(None, masked("1", "c"));
         torn(bodies(&e, &[("1", "OLD")]));
-        let mut e = Changes::default();
+        let mut e = three();
         e.insert(big());
         e.truncate();
-        e.update(None, masked("1", "c"), &[0]);
+        e.update(None, masked("1", "c"));
         torn(bodies(&e, &[]));
 
         // (f) a chain 1→9→5, then a masked update at 5: each event finds the
         // body resolved where the row now is, the destination read at 1 only.
-        let mut f = Changes::default();
-        f.update(Some(&key_only("1")), masked("9", "b"), &[0]); // D 0, U 1
-        f.update(Some(&key_only("9")), masked("5", "c"), &[0]); // D 2, U 3
-        f.update(None, masked("5", "d"), &[0]); // U 4
+        let mut f = three();
+        f.update(Some(&key_only("1")), masked("9", "b")); // D 0, U 1
+        f.update(Some(&key_only("9")), masked("5", "c")); // D 2, U 3
+        f.update(None, masked("5", "d")); // U 4
         assert_eq!(
             bodies(&f, &[("1", "OLD")]),
             Ok(vec![(1, "OLD".to_string()), (3, "OLD".to_string()), (4, "OLD".to_string())])
@@ -416,20 +440,19 @@ mod tests {
     #[test]
     fn masked_cells_are_rebuilt_from_the_window_then_the_destination() {
         // id, title, body — body is the TOASTed column.
-        let names = vec!["id".to_string(), "title".to_string(), "body".to_string()];
-        let mut c = Changes::default();
+        let mut c = three();
         c.insert(row(&[t("1"), t("a"), t("BIG")]));               // full image
-        c.update(None, row(&[t("1"), t("a2"), Cell::UnchangedToast]), &[0]);
-        c.update(None, row(&[t("2"), t("b"), Cell::UnchangedToast]), &[0]);
+        c.update(None, row(&[t("1"), t("a2"), Cell::UnchangedToast]));
+        c.update(None, row(&[t("2"), t("b"), Cell::UnchangedToast]));
         assert!(c.masked);
-        let (keys, cols) = c.mask_plan(&[0]);
+        let (keys, cols) = c.mask_plan();
         assert_eq!(cols, vec![2]);
         assert_eq!(keys, vec![vec![b"1".to_vec()], vec![b"2".to_vec()]]);
 
         // key 2 was never seen in this window, so it comes from the readback.
         let mut base = HashMap::new();
         base.insert(vec![b"2".to_vec()], vec![Some(bytes::Bytes::from_static(b"OLD"))]);
-        let fixed = c.resolve_masked(&[0], &cols, &base, &names).unwrap();
+        let fixed = c.resolve_masked(&cols, &base).unwrap();
 
         // Event 0 carried everything; only the two masked updates are rebuilt.
         assert_eq!(fixed.len(), 2);
@@ -443,19 +466,18 @@ mod tests {
 
     #[test]
     fn a_masked_cell_no_source_can_fill_is_refused_not_nulled() {
-        let names = vec!["id".to_string(), "body".to_string()];
-        let mut c = Changes::default();
-        c.update(None, row(&[t("7"), Cell::UnchangedToast]), &[0]);
-        let (_, cols) = c.mask_plan(&[0]);
-        let err = c.resolve_masked(&[0], &cols, &HashMap::new(), &names).unwrap_err();
+        let mut c = Changes::new(Layout::for_test(&["id", "body"], &[], &["id"]));
+        c.update(None, row(&[t("7"), Cell::UnchangedToast]));
+        let (_, cols) = c.mask_plan();
+        let err = c.resolve_masked(&cols, &HashMap::new()).unwrap_err();
         assert!(format!("{err}").contains("torn"), "{err}");
     }
 
     #[test]
     fn a_window_with_no_toast_never_sets_the_mask_flag() {
-        let mut c = Changes::default();
+        let mut c = two();
         c.insert(row(&[t("1"), t("a")]));
-        c.update(None, row(&[t("1"), Cell::Null]), &[0]);
+        c.update(None, row(&[t("1"), Cell::Null]));
         c.delete(row(&[t("1"), Cell::Null]));
         assert!(!c.masked);
     }
@@ -470,7 +492,7 @@ mod tests {
 
     #[test]
     fn truncate_is_a_record_not_a_wipe() {
-        let mut c = Changes::default();
+        let mut c = two();
         c.insert(row(&[t("1"), t("a")]));
         c.truncate();
         c.insert(row(&[t("2"), t("b")]));

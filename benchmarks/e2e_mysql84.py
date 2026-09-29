@@ -16,6 +16,7 @@ rather than the bug.
   leg 1  8.4 as DESTINATION, bulk  — this is where the hang was: the sink connect
   leg 2  8.4 as DESTINATION, CDC   — the log_based apply path into 8.4
   leg 3  8.4 as SOURCE, binlog CDC — bootstrap, change, drain, exact compare
+  leg 4  8.4 as SOURCE, a TRUNCATE with no rows after it (T1, _trunc_only.py)
 
 Leg 1 is the one that matters most and is listed first for that reason: the
 original silence was a sink connection that never returned.
@@ -27,6 +28,8 @@ import os
 import subprocess
 import sys
 import time
+
+import _trunc_only
 
 MY84 = os.environ.get("MY84_URL", "mysql://root:bench@127.0.0.1:3310/bench")
 PG = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
@@ -202,6 +205,13 @@ if not r["hung"]:
         d_sum = ch(f"SELECT sum(n) FROM {SRC_T}")
         case("insert, update and delete all agree with the source",
              s_n == d_n and s_sum == d_sum, f"n {s_n}/{d_n} sum {s_sum}/{d_sum}")
+
+# ---------------------------------------------------------------------------
+# leg 4: a TRUNCATE with NOTHING after it in its window (T1 a/b/c, claim
+# truncate.only-window) — the same cases e2e_mariadb_cdc.py runs, on 8.4. It is
+# also this leg's only TRUNCATE, so it is what backs truncate.reaches-dest here.
+print("== leg 4: 8.4 as SOURCE, a TRUNCATE with no rows after it ==")
+ok = _trunc_only.run(MY84, CH, my, ch, "my84", deadline=DEADLINE) and ok
 
 # ---------------------------------------------------------------------------
 print("== cleanup ==")

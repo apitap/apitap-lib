@@ -18,9 +18,11 @@
 //!   the `truncate` flag — apply order is truncate → deletes → upserts.
 
 use crate::error::{Error, Result};
+use crate::logbased::window::{Layout, TableWindow};
 use crate::wire::pgoutput::{Cell, Cellv, Tuple};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A replica-identity key: the key columns' text values in key-column order.
 /// NULLs are illegal in identity keys (Postgres enforces NOT NULL on them).
@@ -127,8 +129,9 @@ impl Slot {
 }
 
 pub(crate) struct Collapser {
-    /// Indices of the key columns within the row tuple.
-    key_idx: Vec<usize>,
+    /// The table's columns; its key positions are what a row is keyed by, and
+    /// the sealed window carries it to the applies.
+    layout: Arc<Layout>,
     /// foldhash: the keys are our own PK bytes from a database we connect
     /// to — hashDoS is not in the threat model, and SipHash was 6.5% of the
     /// capped my→ch drain's samples.
@@ -143,9 +146,9 @@ pub(crate) struct Collapser {
 }
 
 impl Collapser {
-    pub(crate) fn new(key_idx: Vec<usize>) -> Self {
+    pub(crate) fn new(layout: Arc<Layout>) -> Self {
         Self {
-            key_idx,
+            layout,
             map: HashMap::default(),
             upserts: Vec::new(),
             residue: Vec::new(),
@@ -156,7 +159,8 @@ impl Collapser {
 
     /// Key of a FULL row tuple (new image) — from the key column indices.
     fn key_of_row(&self, row: &Tuple) -> Result<Key> {
-        self.key_idx
+        self.layout
+            .key_idx()
             .iter()
             .map(|&i| match row.get(i) {
                 // Key stays owned (`Vec<Vec<u8>>`) on purpose: a Bytes key
@@ -349,7 +353,13 @@ impl Collapser {
         }
     }
 
-    pub(crate) fn finish(self) -> Collapsed {
+    /// The window this collapser accumulated, with the layout it was keyed by.
+    pub(crate) fn seal(self, table: &str) -> Result<TableWindow<Collapsed>> {
+        let layout = self.layout.clone();
+        TableWindow::seal(table, layout, self.finish())
+    }
+
+    fn finish(self) -> Collapsed {
         // One pass over the key map at the window's end: no per-event cost,
         // and each deleted key moves out instead of being cloned at its delete.
         let deletes = DeleteSet(self.map.into_iter().filter(|(_, s)| s.del()).map(|(k, _)| k).collect());
@@ -416,6 +426,11 @@ pub(crate) mod gen {
         Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()))
     }
 
+    /// The `(id, v, big)` table `feed` writes, keyed on `id`.
+    pub(crate) fn layout() -> Arc<Layout> {
+        Layout::for_test(&["id", "v", "big"], &[], &["id"])
+    }
+
     /// The key column's text for key `k`, as `Key` spells it.
     pub(crate) fn key(k: u8) -> Key {
         vec![k.to_string().into_bytes()]
@@ -465,7 +480,7 @@ mod tests {
     }
 
     fn c() -> Collapser {
-        Collapser::new(vec![0])
+        Collapser::new(Layout::for_test(&["id", "v"], &[], &["id"]))
     }
 
     #[test]
@@ -591,7 +606,7 @@ mod tests {
         for _ in 0..5000 {
             let len = 1 + rng.below(12) as usize;
             let evs = gen::events(&mut rng, 6, len);
-            let mut cl = c();
+            let mut cl = Collapser::new(gen::layout());
             gen::feed(&mut cl, &evs);
             let got = cl.finish().deletes.sorted();
             let mut want = pushes_0560(&evs);

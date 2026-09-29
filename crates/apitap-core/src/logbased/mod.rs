@@ -12,6 +12,8 @@ pub(crate) mod dest_pg;
 pub(crate) mod drain;
 pub(crate) mod myrun;
 pub(crate) mod mysource;
+pub(crate) mod replay;
 pub(crate) mod resolve;
 pub(crate) mod rowtext;
 pub(crate) mod run;
+pub(crate) mod window;

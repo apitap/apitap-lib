@@ -28,10 +28,12 @@
 
 use crate::error::{Error, Result};
 use crate::lease::Watermark;
-use crate::logbased::collapse::Key;
-use crate::logbased::drain::DrainOutcome;
+use crate::logbased::changelog::Changes;
+use crate::logbased::collapse::{Collapsed, Key};
+use crate::logbased::replay::WindowId;
 use crate::logbased::resolve::{resolve_window, Image};
-use crate::logbased::rowtext::pk_indices;
+use crate::logbased::window::{Bodies, DrainOutcome, TableWindow};
+use std::collections::HashMap;
 use crate::sink::bigquery::sql_str;
 use crate::wire::pgoutput::Cell;
 use serde_json::{json, Map, Value};
@@ -86,9 +88,10 @@ const CL_SEQ: &str = "_apitap_seq";
 const CL_AT: &str = "_apitap_at";
 const CL_BASELINE: &str = "B";
 
-/// One CDC member: (destination table, qualified source, key columns,
-/// source id) — the shape `run.rs` hands a group in.
-pub(crate) type Member = (String, String, Vec<String>, String);
+/// One CDC member: (destination table, qualified source, source id) — the
+/// shape `run.rs` hands a group in. The key columns are each window's own
+/// (`Layout::key_cols`), the names its rows were keyed by.
+pub(crate) type Member = (String, String, String);
 
 pub(crate) struct BqDest {
     store: BqStore,
@@ -206,12 +209,10 @@ impl BqDest {
         ctxs: &[Member],
         outcome: &DrainOutcome,
         lanes: usize,
-        changelog: bool,
     ) -> Result<Vec<(u64, Watermark)>> {
-        if changelog {
-            apply_group_changelog_unit(u, ctxs, outcome, lanes).await
-        } else {
-            apply_group_unit(u, ctxs, outcome, lanes).await
+        match &outcome.bodies {
+            Bodies::Replica(w) => apply_group_unit(u, ctxs, w, &outcome.id, lanes).await,
+            Bodies::Changelog(w) => apply_group_changelog_unit(u, ctxs, w, &outcome.id, lanes).await,
         }
     }
 }
@@ -414,24 +415,25 @@ fn current_view_sql(v: &str, t: &str, pk_cols: &[String]) -> String {
 /// table's INSERT and its watermark and put them in two transactions; it
 /// packs whole groups now. And the stamp was `end_lsn`, which a re-drain
 /// recomputes — so "re-lands from the same LSN" was false and `(lsn, seq)`
-/// could not be used to de-duplicate. It is `start_lsn` now.
+/// could not be used to de-duplicate. It is the window's start now.
 pub(crate) async fn apply_group_changelog_unit(
     u: &mut BqUnit<'_>,
     ctxs: &[Member],
-    outcome: &DrainOutcome,
+    windows: &HashMap<String, TableWindow<Changes>>,
+    id: &WindowId,
     lanes: usize,
 ) -> Result<Vec<(u64, Watermark)>> {
     use futures::stream::{StreamExt as _, TryStreamExt as _};
-    let (ur, cref, oref): (&BqUnit<'_>, _, _) = (&*u, ctxs, outcome);
+    let (ur, cref): (&BqUnit<'_>, _) = (&*u, ctxs);
     let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
         .map(|i| async move {
-            let (dt, q, pk, _) = &cref[i];
-            stage_changelog(ur, dt, q, pk, oref).await.map(|(ev, sql)| (i, ev, sql))
+            let (dt, q, _) = &cref[i];
+            stage_changelog(ur, dt, windows.get(q), id).await.map(|(ev, sql)| (i, ev, sql))
         })
         .buffer_unordered(lanes.max(1))
         .try_collect()
         .await?;
-    Ok(into_groups(u, ctxs, outcome, staged))
+    Ok(into_groups(u, ctxs, id, staged))
 }
 
 /// A whole group's replica window: STAGE every table concurrently (each is a
@@ -446,20 +448,21 @@ pub(crate) async fn apply_group_changelog_unit(
 pub(crate) async fn apply_group_unit(
     u: &mut BqUnit<'_>,
     ctxs: &[Member],
-    outcome: &DrainOutcome,
+    windows: &HashMap<String, TableWindow<Collapsed>>,
+    id: &WindowId,
     lanes: usize,
 ) -> Result<Vec<(u64, Watermark)>> {
     use futures::stream::{StreamExt as _, TryStreamExt as _};
-    let (ur, cref, oref): (&BqUnit<'_>, _, _) = (&*u, ctxs, outcome);
+    let (ur, cref): (&BqUnit<'_>, _) = (&*u, ctxs);
     let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
         .map(|i| async move {
-            let (dt, q, pk, _) = &cref[i];
-            stage(ur, dt, q, pk, oref).await.map(|(ev, sql)| (i, ev, sql))
+            let (dt, q, _) = &cref[i];
+            stage(ur, dt, windows.get(q)).await.map(|(ev, sql)| (i, ev, sql))
         })
         .buffer_unordered(lanes.max(1))
         .try_collect()
         .await?;
-    Ok(into_groups(u, ctxs, outcome, staged))
+    Ok(into_groups(u, ctxs, id, staged))
 }
 
 /// Each staged table's statements into its own group, in member order, and
@@ -468,7 +471,7 @@ pub(crate) async fn apply_group_unit(
 fn into_groups(
     u: &mut BqUnit<'_>,
     ctxs: &[Member],
-    outcome: &DrainOutcome,
+    id: &WindowId,
     mut staged: Vec<(usize, u64, Vec<String>)>,
 ) -> Vec<(u64, Watermark)> {
     staged.sort_by_key(|s| s.0);
@@ -479,8 +482,8 @@ fn into_groups(
     }
     ctxs.iter()
         .zip(events)
-        .map(|((dt, _, _, sid), ev)| {
-            (ev, Watermark::Set { table: dt.clone(), source_id: sid.clone(), lsn: outcome.end_lsn, rows: ev })
+        .map(|((dt, _, sid), ev)| {
+            (ev, Watermark::Set { table: dt.clone(), source_id: sid.clone(), lsn: id.end(), rows: ev })
         })
         .collect()
 }
@@ -539,21 +542,18 @@ async fn read_current(
 async fn stage_changelog(
     u: &BqUnit<'_>,
     dest_table: &str,
-    qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
+    w: Option<&TableWindow<Changes>>,
+    id: &WindowId,
 ) -> Result<(u64, Vec<String>)> {
     let table = bare(dest_table);
-    let Some(c) = outcome.changes.get(qualified_src) else {
+    let Some(w) = w else {
         return Ok((0, Vec::new()));
     };
+    let (c, l) = (w.body(), w.layout());
     if c.events.is_empty() {
         return Ok((0, Vec::new()));
     }
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+    let (wal_cols, oids) = (l.cols(), l.oids());
     for name in wal_cols {
         if matches!(name.as_str(), OP_COL | MASK_COL | CL_LSN | CL_SEQ | CL_AT) {
             return Err(Error::InvalidInput(format!(
@@ -562,10 +562,6 @@ async fn stage_changelog(
             )));
         }
     }
-    let oids = outcome
-        .wal_oids
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
     let meta = u.table_get(table).await?.ok_or_else(|| {
         Error::Transfer(format!(
             "log_based changelog: BigQuery target {table} does not exist — the \
@@ -579,14 +575,13 @@ async fn stage_changelog(
     // as NULL would silently blank the column for every reader of
     // `__current`. One extra query per window, only when a mask is present.
     let patched = if c.masked {
-        let pk_idx = pk_indices(pk_cols, wal_cols)?;
-        let (keys, cols) = c.mask_plan(&pk_idx);
+        let (keys, cols) = c.mask_plan();
         let base = if keys.is_empty() || cols.is_empty() {
             std::collections::HashMap::new()
         } else {
-            read_current(u, table, pk_cols, &keys, &cols, wal_cols).await?
+            read_current(u, table, l.key_cols(), &keys, &cols, wal_cols).await?
         };
-        c.resolve_masked(&pk_idx, &cols, &base, wal_cols)?
+        c.resolve_masked(&cols, &base)?
     } else {
         std::collections::HashMap::new()
     };
@@ -616,7 +611,7 @@ async fn stage_changelog(
             // `_apitap_lsn` and `(lsn, seq)` was useless as a de-duplication
             // key on a log that this path CAN replay (see the chunking note
             // on `apply_group_changelog_unit`).
-            format!("CAST({} AS INT64)", outcome.start_lsn),
+            format!("CAST({} AS INT64)", id.start()),
             format!("CAST({} AS INT64)", bt(CL_SEQ)),
             // One stamp for the whole window: it is the PARTITION and
             // retention key, never an ordering key — `(lsn, seq)` orders.
@@ -674,19 +669,15 @@ async fn cluster_target(u: &mut BqUnit<'_>, table: &str, pk_cols: &[String], row
 async fn stage(
     u: &BqUnit<'_>,
     dest_table: &str,
-    qualified_src: &str,
-    pk_cols: &[String],
-    outcome: &DrainOutcome,
+    w: Option<&TableWindow<Collapsed>>,
 ) -> Result<(u64, Vec<String>)> {
     let table = bare(dest_table);
-    let Some(c) = outcome.tables.get(qualified_src) else {
+    let Some(w) = w else {
         // Foreign-table traffic only: nothing for our table, still advance.
         return Ok((0, Vec::new()));
     };
-    let wal_cols = outcome
-        .wal_cols
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL column list".into()))?;
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, oids, pk_cols) = (l.cols(), l.oids(), l.key_cols());
     for name in wal_cols {
         if name == OP_COL || name == MASK_COL {
             return Err(Error::InvalidInput(format!(
@@ -695,12 +686,6 @@ async fn stage(
             )));
         }
     }
-    let oids = outcome
-        .wal_oids
-        .get(qualified_src)
-        .ok_or_else(|| Error::Transfer("log_based: missing WAL type list".into()))?;
-    let pk_idx = pk_indices(pk_cols, wal_cols)?;
-
     // The target's declared column types drive every cast — read once.
     let meta = u.table_get(table).await?.ok_or_else(|| {
         Error::Transfer(format!(
@@ -728,7 +713,7 @@ async fn stage(
     // row per target row — and `rows()` yields each key exactly once.
     let mut ndjson: Vec<u8> = Vec::new();
     let mut staged = 0u64;
-    for (key, image) in resolve_window(c, &pk_idx).rows() {
+    for (key, image) in resolve_window(w).rows() {
         match image {
             Image::Row(cells) => push_upsert(&mut ndjson, wal_cols, cells, None)?,
             Image::Masked { row, .. } => {

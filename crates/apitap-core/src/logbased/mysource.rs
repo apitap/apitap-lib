@@ -16,8 +16,9 @@
 
 use crate::error::{Error, Result};
 use crate::logbased::changelog::Changes;
-use crate::logbased::collapse::{Collapsed, Collapser};
-use crate::logbased::drain::DrainOutcome;
+use crate::logbased::collapse::Collapser;
+use crate::logbased::replay::WindowId;
+use crate::logbased::window::{Bodies, DrainOutcome, Layout};
 use crate::wire::mybinlog::{self as bl, BinlogState, TableSchema};
 use crate::wire::mywire::MyWire;
 use crate::wire::pgoutput::{PgoMessage, Tuple};
@@ -422,8 +423,36 @@ pub(crate) struct MySession {
     /// The binlog file the stream is currently in.
     pub file: String,
     /// Tables we care about, as "db.table" — everything else is skipped
-    /// before it is ever decoded.
+    /// before it is ever decoded — with the run's key columns for each.
     pub tracked: HashMap<String, Vec<String>>,
+    /// Column layout per tracked "db.table", built from `st.schemas` and the
+    /// run's keys; every body a window builds carries the one it was built
+    /// with. Cleared in the same statement as the schemas, at every DDL.
+    pub layouts: HashMap<String, Arc<Layout>>,
+}
+
+/// The layout of tracked table `q`: cached, else from the schema cache, else
+/// from information_schema. The TABLE_MAP arm and the TRUNCATE arm both ask
+/// here, so a table's first op of a window always finds one — a TRUNCATE is
+/// often the only event a table has in its window, and it carries no columns.
+async fn layout_for(sess: &mut MySession, pool: &sqlx::MySqlPool, q: &str) -> Result<Arc<Layout>> {
+    if let Some(l) = sess.layouts.get(q) {
+        return Ok(l.clone());
+    }
+    let (db, tb) = q
+        .split_once('.')
+        .ok_or_else(|| Error::Transfer(format!("log_based: {q} is not db.table")))?;
+    if !sess.st.schemas.contains_key(q) {
+        let sc = fetch_schema(pool, db, tb).await?;
+        sess.st.schemas.insert(q.to_string(), sc);
+    }
+    let keys = sess
+        .tracked
+        .get(q)
+        .ok_or_else(|| Error::Transfer(format!("log_based: {q} is not tracked")))?;
+    let l = Arc::new(Layout::from_mysql(q, &sess.st.schemas[q], keys)?);
+    sess.layouts.insert(q.to_string(), l.clone());
+    Ok(l)
 }
 
 /// One drain window off a live binlog stream.
@@ -454,16 +483,10 @@ pub(crate) async fn drain_binlog(
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
-    // Tables truncated before this window had ever decoded a row of them — the
-    // wipe waits here for the accumulator that carries the real key layout.
-    let mut pending_truncate: std::collections::HashSet<String> = Default::default();
     // changelog=true captures every operation verbatim instead of collapsing
-    // the window; `key_idx` is what lets a PK-changing update emit D-then-U
-    // exactly like the Postgres lane does.
+    // the window; the layout's key is what lets a PK-changing update emit
+    // D-then-U exactly like the Postgres lane does.
     let mut changelogs: HashMap<String, Changes> = HashMap::new();
-    let mut key_idx: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut wal_cols: HashMap<String, Vec<String>> = HashMap::new();
-    let mut wal_oids: HashMap<String, Vec<u32>> = HashMap::new();
     let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
     let mut end_mark = start;
     let mut buf_bytes = 0usize;
@@ -578,6 +601,10 @@ pub(crate) async fn drain_binlog(
                             c.labels = sc.labels.get(i).cloned().flatten();
                         }
                     }
+                    // Registered only with its layout: a rows event can only
+                    // decode against a map, so every op of a table reaches
+                    // `drain_tx` with a layout for it.
+                    layout_for(sess, pool, &q).await?;
                     sess.st.maps.insert(map.table_id, map);
                 }
             }
@@ -596,30 +623,9 @@ pub(crate) async fn drain_binlog(
                 let ev = bl::parse_rows(body, t, &map)?;
                 for msg in bl::to_messages(&mut sess.st, t, ev)? {
                     match msg {
-                        PgoMessage::Relation(r) => {
-                            let names: Vec<String> =
-                                r.cols.iter().map(|c| c.name.clone()).collect();
-                            wal_oids.insert(q.clone(), vec![0; names.len()]);
-                            wal_cols.insert(q.clone(), names);
-                            let idx: Vec<usize> = r
-                                .cols
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, c)| c.key)
-                                .map(|(i, _)| i)
-                                .collect();
-                            key_idx.entry(q.clone()).or_insert_with(|| idx.clone());
-                            let c = collapsers
-                                .entry(q.clone())
-                                .or_insert_with(|| Collapser::new(idx));
-                            // The truncate that was held above happened BEFORE
-                            // these rows, and this accumulator is empty and
-                            // correctly keyed: applying it here puts the wipe
-                            // back in its original order.
-                            if pending_truncate.remove(&q) {
-                                c.truncate();
-                            }
-                        }
+                        // The layout came from the TABLE_MAP; bodies are built
+                        // at the commit, in `drain_tx`.
+                        PgoMessage::Relation(_) => {}
                         PgoMessage::Insert { new, .. } => {
                             buf_bytes += cells_bytes(&new);
                             tx_buf.push((Arc::from(q.as_str()), TxOp::Insert(new)));
@@ -652,8 +658,18 @@ pub(crate) async fn drain_binlog(
                     // previous attempt is stale.
                     tx_buf.clear();
                 } else if is_ddl(head) {
-                    // DDL invalidates cached column layouts for that db.
-                    sess.st.schemas.retain(|k, _| !k.starts_with(&format!("{db}.")));
+                    // Anything already buffered belongs to the transaction this
+                    // DDL implicitly committed, so it lands FIRST, under the
+                    // layouts it was decoded against.
+                    drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
+                    // A DDL may change any table's columns, and the QUERY
+                    // event's `db` is the session's default database, not
+                    // necessarily the altered table's (`ALTER TABLE other.t`),
+                    // so every cached layout goes — with the schemas they were
+                    // built from, in the same statement, so no layout can
+                    // outlive the catalog read it came from.
+                    sess.st.schemas.clear();
+                    sess.layouts.clear();
                     sess.st.maps.clear();
                     // …and a TRUNCATE is not only a schema event: it empties the
                     // table, and the destination has to hear about it. MySQL
@@ -672,28 +688,14 @@ pub(crate) async fn drain_binlog(
                             // truncate was skipped exactly as before the fix. The
                             // unit test passed; the e2e leg caught it.
                             Some(t) if sess.tracked.contains_key(&t) => {
-                                // Anything already buffered belongs to the
-                                // transaction this DDL implicitly committed, so
-                                // it lands FIRST — then the wipe.
-                                drain_tx(&mut tx_buf, changelog, &key_idx,
-                                         &mut changelogs, &mut collapsers)?;
-                                // The collapser may not exist yet: it is built
-                                // from the first ROWS event for the table, and a
-                                // window shaped `TRUNCATE t; INSERT …` has not
-                                // reached one. Hold the truncate rather than
-                                // create a placeholder — `Collapser::new(vec![])`
-                                // hashes EVERY later row to the same empty key,
-                                // so the two inserts after the wipe would collapse
-                                // into one. Silent loss in place of silent loss.
-                                // The changelog lane needs no such care: a
-                                // `Changes` truncate carries no key.
-                                if changelog || collapsers.contains_key(&t) {
-                                    tx_buf.push((Arc::from(t.as_str()), TxOp::Truncate));
-                                    drain_tx(&mut tx_buf, changelog, &key_idx,
-                                             &mut changelogs, &mut collapsers)?;
-                                } else {
-                                    pending_truncate.insert(t);
-                                }
+                                // The truncate needs the table's layout like any
+                                // op: often it is the table's only event in the
+                                // window, and it carries no columns. 0.56.0 had
+                                // none to give it, and every apply of such a
+                                // window failed for want of a column list.
+                                layout_for(sess, pool, &t).await?;
+                                tx_buf.push((Arc::from(t.as_str()), TxOp::Truncate));
+                                drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
                             }
                             // A truncate of a table this run does not track is
                             // none of our business.
@@ -713,12 +715,23 @@ pub(crate) async fn drain_binlog(
                             }
                         }
                     }
+                    // The DDL is its own commit boundary, so a window can end
+                    // right after it — and one holding a body must: its bodies
+                    // were built with layouts this DDL may just have changed,
+                    // and one window never spans a layout change. The next
+                    // window starts at the next event, under fresh layouts. At
+                    // the stop-line there is no next window to ask for.
+                    if !collapsers.is_empty() || !changelogs.is_empty() {
+                        end_mark = pack_pos(&sess.file, h.log_pos);
+                        hit_budget = end_mark < stop_line;
+                        break;
+                    }
                 }
             }
             bl::TYPE_XID => {
                 // Commit boundary: the buffered ops become real, and the
                 // watermark advances to the position AFTER this event.
-                drain_tx(&mut tx_buf, changelog, &key_idx, &mut changelogs, &mut collapsers)?;
+                drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
                 end_mark = pack_pos(&sess.file, h.log_pos);
                 if end_mark >= stop_line {
                     break;
@@ -752,28 +765,9 @@ pub(crate) async fn drain_binlog(
         }
     }
 
-    // A table truncated and then left alone for the rest of the window never
-    // got a ROWS event, so it has no collapser — and without one the window
-    // carries no evidence of the wipe and the destination keeps its rows. An
-    // empty key layout is harmless here: the window is over, no row will ever
-    // be hashed against it.
-    for t in pending_truncate.drain() {
-        collapsers
-            .entry(t)
-            .or_insert_with(|| Collapser::new(Vec::new()))
-            .truncate();
-    }
-    let tables: HashMap<String, Collapsed> = collapsers
-        .into_iter()
-        .map(|(k, v)| (k, v.finish()))
-        .collect();
     Ok(DrainOutcome {
-        tables,
-        changes: changelogs,
-        end_lsn: end_mark,
-        start_lsn: start,
-        wal_cols,
-        wal_oids,
+        bodies: Bodies::seal(changelog, collapsers, changelogs)?,
+        id: WindowId::new(start, end_mark),
         hit_budget,
     })
 }
@@ -804,35 +798,44 @@ fn cells_bytes(row: &Tuple) -> usize {
 /// `tx_buf` and relied on XID to drain it, which meant the record sat in the
 /// buffer until the NEXT ordinary transaction committed — or was cleared by the
 /// next `BEGIN`, losing it again.
+///
+/// A table's first op of the window builds its body with the table's layout,
+/// whatever the op is. Until 0.57.0 the replica body was built by the first
+/// ROWS event, so an op arriving before one — a TRUNCATE — found no body and
+/// was skipped (`continue`), or was parked and wiped at the window's end into
+/// a body with no layout that every apply refused. An op with no layout at all
+/// is a broken decoder invariant (a map is registered only with its layout,
+/// and the TRUNCATE arm resolves one first), and is an error, never a skip.
 fn drain_tx(
-    tx_buf: &mut Vec<(std::sync::Arc<str>, TxOp)>,
+    tx_buf: &mut Vec<(Arc<str>, TxOp)>,
     changelog: bool,
-    key_idx: &std::collections::HashMap<String, Vec<usize>>,
-    changelogs: &mut std::collections::HashMap<String, crate::logbased::changelog::Changes>,
-    collapsers: &mut std::collections::HashMap<String, Collapser>,
+    layouts: &HashMap<String, Arc<Layout>>,
+    changelogs: &mut HashMap<String, Changes>,
+    collapsers: &mut HashMap<String, Collapser>,
 ) -> Result<()> {
+    let layout_of = |t: &str| {
+        layouts.get(t).cloned().ok_or_else(|| {
+            Error::Transfer(format!("log_based: no column layout for {t} — decoder invariant broken"))
+        })
+    };
     for (table, op) in tx_buf.drain(..) {
         if changelog {
-            // Before the key lookup: `key_idx` is filled from the first ROWS
-            // event, and a truncate can arrive ahead of one. It needs no key
-            // layout to record — gating it on one dropped it.
-            if matches!(op, TxOp::Truncate) {
-                changelogs.entry(table.to_string()).or_default().truncate();
-                continue;
+            if !changelogs.contains_key(table.as_ref()) {
+                changelogs.insert(table.to_string(), Changes::new(layout_of(&table)?));
             }
-            let Some(ki) = key_idx.get(table.as_ref()) else { continue };
-            let c = changelogs.entry(table.to_string()).or_default();
+            let c = changelogs.get_mut(table.as_ref()).expect("changelog just ensured");
             match op {
                 TxOp::Insert(row) => c.insert(row),
-                TxOp::Update(old, row) => c.update(old.as_ref(), row, ki),
+                TxOp::Update(old, row) => c.update(old.as_ref(), row),
                 TxOp::Delete(old) => c.delete(old),
                 TxOp::Truncate => c.truncate(),
             }
             continue;
         }
-        let Some(c) = collapsers.get_mut(table.as_ref()) else {
-            continue;
-        };
+        if !collapsers.contains_key(table.as_ref()) {
+            collapsers.insert(table.to_string(), Collapser::new(layout_of(&table)?));
+        }
+        let c = collapsers.get_mut(table.as_ref()).expect("collapser just ensured");
         match op {
             TxOp::Insert(row) => c.insert(row)?,
             TxOp::Update(old, row) => c.update(old.as_ref(), row)?,
@@ -913,69 +916,63 @@ mod truncate_tests {
         assert_eq!(truncate_target("TRUNCATE", "bench"), None);
     }
 
-    /// A TRUNCATE reaches the accumulators, on both lanes. Until 0.56.0 it
-    /// reached neither: the window carried no truncate, so no destination ever
-    /// emptied the table and the run reported success over the divergence.
+    /// A2. A window holding a table's TRUNCATE and nothing else of it: the
+    /// op builds the table's body itself, on both lanes, and the sealed window
+    /// carries the table's layout. 0.56.0's replica lane found no collapser (the
+    /// first ROWS event built it) and skipped the op, or parked it and wiped
+    /// into a body with no layout at the window's end; every apply then failed
+    /// for want of a column list, on every run (audit §3.4).
     #[test]
-    fn a_truncate_reaches_both_accumulators() {
+    fn drain_tx_truncate_only_builds_window() {
         use std::collections::HashMap;
-        let key: std::sync::Arc<str> = std::sync::Arc::from("bench.t");
+        let l = Layout::for_test(&["id", "v"], &[], &["id"]);
+        let layouts: HashMap<String, Arc<Layout>> = [("bench.t".to_string(), l.clone())].into_iter().collect();
+        let key: Arc<str> = Arc::from("bench.t");
 
-        // replica lane
+        // replica lane: no body yet, only the truncate
         let mut collapsers: HashMap<String, Collapser> = HashMap::new();
-        collapsers.insert("bench.t".into(), Collapser::new(vec![0]));
         let mut buf = vec![(key.clone(), TxOp::Truncate)];
-        drain_tx(&mut buf, false, &HashMap::new(), &mut HashMap::new(), &mut collapsers)
-            .expect("drain");
-        let c = collapsers.remove("bench.t").expect("collapser");
-        assert!(c.finish().truncate, "the replica lane must carry truncate");
+        drain_tx(&mut buf, false, &layouts, &mut HashMap::new(), &mut collapsers).expect("drain");
+        let w = collapsers.remove("bench.t").expect("the truncate built the table's body").seal("bench.t").unwrap();
+        assert!(w.body().truncate, "the replica window must carry the truncate");
+        assert_eq!(w.layout(), &*l, "…and the table's layout");
 
-        // changelog lane
-        let mut key_idx: HashMap<String, Vec<usize>> = HashMap::new();
-        key_idx.insert("bench.t".into(), vec![0]);
-        let mut changelogs: HashMap<String, crate::logbased::changelog::Changes> = HashMap::new();
-        let mut buf = vec![(key, TxOp::Truncate)];
-        drain_tx(&mut buf, true, &key_idx, &mut changelogs, &mut HashMap::new()).expect("drain");
-        assert_eq!(changelogs["bench.t"].events.len(), 1,
-                   "the changelog lane must record a T");
+        // changelog lane: one T record, and the layout
+        let mut changelogs: HashMap<String, Changes> = HashMap::new();
+        let mut buf = vec![(key.clone(), TxOp::Truncate)];
+        drain_tx(&mut buf, true, &layouts, &mut changelogs, &mut HashMap::new()).expect("drain");
+        let w = changelogs.remove("bench.t").expect("the truncate built the table's body").seal("bench.t").unwrap();
+        let ops: Vec<_> = w.body().events.iter().map(|e| e.op).collect();
+        assert_eq!(ops, [crate::logbased::changelog::ChangeOp::Truncate]);
+        assert_eq!(w.layout(), &*l);
+
+        // An op of a table with no layout is a broken invariant, and says so:
+        // 0.56.0 dropped it without a word.
+        for changelog in [false, true] {
+            let cell = |s: &str| Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()));
+            let mut buf = vec![(Arc::from("bench.other"), TxOp::Insert(Tuple::from_cells(&[cell("1"), cell("x")])))];
+            let e = drain_tx(&mut buf, changelog, &layouts, &mut HashMap::new(), &mut HashMap::new())
+                .expect_err("an op with no layout");
+            assert!(e.to_string().contains("bench.other"), "{e}");
+        }
     }
 
-    /// The accumulators are built lazily, from the first ROWS event for a table.
-    /// A window shaped `TRUNCATE t; INSERT …` reaches the truncate first, when
-    /// there is no accumulator and — on the changelog lane — no key index. The
-    /// first fix gated the truncate on those maps, so it was dropped exactly as
-    /// before; the unit tests passed and the e2e leg caught it.
+    /// The truncate lands IN ORDER with the rows around it: rows before it are
+    /// wiped with the table, rows after it survive.
     #[test]
-    fn a_truncate_that_arrives_before_the_first_rows_event_is_still_recorded() {
+    fn a_truncate_lands_between_the_rows_around_it() {
         use std::collections::HashMap;
-        let key: std::sync::Arc<str> = std::sync::Arc::from("bench.t");
-        let mut changelogs: HashMap<String, crate::logbased::changelog::Changes> = HashMap::new();
-        let mut buf = vec![(key, TxOp::Truncate)];
-        // No key index at all: this is what the map looks like before the first
-        // ROWS event has been decoded.
-        drain_tx(&mut buf, true, &HashMap::new(), &mut changelogs, &mut HashMap::new())
-            .expect("drain");
-        assert_eq!(changelogs["bench.t"].events.len(), 1,
-                   "a truncate needs no key layout, so it must not be gated on one");
-    }
-
-    /// Why the replica lane HOLDS the truncate instead of creating an accumulator
-    /// for it: a `Collapser` with no key columns hashes every row to the same
-    /// empty key, so the rows that follow the wipe collapse into one. This is the
-    /// control for `pending_truncate` — delete it and the rows are lost silently.
-    #[test]
-    fn an_empty_key_collapser_would_fold_every_row_into_one() {
         let cell = |s: &str| Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()));
-        let mut placeholder = Collapser::new(Vec::new());
-        placeholder.insert(Tuple::from_cells(&[cell("7"), cell("x")])).expect("insert");
-        placeholder.insert(Tuple::from_cells(&[cell("8"), cell("y")])).expect("insert");
-        assert_eq!(placeholder.finish().upserts.len(), 1,
-                   "an empty key layout is not a harmless placeholder");
-
-        let mut keyed = Collapser::new(vec![0]);
-        keyed.insert(Tuple::from_cells(&[cell("7"), cell("x")])).expect("insert");
-        keyed.insert(Tuple::from_cells(&[cell("8"), cell("y")])).expect("insert");
-        assert_eq!(keyed.finish().upserts.len(), 2, "the real key layout keeps both");
+        let ins = |k: &str| TxOp::Insert(Tuple::from_cells(&[cell(k), cell("x")]));
+        let l = Layout::for_test(&["id", "v"], &[], &["id"]);
+        let layouts: HashMap<String, Arc<Layout>> = [("bench.t".to_string(), l)].into_iter().collect();
+        let key: Arc<str> = Arc::from("bench.t");
+        let mut collapsers: HashMap<String, Collapser> = HashMap::new();
+        let mut buf = vec![(key.clone(), ins("1")), (key.clone(), TxOp::Truncate), (key, ins("2"))];
+        drain_tx(&mut buf, false, &layouts, &mut HashMap::new(), &mut collapsers).expect("drain");
+        let w = collapsers.remove("bench.t").unwrap().seal("bench.t").unwrap();
+        assert!(w.body().truncate);
+        assert_eq!(w.body().upserts.iter().map(|t| t.to_cells()[0].clone()).collect::<Vec<_>>(), [cell("2")]);
     }
 }
 
