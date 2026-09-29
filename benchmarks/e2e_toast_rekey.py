@@ -46,9 +46,14 @@ failed "the window is torn" and the table never moved again. The cell is at
 the OLD key. The window also carries a chain (2 -> 20 -> 5), whose second move
 can only find the body in what the first one resolved.
 
+`chreplay` replays such a window after its re-key landed (a group sibling
+failed after it): the old key is read as it was BEFORE the window, not from
+`__current`, which by then shows the re-key's own `D` there. Before that fix
+the replay failed "torn" on every run.
+
 Rig: `apitap-bench-pg-src` on :5544 (source, always), and as destinations
 `apitap-bench-pg-dst` on :5545, `apitap-bench-my-dst` on :3308, ClickHouse on
-:8124. Pass DESTS to narrow it, e.g. DESTS=ch or DESTS=chlog.
+:8124. Pass DESTS to narrow it, e.g. DESTS=ch, DESTS=chlog or DESTS=chreplay.
 """
 import os
 import subprocess
@@ -153,7 +158,7 @@ def ch_dest():
 
 
 ALL = {"pg": pg_dest, "my": my_dest, "ch": ch_dest}
-WANT = os.environ.get("DESTS", "pg,my,ch,chlog").split(",")
+WANT = os.environ.get("DESTS", "pg,my,ch,chlog,chreplay").split(",")
 
 
 def seed(rows):
@@ -338,10 +343,126 @@ COMMIT;
         drop_our_slots()
 
 
+RP, RPB = "toast_rekey_rp", "toast_rekey_rpb"
+
+
+def run_changelog_replay_ch():
+    """A replay of a window whose re-key already landed (review of 0.57.0 step 28).
+
+    The re-key's masked cell is read back from the destination at the OLD key.
+    A replay reads back AFTER its earlier attempt appended — and that attempt's
+    `D` half is the newest record of the old key, so `__current` had no row
+    there and the `U` half failed "the window is torn" on every later run.
+
+    The replay is made the way production makes one, not by rewinding: a group
+    [RP, RPB] applies member by member, RP's window lands and closes, RPB's
+    fails (a CHECK constraint planted on its ClickHouse table), and the next
+    run drains the group from its minimum, RP's window included. One more
+    update of RP arrives in between, so the replay is LONGER than the attempt:
+    it resumes past the two events that landed and appends the third, which
+    is the path that reads the destination back.
+    """
+    print("\n════════ destination: clickhouse, changelog=True, a replayed re-key ════════")
+    url = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default")
+
+    def q(sql):
+        o = sh(["docker", "exec", "-i", "apitap-bench-ch", "clickhouse-client",
+                "--user", "default", "--password", "bench", "-q", sql])
+        if o.returncode:
+            raise RuntimeError(f"{sql[:120]} -> {o.stderr.strip()[-300:]}")
+        return o.stdout.strip()
+
+    def reset():
+        for t in (RP, RPB):
+            q(f"DROP VIEW IF EXISTS `{t}__current`")
+            q(f"DROP TABLE IF EXISTS `{t}`")
+            for s in ("_apitap_state", "_apitap_cdc_pending"):
+                if q(f"SELECT count() FROM system.tables WHERE database = currentDatabase() "
+                     f"AND name = '{s}'") != "0":
+                    q(f"ALTER TABLE `{s}` DELETE WHERE dest_table = '{t}' SETTINGS mutations_sync = 1")
+
+    def drain():
+        code = ("import apitap\n"
+                f"r = apitap.transfer({SRC!r}, {url!r}, tables={[RP, RPB]!r}, mode='log_based', "
+                "changelog=True)\n"
+                "print('ROWS', r.rows, flush=True)\n")
+        return sh([sys.executable, "-c", code])
+
+    def watermark(t):
+        return q(f"SELECT watermark FROM `_apitap_state` FINAL "
+                 f"WHERE dest_table = '{t}' AND mode = 'log_based'")
+
+    def body_at(i):
+        return q(f"SELECT concat(lower(hex(MD5(ifNull(body, '')))), '/', toString(length(ifNull(body, '')))) "
+                 f"FROM `{RP}__current` WHERE id = {i}")
+
+    for t in (RP, RPB):
+        src(f"DROP TABLE IF EXISTS {t}")
+    src(f"CREATE TABLE {RP} (id int PRIMARY KEY, title text, body text)")
+    src(f"ALTER TABLE {RP} ALTER COLUMN body SET STORAGE EXTERNAL")
+    src(f"INSERT INTO {RP} SELECT g, 'title' || g, repeat(md5(g::text), {CL_BODY // 32}) "
+        f"FROM generate_series(1, 3) g")
+    src(f"CREATE TABLE {RPB} (id int PRIMARY KEY, n int)")
+    src(f"INSERT INTO {RPB} VALUES (1, 1)")
+    try:
+        reset()
+        drop_our_slots()
+        r = drain()
+        if r.returncode:
+            case("bootstrap of the group", False, r.stderr.strip()[-400:])
+            return
+        w0 = watermark(RP)
+
+        print("   -- attempt: RP's re-key lands and closes, RPB's apply fails after it")
+        q(f"ALTER TABLE `{RPB}` ADD CONSTRAINT leg_small CHECK ifNull(n, 0) < 1000")
+        src(f"BEGIN; UPDATE {RP} SET id = 9 WHERE id = 1; INSERT INTO {RPB} VALUES (2, 5000); COMMIT;")
+        r = drain()
+        wa, wb = watermark(RP), watermark(RPB)
+        landed = q(f"SELECT count() FROM `{RP}` WHERE _apitap_op != 'B'")
+        print(f"   rc {r.returncode}; watermarks RP {w0} -> {wa}, RPB {w0} -> {wb}; RP log rows {landed}")
+        if not (r.returncode and wa.isdigit() and w0.isdigit() and int(wa) > int(w0)
+                and wb == w0 and landed == "2"):
+            case("(rig) the attempt landed RP's D and U and failed on RPB after it", False,
+                 (r.stdout + r.stderr).strip()[-300:])
+            return
+        case("the attempt landed RP's re-key (D, U) and failed on RPB after it", True)
+
+        print("   -- the replay: from the group minimum, one RP update longer")
+        src(f"UPDATE {RP} SET title = 'after' WHERE id = 2")
+        q(f"ALTER TABLE `{RPB}` DROP CONSTRAINT leg_small")
+        r = drain()
+        case("the replay succeeds", r.returncode == 0, (r.stdout + r.stderr).strip()[-300:])
+        want9, got9 = src(f"SELECT md5(body) || '/' || length(body) FROM {RP} WHERE id = 9"), body_at(9)
+        case("__current at id=9 carries the source body",
+             got9 == want9 and want9.endswith(f"/{CL_BODY}"), f"source {want9}  ch {got9!r}")
+        case("id=1 is gone from __current",
+             q(f"SELECT count() FROM `{RP}__current` WHERE id = 1") == "0")
+        n, u = q(f"SELECT count(), uniqExact((_apitap_lsn, _apitap_seq)) FROM `{RP}` "
+                 f"WHERE _apitap_op != 'B'").split("\t")
+        case("RP's log holds the three events once each", n == "3" and u == "3", f"count {n}, pairs {u}")
+        ids = q(f"SELECT arrayStringConcat(arraySort(groupArray(toString(id))), ',') FROM `{RP}__current`")
+        want = src(f"SELECT string_agg(id::text, ',' ORDER BY id::text) FROM {RP}")
+        case("RP's __current holds exactly the source's keys", ids == want, f"{want} vs {ids}")
+        b_src = src(f"SELECT string_agg(id || ':' || n, ',' ORDER BY id) FROM {RPB}")
+        b_dst = q(f"SELECT arrayStringConcat(groupArray(concat(toString(id), ':', toString(n))), ',') "
+                  f"FROM (SELECT id, n FROM `{RPB}__current` ORDER BY id)")
+        case("RPB's __current equals the source", b_src == b_dst, f"{b_src} vs {b_dst}")
+        wa2, wb2 = watermark(RP), watermark(RPB)
+        case("both watermarks moved past the attempt, to one value",
+             wa2 == wb2 and wa2.isdigit() and int(wa2) > int(wa), f"RP {wa2}, RPB {wb2}")
+    finally:
+        for t in (RP, RPB):
+            src(f"DROP TABLE IF EXISTS {t}")
+        reset()
+        drop_our_slots()
+
+
 for k in WANT:
     k = k.strip()
     if k == "chlog":
         run_changelog_ch()
+    elif k == "chreplay":
+        run_changelog_replay_ch()
     elif k in ALL:
         run_for(ALL[k]())
     else:

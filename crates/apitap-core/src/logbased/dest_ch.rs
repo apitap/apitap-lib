@@ -300,11 +300,35 @@ fn current_view_sql(dest_table: &str, pk_cols: &[String]) -> String {
     )
 }
 
-/// One readback per window: the current value of every masked column, for
-/// every key that needs one, from `<table>__current`. The view filters the
-/// base table by key first, so this probes the sorting key rather than
-/// scanning the log.
-async fn read_current(
+/// The rows that were in the log before the window `plan` appends: every row
+/// at an earlier stamp, and at its own stamp the baseline and the rows below
+/// its seq base (another writer's, which R1 numbers above). What sits at the
+/// stamp from the base up is this window's own earlier attempt.
+fn before_window(plan: &ReplayPlan) -> String {
+    format!(
+        "({CL_LSN} < {s} OR ({CL_LSN} = {s} AND ({CL_SEQ} < {b} OR {CL_OP} = '{base}')))",
+        s = plan.stamp(),
+        b = plan.seq_base(),
+        base = ch_str(CL_BASELINE),
+    )
+}
+
+/// One readback per window: what every masked column held BEFORE this window,
+/// for every key that needs one — `<table>__current`'s three rules over the
+/// rows `before_window` keeps.
+///
+/// Not the view itself: a replay reads back after its own earlier attempt
+/// landed, and the view shows that attempt. A re-key's `D` half hides the old
+/// key's row there, so its `U` half — resumed past the prefix that landed, or
+/// resolved again by a longer replay — found no cell to carry and failed
+/// "torn" on every run: the table's watermark, and every group sibling's,
+/// never moved again. A masked update followed in the window by a `D` or `T`
+/// of its key did the same. The window's own events are the carry's
+/// (`Changes::resolve_masked`); the destination only has to answer for what
+/// came before them. Filtered by key first, so this probes the sorting key
+/// rather than scanning the log; the `T` bound reads only `T` rows.
+#[allow(clippy::too_many_arguments)]
+async fn read_base(
     u: &mut ChUnit<'_>,
     dest_table: &str,
     pk_cols: &[String],
@@ -312,19 +336,39 @@ async fn read_current(
     keys: &[crate::logbased::changelog::CKey],
     cols: &[usize],
     wal_cols: &[String],
+    plan: &ReplayPlan,
 ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
-    let view = ch_ident(&format!("{dest_table}__current"));
+    let t = ch_ident(dest_table);
     let sel = pk_cols
         .iter()
         .map(|c| ch_ident(c))
         .chain(cols.iter().map(|&i| ch_ident(&wal_cols[i])))
         .collect::<Vec<_>>()
         .join(", ");
+    let key_list = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
     let mut preds = Vec::with_capacity(keys.len());
     for k in keys {
         preds.push(format!("({})", key_pred(pk_cols, k, pk_oids)?));
     }
-    let body = u.read(&format!("SELECT {sel} FROM {view} WHERE {} FORMAT TabSeparated", preds.join(" OR "))).await?;
+    let pre = before_window(plan);
+    let body = u
+        .read(&format!(
+            "SELECT {sel} FROM ( \
+               SELECT * FROM {t} \
+               WHERE ({keys}) AND {pre} \
+                 AND ({CL_LSN}, {CL_SEQ}) > ( \
+                   SELECT ifNull(max(({CL_LSN}, {CL_SEQ})), (toUInt64(0), toUInt32(0))) \
+                   FROM {t} WHERE {CL_OP} = '{tr}' AND {pre} \
+                 ) \
+               ORDER BY {CL_LSN} DESC, {CL_SEQ} DESC, {CL_OP} = '{base}' ASC \
+               LIMIT 1 BY {key_list} \
+             ) WHERE {CL_OP} != '{del}' FORMAT TabSeparated",
+            keys = preds.join(" OR "),
+            tr = ch_str("T"),
+            del = ch_str("D"),
+            base = ch_str(CL_BASELINE),
+        ))
+        .await?;
     let np = pk_cols.len();
     let mut out = std::collections::HashMap::with_capacity(keys.len());
     for line in body.lines().filter(|l| !l.is_empty()) {
@@ -449,9 +493,10 @@ async fn apply_changelog_unit(
 
 /// The TabSeparated rows `plan` appends, and their column list.
 ///
-/// Built after the trim, so the masked readback never sees rows the trim
-/// removes: a torn attempt's rows are this window's own events, and a masked
-/// cell read from one of them would be a LATER value of the row.
+/// The masked readback asks for the rows before this window (`read_base`),
+/// never for what an earlier attempt of it appended: those are this window's
+/// own events, and a cell read from one of them would be a LATER value of the
+/// row — or, behind a re-key's `D` half, no row at all.
 async fn changelog_body(
     u: &mut ChUnit<'_>,
     dest_table: &str,
@@ -469,7 +514,7 @@ async fn changelog_body(
         let base = if keys.is_empty() || cols.is_empty() {
             std::collections::HashMap::new()
         } else {
-            read_current(u, dest_table, l.key_cols(), &l.key_oids(), &keys, &cols, wal_cols).await?
+            read_base(u, dest_table, l.key_cols(), &l.key_oids(), &keys, &cols, wal_cols, plan).await?
         };
         c.resolve_masked(&cols, &base)?
     } else {

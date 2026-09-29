@@ -130,6 +130,13 @@ impl ReplayPlan {
         self.trim_from
     }
 
+    /// The seq of this window's first event. At the stamp, rows below it
+    /// belong to another writer and precede the window; rows from it up are
+    /// this window's own, whichever attempt appended them.
+    pub(crate) fn seq_base(&self) -> u32 {
+        self.seq_base
+    }
+
     /// The table's events (by ordinal) this window appends.
     pub(crate) fn to_append(&self) -> std::ops::Range<usize> {
         self.skip..self.events

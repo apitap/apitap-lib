@@ -170,7 +170,10 @@ impl Changes {
     /// would silently destroy the column for every reader of the view, which is
     /// the single worst thing a CDC tool can do — so the value is reconstructed
     /// instead, from the last event IN THIS WINDOW that carried it, else from
-    /// `base`: the destination's current value, read back once per window.
+    /// `base`: what the destination held BEFORE this window, read back once
+    /// per window. Before it, never now: on a replay the destination already
+    /// holds an earlier attempt of these same events, and a re-key's `D` half
+    /// there hides the very row its `U` half is read from.
     ///
     /// Both are looked up at the key the row WAS at: `moved_from` for the `U`
     /// half of a re-key (the new key held nothing before this event), its own
