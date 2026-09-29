@@ -1249,7 +1249,9 @@ mod store {
         /// DROP → CREATE per window spent three round trips of ceremony on a
         /// window that only has ~7. The first time DROPs before creating rather
         /// than relying on IF NOT EXISTS — `AS SELECT … WHERE 0` freezes the
-        /// key's columns and types at creation.
+        /// key's columns and types at creation. For the same reason its
+        /// `input()` structure is read once per run: a TRUNCATE empties the
+        /// table and keeps its columns.
         pub(crate) async fn key_table_reset(&mut self, table: &str, pk_cols: &[String]) -> Result<String> {
             self.s.note("key_reset");
             let kt = artifact_ident_tok(table, Artifact::CdcDelete, ROOMY, &self.token);
@@ -1272,10 +1274,10 @@ mod store {
                         .await?;
                     self.s.first_time(&format!("\u{1}patch\u{1}{table}"));
                 }
+                self.s.forget_shape(&kt);
             } else {
                 self.s.ch.exec(&format!("TRUNCATE TABLE {kq}")).await?;
             }
-            self.s.forget_shape(&kt);
             Ok(kt)
         }
 
@@ -1973,6 +1975,42 @@ mod tests {
             assert_eq!(*s.ops.lock().unwrap(), ["read", "read", "trim", "mark_pending", "insert"]);
             s.close_unit(u, "_tok", vec![mark]).await.unwrap();
             assert_eq!(s.ops.lock().unwrap().last(), Some(&"state"));
+        });
+    }
+
+    /// The key table is created once per run and TRUNCATEd per window, and
+    /// its `input()` structure is read once. Forgetting the structure after
+    /// every TRUNCATE re-read `system.columns` on every window — 51 extra
+    /// round trips on the T9 receipt's 10M-row run.
+    #[test]
+    fn key_table_shape_is_read_once_per_run() {
+        use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let kt = artifact_ident_tok("t", Artifact::CdcDelete, ROOMY, "_tok");
+            let reads = Arc::new(AtomicUsize::new(0));
+            let (r2, k2) = (reads.clone(), kt.clone());
+            let url = mock_with(Arc::new(move |sql: &str| {
+                if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                    return (format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000), 0);
+                }
+                if sql.contains("SELECT name, type FROM system.columns") && sql.contains(&format!("table = '{k2}'")) {
+                    r2.fetch_add(1, SeqCst);
+                    return ("id\tInt32\n".into(), 0);
+                }
+                (String::new(), 1)
+            }))
+            .await;
+            let s = ChStore::connect(&url).unwrap();
+            let keys = vec![s.lease_key("t")];
+            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+            let id = ["id".to_string()];
+            for _ in 0..3 {
+                assert_eq!(u.key_table_reset("t", &id).await.unwrap(), kt);
+                u.insert_owned(&kt, &id, b"1\n".to_vec()).await.unwrap();
+            }
+            assert_eq!(reads.load(SeqCst), 1, "the key table's columns were read again after a TRUNCATE");
+            assert_eq!(s.ops.lock().unwrap().iter().filter(|o| **o == "key_reset").count(), 3);
         });
     }
 
