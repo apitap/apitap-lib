@@ -13,6 +13,12 @@ the whole window failed "must match at most one source row" on every retry and
 the watermark never moved. Asked of BigQuery: the key is gone, the table equals
 the source, and the newest state row's watermark moved.
 
+And the same key taken through the collapser's ordered tail (T4b): an UPDATE that
+leaves an out-of-line value alone arrives as unchanged-TOAST and sends the key
+there, and a delete in the tail folds to `Gone`. 0.56.0 staged one 'D' for the
+fold's `Gone` and one more for the delete set — so a delete set without
+duplicates still staged this key twice. `Resolved::rows()` yields it once.
+
 The leg drops what it created on exit, pass or fail.
 
 Reads BigQuery back with google-auth + REST (no bq CLI: it can't tell '' from
@@ -223,6 +229,25 @@ one_key_window("window4-delete-insert-delete", 7, [
     f"DELETE FROM {T} WHERE id=7",
     f"INSERT INTO {T} VALUES (7,'again',NULL,false,NULL,NULL)",
     f"DELETE FROM {T} WHERE id=7",
+])
+
+print("== windows 5-6 (T4b): delete / insert / masked update / delete on one key ==")
+# md5 text barely compresses, so 40000 bytes of it stays out of line and an
+# UPDATE that does not touch it really arrives as unchanged-TOAST.
+BIG = "(SELECT string_agg(md5(g::text), '') FROM generate_series(1, 1250) g)"
+pg(f"INSERT INTO {T} VALUES (8,'toasted',{BIG},true,NULL,NULL)")
+r = drain()
+check("window5-seed")
+stored = int(pg(f"SELECT pg_column_size(big) FROM {T} WHERE id=8").strip())
+if stored <= 2100:
+    print(f"   ✗ rig: id=8's big is {stored} bytes, inline — the UPDATE would not be masked")
+    sys.exit(2)
+print(f"   ✓ rig: id=8's big is stored out of line ({stored} bytes)")
+one_key_window("window6-delete-insert-masked-delete", 8, [
+    f"DELETE FROM {T} WHERE id=8",
+    f"INSERT INTO {T} VALUES (8,'again',{BIG},true,NULL,NULL)",
+    f"UPDATE {T} SET v='masked' WHERE id=8",
+    f"DELETE FROM {T} WHERE id=8",
 ])
 
 print("\n   ===== BQ CDC E2E: ALL GREEN =====")

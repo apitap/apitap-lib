@@ -21,14 +21,13 @@
 use crate::error::{Error, Result};
 use crate::lease::Watermark;
 use crate::logbased::drain::DrainOutcome;
-use crate::logbased::resolve::{resolve_window, Fin, Source};
+use crate::logbased::resolve::{resolve_window, Image, Source};
 use crate::logbased::rowtext::{decode_bytea, pk_indices, strip_utc_offset};
 use crate::plan::Delivered;
 use crate::sink::iceberg::CdcWindow;
 use crate::wire::bqparquet::ParquetEncoder;
 use crate::wire::pgcopy as pgc;
 use crate::wire::pgoutput::Cell;
-use std::collections::HashSet;
 
 pub(crate) use store::{IceStore, IceUnit};
 
@@ -145,22 +144,18 @@ async fn apply_unit(
 
     let bound = u.bind(dest_table, wal_cols, oids).await?;
 
-    // Replay the residue tail over the set-phase upserts into one final
-    // per-key state; unresolved TOAST holes go back to the source.
-    let mut finals = resolve_window(c, &pk_idx);
-    src.refetch_masked(&mut finals, qualified_src, pk, wal_cols, oids).await?;
+    // Replay the residue tail over the set-phase upserts into one entry per
+    // key; unresolved TOAST holes go back to the source.
+    let mut r = resolve_window(c, &pk_idx);
+    src.refetch_masked(&mut r, qualified_src, pk, wal_cols, oids).await?;
 
-    // Delete-set: every touched key (deleted or re-landed). A TRUNCATE
-    // window starts from an empty manifest list — nothing old to delete.
+    // Delete-set: every touched key (deleted or re-landed), each once. A
+    // TRUNCATE window starts from an empty manifest list — nothing old to
+    // delete.
     let (mut del_ints, mut del_texts) = (Vec::new(), Vec::new());
     if !c.truncate {
-        let mut seen: HashSet<&[u8]> =
-            HashSet::with_capacity(c.deletes.len() + finals.len());
-        for key in c.deletes.iter().chain(finals.iter().map(|(k, _)| k)) {
+        for (key, _) in r.rows() {
             let k = key[0].as_slice();
-            if !seen.insert(k) {
-                continue;
-            }
             if key_int {
                 del_ints.push(parse_int_key(k)?);
             } else {
@@ -172,7 +167,7 @@ async fn apply_unit(
         }
     }
 
-    let n_rows = finals.iter().filter(|(_, f)| !matches!(f, Fin::Gone)).count() as u64;
+    let n_rows = r.rows().filter(|(_, image)| !matches!(image, Image::Delete)).count() as u64;
     let data = if n_rows > 0 {
         let mut enc = ParquetEncoder::new_ext(
             wal_cols.clone(),
@@ -184,12 +179,11 @@ async fn apply_unit(
         let mut chunk = Vec::with_capacity(256 << 10);
         pgc::header(&mut chunk);
         let mut sent = 0u64;
-        for (_, fin) in &finals {
-            let row: &[Cell] = match fin {
-                Fin::Row(r) => r,
-                Fin::Owned(r) => r,
-                Fin::Gone => continue,
-                Fin::Refetch(_) => {
+        for (_, image) in r.rows() {
+            let row: &[Cell] = match image {
+                Image::Row(row) => row,
+                Image::Delete => continue,
+                Image::Masked { .. } => {
                     return Err(Error::Transfer(
                         "log_based: unchanged-TOAST cell survived the refetch — bug".into(),
                     ))
@@ -249,7 +243,7 @@ async fn apply_unit(
 }
 
 // ── residue resolution ──────────────────────────────────────────────────────
-// `resolve_window` + `Fin` live in `crate::logbased::resolve` (shared with the
+// `resolve_window` + `Image` live in `crate::logbased::resolve` (shared with the
 // BigQuery apply path), and so does `Source`, the read-only handle Iceberg
 // fills its leftover TOAST holes through.
 

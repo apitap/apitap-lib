@@ -40,10 +40,6 @@ impl DeleteSet {
         self.0.iter()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -479,7 +475,7 @@ mod tests {
         cl.insert(row(&[t("2"), t("b")])).unwrap();
         cl.update(None, row(&[t("1"), t("a2")])).unwrap();
         let out = cl.finish();
-        assert_eq!(out.deletes.len(), 0);
+        assert!(out.deletes.is_empty());
         assert_eq!(cells_of(&out.upserts), vec![vec![t("1"), t("a2")], vec![t("2"), t("b")]]);
         assert_eq!(out.events, 3);
     }

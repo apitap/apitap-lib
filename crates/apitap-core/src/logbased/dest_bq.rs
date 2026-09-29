@@ -30,12 +30,11 @@ use crate::error::{Error, Result};
 use crate::lease::Watermark;
 use crate::logbased::collapse::Key;
 use crate::logbased::drain::DrainOutcome;
-use crate::logbased::resolve::{resolve_window, Fin};
+use crate::logbased::resolve::{resolve_window, Image};
 use crate::logbased::rowtext::pk_indices;
 use crate::sink::bigquery::sql_str;
 use crate::wire::pgoutput::Cell;
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
 
 pub(crate) use store::{BqStore, BqUnit};
 
@@ -723,53 +722,25 @@ async fn stage(
     }
     let plan = ApplyPlan::build(table, wal_cols, oids, pk_cols, &types)?;
 
-    // Fold the window to one final image per key.
-    let finals = resolve_window(c, &pk_idx);
-
-    // Build the staging body: upserts (op='U', maybe masked) and deletes
-    // (op='D', PK columns only). A key that is both deleted and re-landed
-    // rides as one 'U' row — never emit a second 'D' for it (the MERGE
-    // requires at most one source row per target row).
-    let landed: HashSet<Key> = finals
-        .iter()
-        .filter(|(_, f)| !matches!(f, Fin::Gone))
-        .map(|(k, _)| k.clone())
-        .collect();
+    // Build the staging body from the window folded to one entry per key:
+    // its final image as op='U' (maybe masked), or op='D' (PK columns only).
+    // One staging row per key is what the MERGE requires — at most one source
+    // row per target row — and `rows()` yields each key exactly once.
     let mut ndjson: Vec<u8> = Vec::new();
     let mut staged = 0u64;
-    for (key, fin) in &finals {
-        match fin {
-            Fin::Row(cells) => {
-                push_upsert(&mut ndjson, wal_cols, cells, None)?;
-                staged += 1;
-            }
-            Fin::Owned(cells) => {
-                push_upsert(&mut ndjson, wal_cols, cells, None)?;
-                staged += 1;
-            }
-            Fin::Refetch(cells) => {
-                let mask: String = cells
+    for (key, image) in resolve_window(c, &pk_idx).rows() {
+        match image {
+            Image::Row(cells) => push_upsert(&mut ndjson, wal_cols, cells, None)?,
+            Image::Masked { row, .. } => {
+                let mask: String = row
                     .iter()
                     .map(|c| if matches!(c, Cell::UnchangedToast) { '1' } else { '0' })
                     .collect();
-                push_upsert(&mut ndjson, wal_cols, cells, Some(&mask))?;
-                staged += 1;
+                push_upsert(&mut ndjson, wal_cols, row, Some(&mask))?;
             }
-            Fin::Gone => {
-                push_delete(&mut ndjson, pk_cols, key)?;
-                staged += 1;
-            }
+            Image::Delete => push_delete(&mut ndjson, pk_cols, key)?,
         }
-    }
-    if !c.truncate {
-        for key in c.deletes.iter() {
-            // A key also re-landed as an upsert rides as that one 'U' row.
-            if landed.contains(key) {
-                continue;
-            }
-            push_delete(&mut ndjson, pk_cols, key)?;
-            staged += 1;
-        }
+        staged += 1;
     }
 
     if staged == 0 {

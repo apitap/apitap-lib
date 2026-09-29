@@ -154,7 +154,8 @@ LEGS = [
     leg("e2e_guard_matrix.py",     "the guard asks Iceberg the same questions", {"iceberg"}, ["ice"],
         proves={"guard.bulk-vs-bulk": ("ice",)}),
 
-    leg("e2e_bq_cdc.py",           "CDC into BigQuery via staging + MERGE", {"bq"}),
+    leg("e2e_bq_cdc.py",           "CDC into BigQuery via staging + MERGE", {"bq"},
+        proves={"bq.replica-one-row-per-key": ("bq",), "leg.e2e_bq_cdc": (_claims.LEG_ENGINE,)}),
     leg("e2e_state_contract.py",   "the state contract, asked of BigQuery", {"bq"}, ["bq"],
         proves={"state.cross-lane-refusal": ("bq",)}),
     leg("e2e_bq_guard.py",         "a BigQuery bulk run meets a drain's announcement", {"bq"},
