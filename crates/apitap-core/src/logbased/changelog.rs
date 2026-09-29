@@ -48,6 +48,14 @@ impl ChangeOp {
 pub(crate) struct Change {
     pub op: ChangeOp,
     pub row: Option<Tuple>,
+    /// The key the row lived at before THIS update moved it: set on the `U`
+    /// half of a key-changing update, `None` everywhere else. An untouched
+    /// TOAST cell of a moved row is still where the row was — in what the
+    /// window carried for that key, or in the destination's row there — never
+    /// at the new key, which held nothing. Boxed: a re-key is rare, and every
+    /// other event of the window then pays a pointer for the field, not an
+    /// empty Vec.
+    pub moved_from: Option<Box<CKey>>,
 }
 
 /// One table's captured window, in WAL order.
@@ -73,36 +81,45 @@ impl Changes {
     pub(crate) fn insert(&mut self, row: Tuple) {
         self.count += 1;
         self.note_mask(&row);
-        self.events.push(Change { op: ChangeOp::Insert, row: Some(row) });
+        self.events.push(Change { op: ChangeOp::Insert, row: Some(row), moved_from: None });
     }
 
     /// An update lands as ONE `U` carrying the new image. A PK-changing update
     /// additionally lands a `D` for the old identity FIRST, so a consumer
     /// replaying the log sees the old key die before the new one appears —
-    /// the same ordering the collapsed path encodes as delete-then-upsert.
+    /// the same ordering the collapsed path encodes as delete-then-upsert —
+    /// and its `U` names the old key in `moved_from`.
     pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple, pk_idx: &[usize]) {
         self.count += 1;
         self.note_mask(&row);
+        let mut moved_from = None;
         if let Some(old) = old {
-            if key_of(old, pk_idx) != key_of(&row, pk_idx) {
-                self.events.push(Change { op: ChangeOp::Delete, row: Some(old.clone()) });
+            let from = key_of(old, pk_idx);
+            if from != key_of(&row, pk_idx) {
+                self.events.push(Change { op: ChangeOp::Delete, row: Some(old.clone()), moved_from: None });
+                moved_from = Some(Box::new(from));
             }
         }
-        self.events.push(Change { op: ChangeOp::Update, row: Some(row) });
+        self.events.push(Change { op: ChangeOp::Update, row: Some(row), moved_from });
     }
 
     pub(crate) fn delete(&mut self, old: Tuple) {
         self.count += 1;
-        self.events.push(Change { op: ChangeOp::Delete, row: Some(old) });
+        self.events.push(Change { op: ChangeOp::Delete, row: Some(old), moved_from: None });
     }
 
     /// Which keys carry a masked cell, and the union of the columns they are
-    /// missing — the shopping list for ONE readback per window.
+    /// missing — the shopping list for ONE readback per window. A moved row's
+    /// cells are read at the key it came from (`moved_from`), and a `D` image
+    /// is never rebuilt (see `resolve_masked`), so it asks for nothing.
     pub(crate) fn mask_plan(&self, pk_idx: &[usize]) -> (Vec<CKey>, Vec<usize>) {
         let mut keys: Vec<CKey> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut cols = std::collections::BTreeSet::new();
         for ev in &self.events {
+            if ev.op == ChangeOp::Delete {
+                continue;
+            }
             let Some(row) = &ev.row else { continue };
             let mut any = false;
             for i in 0..row.len() {
@@ -112,7 +129,10 @@ impl Changes {
                 }
             }
             if any {
-                let k = key_of(row, pk_idx);
+                let k = match &ev.moved_from {
+                    Some(from) => CKey::clone(from),
+                    None => key_of(row, pk_idx),
+                };
                 if seen.insert(k.clone()) {
                     keys.push(k);
                 }
@@ -134,6 +154,18 @@ impl Changes {
     /// instead, from the last event IN THIS WINDOW that carried it, else from
     /// `base`: the destination's current value, read back once per window.
     ///
+    /// Both are looked up at the key the row WAS at: `moved_from` for the `U`
+    /// half of a re-key (the new key held nothing before this event), its own
+    /// key otherwise. Three rules keep the carry honest:
+    /// - every `I`/`U` writes its WHOLE image into the carry, masked cells as
+    ///   resolved, so a later event of a moved row (a masked update at its new
+    ///   key, or a second move) finds them where the row now is;
+    /// - a `D` image writes nothing: under REPLICA IDENTITY DEFAULT it is the
+    ///   key and NULLs, and the `D` half of a re-key would blank the old key's
+    ///   cells just before its `U` half reads them;
+    /// - a `T` empties the carry, and from then on `base` is not the row's
+    ///   past — the destination's pre-window row was truncated away.
+    ///
     /// A cell neither source can fill is a row the destination has never seen —
     /// a torn window, not a NULL. It is refused loudly.
     pub(crate) fn resolve_masked(
@@ -144,9 +176,18 @@ impl Changes {
         names: &[String],
     ) -> Result<HashMap<usize, Tuple>> {
         let mut carry: HashMap<CKey, HashMap<usize, Option<bytes::Bytes>>> = HashMap::new();
+        let mut truncated = false;
         let mut out = HashMap::new();
         for (idx, ev) in self.events.iter().enumerate() {
-            let Some(row) = &ev.row else { continue };
+            let row = match (ev.op, &ev.row) {
+                (ChangeOp::Truncate, _) => {
+                    carry.clear();
+                    truncated = true;
+                    continue;
+                }
+                (ChangeOp::Delete, _) | (_, None) => continue,
+                (_, Some(row)) => row,
+            };
             let n = row.len();
             let mut masked_any = false;
             let mut cells: Vec<Cell> = Vec::with_capacity(n);
@@ -161,46 +202,51 @@ impl Changes {
                 });
             }
             let key = key_of(row, pk_idx);
-            // What THIS event carried becomes the value later events inherit.
-            let slot = carry.entry(key.clone()).or_default();
+            if masked_any {
+                // Where the untouched cells still are: the old key of a move.
+                let src = ev.moved_from.as_deref().unwrap_or(&key);
+                for i in 0..n {
+                    if !matches!(cells[i], Cell::UnchangedToast) {
+                        continue;
+                    }
+                    let from_window = carry.get(src).and_then(|s| s.get(&i)).cloned();
+                    let from_dest = || {
+                        if truncated {
+                            return None;
+                        }
+                        cols.iter()
+                            .position(|&c| c == i)
+                            .and_then(|p| base.get(src).and_then(|b| b.get(p).cloned()))
+                    };
+                    let Some(v) = from_window.or_else(from_dest) else {
+                        return Err(Error::Transfer(format!(
+                            "log_based changelog: column '{}' arrived as unchanged-TOAST for a \
+                             row the destination has never seen — the window is torn. Clear \
+                             this table's _apitap_state row to re-bootstrap",
+                            names.get(i).map(String::as_str).unwrap_or("?")
+                        )));
+                    };
+                    cells[i] = match v {
+                        Some(b) => Cell::Text(b),
+                        None => Cell::Null,
+                    };
+                }
+            }
+            // What the row holds after THIS event — every cell, the ones just
+            // resolved included — is what later events of this key inherit.
+            let slot = carry.entry(key).or_default();
             for (i, c) in cells.iter().enumerate() {
-                match c {
-                    Cell::UnchangedToast => {}
-                    Cell::Null => {
-                        slot.insert(i, None);
-                    }
-                    Cell::Text(t) => {
-                        slot.insert(i, Some(t.clone()));
-                    }
-                }
-            }
-            if !masked_any {
-                continue;
-            }
-            for i in 0..n {
-                if !matches!(cells[i], Cell::UnchangedToast) {
-                    continue;
-                }
-                let from_window = slot.get(&i).cloned();
-                let from_dest = || {
-                    cols.iter()
-                        .position(|&c| c == i)
-                        .and_then(|p| base.get(&key).and_then(|b| b.get(p).cloned()))
+                let v = match c {
+                    Cell::Text(t) => Some(t.clone()),
+                    Cell::Null => None,
+                    // None is left: every masked cell was resolved above.
+                    Cell::UnchangedToast => continue,
                 };
-                let Some(v) = from_window.or_else(from_dest) else {
-                    return Err(Error::Transfer(format!(
-                        "log_based changelog: column '{}' arrived as unchanged-TOAST for a \
-                         row the destination has never seen — the window is torn. Clear \
-                         this table's _apitap_state row to re-bootstrap",
-                        names.get(i).map(String::as_str).unwrap_or("?")
-                    )));
-                };
-                cells[i] = match v {
-                    Some(b) => Cell::Text(b),
-                    None => Cell::Null,
-                };
+                slot.insert(i, v);
             }
-            out.insert(idx, Tuple::from_cells(&cells));
+            if masked_any {
+                out.insert(idx, Tuple::from_cells(&cells));
+            }
         }
         Ok(out)
     }
@@ -210,7 +256,7 @@ impl Changes {
     /// row of that table older than the truncate as gone.
     pub(crate) fn truncate(&mut self) {
         self.count += 1;
-        self.events.push(Change { op: ChangeOp::Truncate, row: None });
+        self.events.push(Change { op: ChangeOp::Truncate, row: None, moved_from: None });
     }
 }
 
@@ -266,6 +312,9 @@ mod tests {
         assert_eq!(ops, vec![ChangeOp::Delete, ChangeOp::Update]);
         // …but it is ONE source event.
         assert_eq!(c.count, 1);
+        // The U half names where the row was; the D half is that key itself.
+        assert_eq!(c.events[0].moved_from, None);
+        assert_eq!(c.events[1].moved_from.as_deref(), Some(&vec![b"1".to_vec()]));
     }
 
     #[test]
@@ -274,6 +323,94 @@ mod tests {
         c.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("1"), t("z")]), &[0]);
         assert_eq!(c.events.len(), 1);
         assert_eq!(c.events[0].op, ChangeOp::Update);
+        assert_eq!(c.events[0].moved_from, None);
+    }
+
+    // C1 (moved_key_masked_update_resolves_from_old_key) and its helper.
+    /// Rows are `id, title, body`, keyed on id, `body` the TOASTed column. The
+    /// rebuilt rows' `body` by event index, or the error's text; `base` is the
+    /// destination's `body` per key.
+    fn bodies(c: &Changes, base: &[(&str, &str)]) -> std::result::Result<Vec<(usize, String)>, String> {
+        let names = vec!["id".to_string(), "title".to_string(), "body".to_string()];
+        let (_, cols) = c.mask_plan(&[0]);
+        let base: HashMap<CKey, Vec<Option<bytes::Bytes>>> = base
+            .iter()
+            .map(|(k, v)| (vec![k.as_bytes().to_vec()], vec![Some(bytes::Bytes::copy_from_slice(v.as_bytes()))]))
+            .collect();
+        let fixed = c.resolve_masked(&[0], &cols, &base, &names).map_err(|e| e.to_string())?;
+        let mut out: Vec<(usize, String)> = fixed
+            .iter()
+            .map(|(i, r)| {
+                let body = match r.view(2) {
+                    Cellv::Text(b) => String::from_utf8_lossy(b).to_string(),
+                    other => format!("{other:?}"),
+                };
+                (*i, body)
+            })
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    #[test]
+    fn moved_key_masked_update_resolves_from_old_key() {
+        // `UPDATE t SET id = 9 WHERE id = 1` with `body` untouched: a D of the
+        // old identity, then a U at 9 whose body is masked. Key 9 held nothing
+        // before this event; the body is still at key 1.
+        let big = || row(&[t("1"), t("a"), t("BIG")]);
+        let key_only = |k: &str| row(&[t(k), Cell::Null, Cell::Null]); // REPLICA IDENTITY DEFAULT
+        let masked = |k: &str, title: &str| row(&[t(k), t(title), Cell::UnchangedToast]);
+        let torn = |r: std::result::Result<Vec<(usize, String)>, String>| {
+            assert!(matches!(&r, Err(m) if m.contains("torn")), "want the torn error, got {r:?}")
+        };
+
+        // (a) the window carried key 1's body (a full old image, as under
+        // REPLICA IDENTITY FULL); (b) only the destination holds it, at key 1.
+        let mut a = Changes::default();
+        a.insert(big());
+        a.update(Some(&big()), masked("9", "b"), &[0]);
+        let mut b = Changes::default();
+        b.update(Some(&key_only("1")), masked("9", "b"), &[0]);
+        assert_eq!(
+            [bodies(&a, &[]), bodies(&b, &[("1", "OLD")])],
+            [Ok(vec![(2, "BIG".to_string())]), Ok(vec![(1, "OLD".to_string())])]
+        );
+        // …so the window's one readback asks for key 1, not 9.
+        assert_eq!(b.mask_plan(&[0]), (vec![vec![b"1".to_vec()]], vec![2]));
+
+        // (c) a value at the NEW key is not this row's past: nothing holds the
+        // body where the row was, so the window is torn.
+        torn(bodies(&b, &[("9", "NINE")]));
+
+        // (d) the D half's key-only image does not blank the carry its U half
+        // reads next.
+        let mut d = Changes::default();
+        d.insert(big());
+        d.update(Some(&key_only("1")), masked("9", "b"), &[0]);
+        assert_eq!(bodies(&d, &[]), Ok(vec![(2, "BIG".to_string())]));
+
+        // (e) after an in-window TRUNCATE, neither the destination's row nor
+        // what the window carried before it is this row's.
+        let mut e = Changes::default();
+        e.truncate();
+        e.update(None, masked("1", "c"), &[0]);
+        torn(bodies(&e, &[("1", "OLD")]));
+        let mut e = Changes::default();
+        e.insert(big());
+        e.truncate();
+        e.update(None, masked("1", "c"), &[0]);
+        torn(bodies(&e, &[]));
+
+        // (f) a chain 1→9→5, then a masked update at 5: each event finds the
+        // body resolved where the row now is, the destination read at 1 only.
+        let mut f = Changes::default();
+        f.update(Some(&key_only("1")), masked("9", "b"), &[0]); // D 0, U 1
+        f.update(Some(&key_only("9")), masked("5", "c"), &[0]); // D 2, U 3
+        f.update(None, masked("5", "d"), &[0]); // U 4
+        assert_eq!(
+            bodies(&f, &[("1", "OLD")]),
+            Ok(vec![(1, "OLD".to_string()), (3, "OLD".to_string()), (4, "OLD".to_string())])
+        );
     }
 
     #[test]

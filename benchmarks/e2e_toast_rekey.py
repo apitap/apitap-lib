@@ -37,9 +37,18 @@ deleting it puts the operation in the residue tail, AFTER the set phase — so a
 later INSERT reusing the old key could be dragged along with it. Both keys go
 sticky to prevent that, and reasoning is not evidence.
 
+One more destination is a changelog, `chlog` (T5a): the same re-key with
+`changelog=True` into ClickHouse. A changelog never patches a row in place —
+every record is read whole — so the apply rebuilds a masked cell from the
+window, else from the destination's row at that key. The `U` half of a re-key
+sits at a key the destination never held, and 0.56.0 looked THERE: every retry
+failed "the window is torn" and the table never moved again. The cell is at
+the OLD key. The window also carries a chain (2 -> 20 -> 5), whose second move
+can only find the body in what the first one resolved.
+
 Rig: `apitap-bench-pg-src` on :5544 (source, always), and as destinations
 `apitap-bench-pg-dst` on :5545, `apitap-bench-my-dst` on :3308, ClickHouse on
-:8124. Pass DESTS to narrow it, e.g. DESTS=ch.
+:8124. Pass DESTS to narrow it, e.g. DESTS=ch or DESTS=chlog.
 """
 import os
 import subprocess
@@ -75,6 +84,8 @@ def drop_our_slots():
     for s in sorted(_slots_now() - _SLOTS_BEFORE):
         src(f"SELECT pg_drop_replication_slot('{s}') FROM pg_replication_slots "
             f"WHERE slot_name='{s}' AND NOT active")
+        # A drain names its publication after its slot.
+        src(f'DROP PUBLICATION IF EXISTS "{s}_pub"')
 
 
 def case(label, good, detail=""):
@@ -142,7 +153,7 @@ def ch_dest():
 
 
 ALL = {"pg": pg_dest, "my": my_dest, "ch": ch_dest}
-WANT = os.environ.get("DESTS", "pg,my,ch").split(",")
+WANT = os.environ.get("DESTS", "pg,my,ch,chlog").split(",")
 
 
 def seed(rows):
@@ -231,9 +242,107 @@ COMMIT;
     drop_our_slots()
 
 
+CL = "toast_rekey_cl"
+CL_BODY = 102400        # 100 KiB: out of line, EXTERNAL keeps it uncompressed
+
+
+def run_changelog_ch():
+    """T5a: a re-key whose TOASTed column must be carried from the old key."""
+    print("\n════════ destination: clickhouse, changelog=True ════════")
+    url = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default")
+
+    def q(sql):
+        o = sh(["docker", "exec", "-i", "apitap-bench-ch", "clickhouse-client",
+                "--user", "default", "--password", "bench", "-q", sql])
+        if o.returncode:
+            raise RuntimeError(f"{sql[:120]} -> {o.stderr.strip()[-300:]}")
+        return o.stdout.strip()
+
+    def reset():
+        q(f"DROP VIEW IF EXISTS `{CL}__current`")
+        q(f"DROP TABLE IF EXISTS `{CL}`")
+        for t in ("_apitap_state", "_apitap_cdc_pending"):
+            if q(f"SELECT count() FROM system.tables WHERE database = currentDatabase() "
+                 f"AND name = '{t}'") != "0":
+                q(f"ALTER TABLE `{t}` DELETE WHERE dest_table = '{CL}' SETTINGS mutations_sync = 1")
+
+    def drain():
+        code = ("import apitap\n"
+                f"r = apitap.transfer({SRC!r}, {url!r}, table={CL!r}, mode='log_based', "
+                "changelog=True)\n"
+                "print('ROWS', r.rows, flush=True)\n")
+        return sh([sys.executable, "-c", code])
+
+    def watermark():
+        # The drain's own row; a Postgres source writes no other for this table.
+        return q(f"SELECT watermark FROM `_apitap_state` FINAL "
+                 f"WHERE dest_table = '{CL}' AND mode = 'log_based'")
+
+    def current(i):
+        return q(f"SELECT concat(lower(hex(MD5(ifNull(body, '')))), '/', toString(length(ifNull(body, '')))) "
+                 f"FROM `{CL}__current` WHERE id = {i}")
+
+    def source(i):
+        return src(f"SELECT md5(body) || '/' || length(body) FROM {CL} WHERE id = {i}")
+
+    src(f"DROP TABLE IF EXISTS {CL}")
+    src(f"CREATE TABLE {CL} (id int PRIMARY KEY, title text, body text)")
+    src(f"ALTER TABLE {CL} ALTER COLUMN body SET STORAGE EXTERNAL")
+    # A different body per row, so a value carried from the wrong key shows.
+    src(f"INSERT INTO {CL} SELECT g, 'title' || g, repeat(md5(g::text), {CL_BODY // 32}) "
+        f"FROM generate_series(1, 3) g")
+    try:
+        stored = src(f"SELECT pg_column_size(body) FROM {CL} WHERE id = 1")
+        case("the body is stored out of line, uncompressed", int(stored) >= CL_BODY, f"{stored} bytes")
+        reset()
+        drop_our_slots()
+        r = drain()
+        if r.returncode:
+            case("bootstrap", False, r.stderr.strip()[-400:])
+            return
+        case("bootstrap landed three baseline rows",
+             q(f"SELECT count() FROM `{CL}` WHERE _apitap_op = 'B'") == "3")
+        before = watermark()
+
+        src(f"""
+BEGIN;
+UPDATE {CL} SET id = 9 WHERE id = 1;
+UPDATE {CL} SET id = 20 WHERE id = 2;
+UPDATE {CL} SET id = 5 WHERE id = 20;
+COMMIT;
+""")
+        r = drain()
+        case("the drain succeeds", r.returncode == 0, r.stderr.strip()[-300:])
+        after = watermark()
+        print(f"   watermark {before} -> {after}")
+        case("the watermark advanced",
+             before.isdigit() and after.isdigit() and int(after) > int(before))
+        want9, got9 = source(9), current(9)
+        case("T5a: __current at id=9 carries the source body",
+             got9 == want9 and want9.endswith(f"/{CL_BODY}"), f"source {want9}  ch {got9!r}")
+        case("T5a: id=1 is gone from __current",
+             q(f"SELECT count() FROM `{CL}__current` WHERE id = 1") == "0")
+        newest = q(f"SELECT length(ifNull(body, '')) FROM `{CL}` WHERE id = 9 AND _apitap_op = 'U' "
+                   f"ORDER BY _apitap_lsn DESC, _apitap_seq DESC LIMIT 1")
+        case("T5a: the U record itself carries the body, not NULL", newest == str(CL_BODY), newest)
+        want5, got5 = source(5), current(5)
+        case("chain 2 -> 20 -> 5: __current at id=5 carries the source body",
+             got5 == want5 and want5.endswith(f"/{CL_BODY}"), f"source {want5}  ch {got5!r}")
+        ids = q(f"SELECT arrayStringConcat(arraySort(groupArray(toString(id))), ',') "
+                f"FROM `{CL}__current`")
+        want = src(f"SELECT string_agg(id::text, ',' ORDER BY id::text) FROM {CL}")
+        case("__current holds exactly the source's keys", ids == want, f"{want} vs {ids}")
+    finally:
+        src(f"DROP TABLE IF EXISTS {CL}")
+        reset()
+        drop_our_slots()
+
+
 for k in WANT:
     k = k.strip()
-    if k in ALL:
+    if k == "chlog":
+        run_changelog_ch()
+    elif k in ALL:
         run_for(ALL[k]())
     else:
         print(f"   .. unknown destination {k!r}, skipped")
