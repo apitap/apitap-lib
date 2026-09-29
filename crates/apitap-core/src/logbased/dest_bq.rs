@@ -762,7 +762,7 @@ async fn stage(
         }
     }
     if !c.truncate {
-        for key in &c.deletes {
+        for key in c.deletes.iter() {
             // A key also re-landed as an upsert rides as that one 'U' row.
             if landed.contains(key) {
                 continue;

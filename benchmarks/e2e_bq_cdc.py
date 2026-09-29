@@ -6,10 +6,19 @@ update, delete, unchanged-TOAST masked update, bytea update, net-delete tx),
 then a TRUNCATE window — and compares a per-row digest of the BigQuery target
 against Postgres ground truth after each.
 
+Then one key, deleted twice in one window (T4, audit §3.11). The MERGE refuses a
+target row that two staging rows match, and 0.56.0 staged one 'D' row per
+delete the collapser had pushed — `DELETE 7; INSERT 7; DELETE 7` pushed two, so
+the whole window failed "must match at most one source row" on every retry and
+the watermark never moved. Asked of BigQuery: the key is gone, the table equals
+the source, and the newest state row's watermark moved.
+
+The leg drops what it created on exit, pass or fail.
+
 Reads BigQuery back with google-auth + REST (no bq CLI: it can't tell '' from
 NULL). The SA private key is loaded inside google-auth and never printed.
 """
-import os, subprocess, sys, time
+import atexit, os, subprocess, sys, time
 import apitap
 
 PG = "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src"
@@ -101,6 +110,60 @@ def drain():
     return r
 
 
+def watermark():
+    """The drain's newest state row per source for T — what every reader
+    resolves. (The bootstrap's replace also leaves a source '*' barrier row
+    with no watermark; it is not the drain's.)"""
+    rows = bq(
+        "SELECT IFNULL(STRING_AGG(CONCAT(source_id, '=', IFNULL(watermark, '<N>')), ',' "
+        "ORDER BY source_id), '') FROM (SELECT source_id, watermark "
+        f"FROM `{PROJECT}.{DATASET}._apitap_state` WHERE dest_table = '{T}' AND mode = 'log_based' "
+        "QUALIFY ROW_NUMBER() OVER (PARTITION BY source_id ORDER BY synced_at DESC) = 1)")
+    return rows[0][0] if rows and rows[0] and rows[0][0] else ""
+
+
+def one_key_window(stage, key, statements):
+    """Run `statements` at the source, drain them as one window, and ask
+    BigQuery what it holds: `key` gone, the watermark moved, every row equal."""
+    before = watermark()
+    for sql in statements:
+        pg(sql)
+    try:
+        r = drain()
+    except Exception as e:  # the 0.56.0 failure is a raise; say what it left
+        after = watermark()
+        print(f"   ✗ {stage}: the drain raised: {str(e)[-400:]}")
+        print(f"     watermark {'UNMOVED' if after == before else 'moved'}: {before} -> {after}")
+        sys.exit(1)
+    print(f"   {stage} rows(events)={r.rows}")
+    n = int(bq(f"SELECT COUNT(*) FROM `{PROJECT}.{DATASET}.{T}` WHERE id = {key}")[0][0])
+    after = watermark()
+    print(f"   {'✓' if n == 0 else '✗'} {stage}: COUNT(*) WHERE id={key} = {n}")
+    moved = after != before and "<N>" not in after and after != ""
+    print(f"   {'✓' if moved else '✗'} {stage}: watermark {before} -> {after}")
+    if n != 0 or not moved:
+        sys.exit(1)
+    check(stage)
+
+
+def cleanup():
+    steps = [lambda t=t: bq(f"DROP TABLE IF EXISTS `{PROJECT}.{DATASET}.{t}`")
+             for t in (T, f"{T}__apitap_cdc")]
+    steps += [
+        lambda: bq(f"DELETE FROM `{PROJECT}.{DATASET}._apitap_state` WHERE dest_table='{T}'"),
+        lambda: pg(f"DROP TABLE IF EXISTS {T} CASCADE"),
+        lambda: pg(f"DROP PUBLICATION IF EXISTS apitap_pub_{T}"),
+        lambda: pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+                   f"WHERE slot_name LIKE 'apitap_%{T}%' AND NOT active"),
+    ]
+    for step in steps:  # each on its own: one failure must not keep the rest
+        try:
+            step()
+        except Exception as e:
+            print(f"   cleanup: {str(e)[:200]}")
+    print("   cleaned up")
+
+
 print("== fresh start ==")
 for tbl in (T,):
     pg(f"DROP TABLE IF EXISTS {tbl} CASCADE")
@@ -121,6 +184,8 @@ pg(f"INSERT INTO {T} VALUES "
    "(1,'a',repeat('x',4000),true,'\\xdeadbeef','2020-01-01 10:00:00+00'),"
    "(2,'',NULL,false,NULL,'2020-02-02 02:02:02+00'),"
    "(3,'c',repeat('y',5000),true,'\\x00','2020-03-03 03:03:03+00')")
+
+atexit.register(cleanup)
 
 print("== bootstrap ==")
 r = drain()
@@ -150,5 +215,14 @@ pg(f"INSERT INTO {T} VALUES (7,'post',repeat('z',3000),true,'\\x01','2022-07-07 
 r = drain()
 print(f"   truncate rows={r.rows}")
 check("window3-truncate")
+
+print("== window 4 (T4): delete / insert / delete on one key ==")
+# id 7 is on both sides (window 3). The window nets to one delete of 7's
+# pre-window row and nothing landed.
+one_key_window("window4-delete-insert-delete", 7, [
+    f"DELETE FROM {T} WHERE id=7",
+    f"INSERT INTO {T} VALUES (7,'again',NULL,false,NULL,NULL)",
+    f"DELETE FROM {T} WHERE id=7",
+])
 
 print("\n   ===== BQ CDC E2E: ALL GREEN =====")

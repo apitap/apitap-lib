@@ -215,6 +215,7 @@ fn db_err(e: sqlx::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logbased::collapse::DeleteSet;
 
     fn t(s: &str) -> Cell {
         Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()))
@@ -226,7 +227,7 @@ mod tests {
     #[test]
     fn residue_replay_lands_final_rows_in_order() {
         let c = Collapsed {
-            deletes: vec![key1("9")],
+            deletes: DeleteSet::from_keys(vec![key1("9")]),
             upserts: vec![
                 Tuple::from_cells(&[t("1"), t("a")]),
                 Tuple::from_cells(&[t("2"), t("b")]),

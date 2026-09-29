@@ -499,7 +499,7 @@ async fn apply_unit(
     if !c.deletes.is_empty() || !c.upserts.is_empty() {
         let kt = u.key_table_reset(dest_table, pk_cols).await?;
         let mut buf = Vec::with_capacity(1 << 20);
-        for key in &c.deletes {
+        for key in c.deletes.iter() {
             let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
             render_ch_key(&refs, &pk_oids, &mut buf)?;
         }

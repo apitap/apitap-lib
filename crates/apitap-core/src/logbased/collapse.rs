@@ -2,8 +2,8 @@
 //! adapted for one-shot set-based apply (docs/design/log_based.md).
 //!
 //! In: the window's row events for ONE table, in WAL order.
-//! Out: `deletes` (replica-identity keys whose destination rows must go),
-//! `upserts` (final row images, last-write-wins), and `residue` (events that
+//! Out: `deletes` (replica-identity keys whose destination rows must go, each
+//! once), `upserts` (final row images, last-write-wins), and `residue` (events that
 //! cannot ride the set-based path, in original order — today that is
 //! exactly the unchanged-TOAST updates, applied as column-masked UPDATEs).
 //!
@@ -26,11 +26,49 @@ use std::collections::HashMap;
 /// NULLs are illegal in identity keys (Postgres enforces NOT NULL on them).
 pub(crate) type Key = Vec<Vec<u8>>;
 
+/// The keys whose destination rows must go, each once, in no particular
+/// order. A set by construction: `Collapser::finish` reads it off the key map,
+/// where a key can only be once. It used to be a Vec pushed at every delete, so
+/// `delete 1; insert 1; delete 1` pushed key 1 twice — harmless to the SQL
+/// engines, whose delete joins a key table, and fatal to BigQuery, whose MERGE
+/// refuses a target row matched by two staging rows.
+#[derive(Debug, Default)]
+pub(crate) struct DeleteSet(Vec<Key>);
+
+impl DeleteSet {
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Key> {
+        self.0.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_keys(mut keys: Vec<Key>) -> Self {
+        keys.sort();
+        keys.dedup();
+        Self(keys)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sorted(&self) -> Vec<Key> {
+        let mut keys = self.0.clone();
+        keys.sort();
+        keys
+    }
+}
+
 /// One table's collapsed window.
 #[derive(Debug, Default)]
 pub(crate) struct Collapsed {
-    /// Destination rows to delete (dedup'd). Applied FIRST.
-    pub deletes: Vec<Key>,
+    /// Keys whose destination rows must go, each once. Order unspecified.
+    /// Applied FIRST.
+    pub deletes: DeleteSet,
     /// Final row images to land (one per surviving key). Applied second.
     pub upserts: Vec<Tuple>,
     /// Ordered tail for keys that touched an unchanged-TOAST update: once a
@@ -69,14 +107,27 @@ pub(crate) enum ResidueOp {
     Rekey { old_key: Key, new_key: Key, row: Vec<Cell> },
 }
 
-#[derive(Debug)]
+/// Where a key stands in the window. `del` says the key's PRE-window row is
+/// removed in the delete phase: the first delete of the key (or of it as the
+/// old identity of a key-changing update) sets it, and nothing but a TRUNCATE,
+/// which empties the map, clears it again.
+#[derive(Debug, Clone, Copy)]
 enum Slot {
-    /// Row pending upsert, at `upsert_seq` insertion order.
-    Upsert(usize),
+    /// Row pending upsert, at `seq` in insertion order.
+    Upsert { seq: usize, del: bool },
     /// Key pending delete only.
     Delete,
     /// Key lives in the residue tail now — all later events follow it there.
-    Residue,
+    Residue { del: bool },
+}
+
+impl Slot {
+    fn del(&self) -> bool {
+        match *self {
+            Slot::Upsert { del, .. } | Slot::Residue { del } => del,
+            Slot::Delete => true,
+        }
+    }
 }
 
 pub(crate) struct Collapser {
@@ -90,7 +141,6 @@ pub(crate) struct Collapser {
     /// version kept `(Key, Vec<Cell>)` and `finish()` threw the key away,
     /// which cost a clone per upsert for nothing.
     upserts: Vec<Option<Tuple>>,
-    deletes: Vec<Key>,
     residue: Vec<ResidueOp>,
     truncate: bool,
     events: u64,
@@ -102,7 +152,6 @@ impl Collapser {
             key_idx,
             map: HashMap::default(),
             upserts: Vec::new(),
-            deletes: Vec::new(),
             residue: Vec::new(),
             truncate: false,
             events: 0,
@@ -150,8 +199,8 @@ impl Collapser {
         // walks of a Vec<Vec<u8>> key for every change.
         match self.map.entry(key) {
             Entry::Occupied(mut e) => match *e.get() {
-                Slot::Residue => self.residue.push(ResidueOp::Upsert { row: row.to_cells() }),
-                Slot::Upsert(seq) => {
+                Slot::Residue { .. } => self.residue.push(ResidueOp::Upsert { row: row.to_cells() }),
+                Slot::Upsert { seq, .. } => {
                     // Last write wins in place.
                     self.upserts[seq] = Some(row);
                 }
@@ -159,13 +208,13 @@ impl Collapser {
                     // (delete then re-insert keeps both: delete phase first.)
                     let seq = self.upserts.len();
                     self.upserts.push(Some(row));
-                    e.insert(Slot::Upsert(seq));
+                    e.insert(Slot::Upsert { seq, del: true });
                 }
             },
             Entry::Vacant(e) => {
                 let seq = self.upserts.len();
                 self.upserts.push(Some(row));
-                e.insert(Slot::Upsert(seq));
+                e.insert(Slot::Upsert { seq, del: false });
             }
         }
         Ok(())
@@ -203,8 +252,14 @@ impl Collapser {
                     // queued: it lands first, and the move then carries it to
                     // the new key with its real TOAST value. That is the
                     // insert-then-rekey case, and it is correct.
-                    self.map.insert(old_key, Slot::Residue);
-                    self.map.insert(new_key, Slot::Residue);
+                    //
+                    // Each key keeps its pending delete: after `delete 9;
+                    // insert 9`, a move onto 9 still has to clear 9's
+                    // pre-window row before the tail runs.
+                    let d_old = self.map.get(&old_key).is_some_and(Slot::del);
+                    let d_new = self.map.get(&new_key).is_some_and(Slot::del);
+                    self.map.insert(old_key, Slot::Residue { del: d_old });
+                    self.map.insert(new_key, Slot::Residue { del: d_new });
                     return Ok(());
                 }
                 // Identity changed: the old row must die.
@@ -213,7 +268,7 @@ impl Collapser {
         }
         match self.map.entry(new_key) {
             Entry::Occupied(mut e) => match *e.get() {
-                Slot::Residue => {
+                Slot::Residue { .. } => {
                     // Sticky: later events on a residue key stay in the
                     // ordered tail. The key is only cloned on the masked
                     // path, where the op itself must carry it.
@@ -224,33 +279,34 @@ impl Collapser {
                         self.residue.push(ResidueOp::Upsert { row: row.to_cells() });
                     }
                 }
-                Slot::Upsert(seq) if !toast => {
+                Slot::Upsert { seq, .. } if !toast => {
                     self.upserts[seq] = Some(row);
                 }
                 Slot::Delete if !toast => {
                     let seq = self.upserts.len();
                     self.upserts.push(Some(row));
-                    e.insert(Slot::Upsert(seq));
+                    e.insert(Slot::Upsert { seq, del: true });
                 }
-                _ => {
+                slot => {
                     // Masked TOAST update on a non-residue key: the missing
                     // values would overwrite real data on the fat path, so the
                     // key goes sticky. A pending SET-phase upsert stays where
-                    // it is (phases run before the tail — correct order).
+                    // it is (phases run before the tail — correct order), and
+                    // so does a pending delete.
                     let key = e.key().clone();
                     self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
-                    e.insert(Slot::Residue);
+                    e.insert(Slot::Residue { del: slot.del() });
                 }
             },
             Entry::Vacant(e) => {
                 if toast {
                     let key = e.key().clone();
                     self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
-                    e.insert(Slot::Residue);
+                    e.insert(Slot::Residue { del: false });
                 } else {
                     let seq = self.upserts.len();
                     self.upserts.push(Some(row));
-                    e.insert(Slot::Upsert(seq));
+                    e.insert(Slot::Upsert { seq, del: false });
                 }
             }
         }
@@ -260,25 +316,7 @@ impl Collapser {
     pub(crate) fn delete(&mut self, old: &Tuple) -> Result<()> {
         self.events += 1;
         let key = self.key_of_old(old)?;
-        match self.map.entry(key) {
-            Entry::Occupied(mut e) => match *e.get() {
-                Slot::Residue => {
-                    let key = e.key().clone();
-                    self.residue.push(ResidueOp::Delete { key });
-                }
-                Slot::Upsert(seq) => {
-                    // insert-then-delete nets to delete-only.
-                    self.upserts[seq] = None;
-                    self.deletes.push(e.key().clone());
-                    e.insert(Slot::Delete);
-                }
-                Slot::Delete => {}
-            },
-            Entry::Vacant(e) => {
-                self.deletes.push(e.key().clone());
-                e.insert(Slot::Delete);
-            }
-        }
+        self.put_delete(key);
         Ok(())
     }
 
@@ -288,41 +326,127 @@ impl Collapser {
         // empty at this point in the sequence.
         self.map.clear();
         self.upserts.clear();
-        self.deletes.clear();
         self.residue.clear();
         self.truncate = true;
     }
 
-    /// Old-identity kill on a PK-changing update. Entry-shaped like the rest;
-    /// a residue-slotted old key follows the ordered tail.
+    /// A delete, and the old-identity kill on a PK-changing update.
+    /// Entry-shaped like the rest; a residue-slotted key follows the ordered
+    /// tail.
     fn put_delete(&mut self, key: Key) {
         match self.map.entry(key) {
             Entry::Occupied(mut e) => match *e.get() {
-                Slot::Residue => {
+                Slot::Residue { .. } => {
                     let key = e.key().clone();
                     self.residue.push(ResidueOp::Delete { key });
                 }
-                Slot::Upsert(seq) => {
+                Slot::Upsert { seq, .. } => {
+                    // insert-then-delete nets to delete-only.
                     self.upserts[seq] = None;
-                    self.deletes.push(e.key().clone());
                     e.insert(Slot::Delete);
                 }
                 Slot::Delete => {}
             },
             Entry::Vacant(e) => {
-                self.deletes.push(e.key().clone());
                 e.insert(Slot::Delete);
             }
         }
     }
 
     pub(crate) fn finish(self) -> Collapsed {
+        // One pass over the key map at the window's end: no per-event cost,
+        // and each deleted key moves out instead of being cloned at its delete.
+        let deletes = DeleteSet(self.map.into_iter().filter(|(_, s)| s.del()).map(|(k, _)| k).collect());
         Collapsed {
-            deletes: self.deletes,
+            deletes,
             upserts: self.upserts.into_iter().flatten().collect(),
             residue: self.residue,
             truncate: self.truncate,
             events: self.events,
+        }
+    }
+}
+
+/// Random windows for the property tests here and in `resolve.rs`: any mix of
+/// these events on a handful of keys. Not source-consistent on purpose (an
+/// insert may hit a live key): the collapser assumes nothing about its input,
+/// so neither do its tests.
+#[cfg(test)]
+pub(crate) mod gen {
+    use super::*;
+
+    /// xorshift64*: deterministic, so a failing sequence reproduces.
+    pub(crate) struct Rng(pub(crate) u64);
+
+    impl Rng {
+        pub(crate) fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) % n
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum Ev {
+        Insert(u8),
+        /// A full new image, no old one (REPLICA IDENTITY DEFAULT, key kept).
+        Update(u8),
+        /// The same with the TOASTed column unchanged.
+        Masked(u8),
+        Delete(u8),
+        /// A key-changing update (`from == to` is an update with an old image).
+        Rekey { from: u8, to: u8, toast: bool },
+        Truncate,
+    }
+
+    pub(crate) fn events(rng: &mut Rng, keys: u64, len: usize) -> Vec<Ev> {
+        (0..len)
+            .map(|_| {
+                let k = rng.below(keys) as u8;
+                match rng.below(100) {
+                    0..=19 => Ev::Insert(k),
+                    20..=34 => Ev::Update(k),
+                    35..=54 => Ev::Masked(k),
+                    55..=74 => Ev::Delete(k),
+                    75..=97 => Ev::Rekey { from: k, to: rng.below(keys) as u8, toast: rng.below(2) == 0 },
+                    _ => Ev::Truncate,
+                }
+            })
+            .collect()
+    }
+
+    fn text(s: &str) -> Cell {
+        Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    /// The key column's text for key `k`, as `Key` spells it.
+    pub(crate) fn key(k: u8) -> Key {
+        vec![k.to_string().into_bytes()]
+    }
+
+    /// Feed `evs` to a collapser keyed on column 0 of `(id, v, big)`; `v`
+    /// carries the event's ordinal, so every image is distinguishable.
+    pub(crate) fn feed(c: &mut Collapser, evs: &[Ev]) {
+        for (i, ev) in evs.iter().enumerate() {
+            let v = text(&format!("v{i}"));
+            let full = |k: u8| Tuple::from_cells(&[text(&k.to_string()), v.clone(), text("big")]);
+            let masked = |k: u8| Tuple::from_cells(&[text(&k.to_string()), v.clone(), Cell::UnchangedToast]);
+            let old = |k: u8| Tuple::from_cells(&[text(&k.to_string()), Cell::Null, Cell::Null]);
+            match *ev {
+                Ev::Insert(k) => c.insert(full(k)),
+                Ev::Update(k) => c.update(None, full(k)),
+                Ev::Masked(k) => c.update(None, masked(k)),
+                Ev::Delete(k) => c.delete(&old(k)),
+                Ev::Rekey { from, to, toast } => {
+                    c.update(Some(&old(from)), if toast { masked(to) } else { full(to) })
+                }
+                Ev::Truncate => {
+                    c.truncate();
+                    Ok(())
+                }
+            }
+            .expect("a well-formed event");
         }
     }
 }
@@ -367,7 +491,7 @@ mod tests {
         cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
         let out = cl.finish();
         assert_eq!(out.upserts.len(), 0);
-        assert_eq!(out.deletes, vec![key(&["1"])]);
+        assert_eq!(out.deletes.sorted(), vec![key(&["1"])]);
     }
 
     #[test]
@@ -376,8 +500,109 @@ mod tests {
         cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
         cl.insert(row(&[t("1"), t("new")])).unwrap();
         let out = cl.finish();
-        assert_eq!(out.deletes, vec![key(&["1"])]);
+        assert_eq!(out.deletes.sorted(), vec![key(&["1"])]);
         assert_eq!(cells_of(&out.upserts), vec![vec![t("1"), t("new")]]);
+    }
+
+    #[test]
+    fn delete_insert_delete_yields_one_delete() {
+        // The audit's BigQuery rejection (§3.11): one key deleted twice in a
+        // window was pushed twice, and a MERGE refuses two staging rows for
+        // one target row.
+        let mut cl = c();
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
+        cl.insert(row(&[t("1"), t("a")])).unwrap();
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
+        let out = cl.finish();
+        assert_eq!(out.deletes.sorted(), vec![key(&["1"])]);
+        assert!(out.upserts.is_empty());
+
+        // Two lives of one key in one window: still one delete.
+        let mut cl = c();
+        cl.insert(row(&[t("1"), t("a")])).unwrap();
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
+        cl.insert(row(&[t("1"), t("b")])).unwrap();
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
+        let out = cl.finish();
+        assert_eq!(out.deletes.sorted(), vec![key(&["1"])]);
+        assert!(out.upserts.is_empty());
+
+        // A move onto a key the window deleted and re-inserted: both
+        // identities go, each once, and the moved row lands.
+        let mut cl = c();
+        cl.delete(&row(&[t("9"), Cell::Null])).unwrap();
+        cl.insert(row(&[t("9"), t("x")])).unwrap();
+        cl.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("9"), t("y")])).unwrap();
+        let out = cl.finish();
+        assert_eq!(out.deletes.sorted(), vec![key(&["1"]), key(&["9"])]);
+        assert_eq!(cells_of(&out.upserts), vec![vec![t("9"), t("y")]]);
+    }
+
+    /// 0.56.0's delete list, transcribed for keys alone: a push at every step
+    /// INTO `Delete` (from a pending upsert or from nothing), none from the
+    /// residue tail, all cleared by a TRUNCATE. Those were the right keys;
+    /// only the count was wrong.
+    fn pushes_0560(evs: &[gen::Ev]) -> Vec<Key> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum S {
+            Up,
+            Del,
+            Res,
+        }
+        fn kill(map: &mut HashMap<Key, S>, pushed: &mut Vec<Key>, k: Key) {
+            if matches!(map.get(&k), None | Some(S::Up)) {
+                pushed.push(k.clone());
+                map.insert(k, S::Del);
+            }
+        }
+        fn land(map: &mut HashMap<Key, S>, k: Key, toast: bool) {
+            if toast {
+                map.insert(k, S::Res);
+            } else if map.get(&k) != Some(&S::Res) {
+                map.insert(k, S::Up);
+            }
+        }
+        let mut map = HashMap::new();
+        let mut pushed = Vec::new();
+        for ev in evs {
+            match *ev {
+                gen::Ev::Insert(k) | gen::Ev::Update(k) => land(&mut map, gen::key(k), false),
+                gen::Ev::Masked(k) => land(&mut map, gen::key(k), true),
+                gen::Ev::Delete(k) => kill(&mut map, &mut pushed, gen::key(k)),
+                gen::Ev::Rekey { from, to, toast } => {
+                    if from != to {
+                        if toast {
+                            map.insert(gen::key(from), S::Res);
+                            map.insert(gen::key(to), S::Res);
+                            continue;
+                        }
+                        kill(&mut map, &mut pushed, gen::key(from));
+                    }
+                    land(&mut map, gen::key(to), toast);
+                }
+                gen::Ev::Truncate => {
+                    map.clear();
+                    pushed.clear();
+                }
+            }
+        }
+        pushed
+    }
+
+    #[test]
+    fn delete_set_is_every_old_push_once() {
+        let mut rng = gen::Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..5000 {
+            let len = 1 + rng.below(12) as usize;
+            let evs = gen::events(&mut rng, 6, len);
+            let mut cl = c();
+            gen::feed(&mut cl, &evs);
+            let got = cl.finish().deletes.sorted();
+            let mut want = pushes_0560(&evs);
+            want.sort();
+            want.dedup();
+            assert_eq!(got, want, "window {evs:?}");
+        }
     }
 
     #[test]
@@ -386,7 +611,7 @@ mod tests {
         cl.insert(row(&[t("1"), t("a")])).unwrap();
         cl.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("9"), t("a")])).unwrap();
         let out = cl.finish();
-        assert_eq!(out.deletes, vec![key(&["1"])]);
+        assert_eq!(out.deletes.sorted(), vec![key(&["1"])]);
         assert_eq!(cells_of(&out.upserts), vec![vec![t("9"), t("a")]]);
     }
 

@@ -163,7 +163,7 @@ async fn apply_unit(
 
     if clear {
         let mut body = Vec::with_capacity(1 << 20);
-        for key in &c.deletes {
+        for key in c.deletes.iter() {
             let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
             render_my_key(&refs, &pk_oids, &mut body)?;
         }

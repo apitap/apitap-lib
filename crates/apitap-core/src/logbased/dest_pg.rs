@@ -162,7 +162,7 @@ async fn apply_unit(
             .await
             .map_err(db_err)?;
         let mut buf = Vec::with_capacity(4 << 20);
-        for key in &c.deletes {
+        for key in c.deletes.iter() {
             let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
             render_key_row(&refs, &mut buf);
             if buf.len() > 4 << 20 {
