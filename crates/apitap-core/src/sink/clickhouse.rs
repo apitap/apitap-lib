@@ -749,6 +749,38 @@ pub(crate) fn ch_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// The one `_apitap_state` read both lanes send ClickHouse: the row's whole
+/// vocabulary, keyed by the lane's spelling of the table, and no predicate on
+/// `mode` or `cursor_col` — `naming::state_verdict` decides whose it is.
+/// `FINAL`: the table is a ReplacingMergeTree keyed on exactly these two
+/// columns, so this is at most one row.
+pub(crate) fn state_read_sql(dest_table: &str, source_id: &str) -> String {
+    format!(
+        "SELECT watermark, cursor_col, mode FROM `_apitap_state` FINAL \
+         WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparated",
+        ch_str(dest_table),
+        ch_str(source_id)
+    )
+}
+
+/// The row `state_read_sql` returned, if any. An empty watermark reads as
+/// none (the column is a plain String, so "" is what an absent value became).
+pub(crate) fn state_row_of(body: &str) -> Result<Option<crate::naming::StateRow>> {
+    let Some(line) = body.lines().next() else { return Ok(None) };
+    let f: Vec<&str> = line.split('\t').collect();
+    if f.len() != 3 {
+        return Err(Error::Transfer(format!("malformed state row from ClickHouse: {line:?}")));
+    }
+    let text = |s: &str| {
+        crate::logbased::rowtext::tsv_unescape(s).map(|b| String::from_utf8_lossy(&b).into_owned())
+    };
+    Ok(Some(crate::naming::StateRow::new(
+        text(f[0]).filter(|w| !w.is_empty()),
+        text(f[1]),
+        text(f[2]),
+    )))
+}
+
 impl ChSink {
     /// Reading a Replicated table through a load balancer means an arbitrary
     /// replica answers, and it may not have fetched the parts another node
@@ -1694,6 +1726,18 @@ impl crate::sink::Sink for ChSink {
         } else {
             Some(prim_key)
         };
+        // The state row BEFORE the emptiness check, and its whole vocabulary:
+        // `naming::cursor_watermark` refuses a drain's row (an LSN is not a
+        // cursor value) and another cursor's, whether or not the table has
+        // rows. Until 0.57.0 this read took `watermark` alone, after the
+        // emptiness return — an append onto a drained table resumed from the
+        // LSN as if it were an id, and an emptied one overwrote the drain's
+        // state. The CDC lane sends the same statement (`state_read_sql`).
+        let state_wm = crate::naming::cursor_watermark(
+            &self.final_bare,
+            cursor,
+            state_row_of(&self.ch.exec(&state_read_sql(&self.final_bare, source_id)).await?)?,
+        )?;
         let n: u64 = self
             .ch
             .exec(&format!("SELECT count() FROM {}", self.final_t))
@@ -1726,19 +1770,6 @@ impl crate::sink::Sink for ChSink {
         // crash can leave the state one run behind. The effective watermark is the
         // GREATEST of state and data: a stale-low state row then merely re-reads a
         // delta the data already shows (loud, bounded), never skips ahead.
-        let state_wm: Option<String> = {
-            let out = self
-                .ch
-                .exec(&format!(
-                    "SELECT watermark FROM `_apitap_state` FINAL \
-                     WHERE dest_table = '{}' AND source_id = '{}'",
-                    ch_str(&self.final_bare),
-                    ch_str(source_id)
-                ))
-                .await?;
-            let t = out.trim();
-            (!t.is_empty()).then(|| t.to_string())
-        };
         let siblings = if state_wm.is_none() {
             let n: u64 = self
                 .ch

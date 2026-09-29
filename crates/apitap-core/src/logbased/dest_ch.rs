@@ -30,7 +30,7 @@ use crate::wire::pgoutput::Cell;
 
 pub(crate) use store::{ChStore, ChUnit};
 
-const STATE_CURSOR: &str = "_lsn";
+use crate::naming::STATE_CURSOR_LSN as STATE_CURSOR;
 
 // ── changelog mode (`changelog=true`) ───────────────────────────────────────
 // The destination stops being a replica and becomes an append-only audit trail:
@@ -79,8 +79,13 @@ impl ChDest {
         }
     }
 
-    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
-        self.store.read_state(dest_table, source_id).await
+    /// The drain's watermark, through the one verdict both lanes share.
+    pub(crate) async fn read_state(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+    ) -> Result<Option<crate::naming::CdcWatermark>> {
+        crate::naming::cdc_watermark(dest_table, self.store.read_state(dest_table, source_id).await?)
     }
 
     pub(crate) async fn validate_changelog_ddl(
@@ -931,18 +936,18 @@ mod store {
             self.structures.lock().unwrap().remove(table);
         }
 
-        pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        /// This table's state row, whichever lane wrote it (the one read both
+        /// lanes send: `sink::clickhouse::state_read_sql`).
+        pub(crate) async fn read_state(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<crate::naming::StateRow>> {
             // Run admission: read_state is the FIRST thing a run asks this
             // destination, for every table — the moment to notice a clustered
             // target and refuse before a bootstrap or a drain moves any data.
             self.refuse_clustered(dest_table).await?;
-            let sql = format!(
-                "SELECT watermark, cursor_col, mode FROM `_apitap_state` FINAL \
-                 WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparated",
-                ch_str(dest_table),
-                ch_str(source_id)
-            );
-            let body = match self.ch.read(&sql).await {
+            let body = match self.ch.read(&crate::sink::clickhouse::state_read_sql(dest_table, source_id)).await {
                 Ok(b) => b,
                 // No state table at all = fresh destination.
                 Err(Error::Transfer(m)) if m.contains("UNKNOWN_TABLE") || m.contains("doesn't exist") => {
@@ -950,22 +955,7 @@ mod store {
                 }
                 Err(e) => return Err(e),
             };
-            let Some(line) = body.lines().next() else { return Ok(None) };
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 3 {
-                return Err(Error::Transfer(format!("log_based: malformed state row from ClickHouse: {line:?}")));
-            }
-            if f[2] != "log_based" || f[1] != STATE_CURSOR {
-                return Err(Error::InvalidInput(format!(
-                    "log_based: state row for this table tracks cursor '{}' in mode \
-                     '{}', not an LSN — it was written by another mode. Use a \
-                     different dest_table or delete the state row",
-                    f[1], f[2]
-                )));
-            }
-            f[0].parse::<u64>()
-                .map(Some)
-                .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{}'", f[0])))
+            crate::sink::clickhouse::state_row_of(&body)
         }
 
         /// Ask ClickHouse itself whether these clauses resolve against the

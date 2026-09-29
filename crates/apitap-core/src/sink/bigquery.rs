@@ -2337,6 +2337,51 @@ impl crate::sink::Sink for BqSink {
                 .unwrap_or(""),
             cursor,
         )?;
+        // The state row BEFORE the emptiness check, and its whole vocabulary:
+        // `naming::cursor_watermark` refuses a drain's row (an LSN is not a
+        // cursor value) and another cursor's, whether or not the table has
+        // rows. Until 0.57.0 this read took `watermark` alone, after the
+        // emptiness return — an append onto a drained table resumed from the
+        // LSN as if it were an id, and an emptied one overwrote the drain's
+        // state.
+        //
+        // The state table is append-only: take MY newest row and check for other
+        // sources' rows, both relative to the newest `*` replace-barrier — all
+        // resolved server-side in one free SELECT (timestamps never round-trip
+        // through text). `o` is referenced once, so its row is one row (its
+        // cells never come from two tie-broken picks); `present` tells "no
+        // row" from a row whose cells are NULL.
+        let (own_state, siblings) = if self.conn.table_get(STATE_TABLE).await?.is_some() {
+            let sql = format!(
+                "WITH s AS (SELECT * FROM {state} WHERE dest_table = '{dt}'), \
+                 b AS (SELECT IFNULL(MAX(synced_at), TIMESTAMP '1970-01-01') AS ts \
+                       FROM s WHERE source_id = '*'), \
+                 o AS (SELECT 'true' AS present, watermark, cursor_col, mode FROM s, b \
+                       WHERE source_id = '{sid}' AND synced_at > b.ts \
+                       ORDER BY synced_at DESC LIMIT 1), \
+                 x AS (SELECT CAST(COUNT(*) > 0 AS STRING) AS sib FROM s, b \
+                       WHERE source_id NOT IN ('*', '{sid}') AND synced_at > b.ts) \
+                 SELECT o.present, o.watermark, o.cursor_col, o.mode, x.sib \
+                 FROM x LEFT JOIN o ON TRUE",
+                state = self.fq(STATE_TABLE),
+                dt = sql_str(&self.final_table),
+                sid = sql_str(source_id),
+            );
+            let rows = self.conn.query(&sql).await?;
+            let row = rows.into_iter().next().unwrap_or_default();
+            let cell = |i: usize| row.get(i).cloned().flatten();
+            let own = (cell(0).as_deref() == Some("true"))
+                .then(|| crate::naming::StateRow::new(cell(1), cell(2), cell(3)));
+            let sib = cell(4).as_deref() == Some("true");
+            // The SELECT above just paid for the table's whole append-only
+            // history; if it has bloated past the threshold, fold it down to
+            // what readers can still use. Best-effort — an error is noted
+            // inside and never fails the run.
+            self.conn.compact_state_if_bloated().await;
+            (crate::naming::cursor_watermark(&self.final_table, cursor, own)?, sib)
+        } else {
+            (None, false)
+        };
         let data_wm = self.max_cursor(&self.final_table, &max_expr).await?;
         if data_wm.is_none() {
             return Ok(DestState {
@@ -2344,38 +2389,6 @@ impl crate::sink::Sink for BqSink {
                 watermark: None,
             });
         }
-        // The state table is append-only: take MY newest row and check for other
-        // sources' rows, both relative to the newest `*` replace-barrier — all
-        // resolved server-side in one free SELECT (timestamps never round-trip
-        // through text).
-        let (own_state, siblings) = if self.conn.table_get(STATE_TABLE).await?.is_some() {
-            let sql = format!(
-                "WITH s AS (SELECT * FROM {state} WHERE dest_table = '{dt}'), \
-                 b AS (SELECT IFNULL(MAX(synced_at), TIMESTAMP '1970-01-01') AS ts \
-                       FROM s WHERE source_id = '*') \
-                 SELECT \
-                   (SELECT watermark FROM s, b \
-                    WHERE source_id = '{sid}' AND synced_at > b.ts \
-                    ORDER BY synced_at DESC LIMIT 1), \
-                   (SELECT CAST(COUNT(*) > 0 AS STRING) FROM s, b \
-                    WHERE source_id NOT IN ('*', '{sid}') AND synced_at > b.ts)",
-                state = self.fq(STATE_TABLE),
-                dt = sql_str(&self.final_table),
-                sid = sql_str(source_id),
-            );
-            let rows = self.conn.query(&sql).await?;
-            let row = rows.into_iter().next().unwrap_or_default();
-            let own = row.first().cloned().flatten();
-            let sib = row.get(1).cloned().flatten().as_deref() == Some("true");
-            // The SELECT above just paid for the table's whole append-only
-            // history; if it has bloated past the threshold, fold it down to
-            // what readers can still use. Best-effort — an error is noted
-            // inside and never fails the run.
-            self.conn.compact_state_if_bloated().await;
-            (own, sib)
-        } else {
-            (None, false)
-        };
         if own_state.is_none() && siblings {
             return Err(Error::InvalidInput(format!(
                 "destination {} is fed by other sources (fan-in) but has no state row \

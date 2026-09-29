@@ -1064,6 +1064,162 @@ mod pg_state_key_tests {
     }
 }
 
+// ── who may read a state row ────────────────────────────────────────────────
+
+/// The `cursor_col` a CDC state row records: its watermark is a log position
+/// (an LSN, or a packed binlog coordinate), not a value of any column.
+pub(crate) const STATE_CURSOR_LSN: &str = "_lsn";
+/// The `mode` a CDC state row records.
+pub(crate) const STATE_MODE_CDC: &str = "log_based";
+
+/// One `_apitap_state` row as a destination returned it, before anybody has
+/// decided what it means.
+///
+/// Both lanes write the same table, and a watermark is only meaningful in the
+/// terms it was written in: an LSN is not a cursor value, and a max(`id`) is
+/// not a max(`n`). Until 0.57.0 eight reads each decided that on their own
+/// terms, and they disagreed: the MySQL drain filtered `AND mode =
+/// 'log_based'`, so a table an `append` had built looked like a fresh
+/// destination and was silently re-bootstrapped; the MySQL, ClickHouse and
+/// BigQuery bulk reads took `watermark` alone, so an `append` onto a drained
+/// table resumed from an LSN as if it were an `id`. Every read now selects
+/// the row's whole vocabulary, with no predicate on it, and [`state_verdict`]
+/// alone decides — a row of the other lane is refused, never invisible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StateRow {
+    watermark: Option<String>,
+    cursor_col: String,
+    mode: String,
+}
+
+impl StateRow {
+    /// A NULL `cursor_col` or `mode` reads as "": a row an older writer left
+    /// without them is judged on what it does say.
+    pub(crate) fn new(watermark: Option<String>, cursor_col: Option<String>, mode: Option<String>) -> Self {
+        Self { watermark, cursor_col: cursor_col.unwrap_or_default(), mode: mode.unwrap_or_default() }
+    }
+
+    fn is_cdc(&self) -> bool {
+        self.mode == STATE_MODE_CDC
+    }
+}
+
+/// The lane asking. The cursor lane is `append`/`merge`, and it asks with the
+/// cursor column this run filters on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Lane<'a> {
+    Cdc,
+    Cursor { cursor: &'a str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StateVerdict {
+    /// No row: a fresh destination, as far as state goes.
+    Absent,
+    /// The asking lane wrote it, in the asking lane's terms.
+    Mine(Option<String>),
+    /// Somebody else's — refused, never read past.
+    Foreign(StateRow),
+}
+
+/// The one rule for whose a state row is.
+///
+/// - CDC lane: only a `log_based` row that tracks `_lsn`.
+/// - Cursor lane: never a `log_based` row, and never a row that tracks a
+///   different cursor. A row with no recorded cursor is the lane's own (an
+///   older bulk writer that did not record one).
+pub(crate) fn state_verdict(row: Option<StateRow>, lane: Lane<'_>) -> StateVerdict {
+    let Some(row) = row else { return StateVerdict::Absent };
+    let mine = match lane {
+        Lane::Cdc => row.is_cdc() && row.cursor_col == STATE_CURSOR_LSN,
+        Lane::Cursor { cursor } => {
+            !row.is_cdc() && (row.cursor_col.is_empty() || row.cursor_col == cursor)
+        }
+    };
+    if mine {
+        StateVerdict::Mine(row.watermark)
+    } else {
+        StateVerdict::Foreign(row)
+    }
+}
+
+/// A CDC watermark that went through the verdict. The constructor is private
+/// to this module, so no destination can hand the run loop a position it
+/// parsed past the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CdcWatermark(u64);
+
+impl CdcWatermark {
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The CDC lane's read of a state row. A NULL watermark on its own row is an
+/// error on every destination: reading it as "no state" (BigQuery did until
+/// 0.57.0) re-bootstraps a table whose drain has already confirmed its
+/// position to the source.
+pub(crate) fn cdc_watermark(dest: &str, row: Option<StateRow>) -> crate::error::Result<Option<CdcWatermark>> {
+    use crate::error::Error;
+    match state_verdict(row, Lane::Cdc) {
+        StateVerdict::Absent => Ok(None),
+        StateVerdict::Mine(None) => {
+            Err(Error::Transfer(format!("log_based: {dest}: state row has NULL watermark")))
+        }
+        StateVerdict::Mine(Some(w)) => w
+            .parse::<u64>()
+            .map(|v| Some(CdcWatermark(v)))
+            .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{w}'"))),
+        StateVerdict::Foreign(r) => Err(foreign_state_error(dest, Lane::Cdc, &r)),
+    }
+}
+
+/// The cursor lane's read of a state row: `None` when there is none it may
+/// use (the caller then falls back to the data, as before).
+pub(crate) fn cursor_watermark(
+    dest: &str,
+    cursor: &str,
+    row: Option<StateRow>,
+) -> crate::error::Result<Option<String>> {
+    match state_verdict(row, Lane::Cursor { cursor }) {
+        StateVerdict::Absent => Ok(None),
+        StateVerdict::Mine(w) => Ok(w),
+        StateVerdict::Foreign(r) => Err(foreign_state_error(dest, Lane::Cursor { cursor }, &r)),
+    }
+}
+
+/// Where an operator clears a table's state, on every destination.
+const CLEAR_STATE: &str =
+    "clear this table's apitap state (its _apitap_state rows; on Iceberg, its apitap.watermark* table properties)";
+
+/// Why a row is not the asking lane's, in the words an operator acts on. The
+/// three texts keep every phrase the state-contract leg asks for: "CDC-managed"
+/// and "LSN", "cursor" and "LSN", and both quoted cursors.
+pub(crate) fn foreign_state_error(dest: &str, lane: Lane<'_>, row: &StateRow) -> crate::error::Error {
+    crate::error::Error::InvalidInput(match lane {
+        Lane::Cursor { .. } if row.is_cdc() => format!(
+            "{dest}: this destination table is CDC-managed — its state watermark is an LSN, \
+             which a cursor-lane run (mode=\"append\" or \"merge\") cannot resume from. Keep \
+             using mode=\"log_based\", or {CLEAR_STATE} to hand it to the cursor lane (the \
+             next run then re-bootstraps)."
+        ),
+        Lane::Cursor { cursor } => format!(
+            "{dest}: the state row tracks cursor '{row_cursor}' but this run uses cursor \
+             '{cursor}' — a watermark in one column's terms cannot resume another's. Re-run \
+             with cursor=\"{row_cursor}\", or {CLEAR_STATE} to restart from a full load.",
+            row_cursor = row.cursor_col,
+        ),
+        Lane::Cdc => format!(
+            "log_based: {dest} is managed by mode='{mode}' — its state watermark tracks cursor \
+             '{cursor}', not an LSN, so a CDC drain cannot resume from it. Keep using that mode, \
+             or {CLEAR_STATE}, under every spelling of its name, to hand it to CDC, which then \
+             re-bootstraps with a full load.",
+            mode = row.mode,
+            cursor = row.cursor_col,
+        ),
+    })
+}
+
 /// The state table's name is fixed — it is per-destination, not per-table, so
 /// it never needs shortening.
 pub(crate) const STATE_TABLE: &str = "_apitap_state";
@@ -2048,5 +2204,124 @@ mod tests {
             assert!(out.len() <= PG_IDENT_MAX);
             assert!(out.ends_with(a.suffix()));
         }
+    }
+
+    // ── state_verdict: who may read a state row (E1-E5) ──────────────────────
+
+    fn row(wm: Option<&str>, cursor: Option<&str>, mode: Option<&str>) -> Option<StateRow> {
+        Some(StateRow::new(wm.map(String::from), cursor.map(String::from), mode.map(String::from)))
+    }
+
+    /// E1. An `append` row is the cursor lane's, and a drain is REFUSED it —
+    /// never shown nothing. 0.56.0's MySQL drain filtered on mode, read no row
+    /// and re-bootstrapped a table an append had built.
+    #[test]
+    fn state_verdict_a_cursor_row_is_foreign_to_cdc() {
+        let r = row(Some("500"), Some("id"), Some("append"));
+        assert!(matches!(state_verdict(r.clone(), Lane::Cdc), StateVerdict::Foreign(_)));
+        assert_eq!(state_verdict(r.clone(), Lane::Cursor { cursor: "id" }), StateVerdict::Mine(Some("500".into())));
+        let e = cdc_watermark("t", r).unwrap_err().to_string();
+        assert!(e.contains("mode='append'") && e.contains("'id'") && e.contains("LSN"), "{e}");
+        // merge is the cursor lane too, and a row with no mode is nobody's drain
+        assert!(matches!(state_verdict(row(Some("5"), Some("id"), Some("merge")), Lane::Cdc), StateVerdict::Foreign(_)));
+        assert!(matches!(state_verdict(row(Some("5"), Some("_lsn"), None), Lane::Cdc), StateVerdict::Foreign(_)));
+    }
+
+    /// E2. A `log_based` row is the drain's, and the cursor lane is refused it
+    /// whatever cursor it asks with. 0.56.0's MySQL, ClickHouse and BigQuery
+    /// bulk reads took `watermark` alone and resumed from an LSN as a cursor.
+    #[test]
+    fn state_verdict_a_cdc_row_is_foreign_to_the_cursor_lane() {
+        let r = row(Some("123456"), Some("_lsn"), Some("log_based"));
+        assert_eq!(state_verdict(r.clone(), Lane::Cdc), StateVerdict::Mine(Some("123456".into())));
+        for cursor in ["id", "_lsn", ""] {
+            assert!(matches!(state_verdict(r.clone(), Lane::Cursor { cursor }), StateVerdict::Foreign(_)),
+                    "cursor {cursor:?} read a CDC row");
+        }
+        let e = cursor_watermark("t", "id", r).unwrap_err().to_string();
+        assert!(e.contains("CDC-managed") && e.contains("LSN"), "{e}");
+        // log_based that does not track `_lsn` is not a position a drain can use
+        assert!(matches!(state_verdict(row(Some("1"), Some("id"), Some("log_based")), Lane::Cdc),
+                         StateVerdict::Foreign(_)));
+    }
+
+    /// E3. A cursor switch is refused naming both cursors; a row that recorded
+    /// no cursor is the lane's own, and a row with no watermark falls back to
+    /// the data exactly like no row.
+    #[test]
+    fn state_verdict_a_cursor_switch_is_foreign_and_an_unrecorded_cursor_is_not() {
+        let r = row(Some("77"), Some("id"), Some("append"));
+        assert!(matches!(state_verdict(r.clone(), Lane::Cursor { cursor: "n" }), StateVerdict::Foreign(_)));
+        let e = cursor_watermark("t", "n", r).unwrap_err().to_string();
+        assert!(e.contains("'id'") && e.contains("'n'"), "{e}");
+        assert_eq!(cursor_watermark("t", "n", row(Some("77"), None, Some("append"))).unwrap(), Some("77".into()));
+        assert_eq!(cursor_watermark("t", "n", row(Some("77"), Some(""), None)).unwrap(), Some("77".into()));
+        assert_eq!(cursor_watermark("t", "n", row(None, Some("n"), Some("append"))).unwrap(), None);
+        assert_eq!(cursor_watermark("t", "n", None).unwrap(), None);
+    }
+
+    /// E4. The drain's own row parses; a NULL or a junk watermark is an error,
+    /// never "no state" — BigQuery answered `Ok(None)` for a NULL until 0.57.0,
+    /// which re-bootstraps a table whose slot has already moved on.
+    #[test]
+    fn state_verdict_cdc_watermark_parses_and_refuses_null_and_junk() {
+        assert_eq!(cdc_watermark("t", None).unwrap(), None);
+        let w = cdc_watermark("t", row(Some("42"), Some("_lsn"), Some("log_based"))).unwrap();
+        assert_eq!(w.map(CdcWatermark::get), Some(42));
+        let e = cdc_watermark("orders", row(None, Some("_lsn"), Some("log_based"))).unwrap_err().to_string();
+        assert!(e.contains("orders") && e.contains("NULL watermark"), "{e}");
+        let e = cdc_watermark("t", row(Some("0/16B3748"), Some("_lsn"), Some("log_based"))).unwrap_err().to_string();
+        assert!(e.contains("bad LSN state '0/16B3748'"), "{e}");
+        // the group drains from its minimum
+        let a = cdc_watermark("a", row(Some("9"), Some("_lsn"), Some("log_based"))).unwrap();
+        let b = cdc_watermark("b", row(Some("10"), Some("_lsn"), Some("log_based"))).unwrap();
+        assert_eq!([b, a].into_iter().flatten().min().map(CdcWatermark::get), Some(9));
+    }
+
+    /// E5. Every `_apitap_state` read selects `watermark, cursor_col, mode`
+    /// with NO predicate on the vocabulary, and `state_verdict` decides. A
+    /// predicate hides the other lane's row, and a hidden row reads as a fresh
+    /// destination: 0.56.0's MySQL drain (`AND mode = 'log_based'`) re-
+    /// bootstrapped a table an append had built, sentinel rows and all.
+    ///
+    /// Comment lines are skipped; the rest of each file is lowercased with
+    /// every whitespace removed, so a predicate a string continuation splits
+    /// across two lines is still one needle.
+    #[test]
+    fn no_state_read_filters_on_mode() {
+        const FILES: &[(&str, &str)] = &[
+            ("logbased/dest_pg.rs", include_str!("logbased/dest_pg.rs")),
+            ("logbased/dest_my.rs", include_str!("logbased/dest_my.rs")),
+            ("logbased/dest_ch.rs", include_str!("logbased/dest_ch.rs")),
+            ("logbased/dest_bq.rs", include_str!("logbased/dest_bq.rs")),
+            ("sink/postgres.rs", include_str!("sink/postgres.rs")),
+            ("sink/mysql.rs", include_str!("sink/mysql.rs")),
+            ("sink/clickhouse.rs", include_str!("sink/clickhouse.rs")),
+            ("sink/bigquery.rs", include_str!("sink/bigquery.rs")),
+        ];
+        let mut hits = Vec::new();
+        for (name, src) in FILES {
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .flat_map(str::chars)
+                .filter(|c| !c.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect();
+            for kw in ["and", "where"] {
+                for col in ["mode", "cursor_col"] {
+                    for op in ["=", "!=", "<>", "in(", "like"] {
+                        let needle = format!("{kw}{col}{op}");
+                        if let Some(at) = code.find(&needle) {
+                            let from = code[..at].char_indices().rev().nth(40).map_or(0, |(i, _)| i);
+                            let to = (at + 60).min(code.len());
+                            let to = (to..=code.len()).find(|&i| code.is_char_boundary(i)).unwrap();
+                            hits.push(format!("{name}: …{}…", &code[from..to]));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hits.is_empty(), "a state read filters on the row's vocabulary:\n{}", hits.join("\n"));
     }
 }

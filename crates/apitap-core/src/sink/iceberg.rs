@@ -962,7 +962,6 @@ impl crate::sink::Sink for IcebergSink {
                 }
             }
         }
-        let _ = cursor;
         self.conn.ensure_namespace().await?;
         let Some(meta) = self.conn.load_table(&self.table).await? else {
             return Ok(DestState { exists: false, watermark: None });
@@ -988,13 +987,11 @@ impl crate::sink::Sink for IcebergSink {
             )));
         }
         let props = meta.properties();
-        // A state row only counts if it tracked THIS cursor column — a
-        // cursor switch quietly re-bootstraps from data instead of feeding a
-        // value from one column into a filter on another.
-        let own = props
-            .get(&self.wm_prop())
-            .filter(|_| props.get(&self.cur_prop()).map(String::as_str) == Some(cursor))
-            .cloned();
+        // The one verdict both lanes use: a drain's watermark (cursor `_lsn`)
+        // and another cursor's are both refused. A cursor switch used to
+        // re-bootstrap quietly from the data instead, appending whatever the
+        // new column's max let through.
+        let own = crate::naming::cursor_watermark(&self.table, cursor, state_row_of(props, source_id))?;
         let sibling = props
             .keys()
             .any(|k| k.starts_with("apitap.watermark.") && *k != self.wm_prop());
@@ -1547,44 +1544,38 @@ fn write_delete_parquet(
 // log_based CDC surface (crate::logbased::dest_ice drives this)
 // ============================================================================
 
-/// The cursor name a log_based watermark records (mirrors the SQL dests'
-/// `_apitap_state.cursor_col = '_lsn'` contract).
-const CDC_CURSOR: &str = "_lsn";
+// The cursor name a log_based watermark records (the SQL dests'
+// `_apitap_state.cursor_col = '_lsn'` contract).
+use crate::naming::STATE_CURSOR_LSN as CDC_CURSOR;
 
 const NUMERIC_OID: u32 = 1700;
 
-/// LSN watermark from the table properties. `None` = no table, or a table
-/// with no log_based state for this source (fresh, or replaced — the replace
+/// This source's state on the table, as the row the SQL destinations would
+/// hold, for `naming::state_verdict` to judge. `None` = no table, or no
+/// watermark-cursor property for this source (fresh, or replaced — the replace
 /// path strips every apitap watermark property).
+///
+/// Iceberg records no mode, so it is read off the cursor: `_lsn` is only ever
+/// written by a drain, any other cursor only by append/merge.
+fn state_row_of(props: &HashMap<String, String>, source_id: &str) -> Option<crate::naming::StateRow> {
+    let cur = props.get(&cur_prop_for(source_id))?;
+    let mode = if cur == CDC_CURSOR { crate::naming::STATE_MODE_CDC } else { "append/merge" };
+    Some(crate::naming::StateRow::new(
+        props.get(&wm_prop_for(source_id)).cloned(),
+        Some(cur.clone()),
+        Some(mode.to_string()),
+    ))
+}
+
 pub(crate) async fn cdc_read_state(
     conn: &IcebergConn,
     table: &str,
     source_id: &str,
-) -> Result<Option<u64>> {
+) -> Result<Option<crate::naming::StateRow>> {
     let Some(meta) = conn.load_table(table).await? else {
         return Ok(None);
     };
-    let props = meta.properties();
-    match props.get(&cur_prop_for(source_id)) {
-        None => Ok(None),
-        Some(cur) if cur != CDC_CURSOR => Err(Error::InvalidInput(format!(
-            "log_based: iceberg table '{table}' tracks cursor '{cur}' for this \
-             source, not an LSN — it was written by mode append/merge. Use a \
-             different dest_table or clear the apitap.watermark* properties"
-        ))),
-        Some(_) => {
-            let wm = props.get(&wm_prop_for(source_id)).ok_or_else(|| {
-                Error::Transfer(format!(
-                    "log_based: iceberg table '{table}' has a watermark-cursor \
-                     property but no watermark — state is corrupt; clear the \
-                     apitap.watermark* properties to re-bootstrap"
-                ))
-            })?;
-            wm.parse::<u64>()
-                .map(Some)
-                .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{wm}'")))
-        }
-    }
+    Ok(state_row_of(meta.properties(), source_id))
 }
 
 /// Props-only watermark write (bootstrap finish, and windows with no traffic

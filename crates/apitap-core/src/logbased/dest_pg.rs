@@ -18,7 +18,7 @@ use sqlx::Executor;
 
 pub(crate) use store::{PgStore, PgUnit};
 
-const STATE_CURSOR: &str = "_lsn";
+use crate::naming::STATE_CURSOR_LSN as STATE_CURSOR;
 
 pub(crate) struct PgDest {
     store: PgStore,
@@ -39,8 +39,13 @@ impl PgDest {
         self.store.resolve_names(tables).await
     }
 
-    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
-        self.store.read_state(dest_table, source_id).await
+    /// The drain's watermark, through the one verdict both lanes share.
+    pub(crate) async fn read_state(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+    ) -> Result<Option<crate::naming::CdcWatermark>> {
+        crate::naming::cdc_watermark(dest_table, self.store.read_state(dest_table, source_id).await?)
     }
 
     /// The bootstrap's full load lands data without constraints; the drain's
@@ -301,7 +306,7 @@ async fn apply_unit(
 
 /// Everything that holds a connection. See the module doc.
 mod store {
-    use super::{db_err, upsert_state_tx, STATE_CURSOR};
+    use super::{db_err, upsert_state_tx};
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, Fence, LeaseStore, Watermark};
@@ -450,7 +455,12 @@ mod store {
             Ok(())
         }
 
-        pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        /// This table's state row, whichever lane wrote it.
+        pub(crate) async fn read_state(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<crate::naming::StateRow>> {
             // Both spellings, because the bulk lane keys the same table as
             // schema.bare where this lane keys it bare — see
             // `naming::pg_state_keys`.
@@ -459,8 +469,8 @@ mod store {
             // cursor lane used to be simply invisible, so a table that had been
             // append-ed and was then pointed at log_based saw NO state, decided
             // it was a fresh destination, and quietly ran a full bootstrap.
-            // Read the row whatever wrote it, and refuse below if it is not
-            // ours; the bulk lane's read has the same shape.
+            // Read the row whatever wrote it; `naming::state_verdict` refuses
+            // it if it is not ours, in both lanes.
             let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
             let row: Option<(Option<String>, String, String)> = sqlx::query_as(
                 "SELECT watermark, cursor_col, mode FROM _apitap_state \
@@ -477,27 +487,7 @@ mod store {
                 sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(None),
                 _ => Err(db_err(e)),
             })?;
-            match row {
-                None => Ok(None),
-                Some((wm, cursor, mode)) => {
-                    if mode != "log_based" || cursor != STATE_CURSOR {
-                        return Err(Error::InvalidInput(format!(
-                            "log_based: {dest_table} is managed by mode='{mode}' — its \
-                             state watermark tracks cursor '{cursor}', not an LSN, so a \
-                             CDC drain cannot resume from it. Keep using that mode, or \
-                             clear this table's _apitap_state rows (both the bare and \
-                             the schema-qualified spelling) to hand it to CDC, which \
-                             then re-bootstraps with a full load."
-                        )));
-                    }
-                    let wm = wm.ok_or_else(|| {
-                        Error::Transfer("log_based: state row has NULL watermark".into())
-                    })?;
-                    wm.parse::<u64>()
-                        .map(Some)
-                        .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{wm}'")))
-                }
-            }
+            Ok(row.map(|(wm, cursor, mode)| crate::naming::StateRow::new(wm, Some(cursor), Some(mode))))
         }
 
         /// The schemas this run's keys can live in.

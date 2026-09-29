@@ -968,29 +968,17 @@ impl crate::sink::Sink for PgSink {
                 ));
             }
         }
-        // An EMPTY table cannot carry a watermark, whatever the state row says —
-        // TRUNCATE-to-resync must work.
-        let has_rows: bool =
-            sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM {})", self.final_t))
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| Error::Transfer(format!("dest emptiness: {e}")))?;
-        if !has_rows {
-            return Ok(DestState {
-                exists: true,
-                watermark: None,
-            });
-        }
-        // The state row is authoritative: it survives destination-side writes,
-        // precision differences, and enables per-source watermarks (fan-in). Only a
-        // missing row (pre-state-table destinations, or a fresh dest built by plain
-        // replace) falls back to deriving the watermark from the data itself.
-        // Read the row's whole vocabulary, not just its value. A watermark is
-        // only meaningful in the terms it was written in: a `log_based` row
-        // holds an LSN, and a cursor lane that adopts an LSN as a cursor value
-        // starts from a position that means nothing — skipping or repeating
-        // rows while reporting success. That exact switch (CDC table later run
-        // with mode="append") used to do exactly that, silently.
+        // The state row first, and whatever the table holds: a row the other
+        // lane wrote is refused before anything is staged, including on an
+        // EMPTY table — which used to return before this read, so an emptied
+        // CDC-managed table ran an append that overwrote the drain's state.
+        //
+        // Read the row's whole vocabulary, not just its value, and let
+        // `naming::cursor_watermark` decide: a `log_based` row holds an LSN,
+        // and a cursor lane that adopts an LSN as a cursor value starts from a
+        // position that means nothing — skipping or repeating rows while
+        // reporting success; a row that tracked another cursor is the same
+        // mistake in one column's terms.
         //
         // Both key spellings are consulted — the CDC lane historically keyed
         // by the bare name where this lane keys by schema.bare, and a guard
@@ -1009,36 +997,28 @@ impl crate::sink::Sink for PgSink {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| Error::Transfer(format!("state read: {e}")))?;
-        let from_state: Option<String> = match row {
-            None => None,
-            Some((wm, row_cursor, row_mode)) => {
-                if row_mode == "log_based" {
-                    return Err(Error::InvalidInput(format!(
-                        "{}: this destination table is CDC-managed — its state \
-                         watermark is an LSN, which a mode=\"{}\" run cannot \
-                         resume from. Keep using mode=\"log_based\", or clear \
-                         this table's _apitap_state rows to hand it to the \
-                         cursor lane (the next run then re-bootstraps).",
-                        self.dest_key,
-                        match mode {
-                            Mode::Merge => "merge",
-                            _ => "append",
-                        },
-                    )));
-                }
-                if row_cursor != cursor {
-                    return Err(Error::InvalidInput(format!(
-                        "{}: the state row tracks cursor '{row_cursor}' but this \
-                         run uses cursor '{cursor}' — a watermark in one \
-                         column's terms cannot resume another's. Re-run with \
-                         cursor=\"{row_cursor}\", or clear this table's \
-                         _apitap_state rows to restart from a full load.",
-                        self.dest_key,
-                    )));
-                }
-                wm
-            }
-        };
+        let from_state = crate::naming::cursor_watermark(
+            &self.dest_key,
+            cursor,
+            row.map(|(wm, c, m)| crate::naming::StateRow::new(wm, Some(c), Some(m))),
+        )?;
+        // An EMPTY table cannot carry a watermark, whatever the state row says —
+        // TRUNCATE-to-resync must work for a table this lane owns.
+        let has_rows: bool =
+            sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM {})", self.final_t))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Transfer(format!("dest emptiness: {e}")))?;
+        if !has_rows {
+            return Ok(DestState {
+                exists: true,
+                watermark: None,
+            });
+        }
+        // The state row is authoritative: it survives destination-side writes,
+        // precision differences, and enables per-source watermarks (fan-in). Only a
+        // missing row (pre-state-table destinations, or a fresh dest built by plain
+        // replace) falls back to deriving the watermark from the data itself.
         let (siblings, data_max) = match &from_state {
             Some(_) => (false, None), // authoritative: the data max is never consulted
             None => {

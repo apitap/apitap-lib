@@ -24,6 +24,7 @@ use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest, PgUnit};
 use crate::logbased::drain::{drain, DrainOutcome, DrainSession};
 use crate::logbased::mysource;
 use crate::logbased::resolve::Source;
+use crate::naming::CdcWatermark;
 use std::sync::Arc;
 use crate::wire::pgoutput::lsn_from_string;
 use crate::wire::walsender::Walsender;
@@ -274,7 +275,11 @@ impl Dest {
         }
     }
 
-    async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+    /// A member's watermark. Every destination reads its state row whole and
+    /// hands it to `naming::cdc_watermark`, so a row the cursor lane wrote is
+    /// refused here, at admission, before anything moves — never read as "no
+    /// state" and bootstrapped over.
+    async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<CdcWatermark>> {
         match self {
             Dest::Pg(d) => d.read_state(dest_table, source_id).await,
             Dest::Ch(d) => d.read_state(dest_table, source_id).await,
@@ -936,7 +941,7 @@ async fn run_group(
             // the drain still owned its slot and its watermark.)
             bootstrap_group(src_url, dst_url, opts, &tenure, &src, &slot, &ctxs).await
         } else {
-            let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty");
+            let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty").get();
             drain_group(
                 src_url,
                 &src,
@@ -1020,7 +1025,7 @@ async fn run_group_mysql(
     for c in &ctxs {
         let marker_id = format!("server-identity:{}", c.source_id);
         match dest.read_state(&c.dest_table, &marker_id).await? {
-            Some(prev) if prev != server => {
+            Some(prev) if prev.get() != server => {
                 return Err(Error::InvalidInput(format!(
                     "log_based: {} was last drained from a DIFFERENT MySQL server than \
                      the one this URL now reaches. A binlog (file, position) is only \
@@ -1132,7 +1137,7 @@ async fn run_group_mysql(
         }
 
         // Drain from the group minimum — members ahead converge idempotently.
-        let wm = marks.iter().flatten().copied().min().unwrap_or(0);
+        let wm = marks.iter().flatten().copied().min().map_or(0, CdcWatermark::get);
         let seed = ctxs
             .iter()
             .map(|c| c.source_id.as_str())

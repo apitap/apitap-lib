@@ -696,6 +696,29 @@ impl MySqlSink {
         Ok(v.flatten())
     }
 
+    /// This table's state row for `source_id`, whichever lane wrote it, for
+    /// `naming::state_verdict` to judge — no predicate on `mode` or
+    /// `cursor_col`. This lane keys the table bare; the CDC lane keys it as it
+    /// was handed, which may be `db.table`, so both spellings are read and
+    /// this lane's ranks first.
+    async fn state_row(&self, source_id: &str) -> Result<Option<crate::naming::StateRow>> {
+        let sql = format!(
+            "SELECT watermark, cursor_col, mode FROM {} \
+             WHERE dest_table IN ('{b}', '{d}.{b}') AND source_id = '{}' \
+             ORDER BY (dest_table = '{b}') DESC LIMIT 1",
+            self.fq("_apitap_state"),
+            sql_lit(source_id),
+            b = sql_lit(&self.bare),
+            d = sql_lit(&self.db),
+        );
+        let mut conn = self.deadline_conn().await?;
+        let v: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_first(sql.as_str())
+            .await
+            .map_err(|e| Error::Transfer(format!("mysql query [{sql}]: {e}")))?;
+        Ok(v.map(|(w, c, m)| crate::naming::StateRow::new(w, c, m)))
+    }
+
     async fn ensure_state_table(&self) -> Result<()> {
         self.exec(&format!(
             "CREATE TABLE IF NOT EXISTS {} (\
@@ -1104,6 +1127,33 @@ impl crate::sink::Sink for MySqlSink {
                 )));
             }
         }
+        // The state table legitimately doesn't exist on the first incremental run —
+        // and then no sibling can hold a row either. Every OTHER error must surface:
+        // swallowing a query failure here silently degrades to the data max, which
+        // is exactly the fan-in skip the guard below refuses.
+        let has_state_table = self
+            .scalar(&format!(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = '{}' AND table_name = '_apitap_state'",
+                sql_lit(&self.db)
+            ))
+            .await?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            > 0;
+        // The state row BEFORE the emptiness check, and its whole vocabulary:
+        // `naming::cursor_watermark` refuses a drain's row (an LSN is not a
+        // cursor value) and another cursor's, whether or not the table has
+        // rows. Until 0.57.0 this read took `watermark` alone, after the
+        // emptiness return — an append onto a drained table resumed from the
+        // LSN as if it were an id, and an emptied one overwrote the drain's
+        // state.
+        let state_wm = if has_state_table {
+            let row = self.state_row(source_id).await?;
+            crate::naming::cursor_watermark(&self.bare, cursor, row)?
+        } else {
+            None
+        };
         // Empty table carries no watermark (TRUNCATE-to-resync must work).
         let n = self
             .scalar(&format!("SELECT COUNT(*) FROM {}", self.fq(&self.bare)))
@@ -1123,31 +1173,6 @@ impl crate::sink::Sink for MySqlSink {
                 self.fq(&self.bare)
             ))
             .await?;
-        // The state table legitimately doesn't exist on the first incremental run —
-        // and then no sibling can hold a row either. Every OTHER error must surface:
-        // swallowing a query failure here silently degrades to the data max, which
-        // is exactly the fan-in skip the guard below refuses.
-        let has_state_table = self
-            .scalar(&format!(
-                "SELECT COUNT(*) FROM information_schema.tables \
-                 WHERE table_schema = '{}' AND table_name = '_apitap_state'",
-                sql_lit(&self.db)
-            ))
-            .await?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
-            > 0;
-        let state_wm = if has_state_table {
-            self.scalar(&format!(
-                "SELECT watermark FROM {} WHERE dest_table='{}' AND source_id='{}'",
-                self.fq("_apitap_state"),
-                sql_lit(&self.bare),
-                sql_lit(source_id)
-            ))
-            .await?
-        } else {
-            None
-        };
         let siblings = if state_wm.is_none() && has_state_table {
             self.scalar(&format!(
                 "SELECT COUNT(*) FROM {} WHERE dest_table='{}'",

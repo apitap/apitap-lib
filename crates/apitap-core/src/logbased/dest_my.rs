@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 pub(crate) use store::{MyStore, MyTx};
 
-const STATE_CURSOR: &str = "_lsn";
+use crate::naming::STATE_CURSOR_LSN as STATE_CURSOR;
 
 /// `dest_table` may arrive schema-qualified; the MySQL database comes from the
 /// URL, so only the bare name addresses the table (same trim as the sink).
@@ -49,8 +49,13 @@ impl MyDest {
         &self.store
     }
 
-    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
-        self.store.read_state(dest_table, source_id).await
+    /// The drain's watermark, through the one verdict both lanes share.
+    pub(crate) async fn read_state(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+    ) -> Result<Option<crate::naming::CdcWatermark>> {
+        crate::naming::cdc_watermark(dest_table, self.store.read_state(dest_table, source_id).await?)
     }
 
     /// The bootstrap's replace path may or may not have carried the PK into
@@ -274,7 +279,7 @@ async fn apply_unit(
 
 /// Everything that holds a connection. See the module doc.
 mod store {
-    use super::{bare, state_upsert_sql, STATE_CURSOR};
+    use super::{bare, state_upsert_sql};
     use crate::dialect::mysql::my_ident;
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
@@ -319,6 +324,9 @@ mod store {
         Ddl(String),
     }
 
+    // What the order test reads; the executor matches on the variant itself,
+    // so outside the tests this accessor would be dead code.
+    #[cfg(test)]
     impl Step {
         pub(super) fn sql(&self) -> &str {
             match self {
@@ -609,16 +617,29 @@ mod store {
             Ok(())
         }
 
-        pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        /// This table's state row, whichever lane wrote it.
+        ///
+        /// Both spellings: the bulk lane keys the table bare (the database is
+        /// the URL's), this lane keys it as it was handed, which may be
+        /// `db.table`; the drain's own spelling ranks first. And NO predicate
+        /// on mode: until 0.57.0 this read said `AND mode = 'log_based'`, so a
+        /// table an `append` had built showed no row, looked fresh, and was
+        /// re-bootstrapped over — its rows and its cursor state with it.
+        pub(crate) async fn read_state(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<crate::naming::StateRow>> {
             let mut conn = self.shared.conn().await?;
-            let row: Option<(Option<String>, Option<String>)> = match conn
+            let row: Option<(Option<String>, Option<String>, Option<String>)> = match conn
                 .exec_first(
                     format!(
-                        "SELECT watermark, cursor_col FROM {} \
-                         WHERE dest_table = ? AND source_id = ? AND mode = 'log_based'",
+                        "SELECT watermark, cursor_col, mode FROM {} \
+                         WHERE dest_table IN (?, ?) AND source_id = ? \
+                         ORDER BY (dest_table = ?) DESC LIMIT 1",
                         self.fq("_apitap_state")
                     ),
-                    (dest_table, source_id),
+                    (bare(dest_table), dest_table, source_id, dest_table),
                 )
                 .await
             {
@@ -627,25 +648,7 @@ mod store {
                 Err(mysql_async::Error::Server(e)) if e.code == 1146 => return Ok(None),
                 Err(e) => return Err(Error::Transfer(format!("log_based: mysql state: {e}"))),
             };
-            match row {
-                None => Ok(None),
-                Some((wm, cursor)) => {
-                    if cursor.as_deref() != Some(STATE_CURSOR) {
-                        return Err(Error::InvalidInput(format!(
-                            "log_based: state row for this table tracks cursor '{}', \
-                             not an LSN — it was written by another mode. Use a \
-                             different dest_table or clear the state row",
-                            cursor.unwrap_or_default()
-                        )));
-                    }
-                    let wm = wm.ok_or_else(|| {
-                        Error::Transfer("log_based: state row has NULL watermark".into())
-                    })?;
-                    wm.parse::<u64>()
-                        .map(Some)
-                        .map_err(|_| Error::Transfer(format!("log_based: bad LSN state '{wm}'")))
-                }
-            }
+            Ok(row.map(|(wm, cursor, mode)| crate::naming::StateRow::new(wm, cursor, mode)))
         }
     }
 

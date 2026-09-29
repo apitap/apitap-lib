@@ -19,9 +19,15 @@ GTIDs.
 Since 8.0.13 the temporary-DDL refusal applies only when the session logs
 statements (`binlog_format=STATEMENT`); with ROW or MIXED a twin created
 inside the transaction is legal, so cases 1 and 2 pass on either side of that
-line. Case 3 is the one that separates: 0.56.0 created its twins inside the
-transaction and fails it with 3748. It switches the server's global format for
-the case and puts ROW back whatever happens.
+line. Case 3 is the one that separates twins created BEFORE the fenced
+transaction from twins created inside it: the latter fails it with 3748. It
+switches the server's global format for the case and puts ROW back whatever
+happens.
+
+This leg is a guard, not a fix's proof: 0.56.0 already created its twins
+before START TRANSACTION, and passes all three cases. Its RED control is a
+mutant whose temporary DDL opens the fenced transaction first (the design the
+brief rejected); on that mutant case 3 raises 3748 and the counts disagree.
 
     APITAP_MY_GTID_URL=mysql://root:bench@127.0.0.1:3311/bench \\
         python benchmarks/e2e_my_gtid_dest.py

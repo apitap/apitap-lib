@@ -63,8 +63,14 @@ impl IceDest {
         &self.store
     }
 
-    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
-        self.store.read_state(dest_table, source_id).await
+    /// The drain's watermark, through the one verdict both lanes share (the
+    /// table properties read as a state row: `sink::iceberg::cdc_read_state`).
+    pub(crate) async fn read_state(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+    ) -> Result<Option<crate::naming::CdcWatermark>> {
+        crate::naming::cdc_watermark(bare(dest_table), self.store.read_state(dest_table, source_id).await?)
     }
 
     /// The bootstrap's replace just created the table (and cleared every
@@ -438,7 +444,11 @@ mod store {
             Ok(Self { conn: IcebergConn::parse(url).await?, opened: Default::default() })
         }
 
-        pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
+        pub(crate) async fn read_state(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<crate::naming::StateRow>> {
             cdc_read_state(&self.conn, bare(dest_table), source_id).await
         }
     }

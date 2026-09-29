@@ -113,8 +113,16 @@ impl BqDest {
         &self.store
     }
 
-    pub(crate) async fn read_state(&self, dest_table: &str, source_id: &str) -> Result<Option<u64>> {
-        self.store.read_state(bare(dest_table), source_id).await
+    /// The drain's watermark, through the one verdict both lanes share. A
+    /// NULL watermark on the drain's own row is now an error here too: read
+    /// as "no state" it re-bootstrapped a table whose slot had moved on.
+    pub(crate) async fn read_state(
+        &self,
+        dest_table: &str,
+        source_id: &str,
+    ) -> Result<Option<crate::naming::CdcWatermark>> {
+        let t = bare(dest_table);
+        crate::naming::cdc_watermark(t, self.store.read_state(t, source_id).await?)
     }
 
     /// The destination's SHAPE must match the mode — see the ClickHouse twin.
@@ -1338,7 +1346,13 @@ mod store {
             self.conn.table_get(table).await
         }
 
-        pub(crate) async fn read_state(&self, table: &str, source_id: &str) -> Result<Option<u64>> {
+        /// This table's newest state row for this source past the last
+        /// replace barrier, whichever lane wrote it.
+        pub(crate) async fn read_state(
+            &self,
+            table: &str,
+            source_id: &str,
+        ) -> Result<Option<crate::naming::StateRow>> {
             if !self.conn.cdc_state_table_exists().await? {
                 return Ok(None);
             }
@@ -1365,26 +1379,10 @@ mod store {
             // runs before a tenure on the MySQL path, beside every drain of the
             // dataset.
             self.conn.compact_state_if_bloated().await;
-            let Some(row) = rows.into_iter().next() else {
-                return Ok(None);
-            };
-            let watermark = row.first().cloned().flatten();
-            let cursor_col = row.get(1).cloned().flatten();
-            let mode = row.get(2).cloned().flatten();
-            if cursor_col.as_deref() != Some("_lsn") || mode.as_deref() != Some("log_based") {
-                return Err(Error::InvalidInput(format!(
-                    "log_based: BigQuery target {table} has state written by a different \
-                     mode (cursor_col={cursor_col:?}, mode={mode:?}) — run once with \
-                     mode='replace' to realign, or clear its _apitap_state rows"
-                )));
-            }
-            match watermark {
-                None => Ok(None),
-                Some(w) => w
-                    .parse::<u64>()
-                    .map(Some)
-                    .map_err(|_| Error::Transfer(format!("log_based: BigQuery watermark '{w}' is not an LSN"))),
-            }
+            Ok(rows.into_iter().next().map(|row| {
+                let cell = |i: usize| row.get(i).cloned().flatten();
+                crate::naming::StateRow::new(cell(0), cell(1), cell(2))
+            }))
         }
 
         async fn ensure_state_table(&self) -> Result<()> {
