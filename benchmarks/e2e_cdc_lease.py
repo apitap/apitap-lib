@@ -16,7 +16,10 @@ What that buys, and what this leg asserts:
   2. the immediate re-run is still refused, by TYPE, and the refusal names a
      deadline rather than a chore
   3. after the TTL the next run collects it and RESUMES FROM THE WATERMARK,
-     with no human step
+     with no human step — even when the dead run's window DELETE is still
+     running on the server as a mutation that reads the key table the
+     collector sweeps (ClickHouse < 25.7: dropped under it, that mutation fails
+     for good and every later DELETE of the table fails UNFINISHED)
   4. a lock with NO lease row is never collected, at any age — every artifact
      written before the lease existed, every operator plant
   5. a LIVE drain's lease is never collectable, so the fix cannot eat a
@@ -171,6 +174,20 @@ case("…and its staging marker", bool(_rig.markers_ch(T)), f"{_rig.markers_ch(T
 case("…and a lease row, which is what makes it recoverable",
      len(leases()) == 1, f"{leases() or 'none'}")
 
+# A kill also leaves the window's DELETE running on the server, as a mutation
+# that joins the key table — on a table slow to mutate, for as long as it takes.
+# A SIGKILL cannot be aimed at that moment, so the statement is planted: the
+# dead run's own shape against its own key table, held pending by stopping the
+# table's merges (which stop its mutations too) until the collector has swept.
+if KEYS not in ch(f"SELECT name FROM system.tables WHERE name = '{KEYS}'"):
+    _rig.rig_fail(f"the dead run's key table {KEYS} is gone before the plant")
+ch(f"SYSTEM STOP MERGES {T}")
+ch(f"DELETE FROM {T} WHERE id IN (SELECT id FROM `{KEYS}`) SETTINGS lightweight_deletes_sync = 0")
+ORPHAN = (f"SELECT count() FROM system.mutations WHERE database = currentDatabase() "
+          f"AND table = '{T}' AND NOT is_done")
+if ch(ORPHAN + f" AND position(command, '{KEYS}') > 0") != "1":
+    _rig.rig_fail("the dead run's DELETE is not pending on the server")
+
 print("== the immediate re-run is still refused — the guard has not gone soft ==")
 e = refusal(drain)
 case("refused by type while the lease is fresh",
@@ -180,8 +197,27 @@ case("and the refusal names a deadline instead of a chore",
 
 print(f"== after the {TTL}s TTL it collects itself, with no human step ==")
 time.sleep(TTL + 3)
-e = refusal(drain)
+c = subprocess.Popen(
+    [sys.executable, "-c",
+     "import apitap, sys\n"
+     "try:\n"
+     f"    apitap.transfer({PG!r}, {CH!r}, table={T!r}, mode='log_based')\n"
+     "except Exception as e:\n"
+     "    print(type(e).__name__, str(e)[:500]); sys.exit(1)\n"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+# The collector sweeps at admission, before its first window: once the DEAD
+# lock is gone (the collector holds one of its own) the merges, and the planted
+# mutation with them, may run again.
+swept = _rig.wait_for(lambda: not any(dead in n for n in locks()), 60)
+ch(f"SYSTEM START MERGES {T}")
+out = c.communicate(timeout=900)[0]
+e = None if c.returncode == 0 else out.strip()[-300:]
+case("(rig) the collector swept while the dead DELETE was held", swept, "")
 case("the next run proceeds", e is None, e or "collected and drained")
+case("…and left no mutation of the table unfinished: the dead run's DELETE was "
+     "killed before its key table was dropped", ch(ORPHAN) == "0",
+     ch(f"SELECT groupArray(substring(latest_fail_reason, 1, 90)) FROM system.mutations "
+        f"WHERE table = '{T}' AND NOT is_done"))
 case("and the dead run's lock is gone", locks() == [], f"{locks() or 'none'}")
 case("and so is its marker — one claim collects both", _rig.markers_ch(T) == [],
      f"{_rig.markers_ch(T) or 'none'}")

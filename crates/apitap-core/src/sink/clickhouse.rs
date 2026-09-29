@@ -268,6 +268,40 @@ impl ChGuard {
     fn oc(&self) -> String {
         self.on_cluster.as_deref().map(|c| format!(" ON CLUSTER `{c}`")).unwrap_or_default()
     }
+
+    /// Kill every unfinished mutation of `table` that reads `scratch`.
+    ///
+    /// A replica window's DELETE joins against its run's key table, and a
+    /// DELETE whose client is gone (a killed drain, a client-side deadline)
+    /// goes on server-side as a mutation that reads the key table part by
+    /// part. Dropped under it, every part left fails UNKNOWN_TABLE for good,
+    /// and every later mutation of the table queues behind it: the table's
+    /// next DELETE fails UNFINISHED, on every run, until someone kills it
+    /// (measured on 24.8, which has no patch-part deletes). Killing it is
+    /// safe: it belongs to a window whose watermark was never written, and
+    /// that window's replay deletes the same keys again.
+    ///
+    /// Asked first, so a sweep with nothing pending — every ordinary one —
+    /// needs no KILL grant.
+    async fn kill_readers(&self, table: &str, scratch: &str) -> Result<()> {
+        let pred = format!(
+            "database = currentDatabase() AND table = '{}' AND NOT is_done AND position(command, '{}') > 0",
+            ch_str(table),
+            ch_str(scratch)
+        );
+        let n = self.ch.read(&format!("SELECT count() FROM system.mutations WHERE {pred}")).await?;
+        if n.trim() == "0" {
+            return Ok(());
+        }
+        self.ch.exec(&format!("KILL MUTATION WHERE {pred}")).await.map(|_| ()).map_err(|e| {
+            Error::Transfer(format!(
+                "{table}: a mutation still reads {scratch}, the key table of a run that stopped \
+                 mid-window, and it could not be killed ({e}). It is kept until the mutation is \
+                 gone: kill it with KILL MUTATION WHERE table = '{table}' AND position(command, \
+                 '{scratch}') > 0, or let it finish; the next run then drops the key table"
+            ))
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -359,16 +393,27 @@ impl crate::guard::GuardStore for ChGuard {
     /// it left half way. Exact token, never lineage; a bulk token has none,
     /// and the drops are IF EXISTS.
     ///
+    /// The key table goes only once no mutation reads it (`kill_readers`),
+    /// and is checked again after the drop: a DELETE analysed just before it
+    /// can register its mutation after the first look. A kill that fails
+    /// keeps the key table and fails the sweep, so the markers stay and a
+    /// later run tries again — the mutation may finish against it meanwhile.
+    ///
     /// Every drop is attempted and the first failure reported: stopping at
     /// the first would leave the rest for a sweep that may never come again.
     async fn sweep_run(&self, bare: &str, token: &str) -> Result<()> {
         use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
-        let mut first = Ok(());
-        for a in [Artifact::CdcDelete, Artifact::ChangelogTmp] {
-            let r = self.drop_object(&artifact_ident_tok(bare, a, ROOMY, token)).await;
-            if first.is_ok() {
-                first = r;
-            }
+        let kt = artifact_ident_tok(bare, Artifact::CdcDelete, ROOMY, token);
+        let mut first = self.kill_readers(bare, &kt).await;
+        if first.is_ok() {
+            first = self.drop_object(&kt).await;
+        }
+        if first.is_ok() {
+            first = self.kill_readers(bare, &kt).await;
+        }
+        let r = self.drop_object(&artifact_ident_tok(bare, Artifact::ChangelogTmp, ROOMY, token)).await;
+        if first.is_ok() {
+            first = r;
         }
         first
     }
@@ -2219,57 +2264,153 @@ impl Loader for ChLoader {
 mod tests {
     use super::*;
 
+    type Answer = std::sync::Arc<dyn Fn(&str) -> (bool, String) + Send + Sync>;
+
+    /// A ClickHouse stand-in, one request per connection: `answer` sees each
+    /// request's SQL and says whether it fails (a ClickHouse exception) and
+    /// what the body is. Every SQL is logged, in order.
+    async fn mock(answer: Answer) -> (ChGuard, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let s2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let (s3, answer) = (s2.clone(), answer.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let mut got = Vec::new();
+                    // Read until the body is in.
+                    let h = loop {
+                        let Ok(n) = c.read(&mut buf).await else { return };
+                        if n == 0 { return; }
+                        got.extend_from_slice(&buf[..n]);
+                        let t = String::from_utf8_lossy(&got).to_string();
+                        if let Some(h) = t.find("\r\n\r\n") {
+                            let len = t[..h].to_ascii_lowercase().lines()
+                                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .unwrap_or(0);
+                            if got.len() >= h + 4 + len { break h; }
+                        }
+                    };
+                    let sql = String::from_utf8_lossy(&got[h + 4..]).to_string();
+                    s3.lock().unwrap().push(sql.clone());
+                    let (fail, body) = answer(&sql);
+                    let resp = if fail {
+                        let b = "Code: 999. DB::Exception: x";
+                        format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    };
+                    let _ = c.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let g = ChGuard::new(ChConn::parse(&format!("clickhouse://default:x@127.0.0.1:{port}/default")).unwrap(), None);
+        (g, seen)
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
     /// A run's scratch is swept by the owner's release and by its collector,
     /// and nothing else ever names the token: one drop failing must not leave
     /// the other table unattempted.
     #[test]
     fn sweep_attempts_every_drop() {
         use crate::guard::GuardStore;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = l.local_addr().unwrap().port();
-            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-            let s2 = seen.clone();
-            tokio::spawn(async move {
-                while let Ok((mut c, _)) = l.accept().await {
-                    let s3 = s2.clone();
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 16384];
-                        let mut got = Vec::new();
-                        // One request per connection: read until the body is in.
-                        loop {
-                            let Ok(n) = c.read(&mut buf).await else { return };
-                            if n == 0 { return; }
-                            got.extend_from_slice(&buf[..n]);
-                            let t = String::from_utf8_lossy(&got).to_string();
-                            if let Some(h) = t.find("\r\n\r\n") {
-                                let len = t[..h].to_ascii_lowercase().lines()
-                                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
-                                    .unwrap_or(0);
-                                if got.len() >= h + 4 + len { break; }
-                            }
-                        }
-                        let body = String::from_utf8_lossy(&got).to_string();
-                        let first = {
-                            let mut v = s3.lock().unwrap();
-                            v.push(body.clone());
-                            v.len() == 1
-                        };
-                        let resp = if first {
-                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nCode: 999. DB::Exception: x"
-                        } else {
-                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        };
-                        let _ = c.write_all(resp.as_bytes()).await;
-                    });
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        rt().block_on(async {
+            let failed = std::sync::Arc::new(AtomicBool::new(false));
+            let (g, seen) = mock(std::sync::Arc::new(move |sql: &str| {
+                if sql.contains("system.mutations") {
+                    return (false, "0\n".into());
                 }
-            });
-            let g = ChGuard::new(ChConn::parse(&format!("clickhouse://default:x@127.0.0.1:{port}/default")).unwrap(), None);
+                // The first DROP fails.
+                (sql.contains("DROP TABLE") && !failed.swap(true, SeqCst), String::new())
+            }))
+            .await;
             let r = g.sweep_run("t", "_tok").await;
             let drops = seen.lock().unwrap().iter().filter(|b| b.contains("DROP TABLE IF EXISTS")).count();
             assert!(r.is_err(), "the failed drop is reported");
             assert_eq!(drops, 2, "the second drop was never attempted");
+        });
+    }
+
+    /// A DELETE whose client is gone goes on as a mutation that reads the key
+    /// table; dropped under it, the mutation fails on its remaining parts for
+    /// good and every later mutation of the table queues behind it (24.8,
+    /// measured). The sweep kills such a mutation before the drop, looks
+    /// again after it, and keeps the key table when the kill fails.
+    #[test]
+    fn sweep_kills_what_reads_the_key_table_first() {
+        use crate::guard::GuardStore;
+        use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
+        let kt = artifact_ident_tok("t", Artifact::CdcDelete, ROOMY, "_tok");
+        let kinds = |log: &[String]| -> Vec<String> {
+            log.iter()
+                .map(|q| {
+                    if q.contains("system.mutations") && q.starts_with("SELECT") {
+                        "look".to_string()
+                    } else if q.starts_with("KILL MUTATION") {
+                        assert!(q.contains(&format!("position(command, '{kt}')")) && q.contains("table = 't'"), "{q}");
+                        "kill".to_string()
+                    } else if q.contains(&kt) {
+                        "drop key table".to_string()
+                    } else {
+                        "drop other".to_string()
+                    }
+                })
+                .collect()
+        };
+        rt().block_on(async {
+            // A mutation reads the key table: killed, then the drop, then a
+            // second look (nothing now).
+            let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let p2 = pending.clone();
+            let (g, seen) = mock(std::sync::Arc::new(move |sql: &str| {
+                if sql.starts_with("KILL MUTATION") {
+                    p2.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                let n = if p2.load(std::sync::atomic::Ordering::SeqCst) { "1\n" } else { "0\n" };
+                (false, if sql.contains("system.mutations") { n.into() } else { String::new() })
+            }))
+            .await;
+            assert!(g.sweep_run("t", "_tok").await.is_ok());
+            assert_eq!(kinds(&seen.lock().unwrap()), ["look", "kill", "drop key table", "look", "drop other"]);
+
+            // Nothing reads it: no KILL at all — the grant is not needed.
+            let (g, seen) = mock(std::sync::Arc::new(|sql: &str| {
+                (false, if sql.contains("system.mutations") { "0\n".into() } else { String::new() })
+            }))
+            .await;
+            assert!(g.sweep_run("t", "_tok").await.is_ok());
+            assert_eq!(kinds(&seen.lock().unwrap()), ["look", "drop key table", "look", "drop other"]);
+
+            // A mutation registered after the first look: killed after the drop.
+            let looks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (g, seen) = mock(std::sync::Arc::new(move |sql: &str| {
+                let first = sql.contains("system.mutations") && looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                (false, if sql.contains("system.mutations") { (if first { "0\n" } else { "1\n" }).into() } else { String::new() })
+            }))
+            .await;
+            assert!(g.sweep_run("t", "_tok").await.is_ok());
+            assert_eq!(kinds(&seen.lock().unwrap()), ["look", "drop key table", "look", "kill", "drop other"]);
+
+            // The kill fails (no KILL grant): the key table stays, the sweep
+            // fails so the markers stay, and the other scratch still goes.
+            let (g, seen) = mock(std::sync::Arc::new(|sql: &str| {
+                if sql.starts_with("KILL MUTATION") {
+                    return (true, String::new());
+                }
+                (false, if sql.contains("system.mutations") { "1\n".into() } else { String::new() })
+            }))
+            .await;
+            let e = g.sweep_run("t", "_tok").await.unwrap_err().to_string();
+            assert!(e.contains("could not be killed") && e.contains(&kt), "{e}");
+            assert_eq!(kinds(&seen.lock().unwrap()), ["look", "kill", "drop other"]);
         });
     }
 
