@@ -19,14 +19,15 @@ counts what is already at the stamp and numbers above it (`replay_plan`, R1).
      `(_apitap_lsn, _apitap_seq)` pair occurs twice; NEW's first seq at the
      boundary stamp is the old maximum + 1
 
-    python benchmarks/e2e_changelog_upgrade.py ch
+    python benchmarks/e2e_changelog_upgrade.py ch     # into ClickHouse
+    python benchmarks/e2e_changelog_upgrade.py bq     # into BigQuery (BQ_SA)
 
 OLD is `APITAP_PY_0551` (prepared from PyPI); NEW is the interpreter running
 this file. RED: run it with the 0.56.0 wheel as NEW (`~/gate-0560-venv`) —
 `__current` keeps `old`, and NEW's event sits at seq 0.
 
 Rig: `apitap-bench-mariadb` :3309 (the binlog source both versions read the
-same way), `apitap-bench-ch` :8124.
+same way), `apitap-bench-ch` :8124, and for `bq` the gate's dataset.
 """
 import os
 import subprocess
@@ -34,15 +35,63 @@ import sys
 
 import _rig
 
-ENGINE = sys.argv[1]
-if ENGINE != "ch":
-    sys.exit(f"usage: {sys.argv[0]} ch")
+ENGINE = sys.argv[1] if len(sys.argv) > 1 else ""
+if ENGINE not in ("ch", "bq"):
+    sys.exit(f"usage: {sys.argv[0]} ch|bq")
 OLD_PY = os.environ["APITAP_PY_0551"]
 NEW_PY = sys.executable
 MA = "mysql://root:bench@127.0.0.1:3309/bench"
-CH = "clickhouse://default:bench@127.0.0.1:8124/default"
-T = "cl_upgrade_ch"
+T = f"cl_upgrade_{ENGINE}"
 ok = True
+
+if ENGINE == "ch":
+    DST = "clickhouse://default:bench@127.0.0.1:8124/default"
+
+    def dq(sql):
+        return _rig.clickhouse(sql)
+
+    def tb(t):
+        return f"`{t}`"
+
+    # The stamp the watermark names: MySQL keeps `position\nserver_id` (0.55.1
+    # may keep the position alone), so the first line, as a number.
+    AT_WM = (f"SELECT toString(toUInt64(splitByChar(char(10), watermark)[1])) FROM `_apitap_state` FINAL "
+             f"WHERE dest_table = '{T}' AND source_id NOT LIKE 'server-identity:%'")
+    COUNT = "count()"
+    DIGEST = f"SELECT concatWithSeparator('|', toString(id), v) FROM `{T}__current` ORDER BY id"
+
+    def clean():
+        ma(f"DROP TABLE IF EXISTS bench.{T}")
+        dq(f"DROP VIEW IF EXISTS `{T}__current`")
+        dq(f"DROP TABLE IF EXISTS `{T}`")
+        for t in ("_apitap_state", "_apitap_cdc_pending"):
+            if dq(f"SELECT count() FROM system.tables WHERE name = '{t}'") != "0":
+                dq(f"ALTER TABLE `{t}` DELETE WHERE dest_table = '{T}' SETTINGS mutations_sync = 1")
+else:
+    DST = _rig.bq_url()
+    DS = f"{_rig.BQ_PROJECT}.{_rig.BQ_DATASET}"
+
+    def dq(sql):
+        rows = _rig.bq(sql)
+        return "\n".join("\t".join(c or "" for c in r) for r in rows)
+
+    def tb(t):
+        return f"`{DS}.{t}`"
+
+    AT_WM = (f"SELECT SPLIT(watermark, '\\n')[OFFSET(0)] FROM {tb('_apitap_state')} "
+             f"WHERE dest_table = '{T}' AND source_id NOT LIKE 'server-identity:%' ORDER BY synced_at DESC LIMIT 1")
+    COUNT = "COUNT(*)"
+    DIGEST = f"SELECT CONCAT(CAST(id AS STRING), '|', v) FROM {tb(T + '__current')} ORDER BY id"
+
+    def clean():
+        ma(f"DROP TABLE IF EXISTS bench.{T}")
+        have = set(_rig.bq_tables())
+        # OLD leaves its scratch untokenized; NEW never bootstraps this table.
+        stmts = [f"DROP VIEW IF EXISTS {tb(T + '__current')};", f"DROP TABLE IF EXISTS {tb(T)};"]
+        stmts += [f"DROP TABLE IF EXISTS {tb(n)};" for n in (f"{T}__apitap_cdc", f"{T}__apitap_cl")]
+        stmts += [f"DELETE FROM {tb(s)} WHERE dest_table = '{T}';"
+                  for s in ("_apitap_state", "_apitap_cdc_pending") if s in have]
+        _rig.bq("\n".join(stmts))
 
 
 def ma(sql):
@@ -53,8 +102,9 @@ def ma(sql):
     return o.stdout.strip()
 
 
-def ch(sql):
-    return _rig.clickhouse(sql)
+def s_(expr):
+    """`expr` as a string, in the destination's dialect."""
+    return f"toString({expr})" if ENGINE == "ch" else f"CAST({expr} AS STRING)"
 
 
 def version(py):
@@ -65,11 +115,11 @@ def version(py):
 def drain(py):
     code = ("import apitap, sys\n"
             "try:\n"
-            f"    apitap.transfer({MA!r}, {CH!r}, table={T!r}, mode='log_based', changelog=True)\n"
+            f"    apitap.transfer({MA!r}, {DST!r}, table={T!r}, mode='log_based', changelog=True)\n"
             "except Exception as e:\n"
             "    print('RAISED', type(e).__name__, str(e).replace(chr(10), ' ')[:600], flush=True)\n"
             "    sys.exit(1)\n")
-    r = subprocess.run([py, "-c", code], capture_output=True, text=True, timeout=600)
+    r = subprocess.run([py, "-c", code], capture_output=True, text=True, timeout=900)
     if r.returncode:
         _rig.rig_fail(f"{version(py)} drain failed: {(r.stdout + r.stderr).strip()[-500:]}")
 
@@ -80,21 +130,7 @@ def case(name, passed, detail=""):
     print(f"   {'✓' if passed else '✗'} {name}: {detail}", flush=True)
 
 
-def clean():
-    ma(f"DROP TABLE IF EXISTS bench.{T}")
-    ch(f"DROP VIEW IF EXISTS `{T}__current`")
-    ch(f"DROP TABLE IF EXISTS `{T}`")
-    for t in ("_apitap_state", "_apitap_cdc_pending"):
-        if ch(f"SELECT count() FROM system.tables WHERE name = '{t}'") != "0":
-            ch(f"ALTER TABLE `{t}` DELETE WHERE dest_table = '{T}' SETTINGS mutations_sync = 1")
-
-
-# The stamp the watermark names: MySQL keeps `position\nserver_id` (0.55.1
-# may keep the position alone), so the first line, as a number.
-AT_WM = (f"SELECT toString(toUInt64(splitByChar(char(10), watermark)[1])) FROM `_apitap_state` FINAL "
-         f"WHERE dest_table = '{T}' AND source_id NOT LIKE 'server-identity:%'")
-
-print(f"== OLD {version(OLD_PY)} -> NEW {version(NEW_PY)}, changelog=True into ClickHouse ==")
+print(f"== OLD {version(OLD_PY)} -> NEW {version(NEW_PY)}, changelog=True into {ENGINE} ==")
 clean()
 try:
     ma(f"CREATE TABLE bench.{T} (id BIGINT PRIMARY KEY, v VARCHAR(64))")
@@ -107,12 +143,12 @@ try:
     drain(OLD_PY)
 
     print("== 2. the collision: rows at the stamp the watermark names ==")
-    w = ch(AT_WM)
+    w = dq(AT_WM)
     if not w.isdigit():
         _rig.rig_fail(f"no single watermark for {T}: {w!r}")
-    at_w = ch(f"SELECT count() FROM `{T}` WHERE _apitap_lsn = {w} AND _apitap_op != 'B'")
-    old_max = ch(f"SELECT toString(max(_apitap_seq)) FROM `{T}` WHERE _apitap_lsn = {w} AND _apitap_op != 'B'")
-    key1 = ch(f"SELECT toString(_apitap_seq) FROM `{T}` WHERE _apitap_lsn = {w} AND v = 'old'")
+    at_w = dq(f"SELECT {s_(COUNT)} FROM {tb(T)} WHERE _apitap_lsn = {w} AND _apitap_op != 'B'")
+    old_max = dq(f"SELECT {s_('max(_apitap_seq)')} FROM {tb(T)} WHERE _apitap_lsn = {w} AND _apitap_op != 'B'")
+    key1 = dq(f"SELECT {s_('_apitap_seq')} FROM {tb(T)} WHERE _apitap_lsn = {w} AND v = 'old'")
     print(f"   watermark {w}: {at_w} rows there, max seq {old_max}, key 1's 'old' at seq {key1}")
     if at_w == "0":
         _rig.rig_fail("the OLD window's rows are not at the watermark's stamp — no collision to test")
@@ -121,16 +157,16 @@ try:
     ma(f"UPDATE bench.{T} SET v = 'new' WHERE id = 1; UPDATE bench.{T} SET v = 'new2' WHERE id = 2")
     drain(NEW_PY)
 
-    print("== 4. what ClickHouse holds ==")
-    cur = ch(f"SELECT v FROM `{T}__current` WHERE id = 1")
+    print(f"== 4. what {ENGINE} holds ==")
+    cur = dq(f"SELECT v FROM {tb(T + '__current')} WHERE id = 1")
     case("__current shows NEW's value for key 1", cur == "new", f"{cur!r}")
     src = ma(f"SELECT CONCAT_WS('|', id, v) FROM bench.{T} ORDER BY id")
-    dst = ch(f"SELECT concatWithSeparator('|', toString(id), v) FROM `{T}__current` ORDER BY id")
+    dst = dq(DIGEST)
     case("__current equals the MariaDB table", src == dst, "" if src == dst else f"\n     src {src!r}\n     dst {dst!r}")
-    twice = ch(f"SELECT count() FROM (SELECT _apitap_lsn, _apitap_seq FROM `{T}` WHERE _apitap_op != 'B' "
-               f"GROUP BY 1, 2 HAVING count() > 1)")
+    twice = dq(f"SELECT {s_(COUNT)} FROM (SELECT _apitap_lsn, _apitap_seq FROM {tb(T)} WHERE _apitap_op != 'B' "
+               f"GROUP BY 1, 2 HAVING {COUNT} > 1)")
     case("no (_apitap_lsn, _apitap_seq) pair occurs twice", twice == "0", f"{twice} repeated")
-    first = ch(f"SELECT toString(min(_apitap_seq)) FROM `{T}` WHERE _apitap_lsn = {w} AND v IN ('new', 'new2')")
+    first = dq(f"SELECT {s_('min(_apitap_seq)')} FROM {tb(T)} WHERE _apitap_lsn = {w} AND v IN ('new', 'new2')")
     case("NEW's first seq at the boundary stamp is the old maximum + 1",
          old_max.isdigit() and first == str(int(old_max) + 1), f"{first} (old max {old_max})")
 finally:

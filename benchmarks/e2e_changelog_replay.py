@@ -43,14 +43,31 @@ logical replication slot's confirmed-flush point is refused outright (and
 Postgres would not re-send the window anyway), while a binlog file+offset can
 simply be read again.
 
-Rig: `apitap-bench-mariadb` on :3309 (root/bench), `apitap-bench-ch` on :8124.
-RED: `~/gate-0560-venv/bin/python benchmarks/e2e_changelog_replay.py`.
+    python benchmarks/e2e_changelog_replay.py [ch]     # ClickHouse, all of the above
+    python benchmarks/e2e_changelog_replay.py bq       # BigQuery (T8): the replay, T3, T2, T2b
+
+The BigQuery half lives in `_changelog_replay_bq.py`: the same cases, asked of
+BigQuery, where a table's rows and watermark share one transaction but a
+group's members do not.
+
+Rig: `apitap-bench-mariadb` on :3309 (root/bench), `apitap-bench-ch` on :8124;
+`bq` needs BQ_SA.
+RED: `~/gate-0560-venv/bin/python benchmarks/e2e_changelog_replay.py [bq]`.
 """
 import os
 import subprocess
 import sys
 
 import apitap
+
+ENGINE = sys.argv[1] if len(sys.argv) > 1 else "ch"
+if ENGINE not in ("ch", "bq"):
+    sys.exit(f"usage: {sys.argv[0]} [ch|bq]")
+if ENGINE == "bq":
+    import _changelog_replay_bq
+    good = _changelog_replay_bq.main()
+    print("\n   ===== CHANGELOG REPLAY E2E (BigQuery): " + ("ALL GREEN" if good else "FAILED") + " =====")
+    sys.exit(0 if good else 1)
 
 MA = "mysql://root:bench@127.0.0.1:3309/bench"
 CH = "clickhouse://default:bench@127.0.0.1:8124/default"

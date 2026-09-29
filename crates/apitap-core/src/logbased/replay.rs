@@ -39,9 +39,8 @@ impl WindowId {
         self.end
     }
 
-    /// The changelog stamp (`_apitap_lsn`). The ClickHouse and BigQuery
-    /// changelog applies read it until they take their stamp from
-    /// `ReplayPlan::stamp`.
+    /// Where the window starts: the stamp the destinations ask their facts
+    /// at, before a plan exists. Rows are stamped with `ReplayPlan::stamp`.
     pub(crate) fn start(&self) -> u64 {
         self.start
     }

@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::lease::Watermark;
 use crate::logbased::changelog::Changes;
 use crate::logbased::collapse::{Collapsed, Key};
-use crate::logbased::replay::WindowId;
+use crate::logbased::replay::{Ask, Memo, ReplayPlan, StampFacts, WindowId};
 use crate::logbased::resolve::{resolve_window, Image};
 use crate::logbased::window::{Bodies, DrainOutcome, TableWindow};
 use std::collections::HashMap;
@@ -95,6 +95,11 @@ pub(crate) type Member = (String, String, String);
 
 pub(crate) struct BqDest {
     store: BqStore,
+    /// What this run knows of each changelog table's stamps (`Memo`).
+    memo: Memo,
+    /// A changelog table's plan between its apply and its unit's commit: the
+    /// memo learns a marker only once the transaction that wrote it committed.
+    staged: std::sync::Mutex<HashMap<(String, String), ReplayPlan>>,
 }
 
 /// `dest_table` may arrive schema-qualified; the BigQuery dataset comes from the
@@ -105,7 +110,7 @@ fn bare(dest_table: &str) -> &str {
 
 impl BqDest {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: BqStore::connect(url).await? })
+        Ok(Self { store: BqStore::connect(url).await?, memo: Memo::default(), staged: Default::default() })
     }
 
     /// The store: the lease and its fence table, the guard, and the units a
@@ -187,22 +192,31 @@ impl BqDest {
     }
 
     /// changelog=true, once, right after the bootstrap's bulk load — see
-    /// `changelog_bootstrap_unit`.
+    /// `changelog_bootstrap_unit`. The table's `_apitap_cdc_pending` rows go
+    /// in the same unit (brief R-B2): they describe the stream the bootstrap
+    /// replaced, and a marker past the new stream's start would refuse every
+    /// window as a rewind.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn changelog_bootstrap_finish(
         &self,
         u: &mut BqUnit<'_>,
         dest_table: &str,
+        source_id: &str,
         pk_cols: &[String],
         lsn: u64,
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
-        changelog_bootstrap_unit(u, dest_table, pk_cols, lsn, partition_by, order_by).await
+        let table = bare(dest_table);
+        self.memo.forget(table, source_id);
+        changelog_bootstrap_unit(u, dest_table, pk_cols, lsn, partition_by, order_by).await?;
+        u.clear_pending(table, source_id).await
     }
 
     /// A whole group's window in one unit — see `apply_group_unit` and
     /// `apply_group_changelog_unit`. Each member's watermark comes back for
-    /// the unit's close, which commits it in that member's own group.
+    /// the unit's close, which commits it in that member's own group. A
+    /// changelog member's plan waits in `staged` for that commit (`settle`).
     pub(crate) async fn apply_group(
         &self,
         u: &mut BqUnit<'_>,
@@ -212,7 +226,30 @@ impl BqDest {
     ) -> Result<Vec<(u64, Watermark)>> {
         match &outcome.bodies {
             Bodies::Replica(w) => apply_group_unit(u, ctxs, w, &outcome.id, lanes).await,
-            Bodies::Changelog(w) => apply_group_changelog_unit(u, ctxs, w, &outcome.id, lanes).await,
+            Bodies::Changelog(w) => {
+                let (out, plans) = apply_group_changelog_unit(u, &self.memo, ctxs, w, &outcome.id, lanes).await?;
+                let mut staged = self.staged.lock().unwrap();
+                for ((dt, _, sid), plan) in ctxs.iter().zip(plans) {
+                    staged.insert((bare(dt).to_string(), sid.clone()), plan);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// The unit that held `dest_table`'s window is closed: `ok` when its
+    /// transaction committed. Only then does the memo take the marker the
+    /// window wrote (brief §0 L14); any failure, the apply's or the commit's,
+    /// makes the table unknown again, and its next window probes. A group
+    /// split across transactions reports one verdict for all of them: a
+    /// member whose own transaction did commit is merely probed again.
+    pub(crate) fn settle(&self, dest_table: &str, source_id: &str, ok: bool) {
+        let table = bare(dest_table);
+        let plan = self.staged.lock().unwrap().remove(&(table.to_string(), source_id.to_string()));
+        match (ok, plan) {
+            (true, Some(p)) => self.memo.committed(table, source_id, &p),
+            (true, None) => {}
+            (false, _) => self.memo.forget(table, source_id),
         }
     }
 }
@@ -401,39 +438,73 @@ fn current_view_sql(v: &str, t: &str, pk_cols: &[String]) -> String {
     )
 }
 
-/// A whole group's changelog window: stage every table concurrently (one
-/// load job each), then hand each table's INSERT to its own group of the unit
-/// — whose close appends that table's watermark row to the SAME group and
-/// commits whole groups, as few transactions as fit.
+/// A whole group's changelog window: plan every member, stage the ones that
+/// append concurrently (one load job each), then hand each table's
+/// statements to its own group of the unit — whose close appends that
+/// table's watermark row to the SAME group and commits whole groups, as few
+/// transactions as fit.
 ///
-/// Replay-safe without a dedup pass: the INSERT and the window's watermark
-/// row commit inside ONE transaction, so a window either landed whole or
-/// not at all, and a re-drained window re-lands from the same LSN.
+/// **Replay.** A group is packed into several transactions (`CHUNK_BYTES`),
+/// so one member's window can commit while a sibling's fails, and the next
+/// run re-drains every member from the group minimum — that member's window
+/// again, from the same start. The stamp is the window's START, the one
+/// position a re-drain reproduces, so `(lsn, seq)` is an event's identity;
+/// each transaction records its attempt in `_apitap_cdc_pending` beside its
+/// rows (start, seq base, end, events); and `replay_plan` decides from both
+/// what this attempt trims, marks and appends (brief §2.B §3.D). A table's
+/// trim, marker, rows and watermark are one transaction, so an attempt is
+/// never torn here: a replay resumes past a whole attempt, or trims the tail
+/// a shorter replay does not carry.
 ///
-/// Both halves of that were untrue until 0.56.0. The chunker packed a FLAT
-/// list of statements by byte size, so a boundary could fall between a
-/// table's INSERT and its watermark and put them in two transactions; it
-/// packs whole groups now. And the stamp was `end_lsn`, which a re-drain
-/// recomputes — so "re-lands from the same LSN" was false and `(lsn, seq)`
-/// could not be used to de-duplicate. It is the window's start now.
+/// The reads are one query job per GROUP, not per table: the probe once per
+/// run (the memo answers every later window with nothing), the facts only on
+/// a window a replay or another writer's rows can reach.
 pub(crate) async fn apply_group_changelog_unit(
     u: &mut BqUnit<'_>,
+    memo: &Memo,
     ctxs: &[Member],
     windows: &HashMap<String, TableWindow<Changes>>,
     id: &WindowId,
     lanes: usize,
-) -> Result<Vec<(u64, Watermark)>> {
+) -> Result<(Vec<(u64, Watermark)>, Vec<ReplayPlan>)> {
     use futures::stream::{StreamExt as _, TryStreamExt as _};
-    let (ur, cref): (&BqUnit<'_>, _) = (&*u, ctxs);
+    let keys: Vec<(&str, &str)> = ctxs.iter().map(|(dt, _, sid)| (bare(dt), sid.as_str())).collect();
+    let unseen: Vec<(&str, &str)> = keys.iter().copied().filter(|(t, s)| memo.ask(t, s, id) == Ask::Probe).collect();
+    if !unseen.is_empty() {
+        for ((t, s), (pending, ceiling)) in unseen.iter().zip(u.probe_group(&unseen).await?) {
+            memo.probed(t, s, pending, ceiling);
+        }
+    }
+    let asks: Vec<(&str, &str, u32)> = keys
+        .iter()
+        .filter_map(|&(t, s)| match memo.ask(t, s, id) {
+            Ask::Facts { base } => Some((t, s, base)),
+            Ask::Nothing | Ask::Probe => None,
+        })
+        .collect();
+    let facts: HashMap<String, StampFacts> =
+        if asks.is_empty() { HashMap::new() } else { u.facts_group(id.start(), &asks).await? };
+    // A member this window does not carry still runs the rule: an earlier
+    // attempt at this start may have committed rows for it.
+    let plans = ctxs
+        .iter()
+        .zip(&keys)
+        .map(|((_, q, _), &(t, s))| {
+            let events = windows.get(q).map_or(0, |w| w.body().events.len());
+            memo.plan(t, s, facts.get(t), id, events)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (ur, cref, pref): (&BqUnit<'_>, _, _) = (&*u, ctxs, &plans);
     let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
         .map(|i| async move {
-            let (dt, q, _) = &cref[i];
-            stage_changelog(ur, dt, windows.get(q), id).await.map(|(ev, sql)| (i, ev, sql))
+            let (dt, q, sid) = &cref[i];
+            stage_changelog(ur, dt, sid, windows.get(q), &pref[i]).await.map(|(ev, sql)| (i, ev, sql))
         })
         .buffer_unordered(lanes.max(1))
         .try_collect()
         .await?;
-    Ok(into_groups(u, ctxs, id, staged))
+    let ends: Vec<u64> = plans.iter().map(ReplayPlan::watermark).collect();
+    Ok((into_groups(u, ctxs, &ends, staged), plans))
 }
 
 /// A whole group's replica window: STAGE every table concurrently (each is a
@@ -462,16 +533,17 @@ pub(crate) async fn apply_group_unit(
         .buffer_unordered(lanes.max(1))
         .try_collect()
         .await?;
-    Ok(into_groups(u, ctxs, id, staged))
+    Ok(into_groups(u, ctxs, &vec![id.end(); ctxs.len()], staged))
 }
 
 /// Each staged table's statements into its own group, in member order, and
-/// the watermark its close writes. Every member gets a mark — a table with
-/// no traffic in the window still advances.
+/// the watermark its close writes (`ends`, per member: a replica window's
+/// end, a changelog plan's watermark). Every member gets a mark — a table
+/// with no traffic in the window still advances.
 fn into_groups(
     u: &mut BqUnit<'_>,
     ctxs: &[Member],
-    id: &WindowId,
+    ends: &[u64],
     mut staged: Vec<(usize, u64, Vec<String>)>,
 ) -> Vec<(u64, Watermark)> {
     staged.sort_by_key(|s| s.0);
@@ -482,46 +554,49 @@ fn into_groups(
     }
     ctxs.iter()
         .zip(events)
-        .map(|((dt, _, sid), ev)| {
-            (ev, Watermark::Set { table: dt.clone(), source_id: sid.clone(), lsn: id.end(), rows: ev })
+        .zip(ends)
+        .map(|(((dt, _, sid), ev), &lsn)| {
+            (ev, Watermark::Set { table: dt.clone(), source_id: sid.clone(), lsn, rows: ev })
         })
         .collect()
 }
 
-/// One readback per window: the current value of every masked column for
-/// every key that needs one. `__current` filters the log by key first and
-/// the table is CLUSTERed on the PK, so this prunes rather than scans.
-async fn read_current(
+/// The rows that were in the log before the window `plan` appends: every row
+/// at an earlier stamp, and at its own stamp the baseline and the rows below
+/// its seq base (another writer's, which R1 numbers above). What sits at the
+/// stamp from the base up is this window's own earlier attempt.
+fn before_window(plan: &ReplayPlan, alias: &str) -> String {
+    format!(
+        "({a}{CL_LSN} < {s} OR ({a}{CL_LSN} = {s} AND ({a}{CL_SEQ} < {b} OR {a}{OP_COL} = '{base}')))",
+        a = alias,
+        s = plan.stamp(),
+        b = plan.seq_base(),
+        base = CL_BASELINE,
+    )
+}
+
+/// One readback per window: what every masked column held BEFORE this window,
+/// for every key that needs one — `<table>__current`'s three rules (the
+/// newest `T`, the newest record per key by `(lsn, seq)`, a `D` dropped after
+/// the pick) over the rows `before_window` keeps.
+///
+/// Not the view itself: a replay reads back after its own earlier attempt
+/// committed, and the view shows that attempt — a re-key's `D` half hides
+/// the old key's row, and the `U` half found no cell to carry ("torn") on
+/// every run. The window's own events are the carry's
+/// (`Changes::resolve_masked`); the destination only answers for what came
+/// before them. Filtered by key, and the table is CLUSTERed on the PK, so
+/// this prunes rather than scans; the `T` bound reads three columns.
+async fn read_base(
     u: &BqUnit<'_>,
     table: &str,
     pk_cols: &[String],
     keys: &[crate::logbased::changelog::CKey],
     cols: &[usize],
     wal_cols: &[String],
+    plan: &ReplayPlan,
 ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
-    let bt = |c: &str| format!("`{c}`");
-    let sel = pk_cols
-        .iter()
-        .map(|c| format!("CAST({} AS STRING)", bt(c)))
-        .chain(cols.iter().map(|&i| format!("CAST({} AS STRING)", bt(&wal_cols[i]))))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut preds = Vec::with_capacity(keys.len());
-    for k in keys {
-        let mut parts = Vec::with_capacity(pk_cols.len());
-        for (c, v) in pk_cols.iter().zip(k.iter()) {
-            let txt = std::str::from_utf8(v).map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
-            parts.push(format!("CAST({} AS STRING) = '{}'", bt(c), sql_str(txt)));
-        }
-        preds.push(format!("({})", parts.join(" AND ")));
-    }
-    let rows = u
-        .query(&format!(
-            "SELECT {sel} FROM {v} WHERE {p}",
-            v = u.fq(&format!("{table}__current")),
-            p = preds.join(" OR "),
-        ))
-        .await?;
+    let rows = u.query(&read_base_sql(&u.fq(table), pk_cols, keys, cols, wal_cols, plan)?).await?;
     let np = pk_cols.len();
     let mut out = std::collections::HashMap::with_capacity(keys.len());
     for row in rows {
@@ -536,32 +611,141 @@ async fn read_current(
     Ok(out)
 }
 
-/// One table's changelog window: every captured event as a staging row,
-/// loaded, then handed back as the INSERT its group commits. The watermark is
-/// not here: the unit's close appends it to this table's group.
+/// `read_base`'s query over the table `t` (fully qualified).
+fn read_base_sql(
+    t: &str,
+    pk_cols: &[String],
+    keys: &[crate::logbased::changelog::CKey],
+    cols: &[usize],
+    wal_cols: &[String],
+    plan: &ReplayPlan,
+) -> Result<String> {
+    let bt = |c: &str| format!("`{c}`");
+    let sel = pk_cols
+        .iter()
+        .map(|c| format!("CAST({} AS STRING)", bt(c)))
+        .chain(cols.iter().map(|&i| format!("CAST({} AS STRING)", bt(&wal_cols[i]))))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut preds = Vec::with_capacity(keys.len());
+    for k in keys {
+        let mut parts = Vec::with_capacity(pk_cols.len());
+        for (c, v) in pk_cols.iter().zip(k.iter()) {
+            let txt = std::str::from_utf8(v).map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+            parts.push(format!("CAST(_apitap_p.{} AS STRING) = '{}'", bt(c), sql_str(txt)));
+        }
+        preds.push(format!("({})", parts.join(" AND ")));
+    }
+    // Every alias `_apitap_`-prefixed and every column qualified, as in the
+    // view: a key called `l` or `s` must not turn ambiguous.
+    let keys_q = pk_cols.iter().map(|c| format!("_apitap_p.{}", bt(c))).collect::<Vec<_>>().join(", ");
+    Ok(format!(
+        "WITH _apitap_pre AS (SELECT * FROM {t} _apitap_p WHERE {pre}), \
+         _apitap_tr AS (SELECT MAX({CL_LSN}) AS _apitap_l FROM _apitap_pre WHERE {OP_COL} = 'T'), \
+         _apitap_trs AS (SELECT MAX(_apitap_p.{CL_SEQ}) AS _apitap_s \
+           FROM _apitap_pre _apitap_p CROSS JOIN _apitap_tr \
+           WHERE _apitap_p.{OP_COL} = 'T' AND _apitap_p.{CL_LSN} = _apitap_tr._apitap_l) \
+         SELECT {sel} FROM ( \
+           SELECT _apitap_p.* FROM _apitap_pre _apitap_p CROSS JOIN _apitap_tr CROSS JOIN _apitap_trs \
+           WHERE ({p}) \
+             AND (_apitap_tr._apitap_l IS NULL OR _apitap_p.{CL_LSN} > _apitap_tr._apitap_l \
+                  OR (_apitap_p.{CL_LSN} = _apitap_tr._apitap_l AND _apitap_p.{CL_SEQ} > _apitap_trs._apitap_s)) \
+           QUALIFY ROW_NUMBER() OVER ( \
+             PARTITION BY {keys_q} \
+             ORDER BY _apitap_p.{CL_LSN} DESC, _apitap_p.{CL_SEQ} DESC, _apitap_p.{OP_COL} = '{base}' ASC) = 1 \
+         ) WHERE {OP_COL} != 'D'",
+        pre = before_window(plan, "_apitap_p."),
+        p = preds.join(" OR "),
+        base = CL_BASELINE,
+    ))
+}
+
+/// Where one changelog table's statements write: the table, the marker
+/// table, and the partition bound (`BqUnit::prune`).
+struct ClTarget<'a> {
+    table: &'a str,
+    source_id: &'a str,
+    table_fq: String,
+    pending_fq: String,
+    prune: String,
+}
+
+/// One changelog table's share of its group's transaction, in the only order
+/// it runs: the trim, the marker, the rows. The watermark is not here: the
+/// unit's close appends it to the same group (brief §0 L13), so the four
+/// commit together or not at all. `insert` is the rows' INSERT … SELECT from
+/// this run's staging, present exactly when the plan appends.
+///
+/// The marker is never after the rows: a transaction that could commit rows
+/// without it would leave rows no marker names, which the next run reads as
+/// another writer's and numbers above — every event twice.
+fn changelog_group_sql(plan: &ReplayPlan, at: &ClTarget<'_>, insert: Option<String>) -> Vec<String> {
+    debug_assert_eq!(insert.is_some(), !plan.to_append().is_empty(), "{plan:?}");
+    let mut v = Vec::with_capacity(3);
+    if let Some(x) = plan.trim_from() {
+        v.push(format!(
+            "DELETE FROM {t} WHERE {CL_LSN} = {s} AND {OP_COL} != '{b}' AND {CL_SEQ} >= {x}{prune};",
+            t = at.table_fq,
+            s = plan.stamp(),
+            b = CL_BASELINE,
+            prune = at.prune,
+        ));
+    }
+    if let Some(m) = plan.marker() {
+        v.push(format!(
+            "INSERT INTO {p} (dest_table, source_id, lsn, seq_base, end_lsn, events, `at`) \
+             VALUES ('{t}', '{sid}', {}, {}, {}, {}, CURRENT_TIMESTAMP());",
+            m.start,
+            m.seq_base,
+            m.end,
+            m.events,
+            p = at.pending_fq,
+            t = sql_str(at.table),
+            sid = sql_str(at.source_id),
+        ));
+    }
+    v.extend(insert);
+    v
+}
+
+/// One table's changelog window under its plan: the events the plan appends
+/// as staging rows, loaded, and the table's statements for its group
+/// (`changelog_group_sql`). A plan that appends nothing — a replay whose
+/// attempt already committed, an absent member — loads nothing and may still
+/// trim. The watermark is not here: the unit's close appends it.
 async fn stage_changelog(
     u: &BqUnit<'_>,
     dest_table: &str,
+    source_id: &str,
     w: Option<&TableWindow<Changes>>,
-    id: &WindowId,
+    plan: &ReplayPlan,
 ) -> Result<(u64, Vec<String>)> {
     let table = bare(dest_table);
-    let Some(w) = w else {
-        return Ok((0, Vec::new()));
+    let at = ClTarget {
+        table,
+        source_id,
+        table_fq: u.fq(table),
+        pending_fq: u.pending_fq(),
+        prune: u.prune(table, source_id),
     };
-    let (c, l) = (w.body(), w.layout());
-    if c.events.is_empty() {
-        return Ok((0, Vec::new()));
-    }
-    let (wal_cols, oids) = (l.cols(), l.oids());
-    for name in wal_cols {
-        if matches!(name.as_str(), OP_COL | MASK_COL | CL_LSN | CL_SEQ | CL_AT) {
-            return Err(Error::InvalidInput(format!(
-                "log_based changelog: source column '{name}' collides with a reserved \
-                 changelog column — rename it at the source or alias it in a view"
-            )));
+    if let Some(w) = w {
+        for name in w.layout().cols() {
+            if matches!(name.as_str(), OP_COL | MASK_COL | CL_LSN | CL_SEQ | CL_AT) {
+                return Err(Error::InvalidInput(format!(
+                    "log_based changelog: source column '{name}' collides with a reserved \
+                     changelog column — rename it at the source or alias it in a view"
+                )));
+            }
         }
     }
+    let rows = w.map_or(0, |w| w.body().count);
+    let range = plan.to_append();
+    if range.is_empty() {
+        return Ok((rows, changelog_group_sql(plan, &at, None)));
+    }
+    let w = w.ok_or_else(|| Error::Transfer(format!("log_based: {table}: internal: rows to append from no window")))?;
+    let (c, l) = (w.body(), w.layout());
+    let (wal_cols, oids) = (l.cols(), l.oids());
     let meta = u.table_get(table).await?.ok_or_else(|| {
         Error::Transfer(format!(
             "log_based changelog: BigQuery target {table} does not exist — the \
@@ -569,7 +753,7 @@ async fn stage_changelog(
         ))
     })?;
     let types = column_types(&meta)?;
-    let plan = ApplyPlan::build(table, wal_cols, oids, &[], &types)?;
+    let cast = ApplyPlan::build(table, wal_cols, oids, &[], &types)?;
 
     // Rebuild unchanged-TOAST cells before anything is staged: writing them
     // as NULL would silently blank the column for every reader of
@@ -579,7 +763,7 @@ async fn stage_changelog(
         let base = if keys.is_empty() || cols.is_empty() {
             std::collections::HashMap::new()
         } else {
-            read_current(u, table, l.key_cols(), &keys, &cols, wal_cols).await?
+            read_base(u, table, l.key_cols(), &keys, &cols, wal_cols, plan).await?
         };
         c.resolve_masked(&cols, &base)?
     } else {
@@ -587,11 +771,11 @@ async fn stage_changelog(
     };
 
     let mut ndjson: Vec<u8> = Vec::new();
-    for (seq, ev) in c.events.iter().enumerate() {
-        let row = patched.get(&seq).or(ev.row.as_ref());
-        push_change(&mut ndjson, wal_cols, row, ev.op.code(), seq)?;
+    for (i, ev) in c.events.iter().enumerate().take(range.end).skip(range.start) {
+        let row = patched.get(&i).or(ev.row.as_ref());
+        push_change(&mut ndjson, wal_cols, row, ev.op.code(), plan.seq_of(i))?;
     }
-    u.load(table, &plan.staging_fields_changelog(), ndjson).await?;
+    u.load(table, &cast.staging_fields_changelog(), ndjson).await?;
 
     let bt = |c: &str| format!("`{c}`");
     let into = wal_cols
@@ -600,18 +784,14 @@ async fn stage_changelog(
         .chain([bt(OP_COL), bt(CL_LSN), bt(CL_SEQ), bt(CL_AT)])
         .collect::<Vec<_>>()
         .join(", ");
-    let sel = plan
+    let sel = cast
         .cast
         .iter()
         .cloned()
         .chain([
             bt(OP_COL),
-            // The window's START, not its end. `end_lsn` is recomputed by
-            // every re-drain, so the same event came back under a different
-            // `_apitap_lsn` and `(lsn, seq)` was useless as a de-duplication
-            // key on a log that this path CAN replay (see the chunking note
-            // on `apply_group_changelog_unit`).
-            format!("CAST({} AS INT64)", id.start()),
+            // The window's START, the one position a re-drain reproduces.
+            format!("CAST({} AS INT64)", plan.stamp()),
             format!("CAST({} AS INT64)", bt(CL_SEQ)),
             // One stamp for the whole window: it is the PARTITION and
             // retention key, never an ordering key — `(lsn, seq)` orders.
@@ -619,10 +799,8 @@ async fn stage_changelog(
         ])
         .collect::<Vec<_>>()
         .join(", ");
-    Ok((
-        c.count,
-        vec![format!("INSERT INTO {t} ({into}) SELECT {sel} FROM {s};", t = u.fq(table), s = u.staging_fq(table))],
-    ))
+    let insert = format!("INSERT INTO {} ({into}) SELECT {sel} FROM {};", at.table_fq, u.staging_fq(table));
+    Ok((rows, changelog_group_sql(plan, &at, Some(insert))))
 }
 
 /// Rewrite the freshly-bootstrapped target clustered on its PK (up to 4
@@ -992,7 +1170,7 @@ fn push_upsert(out: &mut Vec<u8>, cols: &[String], cells: &[Cell], mask: Option<
     Ok(())
 }
 
-/// One changelog record: the op, its in-window sequence, and whatever the
+/// One changelog record: the op, its `_apitap_seq`, and whatever the
 /// event's row image carries. A delete's old image IS the delete record, so it
 /// renders like any other row; a TRUNCATE has no row at all and every data
 /// column is simply absent (BigQuery loads a missing NDJSON field as NULL).
@@ -1005,7 +1183,7 @@ fn push_change(
     cols: &[String],
     row: Option<&crate::wire::pgoutput::Tuple>,
     op: &str,
-    seq: usize,
+    seq: u32,
 ) -> Result<()> {
     use crate::wire::pgoutput::Cellv;
     let mut obj = Map::new();
@@ -1151,13 +1329,15 @@ fn push_delete(out: &mut Vec<u8>, pk_cols: &[String], key: &Key) -> Result<()> {
 
 /// Everything that reaches BigQuery. See the module doc.
 mod store {
-    use super::{bare, pack_whole_groups, CHUNK_BYTES};
+    use super::{bare, pack_whole_groups, CHUNK_BYTES, CL_LSN, CL_SEQ, OP_COL};
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, owned_margin_secs, Fence, LeaseStore, Watermark, LEASE_TABLE, LOST_MARK};
-    use crate::naming::{artifact_ident, artifact_ident_tok, fence_ident, Artifact, ROOMY};
+    use crate::logbased::replay::{parse_ceiling, parse_facts, parse_pending, Pending, StampFacts};
+    use crate::naming::{artifact_ident, artifact_ident_tok, fence_ident, Artifact, CDC_PENDING_TABLE, ROOMY};
     use crate::sink::bigquery::{fence_fq, sql_str, BqConn, BqGuard};
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     pub(crate) struct BqStore {
@@ -1165,6 +1345,109 @@ mod store {
         /// `_apitap_state` is known to exist (one REST probe per run, not per
         /// window).
         state_ready: AtomicBool,
+        /// `_apitap_cdc_pending` is known to exist.
+        pending_ready: AtomicBool,
+        /// This run already looked at `_apitap_cdc_pending`'s size.
+        pending_compacted: AtomicBool,
+        /// Per (table, source): when the watermark this run started from was
+        /// committed (`read_state`), the lower bound of every changelog row
+        /// this run can find at its stamps (`BqUnit::prune`).
+        hint: std::sync::Mutex<HashMap<(String, String), String>>,
+    }
+
+    /// Rows past which a probe compacts `_apitap_cdc_pending`. One row per
+    /// changelog table per window that carried events, so it grows with
+    /// traffic; only the newest per table is ever read.
+    const PENDING_COMPACT_ROWS: u64 = 4096;
+
+    /// `_apitap_cdc_pending` on BigQuery: one row per append attempt, written
+    /// inside the attempt's transaction, never updated. Clustered so a
+    /// probe's join on (dest_table, source_id) prunes. The columns are the
+    /// ClickHouse marker table's; `at` is a keyword in BigQuery's grammar, so
+    /// it is quoted wherever it is spelled.
+    pub(super) fn pending_ddl(p: &str) -> String {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {p} (dest_table STRING NOT NULL, source_id STRING NOT NULL, \
+             lsn INT64 NOT NULL, seq_base INT64 NOT NULL, end_lsn INT64 NOT NULL, events INT64 NOT NULL, \
+             `at` TIMESTAMP NOT NULL) CLUSTER BY dest_table, source_id;"
+        )
+    }
+
+    /// The run's first look at a group's changelog tables, in ONE query job:
+    /// per member its newest marker (`'m'`, ranked by `(lsn, at)` — a
+    /// table's marker starts only rise, so a clock step cannot pick an older
+    /// one) and its log's non-baseline row count and highest stamp (`'c'`,
+    /// the ceiling `replay::Memo` bounds earlier writers by). `members` are
+    /// (table, source, table_fq, prune).
+    pub(super) fn probe_group_sql(p: &str, members: &[(&str, &str, String, String)]) -> String {
+        let k = members
+            .iter()
+            .map(|(t, s, ..)| format!("STRUCT('{}' AS t, '{}' AS s)", sql_str(t), sql_str(s)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = format!(
+            "WITH k AS (SELECT * FROM UNNEST([{k}])), \
+             m AS (SELECT p.dest_table, p.lsn, p.seq_base, p.events, \
+                   ROW_NUMBER() OVER (PARTITION BY p.dest_table, p.source_id ORDER BY p.lsn DESC, p.`at` DESC) AS rn \
+                   FROM {p} p JOIN k ON p.dest_table = k.t AND p.source_id = k.s) \
+             SELECT 'm', dest_table, CAST(lsn AS STRING), CAST(seq_base AS STRING), CAST(events AS STRING) \
+             FROM m WHERE rn = 1"
+        );
+        for (t, _, fq, prune) in members {
+            sql.push_str(&format!(
+                " UNION ALL SELECT 'c', '{t}', CAST(COUNT(*) AS STRING), \
+                 CAST(IFNULL(MAX({CL_LSN}), -1) AS STRING), CAST(NULL AS STRING) \
+                 FROM {fq} WHERE {OP_COL} != 'B'{prune}",
+                t = sql_str(t),
+            ));
+        }
+        sql
+    }
+
+    /// What is at one stamp already, per asked table, in ONE query job: every
+    /// non-baseline row, the ones from the table's base up, and how many
+    /// distinct seqs (`replay::parse_facts`). `asks` are (table, table_fq,
+    /// base, prune).
+    pub(super) fn facts_group_sql(stamp: u64, asks: &[(&str, String, u32, String)]) -> String {
+        asks.iter()
+            .map(|(t, fq, b, prune)| {
+                format!(
+                    "SELECT '{t}', CAST(COUNT(*) AS STRING), CAST(IFNULL(MAX({CL_SEQ}), -1) AS STRING), \
+                     CAST(COUNTIF({CL_SEQ} >= {b}) AS STRING), \
+                     CAST(IFNULL(MAX(IF({CL_SEQ} >= {b}, {CL_SEQ}, NULL)), -1) AS STRING), \
+                     CAST(COUNT(DISTINCT {CL_SEQ}) AS STRING) \
+                     FROM {fq} WHERE {CL_LSN} = {stamp} AND {OP_COL} != 'B'{prune}",
+                    t = sql_str(t),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ")
+    }
+
+    /// The markers every newer marker of their own table supersedes, and only
+    /// those older than a week: the probe reads the newest per table, and a
+    /// marker is never read once its window committed. A DELETE decides on
+    /// its own snapshot, so a marker appended meanwhile — an INSERT never
+    /// conflicts with it — survives; never a WRITE_TRUNCATE rewrite, which
+    /// would lose one (the lesson of `compact_state`). The newest time per
+    /// table is aggregated first: one equality join, linear in the table.
+    pub(super) fn compact_pending_sql(p: &str) -> String {
+        format!(
+            "DELETE FROM {p} x WHERE x.`at` < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY) \
+             AND EXISTS (SELECT 1 FROM (SELECT dest_table, source_id, MAX(`at`) AS newest FROM {p} \
+                         GROUP BY dest_table, source_id) y \
+                         WHERE y.dest_table = x.dest_table AND y.source_id = x.source_id AND x.`at` < y.newest)"
+        )
+    }
+
+    /// A table's markers, for whoever drops its state or starts its stream
+    /// again (brief R-B2).
+    pub(super) fn clear_pending_sql(p: &str, table: &str, source_id: &str) -> String {
+        format!(
+            "DELETE FROM {p} WHERE dest_table = '{}' AND source_id = '{}';",
+            sql_str(table),
+            sql_str(source_id)
+        )
     }
 
     /// One unit: the run's keys, and the statements each table contributes,
@@ -1290,7 +1573,13 @@ mod store {
 
     impl BqStore {
         pub(crate) async fn connect(url: &str) -> Result<Self> {
-            Ok(Self { conn: BqConn::parse(url).await?, state_ready: AtomicBool::new(false) })
+            Ok(Self {
+                conn: BqConn::parse(url).await?,
+                state_ready: AtomicBool::new(false),
+                pending_ready: AtomicBool::new(false),
+                pending_compacted: AtomicBool::new(false),
+                hint: Default::default(),
+            })
         }
 
         pub(crate) fn bq_guard(&self) -> BqGuard {
@@ -1318,7 +1607,8 @@ mod store {
                 "WITH s AS (SELECT * FROM {state} WHERE dest_table = '{dt}'), \
                  b AS (SELECT IFNULL(MAX(synced_at), TIMESTAMP '1970-01-01') AS ts \
                        FROM s WHERE source_id = '*') \
-                 SELECT watermark, cursor_col, mode FROM s, b \
+                 SELECT watermark, cursor_col, mode, \
+                        FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E6S+00', synced_at, 'UTC') FROM s, b \
                  WHERE source_id = '{sid}' AND synced_at > b.ts \
                  ORDER BY synced_at DESC LIMIT 1",
                 state = self.conn.state_fq(),
@@ -1337,8 +1627,63 @@ mod store {
             self.conn.compact_state_if_bloated().await;
             Ok(rows.into_iter().next().map(|row| {
                 let cell = |i: usize| row.get(i).cloned().flatten();
+                // Pasted into SQL as a literal later: kept only if it is the
+                // timestamp that was asked for.
+                if let Some(at) = cell(3).filter(|a| a.bytes().all(|b| b.is_ascii_digit() || b" -:.+".contains(&b))) {
+                    self.hint.lock().unwrap().insert((table.to_string(), source_id.to_string()), at);
+                }
                 crate::naming::StateRow::new(cell(0), cell(1), cell(2))
             }))
+        }
+
+        /// `_apitap_cdc_pending`, created on first use — outside any
+        /// transaction (DDL cannot be in one), once per run.
+        async fn ensure_pending_table(&self) -> Result<()> {
+            if self.pending_ready.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if self.conn.table_get(CDC_PENDING_TABLE).await?.is_none() {
+                self.conn.cdc_script(&pending_ddl(&self.conn.fq(CDC_PENDING_TABLE))).await?;
+            }
+            self.pending_ready.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        /// Whether a table can have markers to clear: a dataset that never had
+        /// a changelog has no marker table.
+        async fn pending_exists(&self) -> Result<bool> {
+            if self.pending_ready.load(Ordering::Relaxed) {
+                return Ok(true);
+            }
+            let there = self.conn.table_get(CDC_PENDING_TABLE).await?.is_some();
+            self.pending_ready.store(there, Ordering::Relaxed);
+            Ok(there)
+        }
+
+        /// Best-effort, once per run, outside any script (brief §0 L11): an
+        /// error is noted and never fails the run, and the next run's probe
+        /// tries again.
+        async fn compact_pending_if_bloated(&self) {
+            if self.pending_compacted.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            let r = async {
+                let Some(meta) = self.conn.table_get(CDC_PENDING_TABLE).await? else { return Ok(()) };
+                // numRows can lag a hair behind recent jobs; for a bloat
+                // threshold, exact is not interesting.
+                let rows: u64 = meta["numRows"].as_str().and_then(|n| n.parse().ok()).unwrap_or(0);
+                if rows <= PENDING_COMPACT_ROWS {
+                    return Ok(());
+                }
+                self.conn.cdc_script(&compact_pending_sql(&self.conn.fq(CDC_PENDING_TABLE))).await
+            }
+            .await;
+            if let Err(e) = r {
+                crate::progress::note(&format!(
+                    "_apitap_cdc_pending compaction skipped (replays are unaffected; the next run \
+                     retries): {e}"
+                ));
+            }
         }
 
         async fn ensure_state_table(&self) -> Result<()> {
@@ -1367,6 +1712,88 @@ mod store {
     impl BqUnit<'_> {
         pub(crate) fn fq(&self, table: &str) -> String {
             self.s.conn.fq(table)
+        }
+
+        /// `_apitap_cdc_pending`, fully qualified.
+        pub(crate) fn pending_fq(&self) -> String {
+            self.fq(CDC_PENDING_TABLE)
+        }
+
+        /// ` AND _apitap_at >= <a constant>`: the partition bound of every
+        /// changelog row this run can find at its stamps, or nothing when the
+        /// run started from no watermark.
+        ///
+        /// Every row at a stamp at or past this run's first window start was
+        /// committed in or after the transaction that wrote the watermark it
+        /// started from (one transaction holds a window's rows, marker and
+        /// state; an older version's rows at that stamp were its watermark's
+        /// own window). A month of slack on top, and the bound is a literal,
+        /// so the default monthly `_apitap_at` partitions prune.
+        pub(crate) fn prune(&self, table: &str, source_id: &str) -> String {
+            match self.s.hint.lock().unwrap().get(&(table.to_string(), source_id.to_string())) {
+                Some(at) => format!(" AND _apitap_at >= TIMESTAMP_SUB(TIMESTAMP '{at}', INTERVAL 31 DAY)"),
+                None => String::new(),
+            }
+        }
+
+        /// The newest marker and the ceiling of each member (`probe_group_sql`),
+        /// in `members` order; the marker table made first if this is its
+        /// first use, and compacted after if it grew (best-effort).
+        pub(crate) async fn probe_group(&self, members: &[(&str, &str)]) -> Result<Vec<(Option<Pending>, Option<u64>)>> {
+            self.s.ensure_pending_table().await?;
+            let m: Vec<(&str, &str, String, String)> =
+                members.iter().map(|&(t, s)| (t, s, self.fq(t), self.prune(t, s))).collect();
+            let rows = self.query(&probe_group_sql(&self.pending_fq(), &m)).await?;
+            let unreadable = || Error::Transfer(format!("log_based changelog: unreadable probe {rows:?}"));
+            let (mut marks, mut ceils) = (HashMap::new(), HashMap::new());
+            for r in &rows {
+                let c = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+                match c(0).as_str() {
+                    "m" => {
+                        marks.insert(c(1), parse_pending("1", &c(2), &c(3), &c(4))?);
+                    }
+                    "c" => {
+                        ceils.insert(c(1), parse_ceiling(&c(2), &c(3))?);
+                    }
+                    _ => return Err(unreadable()),
+                }
+            }
+            self.s.compact_pending_if_bloated().await;
+            members
+                .iter()
+                .map(|(t, _)| match ceils.get(*t) {
+                    Some(ceiling) => Ok((marks.get(*t).copied().flatten(), *ceiling)),
+                    // Every member has a count row; one missing is a misread.
+                    None => Err(unreadable()),
+                })
+                .collect()
+        }
+
+        /// The facts at `stamp` of each asked (table, source, base), by table.
+        pub(crate) async fn facts_group(&self, stamp: u64, asks: &[(&str, &str, u32)]) -> Result<HashMap<String, StampFacts>> {
+            let a: Vec<(&str, String, u32, String)> =
+                asks.iter().map(|&(t, s, b)| (t, self.fq(t), b, self.prune(t, s))).collect();
+            let mut out = HashMap::with_capacity(asks.len());
+            for r in self.query(&facts_group_sql(stamp, &a)).await? {
+                let cells: Vec<String> = r.into_iter().map(Option::unwrap_or_default).collect();
+                let Some((t, rest)) = cells.split_first() else { continue };
+                out.insert(t.clone(), parse_facts(&rest.iter().map(String::as_str).collect::<Vec<_>>())?);
+            }
+            if let Some((t, ..)) = asks.iter().find(|(t, ..)| !out.contains_key(*t)) {
+                return Err(Error::Transfer(format!("log_based changelog: {t}: no facts came back for its stamp")));
+            }
+            Ok(out)
+        }
+
+        /// `table`'s markers go with its state, in its group (brief R-B2): a
+        /// changelog bootstrap starts a new stream, and a marker past the new
+        /// start would refuse every window as a rewind.
+        pub(crate) async fn clear_pending(&mut self, table: &str, source_id: &str) -> Result<()> {
+            if self.s.pending_exists().await? {
+                let sql = clear_pending_sql(&self.pending_fq(), table, source_id);
+                self.push(table, vec![sql]);
+            }
+            Ok(())
         }
 
         /// This run's staging table for `table` — tokenized, so two drains in
@@ -1521,6 +1948,13 @@ mod store {
                                     sql_str(source_id)
                                 ),
                             ));
+                        }
+                        // The markers go with the state (brief R-B2), in the
+                        // same group: a marker past the next stream's start
+                        // is a rewind.
+                        if self.pending_exists().await? {
+                            let sql = clear_pending_sql(&self.conn.fq(CDC_PENDING_TABLE), bare(table), source_id);
+                            states.push((bare(table).to_string(), sql));
                         }
                     }
                 }
@@ -1801,6 +2235,97 @@ mod tests {
         }
         assert_eq!(chunks.iter().flatten().filter(|s| s.contains("INSERT INTO")).count(), 3,
                    "every state row goes out exactly once");
+    }
+
+    /// D8, BigQuery's twin: a changelog table's share of its group's
+    /// transaction is the trim, then the marker, then the rows, for every
+    /// rule — and the state row the unit's close appends lands after them, in
+    /// the same group, so one transaction holds all four. A marker after the
+    /// rows, or none, lets rows commit that no marker names: the next run
+    /// reads them as another writer's and numbers above them, every event
+    /// twice. A trim after the marker deletes nothing the marker describes
+    /// wrongly, but it is no longer the first write at the stamp.
+    #[test]
+    fn changelog_group_sql_order() {
+        use crate::logbased::replay::{replay_plan, Landed, MarkerRow, Pending, StampFacts};
+        #[derive(Debug, PartialEq)]
+        enum St {
+            Trim(u32),
+            Mark(MarkerRow),
+            Append,
+        }
+        let id = WindowId::new(100, 200);
+        let at = |count: u64, max: Option<u32>| {
+            let l = Landed { count, max_seq: max };
+            StampFacts { all: l, from_base: l, distinct_seq: count }
+        };
+        let torn = StampFacts {
+            all: Landed { count: 2, max_seq: Some(4) },
+            from_base: Landed { count: 2, max_seq: Some(4) },
+            distinct_seq: 2,
+        };
+        let mark = |seq_base, events| St::Mark(MarkerRow { start: 100, seq_base, end: 200, events });
+        let here = Some(Pending::recorded(100, 0));
+        let target = ClTarget {
+            table: "t",
+            source_id: "s'1",
+            table_fq: "`p.d.t`".into(),
+            pending_fq: "`p.d._apitap_cdc_pending`".into(),
+            prune: " AND _apitap_at >= TIMESTAMP_SUB(TIMESTAMP '2026-09-01 00:00:00.000000+00', INTERVAL 31 DAY)".into(),
+        };
+        let insert = "INSERT INTO `p.d.t` (`id`) SELECT `id` FROM `p.d.t_x__apitap_cdc`;";
+        let num = |sql: &str, after: &str| -> u64 {
+            let rest = &sql[sql.find(after).unwrap_or_else(|| panic!("{after} in {sql}")) + after.len()..];
+            rest.trim_start().split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+        };
+        let parse = |sql: &str| -> St {
+            if sql.starts_with("DELETE FROM `p.d.t` ") {
+                assert!(sql.contains("_apitap_lsn = 100 AND _apitap_op != 'B'") && sql.contains(&target.prune), "{sql}");
+                St::Trim(num(sql, "_apitap_seq >=") as u32)
+            } else if sql.starts_with("INSERT INTO `p.d._apitap_cdc_pending` ") {
+                assert!(sql.contains("VALUES ('t', 's\\'1', "), "{sql}");
+                let v: Vec<u64> = sql[sql.find("'s\\'1', ").unwrap() + 8..]
+                    .split(", ")
+                    .take(4)
+                    .map(|x| x.trim().parse().unwrap())
+                    .collect();
+                St::Mark(MarkerRow { start: v[0], seq_base: v[1] as u32, end: v[2], events: v[3] })
+            } else if sql == insert {
+                St::Append
+            } else {
+                panic!("a statement no step writes: {sql}")
+            }
+        };
+        let cases: Vec<(&str, Option<Pending>, Option<StampFacts>, usize, Vec<St>)> = vec![
+            ("R1, another writer's rows", None, Some(at(3, Some(2))), 5, vec![mark(3, 5), St::Append]),
+            ("R1, nothing at the stamp", None, None, 5, vec![mark(0, 5), St::Append]),
+            ("R2 torn", here, Some(torn), 5, vec![St::Trim(0), mark(0, 5), St::Append]),
+            ("R2 intact, resumed", here, Some(at(2, Some(1))), 5, vec![mark(0, 5), St::Append]),
+            ("R2 intact, all landed", here, Some(at(5, Some(4))), 5, vec![]),
+            ("R2 shorter replay", here, Some(at(8, Some(7))), 5, vec![St::Trim(5)]),
+            ("R2 absent member", here, Some(at(8, Some(7))), 0, vec![St::Trim(0)]),
+            ("R2 torn, absent member", here, Some(torn), 0, vec![St::Trim(0)]),
+            ("absent, no attempt here", None, None, 0, vec![]),
+        ];
+        for (what, p, f, n_ev, want) in cases {
+            let plan = replay_plan("t", p, f.as_ref(), &id, n_ev).unwrap();
+            let ins = (!plan.to_append().is_empty()).then(|| insert.to_string());
+            let sql = changelog_group_sql(&plan, &target, ins);
+            let got: Vec<St> = sql.iter().map(|s| parse(s)).collect();
+            assert_eq!(got, want, "{what}: {sql:#?}");
+            assert!(sql.iter().all(|s| s.ends_with(';')), "{what}: {sql:?}");
+
+            // The close puts the watermark in the same group, last, and the
+            // packer never splits a group: one transaction.
+            let st = store::state_insert_sql("`p.d._apitap_state`", "t", "s'1", plan.watermark(), 1);
+            let chunks = pack_whole_groups(
+                store::close_groups(vec![("t".to_string(), sql.clone())], vec![("t".to_string(), st.clone())]),
+                CHUNK_BYTES,
+            );
+            assert_eq!(chunks.len(), 1, "{what}: {chunks:?}");
+            assert_eq!(chunks[0].last(), Some(&st), "{what}: the watermark is not the group's last write");
+            assert_eq!(chunks[0].len(), sql.len() + 1, "{what}: {chunks:?}");
+        }
     }
 
     /// The bootstrap DDL guard names this run's fence and every key, with the

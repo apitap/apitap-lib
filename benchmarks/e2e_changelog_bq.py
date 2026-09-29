@@ -98,6 +98,10 @@ except Exception:
     pass
 
 pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text, body text)")  # body TOASTs later
+# Out of line and uncompressed, or the unchanged-TOAST case below tests
+# nothing: 40 KB of one letter compresses to a few hundred bytes, stays in the
+# tuple, and every UPDATE re-sends it whole.
+pg(f"ALTER TABLE {T} ALTER COLUMN body SET STORAGE EXTERNAL")
 pg(f"INSERT INTO {T} VALUES (1,'a'),(2,'b'),(3,'c')")
 
 print("== bootstrap (baseline rows get op B) ==")
@@ -143,6 +147,9 @@ print("== unchanged-TOAST: an UPDATE that skips a big column must not blank it =
 BIG = 40000
 pg(f"UPDATE {T} SET body = repeat('x', {BIG}) WHERE id = 1")
 drain()                                                 # window carrying body
+stored = int(pg(f"SELECT pg_column_size(body) FROM {T} WHERE id = 1"))
+print(f"   body stored out of line, uncompressed: {stored} bytes")
+ok &= stored >= BIG
 pg(f"UPDATE {T} SET v = 'toast-probe' WHERE id = 1")    # body NOT touched
 drain()                                                 # the WAL omits body
 got = int(bq(f"SELECT LENGTH(IFNULL(body,'')) FROM `{DS}.{T}__current` WHERE id=1")[0][0])

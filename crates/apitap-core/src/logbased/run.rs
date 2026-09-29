@@ -348,7 +348,7 @@ impl Dest {
                 d.changelog_bootstrap_finish(u, dest_table, source_id, pk_cols, lsn, partition_by, order_by).await?
             }
             (Dest::Bq(d), Unit::Bq(u), true) => {
-                d.changelog_bootstrap_finish(u, dest_table, pk_cols, lsn, partition_by, order_by).await?
+                d.changelog_bootstrap_finish(u, dest_table, source_id, pk_cols, lsn, partition_by, order_by).await?
             }
             (_, _, true) => return Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             (Dest::Pg(d), Unit::Pg(u), false) => d.bootstrap_finish(u, dest_table, pk_cols).await?,
@@ -405,11 +405,12 @@ impl Dest {
     /// The unit that held `dest_table`'s window is closed, `ok` when it
     /// committed: a changelog destination's replay memo learns the marker the
     /// window wrote only now, and forgets the table on any failure (brief §0
-    /// L14). BigQuery's changelog takes its plan in its own group unit.
+    /// L14).
     fn settle(&self, dest_table: &str, source_id: &str, ok: bool) {
         match self {
             Dest::Ch(d) => d.settle(dest_table, source_id, ok),
-            Dest::Pg(_) | Dest::My(_) | Dest::Bq(_) | Dest::Ice(_) => {}
+            Dest::Bq(d) => d.settle(dest_table, source_id, ok),
+            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => {}
         }
     }
 
@@ -1622,14 +1623,22 @@ async fn apply_windows(
         if let Dest::Bq(_) = dest {
             // BigQuery: stage every table concurrently (one load job each),
             // then commit the whole group's MERGEs + watermarks in as few
-            // script jobs as possible — one unit over the group.
+            // script jobs as possible — one unit over the group. Every member
+            // learns how its unit ended (`Dest::settle`), on every path.
             let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
-            let mut h = t.open(&tables).await?;
-            let Unit::Bq(u) = &mut h.unit else { return Err(mismatch()) };
-            let applied = dest.apply_group(u, &members, &o, lanes).await?;
-            let (rows, marks): (Vec<u64>, Vec<Watermark>) = applied.into_iter().unzip();
-            t.close(h, marks).await?;
-            for (i, n) in rows.into_iter().enumerate() {
+            let r = async {
+                let mut h = t.open(&tables).await?;
+                let Unit::Bq(u) = &mut h.unit else { return Err(mismatch()) };
+                let applied = dest.apply_group(u, &members, &o, lanes).await?;
+                let (rows, marks): (Vec<u64>, Vec<Watermark>) = applied.into_iter().unzip();
+                t.close(h, marks).await?;
+                Ok(rows)
+            }
+            .await;
+            for (dt, _, sid) in &members {
+                dest.settle(dt, sid, r.is_ok());
+            }
+            for (i, n) in r?.into_iter().enumerate() {
                 rows_per[i] += n;
             }
         } else if lanes > 1 && members.len() > 1 {
