@@ -270,8 +270,9 @@ pub(crate) trait LeaseStore: Send + Sync + 'static {
     /// Keys of `token` whose row EXISTS and is NOT collected. Expiry ignored.
     fn lease_unclaimed(&self, token: &str)
         -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
-    /// Drop run-scoped objects not tied to a table (BigQuery's fence).
-    fn close_run(&self, token: &str) -> impl std::future::Future<Output = ()> + Send;
+    /// Drop run-scoped objects not tied to a table (BigQuery's fence). An
+    /// error keeps every member's claim, so a collector finishes the job.
+    fn close_run(&self, token: &str) -> impl std::future::Future<Output = Result<()>> + Send;
     #[cfg(test)]
     fn note(&self, _event: &str) {}
 }
@@ -482,12 +483,27 @@ async fn give_back<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announce
     all
 }
 
-/// `give_back`, and once every member went, the run's own objects (BigQuery's
-/// fence table). A member kept for its collector keeps the fence with it.
+/// The run's own objects (BigQuery's fence table) first, then `give_back`.
+///
+/// First, and not best-effort: like a member's scratch, the fence is named by
+/// the token alone, so once the markers are gone nothing would ever look for
+/// it again — 0.57.0 deleted it last and ignored a failure, which leaked it
+/// for good. A failure here keeps every member's markers and lease, and the
+/// collector that takes them after the TTL deletes it (`lease_claim`).
+/// Deleting it first is safe: `release` has waited for every unit, and only a
+/// unit's close writes through the fence.
 async fn give_back_run<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announced)>, token: &str) {
-    if give_back(dest, held, token).await {
-        dest.close_run(token).await;
+    if let Err(e) = dest.close_run(token).await {
+        eprintln!(
+            "apitap: could not drop run {token}'s own objects ({e}); every claim is kept so the \
+             next run collects them after the TTL"
+        );
+        for (_, a) in held {
+            a.abandon();
+        }
+        return;
     }
+    give_back(dest, held, token).await;
 }
 
 #[cfg(test)]
@@ -553,6 +569,7 @@ mod tests {
         max_in_close: AtomicUsize,
         close_waits: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         sweep_fails: bool,
+        close_run_fails: bool,
     }
 
     impl FakeFence {
@@ -577,8 +594,12 @@ mod tests {
             let collected = self.collected.lock().unwrap().clone();
             Ok(self.keys.lock().unwrap().iter().filter(|k| !collected.contains(*k)).cloned().collect())
         }
-        async fn close_run(&self, _t: &str) {
+        async fn close_run(&self, _t: &str) -> Result<()> {
             self.log.lock().unwrap().push("close_run".into());
+            if self.close_run_fails {
+                return Err(Error::Transfer("close_run: injected".into()));
+            }
+            Ok(())
         }
         fn note(&self, e: &str) {
             self.log.lock().unwrap().push(e.into());
@@ -662,10 +683,10 @@ mod tests {
             let at = |e: &str| ev.iter().position(|x| x == e).unwrap_or_else(|| panic!("{e} missing: {ev:?}"));
             assert!(at("open_unit") < at("close_unit"), "{ev:?}");
             assert!(at("close_unit") < at("keeper_stop"), "release passed an open unit: {ev:?}");
-            assert!(at("keeper_stop") < at("sweep_run"), "{ev:?}");
+            assert!(at("keeper_stop") < at("close_run"), "{ev:?}");
+            assert!(at("close_run") < at("sweep_run"), "the run's objects go before any member's: {ev:?}");
             assert!(at("sweep_run") < at("drop_marker"), "scratch goes before the markers: {ev:?}");
             assert!(at("drop_marker") < at("lease_close"), "{ev:?}");
-            assert!(at("lease_close") < at("close_run"), "{ev:?}");
         });
     }
 
@@ -680,8 +701,27 @@ mod tests {
             t.release().await;
             let ev = f.events();
             assert!(ev.iter().any(|e| e == "sweep_run"), "{ev:?}");
-            for kept in ["drop_marker", "lease_close", "close_run"] {
+            for kept in ["drop_marker", "lease_close"] {
                 assert!(!ev.iter().any(|e| e == kept), "{kept} after a failed sweep: {ev:?}");
+            }
+        });
+    }
+
+    /// The run's own objects (BigQuery's fence table) are named by the token
+    /// alone: if they would not drop, every member keeps its markers and its
+    /// lease, so the collector that takes them deletes the fence. 0.57.0's
+    /// first cut dropped them last and ignored the error — after the markers,
+    /// when no run would ever name the token again.
+    #[test]
+    fn a_failed_close_run_keeps_every_claim() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence { close_run_fails: true, ..Default::default() });
+            let t = tenure(f.clone(), SLOW).await;
+            t.release().await;
+            let ev = f.events();
+            assert!(ev.iter().any(|e| e == "close_run"), "{ev:?}");
+            for kept in ["drop_marker", "lease_close"] {
+                assert!(!ev.iter().any(|e| e == kept), "{kept} after a failed close_run: {ev:?}");
             }
         });
     }

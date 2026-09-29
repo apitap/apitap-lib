@@ -1470,10 +1470,11 @@ mod store {
             crate::sink::bigquery::lease_unclaimed(&self.conn, token).await
         }
 
-        /// The run's fence table. Best-effort: a leftover one is inert, and a
-        /// collector deletes it anyway.
-        async fn close_run(&self, token: &str) {
-            let _ = self.conn.table_delete(&fence_ident(token)).await;
+        /// The run's fence table (`table_delete` reads a 404 as gone). A
+        /// failure keeps every member's claim (`lease::give_back_run`), and
+        /// the collector that takes one deletes the fence (`lease_claim`).
+        async fn close_run(&self, token: &str) -> Result<()> {
+            self.conn.table_delete(&fence_ident(token)).await
         }
     }
 

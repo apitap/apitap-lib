@@ -1512,7 +1512,9 @@ mod store {
             crate::sink::clickhouse::lease_unclaimed(&self.ch, token).await
         }
 
-        async fn close_run(&self, _token: &str) {}
+        async fn close_run(&self, _token: &str) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl Fence for ChStore {

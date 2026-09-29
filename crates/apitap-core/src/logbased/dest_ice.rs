@@ -461,8 +461,9 @@ mod store {
             Ok(self.opened.lock().expect("opened").get(token).cloned().unwrap_or_default())
         }
 
-        async fn close_run(&self, token: &str) {
+        async fn close_run(&self, token: &str) -> Result<()> {
             self.opened.lock().expect("opened").remove(token);
+            Ok(())
         }
     }
 

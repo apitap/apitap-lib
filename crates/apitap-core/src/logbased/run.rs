@@ -186,7 +186,7 @@ impl LeaseStore for Dest {
     /// Drop what the run holds that is not tied to one table — BigQuery's
     /// per-run fence table, Iceberg's note of the keys it opened. Nothing
     /// elsewhere.
-    async fn close_run(&self, token: &str) {
+    async fn close_run(&self, token: &str) -> Result<()> {
         match self {
             Dest::Pg(d) => d.store().close_run(token).await,
             Dest::My(d) => d.store().close_run(token).await,

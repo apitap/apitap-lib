@@ -661,7 +661,9 @@ mod store {
             crate::sink::mysql::lease_unclaimed(self.shared.pool(), self.shared.db(), token).await
         }
 
-        async fn close_run(&self, _token: &str) {}
+        async fn close_run(&self, _token: &str) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl Fence for MyStore {

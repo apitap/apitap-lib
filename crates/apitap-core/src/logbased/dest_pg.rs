@@ -526,7 +526,9 @@ mod store {
             Ok(out)
         }
 
-        async fn close_run(&self, _token: &str) {}
+        async fn close_run(&self, _token: &str) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl Fence for PgStore {
