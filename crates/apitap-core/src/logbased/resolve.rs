@@ -7,7 +7,7 @@
 //! key, preserving insertion order. Iceberg and BigQuery both consume it; the
 //! only difference is what they do with a leftover TOAST hole (iceberg refetches
 //! from the source, BigQuery masks the column and lets its MERGE keep the target
-//! value).
+//! value — read at the key the row came from, when the window moved it).
 //!
 //! The fold is also the one place that decides which keys a set-image apply
 //! writes and how many times: `Resolved::rows` yields every key the window
@@ -52,10 +52,7 @@ pub(crate) enum Image<'a> {
     /// before it moved (see `Fin::Masked`).
     Masked {
         row: &'a [Cell],
-        // For BigQuery's replica MERGE, to read a moved row's holes at the
-        // key it came from. Nothing but the tests reads it before that MERGE
-        // form lands; today the MERGE masks against the new key's row.
-        #[cfg_attr(not(test), allow(dead_code))]
+        // BigQuery's replica MERGE reads a moved row's holes at this key.
         moved_from: Option<&'a Key>,
     },
     /// The key's pre-window row goes, and nothing replaces it.
@@ -86,6 +83,15 @@ impl<'a> Resolved<'a> {
             (key, image)
         });
         finals.chain(self.delete_only.iter().map(|key| (*key, Image::Delete)))
+    }
+
+    /// Whether some key's final image still has a hole AND moved in this
+    /// window: its untouched cells are at another key of the destination.
+    /// BigQuery pays for the join that reads them there only when this holds.
+    pub(crate) fn any_moved_mask(&self) -> bool {
+        self.finals
+            .iter()
+            .any(|(_, fin)| matches!(fin, Fin::Masked { moved_from: Some(_), .. }))
     }
 
     /// The entries still holding a TOAST hole, for the source refetch to
@@ -175,7 +181,8 @@ pub(crate) fn resolve_window<'a>(w: &'a TableWindow<Collapsed>) -> Resolved<'a> 
                 // window carries it, the hole survives as Masked and names the
                 // key it came from (the first one, for a chain 1→9→5), which is
                 // where the destination's copy of the untouched cells still
-                // sits. Iceberg, which cannot read its own rows back,
+                // sits: BigQuery's MERGE reads them from the target's row
+                // there. Iceberg, which cannot read its own rows back,
                 // refetches from the source by the new key instead.
                 let (base, origin) = base_of(&order, &index, old_key);
                 let from = origin.unwrap_or(old_key).clone();
@@ -386,7 +393,9 @@ mod tests {
         // A move with a hole and nothing in the window for the old key: the
         // hole is still at key 1 on the destination.
         let c = Collapsed { residue: vec![rekey("1", "9")], ..Default::default() };
-        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:delete", "9:masked<-1"]);
+        let w = sealed(c);
+        assert_eq!(shape(&resolve_window(&w)), ["1:delete", "9:masked<-1"]);
+        assert!(resolve_window(&w).any_moved_mask(), "BigQuery's MERGE must read key 1");
 
         // A chain 1→9→5 still points at 1: 9 never held the row there.
         let c = Collapsed { residue: vec![rekey("1", "9"), rekey("9", "5")], ..Default::default() };
@@ -405,7 +414,9 @@ mod tests {
             residue: vec![ResidueOp::MaskedUpdate { key: key1("1"), row: hole("1") }],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:masked"]);
+        let w = sealed(c);
+        assert_eq!(shape(&resolve_window(&w)), ["1:masked"]);
+        assert!(!resolve_window(&w).any_moved_mask(), "a hole at its own key needs no join");
         let c = Collapsed {
             residue: vec![ResidueOp::MaskedUpdate { key: key1("1"), row: hole("1") }, rekey("1", "9")],
             ..Default::default()
@@ -418,7 +429,9 @@ mod tests {
             residue: vec![rekey("1", "9")],
             ..Default::default()
         };
-        assert_eq!(shape(&resolve_window(&sealed(c))), ["1:delete", "9:row=full"]);
+        let w = sealed(c);
+        assert_eq!(shape(&resolve_window(&w)), ["1:delete", "9:row=full"]);
+        assert!(!resolve_window(&w).any_moved_mask(), "a move with no hole needs no join");
     }
 
     #[test]

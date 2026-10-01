@@ -51,13 +51,24 @@ failed after it): the old key is read as it was BEFORE the window, not from
 `__current`, which by then shows the re-key's own `D` there. Before that fix
 the replay failed "torn" on every run.
 
+`bq` (T5b, not in the default set: it needs BQ_SA) is the replica re-key into
+BigQuery. A BigQuery replica window lands as ONE staged image per key and one
+MERGE, and a masked cell keeps the target's value at the row's key. The row at
+9 has no target row: 0.56.0's MERGE sent it to its ERROR arm, on every retry,
+and the table never moved again. The MERGE now joins the target at the key
+the row came from. Every row has its own 100 KiB body, so a body read at the
+wrong key shows; the same window also carries a chain (2 -> 20 -> 5), a masked
+update that did not move (the plain path), and a key vacated and reused.
+
 Rig: `apitap-bench-pg-src` on :5544 (source, always), and as destinations
 `apitap-bench-pg-dst` on :5545, `apitap-bench-my-dst` on :3308, ClickHouse on
-:8124. Pass DESTS to narrow it, e.g. DESTS=ch, DESTS=chlog or DESTS=chreplay.
+:8124, BigQuery (BQ_SA). Pass DESTS to narrow it, e.g. DESTS=ch, DESTS=chlog,
+DESTS=chreplay or DESTS=bq.
 """
 import os
 import subprocess
 import sys
+import time
 
 SRC = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
 SRC_C = "apitap-bench-pg-src"
@@ -457,12 +468,150 @@ def run_changelog_replay_ch():
         drop_our_slots()
 
 
+BQT = "toast_rekey_bq"
+
+
+def run_replica_bq():
+    """T5b: a replica re-key into BigQuery whose TOASTed body is untouched."""
+    print("\n════════ destination: bigquery (replica) ════════")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import _rig
+    url = _rig.bq_url()
+    ds = f"`{_rig.BQ_PROJECT}.{_rig.BQ_DATASET}`"
+
+    def reset():
+        _rig.bq(f"DROP TABLE IF EXISTS {ds}.{BQT}")
+        if "_apitap_state" in _rig.bq_tables():
+            _rig.bq(f"DELETE FROM {ds}._apitap_state WHERE dest_table = '{BQT}'")
+
+    def drain():
+        code = ("import apitap\n"
+                f"r = apitap.transfer({SRC!r}, {url!r}, table={BQT!r}, mode='log_based')\n"
+                "print('ROWS', r.rows, flush=True)\n")
+        return sh([sys.executable, "-c", code])
+
+    def watermark():
+        # The drain's newest row (the bootstrap's '*' barrier row is not it).
+        r = _rig.bq(f"SELECT watermark FROM {ds}._apitap_state WHERE dest_table = '{BQT}' "
+                    "AND mode = 'log_based' ORDER BY synced_at DESC LIMIT 1")
+        return r[0][0] if r and r[0][0] else ""
+
+    def dest_rows():
+        return "\n".join(
+            "|".join(r) for r in _rig.bq(
+                f"SELECT CAST(id AS STRING), title, TO_HEX(MD5(body)), CAST(LENGTH(body) AS STRING) "
+                f"FROM {ds}.{BQT} ORDER BY id"))
+
+    def source_rows():
+        return src(f"SELECT id || '|' || title || '|' || md5(body) || '|' || length(body) "
+                   f"FROM {BQT} ORDER BY id")
+
+    def body_of(i, where):
+        rows = [r for r in where.splitlines() if r.split("|")[0] == str(i)]
+        return rows[0].split("|", 1)[1] if rows else "(no row)"
+
+    fq = f"`{_rig.BQ_PROJECT}.{_rig.BQ_DATASET}.{BQT}`"
+
+    def merges_since(t0, want):
+        """The window scripts since `t0` (BigQuery's clock) that MERGE into
+        the table, oldest first: (state, error, whether it joins the target at
+        the old key). JOBS_BY_USER, the gate's account may list only its own
+        jobs, and shows a job seconds late: waited for."""
+        rows = []
+        for _ in range(20):
+            rows = _rig.bq(
+                "SELECT state, IFNULL(error_result.reason, ''), "
+                f"CAST(STRPOS(query, 'LEFT JOIN {fq} F') > 0 AS STRING) "
+                "FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_USER "
+                f"WHERE creation_time > TIMESTAMP '{t0}' AND parent_job_id IS NULL "
+                "AND job_type = 'QUERY' AND STARTS_WITH(query, 'BEGIN TRANSACTION') "
+                f"AND STRPOS(query, 'MERGE {fq} T') > 0 ORDER BY creation_time")
+            if len(rows) >= want and all(r[0] == "DONE" for r in rows):
+                break
+            time.sleep(3)
+        return rows
+
+    src(f"DROP TABLE IF EXISTS {BQT}")
+    src(f"CREATE TABLE {BQT} (id int PRIMARY KEY, title text, body text)")
+    src(f"ALTER TABLE {BQT} ALTER COLUMN body SET STORAGE EXTERNAL")
+    # A different body per row, so a value carried from the wrong key shows.
+    src(f"INSERT INTO {BQT} SELECT g, 'title' || g, repeat(md5(g::text), {CL_BODY // 32}) "
+        f"FROM generate_series(1, 4) g")
+    try:
+        stored = src(f"SELECT pg_column_size(body) FROM {BQT} WHERE id = 1")
+        case("the body is stored out of line, uncompressed", int(stored) >= CL_BODY, f"{stored} bytes")
+        reset()
+        drop_our_slots()
+        r = drain()
+        if r.returncode:
+            case("bootstrap", False, (r.stdout + r.stderr).strip()[-400:])
+            return
+        case("bootstrap landed four rows", dest_rows() == source_rows())
+        before = watermark()
+        t0 = _rig.bq("SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E6S', CURRENT_TIMESTAMP())")[0][0]
+
+        src(f"""
+BEGIN;
+UPDATE {BQT} SET id = 9 WHERE id = 1;
+UPDATE {BQT} SET id = 20 WHERE id = 2;
+UPDATE {BQT} SET id = 5 WHERE id = 20;
+UPDATE {BQT} SET title = 'same-key' WHERE id = 3;
+UPDATE {BQT} SET id = 40 WHERE id = 4;
+INSERT INTO {BQT} VALUES (4, 'new4', repeat(md5('new4'), {CL_BODY // 32}));
+COMMIT;
+""")
+        r = drain()
+        case("the drain succeeds", r.returncode == 0, (r.stdout + r.stderr).strip()[-300:])
+        after = watermark()
+        print(f"   watermark {before} -> {after}")
+        case("the watermark advanced",
+             before.isdigit() and after.isdigit() and int(after) > int(before))
+        want, got = source_rows(), dest_rows()
+        n9 = _rig.bq(f"SELECT CAST(LENGTH(body) AS STRING) FROM {ds}.{BQT} WHERE id = 9")
+        case("T5b: LENGTH(body) at id=9 is the source's 102400",
+             n9 == [[str(CL_BODY)]], f"{n9}")
+        case("T5b: id=9 carries the body it had at id=1",
+             body_of(9, got) == body_of(9, want), f"source {body_of(9, want)}  bq {body_of(9, got)}")
+        n1 = _rig.bq(f"SELECT CAST(COUNT(*) AS STRING) FROM {ds}.{BQT} WHERE id = 1")
+        case("T5b: COUNT(*) WHERE id=1 is 0", n1 == [["0"]], f"{n1}")
+        case("chain 2 -> 20 -> 5: id=5 carries the body it had at id=2",
+             body_of(5, got) == body_of(5, want), f"source {body_of(5, want)}  bq {body_of(5, got)}")
+        case("control: a masked update that did not move keeps its body",
+             body_of(3, got) == body_of(3, want), body_of(3, got))
+        case("a key vacated and reused in the window: 4 is the new row, 40 the old one's body",
+             body_of(4, got) == body_of(4, want) and body_of(40, got) == body_of(40, want),
+             f"4 {body_of(4, got)}  40 {body_of(40, got)}")
+        case("BigQuery equals the source, row by row (id, title, md5, length)", got == want,
+             f"\n   source:\n{want}\n   bq:\n{got}")
+
+        # The next window has no moved row: the plain MERGE again.
+        src(f"UPDATE {BQT} SET title = 'again' WHERE id = 9")
+        r = drain()
+        case("a later masked update of the moved row, plain MERGE", r.returncode == 0
+             and dest_rows() == source_rows(), (r.stdout + r.stderr).strip()[-300:])
+        # Asked of BigQuery: the join ran on the window that moved a masked
+        # row and on no other — a window without one pays nothing for it.
+        scripts = merges_since(t0, 2)
+        case("JOBS_BY_USER: the re-key window's MERGE joined the old key, the next "
+             "window's did not, both without error",
+             scripts == [["DONE", "", "true"], ["DONE", "", "false"]], f"{scripts}")
+    finally:
+        src(f"DROP TABLE IF EXISTS {BQT}")
+        try:
+            reset()
+        except Exception as e:  # noqa: BLE001 — cleanup reports, it does not mask the verdict
+            print(f"   cleanup: {str(e)[:200]}")
+        drop_our_slots()
+
+
 for k in WANT:
     k = k.strip()
     if k == "chlog":
         run_changelog_ch()
     elif k == "chreplay":
         run_changelog_replay_ch()
+    elif k == "bq":
+        run_replica_bq()
     elif k in ALL:
         run_for(ALL[k]())
     else:

@@ -159,6 +159,8 @@ LEGS = [
 
     leg("e2e_bq_cdc.py",           "CDC into BigQuery via staging + MERGE", {"bq"},
         proves={"bq.replica-one-row-per-key": ("bq",), "leg.e2e_bq_cdc": (_claims.LEG_ENGINE,)}),
+    leg("e2e_toast_rekey.py",      "a key-changing UPDATE keeps its TOAST cols, into BigQuery", {"bq"},
+        env={"DESTS": "bq"}, proves={"bq.replica-rekey-toast": ("bq",)}),
     leg("e2e_state_contract.py",   "the state contract, asked of BigQuery", {"bq"}, ["bq"],
         proves={"state.cross-lane-refusal": ("bq",)}),
     leg("e2e_bq_guard.py",         "a BigQuery bulk run meets a drain's announcement", {"bq"},
@@ -209,7 +211,10 @@ LEGS = [
 
 
 def label_of(l):
-    return f"{l.script} {' '.join(l.argv)}".strip()
+    # A row that differs from another only by its env (e2e_toast_rekey.py and
+    # its DESTS=bq row) is another leg, and the run's status is keyed by label.
+    env = " ".join(f"{k}={v}" for k, v in sorted(l.env.items()))
+    return " ".join(x for x in (l.script, " ".join(l.argv), env) if x)
 
 
 # Uppercase FAILED is only ever a verdict in these legs — checked across all 34

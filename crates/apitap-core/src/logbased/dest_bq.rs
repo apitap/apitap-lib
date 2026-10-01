@@ -11,7 +11,9 @@
 //!
 //! Unchanged-TOAST cells that can't be patched from an in-window base ride a
 //! per-row mask column: the masked columns are omitted from the staging row and
-//! the MERGE keeps the target's current value (`IF(masked, T.c, S.c)`).
+//! the MERGE keeps the target's current value (`IF(masked, T.c, S.c)`). A row
+//! the window moved to a new key has no target row there; it names its old key
+//! (`_apitap_from_*`) and the MERGE reads its holes at that key instead.
 //!
 //! Every transaction is fenced on the run's own table, `_apitap_fence<token>`:
 //! its first statement updates that table's one row `WHERE NOT claimed`, and a
@@ -42,6 +44,13 @@ pub(crate) use store::{BqStore, BqUnit};
 
 const OP_COL: &str = "_apitap_op";
 const MASK_COL: &str = "_apitap_mask";
+/// `_apitap_from_<j>`: key part `j` of the key a staged row lived at before
+/// its window moved it, when its image still has a hole (see `merge_sql`).
+const FROM_PREFIX: &str = "_apitap_from_";
+
+fn from_col(j: usize) -> String {
+    format!("{FROM_PREFIX}{j}")
+}
 
 /// One chunk is one BigQuery transaction, so this is what decides which
 /// statements are atomic with which. BigQuery caps a query at ~1 MB, and a
@@ -857,7 +866,7 @@ async fn stage(
     let (c, l) = (w.body(), w.layout());
     let (wal_cols, oids, pk_cols) = (l.cols(), l.oids(), l.key_cols());
     for name in wal_cols {
-        if name == OP_COL || name == MASK_COL {
+        if name == OP_COL || name == MASK_COL || name.starts_with(FROM_PREFIX) {
             return Err(Error::InvalidInput(format!(
                 "log_based: source column '{name}' collides with a reserved BigQuery \
                  CDC staging column — rename it at the source or alias it in a view"
@@ -888,18 +897,22 @@ async fn stage(
     // Build the staging body from the window folded to one entry per key:
     // its final image as op='U' (maybe masked), or op='D' (PK columns only).
     // One staging row per key is what the MERGE requires — at most one source
-    // row per target row — and `rows()` yields each key exactly once.
+    // row per target row — and `rows()` yields each key exactly once. A masked
+    // row that moved names where it was (`_apitap_from_*`): its holes are
+    // there on the target, not at its new key.
+    let resolved = resolve_window(w);
+    let moved = resolved.any_moved_mask();
     let mut ndjson: Vec<u8> = Vec::new();
     let mut staged = 0u64;
-    for (key, image) in resolve_window(w).rows() {
+    for (key, image) in resolved.rows() {
         match image {
-            Image::Row(cells) => push_upsert(&mut ndjson, wal_cols, cells, None)?,
-            Image::Masked { row, .. } => {
+            Image::Row(cells) => push_upsert(&mut ndjson, wal_cols, cells, None, None)?,
+            Image::Masked { row, moved_from } => {
                 let mask: String = row
                     .iter()
                     .map(|c| if matches!(c, Cell::UnchangedToast) { '1' } else { '0' })
                     .collect();
-                push_upsert(&mut ndjson, wal_cols, row, Some(&mask))?;
+                push_upsert(&mut ndjson, wal_cols, row, Some(&mask), moved_from)?;
             }
             Image::Delete => push_delete(&mut ndjson, pk_cols, key)?,
         }
@@ -928,7 +941,7 @@ async fn stage(
             t_load.elapsed().as_secs_f64(),
         );
     }
-    Ok((c.events, vec![format!("{};", plan.merge_sql(&u.fq(table), &u.staging_fq(table), c.truncate))]))
+    Ok((c.events, vec![format!("{};", plan.merge_sql(&u.fq(table), &u.staging_fq(table), c.truncate, moved))]))
 }
 
 // ── the per-table apply plan (cast expressions from the target DDL) ──────────
@@ -938,6 +951,12 @@ struct ApplyPlan {
     /// Per-column SELECT expression casting the STRING staging value to the
     /// target's declared type; index-parallel to `cols`.
     cast: Vec<String>,
+    /// `cast` of the staging alias's column (`S.c`), for the MERGE form that
+    /// joins the target in (`merge_sql` with `moved`); index-parallel too.
+    cast_s: Vec<String>,
+    /// That form's join: each key column of the target equal to the staged
+    /// `_apitap_from_<j>`, cast by the key column's own type and OID.
+    from_on: Vec<String>,
     pk: Vec<String>,
 }
 
@@ -957,6 +976,8 @@ impl ApplyPlan {
             crate::sink::bigquery::bq_ident("column", name)?;
         }
         let mut cast = Vec::with_capacity(wal_cols.len());
+        let mut cast_s = Vec::with_capacity(wal_cols.len());
+        let mut typed = Vec::with_capacity(wal_cols.len());
         for (i, name) in wal_cols.iter().enumerate() {
             let ty = types.get(name).ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -967,8 +988,24 @@ impl ApplyPlan {
             // OID 0 (MySQL binlog) falls straight through to the target-type cast.
             let oid = oids.get(i).copied().unwrap_or(0);
             cast.push(cast_expr(name, oid, ty)?);
+            cast_s.push(cast_expr_of(&format!("S.`{name}`"), name, oid, ty)?);
+            typed.push((oid, ty.as_str()));
         }
-        Ok(Self { cols: wal_cols.to_vec(), cast, pk: pk_cols.to_vec() })
+        // A key column is one of the window's columns (the layout keys by
+        // position); an old key is staged as text like any cell, so it is cast
+        // exactly as that column is.
+        let mut from_on = Vec::with_capacity(pk_cols.len());
+        for (j, k) in pk_cols.iter().enumerate() {
+            let Some(i) = wal_cols.iter().position(|c| c == k) else {
+                return Err(Error::Transfer(format!(
+                    "log_based: {table}: key column '{k}' is not among the window's columns"
+                )));
+            };
+            let (oid, ty) = typed[i];
+            let from = cast_expr_of(&format!("S.`{}`", from_col(j)), k, oid, ty)?;
+            from_on.push(format!("F.`{k}` = {from}"));
+        }
+        Ok(Self { cols: wal_cols.to_vec(), cast, cast_s, from_on, pk: pk_cols.to_vec() })
     }
 
     fn staging_fields(&self) -> Value {
@@ -978,6 +1015,11 @@ impl ApplyPlan {
         ];
         for name in &self.cols {
             fields.push(json!({"name": name, "type": "STRING", "mode": "NULLABLE"}));
+        }
+        // Always there, NULL but on a moved masked row: a staging schema that
+        // depended on the window would be one more thing to get wrong.
+        for j in 0..self.pk.len() {
+            fields.push(json!({"name": from_col(j), "type": "STRING", "mode": "NULLABLE"}));
         }
         Value::Array(fields)
     }
@@ -998,14 +1040,39 @@ impl ApplyPlan {
     }
 
     /// The MERGE of this run's staging (`staging_fq`) into `target_fq`.
-    fn merge_sql(&self, target_fq: &str, staging_fq: &str, truncate: bool) -> String {
+    ///
+    /// A masked row keeps the target's value for each hole (`UPDATE SET …
+    /// T.c`), which is right while the row stays at its key. A row the window
+    /// MOVED (`UPDATE … SET id = 9 WHERE id = 1`, its TOASTed body untouched)
+    /// has no target row at its new key: 0.56.0 sent it to the ERROR arm on
+    /// every retry, and the table never moved again. With `moved` (the window
+    /// holds such a row, `Resolved::any_moved_mask`) the USING body joins the
+    /// target at the row's OLD key, `_apitap_from_*`, and fills each hole from
+    /// there, so the row arrives whole (mask NULL) and inserts; an old key with
+    /// no row is a replay (`moved_source`). The join reads
+    /// the target as it was before this MERGE, so key 1's row is still there
+    /// for key 9 while key 1's own 'D' deletes it. A window without such a row
+    /// gets the plain form, byte for byte, and pays for no join.
+    fn merge_sql(&self, target_fq: &str, staging_fq: &str, truncate: bool, moved: bool) -> String {
         let bt = |c: &str| format!("`{c}`");
-        let using: Vec<String> = self
-            .cols
-            .iter()
-            .zip(&self.cast)
-            .map(|(c, expr)| format!("    {expr} AS {}", bt(c)))
-            .collect();
+        // A move is a change of key, so a keyless plan has none to join on.
+        let source = if moved && !self.pk.is_empty() {
+            self.moved_source(target_fq, staging_fq)
+        } else {
+            let using: Vec<String> = self
+                .cols
+                .iter()
+                .zip(&self.cast)
+                .map(|(c, expr)| format!("    {expr} AS {}", bt(c)))
+                .collect();
+            format!(
+                "  SELECT {}, {},\n{}\n  FROM {}\n",
+                OP_COL,
+                MASK_COL,
+                using.join(",\n"),
+                staging_fq
+            )
+        };
         let on = self
             .pk
             .iter()
@@ -1029,8 +1096,7 @@ impl ApplyPlan {
         let insert_vals = self.cols.iter().map(|c| format!("S.{}", bt(c))).collect::<Vec<_>>().join(", ");
 
         let mut merge = String::new();
-        merge.push_str(&format!("MERGE {} T\nUSING (\n  SELECT {}, {},\n{}\n  FROM {}\n) S\nON {}\n",
-            target_fq, OP_COL, MASK_COL, using.join(",\n"), staging_fq, on));
+        merge.push_str(&format!("MERGE {} T\nUSING (\n{}) S\nON {}\n", target_fq, source, on));
         merge.push_str(&format!("WHEN MATCHED AND S.{OP_COL} = 'D' THEN\n  DELETE\n"));
         if !non_pk.is_empty() {
             merge.push_str(&format!("WHEN MATCHED THEN\n  UPDATE SET\n{set}\n"));
@@ -1050,6 +1116,44 @@ impl ApplyPlan {
         }
         merge
     }
+
+    /// The USING body of the `moved` form (see `merge_sql`). Only a staged row
+    /// that names an old key (`_apitap_from_*`, a moved masked row) can meet a
+    /// target row `F`, and a row that exists has a key, so `F.pk IS NOT NULL`
+    /// is "the old key has a row": each column the mask marks comes from `F`,
+    /// and the row leaves with no mask.
+    ///
+    /// An old key with no row keeps the mask, and the plain arms decide. That
+    /// is a replay: a group commits in several transactions (`CHUNK_BYTES`),
+    /// and when a later one fails the next run re-drains every member from
+    /// the group minimum, so a member whose transaction committed meets this
+    /// window again with the row already whole at its new key and nothing at
+    /// the old one. Kept masked, it matches there and keeps its own cells, as
+    /// every other replayed row converges; raising there instead failed that
+    /// window on every run and wedged the group. A row at neither
+    /// key still fails loudly, in the plain form's NOT MATCHED arm.
+    fn moved_source(&self, target_fq: &str, staging_fq: &str) -> String {
+        let found = format!("F.`{}` IS NOT NULL", self.pk[0]);
+        let cols: Vec<String> = self
+            .cols
+            .iter()
+            .zip(&self.cast_s)
+            .enumerate()
+            .map(|(i, (c, cast))| {
+                format!(
+                    "    IF({found} AND SUBSTR(S.{MASK_COL}, {pos}, 1) = '1', F.`{c}`,\n       \
+                     {cast}) AS `{c}`",
+                    pos = i + 1,
+                )
+            })
+            .collect();
+        format!(
+            "  SELECT S.{OP_COL},\n    IF({found}, NULL, S.{MASK_COL}) AS {MASK_COL},\n{}\n  \
+             FROM {staging_fq} S\n  LEFT JOIN {target_fq} F\n    ON {}\n",
+            cols.join(",\n"),
+            self.from_on.join(" AND "),
+        )
+    }
 }
 
 const BOOL_OID: u32 = 16;
@@ -1062,7 +1166,15 @@ const BOOL_OID: u32 = 16;
 /// path must translate `t`/`f` to match. MySQL binlog columns carry OID 0 and
 /// fall through to the target-type cast (their bool is already `1`/`0`).
 fn cast_expr(name: &str, oid: u32, ty: &str) -> Result<String> {
-    let c = format!("`{name}`");
+    cast_expr_of(&format!("`{name}`"), name, oid, ty)
+}
+
+/// `cast_expr` of any STRING expression `src` that holds column `name`'s
+/// text — a staging column under an alias, or a staged old key: the moved-row
+/// MERGE casts `S.c` and `S._apitap_from_<j>` exactly as the plain form casts
+/// `c`. `name` is only for the messages.
+fn cast_expr_of(src: &str, name: &str, oid: u32, ty: &str) -> Result<String> {
+    let c = src.to_string();
     if oid == BOOL_OID {
         return Ok(match ty {
             "BOOL" | "BOOLEAN" => format!(
@@ -1140,11 +1252,25 @@ fn canonical_type(t: &str) -> &str {
     }
 }
 
-fn push_upsert(out: &mut Vec<u8>, cols: &[String], cells: &[Cell], mask: Option<&str>) -> Result<()> {
+/// One upsert row. `from` is the key a masked row lived at before its window
+/// moved it, staged as `_apitap_from_<j>` for the MERGE to read its holes
+/// there (see `ApplyPlan::merge_sql`).
+fn push_upsert(
+    out: &mut Vec<u8>,
+    cols: &[String],
+    cells: &[Cell],
+    mask: Option<&str>,
+    from: Option<&Key>,
+) -> Result<()> {
     let mut obj = Map::new();
     obj.insert(OP_COL.to_string(), json!("U"));
     if let Some(m) = mask {
         obj.insert(MASK_COL.to_string(), json!(m));
+    }
+    for (j, part) in from.into_iter().flatten().enumerate() {
+        let s = std::str::from_utf8(part)
+            .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+        obj.insert(from_col(j), json!(s));
     }
     for (i, cell) in cells.iter().enumerate() {
         match cell {
@@ -2085,7 +2211,7 @@ mod tests {
         let ty = types(&[("id", "INT64"), ("v", "STRING"), ("flag", "BOOL")]);
         let plan = ApplyPlan::build("orders", &wal, &[23, 25, 16], &pk, &ty).unwrap();
         let stg = "`proj.ds.orders_0000000l000abcd__apitap_cdc`";
-        let sql = plan.merge_sql("`proj.ds.orders`", stg, false);
+        let sql = plan.merge_sql("`proj.ds.orders`", stg, false, false);
         assert!(sql.contains("MERGE `proj.ds.orders` T"), "{sql}");
         assert!(sql.contains(&format!("FROM {stg}")), "{sql}");
         assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
@@ -2094,7 +2220,7 @@ mod tests {
         assert!(sql.contains("SUBSTR(S._apitap_mask, 3, 1)"), "{sql}"); // flag at pos 3
         assert!(!sql.contains("`id` = IF"), "PK must not be updated: {sql}");
         assert!(!sql.contains("NOT MATCHED BY SOURCE"), "no truncate clause: {sql}");
-        let sqlt = plan.merge_sql("`proj.ds.orders`", stg, true);
+        let sqlt = plan.merge_sql("`proj.ds.orders`", stg, true, false);
         assert!(sqlt.contains("WHEN NOT MATCHED BY SOURCE THEN\n  DELETE"), "{sqlt}");
     }
 
@@ -2104,7 +2230,7 @@ mod tests {
         let pk = vec!["a".to_string(), "b".to_string()];
         let ty = types(&[("a", "INT64"), ("b", "STRING")]);
         let plan = ApplyPlan::build("j", &wal, &[23, 25], &pk, &ty).unwrap();
-        let sql = plan.merge_sql("`p.d.j`", "`p.d.j_0000000l000abcd__apitap_cdc`", false);
+        let sql = plan.merge_sql("`p.d.j`", "`p.d.j_0000000l000abcd__apitap_cdc`", false, false);
         assert!(!sql.contains("UPDATE SET"), "no non-PK cols → no UPDATE clause: {sql}");
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"), "{sql}");
     }
@@ -2113,13 +2239,106 @@ mod tests {
     fn upsert_omits_null_and_masked_columns() {
         let cols = vec!["id".to_string(), "v".to_string(), "big".to_string()];
         let mut out = Vec::new();
-        push_upsert(&mut out, &cols, &[Cell::Text("7".into()), Cell::Null, Cell::UnchangedToast], Some("001")).unwrap();
+        push_upsert(&mut out, &cols, &[Cell::Text("7".into()), Cell::Null, Cell::UnchangedToast], Some("001"), None).unwrap();
         let line = String::from_utf8(out).unwrap();
         assert!(line.contains("\"_apitap_op\":\"U\""), "{line}");
         assert!(line.contains("\"_apitap_mask\":\"001\""), "{line}");
         assert!(line.contains("\"id\":\"7\""), "{line}");
         assert!(!line.contains("\"v\""), "null omitted: {line}");
         assert!(!line.contains("\"big\""), "masked omitted: {line}");
+    }
+
+    /// The MERGE 0.56.0 wrote, captured from that tree (`merge_sql` of this
+    /// plan before the moved form existed). A window with no moved masked row
+    /// must still get exactly this: the moved form costs a target read.
+    const PLAIN_MERGE: &str = "MERGE `p.d.t` T
+USING (
+  SELECT _apitap_op, _apitap_mask,
+    CAST(`id` AS INT64) AS `id`,
+    `v` AS `v`,
+    CASE WHEN `flag` IS NULL THEN NULL WHEN `flag` IN ('t','true','TRUE','1') THEN 1 WHEN `flag` IN ('f','false','FALSE','0') THEN 0 ELSE ERROR(FORMAT('log_based: bad bool text %s for column flag', `flag`)) END AS `flag`
+  FROM `p.d.t_stg`
+) S
+ON T.`id` = S.`id`
+WHEN MATCHED AND S._apitap_op = 'D' THEN
+  DELETE
+WHEN MATCHED THEN
+  UPDATE SET
+    `v` = IF(S._apitap_mask IS NULL OR SUBSTR(S._apitap_mask, 2, 1) = '0', S.`v`, T.`v`),
+    `flag` = IF(S._apitap_mask IS NULL OR SUBSTR(S._apitap_mask, 3, 1) = '0', S.`flag`, T.`flag`)
+WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' AND S._apitap_mask IS NULL THEN
+  INSERT (`id`, `v`, `flag`) VALUES (S.`id`, S.`v`, S.`flag`)
+WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
+  INSERT (`id`) VALUES (ERROR('log_based: masked update for a row missing at the BigQuery target — window replay out of order?'))
+";
+
+    /// C3: `UPDATE t SET id = 9 WHERE id = 1` with an untouched TOASTed body
+    /// stages key 9 masked, and key 9 has no target row: 0.56.0's MERGE sent
+    /// it to the ERROR arm on every retry. The moved form reads the hole from
+    /// the target at key 1, `_apitap_from_*`, joined as the key's own type.
+    #[test]
+    fn merge_sql_moved_form() {
+        let wal = vec!["id".to_string(), "v".to_string(), "flag".to_string()];
+        let ty = types(&[("id", "INT64"), ("v", "STRING"), ("flag", "INT64")]);
+        let plan = ApplyPlan::build("t", &wal, &[23, 25, 16], &["id".to_string()], &ty).unwrap();
+        let (t, stg) = ("`p.d.t`", "`p.d.t_stg`");
+        assert_eq!(plan.merge_sql(t, stg, false, false), PLAIN_MERGE, "moved=false is 0.56.0's text");
+        assert_eq!(
+            plan.merge_sql(t, stg, true, false),
+            format!("{PLAIN_MERGE}WHEN NOT MATCHED BY SOURCE THEN\n  DELETE\n")
+        );
+
+        let m = plan.merge_sql(t, stg, false, true);
+        assert!(
+            m.contains("  FROM `p.d.t_stg` S\n  LEFT JOIN `p.d.t` F\n    ON F.`id` = CAST(S.`_apitap_from_0` AS INT64)\n) S\n"),
+            "the old key, joined and cast as the key column is: {m}"
+        );
+        assert!(
+            m.contains("  SELECT S._apitap_op,\n    IF(F.`id` IS NOT NULL, NULL, S._apitap_mask) AS _apitap_mask,\n"),
+            "a row found at its old key leaves whole, without its mask: {m}"
+        );
+        assert!(
+            m.contains(
+                "    IF(F.`id` IS NOT NULL AND SUBSTR(S._apitap_mask, 2, 1) = '1', F.`v`,\n       S.`v`) AS `v`,\n"
+            ),
+            "a hole of a row found at its old key comes from there: {m}"
+        );
+        // A replay: the group's earlier transaction already moved the row, so
+        // the old key has none. Raising there wedged the window for good; the
+        // row keeps its mask and the plain arms decide — its own cells where
+        // it already is, and the NOT MATCHED arm's ERROR where it is not.
+        assert!(!m.contains("ERROR('log_based: t:"), "no error for an empty old key: {m}");
+        assert!(!m.contains("IF(S.`_apitap_from_0` IS NOT NULL, NULL"), "a mask is dropped only where F was found: {m}");
+        assert!(
+            m.contains("       CASE WHEN S.`flag` IS NULL THEN NULL WHEN S.`flag` IN ('t','true','TRUE','1') THEN 1"),
+            "every other cell is cast exactly as the plain form casts it: {m}"
+        );
+        // From the ON on, the two forms are one MERGE.
+        let from_on = |s: &str| s[s.find(") S\nON ").expect("ON")..].to_string();
+        assert_eq!(from_on(&m), from_on(PLAIN_MERGE));
+
+        // A composite key joins on every part, each by its own type.
+        let wal2 = vec!["a".to_string(), "b".to_string(), "body".to_string()];
+        let ty2 = types(&[("a", "INT64"), ("b", "STRING"), ("body", "STRING")]);
+        let pk2 = vec!["a".to_string(), "b".to_string()];
+        let plan2 = ApplyPlan::build("j", &wal2, &[23, 25, 25], &pk2, &ty2).unwrap();
+        let m2 = plan2.merge_sql("`p.d.j`", "`p.d.j_stg`", false, true);
+        assert!(m2.contains("ON F.`a` = CAST(S.`_apitap_from_0` AS INT64) AND F.`b` = S.`_apitap_from_1`\n"), "{m2}");
+        let names: Vec<String> = plan2.staging_fields().as_array().unwrap().iter()
+            .map(|f| f["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["_apitap_op", "_apitap_mask", "a", "b", "body", "_apitap_from_0", "_apitap_from_1"]);
+
+        // The staged row names its old key; a row that did not move names none.
+        let mut out = Vec::new();
+        let old: Key = vec![b"1".to_vec(), b"x".to_vec()];
+        push_upsert(&mut out, &wal2, &[Cell::Text("9".into()), Cell::Text("x".into()), Cell::UnchangedToast],
+                    Some("001"), Some(&old)).unwrap();
+        push_upsert(&mut out, &wal2, &[Cell::Text("3".into()), Cell::Text("y".into()), Cell::UnchangedToast],
+                    Some("001"), None).unwrap();
+        let lines = String::from_utf8(out).unwrap();
+        let (moved, stayed) = lines.split_once('\n').unwrap();
+        assert!(moved.contains("\"_apitap_from_0\":\"1\"") && moved.contains("\"_apitap_from_1\":\"x\""), "{moved}");
+        assert!(!stayed.contains("_apitap_from_"), "{stayed}");
     }
 
     #[test]
