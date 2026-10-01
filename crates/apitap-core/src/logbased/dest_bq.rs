@@ -599,14 +599,13 @@ fn before_window(plan: &ReplayPlan, alias: &str) -> String {
 async fn read_base(
     u: &BqUnit<'_>,
     table: &str,
-    pk_cols: &[String],
+    cast: &ApplyPlan,
     keys: &[crate::logbased::changelog::CKey],
     cols: &[usize],
-    wal_cols: &[String],
     plan: &ReplayPlan,
 ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
-    let rows = u.query(&read_base_sql(&u.fq(table), pk_cols, keys, cols, wal_cols, plan)?).await?;
-    let np = pk_cols.len();
+    let rows = u.query(&read_base_sql(&u.fq(table), cast, keys, cols, plan)?).await?;
+    let np = cast.pk.len();
     let mut out = std::collections::HashMap::with_capacity(keys.len());
     for row in rows {
         if row.len() != np + cols.len() {
@@ -620,22 +619,28 @@ async fn read_base(
     Ok(out)
 }
 
-/// `read_base`'s query over the table `t` (fully qualified).
+/// `read_base`'s query over the table `t` (fully qualified). Every masked
+/// cell is selected as the staging text its column's cast reads
+/// (`base_expr_of`), never as the destination's own string rendering.
 fn read_base_sql(
     t: &str,
-    pk_cols: &[String],
+    cast: &ApplyPlan,
     keys: &[crate::logbased::changelog::CKey],
     cols: &[usize],
-    wal_cols: &[String],
     plan: &ReplayPlan,
 ) -> Result<String> {
     let bt = |c: &str| format!("`{c}`");
-    let sel = pk_cols
+    let pk_cols = &cast.pk;
+    let mut sel: Vec<String> = pk_cols
         .iter()
         .map(|c| format!("CAST({} AS STRING)", bt(c)))
-        .chain(cols.iter().map(|&i| format!("CAST({} AS STRING)", bt(&wal_cols[i]))))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+    for &i in cols {
+        let c = &cast.cols[i];
+        let (oid, ty) = &cast.typed[i];
+        sel.push(base_expr_of(&format!("{}", bt(c)), c, *oid, ty)?);
+    }
+    let sel = sel.join(", ");
     let mut preds = Vec::with_capacity(keys.len());
     for k in keys {
         let mut parts = Vec::with_capacity(pk_cols.len());
@@ -762,7 +767,7 @@ async fn stage_changelog(
         ))
     })?;
     let types = column_types(&meta)?;
-    let cast = ApplyPlan::build(table, wal_cols, oids, &[], &types)?;
+    let cast = ApplyPlan::build(table, wal_cols, oids, l.key_cols(), &types)?;
 
     // Rebuild unchanged-TOAST cells before anything is staged: writing them
     // as NULL would silently blank the column for every reader of
@@ -772,7 +777,7 @@ async fn stage_changelog(
         let base = if keys.is_empty() || cols.is_empty() {
             std::collections::HashMap::new()
         } else {
-            read_base(u, table, l.key_cols(), &keys, &cols, wal_cols, plan).await?
+            read_base(u, table, &cast, &keys, &cols, plan).await?
         };
         c.resolve_masked(&cols, &base)?
     } else {
@@ -958,6 +963,9 @@ struct ApplyPlan {
     /// `_apitap_from_<j>`, cast by the key column's own type and OID.
     from_on: Vec<String>,
     pk: Vec<String>,
+    /// `(OID, target type)` per column, index-parallel to `cols`: what the
+    /// masked readback's value expressions are built from.
+    typed: Vec<(u32, String)>,
 }
 
 impl ApplyPlan {
@@ -989,7 +997,7 @@ impl ApplyPlan {
             let oid = oids.get(i).copied().unwrap_or(0);
             cast.push(cast_expr(name, oid, ty)?);
             cast_s.push(cast_expr_of(&format!("S.`{name}`"), name, oid, ty)?);
-            typed.push((oid, ty.as_str()));
+            typed.push((oid, ty.clone()));
         }
         // A key column is one of the window's columns (the layout keys by
         // position); an old key is staged as text like any cell, so it is cast
@@ -1001,11 +1009,11 @@ impl ApplyPlan {
                     "log_based: {table}: key column '{k}' is not among the window's columns"
                 )));
             };
-            let (oid, ty) = typed[i];
-            let from = cast_expr_of(&format!("S.`{}`", from_col(j)), k, oid, ty)?;
+            let (oid, ty) = &typed[i];
+            let from = cast_expr_of(&format!("S.`{}`", from_col(j)), k, *oid, ty)?;
             from_on.push(format!("F.`{k}` = {from}"));
         }
-        Ok(Self { cols: wal_cols.to_vec(), cast, cast_s, from_on, pk: pk_cols.to_vec() })
+        Ok(Self { cols: wal_cols.to_vec(), cast, cast_s, from_on, pk: pk_cols.to_vec(), typed })
     }
 
     fn staging_fields(&self) -> Value {
@@ -1215,6 +1223,54 @@ fn cast_expr_of(src: &str, name: &str, oid: u32, ty: &str) -> Result<String> {
         "TIMESTAMP" => format!("CAST({c} AS TIMESTAMP)"),
         "DATETIME" => format!("CAST(REGEXP_REPLACE({c}, r'\\+00(:00)?$', '') AS DATETIME)"),
         "TIME" => format!("CAST(REGEXP_REPLACE({c}, r'\\+00(:00)?$', '') AS TIME)"),
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "log_based: BigQuery column '{name}' has type {other}, which the CDC apply \
+                 path can't cast into from WAL text — run mode='replace' once so apitap owns \
+                 the DDL, or drop the column from replication"
+            )))
+        }
+    })
+}
+
+/// The inverse of `cast_expr_of` for a cell that is already typed in the
+/// destination: renders column `src` as the STRING staging text that column's
+/// cast expects, so a masked cell read back before the window re-enters
+/// through exactly the conversion the WAL lane's text does. `NULL` stays NULL.
+///
+/// The destination's own string rendering is NOT that text for every type,
+/// and using it is what silently corrupted a masked BYTES cell: BigQuery's
+/// `CAST(bytes AS STRING)` is the UTF-8 reading (an error for binary), while
+/// the WAL lane and the apply's BYTES cast speak `\x` + hex, and only the
+/// latter round-trips. BOOL likewise: the apply reads WAL `t`/`f` (MySQL's
+/// binlog spells `1`/`0`), never BigQuery's `true`/`false`.
+fn base_expr_of(src: &str, name: &str, oid: u32, ty: &str) -> Result<String> {
+    let c = src.to_string();
+    if oid == BOOL_OID {
+        return Ok(match ty {
+            // `t`/`f` is what a Postgres boolean is in the WAL; every target
+            // type `cast_expr_of` accepts for it reads either spelling.
+            "BOOL" | "BOOLEAN" | "INT64" | "NUMERIC" | "BIGNUMERIC" | "FLOAT64" | "STRING" => {
+                format!("IF({c} IS NULL, NULL, IF({c}, 't', 'f'))")
+            }
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "log_based: boolean column '{name}' maps to BigQuery type {other}, which the \
+                     CDC path can't fill — run mode='replace' once so apitap owns the DDL"
+                )))
+            }
+        });
+    }
+    Ok(match ty {
+        "STRING" => c,
+        "INT64" | "FLOAT64" | "NUMERIC" | "BIGNUMERIC" | "DATE" | "TIMESTAMP" | "DATETIME"
+        | "TIME" => format!("CAST({c} AS STRING)"),
+        // OID 0 (MySQL binlog) booleans are `1`/`0` text.
+        "BOOL" | "BOOLEAN" => format!("IF({c} IS NULL, NULL, IF({c}, '1', '0'))"),
+        // The WAL's bytea spelling: `\x` + lowercase hex. TO_HEX is uppercase
+        // and FROM_HEX accepts either, but the text must match the WAL lane's
+        // byte for byte — it is what the staging column carries.
+        "BYTES" => format!("IF({c} IS NULL, NULL, CONCAT(r'\\x', LOWER(TO_HEX({c}))))"),
         other => {
             return Err(Error::InvalidInput(format!(
                 "log_based: BigQuery column '{name}' has type {other}, which the CDC apply \
@@ -2118,6 +2174,7 @@ mod store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logbased::replay::replay_plan;
 
     fn types(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect()
@@ -2202,6 +2259,58 @@ mod tests {
         // A pg boolean stored as INT64 translates t/f → 1/0, not a failing CAST.
         let b = cast_expr("flag", BOOL_OID, "INT64").unwrap();
         assert!(b.contains("THEN 1") && b.contains("THEN 0") && !b.contains("CAST"), "{b}");
+    }
+
+    /// The masked readback must hand the staging column the text its cast
+    /// reads, not the destination's string rendering. The BYTES cast is
+    /// `FROM_HEX(SUBSTR(c, 3))` (WAL `\x` + hex); BigQuery's
+    /// `CAST(bytes AS STRING)` is the UTF-8 reading — an error for binary
+    /// input, and for text-like bytes the third character on, nonsense. The
+    /// old readback selected the latter and silently re-inserted corrupt
+    /// bytes (`deadbeef…` lost its leading `de`).
+    #[test]
+    fn readback_bytes_value_reenters_as_wal_hex() {
+        let plan = ApplyPlan::build(
+            "t",
+            &["id".into(), "blob".into()],
+            &[23, 17],
+            &["id".into()],
+            &types(&[("id", "INT64"), ("blob", "BYTES")]),
+        )
+        .unwrap();
+        let keys = vec![vec![b"7".to_vec()]];
+        let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
+        let sql = read_base_sql("`p.d.t`", &plan, &keys, &[1], &replay).unwrap();
+        assert!(
+            sql.contains("IF(`blob` IS NULL, NULL, CONCAT(r'\\x', LOWER(TO_HEX(`blob`))))"),
+            "BYTES must come back as the WAL's \\x-hex, not a string rendering: {sql}"
+        );
+        assert!(!sql.contains("CAST(`blob` AS STRING)"), "{sql}");
+    }
+
+    /// A masked cell that was NULL in the pre-window row must stay NULL: the
+    /// readback runs before the row's cast, and NULL has no text spelling.
+    /// Every type either guards explicitly (BOOL, BYTES) or rides a CAST
+    /// whose NULL argument is NULL (CAST(NULL AS STRING) is NULL).
+    #[test]
+    fn readback_null_values_stay_null() {
+        let plan = ApplyPlan::build(
+            "t",
+            &["id".into(), "flag".into(), "blob".into()],
+            &[23, 16, 17],
+            &["id".into()],
+            &types(&[("id", "INT64"), ("flag", "BOOL"), ("blob", "BYTES")]),
+        )
+        .unwrap();
+        let keys = vec![vec![b"7".to_vec()]];
+        let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
+        let sql = read_base_sql("`p.d.t`", &plan, &keys, &[0, 1, 2], &replay).unwrap();
+        assert!(sql.contains("CAST(`id` AS STRING)"), "{sql}");
+        assert!(sql.contains("IF(`flag` IS NULL, NULL, IF(`flag`, 't', 'f'))"), "{sql}");
+        assert!(
+            sql.contains("IF(`blob` IS NULL, NULL, CONCAT(r'\\x', LOWER(TO_HEX(`blob`))))"),
+            "{sql}"
+        );
     }
 
     #[test]
