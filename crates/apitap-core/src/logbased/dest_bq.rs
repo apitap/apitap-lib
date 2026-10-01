@@ -594,8 +594,18 @@ fn before_window(plan: &ReplayPlan, alias: &str) -> String {
 /// the old key's row, and the `U` half found no cell to carry ("torn") on
 /// every run. The window's own events are the carry's
 /// (`Changes::resolve_masked`); the destination only answers for what came
-/// before them. Filtered by key, and the table is CLUSTERed on the PK, so
-/// this prunes rather than scans; the `T` bound reads three columns.
+/// before them.
+///
+/// Rows meet the requested keys by SLOT, never by text: each key is one row
+/// of a typed literal list (`read_base_sqls`), the join carries its slot into
+/// every answer, and the map is re-keyed by the requested key. The old
+/// readback compared `CAST(col AS STRING)` with the raw WAL key text and
+/// keyed the map by that rendering: a BOOL key (`t` vs BigQuery's `true`), a
+/// NUMERIC `1.50` vs `1.5`, a bytea key or MySQL's `1`/`0` never matched, so
+/// the window was refused torn on every run and the drain wedged — and even a
+/// lucky match missed the map lookup. A query that returns no row for a
+/// requested slot now means exactly what it says: the destination holds no
+/// such row before this window.
 async fn read_base(
     u: &BqUnit<'_>,
     table: &str,
@@ -604,74 +614,123 @@ async fn read_base(
     cols: &[usize],
     plan: &ReplayPlan,
 ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
-    let rows = u.query(&read_base_sql(&u.fq(table), cast, keys, cols, plan)?).await?;
-    let np = cast.pk.len();
     let mut out = std::collections::HashMap::with_capacity(keys.len());
-    for row in rows {
-        if row.len() != np + cols.len() {
-            return Err(Error::Transfer("log_based changelog: masked readback column count mismatch".into()));
+    for sql in read_base_sqls(&u.fq(table), cast, keys, cols, plan)? {
+        for row in u.query(&sql).await? {
+            let Some(Some(slot)) = row.first() else {
+                return Err(Error::Transfer("log_based changelog: masked readback without its key slot".into()));
+            };
+            let slot: usize = slot.parse().map_err(|_| {
+                Error::Transfer(format!("log_based changelog: masked readback slot '{slot}' is not a number"))
+            })?;
+            if row.len() != 1 + cols.len() {
+                return Err(Error::Transfer("log_based changelog: masked readback column count mismatch".into()));
+            }
+            let key = keys.get(slot).ok_or_else(|| {
+                Error::Transfer(format!("log_based changelog: masked readback slot {slot} is out of range"))
+            })?;
+            let vals = row[1..].iter().map(|x| x.clone().map(bytes::Bytes::from)).collect();
+            out.insert(key.clone(), vals);
         }
-        let key: crate::logbased::changelog::CKey =
-            row[..np].iter().map(|x| x.clone().unwrap_or_default().into_bytes()).collect();
-        let vals = row[np..].iter().map(|x| x.clone().map(bytes::Bytes::from)).collect();
-        out.insert(key, vals);
     }
     Ok(out)
 }
 
-/// `read_base`'s query over the table `t` (fully qualified). Every masked
-/// cell is selected as the staging text its column's cast reads
-/// (`base_expr_of`), never as the destination's own string rendering.
-fn read_base_sql(
+/// The readback query (or queries, see `CHUNK_BYTES`) behind `read_base`.
+///
+/// `_apitap_keys` is the requested key list as typed literals, one UNION ALL
+/// branch per key: every part is `cast_expr_of` of the key's WAL text, the
+/// same conversion the apply's own INSERT uses, so `t` meets `BOOL TRUE`,
+/// `1.50` meets a `NUMERIC` `1.5`, and `\x…` meets the `BYTES` it names.
+/// `_apitap_k` is the slot in that list and rides through the JOIN into the
+/// answer. Every masked cell is selected as the staging text its column's
+/// cast reads (`base_expr_of`), never as the destination's string rendering.
+/// The `T` bound and the newest-record pick are the old query's, unchanged;
+/// the table is still CLUSTERed on the PK, so the typed join prunes.
+fn read_base_sqls(
     t: &str,
     cast: &ApplyPlan,
     keys: &[crate::logbased::changelog::CKey],
     cols: &[usize],
     plan: &ReplayPlan,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     let bt = |c: &str| format!("`{c}`");
-    let pk_cols = &cast.pk;
-    let mut sel: Vec<String> = pk_cols
-        .iter()
-        .map(|c| format!("CAST({} AS STRING)", bt(c)))
-        .collect();
+    let mut sel: Vec<String> = Vec::with_capacity(cols.len());
     for &i in cols {
         let c = &cast.cols[i];
         let (oid, ty) = &cast.typed[i];
         sel.push(base_expr_of(&format!("{}", bt(c)), c, *oid, ty)?);
     }
     let sel = sel.join(", ");
-    let mut preds = Vec::with_capacity(keys.len());
-    for k in keys {
-        let mut parts = Vec::with_capacity(pk_cols.len());
-        for (c, v) in pk_cols.iter().zip(k.iter()) {
-            let txt = std::str::from_utf8(v).map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
-            parts.push(format!("CAST(_apitap_p.{} AS STRING) = '{}'", bt(c), sql_str(txt)));
+    let mut key_rows: Vec<String> = Vec::with_capacity(keys.len());
+    for (slot, k) in keys.iter().enumerate() {
+        if k.len() != cast.pk.len() {
+            return Err(Error::Transfer(format!(
+                "log_based changelog: readback key has {} part(s), the key has {}",
+                k.len(),
+                cast.pk.len()
+            )));
         }
-        preds.push(format!("({})", parts.join(" AND ")));
+        let mut fields = vec![format!("{slot} AS _apitap_k")];
+        for (j, name) in cast.pk.iter().enumerate() {
+            let txt = std::str::from_utf8(&k[j])
+                .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+            let (oid, ty) = &cast.typed[cast.pk_pos[j]];
+            let lit = format!("'{}'", sql_str(txt));
+            fields.push(format!("{} AS _apitap_k{j}", cast_expr_of(&lit, name, *oid, ty)?));
+        }
+        key_rows.push(format!("SELECT {}", fields.join(", ")));
     }
-    // Every alias `_apitap_`-prefixed and every column qualified, as in the
-    // view: a key called `l` or `s` must not turn ambiguous.
-    let keys_q = pk_cols.iter().map(|c| format!("_apitap_p.{}", bt(c))).collect::<Vec<_>>().join(", ");
-    Ok(format!(
+    let join = cast
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(j, c)| format!("_apitap_p.{} = _apitap_keys._apitap_k{j}", bt(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let head = format!(
         "WITH _apitap_pre AS (SELECT * FROM {t} _apitap_p WHERE {pre}), \
          _apitap_tr AS (SELECT MAX({CL_LSN}) AS _apitap_l FROM _apitap_pre WHERE {OP_COL} = 'T'), \
          _apitap_trs AS (SELECT MAX(_apitap_p.{CL_SEQ}) AS _apitap_s \
            FROM _apitap_pre _apitap_p CROSS JOIN _apitap_tr \
-           WHERE _apitap_p.{OP_COL} = 'T' AND _apitap_p.{CL_LSN} = _apitap_tr._apitap_l) \
-         SELECT {sel} FROM ( \
-           SELECT _apitap_p.* FROM _apitap_pre _apitap_p CROSS JOIN _apitap_tr CROSS JOIN _apitap_trs \
-           WHERE ({p}) \
-             AND (_apitap_tr._apitap_l IS NULL OR _apitap_p.{CL_LSN} > _apitap_tr._apitap_l \
-                  OR (_apitap_p.{CL_LSN} = _apitap_tr._apitap_l AND _apitap_p.{CL_SEQ} > _apitap_trs._apitap_s)) \
-           QUALIFY ROW_NUMBER() OVER ( \
-             PARTITION BY {keys_q} \
-             ORDER BY _apitap_p.{CL_LSN} DESC, _apitap_p.{CL_SEQ} DESC, _apitap_p.{OP_COL} = '{base}' ASC) = 1 \
-         ) WHERE {OP_COL} != 'D'",
+           WHERE _apitap_p.{OP_COL} = 'T' AND _apitap_p.{CL_LSN} = _apitap_tr._apitap_l), \
+         _apitap_keys AS (",
         pre = before_window(plan, "_apitap_p."),
-        p = preds.join(" OR "),
-        base = CL_BASELINE,
-    ))
+    );
+    let assemble = |rows: &[String]| {
+        format!(
+            "{head}{keys}) \
+             SELECT _apitap_k, {sel} FROM ( \
+               SELECT _apitap_p.*, _apitap_keys._apitap_k \
+               FROM _apitap_pre _apitap_p JOIN _apitap_keys ON {join} \
+               CROSS JOIN _apitap_tr CROSS JOIN _apitap_trs \
+               WHERE (_apitap_tr._apitap_l IS NULL OR _apitap_p.{CL_LSN} > _apitap_tr._apitap_l \
+                    OR (_apitap_p.{CL_LSN} = _apitap_tr._apitap_l AND _apitap_p.{CL_SEQ} > _apitap_trs._apitap_s)) \
+               QUALIFY ROW_NUMBER() OVER ( \
+                 PARTITION BY _apitap_keys._apitap_k \
+                 ORDER BY _apitap_p.{CL_LSN} DESC, _apitap_p.{CL_SEQ} DESC, _apitap_p.{OP_COL} = '{base}' ASC) = 1 \
+             ) WHERE {OP_COL} != 'D'",
+            keys = rows.join(" UNION ALL "),
+            base = CL_BASELINE,
+        )
+    };
+    if keys.is_empty() || cols.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut rows: Vec<String> = Vec::new();
+    let mut len = head.len();
+    for r in key_rows {
+        if !rows.is_empty() && len + r.len() > CHUNK_BYTES {
+            out.push(assemble(&rows));
+            rows.clear();
+            len = head.len();
+        }
+        len += r.len() + " UNION ALL ".len();
+        rows.push(r);
+    }
+    out.push(assemble(&rows));
+    Ok(out)
 }
 
 /// Where one changelog table's statements write: the table, the marker
@@ -964,8 +1023,11 @@ struct ApplyPlan {
     from_on: Vec<String>,
     pk: Vec<String>,
     /// `(OID, target type)` per column, index-parallel to `cols`: what the
-    /// masked readback's value expressions are built from.
+    /// masked readback's typed expressions are built from.
     typed: Vec<(u32, String)>,
+    /// For each key column, its index in `cols` — the `typed` entry the
+    /// readback's predicate casts its WAL text through.
+    pk_pos: Vec<usize>,
 }
 
 impl ApplyPlan {
@@ -1003,6 +1065,7 @@ impl ApplyPlan {
         // position); an old key is staged as text like any cell, so it is cast
         // exactly as that column is.
         let mut from_on = Vec::with_capacity(pk_cols.len());
+        let mut pk_pos = Vec::with_capacity(pk_cols.len());
         for (j, k) in pk_cols.iter().enumerate() {
             let Some(i) = wal_cols.iter().position(|c| c == k) else {
                 return Err(Error::Transfer(format!(
@@ -1012,8 +1075,17 @@ impl ApplyPlan {
             let (oid, ty) = &typed[i];
             let from = cast_expr_of(&format!("S.`{}`", from_col(j)), k, *oid, ty)?;
             from_on.push(format!("F.`{k}` = {from}"));
+            pk_pos.push(i);
         }
-        Ok(Self { cols: wal_cols.to_vec(), cast, cast_s, from_on, pk: pk_cols.to_vec(), typed })
+        Ok(Self {
+            cols: wal_cols.to_vec(),
+            cast,
+            cast_s,
+            from_on,
+            pk: pk_cols.to_vec(),
+            typed,
+            pk_pos,
+        })
     }
 
     fn staging_fields(&self) -> Value {
@@ -2280,7 +2352,7 @@ mod tests {
         .unwrap();
         let keys = vec![vec![b"7".to_vec()]];
         let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
-        let sql = read_base_sql("`p.d.t`", &plan, &keys, &[1], &replay).unwrap();
+        let sql = &read_base_sqls("`p.d.t`", &plan, &keys, &[1], &replay).unwrap()[0];
         assert!(
             sql.contains("IF(`blob` IS NULL, NULL, CONCAT(r'\\x', LOWER(TO_HEX(`blob`))))"),
             "BYTES must come back as the WAL's \\x-hex, not a string rendering: {sql}"
@@ -2304,12 +2376,111 @@ mod tests {
         .unwrap();
         let keys = vec![vec![b"7".to_vec()]];
         let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
-        let sql = read_base_sql("`p.d.t`", &plan, &keys, &[0, 1, 2], &replay).unwrap();
+        let sql = &read_base_sqls("`p.d.t`", &plan, &keys, &[0, 1, 2], &replay).unwrap()[0];
         assert!(sql.contains("CAST(`id` AS STRING)"), "{sql}");
         assert!(sql.contains("IF(`flag` IS NULL, NULL, IF(`flag`, 't', 'f'))"), "{sql}");
         assert!(
             sql.contains("IF(`blob` IS NULL, NULL, CONCAT(r'\\x', LOWER(TO_HEX(`blob`))))"),
             "{sql}"
+        );
+    }
+
+    /// A BOOL key's WAL text is `t`; BigQuery renders the same key `true`.
+    /// Comparing the destination's rendering with the raw text matched
+    /// nothing, so the masked readback came back empty and every run refused
+    /// the window torn — the drain wedged. The predicate must be the WAL
+    /// text cast into the key's own type, and the answer must ride back by
+    /// slot, never as a rendering to match again in Rust.
+    #[test]
+    fn readback_bool_key_predicate_is_typed() {
+        let plan = ApplyPlan::build(
+            "t",
+            &["flag".into(), "v".into()],
+            &[16, 25],
+            &["flag".into()],
+            &types(&[("flag", "BOOL"), ("v", "STRING")]),
+        )
+        .unwrap();
+        let keys = vec![vec![b"t".to_vec()]];
+        let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
+        let sqls = read_base_sqls("`p.d.t`", &plan, &keys, &[1], &replay).unwrap();
+        assert_eq!(sqls.len(), 1);
+        let sql = &sqls[0];
+        assert!(
+            sql.contains(
+                "SELECT 0 AS _apitap_k, CASE WHEN 't' IS NULL THEN NULL WHEN 't' IN \
+                 ('t','true','TRUE','1') THEN TRUE WHEN 't' IN ('f','false','FALSE','0') \
+                 THEN FALSE ELSE ERROR("
+            ),
+            "the BOOL key's WAL text must be cast into BOOL, not a string: {sql}"
+        );
+        assert!(!sql.contains("CAST(_apitap_p.`flag` AS STRING)"), "{sql}");
+        assert!(
+            sql.contains("JOIN _apitap_keys ON _apitap_p.`flag` = _apitap_keys._apitap_k0"),
+            "the typed literal must be joined to the key column: {sql}"
+        );
+        assert!(sql.contains("PARTITION BY _apitap_keys._apitap_k"), "{sql}");
+    }
+
+    /// A NUMERIC key's WAL text keeps the source scale (`1.50`); the
+    /// destination renders the same value `1.5`. Renderings never matched;
+    /// the typed predicate compares values.
+    #[test]
+    fn readback_numeric_key_compares_by_value_not_rendering() {
+        let plan = ApplyPlan::build(
+            "t",
+            &["n".into(), "v".into()],
+            &[1700, 25],
+            &["n".into()],
+            &types(&[("n", "NUMERIC"), ("v", "STRING")]),
+        )
+        .unwrap();
+        let keys = vec![vec![b"1.50".to_vec()]];
+        let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
+        let sql = &read_base_sqls("`p.d.t`", &plan, &keys, &[1], &replay).unwrap()[0];
+        assert!(
+            sql.contains("SELECT 0 AS _apitap_k, CAST('1.50' AS NUMERIC) AS _apitap_k0"),
+            "the NUMERIC key's WAL text must be CAST into NUMERIC: {sql}"
+        );
+        assert!(
+            sql.contains("JOIN _apitap_keys ON _apitap_p.`n` = _apitap_keys._apitap_k0"),
+            "{sql}"
+        );
+        assert!(!sql.contains("CAST(_apitap_p.`n` AS STRING)"), "{sql}");
+    }
+
+    /// A window with many masked keys must not grow one unbounded query:
+    /// BigQuery caps a query near 1 MB. The key list is sliced into
+    /// `CHUNK_BYTES`-sized queries, and the slot is the key's GLOBAL index —
+    /// a later query's first branch continues where the last one stopped, so
+    /// the Rust map never confuses two chunks.
+    #[test]
+    fn readback_key_list_is_chunked_and_slots_stay_global() {
+        let plan = ApplyPlan::build(
+            "t",
+            &["k".into(), "v".into()],
+            &[25, 25],
+            &["k".into()],
+            &types(&[("k", "STRING"), ("v", "STRING")]),
+        )
+        .unwrap();
+        let pad = "x".repeat(4000);
+        let keys: Vec<Vec<Vec<u8>>> =
+            (0..200).map(|i| vec![format!("{i}{pad}").into_bytes()]).collect();
+        let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
+        let sqls = read_base_sqls("`p.d.t`", &plan, &keys, &[1], &replay).unwrap();
+        assert!(sqls.len() >= 2, "200 x 4 KB keys must not be one query");
+        assert!(sqls[0].contains("SELECT 0 AS _apitap_k"), "{}", sqls[0]);
+        let first_of_next = sqls[0].matches(" UNION ALL ").count() + 1;
+        assert!(
+            sqls[1].contains(&format!("SELECT {first_of_next} AS _apitap_k,")),
+            "chunk 2 must continue the global slot numbering: {}",
+            sqls[1]
+        );
+        assert!(
+            sqls.iter().all(|s| s.len() <= CHUNK_BYTES + 8192),
+            "a chunk blew the cap: {:?}",
+            sqls.iter().map(String::len).collect::<Vec<_>>()
         );
     }
 
