@@ -3,7 +3,7 @@
 //! `ON CONFLICT` upsert (merge). Captures indexes, constraints and grants so a
 //! replace re-applies what the swap would destroy.
 
-use crate::sink::Loader;
+use crate::sink::{FinishMarked, Loader, Msg};
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
@@ -1272,10 +1272,10 @@ type CopyIn = sqlx::postgres::PgCopyIn<sqlx::pool::PoolConnection<sqlx::Postgres
 pub(crate) enum PgCopyLoader {
     Serial(CopyIn),
     Overlap {
-        /// `Err(())` is the abort marker: the sender task then ABORTS the COPY so
-        /// Postgres discards the partial stream (a clean close would commit it into
-        /// staging — wasted WAL for data the swap will never use).
-        tx: futures::channel::mpsc::Sender<std::result::Result<Vec<u8>, ()>>,
+        /// A dropped sender without [`Msg::Finish`] makes the sender task ABORT
+        /// the COPY so Postgres discards the partial stream (a clean close would
+        /// commit it into staging — wasted WAL for data the swap will never use).
+        tx: futures::channel::mpsc::Sender<Msg<Vec<u8>>>,
         /// Emptied chunk buffers coming back from the sender task for reuse.
         back: futures::channel::mpsc::Receiver<Vec<u8>>,
         join: tokio::task::JoinHandle<Result<u64>>,
@@ -1292,7 +1292,7 @@ impl PgCopyLoader {
             return Ok(Self::Serial(copier));
         }
         use futures::StreamExt;
-        let (tx, mut rx) = futures::channel::mpsc::channel::<std::result::Result<Vec<u8>, ()>>(2);
+        let (tx, rx) = futures::channel::mpsc::channel::<Msg<Vec<u8>>>(2);
         // Sized to the buffers that can be in flight (2 channel slots + 1 in the
         // worker + 1 here); a full channel just drops the buffer instead of blocking.
         let (mut back_tx, back) = futures::channel::mpsc::channel::<Vec<u8>>(4);
@@ -1301,6 +1301,7 @@ impl PgCopyLoader {
                 .copy_in_raw(&copy_in_sql)
                 .await
                 .map_err(|e| Error::Transfer(format!("COPY IN: {e}")))?;
+            let mut rx = FinishMarked::new(rx);
             while let Some(item) = rx.next().await {
                 match item {
                     Ok(mut buf) => {
@@ -1315,7 +1316,7 @@ impl PgCopyLoader {
                         buf.clear();
                         let _ = back_tx.try_send(buf);
                     }
-                    Err(()) => {
+                    Err(_) => {
                         let _ = copier.abort("apitap: source failed").await;
                         return Err(Error::Transfer("copy aborted".into()));
                     }
@@ -1348,7 +1349,7 @@ impl Loader for PgCopyLoader {
                 .map_err(|e| Error::Transfer(format!("pg send: {e}"))),
             Self::Overlap { tx, join, .. } => {
                 use futures::SinkExt;
-                if tx.send(Ok(buf)).await.is_err() {
+                if tx.send(Msg::Buf(buf)).await.is_err() {
                     // Sender died — surface ITS error, not the closed channel.
                     return Err(match join.await {
                         Ok(Ok(_)) => Error::Transfer("pg copy closed early".into()),
@@ -1367,7 +1368,17 @@ impl Loader for PgCopyLoader {
                 .finish()
                 .await
                 .map_err(|e| Error::Transfer(format!("pg finish: {e}"))),
-            Self::Overlap { tx, join, .. } => {
+            Self::Overlap { mut tx, join, .. } => {
+                use futures::SinkExt;
+                if tx.send(Msg::Finish).await.is_err() {
+                    // Sender died before it could be told this is a finish —
+                    // surface ITS error, not the closed channel.
+                    return Err(match join.await {
+                        Ok(Ok(_)) => Error::Transfer("pg copy closed early".into()),
+                        Ok(Err(e)) => e,
+                        Err(e) => Error::Transfer(format!("join: {e}")),
+                    });
+                }
                 drop(tx); // close the channel; the sender task then finishes the COPY
                 match join.await {
                     Ok(r) => r,
@@ -1383,9 +1394,9 @@ impl Loader for PgCopyLoader {
             Self::Serial(copier) => {
                 let _ = copier.abort("apitap: source failed").await;
             }
-            Self::Overlap { mut tx, join, .. } => {
-                use futures::SinkExt;
-                let _ = tx.send(Err(())).await;
+            Self::Overlap { tx, join, .. } => {
+                // No `Finish`: dropping the sender makes the adapter hand the
+                // task a `DROPPED` error, which aborts the COPY server-side.
                 drop(tx);
                 let _ = join.await;
             }

@@ -81,10 +81,72 @@ pub(crate) trait Loader: Send + 'static {
     }
     /// Close the stream cleanly. Returns rows ingested if this sink reports them
     /// (Postgres COPY does; ClickHouse counts via [`Sink::rows_staged`] instead).
+    ///
+    /// The channel-backed loaders commit on a clean end only: their input is a
+    /// [`Msg`] stream, and a sender dropped without [`Msg::Finish`] surfaces the
+    /// [`DROPPED`] error to the consumer, which aborts server-side instead of
+    /// committing the partial stream.
     fn finish(self) -> impl Future<Output = Result<u64>> + Send;
     /// Source-side failure: make the sink DISCARD the partial stream (a clean close
     /// could commit it), then hand the cause back for propagation.
     fn abort(self, cause: Error) -> impl Future<Output = Error> + Send;
+}
+
+/// One item of a channel-backed loader's input: buffers, then — at most once,
+/// at the very end — the proof that the producer meant to finish.
+pub(crate) enum Msg<B> {
+    Buf(B),
+    Finish,
+}
+
+pub(crate) const DROPPED: &str =
+    "apitap: stream closed without Finish — discarded, never committed";
+
+/// Adapter from a [`Msg`] channel to the `Stream<io::Result<B>>` shape the
+/// pg-overlap sender task, mysql_async's LOCAL INFILE handler and
+/// `reqwest::Body::wrap_stream` all want.
+///
+/// `Buf` → `Ok(b)`; `Finish` → clean end; the channel closing WITHOUT `Finish`
+/// → one `Err`, then end. That last arm is the point: a channel-backed loader
+/// commits on a clean end, so "closed without Finish" — a dropped sender, a
+/// panicking worker, a `JoinSet` dropped from above — must abort server-side,
+/// never silently commit.
+///
+/// Hand-written (not `stream::unfold`) so it is `Send + Sync + Unpin` whatever
+/// bounds those three consumers carry.
+pub(crate) struct FinishMarked<B> {
+    rx: Option<futures::channel::mpsc::Receiver<Msg<B>>>,
+}
+
+impl<B> FinishMarked<B> {
+    pub(crate) fn new(rx: futures::channel::mpsc::Receiver<Msg<B>>) -> Self {
+        Self { rx: Some(rx) }
+    }
+}
+
+impl<B> futures::Stream for FinishMarked<B> {
+    type Item = std::io::Result<B>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use futures::StreamExt as _;
+        let Some(rx) = self.rx.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        match futures::ready!(rx.poll_next_unpin(cx)) {
+            Some(Msg::Buf(b)) => std::task::Poll::Ready(Some(Ok(b))),
+            Some(Msg::Finish) => {
+                self.rx = None;
+                std::task::Poll::Ready(None)
+            }
+            None => {
+                self.rx = None;
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(DROPPED))))
+            }
+        }
+    }
 }
 
 /// Wraps any loader to count what passes through it. Every byte of every
@@ -266,6 +328,46 @@ mod tests {
     use crate::sink::{iceberg::IcebergSink, mysql::MySqlSink, postgres::PgSink, s3::S3Sink};
     use crate::wire::bqparquet::parquet_residency;
     use crate::Mode;
+
+    /// The finish marker IS the commit decision for every channel-backed
+    /// loader: a clean EOF means "the producer finished on purpose" and the
+    /// server commits, so a channel that closes without `Finish` must yield an
+    /// error item instead of looking like a clean end.
+    ///
+    /// RED (mutation: the `None` arm returns `Poll::Ready(None)` like a plain
+    /// receiver): `Buf, Buf, <drop tx>` collects `[Ok, Ok]` — the 0.56.0
+    /// commit-on-drop.
+    #[tokio::test]
+    async fn finish_marked_errors_when_dropped_without_finish() {
+        use super::{FinishMarked, Msg, DROPPED};
+        use futures::StreamExt as _;
+
+        async fn collect(items: Vec<Msg<Vec<u8>>>) -> Vec<std::io::Result<Vec<u8>>> {
+            let (mut tx, rx) = futures::channel::mpsc::channel::<Msg<Vec<u8>>>(8);
+            for i in items {
+                tx.try_send(i).expect("fresh channel has capacity");
+            }
+            drop(tx);
+            FinishMarked::new(rx).collect().await
+        }
+
+        // Dropped without Finish: two buffers, then exactly one DROPPED error.
+        let got = collect(vec![Msg::Buf(b"a".to_vec()), Msg::Buf(b"b".to_vec())]).await;
+        assert_eq!(got.len(), 3, "a drop without Finish is an abort item");
+        assert_eq!(got[0].as_deref().unwrap(), &b"a"[..]);
+        assert_eq!(got[1].as_deref().unwrap(), &b"b"[..]);
+        let err = got[2].as_ref().expect_err("drop without Finish must error");
+        assert_eq!(err.to_string(), DROPPED);
+
+        // Finish is a clean end: everything before it, then None.
+        let got = collect(vec![Msg::Buf(b"a".to_vec()), Msg::Finish]).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_deref().unwrap(), &b"a"[..]);
+
+        // Finish ends the stream even with buffers still queued behind it.
+        let got = collect(vec![Msg::Finish, Msg::Buf(b"a".to_vec())]).await;
+        assert!(got.is_empty());
+    }
 
     /// I7: every sink declares its loader's residency, pinned as NUMBERS so a
     /// drift in `parquet_residency` or in one impl shows up here instead of a

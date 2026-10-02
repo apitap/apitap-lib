@@ -27,7 +27,7 @@
 //! longer drops anything on sight either — it lists what is there, reaps
 //! orphans by age and refuses live peers that cannot coexist.
 
-use crate::sink::Loader;
+use crate::sink::{FinishMarked, Loader, Msg};
 use crate::dialect::mysql::{is_binary_udt, my_ident};
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-type Registry = Arc<Mutex<HashMap<u64, mpsc::Receiver<std::io::Result<Bytes>>>>>;
+type Registry = Arc<Mutex<HashMap<u64, InfileData>>>;
 
 
 /// Escape a string as a MySQL SQL single-quoted literal body (no surrounding
@@ -423,7 +423,10 @@ impl MySqlShared {
         tx.clone()
             .try_send(Ok(Bytes::from(body)))
             .expect("fresh infile channel has capacity");
-        self.registry.lock().expect("infile registry").insert(id, rx);
+        // The body is COMPLETE at registration, so a clean end of this plain
+        // stream is a genuine end-of-file: LOAD DATA commits what it read.
+        let data: InfileData = Box::pin(rx);
+        self.registry.lock().expect("infile registry").insert(id, data);
         id
     }
 
@@ -566,7 +569,7 @@ impl MySqlSink {
                     let rx = reg.lock().expect("infile registry").remove(&id);
                     Box::pin(async move {
                         match rx {
-                            Some(rx) => Ok(Box::pin(rx) as InfileData),
+                            Some(rx) => Ok(rx),
                             None => Err(mysql_async::LocalInfileError::OtherError(
                                 format!("apitap: no infile stream for id {id}").into(),
                             )),
@@ -984,11 +987,14 @@ impl crate::sink::Sink for MySqlSink {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // 2-slot channel: a full channel backpressures the source worker while the
         // server digests the load — memory stays bounded.
-        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        let (tx, rx) = mpsc::channel::<Msg<Bytes>>(2);
+        // A stream that ends without `Msg::Finish` — the loader was dropped —
+        // yields the DROPPED error, so LOAD DATA aborts instead of committing.
+        let data: InfileData = Box::pin(FinishMarked::new(rx));
         self.registry
             .lock()
             .expect("infile registry")
-            .insert(id, rx);
+            .insert(id, data);
 
         // Column list: binary columns arrive HEX-encoded and are UNHEXed back.
         // User variables are SYNTHETIC (positional): a column name with a char
@@ -1335,7 +1341,7 @@ impl MySqlSink {
 
 
 pub(crate) struct MySqlLoader {
-    tx: mpsc::Sender<std::io::Result<Bytes>>,
+    tx: mpsc::Sender<Msg<Bytes>>,
     join: tokio::task::JoinHandle<Result<u64>>,
     id: u64,
     registry: Registry,
@@ -1344,13 +1350,17 @@ pub(crate) struct MySqlLoader {
 impl Loader for MySqlLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         self.tx
-            .send(Ok(Bytes::from(buf)))
+            .send(Msg::Buf(Bytes::from(buf)))
             .await
             .map_err(|_| Error::Transfer("mysql LOAD DATA stream closed early".into()))
     }
 
     async fn finish(mut self) -> Result<u64> {
-        // Close the stream → the server sees EOF → LOAD DATA commits.
+        // `Finish` then close: the server sees a clean EOF and LOAD DATA commits.
+        self.tx
+            .send(Msg::Finish)
+            .await
+            .map_err(|_| Error::Transfer("mysql LOAD DATA stream closed early".into()))?;
         self.tx.close_channel();
         self.join
             .await
@@ -1358,12 +1368,8 @@ impl Loader for MySqlLoader {
     }
 
     async fn abort(mut self, cause: Error) -> Error {
-        // Push an error into the stream so the server ABORTS the load instead of
-        // committing a partial file, then drop everything.
-        let _ = self
-            .tx
-            .send(Err(std::io::Error::other("apitap: source failed")))
-            .await;
+        // Close WITHOUT `Finish`: the adapter hands the server the DROPPED
+        // error, so LOAD DATA aborts instead of committing a partial file.
         self.tx.close_channel();
         self.registry
             .lock()

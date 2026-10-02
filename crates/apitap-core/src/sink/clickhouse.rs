@@ -2,7 +2,7 @@
 //! (or TabSeparated for the text fallback lane) into a staging MergeTree, swapped in
 //! atomically with `EXCHANGE TABLES`.
 
-use crate::sink::Loader;
+use crate::sink::{FinishMarked, Loader, Msg};
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
@@ -2146,7 +2146,7 @@ impl ChSink {
 /// spawned task whose result carries the REAL failure (reqwest reduces a mid-body
 /// error to an opaque "error sending request" on the body side).
 pub(crate) struct ChLoader {
-    tx: futures::channel::mpsc::Sender<std::io::Result<bytes::Bytes>>,
+    tx: futures::channel::mpsc::Sender<Msg<bytes::Bytes>>,
     join: tokio::task::JoinHandle<Result<()>>,
     /// Kept so the loader can open a SECOND request when a body cap is set.
     ch: ChConn,
@@ -2165,12 +2165,14 @@ impl ChLoader {
         ch: ChConn,
         insert_sql: String,
     ) -> (
-        futures::channel::mpsc::Sender<std::io::Result<bytes::Bytes>>,
+        futures::channel::mpsc::Sender<Msg<bytes::Bytes>>,
         tokio::task::JoinHandle<Result<()>>,
     ) {
-        let (tx, rx) = futures::channel::mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
+        let (tx, rx) = futures::channel::mpsc::channel::<Msg<bytes::Bytes>>(2);
         let join = tokio::spawn(async move {
-            let body = reqwest::Body::wrap_stream(rx);
+            // Without `Finish` the adapter errors the body, and reqwest turns
+            // that into an aborted request rather than a committed insert.
+            let body = reqwest::Body::wrap_stream(FinishMarked::new(rx));
             ch.insert_stream(&insert_sql, body).await
         });
         (tx, join)
@@ -2183,10 +2185,12 @@ impl ChLoader {
     /// swapped in atomically, and a CDC window re-deletes its keys before
     /// re-inserting, so a failure between requests replays cleanly.
     async fn roll(&mut self) -> Result<()> {
+        use futures::SinkExt;
         let (tx, join) = Self::spawn_request(self.ch.clone(), self.insert_sql.clone());
-        let old_tx = std::mem::replace(&mut self.tx, tx);
+        let mut old_tx = std::mem::replace(&mut self.tx, tx);
         let old_join = std::mem::replace(&mut self.join, join);
-        drop(old_tx); // clean end-of-body: this request commits
+        let _ = old_tx.send(Msg::Finish).await; // clean end-of-body: this request commits
+        drop(old_tx);
         match old_join.await {
             Ok(Ok(())) => {
                 self.sent = 0;
@@ -2233,7 +2237,7 @@ impl Loader for ChLoader {
             }
         }
         self.sent += buf.len() as u64;
-        if self.tx.send(Ok(bytes::Bytes::from(buf))).await.is_err() {
+        if self.tx.send(Msg::Buf(bytes::Bytes::from(buf))).await.is_err() {
             // The insert died — its task holds the real error.
             return Err(Self::real_error(&mut self.join).await);
         }
@@ -2241,8 +2245,10 @@ impl Loader for ChLoader {
     }
 
     async fn finish(self) -> Result<u64> {
-        let Self { tx, mut join, .. } = self;
-        drop(tx); // clean end-of-body: ClickHouse commits the insert
+        use futures::SinkExt;
+        let Self { mut tx, mut join, .. } = self;
+        let _ = tx.send(Msg::Finish).await; // clean end-of-body: ClickHouse commits
+        drop(tx);
         match (&mut join).await {
             Ok(r) => r.map(|_| 0), // rows counted server-side by the sink
             Err(e) => Err(Error::Transfer(format!("join: {e}"))),
@@ -2250,15 +2256,12 @@ impl Loader for ChLoader {
     }
 
     async fn abort(self, cause: Error) -> Error {
-        use futures::SinkExt;
-        let Self { mut tx, join, .. } = self;
-        // Erroring the body aborts the HTTP request, so ClickHouse DISCARDS the
-        // partial stream instead of committing it. With a body cap set, earlier
-        // requests have already committed — the staging table they filled is
-        // dropped by the caller's cleanup, and a CDC window replays its delete.
-        let _ = tx
-            .send(Err(std::io::Error::other("apitap: source failed")))
-            .await;
+        let Self { tx, join, .. } = self;
+        // No `Finish`: dropping the sender makes the adapter hand the request
+        // body the DROPPED error, so ClickHouse DISCARDS the partial stream
+        // instead of committing it. With a body cap set, earlier requests have
+        // already committed — the staging table they filled is dropped by the
+        // caller's cleanup, and a CDC window replays its delete.
         drop(tx);
         let _ = join.await;
         cause
