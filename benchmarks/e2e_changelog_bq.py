@@ -32,6 +32,7 @@ BigQuery object it made when it exits.
 ENV: BQ_SA (service-account JSON path), BQ_PROJECT, BQ_DATASET.
 """
 import atexit
+import hashlib
 import os
 import select
 import socket
@@ -100,19 +101,21 @@ def count(sql):
 
 def drop_bq_objects():
     """Every BigQuery object this leg makes, and its bookkeeping rows."""
-    for t in (f"{T}__current",):
+    for t in (f"{T}__current", f"{T}_bool__current"):
         try:
             bq(f"DROP VIEW IF EXISTS `{DS}.{t}`")
         except Exception:
             pass
-    for t in (T, f"{T}__apitap_cl", f"{T}__apitap_cdc", f"{T}_p"):
+    for t in (T, f"{T}_bool", f"{T}__apitap_cl", f"{T}__apitap_cdc",
+              f"{T}_bool__apitap_cl", f"{T}_bool__apitap_cdc", f"{T}_p"):
         try:
             bq(f"DROP TABLE IF EXISTS `{DS}.{t}`")
         except Exception:
             pass
     for t in ("_apitap_state", "_apitap_cdc_pending"):
         try:
-            bq(f"DELETE FROM `{DS}.{t}` WHERE dest_table IN ('{T}', '{T}_p')")
+            bq(f"DELETE FROM `{DS}.{t}` "
+               f"WHERE dest_table IN ('{T}', '{T}_bool', '{T}_p')")
         except Exception:
             pass
 
@@ -270,7 +273,9 @@ def running_window_script(since_ms, token):
 ok = True
 print("== reset ==")
 pg(f"DROP TABLE IF EXISTS {T} CASCADE")
+pg(f"DROP TABLE IF EXISTS {T}_bool CASCADE")
 pg(f"DROP PUBLICATION IF EXISTS apitap_pub_{T}")
+pg(f"DROP PUBLICATION IF EXISTS apitap_pub_{T}_bool")
 pg("SELECT pg_drop_replication_slot(s) FROM (SELECT slot_name s FROM "
    "pg_replication_slots WHERE slot_name LIKE 'apitap_%') x")
 drop_bq_objects()
@@ -408,6 +413,53 @@ newest = int(bq(f"SELECT LENGTH(IFNULL(body,'')) FROM `{DS}.{T}` WHERE id=1 AND 
 print(f"   …and the newest U record itself carries it: {newest}")
 ok &= newest == BIG
 ok &= current_matches("after-toast")
+
+print("== BOOL PK + untouched BYTEA: the masked readback is typed, not a rendering ==")
+# The same window as above, on the two spellings the readback used to get
+# wrong. A BOOLEAN key: the WAL spells it `t`/`f` and the destination stores
+# it INTEGER 1/0, so the old CAST(col AS STRING) = '<text>' predicate matched
+# no row, the window was refused torn and the drain wedged. A BYTES column:
+# the old readback selected CAST(blob AS STRING) — BigQuery's UTF-8 reading
+# of raw bytes — while the apply's cast is FROM_HEX(SUBSTR(c, 3)).
+#
+# apitap's own Postgres text lane stores a bytea column as the `\x…` STRING,
+# so the true BYTES destination the finding describes is made here, in place,
+# keeping the bootstrapped baseline row's bookkeeping: the same table rebuilt
+# AS SELECT with blob = FROM_HEX(raw). The state row and the slot stay, so the
+# next drain is a plain window, not a bootstrap.
+TB = f"{T}_bool"
+BL = 60000
+pg(f"CREATE TABLE {TB} (g boolean PRIMARY KEY, blob bytea, note text)")
+pg(f"ALTER TABLE {TB} ALTER COLUMN blob SET STORAGE EXTERNAL")
+pg(f"INSERT INTO {TB} VALUES (true, decode(repeat('deadbeef', {BL // 4}), 'hex'), 'a')")
+r = apitap.transfer(PG, BQ, table=TB, mode="log_based", changelog=True)
+stored = int(pg(f"SELECT pg_column_size(blob) FROM {TB} WHERE g"))
+print(f"   bootstrap rows={r.rows}; blob stored out of line: {stored} bytes")
+ok &= stored >= BL
+bq(f"CREATE OR REPLACE TABLE `{DS}.{TB}` "
+   f"PARTITION BY TIMESTAMP_TRUNC(_apitap_at, MONTH) CLUSTER BY g AS SELECT g, "
+   f"FROM_HEX(REPEAT('deadbeef', {BL // 4})) AS blob, note, "
+   f"_apitap_op, _apitap_lsn, _apitap_seq, _apitap_at FROM `{DS}.{TB}` WHERE _apitap_op='B'")
+typed = bq(f"SELECT data_type FROM `{DS}.INFORMATION_SCHEMA.COLUMNS` "
+           f"WHERE table_name='{TB}' AND column_name='blob'")[0][0]
+print(f"   destination blob is {typed} holding raw bytes")
+ok &= typed == "BYTES"
+pg(f"UPDATE {TB} SET note = 'x' WHERE g")              # blob NOT touched: WAL omits it
+try:
+    r = apitap.transfer(PG, BQ, table=TB, mode="log_based", changelog=True)
+    print(f"   window rows={r.rows}")
+except Exception as e:
+    print(f"   ✗ the drain refused a BOOL key's masked BYTES readback: {e}")
+    ok = False
+want = hashlib.sha256(b"\xde\xad\xbe\xef" * (BL // 4)).hexdigest()
+newest = bq(f"SELECT TO_HEX(SHA256(blob)) FROM `{DS}.{TB}` WHERE g = 1 AND _apitap_op='U' "
+            f"ORDER BY _apitap_lsn DESC, _apitap_seq DESC LIMIT 1")
+cur = bq(f"SELECT TO_HEX(SHA256(blob)) FROM `{DS}.{TB}__current` WHERE g = 1")
+good = (bool(newest) and newest[0][0] == want) and (bool(cur) and cur[0][0] == want)
+print(f"   {'✓' if good else '✗'} the masked U record's blob is the raw bytes: U "
+      f"{newest[0][0] if newest else '<none>'}, __current {cur[0][0] if cur else '<none>'} "
+      f"(want {want})")
+ok &= good
 
 print("== partition_by on a non-time column is refused ==")
 pg(f"DROP TABLE IF EXISTS {T}_p CASCADE")
