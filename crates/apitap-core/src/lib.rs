@@ -41,6 +41,7 @@ mod http;
 mod pipeline;
 mod plan;
 mod progress;
+pub(crate) mod pipe;
 mod lease;
 mod naming;
 pub mod shutdown;
