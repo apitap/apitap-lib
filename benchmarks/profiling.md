@@ -300,3 +300,44 @@ Receipts (interleaved @0.5cpu/256MB, ClickHouse per-column checksums exact):
 host my→ch flat (13.3 vs 13.5 s — server-bound there, as the profile
 predicted). Peak RSS on the winning route +25–35 MB (89–102 → 120–134 MB),
 half the 256 MB cap — paid for a 1.75× throughput jump.
+
+## Session 5 — D: the cage is a budget the sink declares (2026-10-03)
+
+The D cluster (0.57.0 steps 35-38) stopped pricing every pipe at 10 ×
+chunk_bytes and gave every sink a `PipeResidency`: the planner now charges
+what a loader actually holds (parquet builders, part buffer, page) and may
+shrink the row group before it loses a pipe. Iceberg's merge stopped
+materialising its delta keys and streams one equality-delete file per data
+file. Receipts: the E1/E2 cells, n = 3, on the non-PGO CP4 wheel
+(`_apitap.abi3.so` md5 `9a6a1b9e`) against the PyPI 0.56.0 PGO wheel
+(`f9d6cc7b`) where the cell differs; each run is `docker run --memory=…m
+--memory-swap=…m --cpus=…`, peak from the kernel's cgroup `memory.peak`,
+readback checked in DuckDB (E1: per-column checksums vs source; E2: an
+anti-join over the snapshot's own files, digit-exact).
+
+| cell | plan chunk/rg/pipes | peak n=3 | parts | 0.56.0 |
+|---|---|---|---|---|
+| pg→S3 parquet 10M, 128m / 2 cpu | 4 MiB / rg8 / 1 | 72 / 71 / 73 MB (56%) | 1 | OOMKilled, peak 130-133 MB |
+| pg→S3 parquet 10M, 256m / 4 cpu | 2 MiB / rg4 / 4 | 198 / 207 / 202 MB (79%) | 4 | OOMKilled, peak 259 MB |
+| pg→S3 parquet 10M, 256m / 0.5 cpu | 4 MiB / rg8 / 2 | 139 / 130 / 124 MB (median 51%) | 2 | green on both: 0.56.0 plans rg24, peak 190 MB |
+| iceberg merge 2.1M, 256m / 0.5 cpu | 4 MiB / rg8 / 2 | 146 / 138 / 146 MB (57%) | delete 2 = data 2 | OOMKilled, peak 256 MB (100%) |
+
+- The 0.56.0 numbers are its own plan with the same wheel it shipped:
+  `(128m,2)` → 2 pipes × rg24, `(256m,4)` → 8 pipes × rg24, `(256m,0.5)`
+  → 2 pipes × rg24 (green on both, which is why it is the two-sided
+  regression guard).
+- `PER_ROW_GROUP = 3` is a measured calibration, not the brief's 2: the
+  model said 2 pipes × rg4 fit 128 MiB (126), the cage killed a 123-159 MB
+  peak. At 3 the same cell plans one pipe × rg8 and peaks 56 %.
+- The (256m, 4) cell sits at 79 % of its cage — the thinnest margin here;
+  it is the one cell whose 0.57 plan differs from 0.56.0 by losing pipes,
+  and the price is paid in wall time, not correctness.
+- E2's snapshot summary on all three runs: `operation=overwrite
+  added-records=2100000 added-delete-files=2 added-data-files=2
+  added-equality-deletes=2100000`, readback `2100000|14035009350000`
+  every time. The readback deliberately does not use `iceberg_scan` (the
+  extension allocated 13+ GB on this rig): it verifies the merged row set,
+  while the delete file's field ids and `equality_ids` are pinned by unit
+  T5/T6 and its per-file membership by T4.
+- Release re-runs these on the PGO wheel per §6.3; those numbers land
+  here when the release is gated.
