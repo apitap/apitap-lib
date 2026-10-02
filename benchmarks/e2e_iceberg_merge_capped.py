@@ -69,7 +69,26 @@ def seed():
 
 
 def cleanup():
-    """Drop the Iceberg table and everything it wrote (the seed stays)."""
+    """Drop the Iceberg table and everything it wrote (the seed stays).
+
+    A run killed before its release leaves its announcement under
+    `metadata/apitap-runs/`, and nothing collects it on its own — a
+    timestamp cannot tell a crashed run from a slow one — so the next run
+    of this table refuses `locked`. This leg's scratch table is the one
+    place that may collect it, and it must do so BEFORE the drop: the
+    catalog metadata that names the base path goes with the table."""
+    try:
+        with urllib.request.urlopen(CATALOG_URL) as r:
+            loc = json.load(r).get("metadata-location", "")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        loc = ""
+    if loc.startswith("s3://apitap-bench/"):
+        base = loc.split("s3://apitap-bench/", 1)[1].rsplit("/metadata/", 1)[0]
+        for k in _rig.s3_list(base + "/metadata/apitap-runs/"):
+            _rig.s3_delete(k)
+            print(f"   swept a crashed run's marker: {k}")
     req = urllib.request.Request(CATALOG_URL + "?purgeRequested=true", method="DELETE")
     try:
         urllib.request.urlopen(req)
