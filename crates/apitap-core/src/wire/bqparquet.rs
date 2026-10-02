@@ -41,8 +41,13 @@ pub(crate) const FRAME_BUF: usize = 1 << 20;
 /// and the writer properties here do not override them.
 pub(crate) const PAGE_TRANSIENT: usize = 2 << 20;
 /// Builders during one row group (≤ 1 rg + one row) plus compressed pages
-/// landing in `out` before the part ships (≤ 1 rg).
-pub(crate) const PER_ROW_GROUP: u64 = 2;
+/// landing in `out` before the part ships (≤ 1 rg), priced with E1's measured
+/// margin: at 2 the fitted (2 MiB, rg4, 2 pipes) plan peaked 134 MB in a
+/// 128 MB cage (model 126), so a capped tier got a pipe the row group's own
+/// transient could not afford. 3 sends the 128 MiB cell to its measured-safe
+/// one-pipe plan (75 MB peak). E1's failure text names this knob: raise it and
+/// re-derive T2/T3.
+pub(crate) const PER_ROW_GROUP: u64 = 3;
 /// `push` copies the input into `buf` while the worker's own `Vec<u8>` argument
 /// stays alive until `send` returns.
 pub(crate) const LOADER_CHUNKS: u64 = 2;
@@ -50,7 +55,6 @@ pub(crate) const LOADER_CHUNKS: u64 = 2;
 /// A row-group size the planner can choose. There is no integer constructor:
 /// every value is a rung the planner priced, or the CDC window size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // the planner's fit() constructs the lower rungs.
 pub(crate) enum RowGroup {
     Mib24,
     Mib8,
@@ -64,7 +68,6 @@ impl RowGroup {
     /// cores and 2 merge pipes fit 256 MiB/0.5 CPU. 4 MiB (floor) lets 2 pipes
     /// fit 128 MiB (2×43+40 = 126). Below 4 MiB, per-row-group metadata and
     /// page count start to cost readers.
-    #[allow(dead_code)] // the planner's PipeCost::rungs() walks it.
     pub(crate) const LADDER: [RowGroup; 3] = [RowGroup::Mib24, RowGroup::Mib8, RowGroup::Mib4];
 
     pub(crate) const fn bytes(self) -> usize {

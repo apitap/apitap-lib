@@ -581,6 +581,8 @@ pub(crate) struct S3Sink {
     run: crate::naming::RunId,
     names: Arc<Vec<String>>,
     delivered: Arc<Vec<Delivered>>,
+    /// The planner's rung for this run's parquet row groups.
+    row_group: RowGroup,
     next_part: Arc<AtomicU64>,
     /// This run's announcement, held for the whole run: a run's segment comes
     /// into existence only with its first part, so a lock dropped early would
@@ -760,7 +762,7 @@ impl S3Sink {
     pub(crate) fn bind(
         conn: S3Conn,
         dest_table: &str,
-        _parallel: usize,
+        shape: crate::pipeline::PipeShape,
         run: &crate::naming::RunId,
     ) -> Result<Self> {
         let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
@@ -792,6 +794,7 @@ impl S3Sink {
             run: run.clone(),
             names: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
+            row_group: shape.row_group,
             next_part: Arc::new(AtomicU64::new(0)),
             announced: std::sync::Mutex::new(None),
         })
@@ -877,7 +880,7 @@ impl crate::sink::Sink for S3Sink {
                 self.names.as_ref().clone(),
                 self.delivered.as_ref().clone(),
                 None,
-                RowGroup::Mib24,
+                self.row_group,
             )?,
             rows: 0,
         })

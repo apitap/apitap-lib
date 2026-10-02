@@ -1782,6 +1782,8 @@ pub(crate) struct BqSink {
     loader_seq: std::sync::atomic::AtomicUsize,
     names: Vec<String>,
     parquet_lane: bool,
+    /// The planner's rung for this run's parquet row groups (CSV ignores it).
+    row_group: RowGroup,
     /// Lane preference, decided at connect from the pipe count: Parquet's
     /// typed builders cost more CPU per row but upload less and parse fastest
     /// server-side — it wins from ~4 pipes up; the CSV lane wins on starved
@@ -1802,10 +1804,10 @@ impl BqSink {
     pub(crate) async fn connect(
         url: &str,
         dest_table: &str,
-        parallel: usize,
+        shape: crate::pipeline::PipeShape,
         run: &crate::naming::RunId,
     ) -> Result<Self> {
-        Self::bind(BqConn::parse(url).await?, dest_table, parallel, run)
+        Self::bind(BqConn::parse(url).await?, dest_table, shape, run)
     }
 
     /// Bind one destination table onto an existing connection — a multi-table run
@@ -1814,14 +1816,14 @@ impl BqSink {
     pub(crate) fn bind(
         conn: BqConn,
         dest_table: &str,
-        parallel: usize,
+        shape: crate::pipeline::PipeShape,
         run: &crate::naming::RunId,
     ) -> Result<Self> {
         // The bulk sink builds its DDL and its cursor probe as text too — the
         // CDC lane's vetting never covered it, so a table name with a backtick
         // in it reached BigQuery raw from here.
         bq_ident("table", dest_table)?;
-        let lane_order = if parallel >= 4 {
+        let lane_order = if shape.pipes >= 4 {
             [WireFormat::PgCopyBinary, WireFormat::TabSeparated]
         } else {
             [WireFormat::TabSeparated, WireFormat::PgCopyBinary]
@@ -1862,6 +1864,7 @@ impl BqSink {
             loader_seq: std::sync::atomic::AtomicUsize::new(0),
             names: Vec::new(),
             parquet_lane: false,
+            row_group: shape.row_group,
             lane_order,
             delivered: Arc::new(Vec::new()),
             source_id: None,
@@ -2544,7 +2547,7 @@ impl crate::sink::Sink for BqSink {
             !self.parquet_lane && self.names.len() == 1,
             self.cursor_track,
             self.staged_wm.clone(),
-            RowGroup::Mib24,
+            self.row_group,
         )
     }
 

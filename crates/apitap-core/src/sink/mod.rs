@@ -281,12 +281,12 @@ mod tests {
         };
         let parquet = PipeResidency {
             fixed: 11 << 20,
-            per_row_group: 2,
+            per_row_group: 3,
             chunks: 2,
         };
         let merge = PipeResidency {
             fixed: 21 << 20,
-            per_row_group: 2,
+            per_row_group: 3,
             chunks: 2,
         };
         assert_eq!(PipeResidency::STREAMING, streaming);

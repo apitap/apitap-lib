@@ -207,6 +207,11 @@ LEGS = [
         proves={"bq.job-identity": ("bq",), "leg.e2e_changelog_bq": (_claims.LEG_ENGINE,)}),
     leg("e2e_changelog_group.py",  "changelog partition/order overrides", {"bq"}),
     leg("e2e_changelog_percolumn.py", "per-column changelog config", {"bq"}),
+
+    leg("e2e_parquet_capped.py",   "parquet pipes fit the cage they are planned into",
+        {"iceberg", "cores>=4"},
+        proves={"memory.parquet-fits-cage": ("s3",),
+                "leg.e2e_parquet_capped": (_claims.LEG_ENGINE,)}),
 ]
 
 

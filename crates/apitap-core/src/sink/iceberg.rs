@@ -651,6 +651,8 @@ pub(crate) struct IcebergSink {
     key_prefix: String,
     names: Arc<Vec<String>>,
     delivered: Arc<Vec<Delivered>>,
+    /// The planner's rung for this run's parquet row groups.
+    row_group: RowGroup,
     field_ids: Arc<Vec<i32>>,
     cursor: Option<(usize, bool)>,
     /// Merge only: (column index, table field id).
@@ -664,7 +666,7 @@ impl IcebergSink {
     pub(crate) fn bind(
         conn: IcebergConn,
         dest_table: &str,
-        _parallel: usize,
+        shape: crate::pipeline::PipeShape,
         run: &crate::naming::RunId,
     ) -> Result<Self> {
         let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
@@ -680,6 +682,7 @@ impl IcebergSink {
             key_prefix: String::new(),
             names: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
+            row_group: shape.row_group,
             field_ids: Arc::new(Vec::new()),
             cursor: None,
             merge_key: None,
@@ -1090,7 +1093,7 @@ impl crate::sink::Sink for IcebergSink {
             self.cursor,
             Some(self.field_ids.as_ref().clone()),
             self.merge_key.map(|(i, _)| i),
-            RowGroup::Mib24,
+            self.row_group,
         )?;
         Ok(IcebergLoader {
             s3,

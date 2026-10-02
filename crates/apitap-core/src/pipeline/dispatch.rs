@@ -8,7 +8,7 @@
 //! `one::<S, D>` / `many::<S, D>` at compile time — no dynamic dispatch anywhere
 //! on the hot path, and per-route perf character lives in the [`Profile`] column.
 
-use super::{norm, Profile};
+use super::{norm, PipeShape, Profile};
 use crate::error::{Error, Result};
 use crate::sink::bigquery::{BqConn, BqSink};
 use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
@@ -103,8 +103,10 @@ struct SinkCfg {
     pg_overlap: bool,
     /// ClickHouse only: engine/order_by/on_cluster DDL options.
     ch_ddl: ChDdl,
-    /// BigQuery only: the run's pipe budget (staging-table load fan-out).
-    budget: usize,
+    /// The planner's fitted shape: parquet sinks read `row_group`, pooled sinks
+    /// read `pipes` (the loader budget). One plan per run, so every table of a
+    /// run is priced by the same sink type and mode.
+    shape: PipeShape,
     /// This run's identity, carried into every scratch object it creates.
     ///
     /// Minted once per dispatch and shared by every table in the run: two
@@ -225,9 +227,8 @@ trait DstScheme {
     /// True where the sink drops schema qualifiers (`a.events` → `events`), so
     /// multi-table pre-flight can refuse silent overwrites up front.
     const BARE_DEST: bool;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg)
-        -> Result<Self::Sink>;
-    async fn shared(url: &str, budget: usize, cfg: &SinkCfg) -> Result<Self::Shared>;
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<Self::Sink>;
+    async fn shared(url: &str, cfg: &SinkCfg) -> Result<Self::Shared>;
     fn bind(shared: Self::Shared, table: &str, cfg: &SinkCfg) -> Result<Self::Sink>;
 }
 
@@ -236,14 +237,14 @@ impl DstScheme for PgTo {
     type Sink = PgSink;
     type Shared = sqlx::PgPool;
     const BARE_DEST: bool = false;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<PgSink> {
-        PgSink::connect(url, dest_table, parallel + 1, cfg.pg_overlap, &cfg.run).await
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<PgSink> {
+        PgSink::connect(url, dest_table, cfg.shape.pipes + 1, cfg.pg_overlap, &cfg.run).await
     }
-    async fn shared(url: &str, budget: usize, _cfg: &SinkCfg) -> Result<sqlx::PgPool> {
+    async fn shared(url: &str, cfg: &SinkCfg) -> Result<sqlx::PgPool> {
         // +8 headroom over the budget: pipes take most connections, the extra
         // covers the short-lived control work (probe/DDL/finalize) of tables
         // waiting in flight.
-        PgSink::shared_pool(url, budget + 8).await
+        PgSink::shared_pool(url, cfg.shape.pipes + 8).await
     }
     fn bind(shared: sqlx::PgPool, table: &str, cfg: &SinkCfg) -> Result<PgSink> {
         Ok(PgSink::bind(shared, table, cfg.pg_overlap, &cfg.run))
@@ -254,10 +255,10 @@ impl DstScheme for ChTo {
     type Sink = ChSink;
     type Shared = ChConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, _parallel: usize, cfg: &SinkCfg) -> Result<ChSink> {
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<ChSink> {
         ChSink::connect(url, dest_table, cfg.ch_ddl.clone(), &cfg.run)
     }
-    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<ChConn> {
+    async fn shared(url: &str, _cfg: &SinkCfg) -> Result<ChConn> {
         // Parse once: the reqwest client inside ChConn is shared by every table.
         ChConn::parse(url)
     }
@@ -270,10 +271,10 @@ impl DstScheme for MyTo {
     type Sink = MySqlSink;
     type Shared = crate::sink::mysql::MySqlShared;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, _parallel: usize, cfg: &SinkCfg) -> Result<MySqlSink> {
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<MySqlSink> {
         MySqlSink::connect(url, dest_table, &cfg.run).await
     }
-    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<Self::Shared> {
+    async fn shared(url: &str, _cfg: &SinkCfg) -> Result<Self::Shared> {
         MySqlSink::shared_pool(url)
     }
     fn bind(shared: Self::Shared, table: &str, cfg: &SinkCfg) -> Result<MySqlSink> {
@@ -285,15 +286,15 @@ impl DstScheme for GcsTo {
     type Sink = GcsSink;
     type Shared = GcsConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<GcsSink> {
-        GcsSink::bind(GcsConn::parse(url).await?, dest_table, parallel, &cfg.run)
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<GcsSink> {
+        GcsSink::bind(GcsConn::parse(url).await?, dest_table, cfg.shape, &cfg.run)
     }
-    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<GcsConn> {
+    async fn shared(url: &str, _cfg: &SinkCfg) -> Result<GcsConn> {
         // Authenticate once — the token and client are shared by every table.
         GcsConn::parse(url).await
     }
     fn bind(shared: GcsConn, table: &str, cfg: &SinkCfg) -> Result<GcsSink> {
-        GcsSink::bind(shared, table, cfg.budget, &cfg.run)
+        GcsSink::bind(shared, table, cfg.shape, &cfg.run)
     }
 }
 struct S3To;
@@ -301,14 +302,14 @@ impl DstScheme for S3To {
     type Sink = S3Sink;
     type Shared = S3Conn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<S3Sink> {
-        S3Sink::bind(S3Conn::parse(url).await?, dest_table, parallel, &cfg.run)
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<S3Sink> {
+        S3Sink::bind(S3Conn::parse(url).await?, dest_table, cfg.shape, &cfg.run)
     }
-    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<S3Conn> {
+    async fn shared(url: &str, _cfg: &SinkCfg) -> Result<S3Conn> {
         S3Conn::parse(url).await
     }
     fn bind(shared: S3Conn, table: &str, cfg: &SinkCfg) -> Result<S3Sink> {
-        S3Sink::bind(shared, table, cfg.budget, &cfg.run)
+        S3Sink::bind(shared, table, cfg.shape, &cfg.run)
     }
 }
 struct IceTo;
@@ -316,14 +317,14 @@ impl DstScheme for IceTo {
     type Sink = IcebergSink;
     type Shared = IcebergConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<IcebergSink> {
-        IcebergSink::bind(IcebergConn::parse(url).await?, dest_table, parallel, &cfg.run)
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<IcebergSink> {
+        IcebergSink::bind(IcebergConn::parse(url).await?, dest_table, cfg.shape, &cfg.run)
     }
-    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<IcebergConn> {
+    async fn shared(url: &str, _cfg: &SinkCfg) -> Result<IcebergConn> {
         IcebergConn::parse(url).await
     }
     fn bind(shared: IcebergConn, table: &str, cfg: &SinkCfg) -> Result<IcebergSink> {
-        IcebergSink::bind(shared, table, cfg.budget, &cfg.run)
+        IcebergSink::bind(shared, table, cfg.shape, &cfg.run)
     }
 }
 struct BqTo;
@@ -331,10 +332,10 @@ impl DstScheme for BqTo {
     type Sink = BqSink;
     type Shared = BqConn;
     const BARE_DEST: bool = true;
-    async fn connect(url: &str, dest_table: &str, parallel: usize, cfg: &SinkCfg) -> Result<BqSink> {
-        BqSink::connect(url, dest_table, parallel, &cfg.run).await
+    async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<BqSink> {
+        BqSink::connect(url, dest_table, cfg.shape, &cfg.run).await
     }
-    async fn shared(url: &str, _budget: usize, _cfg: &SinkCfg) -> Result<BqConn> {
+    async fn shared(url: &str, _cfg: &SinkCfg) -> Result<BqConn> {
         // Authenticate once (JWT sign + OAuth round-trip live in parse) — a
         // 200-table schema must not hit the token endpoint 200 times.
         BqConn::parse(url).await
@@ -342,7 +343,7 @@ impl DstScheme for BqTo {
     fn bind(shared: BqConn, table: &str, cfg: &SinkCfg) -> Result<BqSink> {
         // BigQuery has no schema qualifiers — land `public.events` as `events`.
         let bare = table.rsplit_once('.').map_or(table, |(_, b)| b);
-        BqSink::bind(shared, bare, cfg.budget, &cfg.run)
+        BqSink::bind(shared, bare, cfg.shape, &cfg.run)
     }
 }
 
@@ -362,24 +363,42 @@ async fn one<S: SrcScheme, D: DstScheme>(
 ) -> Result<TransferReport> {
     let dest_table = opts.dest_table.as_deref().unwrap_or(table);
     let source_id = super::source_identity(src_url, table);
-    let (chunk, parallel) = super::knobs(opts, &profile)?;
+    let shape = super::knobs(
+        opts,
+        &profile,
+        <D::Sink as crate::sink::Sink>::pipe_residency(opts.mode),
+    )?;
     // One table can never use more pipes than the profile's per-table cap —
     // clamping HERE also sizes the connection pools honestly for single-stream
-    // sources (a 1-pipe github read must not open a 33-connection pool).
-    let parallel = parallel.min(profile.table_pipe_cap).max(1);
+    // sources (a 1-pipe github read must not open a 33-connection pool). The
+    // row group was fitted for the uncapped ask; for a single-stream route that
+    // is safe, not optimal (§2.D §8).
+    let shape = PipeShape {
+        pipes: shape.pipes.min(profile.table_pipe_cap).max(1),
+        ..shape
+    };
     let cfg = SinkCfg {
         pg_overlap,
         ch_ddl,
-        budget: parallel,
+        shape,
         run: match parent {
             Some(p) => mint_run_within(opts.mode, src_url, p)?,
             None => mint_run(opts.mode, src_url)?,
         },
     };
-    let src = S::connect(src_url, parallel + 1).await?;
-    let sink = D::connect(dst_url, dest_table, parallel, &cfg).await?;
+    let src = S::connect(src_url, shape.pipes + 1).await?;
+    let sink = D::connect(dst_url, dest_table, &cfg).await?;
     super::run(
-        &src, sink, table, opts, &profile, chunk, parallel, exact(parallel), started, &source_id,
+        &src,
+        sink,
+        table,
+        opts,
+        &profile,
+        shape.chunk,
+        shape.pipes,
+        exact(shape.pipes),
+        started,
+        &source_id,
     )
     .await
 }
@@ -396,21 +415,26 @@ async fn many<S: SrcScheme, D: DstScheme>(
     opts: &TransferOptions,
     ch_ddl: ChDdl,
 ) -> Result<(usize, Vec<crate::TableResult>)> {
-    let (chunk, budget) = super::knobs(opts, &profile)?;
+    let shape = super::knobs(
+        opts,
+        &profile,
+        <D::Sink as crate::sink::Sink>::pipe_residency(opts.mode),
+    )?;
+    let budget = shape.pipes;
     let cfg = SinkCfg {
         pg_overlap,
         ch_ddl,
-        budget,
+        shape,
         run: mint_run(opts.mode, src_url)?,
     };
     let src = S::connect(src_url, budget + 8).await?;
     let jobs = jobs_for(&src, &sel, D::BARE_DEST).await?;
-    let shared = D::shared(dst_url, budget, &cfg).await?;
+    let shared = D::shared(dst_url, &cfg).await?;
     let mk = |t: String| {
         let (shared, cfg) = (shared.clone(), cfg.clone());
         async move { D::bind(shared, &t, &cfg) }
     };
-    let r = super::run_many(&src, jobs, opts, &profile, chunk, budget, src_url, mk).await?;
+    let r = super::run_many(&src, jobs, opts, &profile, shape.chunk, budget, src_url, mk).await?;
     Ok((budget, r))
 }
 

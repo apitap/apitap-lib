@@ -14,9 +14,10 @@ pub(crate) mod dispatch;
 
 use crate::error::{Error, Result};
 use crate::plan::{Delta, WireFormat};
-use crate::{Mode, TableResult, TransferOptions, TransferReport};
-use crate::sink::Sink;
+use crate::sink::{PipeResidency, Sink};
 use crate::source::Source;
+use crate::wire::bqparquet::RowGroup;
+use crate::{Mode, TableResult, TransferOptions, TransferReport};
 use std::future::Future;
 
 
@@ -242,29 +243,207 @@ fn smallest_limit_up(
     best
 }
 
-/// Cap an AUTO-derived pipe count by the memory budget: each pipe holds a few
-/// `chunk`-sized buffers in flight (encode buffer, channel slots, HTTP/COPY write
-/// buffers), plus fixed process overhead. Budgets are MEASURED, not guessed —
-/// whole-container cgroup `memory.peak` on the 100 GB pg→ch ladder
+/// The whole-process reserve every lane keeps before pipes are paid for.
+pub(crate) const RESERVE: u64 = 40 << 20;
+/// The measured chunk-scale whole-pipe term of the pg→ch ladder: encode
+/// buffers, channel slots, HTTP/COPY write buffers. Budgets are MEASURED, not
+/// guessed — whole-container cgroup `memory.peak` on the 100 GB pg→ch ladder
 /// (benchmarks/profiling.md): 1 pipe 44.1 MB, 2 pipes 72.4 MB, 3 pipes 113.6 MB,
 /// 5 pipes 170.8 MB → ~29-32 MB marginal per pipe at the 4 MiB default chunk,
-/// ~40 MB base. 10× chunk per pipe + 40 MiB reserve covers the worst measured
-/// cell with ≥25% headroom: a 128 MB cap now auto-runs 2 pipes (measured peak
-/// 72.4 MB — the old 96 MiB reserve forced 1 pipe and doubled the wall time),
-/// 256 MB still picks the proven 5, and 44-80 MB caps stay at 1. An EXPLICIT
-/// `parallel` from the caller is never overridden.
-pub(crate) fn mem_capped_parallel(requested: usize, chunk: usize) -> usize {
-    match mem_limit_bytes() {
-        Some(mem) => mem_capped(requested, chunk, mem),
-        None => requested,
+/// ~40 MB base. 10× chunk per pipe + the reserve covers the worst measured cell
+/// with ≥25% headroom: a 128 MB cap auto-runs 2 pipes (measured peak 72.4 MB —
+/// the old 96 MiB reserve forced 1 pipe and doubled the wall time), 256 MB still
+/// picks the proven 5, and 44-80 MB caps stay at 1.
+pub(crate) const PIPE_CHUNKS: u64 = 10;
+/// The 0.56.0 default chunk; memory-starved auto runs can thin to [`THIN_CHUNK`]
+/// because pipes are worth more than buffer depth — measured (10M pg→ch): a
+/// 128 MB cap runs 2×4 MiB in 30.7 s vs 4×2 MiB in 24.4 s; an 80 MB cap 1×4 MiB
+/// in 57.4 s vs 2×2 MiB in 31.3 s, peaks ≤61% of the cap. Routes whose CPU ask
+/// is already satisfied never take this path, so big boxes keep the deeper
+/// buffers.
+const DEFAULT_CHUNK: usize = 4 << 20;
+const THIN_CHUNK: usize = 2 << 20;
+
+/// The Arrow read lane's swept calibration, moved here verbatim from
+/// read_impl.rs; the read path hands [`fit`] this price instead of the transfer
+/// model's. RE-CALIBRATED 2026-08-08: the previous model (40 MB reserve,
+/// 36 MB/pipe → 6 pipes at 256 MB) was fitted against an engine that no longer
+/// exists: it recorded 6 pipes peaking at 211 MB, and the same 6 pipes now peak
+/// at 133 MB. Buffer recycling and the frame-native rows freed that headroom,
+/// and nothing ever spent it — so every tier was running short of pipes.
+///
+/// Re-swept on the 10M × 15-col read leg at 0.5 core, 2-3 interleaved rounds per
+/// point, peak RSS from cgroup memory.peak:
+///   256 MB:  2 → 38.6s/92MB   4 → 23.3s/107MB  6 → 13.5s/133MB
+///            8 → 12.4s/190MB 12 → 12.4s/222MB 16 → 12.7s/252MB
+///   128 MB:  2 → 37.5s/59MB   3 → 24.2s/68MB   4 → 22.9s/72MB
+///            5 → 15.3s/85MB   6 → 13.4s/106MB
+///    64 MB:  1 → 48.1s/31MB   2 → 41.2s/44MB
+/// 16 MB reserve + 22 MB/pipe lands on 8 / 5 / 2 — each one measured, none
+/// peaking past 74% of its cage, and the reserve keeps a sub-60 MB budget on the
+/// single pipe the 44 MB floor needs. The cap stays at 8 because past the knee
+/// memory buys nothing: at 256 MB, 12 pipes is no faster than 8 and 16 is SLOWER
+/// at 99% of the cage.
+const READ_RESERVE: u64 = 16 << 20;
+const READ_PIPE: u64 = 22 << 20;
+pub(crate) const READ_PIPE_CAP: usize = 8;
+
+/// One price function for every lane: the reserve the whole process keeps, the
+/// pipeline's chunk-scale term per pipe, and what the sink's loader declares it
+/// holds on top ([`crate::sink::Sink::pipe_residency`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PipeCost {
+    pub reserve: u64,
+    pub pipe_chunks: u64,
+    pub residency: PipeResidency,
+}
+
+impl PipeCost {
+    pub(crate) const fn transfer(r: PipeResidency) -> Self {
+        Self {
+            reserve: RESERVE,
+            pipe_chunks: PIPE_CHUNKS,
+            residency: r,
+        }
+    }
+    pub(crate) const READ: Self = Self {
+        reserve: READ_RESERVE,
+        pipe_chunks: 0,
+        residency: PipeResidency {
+            fixed: READ_PIPE,
+            per_row_group: 0,
+            chunks: 0,
+        },
+    };
+    pub(crate) fn pipe_bytes(&self, chunk: usize, rg: RowGroup) -> u64 {
+        let r = &self.residency;
+        (self.pipe_chunks + r.chunks) * chunk as u64 + r.fixed + r.per_row_group * rg.bytes() as u64
+    }
+    fn allowed(&self, chunk: usize, rg: RowGroup, mem: u64) -> u64 {
+        mem.saturating_sub(self.reserve) / self.pipe_bytes(chunk, rg).max(1)
+    }
+    /// The row-group ladder this lane may walk: the full one when the sink has a
+    /// row group to price, else only the top rung (so `fit`'s result is unique).
+    fn rungs(&self) -> &'static [RowGroup] {
+        if self.residency.per_row_group > 0 {
+            &RowGroup::LADDER
+        } else {
+            &RowGroup::LADDER[..1]
+        }
+    }
+    fn largest_rung(&self, chunk: usize, pipes: u64, mem: u64) -> Option<RowGroup> {
+        self.rungs()
+            .iter()
+            .copied()
+            .find(|&rg| self.allowed(chunk, rg, mem) >= pipes)
     }
 }
 
-fn mem_capped(requested: usize, chunk: usize, mem: u64) -> usize {
-    let reserve: u64 = 40 * 1024 * 1024;
-    let per_pipe = (chunk as u64) * 10;
-    let allowed = mem.saturating_sub(reserve) / per_pipe.max(1);
-    requested.min((allowed.max(1)) as usize)
+/// The planner's answer: the chunk and parquet row-group size one pipe gets, and
+/// how many pipes run. The parquet sinks read `row_group`; the pooled sinks read
+/// `pipes`; both were priced by the same [`PipeCost`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PipeShape {
+    pub chunk: usize,
+    pub row_group: RowGroup,
+    pub pipes: usize,
+}
+
+impl PipeShape {
+    pub(crate) fn model_peak(&self, cost: &PipeCost) -> u64 {
+        self.pipes as u64 * cost.pipe_bytes(self.chunk, self.row_group) + cost.reserve
+    }
+}
+
+/// Pure. Enumeration order is the tie-break: fat before thin, larger row group
+/// before smaller. A candidate replaces the best only on STRICTLY more pipes.
+/// That is 0.56.0's `thin > fat` and "big boxes keep the deeper buffers", and it
+/// makes the row group irrelevant for STREAMING. Scores are clamped to ≥1
+/// exactly like 0.56.0's `allowed.max(1)`. One pipe always runs, with the fat
+/// chunk (measured at 44-80 MB, profiling.md), and its row group is the largest
+/// rung one fat pipe fits, else the floor.
+pub(crate) fn fit(
+    ask: usize,
+    pinned: Option<usize>,
+    mem: Option<u64>,
+    cost: &PipeCost,
+) -> PipeShape {
+    let ask = ask.max(1) as u64;
+    let fat = pinned.unwrap_or(DEFAULT_CHUNK);
+    let only = [fat];
+    let both = [DEFAULT_CHUNK, THIN_CHUNK];
+    let chunks: &[usize] = if pinned.is_some() { &only } else { &both };
+    let rungs = cost.rungs();
+    let Some(mem) = mem else {
+        return PipeShape {
+            chunk: fat,
+            row_group: rungs[0],
+            pipes: ask as usize,
+        };
+    };
+    let mut best = (0u64, fat, rungs[0]);
+    for &c in chunks {
+        for &rg in rungs {
+            let s = cost.allowed(c, rg, mem).min(ask).max(1);
+            if s > best.0 {
+                best = (s, c, rg);
+            }
+        }
+    }
+    if best.0 <= 1 {
+        // The documented one-pipe floor: the fat chunk and the largest rung one
+        // fat pipe fits (else the smallest rung). A cage below one pipe's price
+        // runs above the model — the pre-0.57 behaviour, stated in §8.
+        let rg = cost
+            .largest_rung(fat, 1, mem)
+            .unwrap_or(*rungs.last().expect("ladder"));
+        return PipeShape {
+            chunk: fat,
+            row_group: rg,
+            pipes: 1,
+        };
+    }
+    PipeShape {
+        chunk: best.1,
+        row_group: best.2,
+        pipes: best.0 as usize,
+    }
+}
+
+/// An EXPLICIT parallel is never overridden. Its row group is the largest rung
+/// whose p pipes fit, else the floor. A note is printed only when the engine
+/// chose a smaller row group, i.e. never on a STREAMING route.
+fn explicit(p: usize, pinned: Option<usize>, mem: Option<u64>, cost: &PipeCost) -> PipeShape {
+    let chunk = pinned.unwrap_or(DEFAULT_CHUNK);
+    let rungs = cost.rungs();
+    let row_group = match mem {
+        None => rungs[0],
+        Some(m) => cost
+            .largest_rung(chunk, p as u64, m)
+            .unwrap_or(*rungs.last().expect("ladder")),
+    };
+    if row_group != rungs[0] {
+        let m = mem.expect("smaller rung implies a limit");
+        if cost.allowed(chunk, row_group, m) >= p as u64 {
+            crate::progress::note(&format!(
+                "parallel={p}: parquet row groups sized to {} MiB so {p} pipes fit the {} MiB memory limit",
+                row_group.bytes() >> 20,
+                m >> 20
+            ));
+        } else {
+            crate::progress::note(&format!(
+                "parallel={p} is more than this destination's memory model fits in {} MiB ({} pipes); running {p} as asked with {} MiB row groups",
+                m >> 20,
+                fit(p, pinned, mem, cost).pipes,
+                row_group.bytes() >> 20
+            ));
+        }
+    }
+    PipeShape {
+        chunk,
+        row_group,
+        pipes: p,
+    }
 }
 
 /// Per-route tuning that is legitimately different between routes (measured, not
@@ -281,34 +460,38 @@ pub(crate) struct Profile {
     pub table_pipe_cap: usize,
 }
 
-/// Resolve the knobs every route shares. An explicit `parallel` is never overridden;
-/// the auto value is capped by the cgroup memory budget (a 256 MB container at the
-/// CPU-derived pipe count was OOM-killed before this).
-pub(crate) fn knobs(opts: &TransferOptions, profile: &Profile) -> Result<(usize, usize)> {
+/// Resolve the knobs every route shares. An explicit `parallel` is never
+/// overridden; the auto value is fitted to the cgroup budget with what the
+/// destination holds per pipe priced in — a 256 MB container at the CPU-derived
+/// pipe count was OOM-killed before this, and four parquet pipes were invisible
+/// to the old price (0.56.0 audit §3.15).
+pub(crate) fn knobs(
+    opts: &TransferOptions,
+    profile: &Profile,
+    residency: PipeResidency,
+) -> Result<PipeShape> {
     if opts.parallel == Some(0) {
         return Err(Error::InvalidInput("parallel must be at least 1".into()));
     }
-    const DEFAULT_CHUNK: usize = 4 * 1024 * 1024;
     let pinned = opts.chunk_bytes.map(|c| c.max(64 * 1024));
-    let chunk = pinned.unwrap_or(DEFAULT_CHUNK);
-    if let Some(p) = opts.parallel {
-        return Ok((chunk, p));
+    let (cost, mem) = (PipeCost::transfer(residency), mem_limit_bytes());
+    let shape = match opts.parallel {
+        Some(p) => explicit(p, pinned, mem, &cost),
+        None => fit((profile.auto_parallel)(num_cpus::get()), pinned, mem, &cost),
+    };
+    // APITAP_DEBUG already exists (lease.rs); the leg records this line as a
+    // server-side fact about the plan.
+    if std::env::var_os("APITAP_DEBUG").is_some() {
+        eprintln!(
+            "[plan] chunk={}KiB row_group={}MiB pipes={} model_peak={}MiB mem_limit={}",
+            shape.chunk >> 10,
+            shape.row_group.bytes() >> 20,
+            shape.pipes,
+            shape.model_peak(&cost) >> 20,
+            mem.map_or("none".into(), |m| format!("{}MiB", m >> 20))
+        );
     }
-    let ask = (profile.auto_parallel)(num_cpus::get());
-    let fat = mem_capped_parallel(ask, chunk);
-    // Memory-starved with an un-pinned chunk: thinner chunks buy pipes, and pipes
-    // are worth more than buffer depth — measured (10M pg→ch): a 128 MB cap runs
-    // 2×4 MiB in 30.7 s vs 4×2 MiB in 24.4 s; an 80 MB cap 1×4 MiB in 57.4 s vs
-    // 2×2 MiB in 31.3 s, peaks ≤61% of the cap. Routes whose CPU ask is already
-    // satisfied never take this path, so big boxes keep the deeper 4 MiB buffers.
-    if pinned.is_none() && fat < ask {
-        const THIN_CHUNK: usize = 2 * 1024 * 1024;
-        let thin = mem_capped_parallel(ask, THIN_CHUNK);
-        if thin > fat {
-            return Ok((THIN_CHUNK, thin));
-        }
-    }
-    Ok((chunk, fat))
+    Ok(shape)
 }
 
 /// The whole transfer, once: probe → negotiate → stage → fan out → count → swap.
@@ -590,7 +773,7 @@ impl<'a> Grant<'a> {
 
 /// Many tables through ONE pipe budget. The budget is the same number a
 /// single-table run gets (CPU heuristic capped by the cgroup memory model), so
-/// peak memory is the single-table ceiling — `budget × ~8×chunk + reserve` —
+/// peak memory is the single-table ceiling — `budget × pipe_bytes + reserve` —
 /// no matter how many tables are in flight.
 ///
 /// Scheduling: largest-first (LPT). Each table atomically acquires its desired
@@ -698,6 +881,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::bqparquet::parquet_residency;
 
     /// The nested-cgroup case this walker exists for: a container that says
     /// 8 GB, inside a slice capped at 512 MB. The kernel enforces the 512 MB,
@@ -741,21 +925,298 @@ mod tests {
     /// Locks the memory→pipes budget to the MEASURED 100 GB ladder
     /// (benchmarks/profiling.md): peaks were 44.1 MB @1 pipe, 72.4 @2, 113.6 @3,
     /// 170.8 @5 — every cell this table allows ran with ≥25% headroom, and the
-    /// one cell that OOM'd (2 pipes in 64 MB) stays disallowed.
+    /// one cell that OOM'd (2 pipes in 64 MB) stays disallowed. The oracle grid
+    /// then proves `fit`'s STREAMING plan is 0.56.0's plan, cell for cell (I2).
+    ///
+    /// RED controls: `s > best.0` → `>=` makes (256 MiB, ask 2) take the thin
+    /// chunk and the grid fails; `best.0 <= 1` → `< 1` returns that thin chunk
+    /// on the 64 MiB cell instead of the fat one; `PIPE_CHUNKS = 8` makes the
+    /// 256 MiB fat ladder cell read 6.
     #[test]
     fn mem_budget_matches_the_measured_ladder() {
         const MB: u64 = 1024 * 1024;
-        let chunk = 4 * 1024 * 1024; // default chunk_bytes
-        let ask = 32; // CPU-derived ask far above every cap below
-        assert_eq!(mem_capped(ask, chunk, 44 * MB), 1);
-        assert_eq!(mem_capped(ask, chunk, 64 * MB), 1); // 2 pipes OOM'd here
-        assert_eq!(mem_capped(ask, chunk, 80 * MB), 1); // 2 fits but at 90% — too tight for auto
-        assert_eq!(mem_capped(ask, chunk, 128 * MB), 2); // measured 72.4 MB peak
-        assert_eq!(mem_capped(ask, chunk, 256 * MB), 5); // measured 170.8 MB peak
-        // Big boxes: memory stops being the governor, CPU ask passes through.
-        assert_eq!(mem_capped(5, chunk, 4096 * MB), 5);
-        // Smaller chunks buy more pipes in the same cap (the "thin pipes" lever).
-        assert!(mem_capped(ask, 2 * 1024 * 1024, 128 * MB) > 2);
+        let c = PipeCost::transfer(PipeResidency::STREAMING);
+        // Fat-only ladder: the measured cells, through the same `allowed` the
+        // planner scores with.
+        for (mem, want) in [(44u64, 1), (64, 1), (80, 1), (128, 2), (256, 5)] {
+            assert_eq!(
+                c.allowed(DEFAULT_CHUNK, RowGroup::Mib24, mem * MB)
+                    .max(1)
+                    .min(32),
+                want,
+                "{mem} MiB"
+            );
+        }
+        // Big boxes: memory stops being the governor, the CPU ask passes through.
+        assert_eq!(fit(5, None, Some(4096 * MB), &c).pipes, 5);
+        // The thin-chunk lever, and the clamp that keeps the 64 MiB cell on the
+        // fat chunk (the design's scoring bug fix).
+        assert_eq!(
+            fit(32, None, Some(128 * MB), &c),
+            PipeShape {
+                chunk: 2 << 20,
+                row_group: RowGroup::Mib24,
+                pipes: 4
+            }
+        );
+        assert_eq!(
+            fit(32, None, Some(256 * MB), &c),
+            PipeShape {
+                chunk: 2 << 20,
+                row_group: RowGroup::Mib24,
+                pipes: 10
+            }
+        );
+        for mem in [16u64, 44, 64, 80, 100, 128, 200, 256, 512, 1024, 4096] {
+            for ask in [1usize, 2, 4, 5, 8, 16, 32] {
+                for pinned in [None, Some(64 << 10), Some(1 << 20), Some(8 << 20)] {
+                    let got = fit(ask, pinned, Some(mem * MB), &c);
+                    let (chunk, pipes) = knobs_0_56(ask, pinned, mem * MB);
+                    assert_eq!(
+                        (got.chunk, got.pipes),
+                        (chunk, pipes),
+                        "mem={mem} ask={ask} pinned={pinned:?}"
+                    );
+                    assert_eq!(got.row_group, RowGroup::Mib24, "STREAMING has one rung");
+                }
+            }
+        }
+    }
+
+    /// 0.56.0's `knobs` + `mem_capped`, verbatim (pipeline/mod.rs:287-312 and
+    /// :263-268 at d45f932), as the oracle for STREAMING bit-identity (I2).
+    fn knobs_0_56(ask: usize, pinned: Option<usize>, mem: u64) -> (usize, usize) {
+        fn mem_capped_0_56(requested: usize, chunk: usize, mem: u64) -> usize {
+            let reserve: u64 = 40 * 1024 * 1024;
+            let per_pipe = (chunk as u64) * 10;
+            let allowed = mem.saturating_sub(reserve) / per_pipe.max(1);
+            requested.min((allowed.max(1)) as usize)
+        }
+        let chunk = pinned.unwrap_or(DEFAULT_CHUNK);
+        let fat = mem_capped_0_56(ask, chunk, mem);
+        if pinned.is_none() && fat < ask {
+            let thin = mem_capped_0_56(ask, THIN_CHUNK, mem);
+            if thin > fat {
+                return (THIN_CHUNK, thin);
+            }
+        }
+        (chunk, fat)
+    }
+
+    /// §3.15's cells: at 256 MiB/4 cores 0.56.0 planned 8 × 2 MiB × rg24 (≈264
+    /// MiB + chrome), at 128 MiB/2 cores 4 × 2 MiB × rg24 (≈172 MiB + chrome).
+    /// Every fitted cell's MODEL peak fits the cage, and the shapes are exact.
+    /// The 128 MiB cells are one pipe: E1 measured the 2-pipe rg4 plan E1's own
+    /// model at 126 MiB peaking 134 MB (OOM) in a 128 MB cage, so the row-group
+    /// multiplier is 3 (bqparquet.rs) and the 128 MiB tier takes its
+    /// measured-safe one-pipe plan (75 MB peak).
+    /// RED control: point `planned` at `knobs_0_56` with Mib24 — every cell then
+    /// rebuilds the 0.56.0 overcommit above.
+    #[test]
+    fn parquet_pipes_fit_the_cage_they_are_planned_into() {
+        const MB: u64 = 1024 * 1024;
+        let c = PipeCost::transfer(parquet_residency(false));
+        for (mem, ask, want) in [
+            (
+                128u64,
+                4usize,
+                PipeShape {
+                    chunk: 4 << 20,
+                    row_group: RowGroup::Mib8,
+                    pipes: 1,
+                },
+            ),
+            (
+                128,
+                2,
+                PipeShape {
+                    chunk: 4 << 20,
+                    row_group: RowGroup::Mib8,
+                    pipes: 1,
+                },
+            ),
+            (
+                256,
+                8,
+                PipeShape {
+                    chunk: 2 << 20,
+                    row_group: RowGroup::Mib4,
+                    pipes: 4,
+                },
+            ),
+            (
+                256,
+                4,
+                PipeShape {
+                    chunk: 2 << 20,
+                    row_group: RowGroup::Mib4,
+                    pipes: 4,
+                },
+            ),
+            (
+                256,
+                2,
+                PipeShape {
+                    chunk: 4 << 20,
+                    row_group: RowGroup::Mib8,
+                    pipes: 2,
+                },
+            ),
+            (
+                1024,
+                8,
+                PipeShape {
+                    chunk: 4 << 20,
+                    row_group: RowGroup::Mib8,
+                    pipes: 8,
+                },
+            ),
+        ] {
+            let s = planned(mem * MB, ask, &c);
+            assert_eq!(s, want, "mem={mem} ask={ask}");
+            assert!(
+                s.model_peak(&c) <= mem * MB,
+                "mem={mem} ask={ask}: model peak {} MiB > cage",
+                s.model_peak(&c) >> 20
+            );
+        }
+    }
+
+    fn planned(mem: u64, ask: usize, c: &PipeCost) -> PipeShape {
+        fit(ask, None, Some(mem), c)
+    }
+
+    /// I3: at the headline tier the merge companion is paid for by shrinking the
+    /// row group, so the two pipes survive; with E1's `PER_ROW_GROUP = 3` the
+    /// plain parquet route sits on the same 8 MiB rung. RED controls: Iceberg
+    /// declaring `parquet_residency(false)` for merge, or a one-rung ladder.
+    #[test]
+    fn iceberg_merge_keeps_two_pipes_at_the_headline_tier_by_shrinking_the_row_group() {
+        use crate::sink::{iceberg::IcebergSink, Sink};
+        const MB: u64 = 1024 * 1024;
+        let merge = PipeCost::transfer(IcebergSink::pipe_residency(Mode::Merge));
+        let plain = PipeCost::transfer(IcebergSink::pipe_residency(Mode::Replace));
+        assert_eq!(
+            fit(2, None, Some(256 * MB), &merge),
+            PipeShape {
+                chunk: 4 << 20,
+                row_group: RowGroup::Mib8,
+                pipes: 2
+            }
+        );
+        assert_eq!(
+            fit(2, None, Some(256 * MB), &plain),
+            PipeShape {
+                chunk: 4 << 20,
+                row_group: RowGroup::Mib8,
+                pipes: 2
+            }
+        );
+        assert_eq!(
+            fit(2, None, Some(128 * MB), &merge),
+            PipeShape {
+                chunk: 4 << 20,
+                row_group: RowGroup::Mib4,
+                pipes: 1
+            }
+        );
+    }
+
+    /// Every parquet sink keeps two pipes at the 0.5 CPU / 256 MiB headline
+    /// tier in replace mode (I3), on the 8 MiB rung E1's `PER_ROW_GROUP = 3`
+    /// prices. RED control: `PER_ROW_GROUP = 2` buys the 24 MiB rung back and
+    /// costs the measured 128 MiB cell; the brief's RED direction (3) is now
+    /// the shipped calibration, so the control is its inverse.
+    #[test]
+    fn every_parquet_sink_keeps_two_pipes_at_the_headline_tier() {
+        use crate::sink::{bigquery::BqSink, gcs::GcsSink, iceberg::IcebergSink, s3::S3Sink, Sink};
+        const MB: u64 = 1024 * 1024;
+        for (name, r, want_rg) in [
+            ("s3", S3Sink::pipe_residency(Mode::Replace), RowGroup::Mib8),
+            ("gcs", GcsSink::pipe_residency(Mode::Replace), RowGroup::Mib8),
+            ("bq", BqSink::pipe_residency(Mode::Replace), RowGroup::Mib8),
+            ("ice", IcebergSink::pipe_residency(Mode::Replace), RowGroup::Mib8),
+        ] {
+            assert_eq!(
+                fit(2, None, Some(256 * MB), &PipeCost::transfer(r)),
+                PipeShape {
+                    chunk: 4 << 20,
+                    row_group: want_rg,
+                    pipes: 2
+                },
+                "{name}"
+            );
+        }
+    }
+
+    /// I8: an explicit parallel is never overridden; the row group drops to a
+    /// rung that fits, or the floor, and the pipe count stands. STREAMING has no
+    /// smaller rung, so it never prints the note. RED control: route `explicit`
+    /// through `fit` → 8 pipes become 5.
+    #[test]
+    fn explicit_parallel_is_never_overridden() {
+        const MB: u64 = 1024 * 1024;
+        let c = PipeCost::transfer(parquet_residency(false));
+        assert_eq!(
+            explicit(8, None, Some(256 * MB), &c),
+            PipeShape {
+                chunk: 4 << 20,
+                row_group: RowGroup::Mib4,
+                pipes: 8
+            }
+        );
+        // Four pipes at the fat chunk fit no rung: the floor is used and the
+        // count stands. The model's own four-pipe answer for this cell is
+        // 2 MiB / Mib8.
+        assert_eq!(
+            explicit(4, None, Some(256 * MB), &c),
+            PipeShape {
+                chunk: 4 << 20,
+                row_group: RowGroup::Mib4,
+                pipes: 4
+            }
+        );
+        assert_eq!(
+            explicit(4, Some(2 << 20), Some(256 * MB), &c),
+            PipeShape {
+                chunk: 2 << 20,
+                row_group: RowGroup::Mib4,
+                pipes: 4
+            }
+        );
+        let s = PipeCost::transfer(PipeResidency::STREAMING);
+        assert_eq!(
+            explicit(16, None, Some(256 * MB), &s),
+            PipeShape {
+                chunk: 4 << 20,
+                row_group: RowGroup::Mib24,
+                pipes: 16
+            }
+        );
+    }
+
+    /// The read lane's swept calibration (read_impl.rs:130-153), through the
+    /// same `fit` as every other lane: 2/5/8 pipes at 64/128/256 MiB, one below
+    /// the 44 MB floor, capped at 8 past the knee. RED control: `READ_RESERVE =
+    /// 40 MiB` drops the 64 MiB cell to 1.
+    #[test]
+    fn read_pipes_match_the_swept_calibration() {
+        const MB: u64 = 1024 * 1024;
+        for (mem, want) in [
+            (64u64, 2usize),
+            (128, 5),
+            (256, 8),
+            (44, 1),
+            (16, 1),
+            (0, 1),
+            (1024, 8),
+        ] {
+            assert_eq!(
+                fit(READ_PIPE_CAP, Some(DEFAULT_CHUNK), Some(mem * MB), &PipeCost::READ).pipes,
+                want,
+                "{mem} MiB"
+            );
+        }
     }
 
     #[test]

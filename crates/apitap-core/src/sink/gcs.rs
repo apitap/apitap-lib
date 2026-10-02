@@ -469,6 +469,8 @@ pub(crate) struct GcsSink {
     run: crate::naming::RunId,
     names: Arc<Vec<String>>,
     delivered: Arc<Vec<Delivered>>,
+    /// The planner's rung for this run's parquet row groups (CSV ignores it).
+    row_group: RowGroup,
     next_part: Arc<AtomicU64>,
     /// This run's announcement, held for the whole run: a run's segment comes
     /// into existence only with its first part, so a lock dropped early would
@@ -542,12 +544,12 @@ impl GcsSink {
     pub(crate) fn bind(
         conn: GcsConn,
         dest_table: &str,
-        parallel: usize,
+        shape: crate::pipeline::PipeShape,
         run: &crate::naming::RunId,
     ) -> Result<Self> {
         // The CSV lane composes header + one part per pipe; GCS compose caps at
         // 32 sources. Refuse BEFORE uploading anything, not after.
-        if conn.format == GcsFormat::Csv && parallel + 1 > COMPOSE_MAX {
+        if conn.format == GcsFormat::Csv && shape.pipes + 1 > COMPOSE_MAX {
             return Err(Error::InvalidInput(format!(
                 "format=csv supports at most {} pipes (GCS composes header + one \
                  part per pipe, 32-object limit) — lower parallel or use \
@@ -583,6 +585,7 @@ impl GcsSink {
             run: run.clone(),
             names: Arc::new(Vec::new()),
             delivered: Arc::new(Vec::new()),
+            row_group: shape.row_group,
             next_part: Arc::new(AtomicU64::new(0)),
             announced: std::sync::Mutex::new(None),
         })
@@ -711,7 +714,7 @@ impl crate::sink::Sink for GcsSink {
                 self.names.as_ref().clone(),
                 self.delivered.as_ref().clone(),
                 None,
-                RowGroup::Mib24,
+                self.row_group,
             )?),
             GcsFormat::Csv => None,
         };

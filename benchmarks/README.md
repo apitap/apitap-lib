@@ -559,6 +559,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_changelog_bq --> `e2e_changelog_bq.py` | changelog=True on BigQuery |
 | <!-- claim: leg.e2e_changelog_group --> `e2e_changelog_group.py` | changelog partition/order overrides |
 | <!-- claim: leg.e2e_changelog_percolumn --> `e2e_changelog_percolumn.py` | per-column changelog config |
+| <!-- claim: leg.e2e_parquet_capped --> `e2e_parquet_capped.py` | parquet pipes fit the memory cage they are planned into |
 
 ## Multi-table on the tiny box — TPC-H, 10 × 1M rows, 256 MB / 0.5 CPU
 
