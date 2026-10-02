@@ -86,7 +86,6 @@ impl RowGroup {
 /// The only spelling of a parquet lane's per-pipe residency: the 8 MiB part
 /// buffer, a 1 MiB frame buffer and a 2 MiB page — plus one more part buffer
 /// and page for an Iceberg merge's companion key file.
-#[allow(dead_code)] // Sink::pipe_residency wires this in the next step.
 pub(crate) fn parquet_residency(key_companion: bool) -> PipeResidency {
     let companion = if key_companion {
         SEND_THRESHOLD + PAGE_TRANSIENT

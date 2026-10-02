@@ -33,6 +33,7 @@ const API: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD: &str = "https://storage.googleapis.com/upload/storage/v1";
 /// Resumable-chunk alignment GCS requires for every non-final chunk.
 const UPLOAD_ALIGN: usize = 256 * 1024;
+const _: () = assert!(SEND_THRESHOLD % UPLOAD_ALIGN == 0);
 /// GCS compose caps at 32 source objects (header + ≤31 parts; pipe profiles
 /// top out well under this).
 const COMPOSE_MAX: usize = 32;
@@ -621,6 +622,12 @@ impl crate::sink::Sink for GcsSink {
             GcsFormat::Csv => &[WireFormat::TabSeparated],
             GcsFormat::Parquet => &[WireFormat::PgCopyBinary],
         }
+    }
+
+    /// The worst of its two formats: the CSV lane holds ≤ SEND_THRESHOLD of
+    /// gzip plus chunk-scale `csv`, which the parquet price covers.
+    fn pipe_residency(_mode: Mode) -> crate::sink::PipeResidency {
+        crate::wire::bqparquet::parquet_residency(false)
     }
 
     async fn prepare(

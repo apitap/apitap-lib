@@ -821,6 +821,11 @@ impl crate::sink::Sink for S3Sink {
         &[WireFormat::PgCopyBinary]
     }
 
+    /// benchmarks/README.md:631 (pg→s3 at 4 MiB / rg24).
+    fn pipe_residency(_mode: Mode) -> crate::sink::PipeResidency {
+        crate::wire::bqparquet::parquet_residency(false)
+    }
+
     async fn prepare(
         &mut self,
         plan: &TablePlan,

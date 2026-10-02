@@ -34,7 +34,6 @@ pub(crate) struct PipeResidency {
 impl PipeResidency {
     /// The loader holds only chunk-scale buffers already inside the measured
     /// 10×chunk term.
-    #[allow(dead_code)] // Sink::pipe_residency wires this in the next step.
     pub const STREAMING: Self = Self {
         fixed: 0,
         per_row_group: 0,
@@ -137,6 +136,11 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// connection (BigQuery prefers Parquet when CPU is plentiful, CSV when
     /// starved — measured, not guessed).
     fn accepts(&self) -> &[WireFormat];
+    /// REQUIRED. A sink that says nothing is a sink the planner cannot see:
+    /// 0.56.0 planned four parquet pipes into 128 MiB as "4 × 20 MiB" while
+    /// each held ~85 MiB (audit §3.15). The `10 × chunk` term is the
+    /// pipeline's; this declares what the LOADER holds on top of it.
+    fn pipe_residency(mode: Mode) -> PipeResidency;
     /// Can this sink take `format` for THIS plan? Default yes; a sink whose
     /// fast lane can't represent some column (BigQuery's Parquet lane vs
     /// unconstrained NUMERIC, bytea, exotic udts) declines and negotiation
@@ -252,5 +256,51 @@ pub(crate) trait Sink: Sized + Send + Sync {
     /// operator needs to read.
     fn release_lock(&self) -> impl Future<Output = ()> + Send {
         async {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PipeResidency, Sink};
+    use crate::sink::{bigquery::BqSink, clickhouse::ChSink, gcs::GcsSink};
+    use crate::sink::{iceberg::IcebergSink, mysql::MySqlSink, postgres::PgSink, s3::S3Sink};
+    use crate::wire::bqparquet::parquet_residency;
+    use crate::Mode;
+
+    /// I7: every sink declares its loader's residency, pinned as NUMBERS so a
+    /// drift in `parquet_residency` or in one impl shows up here instead of a
+    /// cgroup OOM at 4 pipes. The STREAMING routes stay at zero: they are the
+    /// bit-identity fence with 0.56.0's plan.
+    #[test]
+    fn every_sink_declares_its_pipe_residency() {
+        use Mode::{Append, Merge, Replace};
+        let streaming = PipeResidency {
+            fixed: 0,
+            per_row_group: 0,
+            chunks: 0,
+        };
+        let parquet = PipeResidency {
+            fixed: 11 << 20,
+            per_row_group: 2,
+            chunks: 2,
+        };
+        let merge = PipeResidency {
+            fixed: 21 << 20,
+            per_row_group: 2,
+            chunks: 2,
+        };
+        assert_eq!(PipeResidency::STREAMING, streaming);
+        assert_eq!(parquet_residency(false), parquet);
+        assert_eq!(parquet_residency(true), merge);
+        for m in [Replace, Append, Merge] {
+            assert_eq!(PgSink::pipe_residency(m), streaming, "pg {m:?}");
+            assert_eq!(ChSink::pipe_residency(m), streaming, "ch {m:?}");
+            assert_eq!(MySqlSink::pipe_residency(m), streaming, "my {m:?}");
+            assert_eq!(S3Sink::pipe_residency(m), parquet, "s3 {m:?}");
+            assert_eq!(GcsSink::pipe_residency(m), parquet, "gcs {m:?}");
+            assert_eq!(BqSink::pipe_residency(m), parquet, "bq {m:?}");
+            let want = if m == Merge { merge } else { parquet };
+            assert_eq!(IcebergSink::pipe_residency(m), want, "ice {m:?}");
+        }
     }
 }

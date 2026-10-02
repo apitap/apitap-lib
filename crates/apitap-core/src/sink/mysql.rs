@@ -833,6 +833,11 @@ impl crate::sink::Sink for MySqlSink {
         &[WireFormat::MyTsv]
     }
 
+    /// profiling.md session 3: 303 MB @ 8 pipes / 1 GB.
+    fn pipe_residency(_mode: Mode) -> crate::sink::PipeResidency {
+        crate::sink::PipeResidency::STREAMING
+    }
+
     async fn prepare(
         &mut self,
         plan: &TablePlan,

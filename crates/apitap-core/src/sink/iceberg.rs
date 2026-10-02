@@ -935,6 +935,11 @@ impl crate::sink::Sink for IcebergSink {
         &[WireFormat::PgCopyBinary]
     }
 
+    /// Merge's companion key file adds one more part buffer plus its page.
+    fn pipe_residency(mode: Mode) -> crate::sink::PipeResidency {
+        crate::wire::bqparquet::parquet_residency(mode == Mode::Merge)
+    }
+
     async fn dest_state(
         &mut self,
         plan: &mut TablePlan,

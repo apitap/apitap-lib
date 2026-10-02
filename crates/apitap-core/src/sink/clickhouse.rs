@@ -1302,6 +1302,11 @@ impl crate::sink::Sink for ChSink {
         &[WireFormat::RowBinary, WireFormat::TabSeparated]
     }
 
+    /// Zero-copy body and `reclaim` None; the pg→ch ladder was fitted on it.
+    fn pipe_residency(_mode: Mode) -> crate::sink::PipeResidency {
+        crate::sink::PipeResidency::STREAMING
+    }
+
     fn adjust_plan(&self, plan: &mut TablePlan) {
         // ORDER BY and Replacing-version columns must be non-nullable in ClickHouse;
         // the encoders read the same flag, so DDL and wire stay in agreement (an

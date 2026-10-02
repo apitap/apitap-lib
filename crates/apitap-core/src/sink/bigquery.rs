@@ -42,6 +42,7 @@ const BQ_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 /// Resumable-upload chunks must be 256 KiB multiples (Google's contract);
 /// 8 MiB per PUT amortizes round-trips without holding much gzip output.
 const UPLOAD_ALIGN: usize = 256 * 1024;
+const _: () = assert!(SEND_THRESHOLD % UPLOAD_ALIGN == 0);
 /// Rotate to a NEW load job once a file reaches this many COMPRESSED bytes —
 /// but only if ROTATE_SECS have also passed: BigQuery allows ~5 metadata
 /// updates per 10s PER TABLE, and a fast worker sealing a 12 MiB file every
@@ -2424,6 +2425,11 @@ impl crate::sink::Sink for BqSink {
 
     fn accepts(&self) -> &[WireFormat] {
         &self.lane_order
+    }
+
+    /// `drain_aligned` ships at ≥ SEND_THRESHOLD; the CSV lane strictly less.
+    fn pipe_residency(_mode: Mode) -> crate::sink::PipeResidency {
+        crate::wire::bqparquet::parquet_residency(false)
     }
 
     fn lane_ok(&self, plan: &TablePlan, format: WireFormat) -> bool {

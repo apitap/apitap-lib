@@ -755,6 +755,12 @@ impl crate::sink::Sink for PgSink {
         &[WireFormat::PgCopyBinary]
     }
 
+    /// The 2-slot send and 4-slot reclaim of chunk Vecs sit inside the
+    /// pipeline's 10×chunk term (profiling.md: pg→pg 285 MB @ 8 pipes).
+    fn pipe_residency(_mode: Mode) -> crate::sink::PipeResidency {
+        crate::sink::PipeResidency::STREAMING
+    }
+
     async fn prepare(
         &mut self,
         plan: &TablePlan,
