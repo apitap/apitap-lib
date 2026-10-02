@@ -1146,6 +1146,15 @@ impl crate::sink::Sink for IcebergSink {
         let Some(s3) = self.s3.clone() else {
             return Ok(()); // prepare never got as far as binding storage
         };
+        // Belt for `abort_multipart_noted` failing (as `S3Sink::discard`): this
+        // run's data/delete-file uploads all carry its run id under data/, and
+        // an incomplete one has no completed object for `sweep` to reach.
+        let prefix = format!("{}data/{}-", self.key_prefix, self.run_id);
+        if let Ok(ups) = s3.list_multipart_uploads(&prefix).await {
+            for (k, id) in ups {
+                let _ = s3.abort_multipart(&k, &id).await;
+            }
+        }
         let files = std::mem::take(&mut *self.done.lock().expect("done list"));
         sweep(&s3, &files).await;
         self.release().await;

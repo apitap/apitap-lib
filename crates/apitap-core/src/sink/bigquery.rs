@@ -1318,6 +1318,15 @@ use crate::wire::csvout::base64_into;
 // Loader: one resumable-upload load job per worker
 // ============================================================================
 
+/// One sealed file's load job, kept whole so `abort` can name it to
+/// `jobs.cancel` and then await its TERMINAL state. The handle alone would
+/// leave `abort` unable to prove the job ended once its task was disconnected.
+struct PendingJob {
+    id: String,
+    location: Option<String>,
+    handle: tokio::task::JoinHandle<Result<u64>>,
+}
+
 pub(crate) struct BqLoader {
     conn: BqConn,
     job_config: Value,
@@ -1340,7 +1349,7 @@ pub(crate) struct BqLoader {
     file_rows: u64,
     /// Completed files' jobs, polling in the background while later files
     /// stream — each resolves to its committed row count.
-    pending_jobs: Vec<tokio::task::JoinHandle<Result<u64>>>,
+    pending_jobs: Vec<PendingJob>,
     last_seal: std::time::Instant,
     /// APITAP_DEBUG=1: cumulative per-phase wall time, reported at finish.
     t_transcode: std::time::Duration,
@@ -1617,20 +1626,27 @@ impl BqLoader {
         let location = job["jobReference"]["location"].as_str().map(str::to_string);
         let conn = self.conn.clone();
         let expect_rows = self.file_rows;
-        self.pending_jobs.push(tokio::spawn(async move {
-            let done = conn.poll_job(&job_id, location.as_deref()).await?;
-            let out_rows: u64 = done["statistics"]["load"]["outputRows"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if out_rows != expect_rows {
-                return Err(Error::Transfer(format!(
-                    "bigquery load job {job_id} landed {out_rows} rows, worker \
-                     sent {expect_rows} — refusing to continue on a partial load"
-                )));
-            }
-            Ok(out_rows)
-        }));
+        // Clone id/location BEFORE the task moves them: `abort` needs both to
+        // cancel and re-ask the job after its task is gone.
+        let pending = PendingJob {
+            id: job_id.clone(),
+            location: location.clone(),
+            handle: tokio::spawn(async move {
+                let done = conn.poll_job(&job_id, location.as_deref()).await?;
+                let out_rows: u64 = done["statistics"]["load"]["outputRows"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if out_rows != expect_rows {
+                    return Err(Error::Transfer(format!(
+                        "bigquery load job {job_id} landed {out_rows} rows, worker \
+                         sent {expect_rows} — refusing to continue on a partial load"
+                    )));
+                }
+                Ok(out_rows)
+            }),
+        };
+        self.pending_jobs.push(pending);
         // Fresh file: new resumable session, offsets from zero.
         self.session_uri = None;
         self.offset = 0;
@@ -1706,8 +1722,9 @@ impl Loader for BqLoader {
         let t_poll = std::time::Instant::now();
         let mut committed = 0u64;
         let n_jobs = self.pending_jobs.len();
-        for handle in std::mem::take(&mut self.pending_jobs) {
-            committed += handle
+        for p in std::mem::take(&mut self.pending_jobs) {
+            committed += p
+                .handle
                 .await
                 .map_err(|e| Error::Transfer(format!("bigquery job task: {e}")))??;
         }
@@ -1742,10 +1759,34 @@ impl Loader for BqLoader {
 
     async fn abort(self, cause: Error) -> Error {
         // Sealed files' jobs may already have committed into STAGING — harmless,
-        // staging never reaches the final table on a failed run and the next
-        // run's prepare drops it. Just stop polling them.
-        for handle in &self.pending_jobs {
-            handle.abort();
+        // staging never reaches the final table on a failed run and the caller's
+        // discard drops it. What must NOT happen is a job outliving `discard`
+        // and re-creating a dropped table (CREATE_IF_NEEDED), so every job is
+        // cancelled and then awaited to DONE before this returns.
+        for p in self.pending_jobs {
+            let loc = p
+                .location
+                .as_deref()
+                .map(|l| format!("?location={l}"))
+                .unwrap_or_default();
+            // best effort: jobs.cancel is asynchronous and may not stop a load job
+            let _ = self
+                .conn
+                .api(
+                    reqwest::Method::POST,
+                    format!(
+                        "{BQ_BASE}/projects/{}/jobs/{}/cancel{loc}",
+                        self.conn.project, p.id
+                    ),
+                    None,
+                )
+                .await;
+            // MANDATORY: return only once the job is TERMINAL (DONE, succeeded
+            // or failed), so discard deletes a table no job can re-create.
+            let _ = p.handle.await;
+            // One extra poll: a transient error in the background task, or a
+            // task aborted with the runtime, must not leave the end unproven.
+            let _ = self.conn.poll_job(&p.id, p.location.as_deref()).await;
         }
         // Cancel the resumable session so BigQuery DISCARDS the partial upload —
         // never finalize it into a load job. Google's cancel verb is a DELETE on

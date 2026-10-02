@@ -530,6 +530,46 @@ impl S3Conn {
         Ok(out)
     }
 
+    /// Every incomplete multipart upload under `prefix`, as `(key, upload_id)`.
+    /// The `discard` belt uses it to abort uploads whose owner no longer has a
+    /// `Multipart` handle (a loader dropped after `abort_multipart_noted`
+    /// failed) — parts left behind would bill invisibly.
+    pub(crate) async fn list_multipart_uploads(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let uri = if self.path_style {
+            format!("/{}", enc_seg(&self.bucket))
+        } else {
+            "/".to_string()
+        };
+        let mut out = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut id_marker: Option<String> = None;
+        loop {
+            let mut q = vec![
+                ("uploads".to_string(), String::new()),
+                ("prefix".to_string(), prefix.to_string()),
+            ];
+            if let Some(k) = &key_marker {
+                q.push(("key-marker".to_string(), k.clone()));
+            }
+            if let Some(i) = &id_marker {
+                q.push(("upload-id-marker".to_string(), i.clone()));
+            }
+            let r = self
+                .request(reqwest::Method::GET, &uri, &q, Vec::new(), &payload_hash(b""), &[])
+                .await?;
+            let body = Self::check(r, "list multipart uploads").await?;
+            let keys = xml_tags(&body, "Key");
+            let ids = xml_tags(&body, "UploadId");
+            out.extend(keys.into_iter().zip(ids));
+            key_marker = xml_tag(&body, "NextKeyMarker");
+            id_marker = xml_tag(&body, "NextUploadIdMarker");
+            if key_marker.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) async fn delete(&self, object: &str) -> Result<()> {
         let uri = self.uri_for(object);
         let r = self
@@ -902,6 +942,15 @@ impl crate::sink::Sink for S3Sink {
         for p in self.conn.list(&self.staging).await? {
             if let Err(e) = self.conn.delete(&p).await {
                 first_err.get_or_insert(e);
+            }
+        }
+        // Belt for `abort_multipart_noted` failing (its parts have no completed
+        // object for the listing above to reach). `self.staging` is this run's
+        // own prefix, so the sweep cannot touch a peer's uploads. Best-effort:
+        // the original error, if any, is what the operator needs.
+        if let Ok(ups) = self.conn.list_multipart_uploads(&self.staging).await {
+            for (k, id) in ups {
+                let _ = self.conn.abort_multipart(&k, &id).await;
             }
         }
         self.release().await;
