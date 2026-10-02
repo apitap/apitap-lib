@@ -14,7 +14,7 @@
 use crate::aws::{payload_hash, read_credentials, sigv4_headers, AwsCreds, UNSIGNED_PAYLOAD};
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, Lane, TablePlan, WireFormat};
-use crate::wire::bqparquet::{parquet_col_ok, ParquetEncoder, RowGroup, SEND_THRESHOLD};
+use crate::wire::bqparquet::{parquet_col_ok, ParquetEncoder, RowGroup, SharedBuf, SEND_THRESHOLD};
 use crate::Mode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -869,13 +869,10 @@ impl crate::sink::Sink for S3Sink {
     async fn loader(&self) -> Result<S3Loader> {
         let n = self.next_part.fetch_add(1, Ordering::Relaxed);
         let object = format!("{}part-{n:05}.parquet", self.staging);
-        let upload_id = self.conn.create_multipart(&object).await?;
+        let mp = Multipart::open(&self.conn, object).await?;
         Ok(S3Loader {
             conn: self.conn.clone(),
-            object,
-            upload_id,
-            etags: Vec::new(),
-            part_no: 0,
+            mp,
             pq: ParquetEncoder::new(
                 self.names.as_ref().clone(),
                 self.delivered.as_ref().clone(),
@@ -963,72 +960,101 @@ fn is_part_object(name: &str) -> bool {
         .is_some_and(|digits| digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
-pub(crate) struct S3Loader {
-    conn: S3Conn,
-    object: String,
+/// One multipart upload, from create to complete/abort. S3Loader uses one;
+/// IcebergLoader uses two per pipe (data + the merge key companion), which is
+/// why the state machine lives here instead of being duplicated per loader.
+pub(crate) struct Multipart {
+    pub(crate) key: String,
     upload_id: String,
     etags: Vec<(u32, String)>,
     part_no: u32,
-    pq: ParquetEncoder,
-    rows: u64,
+    /// Total bytes PUT, tail included once `complete` has run.
+    pub(crate) bytes: u64,
 }
 
-impl S3Loader {
-    /// Upload everything buffered as the next part. Unlike GCS chunks, S3
-    /// parts need no alignment — only the ≥5 MiB floor for non-final parts,
-    /// guaranteed by the send threshold; `final_part` lifts the floor.
-    async fn flush_part(&mut self, bytes: Vec<u8>) -> Result<()> {
-        if bytes.is_empty() {
+impl Multipart {
+    pub(crate) async fn open(conn: &S3Conn, key: String) -> Result<Self> {
+        let upload_id = conn.create_multipart(&key).await?;
+        Ok(Self { key, upload_id, etags: Vec::new(), part_no: 0, bytes: 0 })
+    }
+
+    /// Upload one part. Parts need no alignment — only the ≥5 MiB floor for
+    /// non-final parts, guaranteed by the send threshold; `complete`'s tail
+    /// lifts the floor.
+    async fn put(&mut self, conn: &S3Conn, b: Vec<u8>) -> Result<()> {
+        if b.is_empty() {
             return Ok(());
         }
         self.part_no += 1;
-        let etag = self
-            .conn
-            .upload_part(&self.object, &self.upload_id, self.part_no, bytes)
+        self.bytes += b.len() as u64;
+        let etag = conn
+            .upload_part(&self.key, &self.upload_id, self.part_no, b)
             .await?;
         self.etags.push((self.part_no, etag));
         Ok(())
     }
+
+    /// Ship whatever `out` holds once it is a full part's worth.
+    pub(crate) async fn drain(&mut self, conn: &S3Conn, out: &SharedBuf) -> Result<()> {
+        if let Some(b) = out.take_ready() {
+            self.put(conn, b).await?;
+        }
+        Ok(())
+    }
+
+    /// PUT the tail and complete; on any failure abort so the parts stop
+    /// billing, and surface the ORIGINAL error (a failed abort is noted, never
+    /// allowed to mask it). Consumes `self`, hands it back so the caller can
+    /// read `key`/`bytes`.
+    pub(crate) async fn complete(mut self, conn: &S3Conn, tail: Vec<u8>) -> Result<Multipart> {
+        let done = match self.put(conn, tail).await {
+            Ok(()) => conn
+                .complete_multipart(&self.key, &self.upload_id, &self.etags)
+                .await,
+            Err(e) => Err(e),
+        };
+        match done {
+            Ok(()) => Ok(self),
+            Err(e) => {
+                conn.abort_multipart_noted(&self.key, &self.upload_id).await;
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) async fn abort(&self, conn: &S3Conn) {
+        conn.abort_multipart_noted(&self.key, &self.upload_id).await;
+    }
+}
+
+pub(crate) struct S3Loader {
+    conn: S3Conn,
+    mp: Multipart,
+    pq: ParquetEncoder,
+    rows: u64,
 }
 
 impl crate::sink::Loader for S3Loader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         self.rows += self.pq.push(&buf)?;
-        match self.pq.out.take_ready() {
-            Some(pending) => self.flush_part(pending).await,
-            None => Ok(()),
-        }
+        self.mp.drain(&self.conn, &self.pq.out).await
     }
 
     async fn finish(mut self) -> Result<u64> {
         self.pq.finish_file()?;
         let pending = self.pq.out.take_all();
-        if self.etags.is_empty() && pending.is_empty() {
+        if self.mp.part_no == 0 && pending.is_empty() {
             // Nothing was ever produced (0-row worker): abort the upload so no
             // empty object lands; finalize's 0-row guard handles the rest.
-            self.conn.abort_multipart_noted(&self.object, &self.upload_id).await;
+            self.mp.abort(&self.conn).await;
             return Ok(0);
         }
-        let done = match self.flush_part(pending).await {
-            Ok(()) => {
-                self.conn
-                    .complete_multipart(&self.object, &self.upload_id, &self.etags)
-                    .await
-            }
-            Err(e) => Err(e),
-        };
-        if let Err(e) = done {
-            // The object will never complete — abort the upload so its parts
-            // stop billing, then surface the ORIGINAL error (a failed abort
-            // is noted, never allowed to mask it).
-            self.conn.abort_multipart_noted(&self.object, &self.upload_id).await;
-            return Err(e);
-        }
+        self.mp.complete(&self.conn, pending).await?;
         Ok(self.rows)
     }
 
     async fn abort(self, cause: Error) -> Error {
-        self.conn.abort_multipart_noted(&self.object, &self.upload_id).await;
+        self.mp.abort(&self.conn).await;
         cause
     }
 }

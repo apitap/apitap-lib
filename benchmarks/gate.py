@@ -212,6 +212,10 @@ LEGS = [
         {"iceberg", "cores>=4"},
         proves={"memory.parquet-fits-cage": ("s3",),
                 "leg.e2e_parquet_capped": (_claims.LEG_ENGINE,)}),
+    leg("e2e_iceberg_merge_capped.py", "an Iceberg merge delta does not grow memory",
+        {"iceberg"},
+        proves={"memory.iceberg-merge-flat": ("ice",),
+                "leg.e2e_iceberg_merge_capped": (_claims.LEG_ENGINE,)}),
 ]
 
 

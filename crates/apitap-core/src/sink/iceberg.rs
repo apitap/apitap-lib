@@ -44,8 +44,8 @@ use crate::error::{Error, Result};
 use crate::plan::{
     resolve_watermark, wm_max, Delivered, DestState, Lane, TablePlan, WireFormat, WmArbitration,
 };
-use crate::sink::s3::S3Conn;
-use crate::wire::bqparquet::{merge_key_ok, parquet_col_ok, KeyCap, ParquetEncoder, RowGroup};
+use crate::sink::s3::{Multipart, S3Conn};
+use crate::wire::bqparquet::{merge_key_ok, parquet_col_ok, parquet_field, ParquetEncoder, RowGroup};
 use crate::Mode;
 use iceberg::io::{FileIO, FileWrite};
 use iceberg::spec::{
@@ -59,6 +59,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// One finished equality-delete file, streamed per data file in merge mode.
+struct DeleteDone {
+    /// Full `s3://…` URI (what goes in the deletes manifest).
+    path: String,
+    /// Object key inside the bucket (what the cleanup path deletes).
+    key: String,
+    rows: u64,
+    bytes: u64,
+}
+
 /// One finished data file, reported by its loader for the commit.
 struct FileDone {
     /// Full `s3://…` URI (what goes in the manifest).
@@ -69,7 +79,8 @@ struct FileDone {
     bytes: u64,
     /// Max cursor value seen, rendered source-style.
     wm: Option<String>,
-    keys: KeyCap,
+    /// Merge only: the key companion committed in the same snapshot.
+    delete: Option<DeleteDone>,
 }
 
 // ============================================================================
@@ -1086,7 +1097,16 @@ impl crate::sink::Sink for IcebergSink {
         let n = self.next_file.fetch_add(1, Ordering::Relaxed);
         let key = format!("{}data/{}-{n:05}.parquet", self.key_prefix, self.run_id);
         let path = format!("{}/data/{}-{n:05}.parquet", self.location, self.run_id);
-        let upload_id = s3.create_multipart(&key).await?;
+        let data = Multipart::open(&s3, key).await?;
+        // Merge only: a second multipart streams the equality-delete keys in
+        // lockstep with the data file (one delete file per data file, I6).
+        let del = if self.merge_key.is_some() {
+            let dkey = format!("{}data/{}-{n:05}-deletes.parquet", self.key_prefix, self.run_id);
+            let dpath = format!("{}/data/{}-{n:05}-deletes.parquet", self.location, self.run_id);
+            Some((Multipart::open(&s3, dkey).await?, dpath))
+        } else {
+            None
+        };
         let pq = ParquetEncoder::new_ext(
             self.names.as_ref().clone(),
             self.delivered.as_ref().clone(),
@@ -1097,14 +1117,11 @@ impl crate::sink::Sink for IcebergSink {
         )?;
         Ok(IcebergLoader {
             s3,
-            key,
             path,
-            upload_id,
-            etags: Vec::new(),
-            part_no: 0,
+            data,
+            del,
             pq,
             rows: 0,
-            bytes: 0,
             done: self.done.clone(),
         })
     }
@@ -1130,9 +1147,7 @@ impl crate::sink::Sink for IcebergSink {
             return Ok(()); // prepare never got as far as binding storage
         };
         let files = std::mem::take(&mut *self.done.lock().expect("done list"));
-        for f in &files {
-            let _ = s3.delete(&f.key).await;
-        }
+        sweep(&s3, &files).await;
         self.release().await;
         Ok(())
     }
@@ -1141,9 +1156,7 @@ impl crate::sink::Sink for IcebergSink {
         let s3 = self.s3.clone().expect("prepare ran");
         let files = std::mem::take(&mut *self.done.lock().expect("done list"));
         if rows == 0 {
-            for f in &files {
-                let _ = s3.delete(&f.key).await;
-            }
+            sweep(&s3, &files).await;
             self.release().await;
             return Ok(());
         }
@@ -1152,9 +1165,8 @@ impl crate::sink::Sink for IcebergSink {
             Err(e) => {
                 // The commit never happened — no snapshot references these
                 // objects; sweep them so a failed run leaves no stray bytes.
-                for f in &files {
-                    let _ = s3.delete(&f.key).await;
-                }
+                // (0.56.0 never swept the one merge delete object here.)
+                sweep(&s3, &files).await;
                 Err(e)
             }
         };
@@ -1163,6 +1175,18 @@ impl crate::sink::Sink for IcebergSink {
         // next run wait out the reap horizon for nothing.
         self.release().await;
         out
+    }
+}
+
+/// Delete every object this run completed but never committed — the data file
+/// and, in merge mode, its streamed key companion. Written once so no cleanup
+/// path can forget the companion (0.56.0's leak).
+async fn sweep(s3: &S3Conn, files: &[FileDone]) {
+    for f in files {
+        let _ = s3.delete(&f.key).await;
+        if let Some(d) = &f.delete {
+            let _ = s3.delete(&d.key).await;
+        }
     }
 }
 
@@ -1190,45 +1214,9 @@ impl IcebergSink {
             })
             .collect::<Result<_>>()?;
 
-        // -- merge: one equality-delete file for the delta's keys
-        let delete_file: Option<(DataFile, String)> = if mode == Mode::Merge {
-            let (idx, fid) = self.merge_key.expect("merge key resolved in prepare");
-            let mut ints: Vec<i64> = Vec::new();
-            let mut texts: Vec<String> = Vec::new();
-            for f in files {
-                match &f.keys {
-                    KeyCap::Int(v) => ints.extend_from_slice(v),
-                    KeyCap::Text(v) => texts.extend_from_slice(&v[..]),
-                    KeyCap::None => {}
-                }
-            }
-            let n = ints.len() + texts.len();
-            if n as u64 != added_rows {
-                return Err(Error::Transfer(format!(
-                    "iceberg merge: captured {n} keys for {added_rows} rows"
-                )));
-            }
-            let name = &self.names[idx];
-            let d = &self.delivered[idx];
-            let bytes = write_delete_parquet(name, d, fid, &ints, &texts)?;
-            let key = format!("{}data/{}-deletes.parquet", self.key_prefix, self.run_id);
-            let path = format!("{}/data/{}-deletes.parquet", self.location, self.run_id);
-            let size = bytes.len() as u64;
-            s3.put_object(&key, bytes).await?;
-            let df = DataFileBuilder::default()
-                .content(DataContentType::EqualityDeletes)
-                .file_path(path)
-                .file_format(DataFileFormat::Parquet)
-                .partition(Struct::empty())
-                .record_count(n as u64)
-                .file_size_in_bytes(size)
-                .equality_ids(Some(vec![fid]))
-                .build()
-                .map_err(|e| Error::Transfer(format!("iceberg delete file: {e}")))?;
-            Some((df, key))
-        } else {
-            None
-        };
+        // -- merge: one equality-delete file per data file, streamed by the
+        // loaders (the delta's keys never gather in memory; I4/I6)
+        let delete_files = delete_data_files(files, mode, self.merge_key.map(|(_, fid)| fid))?;
 
         // -- new watermark: the freshest cursor value this run shipped
         let numeric = self.cursor.map(|(_, n)| n).unwrap_or(false);
@@ -1276,14 +1264,14 @@ impl IcebergSink {
             );
             manifests.push(data_mf);
 
-            if let Some((df, _)) = &delete_file {
+            if !delete_files.is_empty() {
                 let (mut del_mf, del_bytes) = write_manifest_avro(
                     &io,
                     schema.clone(),
                     pspec.clone(),
                     snapshot_id,
                     true,
-                    std::slice::from_ref(df),
+                    &delete_files,
                     &format!("memory://{}-m1-a{attempt}.avro", self.run_id),
                 )
                 .await?;
@@ -1335,11 +1323,14 @@ impl IcebergSink {
                 ("added-records".to_string(), added_rows.to_string()),
                 ("added-files-size".to_string(), added_bytes.to_string()),
             ]);
-            if let Some((df, _)) = &delete_file {
-                props.insert("added-delete-files".to_string(), "1".to_string());
+            if !delete_files.is_empty() {
+                props.insert(
+                    "added-delete-files".to_string(),
+                    delete_files.len().to_string(),
+                );
                 props.insert(
                     "added-equality-deletes".to_string(),
-                    df.record_count().to_string(),
+                    delete_files.iter().map(|d| d.record_count()).sum::<u64>().to_string(),
                 );
             }
             let snapshot = Snapshot::builder()
@@ -1422,6 +1413,51 @@ impl IcebergSink {
     }
 }
 
+/// One equality-delete `DataFile` per data file, in merge mode. Pure, so the
+/// one-to-one rule (I6) is unit-testable: every data file must carry its
+/// streamed key companion, with the same row count and the table's field id.
+/// Replace/append must carry none.
+fn delete_data_files(files: &[FileDone], mode: Mode, fid: Option<i32>) -> Result<Vec<DataFile>> {
+    if mode != Mode::Merge {
+        if files.iter().any(|f| f.delete.is_some()) {
+            return Err(Error::Transfer(format!(
+                "iceberg: {mode:?} run has delete files — refusing to commit"
+            )));
+        }
+        return Ok(Vec::new());
+    }
+    let fid = fid.ok_or_else(|| {
+        Error::Transfer("iceberg merge: no merge-key field id resolved in prepare".into())
+    })?;
+    files
+        .iter()
+        .map(|f| {
+            let d = f.delete.as_ref().ok_or_else(|| {
+                Error::Transfer(format!(
+                    "iceberg merge: data file {} has no delete file — refusing to commit",
+                    f.path
+                ))
+            })?;
+            if d.rows != f.rows {
+                return Err(Error::Transfer(format!(
+                    "iceberg merge: delete file for {} has {} keys for {} rows",
+                    f.path, d.rows, f.rows
+                )));
+            }
+            DataFileBuilder::default()
+                .content(DataContentType::EqualityDeletes)
+                .file_path(d.path.clone())
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .record_count(d.rows)
+                .file_size_in_bytes(d.bytes)
+                .equality_ids(Some(vec![fid]))
+                .build()
+                .map_err(|e| Error::Transfer(format!("iceberg delete file: {e}")))
+        })
+        .collect()
+}
+
 /// One Avro manifest, written through an in-memory FileIO (the spec writers
 /// demand an `OutputFile`), handed back as bytes for our own PUT.
 async fn write_manifest_avro(
@@ -1480,30 +1516,22 @@ fn write_delete_parquet(
     ints: &[i64],
     texts: &[String],
 ) -> Result<Vec<u8>> {
-    // The same gate the bulk encoder's capture arm asks (I7/I5): one spelling
-    // for what a merge key may be.
+    // The same gate the bulk encoder's key companion asks (I7/I5): one
+    // spelling for what a merge key may be.
     merge_key_ok(d)?;
-    use parquet::basic::{Compression, LogicalType, Repetition, Type as PhysicalType};
+    use parquet::basic::Compression;
     use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::types::Type;
 
-    let field = match d {
-        Delivered::Int { .. } => Type::primitive_type_builder(name, PhysicalType::INT64)
-            .with_repetition(Repetition::OPTIONAL)
-            .with_id(Some(field_id))
-            .build(),
-        _ => Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
-            .with_repetition(Repetition::OPTIONAL)
-            .with_logical_type(Some(LogicalType::String))
-            .with_id(Some(field_id))
-            .build(),
-    }
-    .map_err(|e| Error::Transfer(format!("delete parquet schema: {e}")))?;
+    // The schema is spelled once for both lanes: the companion's field comes
+    // from the same `parquet_field`, so field id, physical type and logical
+    // type cannot drift.
+    let field = parquet_field(name, d, field_id)?;
     let schema = Arc::new(
         Type::group_type_builder("schema")
-            .with_fields(vec![Arc::new(field)])
+            .with_fields(vec![field])
             .build()
             .map_err(|e| Error::Transfer(format!("delete parquet schema: {e}")))?,
     );
@@ -1747,7 +1775,7 @@ pub(crate) async fn cdc_bind(
 
 /// One collapsed window, rendered: the data-file bytes plus the delete-key
 /// set (exactly one of `delete_ints`/`delete_texts` is populated — the PK's
-/// type picks the arm, like the merge path's KeyCap).
+/// type picks the arm, like the merge path's streamed key companion).
 pub(crate) struct CdcWindow {
     /// Finished parquet bytes + row count (`None`: delete-only/truncate window).
     pub(crate) data: Option<(Vec<u8>, u64)>,
@@ -1984,79 +2012,94 @@ impl CdcBound {
 
 pub(crate) struct IcebergLoader {
     s3: S3Conn,
-    key: String,
     path: String,
-    upload_id: String,
-    etags: Vec<(u32, String)>,
-    part_no: u32,
+    /// The data file's multipart upload.
+    data: Multipart,
+    /// Merge only: the key companion's multipart and its `s3://…` URI.
+    del: Option<(Multipart, String)>,
     pq: ParquetEncoder,
     rows: u64,
-    bytes: u64,
     done: Arc<Mutex<Vec<FileDone>>>,
-}
-
-impl IcebergLoader {
-    async fn flush_part(&mut self, bytes: Vec<u8>) -> Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.part_no += 1;
-        self.bytes += bytes.len() as u64;
-        let etag = self
-            .s3
-            .upload_part(&self.key, &self.upload_id, self.part_no, bytes)
-            .await?;
-        self.etags.push((self.part_no, etag));
-        Ok(())
-    }
 }
 
 impl crate::sink::Loader for IcebergLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         self.rows += self.pq.push(&buf)?;
-        match self.pq.out.take_ready() {
-            Some(pending) => self.flush_part(pending).await,
-            None => Ok(()),
+        self.data.drain(&self.s3, &self.pq.out).await?;
+        if let (Some((d, _)), Some(k)) = (&mut self.del, &self.pq.key_file) {
+            d.drain(&self.s3, &k.out).await?;
         }
+        Ok(())
     }
 
     async fn finish(mut self) -> Result<u64> {
-        self.pq.finish_file()?;
-        let pending = self.pq.out.take_all();
+        let key_rows = self.pq.finish_file()?;
+        let data_tail = self.pq.out.take_all();
+        let key_tail = self.pq.key_file.as_ref().map(|k| k.out.take_all());
         // A 0-row worker still produced parquet header+footer bytes — don't
-        // land an empty data file in the manifest; abort the upload instead.
+        // land an empty data file in the manifest; abort both uploads instead.
         if self.rows == 0 {
-            self.s3.abort_multipart_noted(&self.key, &self.upload_id).await;
+            self.data.abort(&self.s3).await;
+            if let Some((d, _)) = &self.del {
+                d.abort(&self.s3).await;
+            }
             return Ok(0);
         }
-        let done = match self.flush_part(pending).await {
-            Ok(()) => {
-                self.s3
-                    .complete_multipart(&self.key, &self.upload_id, &self.etags)
-                    .await
+        let mut delete = None;
+        if let Some((d, dpath)) = self.del.take() {
+            // The companion must hold exactly one key per data row, or the
+            // delete file would remove the wrong rows; check BEFORE either
+            // object completes (0.56.0 checked once at commit, after both).
+            let n = key_rows.unwrap_or(0);
+            if key_rows != Some(self.rows) {
+                self.data.abort(&self.s3).await;
+                d.abort(&self.s3).await;
+                return Err(Error::Transfer(format!(
+                    "iceberg merge: delete file has {n} keys for {} rows",
+                    self.rows
+                )));
             }
-            Err(e) => Err(e),
-        };
-        if let Err(e) = done {
-            // The data file will never complete — abort the upload so its
-            // parts stop billing, then surface the ORIGINAL error (a failed
-            // abort is noted, never allowed to mask it).
-            self.s3.abort_multipart_noted(&self.key, &self.upload_id).await;
-            return Err(e);
+            let d = match d.complete(&self.s3, key_tail.unwrap_or_default()).await {
+                Ok(d) => d,
+                Err(e) => {
+                    self.data.abort(&self.s3).await;
+                    return Err(e);
+                }
+            };
+            // The delete object is complete but not yet referenced: if the
+            // data completion fails, delete it so no orphan is left.
+            delete = Some(DeleteDone {
+                path: dpath,
+                key: d.key.clone(),
+                rows: self.rows,
+                bytes: d.bytes,
+            });
         }
+        let data = match self.data.complete(&self.s3, data_tail).await {
+            Ok(d) => d,
+            Err(e) => {
+                if let Some(del) = &delete {
+                    let _ = self.s3.delete(&del.key).await;
+                }
+                return Err(e);
+            }
+        };
         self.done.lock().expect("done list").push(FileDone {
             path: self.path,
-            key: self.key,
+            key: data.key,
             rows: self.rows,
-            bytes: self.bytes,
+            bytes: data.bytes,
             wm: self.pq.wm.take(),
-            keys: std::mem::replace(&mut self.pq.keys, KeyCap::None),
+            delete,
         });
         Ok(self.rows)
     }
 
     async fn abort(self, cause: Error) -> Error {
-        self.s3.abort_multipart_noted(&self.key, &self.upload_id).await;
+        self.data.abort(&self.s3).await;
+        if let Some((d, _)) = &self.del {
+            d.abort(&self.s3).await;
+        }
         cause
     }
 }
@@ -2121,5 +2164,101 @@ mod tests {
         // PAR1 magic at both ends — a structurally complete file.
         assert_eq!(&bytes[..4], b"PAR1");
         assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+    }
+
+    fn key_col_schema(bytes: Vec<u8>) -> (parquet::basic::Type, i32, Option<parquet::basic::LogicalType>) {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let col = reader.metadata().file_metadata().schema_descr().column(0);
+        (
+            col.physical_type(),
+            col.self_type().get_basic_info().id(),
+            col.logical_type(),
+        )
+    }
+
+    /// T5. The delete file and the streamed key companion share one schema
+    /// spelling (`parquet_field`), so the field id, physical type and logical
+    /// type are the data column's own. 0.56.0 had two spellings; the RED
+    /// control drops `with_id` from the shared one and both lose the id.
+    #[test]
+    fn delete_file_schema_is_the_data_columns_own() {
+        use parquet::basic::{LogicalType, Type as PhysicalType};
+        let uuid = "0f14d0ab-9605-4a62-a9e4-5ed26688389b".to_string();
+        let bytes = write_delete_parquet("id", &Delivered::Uuid, 7, &[], &[uuid]).unwrap();
+        assert_eq!(
+            key_col_schema(bytes),
+            (PhysicalType::BYTE_ARRAY, 7, Some(LogicalType::String))
+        );
+
+        // The bulk merge lane's companion: id from the table's own field ids.
+        let mut enc = ParquetEncoder::new_ext(
+            vec!["id".into()],
+            vec![Delivered::Uuid],
+            None,
+            Some(vec![7]),
+            Some(0),
+            RowGroup::Mib24,
+        )
+        .unwrap();
+        let mut stream = b"PGCOPY\n\xff\r\n\0".to_vec();
+        stream.extend_from_slice(&[0u8; 8]);
+        stream.extend_from_slice(&1i16.to_be_bytes());
+        stream.extend_from_slice(&16i32.to_be_bytes());
+        stream.extend_from_slice(&(0..16).map(|i| i as u8).collect::<Vec<u8>>());
+        stream.extend_from_slice(&(-1i16).to_be_bytes());
+        enc.push(&stream).unwrap();
+        assert_eq!(enc.finish_file().unwrap(), Some(1));
+        let key_bytes = enc.key_file.as_ref().unwrap().out.0.lock().unwrap().clone();
+        assert_eq!(
+            key_col_schema(key_bytes),
+            (PhysicalType::BYTE_ARRAY, 7, Some(LogicalType::String))
+        );
+    }
+
+    fn done(path: &str, rows: u64, delete: bool) -> FileDone {
+        FileDone {
+            path: format!("s3://lake/{path}"),
+            key: path.to_string(),
+            rows,
+            bytes: rows * 10,
+            wm: None,
+            delete: delete.then(|| DeleteDone {
+                path: format!("s3://lake/{path}-deletes.parquet"),
+                key: format!("{path}-deletes.parquet"),
+                rows,
+                bytes: rows,
+            }),
+        }
+    }
+
+    /// T6. I6: a merge commits one equality-delete file per data file, with
+    /// the same record count and the table's field id; a missing companion or
+    /// a mismatched row count refuses BEFORE the catalog commit.
+    #[test]
+    fn delete_data_files_is_one_per_data_file() {
+        let files = vec![done("d0", 3, true), done("d1", 4, true), done("d2", 5, true)];
+        let dfs = delete_data_files(&files, Mode::Merge, Some(7)).unwrap();
+        assert_eq!(dfs.len(), 3);
+        for (df, f) in dfs.iter().zip(&files) {
+            assert_eq!(df.content_type(), DataContentType::EqualityDeletes);
+            assert_eq!(df.record_count(), f.rows);
+            assert_eq!(df.file_size_in_bytes(), f.delete.as_ref().unwrap().bytes);
+            assert_eq!(df.file_path(), f.delete.as_ref().unwrap().path);
+            assert_eq!(df.equality_ids(), Some(vec![7]));
+        }
+        // A data file without its companion cannot commit.
+        let missing = vec![done("d0", 3, true), done("d1", 4, false)];
+        assert!(delete_data_files(&missing, Mode::Merge, Some(7)).is_err());
+        // ...and neither can a record-count mismatch.
+        let mut bad = vec![done("d0", 3, true)];
+        bad[0].delete.as_mut().unwrap().rows = 2;
+        assert!(delete_data_files(&bad, Mode::Merge, Some(7)).is_err());
+        // Merge without a key id is a prepare bug, not an empty commit.
+        assert!(delete_data_files(&files, Mode::Merge, None).is_err());
+        // Replace/append carry no delete files.
+        let replaced = vec![done("d0", 3, false)];
+        assert!(delete_data_files(&replaced, Mode::Replace, None).unwrap().is_empty());
+        assert!(delete_data_files(&files, Mode::Replace, None).is_err());
     }
 }

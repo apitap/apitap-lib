@@ -437,19 +437,26 @@ pub(crate) struct ParquetEncoder {
     // -- row-group bound, enforced per row (see `try_tuple`/`push`)
     row_group: RowGroup,
     group_bytes: usize,
-    // -- merge-key capture (col index) — every value of one column, retained
-    // for the Iceberg sink's equality-delete file. Delta-proportional memory.
-    capture: Option<usize>,
-    pub(crate) keys: KeyCap,
+    // -- merge-key companion: a one-column parquet file written in lockstep
+    // with the data file, row group by row group. Nothing survives a flush,
+    // so a merge's memory is flat in the delta (I4).
+    pub(crate) key_file: Option<KeyFile>,
 }
 
-/// Captured merge-key values. Which arm is used is fixed at construction from
-/// the column's [`Delivered`] type; a NULL in the key column is an error.
-#[derive(Debug)]
-pub(crate) enum KeyCap {
-    None,
-    Int(Vec<i64>),
-    Text(Vec<String>),
+/// A one-column parquet file written IN LOCKSTEP with the data file. Every
+/// data row group is followed by a key row group built from the same builder
+/// (`cols[col]`), before the builders clear. Nothing is copied and nothing
+/// survives a flush.
+pub(crate) struct KeyFile {
+    pub(crate) col: usize,
+    /// `group("schema"){ parquet_field(&names[col], &delivered[col], id) }`,
+    /// id = ids[col] or col+1 — the data column's own fn, so the two schemas
+    /// cannot drift.
+    schema: Arc<Type>,
+    writer: Option<SerializedFileWriter<SharedBuf>>,
+    pub(crate) out: SharedBuf,
+    /// Rows in the OPEN key file; reset when `finish_file` closes it.
+    rows: u64,
 }
 
 impl ParquetEncoder {
@@ -463,15 +470,16 @@ impl ParquetEncoder {
     }
 
     /// `ids`: explicit parquet field ids (Iceberg tables that already exist own
-    /// their ids; ordinal 1..N otherwise). `capture`: column whose every value
-    /// is retained in [`Self::keys`]. `row_group`: the planner-priced bound the
-    /// builders flush at (per row, not per input chunk).
+    /// their ids; ordinal 1..N otherwise). `key_col`: column mirrored into the
+    /// streamed key companion ([`Self::key_file`]); a NULL in it is an error.
+    /// `row_group`: the planner-priced bound the builders flush at (per row,
+    /// not per input chunk).
     pub(crate) fn new_ext(
         names: Vec<String>,
         delivered: Vec<Delivered>,
         cursor: Option<(usize, bool)>,
         ids: Option<Vec<i32>>,
-        capture: Option<usize>,
+        key_col: Option<usize>,
         row_group: RowGroup,
     ) -> Result<Self> {
         if let Some(ids) = &ids {
@@ -483,17 +491,26 @@ impl ParquetEncoder {
                 )));
             }
         }
-        let keys = match capture {
-            None => KeyCap::None,
+        let key_file = match key_col {
+            None => None,
             Some(i) => {
-                // The type gate is shared with the Iceberg CDC delete file;
-                // this arm only picks the retention shape.
+                // The type gate is shared with the Iceberg CDC delete file.
                 merge_key_ok(&delivered[i])?;
-                match &delivered[i] {
-                    Delivered::Int { .. } => KeyCap::Int(Vec::new()),
-                    Delivered::Uuid | Delivered::Text => KeyCap::Text(Vec::new()),
-                    _ => unreachable!("merge_key_ok rejects every other type"),
-                }
+                let id = ids.as_ref().map_or(i as i32 + 1, |v| v[i]);
+                let field = parquet_field(&names[i], &delivered[i], id)?;
+                let schema = Arc::new(
+                    Type::group_type_builder("schema")
+                        .with_fields(vec![field])
+                        .build()
+                        .map_err(|e| Error::Transfer(format!("parquet key schema: {e}")))?,
+                );
+                Some(KeyFile {
+                    col: i,
+                    schema,
+                    writer: None,
+                    out: SharedBuf::default(),
+                    rows: 0,
+                })
             }
         };
         let fields: Vec<Arc<Type>> = names
@@ -538,8 +555,7 @@ impl ParquetEncoder {
             wm: None,
             row_group,
             group_bytes: 0,
-            capture,
-            keys,
+            key_file,
         };
         enc.open_writer()?;
         Ok(enc)
@@ -550,6 +566,12 @@ impl ParquetEncoder {
             SerializedFileWriter::new(self.out.clone(), self.schema.clone(), self.props.clone())
                 .map_err(|e| Error::Transfer(format!("parquet writer: {e}")))?,
         );
+        if let Some(k) = &mut self.key_file {
+            k.writer = Some(
+                SerializedFileWriter::new(k.out.clone(), k.schema.clone(), self.props.clone())
+                    .map_err(|e| Error::Transfer(format!("parquet key writer: {e}")))?,
+            );
+        }
         Ok(())
     }
 
@@ -660,7 +682,7 @@ impl ParquetEncoder {
             let len = i32::from_be_bytes(b[o..o + 4].try_into().unwrap());
             o += 4;
             if len == -1 {
-                if self.capture == Some(i) {
+                if self.key_file.as_ref().is_some_and(|k| k.col == i) {
                     return Err(Error::Transfer(
                         "merge key column contains NULL — a merge key must \
                          identify its row"
@@ -680,41 +702,6 @@ impl ParquetEncoder {
                     let v = render_cursor(&self.delivered[i], f)?;
                     self.wm =
                         crate::plan::wm_max(self.wm.take(), Some(v), numeric);
-                }
-            }
-            if self.capture == Some(i) {
-                match &mut self.keys {
-                    KeyCap::Int(v) => v.push(match f.len() {
-                        2 => i16::from_be_bytes(f.try_into().unwrap()) as i64,
-                        4 => i32::from_be_bytes(f.try_into().unwrap()) as i64,
-                        8 => i64::from_be_bytes(f.try_into().unwrap()),
-                        n => {
-                            return Err(Error::Transfer(format!(
-                                "merge key: unexpected int width {n}"
-                            )))
-                        }
-                    }),
-                    KeyCap::Text(v) => v.push(match &self.delivered[i] {
-                        // pgcopy uuid is 16 raw bytes; render hyphenated
-                        // exactly like the data column does, so the delete
-                        // file and the data file agree byte-for-byte.
-                        Delivered::Uuid => {
-                            let b: [u8; 16] =
-                                f.try_into().map_err(|_| Error::Transfer("merge key: bad uuid".into()))?;
-                            let mut s = String::with_capacity(36);
-                            for (j, byte) in b.iter().enumerate() {
-                                if matches!(j, 4 | 6 | 8 | 10) {
-                                    s.push('-');
-                                }
-                                s.push_str(&format!("{byte:02x}"));
-                            }
-                            s
-                        }
-                        _ => std::str::from_utf8(f)
-                            .map_err(|_| Error::Transfer("merge key: invalid utf-8".into()))?
-                            .to_string(),
-                    }),
-                    KeyCap::None => unreachable!("capture set but keys uninitialized"),
                 }
             }
         }
@@ -784,6 +771,43 @@ impl ParquetEncoder {
         }
         rg.close()
             .map_err(|e| Error::Transfer(format!("parquet row group close: {e}")))?;
+        // Read the row count BEFORE borrowing `key_file`: `rows_buffered` is a
+        // `&self` method and the mutable borrow below is live through it.
+        let buffered = self.rows_buffered() as u64;
+        if let Some(k) = &mut self.key_file {
+            // The companion mirrors the data row groups one-for-one: built
+            // from the same builder, written in the same flush, before the
+            // builders clear. `k.rows` counts the OPEN key file only.
+            let pe = |e| Error::Transfer(format!("parquet key file: {e}"));
+            let mut krg = k
+                .writer
+                .as_mut()
+                .expect("key writer open")
+                .next_row_group()
+                .map_err(pe)?;
+            let mut col = krg.next_column().map_err(pe)?.expect("one column");
+            match &self.cols[k.col] {
+                ColBuf::I64(v) => {
+                    col.typed::<Int64Type>()
+                        .write_batch(v, Some(&self.defs[k.col]), None)
+                        .map_err(pe)?;
+                }
+                // uuid already hyphenated at push_pg: byte-identical by construction.
+                ColBuf::Bytes(v) => {
+                    col.typed::<ByteArrayType>()
+                        .write_batch(v, Some(&self.defs[k.col]), None)
+                        .map_err(pe)?;
+                }
+                _ => {
+                    return Err(Error::Transfer(
+                        "merge key builder is not I64/Bytes: gate bypassed".into(),
+                    ))
+                }
+            }
+            col.close().map_err(pe)?;
+            krg.close().map_err(pe)?;
+            k.rows += buffered;
+        }
         for c in &mut self.cols {
             c.clear();
         }
@@ -795,15 +819,27 @@ impl ParquetEncoder {
     }
 
     /// Close the CURRENT parquet file (footer lands in `out`) and open a
-    /// fresh writer for the next file. Returns rows in the closed file? No —
-    /// the loader tracks rows; this only finalizes bytes.
-    pub(crate) fn finish_file(&mut self) -> Result<()> {
+    /// fresh writer for the next file. Returns the closed key file's rows when
+    /// a key companion is open — S3, GCS, BigQuery and dest_ice ignore it;
+    /// the Iceberg merge checks it against its own row count.
+    pub(crate) fn finish_file(&mut self) -> Result<Option<u64>> {
         self.flush_row_group()?;
         let writer = self.writer.take().expect("writer open");
         writer
             .close()
             .map_err(|e| Error::Transfer(format!("parquet close: {e}")))?;
-        self.open_writer()
+        let key_rows = if let Some(k) = &mut self.key_file {
+            let kw = k.writer.take().expect("key writer open");
+            kw.close()
+                .map_err(|e| Error::Transfer(format!("parquet key close: {e}")))?;
+            let n = k.rows;
+            k.rows = 0;
+            Some(n)
+        } else {
+            None
+        };
+        self.open_writer()?;
+        Ok(key_rows)
     }
 }
 
@@ -1140,5 +1176,100 @@ mod tests {
                 g.num_rows() as usize * per_row
             );
         }
+    }
+
+    /// T4. A merge's key companion is written row group by row group from the
+    /// same builders, so nothing about it grows with the delta — the 0.56.0
+    /// `KeyCap` retained every key until commit (~150 MB for the 2.1M keys of
+    /// E2's OOM). The key file must mirror the data file: same row groups,
+    /// same rows, and the key column's own schema.
+    #[test]
+    fn merge_key_file_streams_per_row_group_and_retains_nothing() {
+        use parquet::record::Field;
+        const RG: usize = 64 << 10;
+        let mut enc = ParquetEncoder::new_ext(
+            vec!["id".into()],
+            vec![Delivered::Int { bytes: 8, unsigned: false }],
+            None,
+            None,
+            Some(0),
+            RowGroup::Test(RG),
+        )
+        .unwrap();
+        let rows: Vec<Vec<Option<Vec<u8>>>> = (0..20_000i64)
+            .map(|i| vec![Some(i.to_be_bytes().to_vec())])
+            .collect();
+        let stream = copy_stream(&rows);
+        // Fed in 1 KiB slices: flushes land inside a push, and the running
+        // counter must never hold more than one row over the priced bound.
+        for part in stream.chunks(1024) {
+            enc.push(part).unwrap();
+            assert!(enc.group_bytes < RG + 10, "{}", enc.group_bytes);
+        }
+        assert_eq!(enc.finish_file().unwrap(), Some(20_000));
+        assert_eq!(enc.key_file.as_ref().unwrap().rows, 0);
+
+        let data_bytes = enc.out.0.lock().unwrap().clone();
+        let key_bytes = enc.key_file.as_ref().unwrap().out.0.lock().unwrap().clone();
+        let data = SerializedFileReader::new(bytes::Bytes::from(data_bytes)).unwrap();
+        let key = SerializedFileReader::new(bytes::Bytes::from(key_bytes)).unwrap();
+        let groups = data.metadata().row_groups().len();
+        assert!(groups > 1, "one row group for 20k rows: bound never fired");
+        assert_eq!(key.metadata().row_groups().len(), groups);
+        let vals: Vec<i64> = key
+            .get_row_iter(None)
+            .unwrap()
+            .map(|r| match r.unwrap().get_column_iter().next().unwrap().1 {
+                Field::Long(v) => *v,
+                other => panic!("key value {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, (0..20_000).collect::<Vec<i64>>());
+        let dcol = data.metadata().file_metadata().schema_descr().column(0);
+        let kcol = key.metadata().file_metadata().schema_descr().column(0);
+        assert_eq!(kcol.physical_type(), dcol.physical_type());
+        assert_eq!(
+            kcol.self_type().get_basic_info().id(),
+            dcol.self_type().get_basic_info().id()
+        );
+
+        // A uuid key is mirrored as the data column's own 36-byte hyphenated
+        // strings (never the 16 wire bytes).
+        let mut enc = ParquetEncoder::new_ext(
+            vec!["uid".into()],
+            vec![Delivered::Uuid],
+            None,
+            None,
+            Some(0),
+            RowGroup::Test(RG),
+        )
+        .unwrap();
+        let rows: Vec<Vec<Option<Vec<u8>>>> = (0..500u16)
+            .map(|i| {
+                let mut b = [0u8; 16];
+                b[0] = i as u8;
+                b[15] = (i >> 8) as u8;
+                vec![Some(b.to_vec())]
+            })
+            .collect();
+        enc.push(&copy_stream(&rows)).unwrap();
+        assert_eq!(enc.finish_file().unwrap(), Some(500));
+        let data_bytes = enc.out.0.lock().unwrap().clone();
+        let key_bytes = enc.key_file.as_ref().unwrap().out.0.lock().unwrap().clone();
+        let values = |b: Vec<u8>| -> Vec<String> {
+            SerializedFileReader::new(bytes::Bytes::from(b))
+                .unwrap()
+                .get_row_iter(None)
+                .unwrap()
+                .map(|r| match r.unwrap().get_column_iter().next().unwrap().1 {
+                    Field::Str(s) => s.clone(),
+                    Field::Bytes(b) => String::from_utf8(b.data().to_vec()).unwrap(),
+                    other => panic!("uuid key value {other:?}"),
+                })
+                .collect()
+        };
+        let data_vals = values(data_bytes);
+        assert_eq!(values(key_bytes), data_vals);
+        assert!(data_vals.iter().all(|s| s.len() == 36 && s.as_bytes()[8] == b'-'));
     }
 }
