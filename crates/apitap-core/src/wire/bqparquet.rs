@@ -16,6 +16,7 @@
 
 use crate::error::{Error, Result};
 use crate::plan::Delivered;
+use crate::sink::PipeResidency;
 use crate::wire::pgcopy::{numeric_to_scaled_i128, PG_EPOCH_DAYS, PG_EPOCH_MICROS};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use parquet::data_type::{
@@ -28,9 +29,88 @@ use parquet::schema::types::Type;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-/// Flush a row group once its builders hold about this much data — small
-/// enough that two workers fit a 256 MB container, big enough for good pages.
-const ROW_GROUP_BYTES: usize = 24 * 1024 * 1024;
+/// Encoded bytes a parquet loader holds before shipping a part / resumable
+/// chunk. S3 keeps its `>= MIN_PART` assert; GCS and BigQuery assert the
+/// `UPLOAD_ALIGN` multiple. One symbol, so a loader cannot charge one price
+/// and drain at another.
+pub(crate) const SEND_THRESHOLD: usize = 8 << 20;
+/// The frame buffer `push` starts with and drains above; one chunk of consumed
+/// COPY prefix is dead weight between calls, not part of the resident builders.
+pub(crate) const FRAME_BUF: usize = 1 << 20;
+/// One open data page + dictionary page. parquet-rs's defaults are 1 MiB each,
+/// and the writer properties here do not override them.
+pub(crate) const PAGE_TRANSIENT: usize = 2 << 20;
+/// Builders during one row group (≤ 1 rg + one row) plus compressed pages
+/// landing in `out` before the part ships (≤ 1 rg).
+pub(crate) const PER_ROW_GROUP: u64 = 2;
+/// `push` copies the input into `buf` while the worker's own `Vec<u8>` argument
+/// stays alive until `send` returns.
+pub(crate) const LOADER_CHUNKS: u64 = 2;
+
+/// A row-group size the planner can choose. There is no integer constructor:
+/// every value is a rung the planner priced, or the CDC window size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // the planner's fit() constructs the lower rungs.
+pub(crate) enum RowGroup {
+    Mib24,
+    Mib8,
+    Mib4,
+    #[cfg(test)]
+    Test(usize),
+}
+
+impl RowGroup {
+    /// Top rung = 0.56.0's ROW_GROUP_BYTES. 8 MiB lets 4 pipes fit 256 MiB/2
+    /// cores and 2 merge pipes fit 256 MiB/0.5 CPU. 4 MiB (floor) lets 2 pipes
+    /// fit 128 MiB (2×43+40 = 126). Below 4 MiB, per-row-group metadata and
+    /// page count start to cost readers.
+    #[allow(dead_code)] // the planner's PipeCost::rungs() walks it.
+    pub(crate) const LADDER: [RowGroup; 3] = [RowGroup::Mib24, RowGroup::Mib8, RowGroup::Mib4];
+
+    pub(crate) const fn bytes(self) -> usize {
+        match self {
+            Self::Mib24 => 24 << 20,
+            Self::Mib8 => 8 << 20,
+            Self::Mib4 => 4 << 20,
+            #[cfg(test)]
+            Self::Test(n) => n,
+        }
+    }
+
+    /// CDC window files are bounded by the drain's byte budget, not by pipes.
+    pub(crate) const fn cdc_window() -> Self {
+        Self::Mib24
+    }
+}
+
+/// The only spelling of a parquet lane's per-pipe residency: the 8 MiB part
+/// buffer, a 1 MiB frame buffer and a 2 MiB page — plus one more part buffer
+/// and page for an Iceberg merge's companion key file.
+#[allow(dead_code)] // Sink::pipe_residency wires this in the next step.
+pub(crate) fn parquet_residency(key_companion: bool) -> PipeResidency {
+    let companion = if key_companion {
+        SEND_THRESHOLD + PAGE_TRANSIENT
+    } else {
+        0
+    };
+    PipeResidency {
+        fixed: (SEND_THRESHOLD + FRAME_BUF + PAGE_TRANSIENT + companion) as u64,
+        per_row_group: PER_ROW_GROUP,
+        chunks: LOADER_CHUNKS,
+    }
+}
+
+/// Merge-key type gate, written once. `new_ext` and the Iceberg CDC delete
+/// file both ask here, so the two spellings cannot drift.
+pub(crate) fn merge_key_ok(d: &Delivered) -> Result<()> {
+    match d {
+        Delivered::Int { .. } | Delivered::Uuid | Delivered::Text => Ok(()),
+        other => Err(Error::InvalidInput(format!(
+            "merge key column has type {other:?} — supported merge \
+             key types on this destination: integer, text, uuid"
+        ))),
+    }
+}
 
 /// Postgres binary-COPY udts this lane can decode. Everything else must be
 /// cast in a source view — better a loud, early error than a garbled column.
@@ -138,6 +218,9 @@ impl ColBuf {
     /// RESIDENT bytes, for row-group sizing — ByteArray/FLBA hold a struct
     /// (~32 B) plus a heap allocation with allocator quantum; undercounting
     /// here is how a 24 MiB gate turns into a 256 MB OOM at 4 pipes.
+    /// `#[cfg(test)]`: the live path carries a running counter, and this
+    /// re-sum is its oracle (T4b).
+    #[cfg(test)]
     fn bytes(&self) -> usize {
         match self {
             ColBuf::I64(v) => v.len() * 8,
@@ -162,25 +245,37 @@ impl ColBuf {
         }
     }
 
-    /// Decode one non-NULL Postgres binary field into this builder.
-    fn push_pg(&mut self, f: &[u8], d: &Delivered) -> Result<()> {
-        match self {
-            ColBuf::I64(v) => v.push(match f.len() {
-                2 => i16::from_be_bytes(f.try_into().unwrap()) as i64,
-                4 => i32::from_be_bytes(f.try_into().unwrap()) as i64,
-                8 => i64::from_be_bytes(f.try_into().unwrap()),
-                n => return Err(bad(&format!("int width {n}"))),
-            }),
+    /// Decode one non-NULL Postgres binary field into this builder, returning
+    /// the RESIDENT bytes that push added — the same unit costs `bytes()`
+    /// sums. Undercounting here is how a 24 MiB gate turns into a 256 MB OOM
+    /// at 4 pipes.
+    fn push_pg(&mut self, f: &[u8], d: &Delivered) -> Result<usize> {
+        Ok(match self {
+            ColBuf::I64(v) => {
+                v.push(match f.len() {
+                    2 => i16::from_be_bytes(f.try_into().unwrap()) as i64,
+                    4 => i32::from_be_bytes(f.try_into().unwrap()) as i64,
+                    8 => i64::from_be_bytes(f.try_into().unwrap()),
+                    n => return Err(bad(&format!("int width {n}"))),
+                });
+                8
+            }
             ColBuf::F32(v) => {
                 v.push(f32::from_be_bytes(f.try_into().map_err(|_| bad("float4"))?));
+                4
             }
             ColBuf::F64(v) => {
                 v.push(f64::from_be_bytes(f.try_into().map_err(|_| bad("float8"))?));
+                8
             }
-            ColBuf::Bool(v) => v.push(f.first().copied().unwrap_or(0) != 0),
+            ColBuf::Bool(v) => {
+                v.push(f.first().copied().unwrap_or(0) != 0);
+                1
+            }
             ColBuf::Dec { vals, scale } => {
                 let x = numeric_to_scaled_i128(f, *scale)?;
                 vals.push(FixedLenByteArray::from(x.to_be_bytes().to_vec()));
+                48
             }
             ColBuf::Date(v) => {
                 let days = i32::from_be_bytes(f.try_into().map_err(|_| bad("date"))?);
@@ -192,6 +287,7 @@ impl ColBuf {
                     ));
                 }
                 v.push((days + PG_EPOCH_DAYS) as i64);
+                8
             }
             ColBuf::Ts(v) => {
                 let us = i64::from_be_bytes(f.try_into().map_err(|_| bad("timestamp"))?);
@@ -203,6 +299,7 @@ impl ColBuf {
                     ));
                 }
                 v.push(us + PG_EPOCH_MICROS);
+                8
             }
             ColBuf::Bytes(v) => match d {
                 Delivered::Uuid => {
@@ -215,15 +312,19 @@ impl ColBuf {
                         s.push_str(&format!("{byte:02x}"));
                     }
                     v.push(ByteArray::from(s.into_bytes()));
+                    48 + 36 // the fixed 36-byte hyphenated text, not `f.len()`
                 }
                 // jsonb = version byte then text; json/text/bytea = raw.
                 Delivered::Json if f.first() == Some(&1) => {
-                    v.push(ByteArray::from(f[1..].to_vec()))
+                    v.push(ByteArray::from(f[1..].to_vec()));
+                    48 + (f.len() - 1)
                 }
-                _ => v.push(ByteArray::from(f.to_vec())),
+                _ => {
+                    v.push(ByteArray::from(f.to_vec()));
+                    48 + f.len()
+                }
             },
-        }
-        Ok(())
+        })
     }
 }
 
@@ -238,8 +339,9 @@ fn bad(what: &str) -> Error {
 /// `id` is the 1-based column ordinal, written as the parquet field id. For
 /// BigQuery/GCS/S3 it is inert metadata; for Iceberg it is load-bearing — the
 /// table schema assigns the same ids, and readers resolve columns BY ID, so
-/// the two assignments must never drift.
-fn parquet_field(name: &str, d: &Delivered, id: i32) -> Result<Arc<Type>> {
+/// the two assignments must never drift. Shared with the Iceberg CDC delete
+/// file so both lanes spell a column's parquet schema exactly once.
+pub(crate) fn parquet_field(name: &str, d: &Delivered, id: i32) -> Result<Arc<Type>> {
     use PhysicalType as P;
     let b = |p| {
         Type::primitive_type_builder(name, p)
@@ -286,6 +388,20 @@ fn parquet_field(name: &str, d: &Delivered, id: i32) -> Result<Arc<Type>> {
 #[derive(Clone, Default)]
 pub(crate) struct SharedBuf(pub(crate) Arc<Mutex<Vec<u8>>>);
 
+impl SharedBuf {
+    /// Take the buffer once it holds a full part's worth. The threshold lives
+    /// HERE so every loader drains at the same price it declared.
+    pub(crate) fn take_ready(&self) -> Option<Vec<u8>> {
+        let mut b = self.0.lock().expect("parquet buf");
+        (b.len() >= SEND_THRESHOLD).then(|| std::mem::take(&mut *b))
+    }
+
+    /// Take whatever is buffered, ready or not (a file's footer tail).
+    pub(crate) fn take_all(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.0.lock().expect("parquet buf"))
+    }
+}
+
 impl Write for SharedBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().expect("parquet buf").extend_from_slice(buf);
@@ -316,6 +432,9 @@ pub(crate) struct ParquetEncoder {
     // -- cursor watermark tracking (col index, numeric compare)
     cursor: Option<(usize, bool)>,
     pub(crate) wm: Option<String>,
+    // -- row-group bound, enforced per row (see `try_tuple`/`push`)
+    row_group: RowGroup,
+    group_bytes: usize,
     // -- merge-key capture (col index) — every value of one column, retained
     // for the Iceberg sink's equality-delete file. Delta-proportional memory.
     capture: Option<usize>,
@@ -336,19 +455,22 @@ impl ParquetEncoder {
         names: Vec<String>,
         delivered: Vec<Delivered>,
         cursor: Option<(usize, bool)>,
+        row_group: RowGroup,
     ) -> Result<Self> {
-        Self::new_ext(names, delivered, cursor, None, None)
+        Self::new_ext(names, delivered, cursor, None, None, row_group)
     }
 
     /// `ids`: explicit parquet field ids (Iceberg tables that already exist own
     /// their ids; ordinal 1..N otherwise). `capture`: column whose every value
-    /// is retained in [`Self::keys`].
+    /// is retained in [`Self::keys`]. `row_group`: the planner-priced bound the
+    /// builders flush at (per row, not per input chunk).
     pub(crate) fn new_ext(
         names: Vec<String>,
         delivered: Vec<Delivered>,
         cursor: Option<(usize, bool)>,
         ids: Option<Vec<i32>>,
         capture: Option<usize>,
+        row_group: RowGroup,
     ) -> Result<Self> {
         if let Some(ids) = &ids {
             if ids.len() != names.len() {
@@ -361,16 +483,16 @@ impl ParquetEncoder {
         }
         let keys = match capture {
             None => KeyCap::None,
-            Some(i) => match &delivered[i] {
-                Delivered::Int { .. } => KeyCap::Int(Vec::new()),
-                Delivered::Uuid | Delivered::Text => KeyCap::Text(Vec::new()),
-                other => {
-                    return Err(Error::InvalidInput(format!(
-                        "merge key column has type {other:?} — supported merge \
-                         key types on this destination: integer, text, uuid"
-                    )))
+            Some(i) => {
+                // The type gate is shared with the Iceberg CDC delete file;
+                // this arm only picks the retention shape.
+                merge_key_ok(&delivered[i])?;
+                match &delivered[i] {
+                    Delivered::Int { .. } => KeyCap::Int(Vec::new()),
+                    Delivered::Uuid | Delivered::Text => KeyCap::Text(Vec::new()),
+                    _ => unreachable!("merge_key_ok rejects every other type"),
                 }
-            },
+            }
         };
         let fields: Vec<Arc<Type>> = names
             .iter()
@@ -406,12 +528,14 @@ impl ParquetEncoder {
             out: SharedBuf::default(),
             cols,
             defs,
-            buf: Vec::with_capacity(1 << 20),
+            buf: Vec::with_capacity(FRAME_BUF),
             pos: 0,
             header_done: false,
             finished: false,
             cursor,
             wm: None,
+            row_group,
+            group_bytes: 0,
             capture,
             keys,
         };
@@ -428,13 +552,14 @@ impl ParquetEncoder {
     }
 
     /// Feed COPY bytes; returns rows completed in this call. Flushes a row
-    /// group into `out` whenever the builders grow past ROW_GROUP_BYTES.
+    /// group into `out` whenever the builders reach the priced bound — checked
+    /// per ROW, so one wide input chunk cannot build a group many times over.
     pub(crate) fn push(&mut self, input: &[u8]) -> Result<u64> {
         if self.pos > 0 && self.pos == self.buf.len() {
             self.buf.clear();
             self.pos = 0;
         }
-        if self.pos > (1 << 20) {
+        if self.pos > FRAME_BUF {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
@@ -468,6 +593,15 @@ impl ParquetEncoder {
                         self.finished = true;
                     } else {
                         rows += 1;
+                        // Per ROW: `try_tuple` already added this row's
+                        // resident bytes, so the bound holds no matter how
+                        // many rows one input chunk carries.
+                        if self.group_bytes >= self.row_group.bytes() {
+                            if let Err(e) = self.flush_row_group() {
+                                res = Err(e);
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -479,9 +613,6 @@ impl ParquetEncoder {
         }
         self.buf = buf;
         res?;
-        if self.group_bytes() >= ROW_GROUP_BYTES {
-            self.flush_row_group()?;
-        }
         Ok(rows)
     }
 
@@ -535,11 +666,12 @@ impl ParquetEncoder {
                     ));
                 }
                 self.defs[i].push(0);
+                self.group_bytes += 2; // the definition level vector's entry
                 continue;
             }
             let f = &b[o..o + len as usize];
             o += len as usize;
-            self.cols[i].push_pg(f, &self.delivered[i])?;
+            self.group_bytes += self.cols[i].push_pg(f, &self.delivered[i])? + 2;
             self.defs[i].push(1);
             if let Some((idx, numeric)) = self.cursor {
                 if i == idx {
@@ -585,11 +717,6 @@ impl ParquetEncoder {
             }
         }
         Ok(Some((off, false)))
-    }
-
-    fn group_bytes(&self) -> usize {
-        self.cols.iter().map(|c| c.bytes()).sum::<usize>()
-            + self.defs.iter().map(|d| d.len() * 2).sum::<usize>()
     }
 
     pub(crate) fn rows_buffered(&self) -> usize {
@@ -661,6 +788,7 @@ impl ParquetEncoder {
         for d in &mut self.defs {
             d.clear();
         }
+        self.group_bytes = 0;
         Ok(())
     }
 
@@ -786,7 +914,8 @@ mod tests {
             Delivered::Bool,
             Delivered::DateTime { utc: true },
         ];
-        let mut enc = ParquetEncoder::new(names, delivered, Some((0, true))).unwrap();
+        let mut enc =
+            ParquetEncoder::new(names, delivered, Some((0, true)), RowGroup::Mib24).unwrap();
         let stream = copy_stream(&[
             vec![
                 Some(7i64.to_be_bytes().to_vec()),
@@ -836,7 +965,7 @@ mod tests {
         };
         let names = vec!["d".into(), "day".into()];
         let delivered = vec![Delivered::Decimal { p: 18, s: 4 }, Delivered::Date];
-        let mut enc = ParquetEncoder::new(names, delivered, None).unwrap();
+        let mut enc = ParquetEncoder::new(names, delivered, None, RowGroup::Mib24).unwrap();
         let stream = copy_stream(&[vec![
             Some(pg_numeric),
             Some(0i32.to_be_bytes().to_vec()), // 2000-01-01
@@ -880,5 +1009,134 @@ mod tests {
             .unwrap(),
             "2000-01-01 00:00:01.5"
         );
+    }
+
+    /// numeric 1.23 (ndigits 1, weight 0, sign +, dscale 2).
+    fn pg_numeric() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&1i16.to_be_bytes());
+        f.extend_from_slice(&0i16.to_be_bytes());
+        f.extend_from_slice(&0i16.to_be_bytes());
+        f.extend_from_slice(&2i16.to_be_bytes());
+        f.extend_from_slice(&123i16.to_be_bytes());
+        f
+    }
+
+    /// T4b. The running counter is the only thing between the builders and an
+    /// out-of-memory kill, so it must equal the resident sum after every push
+    /// — the `ColBuf::bytes` re-sum is the oracle. A uuid's resident bytes are
+    /// its fixed 36-byte hyphenated text plus the ByteArray overhead, never
+    /// the 16 wire bytes.
+    #[test]
+    fn running_group_bytes_equals_the_resident_sum() {
+        let names: Vec<String> = ["i", "f4", "f8", "b", "d", "day", "ts", "u", "j", "t", "raw"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let delivered = vec![
+            Delivered::Int { bytes: 8, unsigned: false },
+            Delivered::Float32,
+            Delivered::Float64,
+            Delivered::Bool,
+            Delivered::Decimal { p: 18, s: 2 },
+            Delivered::Date,
+            Delivered::DateTime { utc: true },
+            Delivered::Uuid,
+            Delivered::Json,
+            Delivered::Text,
+            Delivered::Bytes,
+        ];
+        let mut enc =
+            ParquetEncoder::new(names, delivered.clone(), None, RowGroup::Test(64 << 10)).unwrap();
+        // xorshift64: random shapes, one fixed seed.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut stream = b"PGCOPY\n\xff\r\n\0".to_vec();
+        stream.extend_from_slice(&[0u8; 8]);
+        for _ in 0..500 {
+            stream.extend_from_slice(&(delivered.len() as i16).to_be_bytes());
+            for (i, d) in delivered.iter().enumerate() {
+                if next() % 5 == 0 {
+                    stream.extend_from_slice(&(-1i32).to_be_bytes());
+                    continue;
+                }
+                let f: Vec<u8> = match (i, d) {
+                    (0, _) => next().to_be_bytes().to_vec(),
+                    (1, _) => (next() as u32).to_be_bytes().to_vec(),
+                    (2, _) => next().to_be_bytes().to_vec(),
+                    (3, _) => vec![(next() & 1) as u8],
+                    (4, _) => pg_numeric(),
+                    (5, _) => ((next() % 10_000) as i32).to_be_bytes().to_vec(),
+                    (6, _) => ((next() % (1 << 40)) as i64).to_be_bytes().to_vec(),
+                    (7, _) => (0..16).map(|_| next() as u8).collect(),
+                    (8, _) => {
+                        let mut v = vec![1u8]; // jsonb version byte
+                        v.extend_from_slice(b"{}");
+                        v
+                    }
+                    (9, _) => b"hello".to_vec(),
+                    (10, _) => (0..4).map(|_| next() as u8).collect(),
+                    _ => unreachable!(),
+                };
+                stream.extend_from_slice(&(f.len() as i32).to_be_bytes());
+                stream.extend_from_slice(&f);
+            }
+        }
+        stream.extend_from_slice(&(-1i16).to_be_bytes());
+        // Irregular slices: tuple boundaries and flushes land inside a push.
+        for part in stream.chunks(997) {
+            enc.push(part).unwrap();
+            let oracle = enc.cols.iter().map(|c| c.bytes()).sum::<usize>()
+                + enc.defs.iter().map(|d| d.len() * 2).sum::<usize>();
+            assert_eq!(enc.group_bytes, oracle);
+        }
+    }
+
+    /// T4c. A wide-text row's resident bytes run up to ~10× its wire bytes
+    /// (the 48-byte ByteArray overhead), so a per-chunk flush would build a
+    /// row group dozens of times the priced bound from one 4 MiB chunk. The
+    /// per-row check cannot: every written row group fits the bound, and one
+    /// chunk yields many of them.
+    #[test]
+    fn short_wide_rows_cannot_overshoot_the_row_group() {
+        const RG: usize = 256 << 10;
+        let names: Vec<String> = (0..12).map(|i| format!("c{i}")).collect();
+        let mut enc = ParquetEncoder::new(
+            names,
+            vec![Delivered::Text; 12],
+            None,
+            RowGroup::Test(RG),
+        )
+        .unwrap();
+        // ~4 MiB of COPY bytes: 70 000 rows × (2 + 12×(4+1)) wire bytes.
+        let rows: Vec<Vec<Option<Vec<u8>>>> = (0..70_000)
+            .map(|_| (0..12).map(|_| Some(b"x".to_vec())).collect())
+            .collect();
+        let stream = copy_stream(&rows);
+        assert_eq!(enc.push(&stream).unwrap(), 70_000);
+        // 12 × (48 + 1 stored byte + 2 definition bytes) resident per row.
+        let per_row = 12 * (48 + 1 + 2);
+        assert!(enc.group_bytes < RG + per_row, "{}", enc.group_bytes);
+        enc.finish_file().unwrap();
+        let bytes = enc.out.0.lock().unwrap().clone();
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let groups = reader.metadata().row_groups();
+        assert!(
+            groups.len() > 1,
+            "one input chunk built one {} MiB row group",
+            groups.iter().map(|g| g.num_rows()).sum::<i64>() as usize * per_row >> 20
+        );
+        for g in groups {
+            assert!(
+                g.num_rows() as usize * per_row <= RG + per_row,
+                "row group holds {} resident bytes",
+                g.num_rows() as usize * per_row
+            );
+        }
     }
 }

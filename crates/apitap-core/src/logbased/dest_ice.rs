@@ -27,7 +27,7 @@ use crate::logbased::rowtext::{decode_bytea, strip_utc_offset};
 use crate::logbased::window::TableWindow;
 use crate::plan::Delivered;
 use crate::sink::iceberg::CdcWindow;
-use crate::wire::bqparquet::ParquetEncoder;
+use crate::wire::bqparquet::{ParquetEncoder, RowGroup};
 use crate::wire::pgcopy as pgc;
 use crate::wire::pgoutput::Cell;
 
@@ -171,6 +171,7 @@ async fn apply_unit(
             None,
             Some(bound.field_ids().to_vec()),
             None,
+            RowGroup::cdc_window(),
         )?;
         let mut chunk = Vec::with_capacity(256 << 10);
         pgc::header(&mut chunk);
@@ -544,6 +545,7 @@ mod tests {
             None,
             Some((1..=7).collect()),
             None,
+            RowGroup::Mib24,
         )
         .unwrap();
         let mut buf = Vec::new();

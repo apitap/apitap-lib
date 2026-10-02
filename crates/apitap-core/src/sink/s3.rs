@@ -14,16 +14,13 @@
 use crate::aws::{payload_hash, read_credentials, sigv4_headers, AwsCreds, UNSIGNED_PAYLOAD};
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, Lane, TablePlan, WireFormat};
-use crate::wire::bqparquet::{parquet_col_ok, ParquetEncoder};
+use crate::wire::bqparquet::{parquet_col_ok, ParquetEncoder, RowGroup, SEND_THRESHOLD};
 use crate::Mode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// S3 requires every non-final multipart part to be ≥ 5 MiB.
 const MIN_PART: usize = 5 * 1024 * 1024;
-/// Buffered encoder output that triggers a part upload (comfortably over the
-/// 5 MiB floor, matching the GCS sink's send threshold).
-const SEND_THRESHOLD: usize = 8 * 1024 * 1024;
 const _: () = assert!(SEND_THRESHOLD >= MIN_PART);
 
 #[derive(Clone)]
@@ -871,7 +868,12 @@ impl crate::sink::Sink for S3Sink {
             upload_id,
             etags: Vec::new(),
             part_no: 0,
-            pq: ParquetEncoder::new(self.names.as_ref().clone(), self.delivered.as_ref().clone(), None)?,
+            pq: ParquetEncoder::new(
+                self.names.as_ref().clone(),
+                self.delivered.as_ref().clone(),
+                None,
+                RowGroup::Mib24,
+            )?,
             rows: 0,
         })
     }
@@ -984,22 +986,15 @@ impl S3Loader {
 impl crate::sink::Loader for S3Loader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         self.rows += self.pq.push(&buf)?;
-        let pending = {
-            let mut b = self.pq.out.0.lock().expect("parquet buf");
-            if b.len() < SEND_THRESHOLD {
-                return Ok(());
-            }
-            std::mem::take(&mut *b)
-        };
-        self.flush_part(pending).await
+        match self.pq.out.take_ready() {
+            Some(pending) => self.flush_part(pending).await,
+            None => Ok(()),
+        }
     }
 
     async fn finish(mut self) -> Result<u64> {
         self.pq.finish_file()?;
-        let pending = {
-            let mut b = self.pq.out.0.lock().expect("parquet buf");
-            std::mem::take(&mut *b)
-        };
+        let pending = self.pq.out.take_all();
         if self.etags.is_empty() && pending.is_empty() {
             // Nothing was ever produced (0-row worker): abort the upload so no
             // empty object lands; finalize's 0-row guard handles the rest.

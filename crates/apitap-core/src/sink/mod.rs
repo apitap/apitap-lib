@@ -18,6 +18,30 @@ pub(crate) mod mysql;
 pub(crate) mod s3;
 pub(crate) mod postgres;
 
+/// What ONE pipe of this sink's loader keeps resident at its worst instant,
+/// BEYOND the pipeline's measured chunk-scale term (`pipeline::PIPE_CHUNKS ×
+/// chunk`), for `mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PipeResidency {
+    /// Chunk- and row-group-independent bytes.
+    pub fixed: u64,
+    /// Multiplier on the planner-chosen `RowGroup`; 0 = the sink has none.
+    pub per_row_group: u64,
+    /// Chunk-sized copies the loader holds on top of the pipeline term.
+    pub chunks: u64,
+}
+
+impl PipeResidency {
+    /// The loader holds only chunk-scale buffers already inside the measured
+    /// 10×chunk term.
+    #[allow(dead_code)] // Sink::pipe_residency wires this in the next step.
+    pub const STREAMING: Self = Self {
+        fixed: 0,
+        per_row_group: 0,
+        chunks: 0,
+    };
+}
+
 /// Per-worker stream consumer on the sink side. One loader = one physical ingest
 /// stream (one `COPY … FROM STDIN`, one ClickHouse `INSERT` body).
 pub(crate) trait Loader: Send + 'static {

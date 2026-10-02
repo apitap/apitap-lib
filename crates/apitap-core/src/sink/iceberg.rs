@@ -45,7 +45,7 @@ use crate::plan::{
     resolve_watermark, wm_max, Delivered, DestState, Lane, TablePlan, WireFormat, WmArbitration,
 };
 use crate::sink::s3::S3Conn;
-use crate::wire::bqparquet::{parquet_col_ok, KeyCap, ParquetEncoder};
+use crate::wire::bqparquet::{merge_key_ok, parquet_col_ok, KeyCap, ParquetEncoder, RowGroup};
 use crate::Mode;
 use iceberg::io::{FileIO, FileWrite};
 use iceberg::spec::{
@@ -58,8 +58,6 @@ use iceberg::{TableRequirement, TableUpdate};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-const SEND_THRESHOLD: usize = 8 * 1024 * 1024;
 
 /// One finished data file, reported by its loader for the commit.
 struct FileDone {
@@ -1087,6 +1085,7 @@ impl crate::sink::Sink for IcebergSink {
             self.cursor,
             Some(self.field_ids.as_ref().clone()),
             self.merge_key.map(|(i, _)| i),
+            RowGroup::Mib24,
         )?;
         Ok(IcebergLoader {
             s3,
@@ -1473,6 +1472,9 @@ fn write_delete_parquet(
     ints: &[i64],
     texts: &[String],
 ) -> Result<Vec<u8>> {
+    // The same gate the bulk encoder's capture arm asks (I7/I5): one spelling
+    // for what a merge key may be.
+    merge_key_ok(d)?;
     use parquet::basic::{Compression, LogicalType, Repetition, Type as PhysicalType};
     use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
     use parquet::file::properties::WriterProperties;
@@ -2004,22 +2006,15 @@ impl IcebergLoader {
 impl crate::sink::Loader for IcebergLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         self.rows += self.pq.push(&buf)?;
-        let pending = {
-            let mut b = self.pq.out.0.lock().expect("parquet buf");
-            if b.len() < SEND_THRESHOLD {
-                return Ok(());
-            }
-            std::mem::take(&mut *b)
-        };
-        self.flush_part(pending).await
+        match self.pq.out.take_ready() {
+            Some(pending) => self.flush_part(pending).await,
+            None => Ok(()),
+        }
     }
 
     async fn finish(mut self) -> Result<u64> {
         self.pq.finish_file()?;
-        let pending = {
-            let mut b = self.pq.out.0.lock().expect("parquet buf");
-            std::mem::take(&mut *b)
-        };
+        let pending = self.pq.out.take_all();
         // A 0-row worker still produced parquet header+footer bytes — don't
         // land an empty data file in the manifest; abort the upload instead.
         if self.rows == 0 {

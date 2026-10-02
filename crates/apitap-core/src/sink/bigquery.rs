@@ -30,6 +30,7 @@
 use crate::sink::Loader;
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
+use crate::wire::bqparquet::{RowGroup, SEND_THRESHOLD};
 use crate::Mode;
 use crate::plan::{wm_max, wm_pick};
 use serde_json::{json, Value};
@@ -41,7 +42,6 @@ const BQ_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 /// Resumable-upload chunks must be 256 KiB multiples (Google's contract);
 /// 8 MiB per PUT amortizes round-trips without holding much gzip output.
 const UPLOAD_ALIGN: usize = 256 * 1024;
-const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 /// Rotate to a NEW load job once a file reaches this many COMPRESSED bytes —
 /// but only if ROTATE_SECS have also passed: BigQuery allows ~5 metadata
 /// updates per 10s PER TABLE, and a fast worker sealing a 12 MiB file every
@@ -1366,6 +1366,7 @@ impl BqLoader {
         csv_null_marker: bool,
         cursor: Option<(usize, bool)>,
         shared_wm: Arc<std::sync::Mutex<Option<String>>>,
+        row_group: RowGroup,
     ) -> Result<Self> {
         let mut job_config = base_config.clone();
         job_config["configuration"]["load"]["destinationTable"]["tableId"] = json!(staging_table);
@@ -1374,6 +1375,7 @@ impl BqLoader {
                 names.to_vec(),
                 delivered.as_ref().clone(),
                 cursor,
+                row_group,
             )?)
         } else {
             None
@@ -1593,8 +1595,7 @@ impl BqLoader {
                 // Footer lands in the shared buffer; a fresh writer starts the
                 // next file.
                 pq.finish_file()?;
-                let mut b = pq.out.0.lock().expect("parquet buf");
-                b.drain(..).collect()
+                pq.out.take_all()
             }
             None => std::mem::replace(
                 &mut self.gz,
@@ -1640,7 +1641,7 @@ impl BqLoader {
     async fn drain_aligned(&mut self) -> Result<()> {
         loop {
             let ready = self.pending_len();
-            if ready < UPLOAD_CHUNK {
+            if ready < SEND_THRESHOLD {
                 return Ok(());
             }
             let take = (ready / UPLOAD_ALIGN) * UPLOAD_ALIGN;
@@ -2537,6 +2538,7 @@ impl crate::sink::Sink for BqSink {
             !self.parquet_lane && self.names.len() == 1,
             self.cursor_track,
             self.staged_wm.clone(),
+            RowGroup::Mib24,
         )
     }
 

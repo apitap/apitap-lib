@@ -21,7 +21,7 @@
 
 use crate::error::{Error, Result};
 use crate::plan::{Delivered, Lane, TablePlan, WireFormat};
-use crate::wire::bqparquet::{parquet_col_ok, ParquetEncoder};
+use crate::wire::bqparquet::{parquet_col_ok, ParquetEncoder, RowGroup, SEND_THRESHOLD};
 use crate::wire::csvout::{csv_quote_into, tsv_to_csv};
 use crate::Mode;
 use std::io::Write;
@@ -33,8 +33,6 @@ const API: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD: &str = "https://storage.googleapis.com/upload/storage/v1";
 /// Resumable-chunk alignment GCS requires for every non-final chunk.
 const UPLOAD_ALIGN: usize = 256 * 1024;
-/// Buffered bytes that trigger an upload chunk.
-const SEND_THRESHOLD: usize = 8 * 1024 * 1024;
 /// GCS compose caps at 32 source objects (header + ≤31 parts; pipe profiles
 /// top out well under this).
 const COMPOSE_MAX: usize = 32;
@@ -706,6 +704,7 @@ impl crate::sink::Sink for GcsSink {
                 self.names.as_ref().clone(),
                 self.delivered.as_ref().clone(),
                 None,
+                RowGroup::Mib24,
             )?),
             GcsFormat::Csv => None,
         };
@@ -878,12 +877,8 @@ impl crate::sink::Loader for GcsLoader {
         match &mut self.pq {
             Some(pq) => {
                 self.rows += pq.push(&buf)?;
-                let mut pending = {
-                    let mut b = pq.out.0.lock().expect("parquet buf");
-                    if b.len() < SEND_THRESHOLD {
-                        return Ok(());
-                    }
-                    std::mem::take(&mut *b)
+                let Some(mut pending) = pq.out.take_ready() else {
+                    return Ok(());
                 };
                 self.drain(&mut pending).await?;
                 let mut b = self
@@ -927,8 +922,7 @@ impl crate::sink::Loader for GcsLoader {
         let mut pending = match (self.pq.take(), self.gz.take()) {
             (Some(mut pq), _) => {
                 pq.finish_file()?;
-                let mut b = pq.out.0.lock().expect("parquet buf");
-                std::mem::take(&mut *b)
+                pq.out.take_all()
             }
             (None, Some(gz)) => gz
                 .finish()
