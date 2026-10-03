@@ -100,7 +100,10 @@ impl std::str::FromStr for Mode {
 #[derive(Debug, Clone)]
 pub struct TransferOptions {
     /// Concurrent range pipes. `None` = auto (route-specific CPU heuristic, capped by
-    /// the container's memory). Each pipe holds one connection on both sides.
+    /// the container's memory AND by what the destination holds per pipe: every sink
+    /// declares its `PipeResidency`, and the planner prices it with the chunk, so a
+    /// parquet lane in a small cage loses a row group or a part buffer before it
+    /// loses a pipe). Each pipe holds one connection on both sides.
     pub parallel: Option<usize>,
     /// Numeric column used to split the table into ranges. `None` = auto-detect the
     /// single-column integer primary key; if there is none, Postgres sources fall back
