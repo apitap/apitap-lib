@@ -46,7 +46,7 @@ The two properties everything else rests on:
 | **Process SIGKILLed mid CDC window** | Watermark **unmoved** — the destination is exactly where the last completed window left it. (SIGKILL only: SIGTERM is now handled and lands the window instead — see the row below.) The run's `<dest>_<runtoken>__apitap_lock` is left behind, so re-runs inside the lease's TTL are refused with `locked:`. | **Nothing.** The first run after the TTL (`APITAP_LEASE_TTL_SECS`, 300s by default) collects the lock on the destination's own clock and resumes from the watermark. Every change is then applied exactly once (proven by digest, not by row count alone: 4,000 rows and `sum(id)` identical to the source after the kill + replay). | case 2, and `e2e_cdc_lease.py`, which kills a real drain and then asserts the self-heal |
 | **SIGTERM mid CDC window** (pod evicted, Airflow run cleared, `systemctl stop`) | The window in flight is **applied**, not discarded, and the watermark advances with it. The run exits 0 with a report of the rows it landed. | Nothing. The next run picks up from the new watermark. A second SIGTERM is not absorbed — the default disposition comes back and the process ends at once, which is the SIGKILL case above and equally safe. | `e2e_sigterm.py` (Postgres, incl. a control run with the mechanism disabled), `e2e_sigterm_my.py` (MySQL binlog) |
 | **Two runs of the same destination table at once** (0.55.0+) | **Refused, at `prepare`, before a row moves.** The second run exits non-zero with a `locked:` error naming how long ago the other started, what it is doing, and why the two cannot share the table. Nothing is written; the first run finishes normally. On 0.54.0 and earlier the two interleaved destructively — see [Two runs, one table](#two-runs-one-table). | Run them one at a time — a scheduler's own concurrency setting is the usual answer (Airflow `max_active_runs=1`, a cron `flock`). If the other run is dead rather than slow, drop the staging object the error names and re-run; nothing collects it for you, and the section below says why. | `e2e_concurrent_runs.py` (Postgres: the refusal, the survivor, a control, and fan-in) |
-| **Source connection cut mid-COPY** (server restart, `pg_terminate_backend`, idle/statement timeout, network drop) | Nothing published. The destination table is **not even created** — it only comes into existence at the swap. | Re-run. The error says so explicitly rather than making you guess. | case 3 |
+| **Source connection cut mid-COPY** (server restart, `pg_terminate_backend`, idle/statement timeout, network drop) | Nothing published. The destination table is **not even created** — it only comes into existence at the swap. With `parallel > 1`, <!-- claim: bulk.sibling-cancel --> the other workers stop within one buffer (≤ `chunk_bytes`) of the failure, every destination stream is aborted rather than committed, and staging is swept only after the last of them has ended. On BigQuery the sweep waits for load jobs already submitted to finish or be cancelled. | Re-run. The error says so explicitly rather than making you guess. | case 3; `e2e_worker_cancel.py` |
 | **Structural DDL on the source during a bulk run** | Cannot interleave on Postgres: `COPY` holds `ACCESS SHARE`, and `ALTER TABLE … DROP/ADD COLUMN` needs `ACCESS EXCLUSIVE`, so the DDL **waits for the read to finish**. Column mapping cannot drift mid-stream. | Nothing to do. If the DDL wins a race we do not yet know about, the run fails loudly rather than writing values into the wrong column — that is the assertion the test makes. | case 4 |
 | **CDC schedule stopped for a long time — Postgres** | The replication slot keeps holding WAL on the **source**, which is the guarantee CDC rests on and also how a stopped schedule fills the source's disk. | Run the drain: a backlog is not a reason to refuse, it is a reason to run. apitap prints the retained WAL every run and warns past `APITAP_SLOT_WAL_WARN` (default 4 GiB). Set `max_slot_wal_keep_size` on the server so an abandoned slot is *invalidated* instead of filling the disk — apitap reports that as slot-is-GONE and recovers with a fresh bootstrap. | `e2e_cdc_retention.py` |
 | **CDC schedule stopped for a long time — MySQL/MariaDB** | The opposite risk: the server **purges** binlogs on its own retention, so the stored position can simply be gone. Resuming would skip every change in between. | apitap refuses before asking the server, names the missing file and position, and tells you the only correct recovery: clear that table's state on the destination and re-bootstrap. Prevention: keep binlog retention longer than the longest gap between runs. | `e2e_cdc_retention.py` |
@@ -266,6 +266,14 @@ run leaves it beside the parts.
 | `append`/`merge` | same source | refused — both would read the same watermark and land the same rows twice |
 | `append`/`merge` | **different** source | **allowed** — this is fan-in, and `_apitap_state` keys watermarks per source precisely so it works |
 
+<!-- claim: guard.bulk-vs-bulk --> Two BULK runs of one table are refused on
+every destination this guard covers — Postgres, MySQL, ClickHouse, BigQuery, S3,
+GCS and Iceberg — at `prepare`, before a row moves, and the loser is told which
+run it collided with and how long ago that one started. A bulk run's staging is
+never collected at any age: it holds data, so a run that is merely slow looks
+exactly like a run that died, and no record of liveness means refuse.
+(the GCS lane has no gate leg: the gate's service account is BigQuery-only)
+
 **The `log_based` rows were not enforced until 0.56.0, and 0.55.0 said they
 were.** A CDC drain never entered the guard at all: `transfer(mode="log_based")`
 returns into the drain before the bulk dispatcher runs, and the dispatcher was
@@ -279,19 +287,29 @@ replication-slot check that predates this mechanism.
 The drain mints a `LandKind::Cdc` identity from the same normalized source
 origin the bulk lane uses, writes the same tokenized `__apitap_lock` before it
 reads a watermark or decides whether to bootstrap, and scans for BOTH kinds of
-artifact. A drain and a `replace` now refuse each other in both directions, and
-so do two drains, with the same typed `LockedError` and the same message.
+artifact.
+
+<!-- claim: guard.drain-vs-bulk --> A drain and a `replace` refuse each other
+in both directions, with the same typed `LockedError` and the same message — and
+since 0.57.0 that holds across an upgrade as well, because a 0.57.0 drain
+announces itself with an empty tokenized `__apitap_staging` marker too, which is
+the one artifact a 0.55.1 bulk run scans for ([upgrading and rolling
+back](#upgrading-and-rolling-back)).
+
+<!-- claim: guard.drain-vs-drain --> A second drain is that same collision, so
+two drains of one table refuse each other on all four of those destinations: a
+dead peer's claim is collected and its lock and marker dropped, a live one's is
+refused by type.
 
 Two details worth knowing:
 
-- **A bootstrap hands the guard over.** A first run's full load re-enters
-  `transfer(mode="replace")`, whose sink announces a *swap* lock of its own —
-  and the matrix would have it refuse the drain's. That is the matrix working
-  correctly on the wrong pair, because this is one run and not two, so the drain
-  releases its announcement and the bulk lock covers the load. What that gives
-  up is the instant between the two: two CDC runs that both read "no state" both
-  reach the bootstrap, and the loser is refused by the bulk guard rather than
-  the CDC one. Loudly, either way.
+- <!-- claim: bootstrap.keeps-lock --> **A bootstrap keeps its lock.** A first
+  run's full load is a nested run: it takes a swap lock of its own, and that
+  lock recognises the drain that spawned it, so the drain never releases its
+  announcement. The lock and its lease are held from the scan to the last
+  statement of the bootstrap, including the primary-key and watermark writes. A
+  second first run of the same group started at any point in between is refused
+  with `LockedError` and writes nothing.
 - **A hard-killed drain's lock clears itself. This is the lease.**
   Every clean exit takes the lock back — the graceful SIGTERM stop, an ordinary
   error, a refusal — but a process killed outright (`SIGKILL`, an OOM kill, a
@@ -306,9 +324,11 @@ Two details worth knowing:
   token and the destination server itself says it has lapsed. The default life
   is 300 seconds (`APITAP_LEASE_TTL_SECS`, clamped to 30–3600); the renewal is
   always a tenth of it, so ten ticks have to be missed before a live run looks
-  dead.
+  dead. Since 0.57.0 the keeper also asks the destination which of its rows still
+  exist uncollected, and a key missing from that answer — claimed, never expired —
+  is what stops the drain before its next write.
 
-  Three properties are worth stating exactly, because each one is load-bearing:
+  Five properties are worth stating exactly, because each one is load-bearing:
 
   * **The clock is the destination's, never a client's.** `expires_at` is
     stamped and compared inside the same statement, against the destination's
@@ -316,12 +336,35 @@ Two details worth knowing:
     A destination clock that steps BACKWARD fails safe — nothing is collected
     until it catches up — and the refusal prints the remaining life, so an
     absurd figure shows up in the log instead of nothing at all.
-  * **No lease, no collection — ever.** A lock written by an apitap that
-    predates the lease, one an operator planted, a bulk run's lock, and a
-    staging object at any age all have no liveness record, and the refusal for
-    them still says, word for word, that nothing collects them on their own.
-    This is the same decision that turned `Found::Dead` into `Found::Legacy`:
-    absence of evidence is refusal, not permission.
+  * <!-- claim: lease.live-never-collected --> **A drain whose lease is renewed
+    is never collected.** The keeper renews every tenth of the TTL, off the
+    window path, so a healthy drain is never in the state a collector is looking
+    for. What is irreversible is a CLAIM, not an expiry: every renewal is
+    predicated on the row still being uncollected — `AND NOT collected` in the
+    `UPDATE` on Postgres, MySQL and BigQuery, and on ClickHouse an `INSERT` whose
+    version a biased claim row always outranks — so a claimed drain can neither
+    extend its lease nor write again. A lapsed lease nobody claimed is still that
+    run's on Postgres, MySQL and BigQuery, and the next renewal revives it; on
+    ClickHouse a lapse past half the TTL stops the drain instead, loudly, with
+    nothing written.
+  * <!-- claim: guard.no-lease-no-collect --> **No lease, no collection —
+    ever.** A lock written by an apitap that predates the lease, one an operator
+    planted, a bulk run's lock, and a staging object at any age all have no
+    liveness record, and the refusal for them still says, word for word, that
+    nothing collects them on their own. This is the same decision that turned
+    `Found::Dead` into `Found::Legacy`: absence of evidence is refusal, not
+    permission.
+  * <!-- claim: keeper.skips-own-held-row --> **A member's held row never stalls
+    the others.** A group's members are applied one at a time and each apply
+    holds its own lease row for its whole duration, so the group-wide renewal has
+    to step around the row its own run is holding: Postgres with
+    `FOR UPDATE SKIP LOCKED`, MySQL with a one-second lock wait whose 1205
+    timeout is read as "skip". Without that, one member whose window runs
+    long — a single source transaction larger than the byte budget is enough —
+    would block the renewal and let every other member's lease lapse under a
+    live, healthy group. The
+    keeper also runs on a connection of its own, so two apply lanes cannot
+    starve it.
   * **A lapse alone is not enough, because a partitioned run also stops
     renewing.** On Postgres and MySQL the lease row is also the FENCE: the
     drain's apply transaction takes it `FOR UPDATE` as its first statement and
@@ -332,23 +375,70 @@ Two details worth knowing:
     interleaving that would hurt — fence passes, claim succeeds, drain writes —
     cannot happen, because the fence and the write are one transaction.
 
-  **ClickHouse and BigQuery are not fenced, and the difference is real.**
-  Neither has a row lock the apply can hold, so there the lease is checked, not
-  held: a wrongly evicted drain can still land the ONE window already in flight.
-  That window is idempotent — its rows carry the window's start LSN, and a
-  same-start replay appends nothing twice — and the drain re-checks before it
-  moves the watermark, so the winner's cursor stays authoritative. On those two
-  engines the guarantee reads: *never two winners for longer than one window,
-  and the loser's extra window is an idempotent replay, never a truncation.*
+  **Where the lease is a fence, and where it is only a check.**
+  <!-- claim: fence.evicted-writes-nothing --> On Postgres, MySQL and BigQuery
+  an evicted drain writes nothing more. On Postgres and MySQL the drain's apply
+  transaction holds its lease row from its first statement to COMMIT. On
+  BigQuery every apply script first updates a per-run fence table,
+  `_apitap_fence<token>`, which a collector marks claimed before it proceeds, so
+  a script that overlaps a claim rolls back whole.
+  <!-- claim: check.evicted-stops-within-statement --> ClickHouse has no
+  transaction to hold, so every statement a drain writes there carries its own
+  ownership predicate instead. It runs only while more than half the TTL
+  remains, and the server ends it within half a TTL, so it finishes before any
+  peer can claim the lease. An evicted drain therefore lands at most
+  the one statement already executing; that statement's watermark `INSERT` then
+  writes no row, and the drain stops at its next write. In 0.56.0 BigQuery's apply
+  read no lease at all, and ClickHouse's evicted drain overwrote the collector's
+  claim on its next renewal. Both are proven now by `e2e_cdc_lease_bq.py` and
+  `e2e_cdc_evict_ch.py`.
 
-  **What this does NOT cover.** A killed BULK run's staging table is still not
-  collected by anything, and will not be: it holds data, and nothing can prove a
-  live loader is not writing into it — that is where `classify`'s severity
-  argument has full force. A killed CDC BOOTSTRAP is in the same position: it
-  hands the guard to the bulk lane's lock, which carries no lease. And a
-  partition longer than the TTL now ENDS a drain that would previously have
-  survived it — the correct direction, since a drain that cannot prove it still
-  holds the table must stop, but it is a new way to die.
+  A `changelog=True` destination writes the same windows to a log instead of a
+  table, and the replay rule is stated there in the log's own terms.
+  <!-- claim: changelog.replay-not-doubled --> Every window records
+  `(start, seq_base, end, events)` in `_apitap_cdc_pending` before it appends —
+  inside the window's own transaction on BigQuery — and a replay of that stamp
+  trims the keys it is about to rewrite before it writes them again. So a replay
+  appends nothing twice, of any length: one shorter than the original, or one
+  carrying no rows for a table the first attempt did, still leaves exactly this
+  window's events under this window's own stamp. A replay that finds itself
+  behind an append already recorded is refused instead, naming the rows to
+  delete.
+  <!-- claim: changelog.group-replay --> A group is replayed the same way: one
+  member's failure re-drains every member from the group minimum, and each
+  member's own stamp is what de-duplicates it, so a group's replay is a no-op
+  rather than a second copy.
+
+  **What a kill leaves, and what a partition costs.**
+  <!-- claim: lease.killed-drain-self-heals --> A drain killed outright at any
+  point other than a first run's full load leaves only its lock and marker, and
+  its lock clears itself once the lease lapses, on every guarded destination: on
+  ClickHouse the lease table's TTL never deletes a row that has not been
+  collected, so this holds after a weekend too. A killed BOOTSTRAP is in a
+  different position: the full load's own lock and staging are a bulk run's, and
+  a bulk run's artifacts are never collected — drop them by hand, and the next
+  run's error names them. Once they are gone, the drain's own pair clears itself
+  with the lease like any other.
+  <!-- claim: ch.lease-survives-ttl-merge --> A drain partitioned for longer
+  than the TTL can be collected by a peer; it then writes nothing more on
+  Postgres, MySQL and BigQuery, and at most one statement on ClickHouse, and
+  exits at its next statement or renewal — even after a ClickHouse merge has run
+  on the lease table. A partition long enough for a peer to CLAIM the lease
+  therefore ends a drain at its next write; a lapse with no claimant does not
+  (on ClickHouse, a lapse past half the TTL stops it loudly). What still costs
+  you by hand at any age: a killed BULK run's staging table, because it holds
+  data and nothing can prove a live loader is not still writing into it.
+
+  <!-- claim: collect.claim-then-crash --> **A collection that dies half way is
+  finished, not abandoned.** Every claim is decided by reading the row —
+  `RETURNING` on Postgres, a locked read on MySQL, a biased row on ClickHouse,
+  the `collected` flag itself on BigQuery — so a claim is monotonic: once taken,
+  nothing makes it un-taken. And a collector never closes the victim's lease row,
+  because "no row" would be ambiguous to every fence that reads it. So a
+  collector that stops between taking the claim and dropping the markers leaves
+  the claim taken and the markers standing: the refusal says exactly that, and
+  the next run finishes the collection — sweeping the run's scratch, then the
+  markers the first one did not reach.
 
 - **Iceberg destinations are still unguarded for the drain.** A claim there
   lives in object storage, and the CDC lane holds only a catalog connection;
@@ -357,6 +447,14 @@ Two details worth knowing:
   duplication this design exists to avoid. An Iceberg CDC *bootstrap* rides the
   bulk sink and is covered; its incremental windows are not. One drain per
   Iceberg table stays the scheduler's job.
+
+- <!-- claim: cdc.apply-joined-on-error --> **A drain that loses its source
+  joins its apply before it lets go.** The exit arm awaits the window in flight
+  instead of abandoning it, and a drain dropped before that — a panic unwinding
+  past it — aborts the apply task rather than detaching it, so
+  nothing is written after the lock is taken back. 0.56.0 returned a failed
+  standby status past the join: the run released its lock and raised, and the
+  apply went on committing windows beside the next owner.
 
 An earlier plan for this said "an atomic create has exactly one winner, so use
 one lock". That was wrong and is recorded here so it is not re-proposed: an
@@ -434,6 +532,60 @@ while it is still cheap. Retry and backoff belong to the scheduler, which
 already has them; a clean non-zero exit composes with all of them, and a hang
 composes with none.
 
+## Upgrading and rolling back
+
+A run of one apitap must refuse correctly beside a run of another. From 0.57.0
+that is a designed property rather than a coincidence: `naming::compat::Generation`
+is a table of what every supported release writes beside a table and what it
+scans for, and a unit test refuses to build a release that a supported older
+reader cannot see. The columns are facts about released wheels, so a change to
+either is a test failure rather than a silent rewrite of history.
+
+<!-- claim: compat.old-bulk-refused-by-new-drain --> A 0.57.0 drain announces
+itself with both a `__apitap_lock` and an empty tokenized `__apitap_staging`
+marker, because a 0.55.1 bulk run scans only for staging — so a 0.55.1 or 0.56.0
+`replace` / `append` / `merge` is refused beside it.
+
+<!-- claim: compat.new-drain-refused-by-old-bulk --> The reverse holds too — a
+0.57.0 drain is refused beside a 0.55.1 bulk run on every guarded destination,
+including BigQuery's per-worker staging tables.
+
+**The one hole, and the order that avoids it.**
+<!-- claim: compat.old-drain-writes-nothing --> A 0.55.1 drain writes no artifact
+at all, so nothing can refuse beside it. In a rolling upgrade,
+upgrade the `log_based` jobs first and the bulk jobs after, and until every drain
+is 0.56.0+, do not schedule a bulk run of a table a 0.55.1 drain may be
+draining. 0.55.0 is not a supported neighbour; move it to 0.55.1 first.
+<!-- claim: compat.bq-0560-victim --> On BigQuery,
+stop every 0.56.0 BigQuery drain before any 0.57.0 run of the same dataset
+starts: a 0.56.0 drain never reads its lease, so if a 0.57.0 run collects it
+while it is paused, both write.
+
+**Rolling back.** <!-- claim: compat.rollback-leaks --> A 0.55.1 apitap does not
+know that `_apitap_lease` and `_apitap_cdc_pending` are apitap's, and a
+`tables="*"` transfer that reads this destination as a source replicates them.
+Before rolling back to 0.55.1: stop every drain; confirm that no live lease
+remains — Postgres `SELECT count(*) FROM _apitap_lease WHERE NOT collected AND expires_at > now()`,
+MySQL the same with `UTC_TIMESTAMP(6)`, BigQuery with `CURRENT_TIMESTAMP()`,
+ClickHouse `SELECT count() FROM (SELECT token, argMax(collected, seq) c, argMax(expires_at, seq) e FROM _apitap_lease GROUP BY dest_key, token) WHERE c = 0 AND e > now64(6)` —
+then `DROP TABLE _apitap_lease` and `DROP TABLE _apitap_cdc_pending`, or list
+tables explicitly. Rolling back to 0.56.0 needs nothing, with one cost: a 0.57.0
+drain killed outright leaves a lock and a staging marker, and 0.56.0 collects the
+lock but refuses on the marker, naming it — drop it by hand, once.
+
+**`changelog=True` across the boundary.**
+<!-- claim: changelog.upgrade-stamp-boundary --> 0.55.x stamped `_apitap_lsn`
+with a window's end; 0.56.0+ stamps its start, which is the watermark it drained
+from, so the last old window and the first new one share a stamp. 0.57.0 continues
+`_apitap_seq` above the rows already at that stamp, so `<t>__current` (ordered by
+`lsn DESC, seq DESC`) shows the newer value. Upgrade 0.55.x straight to 0.57.0 —
+do not stop at 0.56.0 on a `changelog=True` destination, because 0.56.0 restarts
+`_apitap_seq` at 0. As a diagnostic (optional, not a step), this counts the rows
+at the current watermark's stamp: ClickHouse `SELECT count() FROM <t> WHERE
+_apitap_lsn = (SELECT watermark FROM _apitap_state FINAL WHERE dest_table='<t>'
+AND source_id NOT LIKE 'server-identity:%') AND _apitap_op != 'B'`, BigQuery the
+same without `FINAL`.
+
 ## Rules of thumb
 
 1. **Re-running is the recovery.** Every failure mode above is repaired by
@@ -448,6 +600,12 @@ composes with none.
    is loud and idempotent. A schedule that quietly stops is what fills a
    Postgres disk or outruns a MySQL binlog — the two cases apitap now reports
    and refuses on, respectively.
+4. **In a memory-capped container, leave `parallel` unset.** Auto never plans
+   more pipes than the memory model fits, and it shrinks a parquet row group
+   (24 → 8 → 4 MiB) before it gives a pipe up. An explicit `parallel` runs
+   exactly as asked; on a parquet destination it gets the smallest row group
+   (4 MiB) and a note saying the model fits fewer — see
+   [Parallelism and memory](usage.md#parallelism-and-memory).
 
 ## The hole that was open, and how it closed
 

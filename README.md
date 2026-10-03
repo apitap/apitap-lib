@@ -103,7 +103,8 @@ durability semantics, troubleshooting — lives in [docs/usage.md](docs/usage.md
 - **Parallel range pipes.** The table is split into N contiguous ranges of its integer
   primary key (auto-detected) and each range streams concurrently.
 - **Bounded memory.** Bytes stream with TCP backpressure; memory is
-  `parallel × chunk_bytes`, not the table size. A 256 MB container moves 10M+ rows.
+  `parallel ×` (chunk buffers + what the destination holds per pipe), never the
+  table size. A 256 MB container moves 10M+ rows.
 - **Warehouse-native ingestion.** BigQuery gets rotating parallel load jobs
   (Parquet or CSV, picked per box) and an atomic copy — the free path end to
   end, with incremental state that never needs DML (sandbox projects work).
@@ -198,11 +199,15 @@ use it for rebuildable destinations.
   the other branch: when each sees the other, both fail, loudly, with nothing
   written.
   Since 0.56.0 `mode="log_based"` drains enter the same guard: a drain and a
-  bulk run refuse each other in both directions, and so do two drains. Iceberg
-  destinations are the exception — their drains are still unguarded, and one
-  drain per Iceberg table stays the scheduler's job.
-  A drain also **renews a lease** while it runs, so a drain killed outright
-  stops blocking the table by itself once that lease lapses
+  bulk run refuse each other in both directions, and so do two drains — and
+  since 0.57.0 that holds across an upgrade as well: a 0.55.1 bulk run is refused
+  beside a 0.57.0 drain, because the drain also announces itself in the older
+  vocabulary. A 0.55.1 drain is the one thing nothing can see; upgrade drains
+  first. Iceberg destinations are the exception — their drains are still
+  unguarded, and one drain per Iceberg table stays the scheduler's job.
+  A drain also **renews a lease** while it runs, and every write it makes — rows
+  and watermark — is conditional on that lease still being its own, so one
+  killed outright stops blocking the table by itself once that lease lapses
   (`APITAP_LEASE_TTL_SECS`, 300s by default) and the next scheduled run resumes
   from its watermark with nothing for an operator to do. A killed *bulk* run's
   staging table is not collected that way and still needs a manual drop — it

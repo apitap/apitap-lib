@@ -96,11 +96,12 @@ independent watermarks and both proceed. Since 0.56.0 a run announces itself
 before it looks, so two runs starting in the same instant can never both
 proceed, and `mode="log_based"` drains are guarded too — a drain and a bulk run
 refuse each other, and so do two drains (Postgres, MySQL, ClickHouse and
-BigQuery destinations; Iceberg drains are not guarded). A drain killed outright
-stops blocking its table by itself once its lease lapses
-(`APITAP_LEASE_TTL_SECS`, 300 s by default) and the next run resumes from the
-watermark; a killed bulk run's staging still needs a manual drop. What each
-failure leaves behind is measured on the
+BigQuery destinations; Iceberg drains are not guarded) — from 0.57.0 also beside
+a 0.55.1 bulk run, though a 0.55.1 drain is invisible to every other run, so
+upgrade drains before bulk jobs. A drain killed outright stops blocking its table
+by itself once its lease lapses (`APITAP_LEASE_TTL_SECS`, 300 s by default) and
+the next run resumes from the watermark; a killed bulk run's staging still needs
+a manual drop. What each failure leaves behind is measured on the
 [failure modes](https://apitap.dev/docs/failure-modes) page.
 
 What happens when a run does *not* finish — killed process, cut connection, DDL

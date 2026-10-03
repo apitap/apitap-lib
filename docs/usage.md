@@ -170,14 +170,40 @@ Branch on the type, not on the message text — see
 Auto `parallel` is route-specific (measured, not guessed): Postgres→Postgres uses up
 to 8 pipes (destination COPY is writer-bound), ClickHouse destinations up to 32,
 MySQL→Postgres up to 16. The auto value is then capped by the cgroup memory
-limit. Each pipe budgets ~10 × `chunk_bytes` plus a 40 MiB reserve, numbers
-fitted to measured whole-container peaks (benchmarks/profiling.md), so the same
-code that uses 32 pipes on a big host uses 5 in a 256 MB container instead of
-getting OOM-killed. When memory, not CPU, is what limits the pipe count and
-`chunk_bytes` wasn't set explicitly, the engine also thins the chunk to 2 MiB
-when that buys extra pipes — measured **1.3-1.8× faster** on 80-128 MB boxes. Memory
-use scales with `parallel × chunk_bytes`, never with table size; bytes stream with
-TCP backpressure.
+limit. <!-- claim: memory.parquet-fits-cage --> Each pipe is priced at
+10 × `chunk_bytes` (fitted to measured whole-container peaks,
+benchmarks/profiling.md) plus what the destination's loader declares it holds per
+pipe. For Postgres, ClickHouse and MySQL that is nothing more. For the parquet
+lanes (S3, GCS, BigQuery, Iceberg) it is two more chunk-sized copies, an 11 MiB
+fixed term — the 8 MiB part buffer, a 1 MiB frame buffer and a 2 MiB page — and
+three row groups; an Iceberg merge adds one more part buffer and page for the
+delete-file companion. A 40 MiB reserve comes on top. In a small container the
+parquet row group shrinks (24 → 8 → 4 MiB) before a pipe is given up, and the
+engine thins the chunk to 2 MiB only when that buys a pipe under the full price.
+Memory is `parallel ×` (chunk-scale buffers + destination residency): never the
+table size, never the size of a merge delta. Bytes stream with TCP backpressure.
+One of those lanes is covered by construction only:
+(the GCS lane has no gate leg: the gate's service account is BigQuery-only)
+
+What that model buys, for the parquet lanes on a 4-core box (which asks for 8
+pipes). Every cell is priced by `pipes ×` (chunk buffers + residency) `+` the
+40 MiB reserve:
+
+| container | 0.57.0 plans | modeled peak |
+|---|---|---|
+| 128 MiB | 1 pipe — 4 MiB chunk, 8 MiB row group | 123 MiB |
+| 256 MiB | 4 pipes — 2 MiB chunk, 4 MiB row group | 228 MiB |
+| 1 GiB | 8 pipes — 4 MiB chunk, 8 MiB row group | 704 MiB |
+
+0.56.0 charged a pipe `10 × chunk_bytes` and nothing else, so at 256 MiB it
+planned 8 pipes of 2 MiB and called it 200 MiB — while a parquet pipe at the fat
+chunk really held 85–88 MiB (benchmarks/profiling.md). That gap is what the
+residency term closes. A cage too small for even one pipe's full price runs the
+one-pipe floor above the model, exactly as in 0.56.0. Iceberg `mode="merge"` pays
+for its delete-file companion inside the row group rather than with a pipe: 3
+pipes at 256 MiB, 2 MiB chunk, 8 MiB row group. An explicit `parallel` is never
+overridden — the row group drops to a rung that fits, or to the 4 MiB floor, and
+a note says which.
 
 ### Cursor and PK-less tables
 
@@ -372,12 +398,16 @@ apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_a
   `prepare`, before a row moves: the second exits non-zero with a `locked:`
   error naming the other run, and nothing is written. Fan-in still works — two
   `append` runs from DIFFERENT sources into one table are allowed, because
-  their watermarks are independent. A run killed with SIGKILL leaves its
-  staging object behind and later runs of that table refuse until you drop it;
-  the error names it. See [Two runs, one table](failure-modes.md) for the full
-  matrix, for why nothing collects that leftover automatically, and for the one
-  case the guard does not cover — two runs that start in the very same instant,
-  where the destination still ends up whole but the loser's error is uglier.
+  their watermarks are independent. A bulk run killed with SIGKILL leaves its
+  staging object behind, and later runs of that table refuse until you drop it;
+  the error names it. A `log_based` drain killed the same way leaves a lock that
+  clears itself once its lease lapses (`APITAP_LEASE_TTL_SECS`, 300 s), and the
+  next run resumes from the watermark — except during a first run's full load,
+  which also leaves the load's own lock and staging for you to drop, since a bulk
+  run's artifacts are never collected. Two runs that start in the very same
+  instant can both be refused; nothing is written when they are. See [Two runs,
+  one table](failure-modes.md#two-runs-one-table) for the matrix and for why
+  nothing collects a bulk leftover automatically.
 - Do not schedule two syncs of the same (source, destination) pair to overlap.
   On 0.55.0+ the second is refused rather than landing the same delta twice; on
   earlier versions it is not, so a scheduler's own concurrency setting (Airflow
@@ -542,6 +572,29 @@ apitap.transfer(
   watermark absorbs it (no skip, no duplicate). BigQuery tables don't dedup,
   so never point two pipelines at one destination table without the fan-in
   guard tripping first.
+- **Every CDC write is fenced.** Each window's `MERGE`, its staging table and
+  its watermark row go in one script whose first statement updates a per-run
+  fence table, so what a drain writes is conditional on that drain still holding
+  the table — and a script that overlaps a collector's claim rolls back whole
+  instead of interleaving with the next owner.
+- <!-- claim: bq.job-identity --> **The job id is the client's.** Every script a
+  CDC run submits is submitted as `apitap_cdc_<uuid4 hex>`, so a retry of the same
+  script finds the job BigQuery already has instead of starting a second one —
+  and it adopts that job only when the query text is the one it submitted.
+- <!-- claim: bq.multi-drain-one-dataset --> **Several drains can share the
+  same dataset.** Each run fences its scripts on its own fence table and renews only
+  its own lease rows, so a sibling's keeper never writes into another run's
+  script, and a collected run's scripts roll back whole rather than interleaving.
+- <!-- claim: bq.replica-rekey-toast --> **A key-changing UPDATE keeps its large
+  values.** The staged row names the key it moved from, and the `MERGE` reads that
+  row's untouched TOAST cells from there — the value the WAL never sent arrives
+  with the row instead of as NULL.
+- <!-- claim: bq.bulk-meets-cdc-lock --> **A bulk run meets a drain's
+  announcement.** A `replace` / `append` / `merge` of a table a drain is holding
+  is refused by type — `apitap.LockedError` — before a single load job is
+  submitted, and the drain's lock is still listed afterwards. One cell of that
+  claim has no leg on this rig:
+  (a sandbox (no-billing) project is not exercised by the gate)
 
 ## Google Sheets source
 
@@ -746,9 +799,11 @@ apitap.transfer(
     travel keeps working; readers flip atomically at the catalog commit.
   - `append` → an **append snapshot** carrying the previous manifests plus
     the delta's data files.
-  - `merge` → a **row-delta snapshot** (merge-on-read upsert): the delta's
-    merge-key values land as an equality-delete file alongside the delta's
-    data files in one commit. Single-column integer/text/uuid keys for now.
+  - `merge` → a **row-delta snapshot** (merge-on-read upsert):
+    <!-- claim: memory.iceberg-merge-flat --> the delta's merge-key values land
+    as one equality-delete file per data file, streamed row group by row group
+    and committed in the same snapshot; memory does not grow with the delta.
+    Single-column integer/text/uuid keys for now.
 - **State lives in the table**: the cursor watermark is written as table
   properties (`apitap.watermark.<source>` + `apitap.watermark-cursor.<source>`)
   **in the same catalog commit as the data** — transactional, queryable, no
@@ -756,8 +811,10 @@ apitap.transfer(
   incremental run **bootstraps from the destination's own parquet footer
   statistics** (a few KB of ranged GETs), which also means apitap can pick up
   incremental sync on an Iceberg table it never wrote — Spark/Trino/pyiceberg
-  output included. Switching cursor columns re-bootstraps instead of reusing
-  a stale value.
+  output included. Since 0.57.0 switching the cursor column on a table that
+  already carries a watermark refuses, instead of quietly re-bootstrapping from
+  the data under the new column's maximum; clear that table's watermark
+  properties first.
 - **Files**: parquet (ZSTD), field ids conformed to the table schema's own
   ids, one file per pipe under `{location}/data/`. Table maintenance
   (snapshot expiry, compaction) stays with your catalog/engine.
@@ -858,11 +915,35 @@ apitap.transfer(
   104 windows). One giant transaction still buffers whole: pgoutput ships
   a transaction only after its commit.
 - **Scheduling**: run it from cron/Airflow at any cadence; the call is
-  identical every time. An overlapping run fails fast (the slot shows
-  active). A paused schedule loses nothing — Postgres retains WAL on the
-  slot until the next run confirms (guard runaway retention with
-  `max_slot_wal_keep_size`). If you retire a schedule, drop its slot:
+  identical every time. An overlapping run is refused before a row moves — by
+  the destination guard on Postgres, MySQL, ClickHouse and BigQuery (0.56.0+),
+  and on a Postgres source also by the slot showing active. Into Iceberg only
+  the slot check applies: Iceberg drains are unguarded, so one drain per Iceberg
+  table is the scheduler's job. A paused schedule loses nothing — Postgres
+  retains WAL on the slot until the next run confirms (guard runaway retention
+  with `max_slot_wal_keep_size`). If you retire a schedule, drop its slot:
   `SELECT pg_drop_replication_slot('apitap_…')`.
+- **TRUNCATE, in order**: <!-- claim: truncate.reaches-dest --> a source
+  `TRUNCATE` is applied in order on every destination — every engine the WAL or
+  binlog saw it on empties the table and moves the watermark in the same run that
+  read it. <!-- claim: truncate.only-window --> A window with no rows after it
+  still applies: a TRUNCATE is often the only event a window carries, and it
+  travels with the table's own layout. On a ClickHouse destination it is applied
+  as a lightweight row delete, so its cost is proportional to the table; on MySQL
+  it stays a real `TRUNCATE` — O(1), applied under the fence: the lease row is
+  renewed while it is held, and the statement's implicit commit publishes that
+  renewal as it begins.
+- <!-- claim: state.cross-lane-refusal --> **One table, one lane.** `append` /
+  `merge` on a table a drain owns, and `log_based` on a table a cursor run owns,
+  are refused on every destination (Postgres, MySQL, ClickHouse, BigQuery,
+  Iceberg) rather than sharing one `_apitap_state` row and quietly re-bootstrapping
+  each other; a cursor switch on an Iceberg table refuses for the same reason
+  instead of re-bootstrapping from the data's own footer statistics.
+- <!-- claim: my.gtid-destination --> **A GTID-enforced MySQL destination** is
+  supported, statement-based binlogs included: the temporary twins the apply
+  needs are created before the fenced transaction opens, which is the only shape
+  `enforce_gtid_consistency=ON` accepts, so every window — updates, deletes, a
+  `TRUNCATE` — is applied and `@@gtid_executed` advances.
 - **TOAST, handled**: an UPDATE that leaves a TOASTed column untouched
   omits that value from the WAL; those rows apply as column-masked UPDATEs
   so the destination's large values survive. Verified in the e2e suite
@@ -906,7 +987,8 @@ apitap.transfer(
   (equality-delete files are single-key), and the parquet lane's bytea
   restriction applies there as everywhere else. BigQuery lands each window in a
   staging table and applies one `MERGE` — it needs a project with billing
-  enabled (CDC uses row-level DML).
+  enabled (CDC uses row-level DML). Iceberg drains are not covered by the
+  destination guard (bootstraps are).
 - **Many tables, ONE slot**: a list of tables forms a slot GROUP — one
   publication, one drain pass per run, one snapshot-pinned bootstrap for
   every member, and the slot is confirmed only after the whole group
@@ -1061,9 +1143,12 @@ apitap.transfer(src, dst, tables=tables, mode="log_based", slots=8)
   — the run refuses loudly rather than silently starting fresh slots and losing
   the WAL the old ones were holding.
 - Each group keeps every guarantee a single group has: snapshot-pinned
-  bootstrap, atomic apply-with-watermark, group-wide confirmation. Tables in
-  *different* groups are no longer at the same instant as each other — that is
-  the trade you are making for the throughput.
+  bootstrap, atomic apply-with-watermark, group-wide confirmation. The groups are
+  <!-- claim: slots.groups-independent --> independent — each holds its own
+  tenure over its own members, so one group's lease, guard and keeper never
+  touch another's, and a table whose peer group is slow or evicted does not hold
+  up the rest. Tables in *different* groups are no longer at the same instant as
+  each other — that is the trade you are making for the throughput.
 - The memory budget is divided by `N`, so peak RSS does not scale with slots.
 - Measured on a 44-core Postgres, 100 tables, 100M changes per round:
   178K/391K/443K/476K changes per second at `N=1/4/8/16`. The knee is at 4–8;
@@ -1097,7 +1182,7 @@ The destination table gains four columns:
 |---|---|
 | `_apitap_op` | `I` insert · `U` update · `D` delete · `T` truncate · `B` the bootstrap baseline |
 | `_apitap_lsn` | the window's START LSN — the watermark it was drained FROM (binlog position for MySQL sources) |
-| `_apitap_seq` | order WITHIN the window — one window stamps one LSN on every row it lands, so `seq` is what orders events inside it |
+| `_apitap_seq` | order within the window's stamp; <!-- claim: changelog.seq-continuation --> it continues (never restarts) above rows an older version wrote at the same stamp |
 | `_apitap_at` | when the window landed (the partition/retention key) |
 
 - **Every operation is kept.** Three updates to one key land three rows, not
@@ -1161,11 +1246,13 @@ The destination table gains four columns:
   same event came back under a different number every time and the pair could
   not be used to de-duplicate anything.
 
-  On ClickHouse a replay now normally appends **nothing at all**: the destination
-  records the window it is about to append, and on the next attempt at the same
-  window it counts what is already there and skips it. On BigQuery a table's
-  `INSERT` and its own watermark row commit in one transaction — as of 0.56.0
-  the statement batcher can no longer split that pair across two.
+  On ClickHouse and BigQuery <!-- claim: changelog.rewind-refused --> a replay
+  appends nothing twice: no `(_apitap_lsn, _apitap_seq)` pair is ever written
+  twice and no event appears under two stamps, including a replay that is
+  shorter than the original or omits a table. A replay whose position is behind
+  an earlier append is refused with a message naming the rows to delete. A
+  BigQuery table's `INSERT` and its own watermark row commit in one transaction —
+  as of 0.56.0 the statement batcher can no longer split that pair across two.
 
   One consequence worth knowing: the bootstrap baseline (`_apitap_op = 'B'`) is
   stamped with the consistent point the snapshot was taken at, and the FIRST
@@ -1281,8 +1368,14 @@ transfers in separate processes if you need their progress apart.
 run installs no handler and still dies on the first SIGTERM, because there is
 nothing useful to land: a bulk load publishes at the swap, so a run stopped
 halfway has produced no partial result to keep. That case is the killed-run row
-in [failure-modes.md](failure-modes.md) — re-run, and the only cost is a
-staging table left on disk until the next run drops it.
+in [failure-modes.md](failure-modes.md) — drop the staging table the next run's
+error names, then re-run: nothing collects a bulk run's staging on its own,
+because a timestamp cannot tell a crashed run from a slow one.
+
+<!-- claim: graceful.stop-releases-lock --> Either way the wind-down
+takes its lock back before the process exits — markers first, and only once every
+one of them is observed gone do the scratch and the lease row go with them — so
+the next run starts on a clean catalog instead of waiting out the TTL.
 
 Set `APITAP_GRACEFUL_STOP=0` to turn all of this off and get the kernel
 default back.

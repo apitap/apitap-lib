@@ -34,18 +34,40 @@
 //! direction; the refusal prints the remaining life so an absurd figure is
 //! visible in the log rather than mute.
 //!
+//! # Ownership is a value, not a check
+//!
+//! **Owning this run's claim means one thing: my row exists and is not
+//! collected.** `expires_at` is not part of it — it is the collector's
+//! permission to claim, and a renewal's right to keep publishing. So a lease
+//! that lapsed with nobody claiming it is still this run's (the next renewal
+//! revives it), and a claimed one is gone for good however healthy the run
+//! behind it still looks.
+//!
 //! # Why a lapse is not enough on its own
 //!
 //! A live run that is merely partitioned from its destination also stops
-//! renewing. So on Postgres and MySQL the lease row is ALSO the fence: the
-//! drain's apply transaction takes it `FOR UPDATE` as its first statement and
-//! renews it in the same transaction, and the collector's claim is an `UPDATE`
-//! of that row with `NOWAIT`. The two cannot interleave, so a run whose lease
-//! was collected writes nothing afterwards — it fails its own fence and exits.
-//! ClickHouse and BigQuery have no such row lock; there the check is
-//! check-then-act and a wrongly-evicted drain can land the one window already
-//! in flight, which the window machinery already makes idempotent. That
-//! weakening is stated in `docs/failure-modes.md` rather than papered over.
+//! renewing, so each engine has to say the same thing in its own words:
+//!
+//! - **Postgres, MySQL** — the lease row is ALSO the fence. The apply
+//!   transaction takes it `FOR UPDATE` as its first statement and renews it in
+//!   the same transaction; a collector's claim is a locked write of that same
+//!   row (`NOWAIT` on Postgres, a one-second wait on MySQL). The two cannot
+//!   interleave, so a run whose claim was collected writes nothing afterwards:
+//!   its next unit fails its own fence and exits.
+//! - **ClickHouse** — no row lock to hold, so the predicate travels inside
+//!   every statement instead: the row exists, is not collected, and has more
+//!   than half a TTL of life left. True at analysis means no claim can be taken
+//!   before `expires_at`, so each statement is bounded server-side to that same
+//!   half and an evicted drain lands at most the one already executing. The
+//!   lease table carries no TTL, and a claim's version outranks every renewal's.
+//! - **BigQuery** — no transaction to roll back either, so every apply script's
+//!   first statement updates this run's own `_apitap_fence<token>` table, and a
+//!   collector marks that table claimed before it proceeds. A script that
+//!   overlaps the claim matches no row and rolls back whole.
+//! - **Iceberg** — the one `Unguarded` store, by design.
+//!
+//! What is weaker on each of them, and what stays deferred, is written down in
+//! `docs/failure-modes.md` rather than papered over.
 
 use crate::error::{Error, Result};
 use crate::guard::{GuardStore, Mine};

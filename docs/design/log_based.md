@@ -114,8 +114,14 @@ Per table over the drained window, keyed by replica-identity columns:
 - insert-then-delete nets to **delete** (kept — dropping it leaves phantoms);
 - residue (ordered, applied after the set phase): key-column NULL,
   unchanged-TOAST masks, hash-collision double-check failures.
-- Output per table: `deletes: Vec<Key>`, `upserts: Vec<Row>`,
-  `residue: Vec<Event>` — sized by the window, not the table.
+- Output per table: `deletes: DeleteSet` (each key once, by construction),
+  `upserts`, `residue` — sized by the window, not the table. The set-image
+  consumers (BigQuery, Iceberg) read `Resolved::rows()`,
+  <!-- claim: bq.replica-one-row-per-key --> which yields every touched key
+  exactly once. BigQuery's staging therefore carries one row per key — at most
+  one source row per target row — and the key a row moved from arrives as that
+  row's `op='D'`, so the same `MERGE` deletes the old key and writes the new
+  one.
 
 ## The bypass: `changelog=True` (analytical destinations)
 
@@ -125,26 +131,36 @@ engine and the user wants the history, `changelog=True` swaps the collapser
 for an accumulator (`logbased/changelog.rs`) that keeps every event in arrival
 order and emits it verbatim:
 
-- `Changes { events: Vec<Change>, count }`, `Change { op, row }`, with
+- `Changes { events: Vec<Change>, count }`, `Change { op, row, moved_from }`, with
   `op ∈ {I, U, D, T}` plus `B` for rows the bootstrap loaded. There is no
   key map and no per-key state — appending is O(1) per event, which is why the
   mode is never slower than the replica path and is measurably faster wherever
   the capture plane isn't already the wall
-  ([the ledger](../../benchmarks/changelog-cdc.md)).
+  ([the ledger](../../benchmarks/changelog-cdc.md)). <!-- claim: changelog.rekey-toast -->
+  The `U` half of a moved key names the key the row came from, which is where its
+  untouched TOAST cells are read — so a re-key never tears a row apart.
 - A **PK-changing update emits two records** — `D` on the old identity, then
   `U` on the new one — so the old key really leaves `__current`. This is the
   one place the accumulator needs the key indices; everything else is opaque.
 - Both capture planes build it: `drain.rs` (Postgres WAL) and `mysource.rs`
-  (MySQL binlog). MySQL carries no TRUNCATE op, so `T` records are
-  Postgres-only.
+  (MySQL binlog). Both planes emit `T` — MySQL writes TRUNCATE as a QUERY event,
+  it has been applied in order since 0.56.0, and a window is cut at every DDL so
+  it never spans a layout change.
 - Applying is one plain INSERT (ClickHouse) or one load job plus one
   `INSERT … SELECT` inside the window transaction (BigQuery). Neither engine
   mutates, so BigQuery needs no billing here and ClickHouse rewrites no parts.
 - `<table>__current` reconstructs the replica: drop everything at or below the
   newest `T`, take the latest record per key by the PAIR `(lsn, seq)` — one
-  window stamps ONE end-LSN on every row it lands, so `seq` orders events
-  inside a window — then drop keys whose newest record is `D`, **after** the
-  pick, never before.
+  window stamps its START on every row it lands, so `seq` orders events inside a
+  window, and `_apitap_seq = seq_base + ordinal` continues above rows another
+  version wrote at the same stamp — then drop keys whose newest record is `D`,
+  **after** the pick, never before.
+- **One replay rule** (`logbased/replay.rs`): every window records
+  `(start, seq_base, end, events)` in `_apitap_cdc_pending` before it appends
+  (ClickHouse) or inside the window's own transaction (BigQuery), and a replay
+  makes the log at that stamp equal exactly the window being replayed — trim what
+  it is about to rewrite, then append. A replay behind an earlier append is
+  refused rather than guessed at.
 - The log is partitioned by TIME (monthly default) for retention, not for
   query speed: `__current` scans every version per key by design.
   `partition_by` is a verbatim expression on ClickHouse and a COLUMN NAME on
@@ -172,8 +188,10 @@ One destination transaction per run (pg/mysql), or one snapshot commit
   multi-statement transaction that also advances the watermark. Column types
   come from the destination's own DDL, so a MySQL binlog source (every OID 0)
   applies through the same path and needs no source pool. Unchanged-TOAST
-  cells ride a per-row mask column resolved inside the MERGE
-  (`IF(masked, T.c, S.c)`). Requires a billed project — CDC uses row-level DML.
+  cells ride a per-row mask column; a row that also MOVED names the key it came
+  from in `_apitap_from_<j>`, and the MERGE's USING body LEFT JOINs the target on
+  that old key, taking each masked column from the row found there — the new key
+  held nothing. Requires a billed project — CDC uses row-level DML.
   BigQuery is LATENCY-bound (each window is a load + MERGE job round-trip, ~0
   local CPU), so it diverges from the CPU-bound paths: it fills a bigger window
   (lever `APITAP_CDC_WINDOW_BYTES`), applies a group's tables CONCURRENTLY,
@@ -196,6 +214,46 @@ the slot name; one row per (dest_table, source). For the slot itself there
 is ONE lsn per (source db, slot) — not per table (kills PipelineWise's
 `min()` disease); multi-table tasks share a slot + publication and commit
 one watermark. Iceberg: `apitap.watermark.*` properties, same shape.
+
+Both lanes read `watermark, cursor_col, mode` with no predicate on either, and
+`naming::state_verdict` decides: a row that is not this lane's is **refused**,
+never silently read as "no state". A drain and a cursor run therefore cannot
+share one row, and a CDC row's NULL watermark is an error rather than a
+re-bootstrap.
+
+## Tenure
+
+Ownership is a value, not a convention. `lease.rs` holds it:
+
+- `LeaseStore` — `lease_key`, `lease_open`, `lease_renew`, `lease_unclaimed`,
+  `close_run`. "I own this" means **my row exists and is not collected**;
+  `expires_at` is only the collector's permission to claim, never the fence.
+- `Fence: LeaseStore` — adds `guard()` (the announce / scan / collect loop),
+  `serial_commit()`, `open_unit`, `close_unit`. A `Unit` is the only writable
+  handle and `Tenure::open` is its only constructor, so "write without owning
+  it" is not expressible. `Tenure::acquire` opens the lease, announces, checks
+  peers, spawns the keeper; `Tenure::release` waits for every open unit, stops
+  the keeper, then gives back markers → scratch → lease, in that order.
+- Each engine spells its own fence, and only its own fence:
+  - **Postgres / MySQL**: the lease row is locked for the whole apply
+    transaction (`FOR UPDATE … AND NOT collected`), so the fence and the write
+    are one transaction and a claim is refused while it is held.
+  - **ClickHouse**: `owner_pred` — the row exists, is not collected, and has more
+    than half a TTL of life — inside every statement, each bounded server-side
+    to that same half. The lease table has no TTL, and a claim's version always
+    outranks a renewal's.
+  - **BigQuery**: `fenced_script` opens with an `UPDATE` of the run's own
+    `_apitap_fence<token>` table and raises `apitap-lease-lost` when it matches no
+    row; a collector marks that table claimed before it proceeds.
+  - **MySQL DDL**: `my_owned_ddl_plan` renews the row, re-reads it, then runs the
+    `TRUNCATE` / `ADD PRIMARY KEY` whose implicit commit publishes that renewal —
+    so a TRUNCATE stays O(1) under the fence.
+  - **Iceberg**: the one `Unguarded` store, by design.
+
+Every statement that reaches a connection lives in the destination's
+`mod store`; a lint test fails the build if a connection type or a
+`COMMIT`/`ROLLBACK` literal appears outside it. Engine modules spell statements;
+`lease.rs` and `guard.rs` decide.
 
 ## Driver decision (RESOLVED)
 
