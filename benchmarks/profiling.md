@@ -341,3 +341,27 @@ anti-join over the snapshot's own files, digit-exact).
   T5/T6 and its per-file membership by T4.
 - Release re-runs these on the PGO wheel per §6.3; those numbers land
   here when the release is gated.
+
+## Session 6 — C: one crew owns every lane (2026-10-04)
+
+The C cluster (0.57.0 steps 39-42) made a failed worker stop its siblings
+before the staging sweep, and gave every task-owning loader a
+`pipe::JoinOnce` so a handle can never be joined twice. The capped headline
+route pays nothing for it: pg→pg 10M (`bench_data_10m`, 11.8M rows) at 0.5
+CPU / 256 MB, n = 3 interleaved, per-row checksums MATCH every round, on
+the PyPI 0.56.0 PGO wheel (`.so` `f9d6cc7b`) against the CP5 wheel
+(`.so` `51ad0fba`):
+
+| wheel | r1 | r2 | r3 | median | cgroup peak |
+|---|---|---|---|---|---|
+| 0.56.0 PGO (before) | 77.88 s | 76.17 s | 75.27 s | **76.17 s** | 48 / 48 / 56 MB |
+| CP5 (after) | 75.38 s | 76.02 s | 76.85 s | **76.02 s** | 48 / 49 / 48 MB |
+
+−0.2 % median, inside the round-to-round spread on both wheels: the crew
+costs nothing on the route that never fails, which is the point of keeping
+the join loop in one place. The cancellation facts live in the gate legs
+(`e2e_worker_cancel.py` on pg, ch, s3, bq and now my: 0.56.0 reads ~0.96N
+after one backend dies and leaves parts/staging behind; this release reads
+< 0.25N and leaves nothing), and the abort semantics of each sink in the
+commit bodies of steps 39-42. The CDC (T9) and mysql→ClickHouse receipts
+land here with the release wheel per §6.3.
