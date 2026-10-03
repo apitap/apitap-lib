@@ -989,6 +989,147 @@ mod tests {
         ("sink/mod.rs", include_str!("sink/mod.rs")),
     ];
 
+    const CFG_TEST: &str = "#[cfg(test)]";
+
+    /// The production text of a watched file: the whole file minus every
+    /// `#[cfg(test)]` item, each skipped by brace match.
+    ///
+    /// Why not "cut at the first `#[cfg(test)]`" (0.57.0): that is only correct
+    /// when a file's test module comes last. `pipeline/dispatch.rs` carries an
+    /// inline `#[cfg(test)] const ROUTES` INSIDE `macro_rules! routes`, ahead of
+    /// the `route_single`/`route_multi`/`unsupported` arms the macro expands to
+    /// and every helper below it — so that whole tail of production text was
+    /// never scanned, and a worker pushed into `one`/`many` would have passed.
+    fn production_text(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let (mut at, mut last) = (0usize, 0usize);
+        while let Some(rel) = text[at..].find(CFG_TEST) {
+            let i = at + rel;
+            out.push_str(&text[last..i]);
+            let end = item_end(text, i + CFG_TEST.len());
+            at = end;
+            last = end;
+        }
+        out.push_str(&text[last..]);
+        out
+    }
+
+    /// Where the item behind an attribute ends: past the `}` that closes its
+    /// block, or past the `;` of a `const`/`use`. A `(`/`[` nests (a `const`
+    /// initializer is a bracket soup before its `;`), strings and comments are
+    /// stepped over, and an unrecognisable tail stops at the attribute — an
+    /// over-skip would hide production text, which is the defect being fixed.
+    fn item_end(text: &str, from: usize) -> usize {
+        let b = text.as_bytes();
+        let (mut i, mut nest) = (from, 0i32);
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    i += 2;
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'"' | b'\'' if nest == 0 => {
+                    i = literal_end(text, i, b[i]);
+                    continue;
+                }
+                b'(' | b'[' => nest += 1,
+                b')' | b']' => nest -= 1,
+                b'{' | b';' if nest == 0 => {
+                    return if b[i] == b'{' { block_end(text, i) } else { i + 1 };
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        from
+    }
+
+    /// Past a `"`/`'` string or `'a` lifetime, starting at the quote. A quote
+    /// followed by an identifier char is a lifetime (nothing to skip); otherwise
+    /// the literal ends at the next unescaped quote of the same kind.
+    fn literal_end(text: &str, at: usize, q: u8) -> usize {
+        let b = text.as_bytes();
+        let nxt = b.get(at + 1).copied().unwrap_or(0);
+        if q == b'\'' && (nxt.is_ascii_alphanumeric() || nxt == b'_') {
+            return at + 1;
+        }
+        let mut i = at + 1;
+        while i < b.len() {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == q {
+                return i + 1;
+            }
+            if b[i] == b'\n' && q == b'\'' {
+                return i; // not a char literal after all
+            }
+            i += 1;
+        }
+        b.len()
+    }
+
+    /// Past the `}` matching the `{` at `at`. Braces inside strings, raws and
+    /// comments do not count: a test's `"{name}: {bad:?}"` is the reason a raw
+    /// count would mis-pair and swallow the production text after it.
+    fn block_end(text: &str, at: usize) -> usize {
+        let b = text.as_bytes();
+        let (mut i, mut depth) = (at, 0i32);
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    i += 2;
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'r' if matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
+                    && !b.get(i.wrapping_sub(1)).is_some_and(|c| c.is_ascii_alphanumeric()) =>
+                {
+                    let mut hashes = 0;
+                    while b.get(i + 1 + hashes) == Some(&b'#') {
+                        hashes += 1;
+                    }
+                    if b.get(i + 1 + hashes) == Some(&b'"') {
+                        let close = format!("\"{}", "#".repeat(hashes));
+                        i += match text[i + 1..].find(&close) {
+                            Some(j) => j + close.len() + 1,
+                            None => b.len(),
+                        };
+                        continue;
+                    }
+                }
+                b'"' | b'\'' => {
+                    i = literal_end(text, i, b[i]);
+                    continue;
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        b.len()
+    }
+
     #[test]
     fn no_spawn_outside_the_crew() {
         // The token set lint, not a parser: these five spellings are the ways
@@ -998,11 +1139,13 @@ mod tests {
             ["tokio::spawn", "task::spawn", "JoinSet", "JoinHandle", "WorkQueue", "fn pop("];
         for (name, text) in WATCHED {
             // The test modules legitimately spawn (their 0.56.0-control bodies
-            // live there); only production text is the source's surface.
-            let prod = match text.find("#[cfg(test)]") {
-                Some(i) => &text[..i],
-                None => text,
-            };
+            // live there); only production text is the source's surface, and
+            // `production_text` keeps ALL of it that is not under `#[cfg(test)]`.
+            let prod = production_text(text);
+            assert!(
+                prod.len() > 0,
+                "{name}: the scanner stripped the whole file — it would pass on anything"
+            );
             for bad in FORBIDDEN {
                 assert!(
                     !prod.contains(bad),
@@ -1178,5 +1321,38 @@ mod tests {
             "the pipe that claimed keeps the error: {err}"
         );
         assert_eq!(panic_count(&log), 1, "the sibling really panicked: {:?}", drain(&log));
+    }
+
+    /// 14. The scanner itself, so lint 9's fix cannot rot back: an inline
+    /// `#[cfg(test)]` item — `pipeline/dispatch.rs` has one inside
+    /// `macro_rules!` — must hide ONLY its own lines, a test module's
+    /// braces-inside-strings must not mis-pair and swallow what follows it, and
+    /// production text on both sides must survive.
+    #[test]
+    fn the_production_scanner_skips_only_cfg_test_items() {
+        let text = "\
+macro_rules! m {
+    #[cfg(test)]
+    const ROUTES: &[(&str, &str)] = &[ (\"a\", \"b\") ];
+    fn one() { let _ = 1; }
+}
+#[cfg(test)]
+mod tests {
+    // braces in a comment: {name} and {0} must not pair up
+    const S: &str = \"{not code}\";
+    #[test]
+    fn t() { assert_eq!(S, \"{not code}\"); }
+}
+fn production() { tokio::spawn(async {}); }
+";
+        let prod = production_text(text);
+        assert!(!prod.contains("ROUTES"), "the inline const is test text: {prod}");
+        assert!(!prod.contains("not code"), "the test module is test text: {prod}");
+        assert!(!prod.contains("braces in a comment"), "and its comment: {prod}");
+        assert!(prod.contains("fn one()"), "the macro arm is production text: {prod}");
+        assert!(
+            prod.contains("tokio::spawn"),
+            "production text after the test module must survive — lint 9 missed it entirely in 0.57.0: {prod}"
+        );
     }
 }
