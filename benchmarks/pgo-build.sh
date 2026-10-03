@@ -79,6 +79,33 @@ docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc \
 docker exec apitap-bench-pg-dst psql -U postgres -d apitap_bench_dst -Atc \
     "DROP TABLE IF EXISTS pgo_cdc; DELETE FROM _apitap_state WHERE dest_table='pgo_cdc'" >/dev/null 2>&1 || true
 
+# T10 (0.57.0): the same drain into CLICKHOUSE. dest_ch's `input()` INSERT path
+# and its owned Statements are new and hot, and profiles are per-branch — an
+# untrained route regresses (the same class as the BigQuery lanes below).
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc \
+    "DROP TABLE IF EXISTS pgo_cdc_ch; CREATE TABLE pgo_cdc_ch(id int primary key, v text); \
+     INSERT INTO pgo_cdc_ch SELECT g, 'v'||g FROM generate_series(1,200000) g" >/dev/null
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$PS', '$CH', table='pgo_cdc_ch', mode='log_based')"
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc \
+    "INSERT INTO pgo_cdc_ch SELECT g, 'w'||g FROM generate_series(200001,400000) g; \
+     UPDATE pgo_cdc_ch SET v='u' WHERE id <= 50000; DELETE FROM pgo_cdc_ch WHERE id BETWEEN 60000 AND 70000" >/dev/null
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    apitap-pgo:inst python -c "
+import apitap
+apitap.transfer('$PS', '$CH', table='pgo_cdc_ch', mode='log_based')"
+docker exec apitap-bench-pg-src psql -U postgres -d apitap_bench_src -Atc \
+    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'apitap_%'; \
+     DROP TABLE pgo_cdc_ch" >/dev/null 2>&1 || true
+docker exec apitap-bench-ch clickhouse-client -q \
+    "DROP TABLE IF EXISTS default.pgo_cdc_ch SYNC; \
+     ALTER TABLE default._apitap_state DELETE WHERE dest_table = 'pgo_cdc_ch' SETTINGS mutations_sync = 2" \
+    >/dev/null 2>&1 || true
+
 # GCS (both formats) needs live GCP creds: set GCS_TRAIN_URL to the parquet
 # URL (gcs://bucket/prefix?format=parquet&credentials=/abs/key.json) and
 # GCS_TRAIN_SA to the key path; skipped otherwise.
