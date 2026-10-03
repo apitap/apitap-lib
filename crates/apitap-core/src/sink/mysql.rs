@@ -1031,6 +1031,15 @@ impl crate::sink::Sink for MySqlSink {
         )
         .await
         .map_err(|e| Error::Transfer(format!("mysql loader session: {e}")))?;
+        // The server-side abort handle, taken on the connection that will run
+        // the LOAD DATA. Needed because closing the stream does NOT abort it
+        // (see `MySqlLoader::abort`): without this id an aborted load COMMITS
+        // its partial rows into staging.
+        let conn_id: u64 = conn
+            .query_first::<u64, _>("SELECT CONNECTION_ID()")
+            .await
+            .map_err(|e| Error::Transfer(format!("mysql loader connection id: {e}")))?
+            .ok_or_else(|| Error::Transfer("mysql loader got no CONNECTION_ID()".into()))?;
 
         let join = tokio::spawn(async move {
             conn.query_drop(&load_sql)
@@ -1043,6 +1052,8 @@ impl crate::sink::Sink for MySqlSink {
             join,
             id,
             registry: self.registry.clone(),
+            conn_id,
+            pool: self.pool.clone(),
         })
     }
 
@@ -1345,6 +1356,42 @@ pub(crate) struct MySqlLoader {
     join: tokio::task::JoinHandle<Result<u64>>,
     id: u64,
     registry: Registry,
+    /// This load's `CONNECTION_ID()`, taken before the LOAD DATA starts. The
+    /// only handle that can stop the load SERVER-side — see `abort`.
+    conn_id: u64,
+    /// Where the KILL is issued from: this loader's connection is busy
+    /// streaming the file, so it cannot be the one to kill it.
+    pool: Pool,
+}
+
+/// How long `abort` waits to have a pooled connection issue the KILL. An abort
+/// must never become a hang — the channel close is what stops the client's side,
+/// the KILL is what stops the server's, and one without the other is survivable.
+const KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl MySqlLoader {
+    /// `KILL QUERY <this load's CONNECTION_ID()>` from another connection.
+    ///
+    /// `KILL QUERY`, not `KILL`: the statement is interrupted and its InnoDB
+    /// transaction rolled back, while the connection itself stays healthy for
+    /// the pool. `KILL` would take the whole connection down and hand the pool a
+    /// corpse it might hand to the next statement.
+    ///
+    /// Failure is tolerated and reported, never fatal: without it the client-side
+    /// close still runs (the 0.57.0 behaviour, which commits a partial file), so
+    /// the best effort is strictly better than none and a bounded wait is
+    /// strictly better than an abort that hangs.
+    async fn kill_statement(&self) -> std::result::Result<(), String> {
+        let sql = format!("KILL QUERY {}", self.conn_id);
+        let fut = async {
+            let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
+            conn.query_drop(sql).await.map_err(|e| e.to_string())
+        };
+        match tokio::time::timeout(KILL_TIMEOUT, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(format!("no answer in {}s", KILL_TIMEOUT.as_secs())),
+        }
+    }
 }
 
 impl Loader for MySqlLoader {
@@ -1368,17 +1415,113 @@ impl Loader for MySqlLoader {
     }
 
     async fn abort(mut self, cause: Error) -> Error {
-        // Close WITHOUT `Finish`: the adapter hands the server the DROPPED
-        // error, so LOAD DATA aborts instead of committing a partial file.
+        // 0.57.0 said here that closing the channel without `Finish` makes
+        // "LOAD DATA abort instead of committing a partial file". That is
+        // FALSE for mysql_async 0.37: its local-infile handler breaks on the
+        // stream error and then UNCONDITIONALLY writes the terminating empty
+        // packet (registry `conn/routines/helpers.rs`, `write_bytes(&[])` after
+        // the `break`), so the server holds a syntactically complete file and
+        // COMMITS the partial rows into `<table>_<token>__apitap_staging`. The
+        // table then survives until `pipeline::run`'s `sink.discard()`, and a
+        // failed discard or a process death in that window leaves a committed,
+        // live-looking staging artifact.
+        //
+        // So the server is told to stop while the statement is still in flight:
+        // the KILL goes out BEFORE the channel closes, because the close is
+        // what makes the handler write the terminating packet. Killing the
+        // statement rolls back the load's transaction, so nothing partial is
+        // committed, and no connection dies. A commit can only have happened
+        // already if the file was closed with bytes still buffered — and those
+        // bytes only reach the server after it asked for them, i.e. while the
+        // statement is running and the KILL lands.
+        //
+        // Only while the loader still holds its connection: once its task has
+        // ended the connection is back in the pool, and `CONNECTION_ID()` could
+        // by then name somebody else's statement.
+        let killed = if self.join.is_finished() {
+            "the load had already ended".to_string()
+        } else {
+            match self.kill_statement().await {
+                Ok(()) => format!("KILL QUERY {} accepted", self.conn_id),
+                Err(e) => format!("KILL QUERY {} NOT accepted: {e}", self.conn_id),
+            }
+        };
         self.tx.close_channel();
         self.registry
             .lock()
             .expect("infile registry")
             .remove(&self.id);
-        let _ = self.join.await;
+        let joined = self.join.await;
+        if std::env::var_os("APITAP_DEBUG").is_some() {
+            eprintln!(
+                "[mysql loader {}] {killed}; join: {joined:?}",
+                self.id
+            );
+        }
         cause
     }
 }
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+
+    /// The body of `fn <header>`, brace matched with strings stepped over.
+    fn fn_body<'a>(src: &'a str, header: &str) -> &'a str {
+        let i = src.find(header).unwrap_or_else(|| panic!("not found: {header}"));
+        let start = i + header.len();
+        let b = src.as_bytes();
+        let (mut j, mut depth) = (start, 1i32);
+        while j < b.len() && depth > 0 {
+            match b[j] {
+                b'"' => {
+                    j += 1;
+                    while j < b.len() && b[j] != b'"' {
+                        j += if b[j] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        &src[start..j.saturating_sub(1)]
+    }
+
+    /// The ORDER is the fix. Closing the stream is what makes mysql_async write
+    /// the terminating empty packet, so the KILL has to leave with the load still
+    /// in flight — after the close it can arrive once the server already holds a
+    /// complete file, and the load COMMITS. `KILL QUERY` (not `KILL`) keeps the
+    /// connection alive for the pool, and the wait is bounded so an abort cannot
+    /// become a hang.
+    ///
+    /// Hermetic proof of the ORDER is a shape check. The server-side effect is
+    /// proven by `e2e_worker_cancel.py my`, which asks the destination server
+    /// itself what a load whose client stops early does (the rows are committed),
+    /// what `KILL QUERY` mid-load does (nothing is), and then reads the aborted
+    /// run's own record of the KILLs it sent.
+    #[test]
+    fn the_kill_goes_out_before_the_stream_closes() {
+        let src = include_str!("mysql.rs");
+        let abort = fn_body(src, "async fn abort(mut self, cause: Error) -> Error {");
+        let kill = abort.find("self.kill_statement().await")
+            .expect("abort must stop the statement server-side");
+        let close = abort.find("self.tx.close_channel()")
+            .expect("abort must still close the stream");
+        assert!(kill < close, "the KILL must leave while the load is in flight: {abort}");
+        assert!(abort.find("self.join.await").is_some(), "and the loader is still awaited: {abort}");
+
+        let killer = fn_body(src, "async fn kill_statement(&self) -> std::result::Result<(), String> {");
+        assert!(killer.contains("KILL QUERY"), "statement-level, so the pool keeps a live conn: {killer}");
+        assert!(killer.contains("self.conn_id"), "the load's own CONNECTION_ID(): {killer}");
+        assert!(killer.contains("self.pool.get_conn()"), "issued from another connection: {killer}");
+        assert!(killer.contains("timeout("), "bounded: {killer}");
+
+        let open = fn_body(src, "async fn loader(&self) -> Result<MySqlLoader> {");
+        assert!(open.contains("SELECT CONNECTION_ID()"), "the id is taken at open: {open}");
+    }
+}
+
 #[cfg(test)]
 mod ssl_default_tests {
     use super::*;

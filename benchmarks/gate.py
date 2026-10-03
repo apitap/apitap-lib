@@ -225,6 +225,8 @@ LEGS = [
         proves={"bulk.sibling-cancel": ("s3",)}),
     leg("e2e_worker_cancel.py", "the same, into BigQuery", {"bq"}, ["bq"],
         proves={"bulk.sibling-cancel": ("bq",)}),
+    leg("e2e_worker_cancel.py", "the same, into MySQL", argv=["my"],
+        proves={"bulk.sibling-cancel": ("my",)}),
 ]
 
 

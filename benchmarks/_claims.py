@@ -77,7 +77,7 @@ CLAIMS = {
     "my.gtid-destination":           Claim("usage.md", ("my-gtid",), ("GTID",)),
 
     # bulk lifecycle and memory
-    "bulk.sibling-cancel":           Claim("failure-modes.md", ("pg", "ch", "s3", "bq"), ("other workers stop",)),
+    "bulk.sibling-cancel":           Claim("failure-modes.md", ("pg", "my", "ch", "s3", "bq"), ("other workers stop",)),
     "memory.parquet-fits-cage":      Claim("usage.md", ("s3", "gcs"), ("row group",)),
     "memory.iceberg-merge-flat":     Claim("usage.md", ("ice",), ("memory does not grow",)),
 }
