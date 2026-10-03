@@ -29,6 +29,7 @@
 
 use crate::sink::Loader;
 use crate::error::{Error, Result};
+use crate::pipe;
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::wire::bqparquet::{RowGroup, SEND_THRESHOLD};
 use crate::Mode;
@@ -1326,7 +1327,7 @@ use crate::wire::csvout::base64_into;
 struct PendingJob {
     id: String,
     location: Option<String>,
-    handle: tokio::task::JoinHandle<Result<u64>>,
+    handle: pipe::JoinOnce<Result<u64>>,
 }
 
 pub(crate) struct BqLoader {
@@ -1635,7 +1636,7 @@ impl BqLoader {
         let pending = PendingJob {
             id: job_id.clone(),
             location: location.clone(),
-            handle: tokio::spawn(async move {
+            handle: pipe::JoinOnce::new(tokio::spawn(async move {
                 let done = conn.poll_job(&job_id, location.as_deref()).await?;
                 let out_rows: u64 = done["statistics"]["load"]["outputRows"]
                     .as_str()
@@ -1648,7 +1649,7 @@ impl BqLoader {
                     )));
                 }
                 Ok(out_rows)
-            }),
+            })),
         };
         self.pending_jobs.push(pending);
         // Fresh file: new resumable session, offsets from zero.
@@ -1685,10 +1686,14 @@ impl BqLoader {
     async fn await_jobs(jobs: &mut Vec<PendingJob>) -> Result<u64> {
         let mut committed = 0u64;
         while !jobs.is_empty() {
-            let p = jobs.remove(0);
+            let mut p = jobs.remove(0);
+            // `JoinOnce`, so a handle can never be polled twice: `quiesce`
+            // reaches the same field on the error path.
             committed += p
                 .handle
+                .join()
                 .await
+                .ok_or_else(|| Error::Transfer("bigquery job task had already been joined".into()))?
                 .map_err(|e| Error::Transfer(format!("bigquery job task: {e}")))??;
         }
         Ok(committed)
@@ -1742,7 +1747,7 @@ impl BqLoader {
         // discard drops it. What must NOT happen is a job outliving `discard`
         // and re-creating a dropped table (CREATE_IF_NEEDED), so every job is
         // cancelled and then awaited to DONE before this returns.
-        for p in std::mem::take(&mut self.pending_jobs) {
+        for mut p in std::mem::take(&mut self.pending_jobs) {
             let loc = p
                 .location
                 .as_deref()
@@ -1762,7 +1767,7 @@ impl BqLoader {
                 .await;
             // MANDATORY: return only once the job is TERMINAL (DONE, succeeded
             // or failed), so discard deletes a table no job can re-create.
-            let _ = p.handle.await;
+            let _ = p.handle.join().await;
             // One extra poll: a transient error in the background task, or a
             // task aborted with the runtime, must not leave the end unproven.
             let _ = self.conn.poll_job(&p.id, p.location.as_deref()).await;
@@ -2884,7 +2889,7 @@ mod tests {
         PendingJob {
             id: id.to_string(),
             location: None,
-            handle: tokio::spawn(async move { r }),
+            handle: pipe::JoinOnce::new(tokio::spawn(async move { r })),
         }
     }
 
@@ -2976,7 +2981,7 @@ mod tests {
         assert!(!commit.contains("mem::take"), "commit must never take the whole list: {commit}");
         let quiesce = fn_body(src, "async fn quiesce(&mut self) {");
         assert!(quiesce.contains("/cancel"), "every job is cancelled: {quiesce}");
-        assert!(quiesce.contains("p.handle.await"), "and awaited to terminal: {quiesce}");
+        assert!(quiesce.contains("p.handle.join().await"), "and awaited to terminal: {quiesce}");
         assert!(quiesce.contains("poll_job"), "with one extra poll: {quiesce}");
     }
 

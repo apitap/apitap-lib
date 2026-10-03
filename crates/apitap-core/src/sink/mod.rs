@@ -89,6 +89,13 @@ pub(crate) trait Loader: Send + 'static {
     ///
     /// `finish` and `abort` are called only by `pipe::Pipe::drive`. Sources hold
     /// `&mut pipe::Pipe<L>`, which has neither.
+    ///
+    /// A loader that runs its ingest in a spawned task holds that task in a
+    /// [`JoinOnce`](crate::pipe::JoinOnce) and joins it AT MOST ONCE. `send`
+    /// joins it to report the REAL failure behind a closed channel — a proxy's
+    /// 413, a COPY the server aborted — and the abort the engine runs next
+    /// must not await the same handle again: awaiting a finished task handle
+    /// twice is a panic, and it costs the run the error it was carrying.
     fn finish(self) -> impl Future<Output = Result<u64>> + Send;
     /// Source-side failure: make the sink DISCARD the partial stream (a clean close
     /// could commit it), then hand the cause back for propagation.

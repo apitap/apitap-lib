@@ -30,6 +30,7 @@
 use crate::sink::{FinishMarked, Loader, Msg};
 use crate::dialect::mysql::{is_binary_udt, my_ident};
 use crate::error::{Error, Result};
+use crate::pipe;
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
 use bytes::Bytes;
@@ -1041,12 +1042,12 @@ impl crate::sink::Sink for MySqlSink {
             .map_err(|e| Error::Transfer(format!("mysql loader connection id: {e}")))?
             .ok_or_else(|| Error::Transfer("mysql loader got no CONNECTION_ID()".into()))?;
 
-        let join = tokio::spawn(async move {
+        let join = pipe::JoinOnce::new(tokio::spawn(async move {
             conn.query_drop(&load_sql)
                 .await
                 .map_err(|e| Error::Transfer(format!("LOAD DATA: {e}")))?;
             Ok(conn.affected_rows())
-        });
+        }));
         Ok(MySqlLoader {
             tx,
             join,
@@ -1353,7 +1354,9 @@ impl MySqlSink {
 
 pub(crate) struct MySqlLoader {
     tx: mpsc::Sender<Msg<Bytes>>,
-    join: tokio::task::JoinHandle<Result<u64>>,
+    /// The LOAD DATA task, joined ONCE (`pipe::JoinOnce`): `finish` and `abort`
+    /// are mutually exclusive, and a second poll of a finished handle panics.
+    join: pipe::JoinOnce<Result<u64>>,
     id: u64,
     registry: Registry,
     /// This load's `CONNECTION_ID()`, taken before the LOAD DATA starts. The
@@ -1409,9 +1412,10 @@ impl Loader for MySqlLoader {
             .await
             .map_err(|_| Error::Transfer("mysql LOAD DATA stream closed early".into()))?;
         self.tx.close_channel();
-        self.join
-            .await
-            .map_err(|e| Error::Transfer(format!("mysql loader join: {e}")))?
+        match self.join.join().await {
+            Some(r) => r.map_err(|e| Error::Transfer(format!("mysql loader join: {e}")))?,
+            None => Err(Error::Transfer("mysql LOAD DATA task had already ended".into())),
+        }
     }
 
     async fn abort(mut self, cause: Error) -> Error {
@@ -1451,7 +1455,7 @@ impl Loader for MySqlLoader {
             .lock()
             .expect("infile registry")
             .remove(&self.id);
-        let joined = self.join.await;
+        let joined = self.join.join().await;
         if std::env::var_os("APITAP_DEBUG").is_some() {
             eprintln!(
                 "[mysql loader {}] {killed}; join: {joined:?}",
@@ -1509,7 +1513,10 @@ mod abort_tests {
         let close = abort.find("self.tx.close_channel()")
             .expect("abort must still close the stream");
         assert!(kill < close, "the KILL must leave while the load is in flight: {abort}");
-        assert!(abort.find("self.join.await").is_some(), "and the loader is still awaited: {abort}");
+        assert!(
+            abort.find("self.join.join().await").is_some(),
+            "and the loader is still awaited: {abort}"
+        );
 
         let killer = fn_body(src, "async fn kill_statement(&self) -> std::result::Result<(), String> {");
         assert!(killer.contains("KILL QUERY"), "statement-level, so the pool keeps a live conn: {killer}");

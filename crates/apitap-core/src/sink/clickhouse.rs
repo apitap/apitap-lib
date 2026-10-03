@@ -4,6 +4,7 @@
 
 use crate::sink::{FinishMarked, Loader, Msg};
 use crate::error::{Error, Result};
+use crate::pipe;
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
 use crate::Mode;
 
@@ -2147,7 +2148,10 @@ impl ChSink {
 /// error to an opaque "error sending request" on the body side).
 pub(crate) struct ChLoader {
     tx: futures::channel::mpsc::Sender<Msg<bytes::Bytes>>,
-    join: tokio::task::JoinHandle<Result<()>>,
+    /// Joined ONCE, by whichever reaches it first: `send`'s error path takes it
+    /// to report the real failure, and the abort that follows must not poll it
+    /// again (see `pipe::JoinOnce`).
+    join: pipe::JoinOnce<Result<()>>,
     /// Kept so the loader can open a SECOND request when a body cap is set.
     ch: ChConn,
     insert_sql: String,
@@ -2158,7 +2162,14 @@ pub(crate) struct ChLoader {
 impl ChLoader {
     fn open(ch: ChConn, insert_sql: String) -> Self {
         let (tx, join) = Self::spawn_request(ch.clone(), insert_sql.clone());
-        Self { tx, join, ch, insert_sql, cap: max_body_bytes(), sent: 0 }
+        Self {
+            tx,
+            join: pipe::JoinOnce::new(join),
+            ch,
+            insert_sql,
+            cap: max_body_bytes(),
+            sent: 0,
+        }
     }
 
     fn spawn_request(
@@ -2188,24 +2199,33 @@ impl ChLoader {
         use futures::SinkExt;
         let (tx, join) = Self::spawn_request(self.ch.clone(), self.insert_sql.clone());
         let mut old_tx = std::mem::replace(&mut self.tx, tx);
-        let old_join = std::mem::replace(&mut self.join, join);
+        let mut old_join = std::mem::replace(&mut self.join, pipe::JoinOnce::new(join));
         let _ = old_tx.send(Msg::Finish).await; // clean end-of-body: this request commits
         drop(old_tx);
-        match old_join.await {
-            Ok(Ok(())) => {
+        match old_join.join().await {
+            Some(Ok(Ok(()))) => {
                 self.sent = 0;
                 Ok(())
             }
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(Error::Transfer(format!("join: {e}"))),
+            Some(Ok(Err(e))) => Err(e),
+            Some(Err(e)) => Err(Error::Transfer(format!("join: {e}"))),
+            // `send` already joined this request and reported its failure, so
+            // there is nothing left to wait for and nothing to commit.
+            None => Err(Error::Transfer(
+                "clickhouse insert closed early: its request had already ended".into(),
+            )),
         }
     }
 
-    async fn real_error(join: &mut tokio::task::JoinHandle<Result<()>>) -> Error {
-        match join.await {
-            Ok(Ok(())) => Error::Transfer("clickhouse insert closed early".into()),
-            Ok(Err(e)) => e,
-            Err(e) => Error::Transfer(format!("join: {e}")),
+    /// The REAL failure of a refused request. Taking the handle is what makes
+    /// this the ONE time it is awaited: the engine's `abort` runs next, and it
+    /// must not poll a handle this already consumed.
+    async fn real_error(join: &mut pipe::JoinOnce<Result<()>>) -> Error {
+        match join.join().await {
+            Some(Ok(Ok(()))) => Error::Transfer("clickhouse insert closed early".into()),
+            Some(Ok(Err(e))) => e,
+            Some(Err(e)) => Error::Transfer(format!("join: {e}")),
+            None => Error::Transfer("clickhouse insert closed early: no live request".into()),
         }
     }
 }
@@ -2249,21 +2269,26 @@ impl Loader for ChLoader {
         let Self { mut tx, mut join, .. } = self;
         let _ = tx.send(Msg::Finish).await; // clean end-of-body: ClickHouse commits
         drop(tx);
-        match (&mut join).await {
-            Ok(r) => r.map(|_| 0), // rows counted server-side by the sink
-            Err(e) => Err(Error::Transfer(format!("join: {e}"))),
+        match join.join().await {
+            Some(Ok(r)) => r.map(|_| 0), // rows counted server-side by the sink
+            Some(Err(e)) => Err(Error::Transfer(format!("join: {e}"))),
+            // Nothing can prove the insert committed, so this is not an `Ok`.
+            None => Err(Error::Transfer("clickhouse insert closed early".into())),
         }
     }
 
     async fn abort(self, cause: Error) -> Error {
-        let Self { tx, join, .. } = self;
+        let Self { tx, mut join, .. } = self;
         // No `Finish`: dropping the sender makes the adapter hand the request
         // body the DROPPED error, so ClickHouse DISCARDS the partial stream
         // instead of committing it. With a body cap set, earlier requests have
         // already committed — the staging table they filled is dropped by the
         // caller's cleanup, and a CDC window replays its delete.
         drop(tx);
-        let _ = join.await;
+        // `None` here is the refused-request case (`e2e_ch_body_cap.py`): `send`
+        // joined this request to report the proxy's 413, so the task is already
+        // ended and re-awaiting the handle is the panic the 0.57.0 gate caught.
+        let _ = join.join().await;
         cause
     }
 }

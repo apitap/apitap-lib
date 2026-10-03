@@ -217,6 +217,59 @@ impl<L: Loader> Drop for Pipe<L> {
     }
 }
 
+/// A loader's background task, joinable AT MOST ONCE.
+///
+/// Tokio answers a second poll of a finished handle with a PANIC ("JoinHandle
+/// polled after completion"), and a loader's handle is reached from two
+/// directions BY DESIGN: `send`/`finish` join it to learn the REAL failure — a
+/// 413 from a body-limiting proxy, a COPY the server aborted — and the engine
+/// then calls `abort` on that same loader, which must still WAIT for the task
+/// before `discard` runs (I1, I5). Dropping the handle instead would detach
+/// the task, which is the 0.56.0 defect all over again.
+///
+/// 0.57.0 held the bare handle, so the abort that follows a failed `send`
+/// polled a completed one: the panic escaped `drive` (whose `catch_unwind`
+/// covers `body.run` only), the join loop saw a `JoinError`, and the whole set
+/// answered `worker panicked: JoinHandle polled after completion` INSTEAD of
+/// the sink's own error. `join` TAKES the handle, so the second caller gets
+/// `None` and the task is joined exactly once — and taking before the await
+/// keeps the invariant true even when the joiner itself is cancelled.
+pub(crate) struct JoinOnce<T> {
+    h: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> JoinOnce<T> {
+    pub(crate) fn new(h: tokio::task::JoinHandle<T>) -> Self {
+        Self { h: Some(h) }
+    }
+
+    /// The task has ended, or there is none left to wait for. A loader about to
+    /// stop something SERVER-side asks this first — the handle is usually gone
+    /// by then, because `send` joined it to report the failure. Never a poll.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.h.as_ref().map_or(true, |h| h.is_finished())
+    }
+
+    /// Join the task once. `None` = a previous caller already joined it: there
+    /// is nothing left to wait for, and NOT "it succeeded".
+    pub(crate) async fn join(
+        &mut self,
+    ) -> Option<std::result::Result<T, tokio::task::JoinError>> {
+        match self.h.take() {
+            Some(h) => Some(h.await),
+            None => None,
+        }
+    }
+}
+
+/// `PendingJob` derives `Debug` and holds one of these, so the handle stays
+/// unprinted: its `T` need not be `Debug`.
+impl<T> std::fmt::Debug for JoinOnce<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinOnce").finish_non_exhaustive()
+    }
+}
+
 enum Outcome {
     Done(u64),
     Cause(Error),
@@ -1354,5 +1407,181 @@ fn production() { tokio::spawn(async {}); }
             prod.contains("tokio::spawn"),
             "production text after the test module must survive — lint 9 missed it entirely in 0.57.0: {prod}"
         );
+    }
+
+    /// The 413 a body-limiting proxy answers with, and the three things the
+    /// operator has to read to fix it — the message `sink::clickhouse` builds
+    /// and `benchmarks/e2e_ch_body_cap.py` asserts on the real transfer.
+    const BODY_CAP_413: &str = "clickhouse 413 Payload Too Large: a proxy in front of \
+         ClickHouse refused the request body. apitap streams each worker's data \
+         as ONE chunked request, so a body limit (nginx client_max_body_size, \
+         ingress/ALB caps) rejects it regardless of chunk size. Either raise that \
+         limit, or set APITAP_CH_MAX_BODY=<size below the limit, e.g. 512K> plus a \
+         matching chunk_bytes= to split the load across requests.";
+
+    /// 15. (0.57.0 fix) The panic the CHECKPOINT 5 gate caught, in its own
+    /// type: a finished task handle polled a second time. `join` TAKES, so the
+    /// second caller has nothing to poll — it cannot panic, and it is told
+    /// there was nothing left (`None`) rather than being handed a fake success.
+    #[tokio::test]
+    async fn a_loader_task_handle_is_joined_at_most_once() {
+        let mut j = JoinOnce::new(tokio::spawn(async { 7u64 }));
+
+        assert!(
+            matches!(j.join().await, Some(Ok(7))),
+            "the first join carries the task's value"
+        );
+        assert!(j.join().await.is_none(), "the second join has nothing to poll");
+        assert!(j.is_finished(), "no task left is finished");
+        assert!(j.join().await.is_none(), "and joining again stays None");
+    }
+
+    /// 16. (0.57.0 fix) The gate's whole case, at the crew's own level: pg →
+    /// ClickHouse through a 1 MB-body proxy with `parallel=32`. Every worker's
+    /// `send` fails; the first one joins its own request task to learn the REAL
+    /// error, and `Pipe::drive` then calls `abort` on that same loader — which
+    /// must still consume it and wait for its task. With the bare handle it
+    /// waited for a task that had already ended, the panic escaped `drive`, the
+    /// join loop saw a `JoinError`, and the set answered `worker panicked:
+    /// JoinHandle polled after completion`, naming a tokio internal instead of
+    /// the 413 that names the fix.
+    struct SelfJoiningLoader {
+        id: usize,
+        log: Arc<Mutex<Vec<Ev>>>,
+        join: JoinOnce<Result<u64>>,
+    }
+
+    impl SelfJoiningLoader {
+        /// Every worker's request is refused by the proxy, so every task ends
+        /// in the same 413.
+        fn refused(id: usize, log: Arc<Mutex<Vec<Ev>>>) -> Self {
+            let task = tokio::spawn(async { Err(Error::Transfer(BODY_CAP_413.to_string())) });
+            Self { id, log, join: JoinOnce::new(task) }
+        }
+    }
+
+    impl Loader for SelfJoiningLoader {
+        async fn send(&mut self, _buf: Vec<u8>) -> Result<()> {
+            self.log.lock().unwrap().push(Ev::Send(self.id));
+            match self.join.join().await {
+                Some(Ok(Ok(_))) => Ok(()),
+                // The real failure, which the channel close alone never carried.
+                Some(Ok(Err(e))) => Err(e),
+                Some(Err(e)) => Err(Error::Transfer(format!("join: {e}"))),
+                None => Err(Error::Transfer("the insert task was already joined".into())),
+            }
+        }
+
+        async fn finish(self) -> Result<u64> {
+            Err(Error::Transfer("a refused insert never finishes".into()))
+        }
+
+        async fn abort(mut self, cause: Error) -> Error {
+            // The engine MUST consume the loader after a failed send, and this
+            // is the wait that panicked: `send` had already joined the task.
+            let joined = self.join.join().await;
+            self.log.lock().unwrap().push(Ev::Abort(
+                self.id,
+                format!("{cause} [task joined: {}]", joined.is_some()),
+            ));
+            cause
+        }
+    }
+
+    enum CappedCrew {
+        /// The worker whose `send` is refused by the proxy, and which claims
+        /// the set with the 413.
+        First,
+        /// A sibling: it keeps working until the claim, then returns `Ok` —
+        /// which `drive` turns into an abort, so it finishes beside the failed
+        /// worker instead of racing it for the first cause.
+        Second,
+    }
+
+    impl PipeBody<SelfJoiningLoader> for CappedCrew {
+        async fn run(self, pipe: &mut Pipe<SelfJoiningLoader>, _spans: Spans) -> Result<Rows> {
+            match self {
+                CappedCrew::First => {
+                    pipe.send(vec![0; 8]).await?;
+                    Ok(Rows::Own(1))
+                }
+                CappedCrew::Second => {
+                    while !pipe.latch.is_set() {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(Rows::Own(2))
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_sends_own_error_survives_the_abort_that_follows_it() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let loaders = (0..4)
+            .map(|i| SelfJoiningLoader::refused(i, log.clone()))
+            .collect::<Vec<_>>();
+
+        let res = Pipes::for_read(loaders)
+            .run(vec!["one span".to_string()], |i| {
+                if i == 0 {
+                    CappedCrew::First
+                } else {
+                    CappedCrew::Second
+                }
+            })
+            .await;
+
+        let err = res.expect_err("the 413 is the run's error");
+        let msg = err.to_string();
+        for want in ["413", "APITAP_CH_MAX_BODY", "client_max_body_size"] {
+            assert!(msg.contains(want), "the 413 must name {want}: {msg}");
+        }
+        assert!(
+            !msg.contains("worker panicked") && !msg.contains("polled after completion"),
+            "a tokio internal must never stand in for the sink's error: {msg}"
+        );
+        let events = drain(&log);
+        let aborts = abort_events(&log);
+        assert_eq!(aborts.len(), 4, "every pipe is consumed: {events:?}");
+        assert!(
+            aborts.iter().any(|(id, cause)| *id == 0 && cause.contains("413")),
+            "and the abort that panicked is the one carrying it: {events:?}"
+        );
+        assert!(
+            aborts.iter().any(|(id, cause)| *id == 0 && cause.contains("task joined: false")),
+            "the abort waits for a task its send already joined, and does not \
+             poll it again: {events:?}"
+        );
+        assert_eq!(finish_count(&log), 0, "a refused insert never finishes: {events:?}");
+    }
+
+    /// 17. The rule the two tests above rest on, as a lint: every task a loader
+    /// owns is a [`JoinOnce`]. A loader whose `send` joins its task to report
+    /// the real failure and whose `abort` must wait for it again cannot hold a
+    /// bare handle — that is the exact shape that panicked, and it is invisible
+    /// in review because both awaits look locally correct.
+    const SINKS_WITH_TASKS: [(&str, &str); 4] = [
+        ("sink/clickhouse.rs", include_str!("sink/clickhouse.rs")),
+        ("sink/postgres.rs", include_str!("sink/postgres.rs")),
+        ("sink/mysql.rs", include_str!("sink/mysql.rs")),
+        ("sink/bigquery.rs", include_str!("sink/bigquery.rs")),
+    ];
+
+    #[test]
+    fn every_loader_task_handle_is_a_join_once() {
+        for (name, text) in SINKS_WITH_TASKS {
+            let prod = production_text(text);
+            assert!(prod.len() > 0, "{name}: the scanner stripped the whole file — it would pass on anything");
+            // A FIELD declaration is the one spelling that means "this loader
+            // holds a handle it will await": a spawn site's return type has no
+            // colon in front of it.
+            assert!(
+                !prod.contains(": tokio::task::JoinHandle"),
+                "{name}: a loader holds a raw task handle. `send` and `abort` \
+                 both reach it, and awaiting a finished one panics — hold it in \
+                 a `pipe::JoinOnce` instead."
+            );
+        }
     }
 }
