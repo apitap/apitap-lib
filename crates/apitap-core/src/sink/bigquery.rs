@@ -1318,9 +1318,11 @@ use crate::wire::csvout::base64_into;
 // Loader: one resumable-upload load job per worker
 // ============================================================================
 
-/// One sealed file's load job, kept whole so `abort` can name it to
-/// `jobs.cancel` and then await its TERMINAL state. The handle alone would
-/// leave `abort` unable to prove the job ended once its task was disconnected.
+/// One sealed file's load job, kept whole so `quiesce` can name it to
+    /// `jobs.cancel` and then await its TERMINAL state. The handle alone would
+    /// leave `quiesce` unable to prove the job ended once its task was
+    /// disconnected.
+#[derive(Debug)]
 struct PendingJob {
     id: String,
     location: Option<String>,
@@ -1348,7 +1350,9 @@ pub(crate) struct BqLoader {
     /// Rows in the CURRENT file (cross-checked against its job's outputRows).
     file_rows: u64,
     /// Completed files' jobs, polling in the background while later files
-    /// stream — each resolves to its committed row count.
+    /// stream — each resolves to its committed row count. `await_jobs` empties
+    /// it one handle at a time and `quiesce` drains what is left, so no handle
+    /// is ever dropped while its job can still run.
     pending_jobs: Vec<PendingJob>,
     last_seal: std::time::Instant,
     /// APITAP_DEBUG=1: cumulative per-phase wall time, reported at finish.
@@ -1666,6 +1670,112 @@ impl BqLoader {
             self.put_chunk(chunk, None).await?;
         }
     }
+
+    /// Wait for every sealed file's load job, in seal order, and add up the rows
+    /// it committed.
+    ///
+    /// Each handle LEAVES `jobs` as it is awaited, so an error part-way through
+    /// leaves every un-awaited handle owned by the caller — `quiesce` then
+    /// cancels them and waits for them to be TERMINAL. `mem::take` here would
+    /// hand them all to the loop, and the early return would DROP them: a
+    /// dropped `JoinHandle` is detached on tokio, so the job keeps loading while
+    /// `pipeline::run`'s error arm runs `discard()` underneath it, and a job
+    /// still PENDING re-creates the staging table it dropped (CREATE_IF_NEEDED,
+    /// `bq_job_config`) — the next run then refuses it with `locked:`.
+    async fn await_jobs(jobs: &mut Vec<PendingJob>) -> Result<u64> {
+        let mut committed = 0u64;
+        while !jobs.is_empty() {
+            let p = jobs.remove(0);
+            committed += p
+                .handle
+                .await
+                .map_err(|e| Error::Transfer(format!("bigquery job task: {e}")))??;
+        }
+        Ok(committed)
+    }
+
+    /// Seal the last file, wait for every job, and only then advance the staged
+    /// watermark. Every `?` here leaves through `finish`, which quiesces.
+    async fn commit(&mut self) -> Result<u64> {
+        if self.file_rows > 0 || self.session_uri.is_some() {
+            self.seal_file().await?;
+        }
+        let t_poll = std::time::Instant::now();
+        let n_jobs = self.pending_jobs.len();
+        let committed = Self::await_jobs(&mut self.pending_jobs).await?;
+        if std::env::var("APITAP_DEBUG").is_ok() {
+            eprintln!(
+                "[bq loader] rows={} files={n_jobs} transcode={:.1}s gzip={:.1}s \
+                 upload={:.1}s job_wait={:.1}s",
+                self.rows,
+                self.t_transcode.as_secs_f64(),
+                self.t_gzip.as_secs_f64(),
+                self.t_upload.as_secs_f64(),
+                t_poll.elapsed().as_secs_f64(),
+            );
+        }
+        if committed != self.rows {
+            return Err(Error::Transfer(format!(
+                "bigquery load jobs landed {committed} rows, worker sent {} — \
+                 refusing to continue on a partial load",
+                self.rows
+            )));
+        }
+        // Only rows the jobs COMMITTED may advance the staged watermark.
+        if let Some(pq) = &mut self.pq {
+            self.local_wm = pq.wm.take();
+        }
+        if let (Some((_, numeric)), Some(local)) = (self.cursor, self.local_wm.take()) {
+            let mut shared = self.shared_wm.lock().expect("wm lock");
+            *shared = wm_max(shared.take(), Some(local), numeric);
+        }
+        Ok(committed)
+    }
+
+    /// Bring every load job this loader submitted to a TERMINAL state and drop
+    /// the resumable session. `abort` is this plus the cause; `finish`'s error
+    /// arms run it too, because `finish` consumed the loader and cannot leave
+    /// the work to `abort`.
+    async fn quiesce(&mut self) {
+        // Sealed files' jobs may already have committed into STAGING — harmless,
+        // staging never reaches the final table on a failed run and the caller's
+        // discard drops it. What must NOT happen is a job outliving `discard`
+        // and re-creating a dropped table (CREATE_IF_NEEDED), so every job is
+        // cancelled and then awaited to DONE before this returns.
+        for p in std::mem::take(&mut self.pending_jobs) {
+            let loc = p
+                .location
+                .as_deref()
+                .map(|l| format!("?location={l}"))
+                .unwrap_or_default();
+            // best effort: jobs.cancel is asynchronous and may not stop a load job
+            let _ = self
+                .conn
+                .api(
+                    reqwest::Method::POST,
+                    format!(
+                        "{BQ_BASE}/projects/{}/jobs/{}/cancel{loc}",
+                        self.conn.project, p.id
+                    ),
+                    None,
+                )
+                .await;
+            // MANDATORY: return only once the job is TERMINAL (DONE, succeeded
+            // or failed), so discard deletes a table no job can re-create.
+            let _ = p.handle.await;
+            // One extra poll: a transient error in the background task, or a
+            // task aborted with the runtime, must not leave the end unproven.
+            let _ = self.conn.poll_job(&p.id, p.location.as_deref()).await;
+        }
+        // Cancel the resumable session so BigQuery DISCARDS the partial upload —
+        // never finalize it into a load job. Google's cancel verb is a DELETE on
+        // the session URI; best-effort, the session also just expires.
+        if let Some(uri) = self.session_uri.take() {
+            if let Ok(token) = self.conn.bearer().await {
+                let _ = self.conn.client.delete(uri).bearer_auth(token).send().await;
+            }
+        }
+    }
 }
 
 impl Loader for BqLoader {
@@ -1716,86 +1826,24 @@ impl Loader for BqLoader {
     }
 
     async fn finish(mut self) -> Result<u64> {
-        if self.file_rows > 0 || self.session_uri.is_some() {
-            self.seal_file().await?;
-        }
-        let t_poll = std::time::Instant::now();
-        let mut committed = 0u64;
-        let n_jobs = self.pending_jobs.len();
-        for p in std::mem::take(&mut self.pending_jobs) {
-            committed += p
-                .handle
-                .await
-                .map_err(|e| Error::Transfer(format!("bigquery job task: {e}")))??;
-        }
-        if std::env::var("APITAP_DEBUG").is_ok() {
-            eprintln!(
-                "[bq loader] rows={} files={n_jobs} transcode={:.1}s gzip={:.1}s \
-                 upload={:.1}s job_wait={:.1}s",
-                self.rows,
-                self.t_transcode.as_secs_f64(),
-                self.t_gzip.as_secs_f64(),
-                self.t_upload.as_secs_f64(),
-                t_poll.elapsed().as_secs_f64(),
-            );
-        }
-        if committed != self.rows {
-            return Err(Error::Transfer(format!(
-                "bigquery load jobs landed {committed} rows, worker sent {} — \
-                 refusing to continue on a partial load",
-                self.rows
-            )));
-        }
-        // Only rows the jobs COMMITTED may advance the staged watermark.
-        if let Some(pq) = &mut self.pq {
-            self.local_wm = pq.wm.take();
-        }
-        if let (Some((_, numeric)), Some(local)) = (self.cursor, self.local_wm.take()) {
-            let mut shared = self.shared_wm.lock().expect("wm lock");
-            *shared = wm_max(shared.take(), Some(local), numeric);
-        }
-        Ok(committed)
-    }
-
-    async fn abort(self, cause: Error) -> Error {
-        // Sealed files' jobs may already have committed into STAGING — harmless,
-        // staging never reaches the final table on a failed run and the caller's
-        // discard drops it. What must NOT happen is a job outliving `discard`
-        // and re-creating a dropped table (CREATE_IF_NEEDED), so every job is
-        // cancelled and then awaited to DONE before this returns.
-        for p in self.pending_jobs {
-            let loc = p
-                .location
-                .as_deref()
-                .map(|l| format!("?location={l}"))
-                .unwrap_or_default();
-            // best effort: jobs.cancel is asynchronous and may not stop a load job
-            let _ = self
-                .conn
-                .api(
-                    reqwest::Method::POST,
-                    format!(
-                        "{BQ_BASE}/projects/{}/jobs/{}/cancel{loc}",
-                        self.conn.project, p.id
-                    ),
-                    None,
-                )
-                .await;
-            // MANDATORY: return only once the job is TERMINAL (DONE, succeeded
-            // or failed), so discard deletes a table no job can re-create.
-            let _ = p.handle.await;
-            // One extra poll: a transient error in the background task, or a
-            // task aborted with the runtime, must not leave the end unproven.
-            let _ = self.conn.poll_job(&p.id, p.location.as_deref()).await;
-        }
-        // Cancel the resumable session so BigQuery DISCARDS the partial upload —
-        // never finalize it into a load job. Google's cancel verb is a DELETE on
-        // the session URI; best-effort, the session also just expires.
-        if let Some(uri) = &self.session_uri {
-            if let Ok(token) = self.conn.bearer().await {
-                let _ = self.conn.client.delete(uri).bearer_auth(token).send().await;
+        // WHY the wrapper: `finish` CONSUMES the loader, so once it returns an
+        // error nothing can reach `pending_jobs` — `abort` is unreachable and a
+        // dropped handle detaches its job. The run's error arm then runs
+        // `sink.discard()`, and a job that is still PENDING re-creates this
+        // run's staging under CREATE_IF_NEEDED, so the next run refuses it with
+        // `locked:`. Every error below therefore goes through the same
+        // cancel-and-await-terminal that `abort` does.
+        match self.commit().await {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                self.quiesce().await;
+                Err(e)
             }
         }
+    }
+
+    async fn abort(mut self, cause: Error) -> Error {
+        self.quiesce().await;
         cause
     }
 }
@@ -2830,6 +2878,107 @@ impl BqSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job task that resolves to `rows`, for the ownership tests below.
+    fn job(id: &str, r: Result<u64>) -> PendingJob {
+        PendingJob {
+            id: id.to_string(),
+            location: None,
+            handle: tokio::spawn(async move { r }),
+        }
+    }
+
+    /// F-A: an error while waiting for one sealed file's job must leave every
+    /// LATER job OWNED, because a dropped `JoinHandle` is detached on tokio —
+    /// the job keeps loading, `discard` deletes the staging under it, and a
+    /// PENDING job re-creates it (CREATE_IF_NEEDED), so the next run refuses
+    /// `locked:`. 0.57.0 took the whole vector, so the early return dropped the
+    /// rest and proved nothing.
+    #[tokio::test]
+    async fn an_error_mid_commit_leaves_every_later_job_owned() {
+        let mut jobs = vec![
+            job("first", Ok(10)),
+            job("second", Err(Error::Transfer("job second failed".into()))),
+            job("third", Ok(30)),
+        ];
+
+        let err = BqLoader::await_jobs(&mut jobs)
+            .await
+            .expect_err("the failing job is the error");
+        assert!(err.to_string().contains("second"), "got: {err}");
+
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the un-awaited handle must still be owned by the loader: {jobs:?}"
+        );
+        assert_eq!(jobs[0].id, "third", "and it is the one that had not been awaited");
+        // Still live: awaiting it now is what `quiesce` does. A detached handle
+        // could not be awaited at all — its value would already be gone.
+        assert_eq!(BqLoader::await_jobs(&mut jobs).await.expect("third"), 30);
+        assert!(jobs.is_empty(), "quiesce's loop drains the rest");
+    }
+
+    /// The clean path still adds up every job's committed rows.
+    #[tokio::test]
+    async fn commit_adds_up_every_jobs_rows() {
+        let mut jobs = vec![job("a", Ok(7)), job("b", Ok(5))];
+        assert_eq!(BqLoader::await_jobs(&mut jobs).await.expect("all done"), 12);
+        assert!(jobs.is_empty(), "nothing is left to quiesce");
+    }
+
+    /// The body of `fn <header>`, brace matched with strings stepped over (a
+    /// `format!` in these bodies carries `{committed}` and `{}`).
+    fn fn_body<'a>(src: &'a str, header: &str) -> &'a str {
+        let i = src.find(header).unwrap_or_else(|| panic!("not found: {header}"));
+        let start = i + header.len();
+        let b = src.as_bytes();
+        let (mut j, mut depth) = (start, 1i32);
+        while j < b.len() && depth > 0 {
+            match b[j] {
+                b'"' => {
+                    j += 1;
+                    while j < b.len() && b[j] != b'"' {
+                        j += if b[j] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        &src[start..j.saturating_sub(1)]
+    }
+
+    /// What the ownership test above cannot reach: `finish`'s arms, because a
+    /// BqLoader needs a BigQuery connection (jobs.cancel, poll_job). So the
+    /// wiring is pinned by shape — `finish` consumes the loader, so its error
+    /// arms must run the SAME routine `abort` runs, or a job outlives
+    /// `discard`. This does NOT prove the cancel and the poll reach Google; that
+    /// is `e2e_worker_cancel.py bq`.
+    #[test]
+    fn finish_quiesces_before_it_hands_back_its_error() {
+        let src = include_str!("bigquery.rs");
+        let finish = fn_body(src, "async fn finish(mut self) -> Result<u64> {");
+        assert!(finish.contains("self.commit().await"), "finish delegates: {finish}");
+        assert!(
+            finish.contains("self.quiesce().await"),
+            "finish consumed the loader, so its error arm must quiesce: {finish}"
+        );
+        let abort = fn_body(src, "async fn abort(mut self, cause: Error) -> Error {");
+        assert!(abort.contains("self.quiesce().await"), "abort shares it: {abort}");
+        let commit = fn_body(src, "async fn commit(&mut self) -> Result<u64> {");
+        assert!(
+            commit.contains("Self::await_jobs(&mut self.pending_jobs)"),
+            "commit waits in place: {commit}"
+        );
+        assert!(!commit.contains("mem::take"), "commit must never take the whole list: {commit}");
+        let quiesce = fn_body(src, "async fn quiesce(&mut self) {");
+        assert!(quiesce.contains("/cancel"), "every job is cancelled: {quiesce}");
+        assert!(quiesce.contains("p.handle.await"), "and awaited to terminal: {quiesce}");
+        assert!(quiesce.contains("poll_job"), "with one extra poll: {quiesce}");
+    }
 
     /// The compaction deletes only rows older than their OWN key's newest:
     /// widen the comparison to `<=` and every key loses its newest row too;
