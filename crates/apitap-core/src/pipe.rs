@@ -269,26 +269,55 @@ async fn drive_span<T: SpanBody>(body: T, spans: Spans, latch: Arc<Latch>) -> Ou
     }
 }
 
+/// A task that ended in a `JoinError` is a pipe the crew did not consume:
+/// `catch_unwind` covers `body.run` only, so a panic in `finish`/`abort`
+/// escapes `drive`, and a runtime shutdown cancels the task. It is an ERROR,
+/// and it names itself.
+fn join_failure(je: tokio::task::JoinError) -> Error {
+    match je.try_into_panic() {
+        Ok(p) => Error::Transfer(format!("worker panicked: {}", panic_text(&*p))),
+        // Not a panic: the task was cancelled from outside, so this pipe was
+        // dropped mid-flight. Still an error — a crew that lost a pipe cannot
+        // report that everything it sent landed.
+        Err(je) => Error::Transfer(format!("worker ended without finishing: {je}")),
+    }
+}
+
 /// THE join loop. Never returns early: the JoinSet is empty at return, so
 /// `discard` runs only after every loader has finished or aborted (I1, I5).
 async fn join_all(mut set: tokio::task::JoinSet<Outcome>, latch: &Latch) -> Result<u64> {
-    let (mut cause, mut saw_cancel, mut rows) = (None, false, 0u64);
+    // `lost` holds a JoinError whose task had ALREADY claimed the latch: the
+    // 0.57.0 arm tried to claim and dropped the error when it lost the CAS, so
+    // a body that failed and then panicked in its own `abort` left the set with
+    // no cause and no cancel — and the loop answered `Ok(rows)` over a partial
+    // commit. The latch cannot carry the error (the claiming task died with it),
+    // so the join loop has to.
+    let (mut cause, mut saw_cancel, mut rows, mut lost) = (None, false, 0u64, None);
     while let Some(j) = set.join_next().await {
         match j {
             Ok(Outcome::Done(n)) => rows += n,
             Ok(Outcome::Cause(e)) => cause = Some(e), // exactly one, by `claim`
             Ok(Outcome::Cancelled) => saw_cancel = true,
             Err(je) => {
+                let e = join_failure(je);
                 if latch.claim() {
-                    cause = Some(Error::Transfer(format!("join: {je}")));
+                    cause = Some(e);
+                } else if lost.is_none() {
+                    lost = Some(e);
+                } else {
+                    debug_note(&e);
                 }
             }
         }
     }
-    match (cause, saw_cancel) {
-        (Some(e), _) => Err(e),
-        (None, true) => Err(cancelled()),
-        (None, false) => Ok(rows),
+    // A claimed cause is still THE error (D1: the claim decides, not the
+    // completion order); a pipe that ended in a JoinError comes next; a
+    // cancelled sibling last. `Ok` requires EVERY task to have reported.
+    match (cause, lost, saw_cancel) {
+        (Some(e), _, _) => Err(e),
+        (None, Some(e), _) => Err(e),
+        (None, None, true) => Err(cancelled()),
+        (None, None, false) => Ok(rows),
     }
 }
 
@@ -407,16 +436,21 @@ mod tests {
         Send(usize),
         Finish(usize),
         Abort(usize, String),
+        /// The abort reached the point where it panics (logged so a test can
+        /// prove the panic, not some earlier exit, is what it is looking at).
+        Panic(usize, String),
     }
 
     /// One fake loader per pipe. `fail_send_at = Some(k)` makes the k-th send
     /// carry the error under test; `abort_delay` holds an abort open long
-    /// enough to order it against sibling cancellation.
+    /// enough to order it against sibling cancellation; `abort_panic` makes the
+    /// abort itself panic, which is the one way a pipe can end in a JoinError.
     struct FakeLoader {
         id: usize,
         log: Arc<Mutex<Vec<Ev>>>,
         fail_send_at: Option<usize>,
         abort_delay: Duration,
+        abort_panic: Option<&'static str>,
         finish_rows: u64,
         sends: usize,
     }
@@ -428,6 +462,7 @@ mod tests {
                 log,
                 fail_send_at: None,
                 abort_delay: Duration::ZERO,
+                abort_panic: None,
                 finish_rows: 0,
                 sends: 0,
             }
@@ -440,6 +475,11 @@ mod tests {
 
         fn abort_delay(mut self, d: Duration) -> Self {
             self.abort_delay = d;
+            self
+        }
+
+        fn panics_in_abort(mut self, msg: &'static str) -> Self {
+            self.abort_panic = Some(msg);
             self
         }
 
@@ -472,6 +512,10 @@ mod tests {
             // Log at COMPLETION, so log order is completion order: an abort
             // that finished before a slow one appears before it.
             tokio::time::sleep(self.abort_delay).await;
+            if let Some(msg) = self.abort_panic {
+                self.log().push(Ev::Panic(self.id, msg.into()));
+                panic!("{msg}");
+            }
             self.log().push(Ev::Abort(self.id, cause.to_string()));
             cause
         }
@@ -509,6 +553,14 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|e| matches!(e, Ev::Finish(_)))
+            .count()
+    }
+
+    fn panic_count(log: &Mutex<Vec<Ev>>) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Ev::Panic(_, _)))
             .count()
     }
 
@@ -1034,5 +1086,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 12. (0.57.0 fix) A pipe whose body fails and whose loader PANICS in
+    /// `abort`: the latch was already claimed by that same task, so the cause
+    /// died with it and the old `Err(je)` arm could not claim either — the set
+    /// answered `Ok(rows)` over a commit nothing verified. A JoinError is
+    /// always an error, and it names itself.
+    struct FailBody;
+
+    impl PipeBody<FakeLoader> for FailBody {
+        async fn run(self, pipe: &mut Pipe<FakeLoader>, _spans: Spans) -> Result<Rows> {
+            pipe.send(vec![0; 8]).await?;
+            Err(Error::Transfer("boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_abort_is_never_swallowed() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let loader = FakeLoader::new(0, log.clone()).panics_in_abort("abort exploded");
+        // `run`, not `run_inline`: the JoinError only exists because the drive
+        // runs in its own task.
+        let res = Pipes::for_read(vec![loader])
+            .run(vec!["one span".to_string()], |_| FailBody)
+            .await;
+
+        let err = res.expect_err("a panicking abort is an error, never a committed Ok");
+        let msg = err.to_string();
+        assert!(msg.contains("worker panicked"), "the panic must be named: {msg}");
+        assert!(msg.contains("abort exploded"), "its payload must be named: {msg}");
+        let events = drain(&log);
+        assert_eq!(panic_count(&log), 1, "the abort really panicked: {events:?}");
+        assert_eq!(finish_count(&log), 0, "a panicking abort never finishes: {events:?}");
+    }
+
+    /// 13. (0.57.0 fix) The mirror of 12, so the fix cannot become "any panic
+    /// wins": the pipe that claimed the latch keeps the error even when a
+    /// sibling's abort panics afterwards (D1 — the claim decides).
+    enum MixedCrew {
+        First,
+        Second { log: Arc<Mutex<Vec<Ev>>> },
+    }
+
+    impl PipeBody<FakeLoader> for MixedCrew {
+        async fn run(self, pipe: &mut Pipe<FakeLoader>, _spans: Spans) -> Result<Rows> {
+            match self {
+                MixedCrew::First => {
+                    pipe.send(vec![0; 8]).await?;
+                    Err(Error::Transfer("boom".into()))
+                }
+                MixedCrew::Second { log } => {
+                    // Ordered on pipe 0's completed abort, so the claim is
+                    // deterministic: pipe 1 can only fail after pipe 0 claimed.
+                    while !abort_events(&log).iter().any(|(id, _)| *id == 0) {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(Error::Transfer("late".into()))
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_siblings_panicking_abort_does_not_steal_the_first_cause() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let loaders = (0..2)
+            .map(|i| {
+                let l = FakeLoader::new(i, log.clone());
+                if i == 1 {
+                    l.panics_in_abort("sibling abort exploded")
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let res = Pipes::for_read(loaders)
+            .run(vec!["one span".to_string()], |i| {
+                if i == 0 {
+                    MixedCrew::First
+                } else {
+                    MixedCrew::Second { log: log.clone() }
+                }
+            })
+            .await;
+
+        let err = res.expect_err("the first cause is still an error");
+        assert!(
+            err.to_string().contains("boom"),
+            "the pipe that claimed keeps the error: {err}"
+        );
+        assert_eq!(panic_count(&log), 1, "the sibling really panicked: {:?}", drain(&log));
     }
 }
