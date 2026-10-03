@@ -1,0 +1,831 @@
+apitap 0.57.0 (PyPI) vs ingestr 1.1.61 — capped MySQL -> ClickHouse
+raw log, generated 2026-10-03T17:54:28Z on the bench VPS
+host: 16 cores, 61 GB RAM
+
+===== 1. the tools
+$ ~/apitap-057-pullback/bin/python -c 'import apitap; ...'
+  apitap.__version__       0.57.0
+  interpreter              3.13.3 (abi3 wheel)
+  _apitap.abi3.so md5      41e9f7c252d3e1eb5403b70f87bf5435
+$ ~/ingestr-venv/bin/pip show ingestr
+  Name: ingestr
+  Version: 1.1.61
+  ingestr 1.1.x is a native binary: the pip wrapper downloads and execs it
+  -rwxrwxr-x 1 ubuntu ubuntu 254172496 Oct  3 15:38 /home/ubuntu/.cache/ingestr/bin/v1.1.61/Linux_x86_64/ingestr
+  that exact executable is bind-mounted into the cage
+
+===== 2. the seed (10 identical tables, kept between runs)
+  seeded from bench.bench_my_1m with CREATE TABLE ... LIKE + INSERT ... SELECT
+  seeding wall time: 232 s for all 10 tables (excluded from every measurement)
+  columns per seed:
+  10 tables x 15 columns
+  the schema (from bench_my_1m, LIKE-cloned into all 10):
+  cmp_my_t01	CREATE TABLE `cmp_my_t01` (
+          `id` int NOT NULL,
+          `small_str` varchar(20) DEFAULT NULL,
+          `medium_str` varchar(100) DEFAULT NULL,
+          `large_str` varchar(500) DEFAULT NULL,
+          `tiny_int` smallint DEFAULT NULL,
+          `regular_int` int DEFAULT NULL,
+          `big_int` bigint DEFAULT NULL,
+          `float_val` double DEFAULT NULL,
+          `decimal_val` decimal(18,4) DEFAULT NULL,
+          `bool_val` tinyint(1) DEFAULT NULL,
+          `date_val` date DEFAULT NULL,
+          `ts_val` datetime(6) DEFAULT NULL,
+          `ts_tz_val` datetime(6) DEFAULT NULL,
+          `json_val` json DEFAULT NULL,
+          `extra_text` longtext,
+          PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  source aggregates (cached; identical for all 10 by construction):
+  cmp_my_t01 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t02 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t03 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t04 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t05 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t06 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t07 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t08 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t09 cached 1000000|2147266635853629|2147375244801801|1|1000000
+  cmp_my_t10 cached 1000000|2147266635853629|2147375244801801|1|1000000
+
+===== 3. the control (validator proven both ways before anything was timed)
+== control table (1000 rows, the same 15 columns as the seed)
+  src rows=1000 cols=15
+
+== (1) apitap, uncapped
+  version 0.57.0
+  rows 1000 pipes 32
+2026-10-03T17:24:32Z apitap done table=cmp_ctrl_t rows=1000 bytes=402378 rows_per_s=5270 bytes_per_s=2120579 elapsed_s=0.2 pipes=32 percent_est=99.9
+  --- what apitap created in ClickHouse:
+  cmp_ctrl_t MergeTree 1000
+  id Int32
+  small_str Nullable(String)
+  medium_str Nullable(String)
+  large_str Nullable(String)
+  tiny_int Nullable(Int16)
+  regular_int Nullable(Int32)
+  big_int Nullable(Int64)
+  float_val Nullable(Float64)
+  decimal_val Nullable(Decimal(18, 4))
+  bool_val Nullable(Int8)
+  date_val Nullable(Date32)
+  ts_val Nullable(DateTime64(6))
+  ts_tz_val Nullable(DateTime64(6))
+  json_val Nullable(String)
+  extra_text Nullable(String)
+  mysql : 1000|2168502783323|2130606287102|1|1000
+  ch    : 1000|2168502783323|2130606287102|1|1000
+  GREEN: the validator agrees across engines on an intact table
+
+== (2) sensitivity: perturb ONE source row, the verdict must notice
+  GREEN: one changed value changes the digest (2168502783323|2130606287102|1|1000 -> 2170267471401|2130606287102|1|1000)
+
+== (3) ingestr 1.1.61, documented invocation, uncapped
+ingestr version v1.1.61
+Incremental Strategy: replace
+Incremental Key: None
+Primary Key: id
+
+
+
+Starting data ingestion...
+[STRATEGY] 17:24:34 | Using staging table: _bruin_staging.cmp_ctrl_t_ingestr_staging_3e4f60c16d8e492893ea522806cafe3d
+[PROGRESS] 17:24:34 | Rows: 1,000 | Batches: 1 | Rate: 17944 rows/s | CPU: 41.6% | Mem: 155 MB
+
+┌────────────────┬───────────────┐
+│     METRIC     │     VALUE     │
+├────────────────┼───────────────┤
+│ Total Rows     │         1,000 │
+│ Total Batches  │             1 │
+│ Duration       │          0.1s │
+│ Avg Throughput │ 17,742 rows/s │
+│ Peak Memory    │        155 MB │
+└────────────────┴───────────────┘
+Ingestion completed successfully!
+  --- what ingestr created in ClickHouse:
+  cmp_ctrl_t MergeTree 1000
+  cmp_ctrl_t_ingestr ReplacingMergeTree 1000
+  id Int32
+  small_str Nullable(String)
+  medium_str Nullable(String)
+  large_str Nullable(String)
+  tiny_int Nullable(Int16)
+  regular_int Nullable(Int32)
+  big_int Nullable(Int64)
+  float_val Nullable(Float64)
+  decimal_val Nullable(Decimal(18, 4))
+  bool_val Nullable(Int16)
+  date_val Nullable(Date)
+  ts_val Nullable(DateTime64(6))
+  ts_tz_val Nullable(DateTime64(6))
+  json_val Nullable(String)
+  extra_text Nullable(String)
+  _ingestr_loaded_at Nullable(DateTime64(6, \'UTC\'))
+  _ingestr_run_id Nullable(String)
+  mysql : 1000|2170267471401|2130606287102|1|1000
+  ch    : 1000|2170267471401|2130606287102|1|1000
+  GREEN: ingestr's landing validates against the same validator
+
+== control cleanup
+  left behind: 0 ch table(s), 0 my table(s)
+
+===== 4. what each tool pays in the cage BEFORE it moves a row
+before cmp-apitap-rstartup loadavg=2.48 2.23 2.72 memavail_kb=49820256 cached_kb=41531684
+after  cmp-apitap-rstartup loadavg=2.36 2.21 2.71 memavail_kb=49766172 cached_kb=41535844
+LEG apitap round=startup
+  stopped_by completed
+  wall_container_s 2.011776594
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 16.3
+  host_sampled_peak_mb 14.0
+  MEMPEAK=17129472
+  MEMSTAT anon 270336
+  MEMSTAT file 1777664
+  proc_lines 0
+  failed_procs 0
+  log /home/ubuntu/bench-capped/logs/cmp-apitap-rstartup.log
+before cmp-ingestr-rstartup loadavg=2.36 2.21 2.71 memavail_kb=49761468 cached_kb=41535608
+after  cmp-ingestr-rstartup loadavg=2.36 2.21 2.71 memavail_kb=49854872 cached_kb=41569420
+LEG ingestr round=startup
+  stopped_by completed
+  wall_container_s 2.017092581
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 71.2
+  host_sampled_peak_mb 59.1
+  MEMPEAK=74629120
+  MEMSTAT anon 262144
+  MEMSTAT file 32198656
+  proc_lines 0
+  failed_procs 0
+  log /home/ubuntu/bench-capped/logs/cmp-ingestr-rstartup.log
+
+===== 5. the campaign: 3 interleaved rounds, every arm checksum-verified
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+SEED_SECONDS 1.3
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t01 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t02 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t03 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t04 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t05 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t06 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t07 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t08 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t09 cols=15 rows=1000000
+mysql: [Warning] Using a password on the command line interface can be insecure.
+cmp_my_t10 cols=15 rows=1000000
+cmp_my_t01 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t02 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t03 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t04 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t05 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t06 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t07 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t08 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t09 cached 1000000|2147266635853629|2147375244801801|1|1000000
+cmp_my_t10 cached 1000000|2147266635853629|2147375244801801|1|1000000
+=== round 1 · apitap  (17:28:28)
+before cmp-apitap-r1 loadavg=3.92 2.94 3.35 memavail_kb=49738320 cached_kb=43393296
+after  cmp-apitap-r1 loadavg=7.77 3.93 3.66 memavail_kb=49266120 cached_kb=44447860
+LEG apitap round=1
+  stopped_by completed
+  wall_container_s 36.115622879
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 99.1
+  host_sampled_peak_mb 95.1
+  APITAP_VERSION 0.57.0
+  ROWS 10000000
+  PIPE_BUDGET 8
+  IMPORT_S 0.667
+  ELAPSED 33.893
+  MEMPEAK=103956480
+  proc_lines 0
+  failed_procs 0
+  log /home/ubuntu/bench-capped/logs/cmp-apitap-r1.log
+VERIFY cmp_my_t01 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t02 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t03 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t04 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t05 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t06 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t07 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t08 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t09 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t10 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY_SUMMARY match=10 mismatch=0
+TOTAL_ROWS 10000000
+=== round 1 · ingestr  (17:29:12)
+before cmp-ingestr-r1 loadavg=7.19 3.94 3.67 memavail_kb=49371660 cached_kb=44454868
+after  cmp-ingestr-r1 loadavg=5.98 3.83 3.63 memavail_kb=49742136 cached_kb=44474936
+LEG ingestr round=1
+  stopped_by completed
+  wall_container_s 14.045261423
+  docker_state true 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 257.1
+  host_sampled_peak_mb 256.6
+  INGESTR_VERSION 1.1.61
+  PROC_ALL_RC 1
+  ELAPSED_MS 12024
+  MEMPEAK=269545472
+  proc_lines 10
+  failed_procs 10
+  log /home/ubuntu/bench-capped/logs/cmp-ingestr-r1.log
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t01' in scope SELECT count() FROM default.cmp_my_t01. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t01`)
+VERIFY cmp_my_t01 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t02' in scope SELECT count() FROM default.cmp_my_t02. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t02`)
+VERIFY cmp_my_t02 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t03' in scope SELECT count() FROM default.cmp_my_t03. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t03`)
+VERIFY cmp_my_t03 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t04' in scope SELECT count() FROM default.cmp_my_t04. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t04`)
+VERIFY cmp_my_t04 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t05' in scope SELECT count() FROM default.cmp_my_t05. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t05`)
+VERIFY cmp_my_t05 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t06' in scope SELECT count() FROM default.cmp_my_t06. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t06`)
+VERIFY cmp_my_t06 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t07' in scope SELECT count() FROM default.cmp_my_t07. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t07`)
+VERIFY cmp_my_t07 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t08' in scope SELECT count() FROM default.cmp_my_t08. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t08`)
+VERIFY cmp_my_t08 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t09' in scope SELECT count() FROM default.cmp_my_t09. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t09`)
+VERIFY cmp_my_t09 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t10' in scope SELECT count() FROM default.cmp_my_t10. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t10`)
+VERIFY cmp_my_t10 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+VERIFY_SUMMARY match=0 mismatch=10
+\N
+=== round 1 · ingestr1  (17:29:31)
+before cmp-ingestr1-r1 loadavg=5.66 3.80 3.62 memavail_kb=49745928 cached_kb=44457584
+after  cmp-ingestr1-r1 loadavg=3.70 3.51 3.53 memavail_kb=49771324 cached_kb=44510944
+LEG ingestr1 round=1
+  stopped_by completed
+  wall_container_s 44.160766785
+  docker_state true 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 256.3
+  host_sampled_peak_mb 256.0
+  INGESTR_VERSION 1.1.61
+  PROC_ALL_RC 1
+  ELAPSED_MS 42597
+  MEMPEAK=268783616
+  proc_lines 10
+  failed_procs 10
+  log /home/ubuntu/bench-capped/logs/cmp-ingestr1-r1.log
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t01' in scope SELECT count() FROM default.cmp_my_t01. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t01`)
+VERIFY cmp_my_t01 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t02' in scope SELECT count() FROM default.cmp_my_t02. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t02`)
+VERIFY cmp_my_t02 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t03' in scope SELECT count() FROM default.cmp_my_t03. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t03`)
+VERIFY cmp_my_t03 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t04' in scope SELECT count() FROM default.cmp_my_t04. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t04`)
+VERIFY cmp_my_t04 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t05' in scope SELECT count() FROM default.cmp_my_t05. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t05`)
+VERIFY cmp_my_t05 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t06' in scope SELECT count() FROM default.cmp_my_t06. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t06`)
+VERIFY cmp_my_t06 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t07' in scope SELECT count() FROM default.cmp_my_t07. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t07`)
+VERIFY cmp_my_t07 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t08' in scope SELECT count() FROM default.cmp_my_t08. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t08`)
+VERIFY cmp_my_t08 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t09' in scope SELECT count() FROM default.cmp_my_t09. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t09`)
+VERIFY cmp_my_t09 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t10' in scope SELECT count() FROM default.cmp_my_t10. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t10`)
+VERIFY cmp_my_t10 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+VERIFY_SUMMARY match=0 mismatch=10
+\N
+=== round 2 · apitap  (17:30:21)
+before cmp-apitap-r2 loadavg=3.37 3.44 3.51 memavail_kb=49769472 cached_kb=44514544
+after  cmp-apitap-r2 loadavg=5.40 3.96 3.68 memavail_kb=49691120 cached_kb=44843276
+LEG apitap round=2
+  stopped_by completed
+  wall_container_s 36.118083317
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 99.1
+  host_sampled_peak_mb 93.7
+  APITAP_VERSION 0.57.0
+  ROWS 10000000
+  PIPE_BUDGET 8
+  IMPORT_S 0.679
+  ELAPSED 34.695
+  MEMPEAK=103931904
+  proc_lines 0
+  failed_procs 0
+  log /home/ubuntu/bench-capped/logs/cmp-apitap-r2.log
+VERIFY cmp_my_t01 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t02 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t03 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t04 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t05 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t06 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t07 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t08 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t09 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t10 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY_SUMMARY match=10 mismatch=0
+TOTAL_ROWS 10000000
+=== round 2 · ingestr  (17:31:06)
+before cmp-ingestr-r2 loadavg=5.05 3.91 3.67 memavail_kb=49414804 cached_kb=44829236
+after  cmp-ingestr-r2 loadavg=4.88 3.94 3.68 memavail_kb=49789016 cached_kb=44835172
+LEG ingestr round=2
+  stopped_by completed
+  wall_container_s 19.060915957
+  docker_state true 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 260.6
+  host_sampled_peak_mb 257.5
+  INGESTR_VERSION 1.1.61
+  PROC_ALL_RC 1
+  ELAPSED_MS 16854
+  MEMPEAK=273272832
+  proc_lines 10
+  failed_procs 10
+  log /home/ubuntu/bench-capped/logs/cmp-ingestr-r2.log
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t01' in scope SELECT count() FROM default.cmp_my_t01. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t01`)
+VERIFY cmp_my_t01 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t02' in scope SELECT count() FROM default.cmp_my_t02. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t02`)
+VERIFY cmp_my_t02 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t03' in scope SELECT count() FROM default.cmp_my_t03. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t03`)
+VERIFY cmp_my_t03 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t04' in scope SELECT count() FROM default.cmp_my_t04. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t04`)
+VERIFY cmp_my_t04 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t05' in scope SELECT count() FROM default.cmp_my_t05. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t05`)
+VERIFY cmp_my_t05 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t06' in scope SELECT count() FROM default.cmp_my_t06. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t06`)
+VERIFY cmp_my_t06 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t07' in scope SELECT count() FROM default.cmp_my_t07. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t07`)
+VERIFY cmp_my_t07 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t08' in scope SELECT count() FROM default.cmp_my_t08. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t08`)
+VERIFY cmp_my_t08 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t09' in scope SELECT count() FROM default.cmp_my_t09. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t09`)
+VERIFY cmp_my_t09 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t10' in scope SELECT count() FROM default.cmp_my_t10. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t10`)
+VERIFY cmp_my_t10 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+VERIFY_SUMMARY match=0 mismatch=10
+\N
+=== round 2 · ingestr1  (17:31:30)
+before cmp-ingestr1-r2 loadavg=4.57 3.89 3.67 memavail_kb=49466156 cached_kb=44843520
+after  cmp-ingestr1-r2 loadavg=3.38 3.67 3.60 memavail_kb=49766280 cached_kb=44845464
+LEG ingestr1 round=2
+  stopped_by completed
+  wall_container_s 39.118057518
+  docker_state true 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 256.2
+  host_sampled_peak_mb 256.2
+  INGESTR_VERSION 1.1.61
+  PROC_ALL_RC 1
+  ELAPSED_MS 37200
+  MEMPEAK=268636160
+  proc_lines 10
+  failed_procs 10
+  log /home/ubuntu/bench-capped/logs/cmp-ingestr1-r2.log
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t01' in scope SELECT count() FROM default.cmp_my_t01. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t01`)
+VERIFY cmp_my_t01 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t02' in scope SELECT count() FROM default.cmp_my_t02. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t02`)
+VERIFY cmp_my_t02 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t03' in scope SELECT count() FROM default.cmp_my_t03. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t03`)
+VERIFY cmp_my_t03 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t04' in scope SELECT count() FROM default.cmp_my_t04. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t04`)
+VERIFY cmp_my_t04 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t05' in scope SELECT count() FROM default.cmp_my_t05. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t05`)
+VERIFY cmp_my_t05 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t06' in scope SELECT count() FROM default.cmp_my_t06. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t06`)
+VERIFY cmp_my_t06 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t07' in scope SELECT count() FROM default.cmp_my_t07. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t07`)
+VERIFY cmp_my_t07 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t08' in scope SELECT count() FROM default.cmp_my_t08. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t08`)
+VERIFY cmp_my_t08 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t09' in scope SELECT count() FROM default.cmp_my_t09. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t09`)
+VERIFY cmp_my_t09 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t10' in scope SELECT count() FROM default.cmp_my_t10. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t10`)
+VERIFY cmp_my_t10 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+VERIFY_SUMMARY match=0 mismatch=10
+\N
+=== round 3 · apitap  (17:32:14)
+before cmp-apitap-r3 loadavg=3.19 3.62 3.59 memavail_kb=49700228 cached_kb=44845644
+after  cmp-apitap-r3 loadavg=3.93 3.75 3.63 memavail_kb=49428080 cached_kb=44790868
+LEG apitap round=3
+  stopped_by completed
+  wall_container_s 38.134509181
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 97.7
+  host_sampled_peak_mb 90.5
+  APITAP_VERSION 0.57.0
+  ROWS 10000000
+  PIPE_BUDGET 8
+  IMPORT_S 0.603
+  ELAPSED 36.154
+  MEMPEAK=102395904
+  proc_lines 0
+  failed_procs 0
+  log /home/ubuntu/bench-capped/logs/cmp-apitap-r3.log
+VERIFY cmp_my_t01 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t02 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t03 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t04 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t05 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t06 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t07 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t08 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t09 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY cmp_my_t10 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+VERIFY_SUMMARY match=10 mismatch=0
+TOTAL_ROWS 10000000
+=== round 3 · ingestr  (17:33:02)
+before cmp-ingestr-r3 loadavg=3.95 3.76 3.63 memavail_kb=49278548 cached_kb=44815968
+after  cmp-ingestr-r3 loadavg=3.68 3.71 3.62 memavail_kb=49873936 cached_kb=44809520
+LEG ingestr round=3
+  stopped_by completed
+  wall_container_s 19.187107683
+  docker_state true 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 264.1
+  host_sampled_peak_mb 264.1
+  INGESTR_VERSION 1.1.61
+  PROC_ALL_RC 1
+  ELAPSED_MS 17212
+  MEMPEAK=276938752
+  proc_lines 10
+  failed_procs 10
+  log /home/ubuntu/bench-capped/logs/cmp-ingestr-r3.log
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t01' in scope SELECT count() FROM default.cmp_my_t01. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t01`)
+VERIFY cmp_my_t01 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t02' in scope SELECT count() FROM default.cmp_my_t02. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t02`)
+VERIFY cmp_my_t02 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t03' in scope SELECT count() FROM default.cmp_my_t03. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t03`)
+VERIFY cmp_my_t03 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t04' in scope SELECT count() FROM default.cmp_my_t04. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t04`)
+VERIFY cmp_my_t04 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t05' in scope SELECT count() FROM default.cmp_my_t05. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t05`)
+VERIFY cmp_my_t05 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t06' in scope SELECT count() FROM default.cmp_my_t06. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t06`)
+VERIFY cmp_my_t06 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t07' in scope SELECT count() FROM default.cmp_my_t07. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t07`)
+VERIFY cmp_my_t07 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t08' in scope SELECT count() FROM default.cmp_my_t08. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t08`)
+VERIFY cmp_my_t08 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t09' in scope SELECT count() FROM default.cmp_my_t09. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t09`)
+VERIFY cmp_my_t09 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t10' in scope SELECT count() FROM default.cmp_my_t10. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t10`)
+VERIFY cmp_my_t10 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+VERIFY_SUMMARY match=0 mismatch=10
+\N
+=== round 3 · ingestr1  (17:33:26)
+before cmp-ingestr1-r3 loadavg=3.47 3.66 3.61 memavail_kb=49775476 cached_kb=44798996
+after  cmp-ingestr1-r3 loadavg=3.11 3.54 3.57 memavail_kb=49756404 cached_kb=44844328
+LEG ingestr1 round=3
+  stopped_by completed
+  wall_container_s 46.155022846
+  docker_state true 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 256.4
+  host_sampled_peak_mb 256.3
+  INGESTR_VERSION 1.1.61
+  PROC_ALL_RC 1
+  ELAPSED_MS 44214
+  MEMPEAK=268812288
+  proc_lines 10
+  failed_procs 10
+  log /home/ubuntu/bench-capped/logs/cmp-ingestr1-r3.log
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t01' in scope SELECT count() FROM default.cmp_my_t01. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t01`)
+VERIFY cmp_my_t01 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t02' in scope SELECT count() FROM default.cmp_my_t02. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t02`)
+VERIFY cmp_my_t02 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t03' in scope SELECT count() FROM default.cmp_my_t03. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t03`)
+VERIFY cmp_my_t03 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t04' in scope SELECT count() FROM default.cmp_my_t04. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t04`)
+VERIFY cmp_my_t04 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t05' in scope SELECT count() FROM default.cmp_my_t05. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t05`)
+VERIFY cmp_my_t05 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t06' in scope SELECT count() FROM default.cmp_my_t06. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t06`)
+VERIFY cmp_my_t06 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t07' in scope SELECT count() FROM default.cmp_my_t07. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t07`)
+VERIFY cmp_my_t07 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t08' in scope SELECT count() FROM default.cmp_my_t08. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t08`)
+VERIFY cmp_my_t08 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t09' in scope SELECT count() FROM default.cmp_my_t09. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t09`)
+VERIFY cmp_my_t09 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+Received exception from server (version 24.8.14):
+Code: 60. DB::Exception: Received from localhost:9000. DB::Exception: Unknown table expression identifier 'default.cmp_my_t10' in scope SELECT count() FROM default.cmp_my_t10. (UNKNOWN_TABLE)
+(query: SELECT count() FROM `default`.`cmp_my_t10`)
+VERIFY cmp_my_t10 rows=? MISMATCH
+  src=1000000|2147266635853629|2147375244801801|1|1000000
+  dst=<no table / no row>
+VERIFY_SUMMARY match=0 mismatch=10
+\N
+
+TOOL     RND     WALL_S    PEAK_MB         ROWS   CHECKSUM 
+apitap   1   36.115622879       99.1              false 0 (OOMKilled ExitCode) in_cage=33.893
+apitap   2   36.118083317       99.1              false 0 (OOMKilled ExitCode) in_cage=34.695
+apitap   3   38.134509181       97.7              false 0 (OOMKilled ExitCode) in_cage=36.154
+ingestr  1   14.045261423      257.1              true 1 (OOMKilled ExitCode) in_cage=12024
+ingestr  2   19.060915957      260.6              true 1 (OOMKilled ExitCode) in_cage=16854
+ingestr  3   19.187107683      264.1              true 1 (OOMKilled ExitCode) in_cage=17212
+ingestr1 1   44.160766785      256.3              true 1 (OOMKilled ExitCode) in_cage=42597
+ingestr1 2   39.118057518      256.2              true 1 (OOMKilled ExitCode) in_cage=37200
+ingestr1 3   46.155022846      256.4              true 1 (OOMKilled ExitCode) in_cage=44214
+MEDIAN apitap wall_s 36.1  rounds [36.1, 36.1, 38.1]
+MEDIAN ingestr wall_s 19.1  rounds [14.0, 19.1, 19.2]
+MEDIAN ingestr1 wall_s 44.2  rounds [44.2, 39.1, 46.2]
+
+checksum verdicts per leg: see the VERIFY lines above (drop after each run)
+
+===== 6. the ceiling probe (how many rows ONE ingestr process lands at this cap)
+CEILING 100000 rows docker_state=false 0 peak_mb=222.7
+  dst_sum  100000|214770805050524|214644031908969|1|100000
+  src_sum  100000|214770805050524|214644031908969|1|100000
+CEILING 200000 rows docker_state=true 0 peak_mb=256.0
+  dst_sum  
+  src_sum  200000|429501015462349|429391670523406|1|200000
+CEILING 400000 rows docker_state=true 0 peak_mb=256.0
+  dst_sum  
+  src_sum  400000|858763243094625|858887841125208|1|400000
+
+===== 7. host state around every leg
+before cmp-apitap-r1 loadavg=3.92 2.94 3.35 memavail_kb=49738320 cached_kb=43393296
+after  cmp-apitap-r1 loadavg=7.77 3.93 3.66 memavail_kb=49266120 cached_kb=44447860
+before cmp-ingestr-r1 loadavg=7.19 3.94 3.67 memavail_kb=49371660 cached_kb=44454868
+after  cmp-ingestr-r1 loadavg=5.98 3.83 3.63 memavail_kb=49742136 cached_kb=44474936
+before cmp-ingestr1-r1 loadavg=5.66 3.80 3.62 memavail_kb=49745928 cached_kb=44457584
+after  cmp-ingestr1-r1 loadavg=3.70 3.51 3.53 memavail_kb=49771324 cached_kb=44510944
+before cmp-apitap-r2 loadavg=3.37 3.44 3.51 memavail_kb=49769472 cached_kb=44514544
+after  cmp-apitap-r2 loadavg=5.40 3.96 3.68 memavail_kb=49691120 cached_kb=44843276
+before cmp-ingestr-r2 loadavg=5.05 3.91 3.67 memavail_kb=49414804 cached_kb=44829236
+after  cmp-ingestr-r2 loadavg=4.88 3.94 3.68 memavail_kb=49789016 cached_kb=44835172
+before cmp-ingestr1-r2 loadavg=4.57 3.89 3.67 memavail_kb=49466156 cached_kb=44843520
+after  cmp-ingestr1-r2 loadavg=3.38 3.67 3.60 memavail_kb=49766280 cached_kb=44845464
+before cmp-apitap-r3 loadavg=3.19 3.62 3.59 memavail_kb=49700228 cached_kb=44845644
+after  cmp-apitap-r3 loadavg=3.93 3.75 3.63 memavail_kb=49428080 cached_kb=44790868
+before cmp-ingestr-r3 loadavg=3.95 3.76 3.63 memavail_kb=49278548 cached_kb=44815968
+after  cmp-ingestr-r3 loadavg=3.68 3.71 3.62 memavail_kb=49873936 cached_kb=44809520
+before cmp-ingestr1-r3 loadavg=3.47 3.66 3.61 memavail_kb=49775476 cached_kb=44798996
+after  cmp-ingestr1-r3 loadavg=3.11 3.54 3.57 memavail_kb=49756404 cached_kb=44844328
+before cmp-apitap-rstartup loadavg=2.48 2.23 2.72 memavail_kb=49820256 cached_kb=41531684
+after  cmp-apitap-rstartup loadavg=2.36 2.21 2.71 memavail_kb=49766172 cached_kb=41535844
+before cmp-ingestr-rstartup loadavg=2.36 2.21 2.71 memavail_kb=49761468 cached_kb=41535608
+after  cmp-ingestr-rstartup loadavg=2.36 2.21 2.71 memavail_kb=49854872 cached_kb=41569420
+
+===== 8. the rig afterwards
+== ClickHouse leftovers from this campaign:
+  0
+  _bruin_staging tables: 0
+== MySQL seeds (columns per seed, then exact row counts):
+  seeds: 10 tables, columns each 15-15
+  cmp_my_t01 rows=1000000
+  cmp_my_t02 rows=1000000
+  cmp_my_t03 rows=1000000
+  cmp_my_t04 rows=1000000
+  cmp_my_t05 rows=1000000
+  cmp_my_t06 rows=1000000
+  cmp_my_t07 rows=1000000
+  cmp_my_t08 rows=1000000
+  cmp_my_t09 rows=1000000
+  cmp_my_t10 rows=1000000

@@ -38,6 +38,14 @@ Companion write-ups in this directory:
   design caught us in (ON CONFLICT vs clear-then-insert, 16.2 s → 2.8 s)
   and where the remaining time honestly goes (Postgres's own logical
   decoding). Raw: [logbased-cdc-raw.log](logbased-cdc-raw.log).
+- **[bench-capped-my-ch-0.57.md](bench-capped-my-ch-0.57.md)** — the capped
+  tier, MySQL → ClickHouse: 10 tables × 1M rows × 15 columns, all ten
+  synced concurrently in ONE job inside ONE container at **0.5 CPU / 256 MB**,
+  3 interleaved rounds. **apitap 0.57.0 (PyPI): median 36.1 s, 99 MB peak,
+  30/30 tables checksum-MATCH. ingestr 1.1.61: OOM-killed in 6 of 6 legs
+  (both its native 10-process model and one process at a time), 0 rows** —
+  plus a ceiling probe locating that cage at 100k–400k rows for one table.
+  Raw: [bench-capped-my-ch-0.57-raw.log](bench-capped-my-ch-0.57-raw.log).
 - **[iceberg-showdown.md](iceberg-showdown.md)** — the `iceberg://`
   destination's three-phase showdown (full 10.3M / append +1M / merge 1M
   upsert) at 16 vCPU / 4 GB: **apitap 15.2 s · 2.2 s · 3.8 s, all read-back
