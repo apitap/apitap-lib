@@ -746,7 +746,7 @@ mod tests {
             _p: &TablePlan,
             _l: &Lane,
             _s: Vec<String>,
-            _ld: Vec<L>,
+            _ld: crate::pipe::Pipes<L>,
             _c: usize,
         ) -> Result<u64> {
             unimplemented!()

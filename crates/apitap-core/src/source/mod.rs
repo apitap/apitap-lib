@@ -76,32 +76,19 @@ pub(crate) trait Source: Sized + Send + Sync {
         want: usize,
         delta: Option<&Delta>,
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
-    /// Spawn one worker per loader over a shared span queue; return rows reported by
-    /// the loaders (0 when the sink counts server-side). Implementations own the hot
-    /// loop: pull span → read → encode → coalesce → `loader.send`.
+    /// Consume `pipes` with `pipe::Pipes::run` (parallel) or
+    /// `pipe::Pipes::run_inline` (one stream); nothing else can. The queue is
+    /// `pipe::Spans`, whose `next` refuses as soon as the set's latch is set,
+    /// so a cancelled sibling issues no further statement. Implementations
+    /// own the hot loop: pull span → read → encode → coalesce → `pipe.send`.
     fn run_workers<L: Loader>(
         &self,
         plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
-        loaders: Vec<L>,
+        pipes: crate::pipe::Pipes<L>,
         chunk: usize,
     ) -> impl Future<Output = Result<u64>> + Send;
-}
-
-/// Work-stealing statement queue: many small spans, N workers pull until it drains.
-/// Static one-span-per-worker left a straggler tail (a probe caught only 7 of 12 pipes
-/// still alive at ~80% wall time).
-pub(crate) type WorkQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
-
-pub(crate) fn work_queue(stmts: Vec<String>) -> WorkQueue {
-    std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
-        stmts,
-    )))
-}
-
-pub(crate) fn pop(queue: &WorkQueue) -> Option<String> {
-    queue.lock().unwrap().pop_front()
 }
 
 /// Split `[lo, hi]` into at most `n` contiguous, non-overlapping, covering spans.

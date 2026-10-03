@@ -5,7 +5,8 @@
 //! wire format directly — ClickHouse RowBinary or Postgres binary COPY, no
 //! intermediate text, no Arrow.
 
-use super::{pop, spans, WorkQueue};
+use super::spans;
+use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::sink::Loader;
 use crate::source::Source;
 use crate::error::{Error, Result};
@@ -1119,7 +1120,7 @@ impl Source for MySqlSource {
         plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
-        loaders: Vec<L>,
+        pipes: Pipes<L>,
         chunk: usize,
     ) -> Result<u64> {
         let enc = match lane.format {
@@ -1163,34 +1164,48 @@ impl Source for MySqlSource {
                     },
                 }
             };
-        let queue = super::work_queue(stmts);
-        let mut tasks = Vec::with_capacity(loaders.len());
-        for loader in loaders {
-            tasks.push(match &wire {
-                Some(w) => tokio::spawn(raw_transfer_worker(
-                    self.url.clone(),
-                    queue.clone(),
-                    enc.clone(),
-                    w.clone(),
-                    loader,
+        pipes
+            .run(stmts, |_| match &wire {
+                Some(w) => MyBody::Raw {
+                    url: self.url.clone(),
+                    enc: enc.clone(),
+                    wire: w.clone(),
                     chunk,
-                )),
-                None => tokio::spawn(row_worker(
-                    self.pool.clone(),
-                    queue.clone(),
-                    enc.clone(),
-                    loader,
+                },
+                None => MyBody::Row {
+                    pool: self.pool.clone(),
+                    enc: enc.clone(),
                     chunk,
-                )),
-            });
+                },
+            })
+            .await
+    }
+}
+
+/// One transfer worker's plan, chosen once per connection canary: the raw
+/// plane when a MyWire handshake succeeded, sqlx otherwise.
+enum MyBody {
+    Row {
+        pool: MySqlPool,
+        enc: MyEnc,
+        chunk: usize,
+    },
+    Raw {
+        url: std::sync::Arc<str>,
+        enc: MyEnc,
+        wire: std::sync::Arc<Vec<MyAr>>,
+        chunk: usize,
+    },
+}
+
+impl<L: Loader> PipeBody<L> for MyBody {
+    async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
+        match self {
+            MyBody::Row { pool, enc, chunk } => row_worker(pool, spans, enc, pipe, chunk).await,
+            MyBody::Raw { url, enc, wire, chunk } => {
+                raw_transfer_worker(url, spans, enc, wire, pipe, chunk).await
+            }
         }
-        let mut rows = 0u64;
-        for t in tasks {
-            rows += t
-                .await
-                .map_err(|e| Error::Transfer(format!("join: {e}")))??;
-        }
-        Ok(rows)
     }
 }
 
@@ -1207,11 +1222,11 @@ enum MyEnc {
 /// format, and streams into ONE sink loader, coalescing to ~`chunk`-byte sends.
 async fn row_worker<L: Loader>(
     pool: MySqlPool,
-    queue: WorkQueue,
+    spans: Spans,
     enc: MyEnc,
-    mut loader: L,
+    pipe: &mut Pipe<L>,
     chunk: usize,
-) -> Result<u64> {
+) -> Result<Rows> {
     use futures::TryStreamExt;
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let (mut t_fetch, mut t_enc, mut t_send) = (
@@ -1224,7 +1239,7 @@ async fn row_worker<L: Loader>(
     if let MyEnc::PgCopy(_) = &enc {
         pgc::header(&mut out);
     }
-    while let Some(sql) = pop(&queue) {
+    while let Some(sql) = spans.next()? {
         let mut rows = sqlx::query(&sql).fetch(&pool);
         loop {
             let tf = dbg.then(std::time::Instant::now);
@@ -1232,9 +1247,7 @@ async fn row_worker<L: Loader>(
                 Ok(Some(r)) => r,
                 Ok(None) => break,
                 Err(e) => {
-                    return Err(loader
-                        .abort(Error::Transfer(format!("mysql read: {e}")))
-                        .await)
+                    return Err(Error::Transfer(format!("mysql read: {e}")))
                 }
             };
             if let Some(tf) = tf {
@@ -1293,9 +1306,7 @@ async fn row_worker<L: Loader>(
             if let Some(te) = te {
                 t_enc += te.elapsed();
             }
-            if let Err(e) = step {
-                return Err(loader.abort(e).await);
-            }
+            step?;
             pending_rows += 1;
             // mem::replace (not take): take leaves capacity 0 and the next chunk pays
             // ~1 extra full copy in geometric regrowth. Recycled buffers from the
@@ -1305,8 +1316,7 @@ async fn row_worker<L: Loader>(
             if out.len() >= chunk {
                 let full = std::mem::replace(
                     &mut out,
-                    loader
-                        .reclaim()
+                    pipe.reclaim()
                         .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024)),
                 );
                 let ts = std::time::Instant::now();
@@ -1314,7 +1324,7 @@ async fn row_worker<L: Loader>(
                 // every row anyway, so the count is exact, and one relaxed add
                 // per few MB costs nothing.
                 crate::progress::add_rows(std::mem::take(&mut pending_rows));
-                loader.send(full).await?;
+                pipe.send(full).await?;
                 if dbg {
                     t_send += ts.elapsed();
                 }
@@ -1326,7 +1336,7 @@ async fn row_worker<L: Loader>(
     }
     if !out.is_empty() {
         crate::progress::add_rows(std::mem::take(&mut pending_rows));
-        loader.send(out).await?;
+        pipe.send(out).await?;
     }
     if dbg {
         eprintln!(
@@ -1336,7 +1346,7 @@ async fn row_worker<L: Loader>(
             t_send.as_secs_f64()
         );
     }
-    loader.finish().await
+    Ok(Rows::FromLoader)
 }
 
 /// [`row_worker`]'s raw-plane twin: own TCP connection, prepared span
@@ -1347,12 +1357,12 @@ async fn row_worker<L: Loader>(
 /// them.
 async fn raw_transfer_worker<L: Loader>(
     url: std::sync::Arc<str>,
-    queue: WorkQueue,
+    spans: Spans,
     enc: MyEnc,
     wire: std::sync::Arc<Vec<MyAr>>,
-    mut loader: L,
+    pipe: &mut Pipe<L>,
     chunk: usize,
-) -> Result<u64> {
+) -> Result<Rows> {
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let (mut t_fetch, mut t_enc, mut t_send) = (
         std::time::Duration::ZERO,
@@ -1366,29 +1376,25 @@ async fn raw_transfer_worker<L: Loader>(
     }
     let mut w = match MyWire::connect(&url).await {
         Ok(w) => w,
-        Err(e) => return Err(loader.abort(e).await),
+        Err(e) => return Err(e),
     };
-    while let Some(sql) = pop(&queue) {
+    while let Some(sql) = spans.next()? {
         let (sid, ncols) = match w.prepare(&sql).await {
             Ok(v) => v,
-            Err(e) => return Err(loader.abort(e).await),
+            Err(e) => return Err(e),
         };
         if ncols != wire.len() {
-            return Err(loader
-                .abort(Error::Transfer(format!(
+            return Err(Error::Transfer(format!(
                     "mysql wire: span returned {ncols} columns, planned {}",
                     wire.len()
-                )))
-                .await);
+                )));
         }
-        if let Err(e) = w.execute(sid).await {
-            return Err(loader.abort(e).await);
-        }
+        w.execute(sid).await?;
         loop {
             let tf = dbg.then(std::time::Instant::now);
             let row = match w.next_row().await {
                 Ok(r) => r,
-                Err(e) => return Err(loader.abort(e).await),
+                Err(e) => return Err(e),
             };
             if let Some(tf) = tf {
                 t_fetch += tf.elapsed();
@@ -1425,15 +1431,12 @@ async fn raw_transfer_worker<L: Loader>(
             if let Some(te) = te {
                 t_enc += te.elapsed();
             }
-            if let Err(e) = step {
-                return Err(loader.abort(e).await);
-            }
+            step?;
             pending_rows += 1;
             if out.len() >= chunk {
                 let full = std::mem::replace(
                     &mut out,
-                    loader
-                        .reclaim()
+                    pipe.reclaim()
                         .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024)),
                 );
                 let ts = std::time::Instant::now();
@@ -1441,22 +1444,20 @@ async fn raw_transfer_worker<L: Loader>(
                 // every row anyway, so the count is exact, and one relaxed add
                 // per few MB costs nothing.
                 crate::progress::add_rows(std::mem::take(&mut pending_rows));
-                loader.send(full).await?;
+                pipe.send(full).await?;
                 if dbg {
                     t_send += ts.elapsed();
                 }
             }
         }
-        if let Err(e) = w.stmt_close(sid).await {
-            return Err(loader.abort(e).await);
-        }
+        w.stmt_close(sid).await?;
     }
     if let MyEnc::PgCopy(_) = &enc {
         pgc::trailer(&mut out);
     }
     if !out.is_empty() {
         crate::progress::add_rows(std::mem::take(&mut pending_rows));
-        loader.send(out).await?;
+        pipe.send(out).await?;
     }
     if dbg {
         eprintln!(
@@ -1466,7 +1467,7 @@ async fn raw_transfer_worker<L: Loader>(
             t_send.as_secs_f64()
         );
     }
-    loader.finish().await
+    Ok(Rows::FromLoader)
 }
 
 impl MySqlSource {
@@ -1506,35 +1507,59 @@ impl MySqlSource {
                 }
             }
         }
-        let queue = super::work_queue(stmts);
-        let mut tasks = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let bb = BatchBuilder::new(kinds.clone(), batch_bytes);
-            tasks.push(if raw {
-                tokio::spawn(raw_arrow_worker(
-                    self.url.clone(),
-                    queue.clone(),
-                    encs.clone(),
-                    bb,
-                    tx.clone(),
-                ))
-            } else {
-                tokio::spawn(arrow_row_worker(
-                    self.pool.clone(),
-                    queue.clone(),
-                    encs.clone(),
-                    bb,
-                    tx.clone(),
-                ))
-            });
+        let bodies: Vec<ArrowBody> = (0..workers)
+            .map(|_| {
+                let bb = BatchBuilder::new(kinds.clone(), batch_bytes);
+                if raw {
+                    ArrowBody::Raw {
+                        url: self.url.clone(),
+                        encs: encs.clone(),
+                        bb,
+                        tx: tx.clone(),
+                    }
+                } else {
+                    ArrowBody::Row {
+                        pool: self.pool.clone(),
+                        encs: encs.clone(),
+                        bb,
+                        tx: tx.clone(),
+                    }
+                }
+            })
+            .collect();
+        // The loader-less lane runs through the same crew join loop as the
+        // loader-bound lanes; only the body differs.
+        crate::pipe::run_tasks(stmts, bodies).await
+    }
+}
+
+/// One direct-Arrow read worker's plan. The body is loader-less (cells go into
+/// a [`BatchBuilder`], sealed batches into `tx`), so it runs as a `SpanBody`.
+enum ArrowBody {
+    Row {
+        pool: MySqlPool,
+        encs: std::sync::Arc<Vec<MyAr>>,
+        bb: BatchBuilder,
+        tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+    },
+    Raw {
+        url: std::sync::Arc<str>,
+        encs: std::sync::Arc<Vec<MyAr>>,
+        bb: BatchBuilder,
+        tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+    },
+}
+
+impl crate::pipe::SpanBody for ArrowBody {
+    async fn run(self, spans: Spans) -> Result<u64> {
+        match self {
+            ArrowBody::Row { pool, encs, bb, tx } => {
+                arrow_row_worker(pool, spans, encs, bb, tx).await
+            }
+            ArrowBody::Raw { url, encs, bb, tx } => {
+                raw_arrow_worker(url, spans, encs, bb, tx).await
+            }
         }
-        let mut rows = 0u64;
-        for t in tasks {
-            rows += t
-                .await
-                .map_err(|e| Error::Transfer(format!("join: {e}")))??;
-        }
-        Ok(rows)
     }
 }
 
@@ -1608,7 +1633,7 @@ fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
 /// walked in place from the socket buffer into the column builders.
 async fn raw_arrow_worker(
     url: std::sync::Arc<str>,
-    queue: WorkQueue,
+    spans: Spans,
     encs: std::sync::Arc<Vec<MyAr>>,
     mut bb: BatchBuilder,
     tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
@@ -1622,7 +1647,7 @@ async fn raw_arrow_worker(
     let cancelled = || Error::Transfer("read cancelled by consumer".into());
     let mut w = MyWire::connect(&url).await?;
     let mut since_seal = 0u32;
-    while let Some(sql) = pop(&queue) {
+    while let Some(sql) = spans.next()? {
         let (sid, ncols) = w.prepare(&sql).await?;
         if ncols != encs.len() {
             return Err(Error::Transfer(format!(
@@ -1678,7 +1703,7 @@ async fn raw_arrow_worker(
 /// hot for every row.
 async fn arrow_row_worker(
     pool: MySqlPool,
-    queue: WorkQueue,
+    spans: Spans,
     encs: std::sync::Arc<Vec<MyAr>>,
     mut bb: BatchBuilder,
     tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
@@ -1692,7 +1717,7 @@ async fn arrow_row_worker(
     );
     let cancelled = || Error::Transfer("read cancelled by consumer".into());
     let mut since_seal = 0u32;
-    while let Some(sql) = pop(&queue) {
+    while let Some(sql) = spans.next()? {
         let mut rows = sqlx::query(&sql).fetch(&pool);
         loop {
             let tf = dbg.then(std::time::Instant::now);

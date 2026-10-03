@@ -19,10 +19,11 @@
 //!     multiset. Those engines read as ONE span.
 
 use crate::error::{Error, Result};
+use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::plan::{ColumnPlan, Delivered, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::clickhouse::ChConn;
 use crate::sink::Loader;
-use crate::source::{pop, spans, work_queue, WorkQueue};
+use crate::source::spans;
 
 pub(crate) struct ChSource {
     conn: ChConn,
@@ -555,7 +556,7 @@ impl crate::source::Source for ChSource {
         _plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
-        loaders: Vec<L>,
+        pipes: Pipes<L>,
         chunk: usize,
     ) -> Result<u64> {
         let skips: std::sync::Arc<Vec<Skip>> = std::sync::Arc::new(
@@ -568,48 +569,46 @@ impl crate::source::Source for ChSource {
                 })
                 .collect(),
         );
-        let queue = work_queue(stmts);
-        let mut tasks = Vec::with_capacity(loaders.len());
-        for loader in loaders {
-            let conn = self.conn.clone();
-            let queue = queue.clone();
-            let skips = skips.clone();
-            tasks.push(tokio::spawn(async move {
-                worker(conn, queue, skips, loader, chunk).await
-            }));
-        }
-        let mut rows = 0u64;
-        for t in tasks {
-            rows += t
-                .await
-                .map_err(|e| Error::Transfer(format!("join: {e}")))??;
-        }
-        Ok(rows)
+        pipes
+            .run(stmts, move |_| ChBody {
+                conn: self.conn.clone(),
+                skips: skips.clone(),
+                chunk,
+            })
+            .await
+    }
+}
+
+struct ChBody {
+    conn: ChConn,
+    skips: std::sync::Arc<Vec<Skip>>,
+    chunk: usize,
+}
+
+impl<L: Loader> PipeBody<L> for ChBody {
+    async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
+        worker(self.conn, spans, self.skips, pipe, self.chunk).await
     }
 }
 
 /// One worker: pull a span, stream its RowBinary body, count rows as they pass,
 /// coalesce to ~`chunk` bytes on ROW boundaries (the loader framing contract),
-/// and verify the span's row count before letting the transfer proceed.
+/// and verify the span's row count before letting the transfer proceed. The
+/// `next` precedes the count, so a cancelled sibling issues neither count nor
+/// stream.
 async fn worker<L: Loader>(
     conn: ChConn,
-    queue: WorkQueue,
+    spans: Spans,
     skips: std::sync::Arc<Vec<Skip>>,
-    mut loader: L,
+    pipe: &mut Pipe<L>,
     chunk: usize,
-) -> Result<u64> {
+) -> Result<Rows> {
     let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
     let mut carry: Vec<u8> = Vec::new();
     let mut total = 0u64;
-    while let Some(sql) = pop(&queue) {
-        let expected = match count_of(&conn, &sql).await {
-            Ok(n) => n,
-            Err(e) => return Err(loader.abort(e).await),
-        };
-        let mut resp = match conn.query_stream(&sql).await {
-            Ok(r) => r,
-            Err(e) => return Err(loader.abort(e).await),
-        };
+    while let Some(sql) = spans.next()? {
+        let expected = count_of(&conn, &sql).await?;
+        let mut resp = conn.query_stream(&sql).await?;
         let mut got = 0u64;
         carry.clear();
         loop {
@@ -617,9 +616,7 @@ async fn worker<L: Loader>(
                 Ok(Some(b)) => b,
                 Ok(None) => break,
                 Err(e) => {
-                    return Err(loader
-                        .abort(Error::Transfer(format!("clickhouse read: {e}")))
-                        .await)
+                    return Err(Error::Transfer(format!("clickhouse read: {e}")))
                 }
             };
             carry.extend_from_slice(&piece);
@@ -629,40 +626,35 @@ async fn worker<L: Loader>(
             out.extend_from_slice(&carry[..consumed]);
             carry.drain(..consumed);
             if out.len() >= chunk {
-                let fresh = loader
+                let fresh = pipe
                     .reclaim()
                     .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024));
                 let full = std::mem::replace(&mut out, fresh);
-                loader.send(full).await?;
+                pipe.send(full).await?;
             }
         }
         // A ClickHouse read that dies mid-stream still answers HTTP 200 and glues
         // its exception onto the end of the body. Both symptoms land here.
         if !carry.is_empty() {
-            return Err(loader
-                .abort(Error::Transfer(format!(
-                    "clickhouse: span ended mid-row with {} trailing bytes — the \
-                     server aborted the query after sending a 200 (tail: {:?})",
-                    carry.len(),
-                    String::from_utf8_lossy(&carry[..carry.len().min(180)])
-                )))
-                .await);
+            return Err(Error::Transfer(format!(
+                "clickhouse: span ended mid-row with {} trailing bytes — the \
+                 server aborted the query after sending a 200 (tail: {:?})",
+                carry.len(),
+                String::from_utf8_lossy(&carry[..carry.len().min(180)])
+            )));
         }
         if got != expected {
-            return Err(loader
-                .abort(Error::Transfer(format!(
-                    "clickhouse: span returned {got} rows, count() says {expected} — \
-                     refusing to swap a short read in"
-                )))
-                .await);
+            return Err(Error::Transfer(format!(
+                "clickhouse: span returned {got} rows, count() says {expected} — \
+                 refusing to swap a short read in"
+            )));
         }
         total += got;
     }
     if !out.is_empty() {
-        loader.send(out).await?;
+        pipe.send(out).await?;
     }
-    loader.finish().await?;
-    Ok(total)
+    Ok(Rows::Own(total))
 }
 
 async fn count_of(conn: &ChConn, stmt: &str) -> Result<u64> {

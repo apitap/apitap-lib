@@ -364,15 +364,12 @@ impl S3Conn {
             let qs = if query.is_empty() {
                 String::new()
             } else {
+                // `k=v` even for an empty v: `sigv4_headers` canonicalizes an
+                // empty value as `k=`, so the request must spell it the same
+                // way (a bare `uploads` signs differently than it is sent).
                 let parts: Vec<String> = query
                     .iter()
-                    .map(|(k, v)| {
-                        if v.is_empty() {
-                            enc_seg(k)
-                        } else {
-                            format!("{}={}", enc_seg(k), enc_seg(v))
-                        }
-                    })
+                    .map(|(k, v)| format!("{}={}", enc_seg(k), enc_seg(v)))
                     .collect();
                 format!("?{}", parts.join("&"))
             };
@@ -522,7 +519,10 @@ impl S3Conn {
                 .await?;
             let body = Self::check(r, "list").await?;
             out.extend(xml_tags(&body, "Key"));
-            token = xml_tag(&body, "NextContinuationToken");
+            // MinIO answers a complete listing with an EMPTY
+            // `<NextContinuationToken></NextContinuationToken>` rather than
+            // omitting it; `Some("")` means "no more pages", not "page again".
+            token = xml_tag(&body, "NextContinuationToken").filter(|t| !t.is_empty());
             if token.is_none() {
                 break;
             }
@@ -561,8 +561,12 @@ impl S3Conn {
             let keys = xml_tags(&body, "Key");
             let ids = xml_tags(&body, "UploadId");
             out.extend(keys.into_iter().zip(ids));
-            key_marker = xml_tag(&body, "NextKeyMarker");
-            id_marker = xml_tag(&body, "NextUploadIdMarker");
+            // Same MinIO shape as `list`: an empty marker means the listing is
+            // complete. Without the filter an empty marker was `Some("")`, so
+            // `discard` re-asked forever — the exact hang this belt exists to
+            // prevent (measured: a failed pg→s3 run never returned).
+            key_marker = xml_tag(&body, "NextKeyMarker").filter(|m| !m.is_empty());
+            id_marker = xml_tag(&body, "NextUploadIdMarker").filter(|m| !m.is_empty());
             if key_marker.is_none() {
                 break;
             }

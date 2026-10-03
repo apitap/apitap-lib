@@ -17,6 +17,7 @@
 //! repos; the token rides only in the Authorization header.
 
 use crate::error::{Error, Result};
+use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::Source;
@@ -830,14 +831,30 @@ impl Source for GithubApiSource {
         plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
-        loaders: Vec<L>,
+        pipes: Pipes<L>,
         chunk: usize,
     ) -> Result<u64> {
-        let mut loader = loaders
-            .into_iter()
-            .next()
-            .expect("one span always yields one loader");
-        let stmt: Value = serde_json::from_str(&stmts[0])
+        pipes
+            .run_inline(
+                stmts,
+                GhApiBody { src: self, plan, lane, chunk },
+            )
+            .await
+    }
+}
+
+/// One single-stream worker: the REST lists are cursor-paged, not splittable.
+/// The pipe is borrowed, never owned — the engine finishes or aborts it.
+struct GhApiBody<'a> {
+    src: &'a GithubApiSource,
+    plan: &'a TablePlan,
+    lane: &'a Lane,
+    chunk: usize,
+}
+
+impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
+    async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
+        let stmt: Value = serde_json::from_str(&spans.next()?.expect("one span statement"))
             .map_err(|e| Error::Transfer(format!("github+api span stmt: {e}")))?;
         let e = entity(stmt["entity"].as_str().unwrap_or_default())?;
         let since = stmt["since"].as_str().map(str::to_string);
@@ -853,8 +870,8 @@ impl Source for GithubApiSource {
 
         // RowBinary lane: run the pgcopy stream through the same transcoder the
         // Postgres source uses — one encoder, every destination.
-        let tsv_lane = lane.format == WireFormat::MyTsv;
-        let mut xcode = match lane.format {
+        let tsv_lane = self.lane.format == WireFormat::MyTsv;
+        let mut xcode = match self.lane.format {
             WireFormat::PgCopyBinary | WireFormat::MyTsv => None,
             WireFormat::RowBinary => {
                 // Nullability comes from the ADJUSTED plan — the ClickHouse
@@ -862,7 +879,8 @@ impl Source for GithubApiSource {
                 // DDL and this wire framing must agree (the flag byte would
                 // frame-shift a non-Nullable column). Same contract as the
                 // Postgres source.
-                let cols = plan
+                let cols = self
+                    .plan
                     .cols
                     .iter()
                     .map(|c| {
@@ -879,39 +897,30 @@ impl Source for GithubApiSource {
                 Some(Transcoder::new(cols))
             }
             WireFormat::TabSeparated => {
-                return Err(loader
-                    .abort(Error::Transfer(
-                        "github+api never negotiates the PG text dialect".into(),
-                    ))
-                    .await)
+                return Err(Error::Transfer(
+                    "github+api never negotiates the PG text dialect".into(),
+                ))
             }
         };
 
-        let mut pg: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
+        let mut pg: Vec<u8> = Vec::with_capacity(self.chunk + 64 * 1024);
         if !tsv_lane {
             pgc::header(&mut pg);
         }
-        let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
+        let mut out: Vec<u8> = Vec::with_capacity(self.chunk + 64 * 1024);
         let mut rows: u64 = 0;
-        let mut url = self.first_page_url(e, since.as_deref());
+        let mut url = self.src.first_page_url(e, since.as_deref());
         loop {
-            let resp = match self.send(url.clone(), e.accept, e.name).await {
-                Ok(r) => r,
-                Err(err) => return Err(loader.abort(err).await),
-            };
+            let resp = self.src.send(url.clone(), e.accept, e.name).await?;
             let next = resp
                 .headers()
                 .get("link")
                 .and_then(|v| v.to_str().ok())
                 .and_then(link_next);
-            let body: Value = match resp.json().await {
-                Ok(v) => v,
-                Err(err) => {
-                    return Err(loader
-                        .abort(Error::Transfer(format!("github+api {}: {err}", e.name)))
-                        .await)
-                }
-            };
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|err| Error::Transfer(format!("github+api {}: {err}", e.name)))?;
             let items = match e.wrap {
                 Some(k) => body[k].as_array().cloned().unwrap_or_default(),
                 None => body.as_array().cloned().unwrap_or_default(),
@@ -926,36 +935,31 @@ impl Source for GithubApiSource {
                 // (op `>`) must not re-land the watermark row.
                 if let (Some(wm), Some(p)) = (wm_micros, cursor_path) {
                     if let Some(v) = walk(item, p).as_str() {
-                        let m = match ts_micros(v) {
-                            Ok(m) => m,
-                            Err(err) => return Err(loader.abort(err).await),
-                        };
+                        let m = ts_micros(v)?;
                         if m < wm || (strict && m == wm) {
                             continue;
                         }
                     }
                 }
-                let enc_res = if tsv_lane {
-                    encode_row_tsv(e, item, &mut pg)
+                if tsv_lane {
+                    encode_row_tsv(e, item, &mut pg)?;
                 } else {
-                    encode_row(e, item, &mut pg)
-                };
-                if let Err(err) = enc_res {
-                    return Err(loader.abort(err).await);
+                    encode_row(e, item, &mut pg)?;
                 }
                 rows += 1;
-                if pg.len() >= chunk {
-                    let buf = std::mem::replace(&mut pg, Vec::with_capacity(chunk + 64 * 1024));
+                if pg.len() >= self.chunk {
+                    let buf =
+                        std::mem::replace(&mut pg, Vec::with_capacity(self.chunk + 64 * 1024));
                     match &mut xcode {
-                        None => loader.send(buf).await?,
+                        None => pipe.send(buf).await?,
                         Some(t) => {
-                            if let Err(err) = t.push(&buf, &mut out) {
-                                return Err(loader.abort(err).await);
-                            }
-                            let ready =
-                                std::mem::replace(&mut out, Vec::with_capacity(chunk + 64 * 1024));
+                            t.push(&buf, &mut out)?;
+                            let ready = std::mem::replace(
+                                &mut out,
+                                Vec::with_capacity(self.chunk + 64 * 1024),
+                            );
                             if !ready.is_empty() {
-                                loader.send(ready).await?;
+                                pipe.send(ready).await?;
                             }
                         }
                     }
@@ -972,20 +976,17 @@ impl Source for GithubApiSource {
         match &mut xcode {
             None => {
                 if !pg.is_empty() {
-                    loader.send(pg).await?;
+                    pipe.send(pg).await?;
                 }
             }
             Some(t) => {
-                if let Err(err) = t.push(&pg, &mut out) {
-                    return Err(loader.abort(err).await);
-                }
+                t.push(&pg, &mut out)?;
                 if !out.is_empty() {
-                    loader.send(out).await?;
+                    pipe.send(out).await?;
                 }
             }
         }
-        let reported = loader.finish().await?;
-        Ok(if reported > 0 { reported } else { rows })
+        Ok(Rows::LoaderElseOwn(rows))
     }
 }
 

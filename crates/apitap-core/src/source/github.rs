@@ -16,6 +16,7 @@
 //! `mode="replace"`.
 
 use crate::error::{Error, Result};
+use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::plan::{Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::csvfile;
@@ -450,19 +451,35 @@ impl Source for GithubSource {
         plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
-        loaders: Vec<L>,
+        pipes: Pipes<L>,
         chunk: usize,
     ) -> Result<u64> {
-        let loader = loaders
-            .into_iter()
-            .next()
-            .expect("one span always yields one loader");
-        let key = stmts.into_iter().next().expect("one span statement");
-        let stream = match self.raw(&key).await {
-            Ok(r) => r.bytes_stream(),
-            Err(e) => return Err(loader.abort(e).await),
-        };
-        csvfile::stream_rows(&key, stream, plan, lane, loader, chunk).await
+        pipes
+            .run_inline(
+                stmts,
+                GhBody { src: self, plan, lane, chunk },
+            )
+            .await
+    }
+}
+
+/// One single-stream worker: resolve the file URL, then hand its byte stream
+/// to the shared CSV pump. The pipe is borrowed, never owned — the engine
+/// finishes or aborts it.
+struct GhBody<'a> {
+    src: &'a GithubSource,
+    plan: &'a TablePlan,
+    lane: &'a Lane,
+    chunk: usize,
+}
+
+impl<L: Loader> PipeBody<L> for GhBody<'_> {
+    async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
+        let key = spans.next()?.expect("one span statement");
+        let stream = self.src.raw(&key).await?.bytes_stream();
+        Ok(Rows::LoaderElseOwn(
+            csvfile::stream_rows(&key, stream, self.plan, self.lane, pipe, self.chunk).await?,
+        ))
     }
 }
 

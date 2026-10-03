@@ -647,15 +647,14 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
             .span_stmts(table, &plan, &lane, want, delta.as_ref())
             .await?;
         let used = resolve(stmts.len()).min(stmts.len()).max(1);
-        let mut loaders = Vec::with_capacity(used);
-        for _ in 0..used {
-            // Counted: one wrapper here instruments every source × destination
-            // pair at once — see `sink::Counted`.
-            loaders.push(crate::sink::Counted(sink.loader().await?));
-        }
+        // One crew per set: `Pipes::open` aborts the already-open loaders if
+        // the k-th fails, and `run_workers` cannot resolve while any worker
+        // task exists — every loader is finished or aborted inside it. That
+        // ordering is what makes `discard` below run after the last write.
+        let pipes = crate::pipe::Pipes::open(used, || sink.loader()).await?;
         crate::progress::set_pipes(used);
 
-        let loaded = src.run_workers(&plan, &lane, stmts, loaders, chunk).await?;
+        let loaded = src.run_workers(&plan, &lane, stmts, pipes, chunk).await?;
         let rows = sink.rows_staged(loaded).await?;
         sink.finalize(rows, mode).await?;
         Ok((rows, used))

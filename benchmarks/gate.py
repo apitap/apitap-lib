@@ -216,6 +216,15 @@ LEGS = [
         {"iceberg"},
         proves={"memory.iceberg-merge-flat": ("ice",),
                 "leg.e2e_iceberg_merge_capped": (_claims.LEG_ENGINE,)}),
+
+    leg("e2e_worker_cancel.py", "a failed worker stops its siblings before staging is swept",
+        argv=["pg"], proves={"bulk.sibling-cancel": ("pg",)}),
+    leg("e2e_worker_cancel.py", "the same, into ClickHouse",
+        argv=["ch"], proves={"bulk.sibling-cancel": ("ch",)}),
+    leg("e2e_worker_cancel.py", "the same, into S3 (MinIO)", {"iceberg"}, ["s3"],
+        proves={"bulk.sibling-cancel": ("s3",)}),
+    leg("e2e_worker_cancel.py", "the same, into BigQuery", {"bq"}, ["bq"],
+        proves={"bulk.sibling-cancel": ("bq",)}),
 ]
 
 

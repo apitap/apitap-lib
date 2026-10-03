@@ -320,17 +320,20 @@ def s3_url(prefix):
             f"&region={S3_REGION}&access_key_id={_S3_KEY}&secret_access_key={_S3_SECRET}")
 
 
-def _s3(method, key="", query=None, body=b""):
+def _s3(method, key="", query=None, body=b"", bucket=None):
     """One SigV4-signed, path-style request — enough S3 to plant, list and
-    delete what a leg needs, with nothing to install."""
+    delete what a leg needs, with nothing to install. `bucket` defaults to the
+    shared bench bucket; a leg with its own bucket passes it explicitly.
+    Every query value is spelled `k=v`, the form the signer canonicalizes."""
     import datetime
     import hashlib
     import hmac
     import urllib.parse
     import requests
+    bucket = bucket or S3_BUCKET
     now = datetime.datetime.now(datetime.timezone.utc)
     amz, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
-    path = f"/{S3_BUCKET}" + (f"/{urllib.parse.quote(key, safe='/~')}" if key else "")
+    path = f"/{bucket}" + (f"/{urllib.parse.quote(key, safe='/~')}" if key else "")
     q = "&".join(f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
                  for k, v in sorted((query or {}).items()))
     payload = hashlib.sha256(body).hexdigest()
@@ -353,22 +356,55 @@ def _s3(method, key="", query=None, body=b""):
     return r
 
 
-def s3_put(key, body=b""):
-    _s3("PUT", key, body=body)
+def s3_put(key, body=b"", bucket=None):
+    _s3("PUT", key, body=body, bucket=bucket)
 
 
-def s3_delete(key):
-    _s3("DELETE", key)
+def s3_delete(key, bucket=None):
+    _s3("DELETE", key, bucket=bucket)
 
 
-def s3_list(prefix):
+def s3_create_bucket(bucket):
+    """CreateBucket; an existing bucket of the same owner is success too."""
+    try:
+        _s3("PUT", bucket=bucket)
+    except RuntimeError as e:
+        if "409" not in str(e):
+            raise
+
+
+def s3_delete_bucket(bucket):
+    """Best effort — a bucket with any object left refuses, and that object is
+    the more useful thing for the operator to see."""
+    try:
+        _s3("DELETE", bucket=bucket)
+        return True
+    except RuntimeError:
+        return False
+
+
+def s3_list(prefix, bucket=None):
     import re
     keys, token = [], None
     while True:
         q = {"list-type": "2", "prefix": prefix, **({"continuation-token": token} if token else {})}
-        text = _s3("GET", query=q).text
+        text = _s3("GET", query=q, bucket=bucket).text
         keys += re.findall(r"<Key>([^<]+)</Key>", text)
         m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", text)
         if not m:
             return keys
         token = m.group(1)
+
+
+def s3_list_uploads(prefix, bucket=None):
+    """Incomplete multipart uploads under `prefix`, as (key, upload_id) — the
+    objects a cancelled worker can still complete after `discard` swept."""
+    import re
+    text = _s3("GET", query={"uploads": "", "prefix": prefix}, bucket=bucket).text
+    out = []
+    for m in re.finditer(r"<Upload>(.*?)</Upload>", text, re.S):
+        k = re.search(r"<Key>([^<]+)</Key>", m.group(1))
+        i = re.search(r"<UploadId>([^<]+)</UploadId>", m.group(1))
+        if k and i:
+            out.append((k.group(1), i.group(1)))
+    return out

@@ -7,6 +7,7 @@
 //! bounded buffer that only ever grows to the largest single record.
 
 use crate::error::{Error, Result};
+use crate::pipe::Pipe;
 use crate::plan::{ColumnPlan, Lane, TablePlan};
 use crate::sink::Loader;
 use crate::wire::textrow::TextEnc;
@@ -278,7 +279,7 @@ pub(crate) async fn stream_rows<L, S>(
     mut stream: S,
     plan: &TablePlan,
     lane: &Lane,
-    mut loader: L,
+    pipe: &mut Pipe<L>,
     chunk: usize,
 ) -> Result<u64>
 where
@@ -296,11 +297,7 @@ where
     while !eof {
         match stream.next().await {
             Some(Ok(bytes)) => pump.feed(&bytes),
-            Some(Err(e)) => {
-                return Err(loader
-                    .abort(Error::Transfer(format!("read '{label}': {e}")))
-                    .await)
-            }
+            Some(Err(e)) => return Err(Error::Transfer(format!("read '{label}': {e}"))),
             None => eof = true,
         }
         while let Some(row) = pump.next_record(eof) {
@@ -310,15 +307,13 @@ where
             }
             if row.len() > ncols {
                 let n = row.len();
-                return Err(loader
-                    .abort(Error::InvalidInput(format!(
-                        "'{label}' record {} (header counted, blank lines not) has \
-                         {n} fields but the header has {ncols} — fix the file (short \
-                         rows pad with NULLs; a long row is refused, it would drop \
-                         data)",
-                        rows_sent + 2,
-                    )))
-                    .await);
+                return Err(Error::InvalidInput(format!(
+                    "'{label}' record {} (header counted, blank lines not) has \
+                     {n} fields but the header has {ncols} — fix the file (short \
+                     rows pad with NULLs; a long row is refused, it would drop \
+                     data)",
+                    rows_sent + 2,
+                )));
             }
             enc.row_start(ncols, &mut out);
             for i in 0..ncols {
@@ -329,16 +324,17 @@ where
             rows_sent += 1;
             if out.len() >= chunk {
                 let buf = std::mem::replace(&mut out, Vec::with_capacity(chunk + 64 * 1024));
-                loader.send(buf).await?;
+                pipe.send(buf).await?;
             }
         }
     }
     enc.close(&mut out);
     if !out.is_empty() {
-        loader.send(out).await?;
+        pipe.send(out).await?;
     }
-    let reported = loader.finish().await?;
-    Ok(if reported > 0 { reported } else { rows_sent })
+    // The worker's own tally; `Pipe::drive` resolves it against the finish
+    // value with the loader-else-own rule (I10).
+    Ok(rows_sent)
 }
 
 #[cfg(test)]

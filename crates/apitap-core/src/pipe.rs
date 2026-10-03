@@ -344,8 +344,8 @@ impl<L: Loader> Pipes<L> {
         Ok(Self { pipes, latch })
     }
 
-    /// Read lane: ArrowLoaders, NOT counted (read_impl never wrapped them in
-    /// `Counted` — I10: progress bytes stay identical).
+    /// Read lane: ArrowLoaders, NOT counted (0.56.0's `Counted` wrapper existed
+    /// only on the bulk lane — I10: progress bytes stay identical).
     pub(crate) fn for_read(loaders: Vec<L>) -> Self {
         let latch = Latch::new();
         Self {
@@ -912,6 +912,65 @@ mod tests {
             "siblings stop at their next span"
         );
         assert_eq!(alive.load(SeqCst), 0, "run_tasks returns only after every task ended");
+    }
+
+    /// 9. The crew is the only spawn: a source that pushed a loader into its
+    /// own task or queue would outlive the join loop, escape the latch, and
+    /// keep writing while `discard` runs. read_impl.rs (the read supervisor)
+    /// is deliberately not listed — its `JoinSet` drop is the one legal abort
+    /// from above, and `ArrowLoader::abort` owes nothing.
+    ///
+    /// RED (mutation: add `tokio::spawn` or a `WorkQueue` pop to any listed
+    /// file): the matching assert names that file; on the pre-rewire tree the
+    /// production text of every database source contains one.
+    const WATCHED: [(&str, &str); 11] = [
+        ("source/mod.rs", include_str!("source/mod.rs")),
+        ("source/postgres.rs", include_str!("source/postgres.rs")),
+        ("source/mysql.rs", include_str!("source/mysql.rs")),
+        ("source/clickhouse.rs", include_str!("source/clickhouse.rs")),
+        ("source/csvfile.rs", include_str!("source/csvfile.rs")),
+        ("source/github.rs", include_str!("source/github.rs")),
+        ("source/gsheets.rs", include_str!("source/gsheets.rs")),
+        ("source/github_api.rs", include_str!("source/github_api.rs")),
+        ("pipeline/mod.rs", include_str!("pipeline/mod.rs")),
+        ("pipeline/dispatch.rs", include_str!("pipeline/dispatch.rs")),
+        ("sink/mod.rs", include_str!("sink/mod.rs")),
+    ];
+
+    #[test]
+    fn no_spawn_outside_the_crew() {
+        // The token set lint, not a parser: these five spellings are the ways
+        // 0.56.0 detached a worker, and a source cannot be written into the
+        // crew without deleting every one of them.
+        const FORBIDDEN: [&str; 6] =
+            ["tokio::spawn", "task::spawn", "JoinSet", "JoinHandle", "WorkQueue", "fn pop("];
+        for (name, text) in WATCHED {
+            // The test modules legitimately spawn (their 0.56.0-control bodies
+            // live there); only production text is the source's surface.
+            let prod = match text.find("#[cfg(test)]") {
+                Some(i) => &text[..i],
+                None => text,
+            };
+            for bad in FORBIDDEN {
+                assert!(
+                    !prod.contains(bad),
+                    "{name}: {bad:?} outside the crew — a worker could outlive the join loop"
+                );
+            }
+        }
+        // A new source must be listed above, or it never enters this lint.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/source");
+        let mut listed: Vec<String> = WATCHED
+            .iter()
+            .filter_map(|(n, _)| n.strip_prefix("source/").map(str::to_string))
+            .collect();
+        listed.sort();
+        let mut actual: Vec<String> = std::fs::read_dir(dir)
+            .expect("src/source")
+            .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        actual.sort();
+        assert_eq!(listed, actual, "a source file is missing from WATCHED: add it (it must not spawn)");
     }
 
     /// 10. The surface sources see is pinned: no `into_inner`, no `finish`,

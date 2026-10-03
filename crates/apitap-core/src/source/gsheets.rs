@@ -14,6 +14,7 @@
 //! carry no usable cursor) — use `mode="replace"`.
 
 use crate::error::{Error, Result};
+use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::Source;
@@ -287,28 +288,41 @@ impl Source for GsheetsSource {
         plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
-        loaders: Vec<L>,
+        pipes: Pipes<L>,
         chunk: usize,
     ) -> Result<u64> {
-        let mut loader = loaders
-            .into_iter()
-            .next()
-            .expect("one span always yields one loader");
-        let tab = stmts.into_iter().next().expect("one span statement");
-        let ncols = plan.cols.len();
-        let enc = TextEnc::of(lane.format);
+        pipes
+            .run_inline(
+                stmts,
+                GsBody { src: self, plan, lane, chunk },
+            )
+            .await
+    }
+}
 
-        let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
+/// One single-stream worker: page the tab, frame each row, feed the pipe. The
+/// pipe is borrowed, never owned — the engine finishes or aborts it.
+struct GsBody<'a> {
+    src: &'a GsheetsSource,
+    plan: &'a TablePlan,
+    lane: &'a Lane,
+    chunk: usize,
+}
+
+impl<L: Loader> PipeBody<L> for GsBody<'_> {
+    async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
+        let tab = spans.next()?.expect("one span statement");
+        let ncols = self.plan.cols.len();
+        let enc = TextEnc::of(self.lane.format);
+
+        let mut out: Vec<u8> = Vec::with_capacity(self.chunk + 64 * 1024);
         enc.open(&mut out);
         let page_rows = fetch_rows();
         let mut start = 2usize; // row 1 is the header
         let mut rows_sent: u64 = 0;
         loop {
             let cells = format!("A{start}:ZZZ{}", start + page_rows - 1);
-            let page = match self.values(&Self::range(&tab, &cells)).await {
-                Ok(p) => p,
-                Err(e) => return Err(loader.abort(e).await),
-            };
+            let page = self.src.values(&GsheetsSource::range(&tab, &cells)).await?;
             if page.is_empty() {
                 break;
             }
@@ -321,9 +335,9 @@ impl Source for GsheetsSource {
                 }
                 enc.row_end(&mut out);
                 rows_sent += 1;
-                if out.len() >= chunk {
-                    let buf = std::mem::replace(&mut out, Vec::with_capacity(chunk + 64 * 1024));
-                    loader.send(buf).await?;
+                if out.len() >= self.chunk {
+                    let buf = std::mem::replace(&mut out, Vec::with_capacity(self.chunk + 64 * 1024));
+                    pipe.send(buf).await?;
                 }
             }
             if got < page_rows {
@@ -333,9 +347,8 @@ impl Source for GsheetsSource {
         }
         enc.close(&mut out);
         if !out.is_empty() {
-            loader.send(out).await?;
+            pipe.send(out).await?;
         }
-        let reported = loader.finish().await?;
-        Ok(if reported > 0 { reported } else { rows_sent })
+        Ok(Rows::LoaderElseOwn(rows_sent))
     }
 }

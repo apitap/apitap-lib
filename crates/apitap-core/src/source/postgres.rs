@@ -20,7 +20,8 @@
 //!   UTC datetimes, `1`/`0` booleans, HEX bytea) — relaying Postgres TEXT COPY
 //!   would be wrong here, the escape dialects differ (`\v`, `\b`, `\f`).
 
-use super::{pop, spans, WorkQueue};
+use super::spans;
+use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::sink::Loader;
 use crate::source::Source;
 use crate::error::{Error, Result};
@@ -459,60 +460,74 @@ impl Source for PgSource {
         plan: &TablePlan,
         lane: &Lane,
         stmts: Vec<String>,
-        loaders: Vec<L>,
+        pipes: Pipes<L>,
         chunk: usize,
     ) -> Result<u64> {
-        let queue = super::work_queue(stmts);
-        let mut tasks = Vec::with_capacity(loaders.len());
-        for loader in loaders {
-            let mode = match lane.format {
-                WireFormat::PgCopyBinary => {
-                    if lane.raw_frames {
-                        PgReadMode::FrameRaw
-                    } else {
-                        PgReadMode::FrameStrip
-                    }
+        // One plan for the whole crew, not one per pipe: `mode` is derived
+        // from the lane, which every worker shares.
+        let mode = match lane.format {
+            WireFormat::PgCopyBinary => {
+                if lane.raw_frames {
+                    PgReadMode::FrameRaw
+                } else {
+                    PgReadMode::FrameStrip
                 }
-                WireFormat::RowBinary => PgReadMode::Transcode(
-                    plan.cols
-                        .iter()
-                        .map(|c| {
-                            // can_produce(RowBinary) already proved coverage.
-                            (rb_type(&c.udt, c.precision, c.scale).unwrap(), c.nullable)
-                        })
-                        .collect(),
-                ),
-                WireFormat::TabSeparated => PgReadMode::Text,
-                WireFormat::MyTsv => PgReadMode::MyTsv(
-                    plan.cols
-                        .iter()
-                        .map(|c| {
-                            // can_produce(MyTsv) already proved coverage.
-                            (
-                                my_tsv_type(&c.udt, c.precision, c.scale).unwrap(),
-                                c.name.clone(),
-                            )
-                        })
-                        .collect(),
-                ),
-            };
-            tasks.push(tokio::spawn(copy_out_worker(
-                self.pool.clone(),
-                self.url.clone(),
-                queue.clone(),
-                mode,
-                loader,
+            }
+            WireFormat::RowBinary => PgReadMode::Transcode(
+                plan.cols
+                    .iter()
+                    .map(|c| {
+                        // can_produce(RowBinary) already proved coverage.
+                        (rb_type(&c.udt, c.precision, c.scale).unwrap(), c.nullable)
+                    })
+                    .collect(),
+            ),
+            WireFormat::TabSeparated => PgReadMode::Text,
+            WireFormat::MyTsv => PgReadMode::MyTsv(
+                plan.cols
+                    .iter()
+                    .map(|c| {
+                        // can_produce(MyTsv) already proved coverage.
+                        (
+                            my_tsv_type(&c.udt, c.precision, c.scale).unwrap(),
+                            c.name.clone(),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        pipes
+            .run(stmts, move |_| PgBody {
+                pool: self.pool.clone(),
+                url: self.url.clone(),
+                mode: mode.clone(),
                 chunk,
-                self.snapshot.clone(),
-            )));
-        }
-        let mut rows = 0u64;
-        for t in tasks {
-            rows += t
-                .await
-                .map_err(|e| Error::Transfer(format!("join: {e}")))??;
-        }
-        Ok(rows)
+                snapshot: self.snapshot.clone(),
+            })
+            .await
+    }
+}
+
+struct PgBody {
+    pool: PgPool,
+    url: std::sync::Arc<str>,
+    mode: PgReadMode,
+    chunk: usize,
+    snapshot: Option<std::sync::Arc<str>>,
+}
+
+impl<L: Loader> PipeBody<L> for PgBody {
+    async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
+        copy_out_worker(
+            self.pool,
+            self.url,
+            spans,
+            self.mode,
+            pipe,
+            self.chunk,
+            self.snapshot,
+        )
+        .await
     }
 }
 
@@ -561,6 +576,7 @@ fn delivered_of_udt(c: &ColumnPlan) -> Delivered {
 // Byte-stream worker
 // ---------------------------------------------------------------------------------
 
+#[derive(Clone)]
 enum PgReadMode {
     /// Raw binary passthrough with per-span framing stripped (see [`SpanStrip`]).
     FrameStrip,
@@ -615,19 +631,19 @@ impl SpanState {
 }
 
 /// One worker: keeps ONE sink stream open and feeds it the byte streams of successive
-/// `COPY` statements pulled from the shared work queue. Output is coalesced to
+/// `COPY` statements pulled from the set's [`Spans`] queue. Output is coalesced to
 /// ~`chunk` bytes — sqlx yields one piece per COPY message (≈ one row), and per-row
 /// sends are pure protocol overhead.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn copy_out_worker<L: Loader>(
     pool: PgPool,
     url: std::sync::Arc<str>,
-    queue: WorkQueue,
+    spans: Spans,
     mode: PgReadMode,
-    mut loader: L,
+    pipe: &mut Pipe<L>,
     chunk: usize,
     snapshot: Option<std::sync::Arc<str>>,
-) -> Result<u64> {
+) -> Result<Rows> {
     let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
     if matches!(mode, PgReadMode::FrameStrip) {
         // One synthetic stream header for the whole worker; each span's own header and
@@ -661,7 +677,7 @@ async fn copy_out_worker<L: Loader>(
         None
     };
     let mut piece: Vec<u8> = Vec::new();
-    while let Some(sql) = pop(&queue) {
+    while let Some(sql) = spans.next()? {
         if let Some(ws) = raw.as_mut() {
             if let Some(snap) = &snapshot {
                 let pin = format!(
@@ -670,20 +686,16 @@ async fn copy_out_worker<L: Loader>(
                     snap.replace('\'', "''")
                 );
                 if let Err(e) = ws.simple_query(&pin).await {
-                    return Err(loader
-                        .abort(Error::Transfer(format!(
+                    return Err(Error::Transfer(format!(
                             "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
                              walsender session still open?"
-                        )))
-                        .await);
+                        )));
                 }
             }
             if let Err(e) = ws.copy_out_start(&sql).await {
-                return Err(loader
-                    .abort(Error::Transfer(format!("COPY OUT: {e}")))
-                    .await);
+                return Err(Error::Transfer(format!("COPY OUT: {e}")));
             }
-            if matches!(mode, PgReadMode::FrameRaw) && loader.framed_capable() {
+            if matches!(mode, PgReadMode::FrameRaw) && pipe.framed_capable() {
                 // Framed OWNED window: the builder walks the raw wire bytes
                 // in place (CopyData headers included) — the per-piece
                 // memcpy (13% of a 0.5-core read) is gone. The window
@@ -694,31 +706,22 @@ async fn copy_out_worker<L: Loader>(
                 'copy: loop {
                     if ws.co_window().is_empty() {
                         if let Err(e) = ws.co_refill().await {
-                            return Err(loader
-                                .abort(Error::Transfer(format!("pg read: {e}")))
-                                .await);
+                            return Err(Error::Transfer(format!("pg read: {e}")));
                         }
                     }
-                    let step = match loader.send_framed(ws.co_window()).await {
-                        Ok(r) => r,
-                        Err(e) => return Err(loader.abort(e).await),
-                    };
+                    let step = pipe.send_framed(ws.co_window()).await?;
                     ws.co_advance(step.0);
                     match step.1 {
                         FramedPush::NeedMore => {
                             if let Err(e) = ws.co_refill().await {
-                                return Err(loader
-                                    .abort(Error::Transfer(format!("pg read: {e}")))
-                                    .await);
+                                return Err(Error::Transfer(format!("pg read: {e}")));
                             }
                         }
                         FramedPush::Control => match ws.co_control().await {
                             Ok(true) => break 'copy,
                             Ok(false) => {}
                             Err(e) => {
-                                return Err(loader
-                                    .abort(Error::Transfer(format!("pg read: {e}")))
-                                    .await)
+                                return Err(Error::Transfer(format!("pg read: {e}")))
                             }
                         },
                         FramedPush::Straddle(mut left) => {
@@ -729,11 +732,9 @@ async fn copy_out_worker<L: Loader>(
                                 while left > 0 {
                                     if ws.co_window().is_empty() {
                                         if let Err(e) = ws.co_refill().await {
-                                            return Err(loader
-                                                .abort(Error::Transfer(format!(
+                                            return Err(Error::Transfer(format!(
                                                     "pg read: {e}"
-                                                )))
-                                                .await);
+                                                )));
                                         }
                                     }
                                     let take = ws.co_window().len().min(left);
@@ -741,15 +742,13 @@ async fn copy_out_worker<L: Loader>(
                                     piece.extend_from_slice(&ws.co_window()[..take]);
                                     ws.co_advance(take);
                                     left -= take;
-                                    let fresh = loader.reclaim().unwrap_or_default();
+                                    let fresh = pipe.reclaim().unwrap_or_default();
                                     let full = std::mem::replace(&mut piece, fresh);
-                                    loader.send(full).await?;
+                                    pipe.send(full).await?;
                                 }
                                 while ws.co_window().len() < 5 {
                                     if let Err(e) = ws.co_refill().await {
-                                        return Err(loader
-                                            .abort(Error::Transfer(format!("pg read: {e}")))
-                                            .await);
+                                        return Err(Error::Transfer(format!("pg read: {e}")));
                                     }
                                 }
                                 let w = ws.co_window();
@@ -758,22 +757,18 @@ async fn copy_out_worker<L: Loader>(
                                         Ok(true) => break 'copy,
                                         Ok(false) => continue,
                                         Err(e) => {
-                                            return Err(loader
-                                                .abort(Error::Transfer(format!(
+                                            return Err(Error::Transfer(format!(
                                                     "pg read: {e}"
                                                 )))
-                                                .await)
                                         }
                                     }
                                 }
                                 let len =
                                     u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
                                 if len < 4 {
-                                    return Err(loader
-                                        .abort(Error::Transfer(
+                                    return Err(Error::Transfer(
                                             "copy_out: bad message length".into(),
-                                        ))
-                                        .await);
+                                        ));
                                 }
                                 ws.co_advance(5);
                                 left = len - 4;
@@ -790,14 +785,12 @@ async fn copy_out_worker<L: Loader>(
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(e) => {
-                            return Err(loader
-                                .abort(Error::Transfer(format!("pg read: {e}")))
-                                .await)
+                            return Err(Error::Transfer(format!("pg read: {e}")))
                         }
                     }
-                    let fresh = loader.reclaim().unwrap_or_default();
+                    let fresh = pipe.reclaim().unwrap_or_default();
                     let full = std::mem::replace(&mut piece, fresh);
-                    loader.send(full).await?;
+                    pipe.send(full).await?;
                 }
             } else {
                 let mut state = match &mode {
@@ -810,33 +803,24 @@ async fn copy_out_worker<L: Loader>(
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(e) => {
-                            return Err(loader
-                                .abort(Error::Transfer(format!("pg read: {e}")))
-                                .await)
+                            return Err(Error::Transfer(format!("pg read: {e}")))
                         }
                     }
-                    if let Err(e) = state.push(&piece, &mut out) {
-                        return Err(loader.abort(e).await);
-                    }
+                    state.push(&piece, &mut out)?;
                     if out.len() >= chunk {
-                        let fresh = loader
-                            .reclaim()
+                        let fresh = pipe.reclaim()
                             .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024));
                         let full = std::mem::replace(&mut out, fresh);
-                        loader.send(full).await?;
+                        pipe.send(full).await?;
                     }
                 }
                 if !state.finished() {
-                    return Err(loader
-                        .abort(Error::Transfer("pg binary COPY ended mid-stream".into()))
-                        .await);
+                    return Err(Error::Transfer("pg binary COPY ended mid-stream".into()));
                 }
             }
             if snapshot.is_some() {
                 if let Err(e) = ws.simple_query("COMMIT").await {
-                    return Err(loader
-                        .abort(Error::Transfer(format!("COMMIT: {e}")))
-                        .await);
+                    return Err(Error::Transfer(format!("COMMIT: {e}")));
                 }
             }
             continue;
@@ -850,9 +834,7 @@ async fn copy_out_worker<L: Loader>(
                 let mut conn = match pool.acquire().await {
                     Ok(c) => c,
                     Err(e) => {
-                        return Err(loader
-                            .abort(Error::Transfer(format!("pin acquire: {e}")))
-                            .await)
+                        return Err(Error::Transfer(format!("pin acquire: {e}")))
                     }
                 };
                 let pin = async {
@@ -868,12 +850,10 @@ async fn copy_out_worker<L: Loader>(
                 }
                 .await;
                 if let Err(e) = pin {
-                    return Err(loader
-                        .abort(Error::Transfer(format!(
+                    return Err(Error::Transfer(format!(
                             "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
                              walsender session still open?"
-                        )))
-                        .await);
+                        )));
                 }
                 Some(conn)
             }
@@ -884,9 +864,7 @@ async fn copy_out_worker<L: Loader>(
         } {
             Ok(s) => s,
             Err(e) => {
-                return Err(loader
-                    .abort(Error::Transfer(format!("COPY OUT: {e}")))
-                    .await)
+                return Err(Error::Transfer(format!("COPY OUT: {e}")))
             }
         };
         let mut state = match &mode {
@@ -902,27 +880,22 @@ async fn copy_out_worker<L: Loader>(
             let piece = match stream.try_next().await {
                 Ok(Some(b)) => b,
                 Ok(None) => break,
-                Err(e) => return Err(loader.abort(Error::Transfer(format!("pg read: {e}"))).await),
+                Err(e) => return Err(Error::Transfer(format!("pg read: {e}"))),
             };
-            if let Err(e) = state.push(&piece, &mut out) {
-                return Err(loader.abort(e).await);
-            }
+            state.push(&piece, &mut out)?;
             // mem::replace (not take): take leaves capacity 0 and the next chunk pays
             // ~1 extra full copy in geometric regrowth. A loader that finishes with
             // its buffers hands them back — at steady state this loop allocates
             // nothing (the fresh 4 MiB Vec per chunk was 99.9% of allocator traffic).
             if out.len() >= chunk {
-                let fresh = loader
-                    .reclaim()
+                let fresh = pipe.reclaim()
                     .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024));
                 let full = std::mem::replace(&mut out, fresh);
-                loader.send(full).await?;
+                pipe.send(full).await?;
             }
         }
         if !state.finished() {
-            return Err(loader
-                .abort(Error::Transfer("pg binary COPY ended mid-stream".into()))
-                .await);
+            return Err(Error::Transfer("pg binary COPY ended mid-stream".into()));
         }
         drop(stream);
         if let Some(mut conn) = pinned_conn {
@@ -934,9 +907,9 @@ async fn copy_out_worker<L: Loader>(
         crate::wire::pgcopy::trailer(&mut out);
     }
     if !out.is_empty() {
-        loader.send(out).await?;
+        pipe.send(out).await?;
     }
-    loader.finish().await
+    Ok(Rows::FromLoader)
 }
 
 

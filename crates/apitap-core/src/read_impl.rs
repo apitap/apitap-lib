@@ -311,7 +311,8 @@ fn launch_loaders<S: Source + 'static>(src: S, rp: ReadPlan, chunk: usize) -> Re
 
     let done = completed.clone();
     let supervisor = tokio::spawn(async move {
-        if let Err(e) = src.run_workers(&plan, &lane, stmts, loaders, chunk).await {
+        let pipes = crate::pipe::Pipes::for_read(loaders);
+        if let Err(e) = src.run_workers(&plan, &lane, stmts, pipes, chunk).await {
             let _ = tx.send(Err(e)).await;
         }
         // Ordering: mark complete BEFORE the last sender drops, so a `None`
