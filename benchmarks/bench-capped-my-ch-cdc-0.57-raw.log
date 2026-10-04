@@ -1,0 +1,1082 @@
+apitap 0.57.0 (PyPI) vs ingestr 1.1.61 — capped MySQL -> ClickHouse, CDC
+raw log, generated 2026-10-04T11:15:33Z on the bench VPS
+host: 16 cores, 61 GB RAM, shared with production
+
+===== 1. the tools and their provenance
+$ ~/apitap-057-pullback/bin/python -c 'import apitap; ...'
+  apitap.__version__       0.57.0
+  interpreter              3.13.3 (abi3 wheel)
+  _apitap.abi3.so md5      41e9f7c252d3e1eb5403b70f87bf5435
+  site-packages is bind-mounted READ-ONLY into the cage at /py and put on
+  PYTHONPATH, so the PyPI wheel is what runs and nothing is built on this box.
+  every leg re-asserts it from INSIDE the cage; the catch-up legs' own log:
+    APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+    APITAP_TABLES 30
+    APITAP_VERSION 0.57.0
+
+$ ingestr --version   (the native binary from its own cache, bind-mounted in)
+  ingestr version v1.1.61
+  -rwxrwxr-x 1 ubuntu ubuntu 254172496 Oct  3 15:38 /home/ubuntu/.cache/ingestr/bin/v1.1.61/Linux_x86_64/ingestr
+  ingestr 1.1.x is no longer a Python program: the pip package is a thin
+  wrapper that downloads and execs this 254 MB native binary, which is
+  mounted read-only, so nothing is downloaded inside a measurement.
+
+===== 2. the rig: this campaign's own source, and the SHARED destination
+== this campaign's own source container ==
+  apitap-bench-cdc-my is already up and answering; keeping it (RECREATE=1 to rebuild)
+  apitap-bench-cdc-my  mysql:8.0  127.0.0.1:3313  db bench  root/bench
+== the CDC preconditions, read from the running server ==
+  binlog_expire_logs_seconds = 86400
+  binlog_format = ROW
+  binlog_row_image = FULL
+  binlog_row_value_options = 
+  enforce_gtid_consistency = ON
+  gtid_mode = ON
+  innodb_buffer_pool_size = 2147483648
+  innodb_flush_log_at_trx_commit = 1
+  log_bin = ON
+  server_id = 3302
+  sync_binlog = 1
+  version 8.0.46
+== ingestr's other documented CDC requirements, checked from the server ==
+  cdc_my_t01: columns=15 pk=1 enum/set/bit=0
+  apitap MySQL-CDC type gate — json columns in the seed: 0 (OK: none, the CDC lane will run)
+  root's grants cover SELECT + RELOAD + REPLICATION SLAVE + REPLICATION CLIENT:
+    GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, SHUTDOWN, PROCESS, FILE, REFERENCES, INDEX, ALTER, SHOW DATABASES, SUPER, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, CREATE USER, EVENT, TRIGGER, CREATE TABLESPACE, CREATE ROLE, DROP ROLE ON *.* TO `root`@`localhost` WITH GRANT OPTION
+    GRANT APPLICATION_PASSWORD_ADMIN,AUDIT_ABORT_EXEMPT,AUDIT_ADMIN,AUTHENTICATION_POLICY_ADMIN,BACKUP_ADMIN,BINLOG_ADMIN,BINLOG_ENCRYPTION_ADMIN,CLONE_ADMIN,CONNECTION_ADMIN,ENCRYPTION_KEY_ADMIN,FIREWALL_EXEMPT,FLUSH_OPTIMIZER_COSTS,FLUSH_STATUS,FLUSH_TABLES,FLUSH_USER_RESOURCES,GROUP_REPLICATION_ADMIN,GROUP_REPLICATION_STREAM,INNODB_REDO_LOG_ARCHIVE,INNODB_REDO_LOG_ENABLE,PASSWORDLESS_USER_ADMIN,PERSIST_RO_VARIABLES_ADMIN,REPLICATION_APPLIER,REPLICATION_SLAVE_ADMIN,RESOURCE_GROUP_ADMIN,RESOURCE_GROUP_USER,ROLE_ADMIN,SENSITIVE_VARIABLES_OBSERVER,SERVICE_CONNECTION_ADMIN,SESSION_VARIABLES_ADMIN,SET_USER_ID,SHOW_ROUTINE,SYSTEM_USER,SYSTEM_VARIABLES_ADMIN,TABLE_ENCRYPTION_ADMIN,TELEMETRY_LOG_ADMIN,XA_RECOVER_ADMIN ON *.* TO `root`@`localhost` WITH GRANT OPTION
+    GRANT PROXY ON ``@`` TO `root`@`localhost` WITH GRANT OPTION
+== the destination (the previous campaign's container, shared) ==
+apitap-bench-cdc-ch  clickhouse/clickhouse-server:24.8  Up 9 hours  9009/tcp, 127.0.0.1:8128->8123/tcp, 127.0.0.1:9128->9000/tcp
+  ClickHouse 24.8.14.39
+== what this campaign must not touch ==
+  pre-existing cdc_pg_* _apitap_state rows in the destination: 0 (total rows 0)
+  disk /dev/sda1       339G  316G   23G  94% /
+
+  the container's own arguments, verbatim from docker inspect:
+    ["--server-id=3302","--log-bin=mysql-bin","--binlog-format=ROW","--binlog-row-image=FULL","--gtid-mode=ON","--enforce-gtid-consistency=ON","--binlog-expire-logs-seconds=86400","--innodb-buffer-pool-size=2G","--max-connections=200"]
+    ports {"3306/tcp":[{"HostIp":"127.0.0.1","HostPort":"3313"}]}  volume apitap-bench-cdc-my-data
+  the seed's declared shape, from the server:
+    mysql: [Warning] Using a password on the command line interface can be insecure.
+    cdc_my_t01	CREATE TABLE `cdc_my_t01` (\n  `id` int NOT NULL,\n  `small_str` varchar(20) DEFAULT NULL,\n  `medium_str` varchar(100) DEFAULT NULL,\n  `large_str` varchar(500) DEFAULT NULL,\n  `tiny_int` smallint DEFAULT NULL,\n  `regular_int` int DEFAULT NULL,\n  `big_int` bigint DEFAULT NULL,\n  `float_val` double DEFAULT NULL,\n  `decimal_val` decimal(18,4) DEFAULT NULL,\n  `bool_val` tinyint(1) DEFAULT NULL,\n  `date_val` date DEFAULT NULL,\n  `ts_val` datetime(6) DEFAULT NULL,\n  `ts_tz_val` datetime(6) DEFAULT NULL,\n  `json_val` longtext,\n  `extra_text` longtext,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+
+===== 3. the seed: 30 identical tables, the bulk arm's schema
+  (ONE declared type differs from the bulk arm's — json_val is longtext, not a
+   native JSON column, because apitap's MySQL CDC lane refuses the latter.
+   The refusal and the product's own suggested workaround are in section 4.)
+== this campaign's containers ==
+apitap-bench-cdc-my  mysql:8.0  Up 2 hours  33060/tcp, 127.0.0.1:3313->3306/tcp
+apitap-bench-cdc-pg  postgres:16-alpine  Up 6 hours  127.0.0.1:5548->5432/tcp
+apitap-bench-cdc-ch  clickhouse/clickhouse-server:24.8  Up 9 hours  9009/tcp, 127.0.0.1:8128->8123/tcp, 127.0.0.1:9128->9000/tcp
+== this campaign's volume (on disk) ==
+  apitap-bench-cdc-my-data 17G
+== the seed (KEPT) ==
+  declared: 30 tables, columns each 15-15, 12.67 GiB on disk
+  EXACT row counts (COUNT(*), never information_schema's estimate):
+  cdc_my_t01 1036000
+  cdc_my_t02 1036000
+  cdc_my_t03 1036000
+  cdc_my_t04 1036000
+  cdc_my_t05 1036000
+  cdc_my_t06 1036000
+  cdc_my_t07 1036000
+  cdc_my_t08 1036000
+  cdc_my_t09 1036000
+  cdc_my_t10 1036000
+  cdc_my_t11 1036000
+  cdc_my_t12 1036000
+  cdc_my_t13 1036000
+  cdc_my_t14 1036000
+  cdc_my_t15 1036000
+  cdc_my_t16 1036000
+  cdc_my_t17 1036000
+  cdc_my_t18 1036000
+  cdc_my_t19 1036000
+  cdc_my_t20 1036000
+  cdc_my_t21 1036000
+  cdc_my_t22 1036000
+  cdc_my_t23 1036000
+  cdc_my_t24 1036000
+  cdc_my_t25 1036000
+  cdc_my_t26 1036000
+  cdc_my_t27 1036000
+  cdc_my_t28 1036000
+  cdc_my_t29 1036000
+  cdc_my_t30 1036000
+== the source's binlog ==
+  SHOW MASTER STATUS: mysql-bin.000006	698214500			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40784
+  binlogs on disk: 6 files, 1.7G
+  replication_connection_status rows: 0
+  binlog-dump / replica-IO threads: 0
+== destination leftovers (this campaign only) ==
+  cdc_my_* tables: 0
+  another campaign cdc_pg_* rows in _apitap_state (untouched): 0
+== replicas/slaves attached to the source ==
+  0
+== disk ==
+  /dev/sda1       339G  316G   23G  94% /
+
+  seeding wall time, and the binlog coordinates before any run:
+  SEED_SECONDS 500.7
+
+===== 4. the control: the validator AND the CDC lane proven before anything was timed
+  leg 4 is where the rival's fate was found: its CDC landing is validated on a
+  destination it accepts, and its refusal of THIS campaign's ClickHouse is
+  recorded verbatim, plus the probe that shows the refusal is not about our
+  schema.
+== 0. the control table (1000 rows, the campaign's OWN schema, loaded from the bulk arm's seed) ==
+  json_crc over the SAME 1000 ids — control (longtext) vs bulk seed (native JSON):
+    control 2130606287102
+    seed    2130606287102
+    GREEN the document's bytes are unchanged by storing it as longtext
+SOURCE   1000|2168502783323|2130606287102|1|1000
+
+== 1. AGREEMENT: apitap's CDC landing equals the source ==
+APITAP   1000|2168502783323|2130606287102|1|1000
+  the landing apitap built, before anyone else touches it:
+    engine=MergeTree sorting=id
+    id Int32
+    small_str Nullable(String)
+    medium_str Nullable(String)
+    large_str Nullable(String)
+    tiny_int Nullable(Int16)
+    regular_int Nullable(Int32)
+    big_int Nullable(Int64)
+    float_val Nullable(Float64)
+    decimal_val Nullable(Decimal(18, 4))
+    bool_val Nullable(Int8)
+    date_val Nullable(Date32)
+    ts_val Nullable(DateTime64(6))
+    ts_tz_val Nullable(DateTime64(6))
+    json_val Nullable(String)
+    extra_text Nullable(String)
+    state: cursor=_lsn mode=log_based watermark=26466830523 last_rows=1000
+    state: cursor=_lsn mode=log_based watermark=16201828841002118240 last_rows=0
+  the binlog coordinate the group minted:
+      SHOW MASTER STATUS: mysql-bin.000006	697026747			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40731
+      binlogs on disk: 6 files, 1.7G
+      replication_connection_status rows: 0
+      binlog-dump / replica-IO threads: 0
+  GREEN agreement
+
+== 2. SENSITIVITY: one value in one row must move the digest ==
+TAMPERED 1000|2170094852481|2130606287102|1|1000
+  GREEN sensitivity
+RESTORED 1000|2168502783323|2130606287102|1|1000
+  GREEN reversible
+
+== 3. THE CDC LANE: insert + update + delete, drained again ==
+SOURCE   1040|2246973261221|2223082727652|1|2000050   (expected rows 1000 + 50 - 10 = 1040)
+APITAP   1040|2246973261221|2223082727652|1|2000050
+  GREEN the change stream follows
+  the empty drain reported: IDEMPOTENT second_drain_rows=0
+  GREEN an empty drain is a no-op
+
+== 4. THE RIVAL: ingestr's CDC landing, read by the SAME validator ==
+INGESTR  1040|2246973261221|2223082727652|1|2000050
+  GREEN the rival validates
+  the leg's own receipt:
+    --
+    LEG ingestr tag=ctrl-my tuned=no
+      stopped_by container_exited
+      wall_container_s 4.9 (container lifetime: it never reached full landing)
+      docker_state false 0 (OOMKilled ExitCode)
+      cgroup_memory_peak_mb 0.0
+      host_sampled_peak_mb 50.8
+      INGESTR_VERSION ingestr version v1.1.61
+      INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+      INGESTR_TABLES 1
+      INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+      INGESTR_DEST_NAMING --dest-table cdc_ctrl
+      INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=0
+      INGESTR_WALL_S 1.6
+  the landing's shape, as ingestr built it (its own CDC metadata columns are
+  extra and are NOT read by the aggregate, which names the fifteen data columns):
+        id
+    small_str
+    medium_str
+    large_str
+    tiny_int
+    regular_int
+    big_int
+    float_val
+    decimal_val
+    bool_val
+    date_val
+    ts_val
+    ts_tz_val
+    json_val
+    extra_text
+    _cdc_lsn
+    _cdc_deleted
+    _cdc_synced_at
+    _ingestr_loaded_at
+    _ingestr_run_id
+
+== 4b. the campaign's ACTUAL destination: what ingestr does with ClickHouse ==
+  the refusal, verbatim from the leg's own log:
+    Error: destination scheme "clickhouse" cannot safely run managed CDC: destination-managed state with fencing, pruning, and truncation is not supported
+  the same refusal against a 3-column, 2-row table (so it is not about our
+  schema): Error: destination scheme "clickhouse" cannot safely run managed CDC: destination-managed state with fencing, pruning, and truncation is not supported
+
+== 5. THE TYPE GATE: a native JSON column is refused, with the engine's own words ==
+  the table under the gate declares json_val as: json
+  the refusal, verbatim from that leg's own log:
+    RAISED ValueError: log_based: bench.ctrl_json has JSON column(s) json_val and apitap cannot yet 
+    render MySQL's binary JSON encoding from the binlog. A CDC update would write the raw envelope 
+    where the full load wrote the document, so the run refuses instead of corrupting the column. 
+    Use mode='replace' or 'append' for this table, or store the document in a text column. (MariaDB 
+    is unaffected — its JSON is LONGTEXT.)
+  GREEN the CDC lane refuses a native JSON column by name, and says why
+
+== cleanup: the destination tables go, the control table goes ==
+CONTROL GREEN x5
+
+  --- apitap's MySQL CDC lane refuses a native JSON column, verbatim ---
+  RAISED ValueError: log_based: bench.ctrl_json has JSON column(s) json_val and apitap cannot yet render MySQL's binary JSON encoding from the binlog. A CDC update would write the raw envelope where the full load wrote the document, so the run refuses instead of corrupting the column. Use mode='replace' or 'append' for this table, or store the document in a text column. (MariaDB is unaffected — its JSON is LONGTEXT.)
+  --- where ingestr's CDC path does and does not land ---
+  ingestr      : ingestr version v1.1.61
+  source       : mysql+cdc://root:bench@127.0.0.1:3313/bench   (mysql+cdc, this campaign's own source)
+  source-db    : bench  (probe_mini: 3 columns, 2 rows, created by this probe)
+  workdir      : /home/ubuntu/bench-cdc-my-probe
+  ==================================================================
+  == clickhouse
+     dest-uri: clickhouse://default:bench@127.0.0.1:9128?http_port=8128
+     container exit: 1
+     --- ingestr's own output (last 12 lines, verbatim) ---
+     Error: destination scheme "clickhouse" cannot safely run managed CDC: destination-managed state with fencing, pruning, and truncation is not supported
+  
+  ==================================================================
+  == duckdb
+     dest-uri: duckdb:///out/probe.duckdb
+     container exit: 0
+     --- ingestr's own output (last 12 lines, verbatim) ---
+     [PROGRESS] 11:15:51 | Rows: 2 | Batches: 1 | Rate: 5 rows/s | CPU: 39.0% | Mem: 209 MB
+     
+     ┌────────────────┬──────────┐
+     │     METRIC     │  VALUE   │
+     ├────────────────┼──────────┤
+     │ Total Rows     │        2 │
+     │ Total Batches  │        1 │
+     │ Duration       │     0.4s │
+     │ Avg Throughput │ 5 rows/s │
+     │ Peak Memory    │   209 MB │
+     └────────────────┴──────────┘
+     Ingestion completed successfully!
+     LANDED: probe.duckdb (1847296 bytes)
+  
+  ==================================================================
+  == sqlite
+     dest-uri: sqlite:///out/probe.sqlite
+     container exit: 1
+     --- ingestr's own output (last 12 lines, verbatim) ---
+     Error: destination scheme "sqlite" cannot safely run MySQL CDC: atomic target-incarnation fencing for merge is not supported
+     LANDED: probe.sqlite (4096 bytes)
+  
+  ==================================================================
+  == mysql
+     dest-uri: mysql://root:bench@127.0.0.1:3313/cdcdst
+     container exit: 1
+     --- ingestr's own output (last 12 lines, verbatim) ---
+     Warning: dest_schema is ignored when --source-table names a single table; the destination is "probe_mini". Omit --source-table, or list several tables, for multi-table mode, or qualify --dest-table instead
+     Error: failed to inspect legacy CDC cursor for probe_mini: Error 1054 (42S22): Unknown column '_cdc_lsn' in 'field list'
+  
+  == probe workdir ==
+    total 1884
+    drwxrwxr-x   2 ubuntu ubuntu    4096 Oct  4 11:15 .
+    drwxr-x--- 101 ubuntu ubuntu   36864 Oct  4 10:08 ..
+    -rw-r--r--   1 root   root   1847296 Oct  4 11:15 probe.duckdb
+    -rw-------   1 root   root         0 Oct  4 11:15 probe.duckdb.ingestr-cdc.lock
+    -rw-r--r--   1 root   root      4096 Oct  4 11:15 probe.sqlite
+    -rw-r--r--   1 root   root       151 Oct  4 11:15 run-clickhouse.log
+    -rw-r--r--   1 root   root         2 Oct  4 11:15 run-clickhouse.rc
+    -rw-r--r--   1 root   root      1266 Oct  4 11:15 run-duckdb.log
+    -rw-r--r--   1 root   root         2 Oct  4 11:15 run-duckdb.rc
+    -rw-r--r--   1 root   root       327 Oct  4 11:15 run-mysql.log
+    -rw-r--r--   1 root   root         2 Oct  4 11:15 run-mysql.rc
+    -rw-r--r--   1 root   root       125 Oct  4 11:15 run-sqlite.log
+    -rw-r--r--   1 root   root         2 Oct  4 11:15 run-sqlite.rc
+
+===== 5. PASS A — the cold catch-up on the source the brief specifies
+  30 tables x 1,000,000 rows x 15 columns, all 30 in ONE CDC group over ONE
+  binlog stream, arms interleaved: apitap · ingestr · ingestr-tuned, n=2.
+  Every leg checksum-verified before the destination was dropped.
+LEG apitap tag=r1 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 105.9
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 119.1
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=30000000 wall_s=104.444 budget=8 tables_reporting=30 fd_now=4 fd_peak=29
+    per_table_rows cdc_my_t01=1000000 cdc_my_t02=1000000 cdc_my_t03=1000000 cdc_my_t04=1000000 cdc_my_t05=1000000 cdc_my_t06=1000000 cdc_my_t07=1000000 cdc_my_t08=1000000 cdc_my_t09=1000000 cdc_my_t10=1000000 cdc_my_t11=1000000 cdc_my_t12=1000000 cdc_my_t13=1000000 cdc_my_t14=1000000 cdc_my_t15=1000000 cdc_my_t16=1000000 cdc_my_t17=1000000 cdc_my_t18=1000000 cdc_my_t19=1000000 cdc_my_t20=1000000 cdc_my_t21=1000000 cdc_my_t22=1000000 cdc_my_t23=1000000 cdc_my_t24=1000000 cdc_my_t25=1000000 cdc_my_t26=1000000 cdc_my_t27=1000000 cdc_my_t28=1000000 cdc_my_t29=1000000 cdc_my_t30=1000000
+    per_table_nonzero 30 of 30  sum=30000000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.694
+  ELAPSED 104.444
+  FD_PEAK 29
+  FD_END 4
+  MEMPEAK=124878848
+  MEMSTAT=anon 417792 file 16031744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-r1.log
+LEG ingestr tag=r1 tuned=no
+  stopped_by container_exited
+  wall_container_s 5.5 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 47.5
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=0
+  INGESTR_WALL_S 1.1
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791108192.943439880 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r1.log
+LEG ingestr tag=r1 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 42.3
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=200000
+  INGESTR_WALL_S 1.1
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791108214.078827633 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r1-tuned.log
+LEG apitap tag=r2 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 106.4
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 114.5
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=30000000 wall_s=104.878 budget=8 tables_reporting=30 fd_now=4 fd_peak=29
+    per_table_rows cdc_my_t01=1000000 cdc_my_t02=1000000 cdc_my_t03=1000000 cdc_my_t04=1000000 cdc_my_t05=1000000 cdc_my_t06=1000000 cdc_my_t07=1000000 cdc_my_t08=1000000 cdc_my_t09=1000000 cdc_my_t10=1000000 cdc_my_t11=1000000 cdc_my_t12=1000000 cdc_my_t13=1000000 cdc_my_t14=1000000 cdc_my_t15=1000000 cdc_my_t16=1000000 cdc_my_t17=1000000 cdc_my_t18=1000000 cdc_my_t19=1000000 cdc_my_t20=1000000 cdc_my_t21=1000000 cdc_my_t22=1000000 cdc_my_t23=1000000 cdc_my_t24=1000000 cdc_my_t25=1000000 cdc_my_t26=1000000 cdc_my_t27=1000000 cdc_my_t28=1000000 cdc_my_t29=1000000 cdc_my_t30=1000000
+    per_table_nonzero 30 of 30  sum=30000000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.778
+  ELAPSED 104.878
+  FD_PEAK 29
+  FD_END 4
+  MEMPEAK=120086528
+  MEMSTAT=anon 425984 file 647168 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-r2.log
+LEG ingestr tag=r2 tuned=no
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 44.4
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=0
+  INGESTR_WALL_S 1.2
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791108371.623698704 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r2.log
+LEG ingestr tag=r2 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 5.7 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 41.9
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=200000
+  INGESTR_WALL_S 1.0
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791108393.109107104 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r2-tuned.log
+
+  --- pass A's own summary table (arm / wall / peak / stopped / rows + medians) ---
+
+ARM        TAG                    WALL_S      PEAK_MB STOPPED            DOCKER                 ROWS
+apitap     r1                      105.9        119.1 completed          false 0 (OOMKilled ExitCode) 30000000
+ingestr    r1                 5.5 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+ingestr    r1                 5.4 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+apitap     r2                      106.4        114.5 completed          false 0 (OOMKilled ExitCode) 30000000
+ingestr    r2                 5.4 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+ingestr    r2                 5.7 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+
+MEDIAN apitap wall_s 106.2  rounds [105.9, 106.4]  peak_mb 119.1
+MEDIAN ingestr wall_s 5.5  rounds [5.5, 5.4, 5.4, 5.7]  peak_mb 0.0
+
+checksum verdicts per leg: the VERIFY lines above (the destination is dropped after each)
+
+  --- pass A's per-table checksums ---
+VERIFY cdc_my_t01 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t02 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t03 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t04 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t05 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t06 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t07 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t08 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t09 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t10 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t11 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t12 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t13 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t14 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t15 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t16 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t17 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t18 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t19 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t20 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t21 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t22 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t23 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t24 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t25 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t26 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t27 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t28 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t29 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t30 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t01 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t02 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t03 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t04 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t05 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t06 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t07 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t08 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t09 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t10 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t11 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t12 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t13 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t14 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t15 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t16 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t17 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t18 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t19 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t20 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t21 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t22 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t23 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t24 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t25 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t26 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t27 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t28 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t29 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+VERIFY cdc_my_t30 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+
+===== 6. PASS B — the same legs on the source the window left behind
+LEG apitap tag=r1 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 110.4
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 118.4
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=31080000 wall_s=108.486 budget=8 tables_reporting=30 fd_now=4 fd_peak=29
+    per_table_rows cdc_my_t01=1036000 cdc_my_t02=1036000 cdc_my_t03=1036000 cdc_my_t04=1036000 cdc_my_t05=1036000 cdc_my_t06=1036000 cdc_my_t07=1036000 cdc_my_t08=1036000 cdc_my_t09=1036000 cdc_my_t10=1036000 cdc_my_t11=1036000 cdc_my_t12=1036000 cdc_my_t13=1036000 cdc_my_t14=1036000 cdc_my_t15=1036000 cdc_my_t16=1036000 cdc_my_t17=1036000 cdc_my_t18=1036000 cdc_my_t19=1036000 cdc_my_t20=1036000 cdc_my_t21=1036000 cdc_my_t22=1036000 cdc_my_t23=1036000 cdc_my_t24=1036000 cdc_my_t25=1036000 cdc_my_t26=1036000 cdc_my_t27=1036000 cdc_my_t28=1036000 cdc_my_t29=1036000 cdc_my_t30=1036000
+    per_table_nonzero 30 of 30  sum=31080000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.763
+  ELAPSED 108.486
+  FD_PEAK 29
+  FD_END 4
+  MEMPEAK=124190720
+  MEMSTAT=anon 421888 file 1925120 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-r1.log
+LEG ingestr tag=r1 tuned=no
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 44.4
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=0
+  INGESTR_WALL_S 1.1
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791110676.023223909 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r1.log
+LEG ingestr tag=r1 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 42.2
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=200000
+  INGESTR_WALL_S 1.2
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791110696.522858649 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r1-tuned.log
+LEG apitap tag=r2 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 119.7
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 124.7
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=31080000 wall_s=118.132 budget=8 tables_reporting=30 fd_now=4 fd_peak=29
+    per_table_rows cdc_my_t01=1036000 cdc_my_t02=1036000 cdc_my_t03=1036000 cdc_my_t04=1036000 cdc_my_t05=1036000 cdc_my_t06=1036000 cdc_my_t07=1036000 cdc_my_t08=1036000 cdc_my_t09=1036000 cdc_my_t10=1036000 cdc_my_t11=1036000 cdc_my_t12=1036000 cdc_my_t13=1036000 cdc_my_t14=1036000 cdc_my_t15=1036000 cdc_my_t16=1036000 cdc_my_t17=1036000 cdc_my_t18=1036000 cdc_my_t19=1036000 cdc_my_t20=1036000 cdc_my_t21=1036000 cdc_my_t22=1036000 cdc_my_t23=1036000 cdc_my_t24=1036000 cdc_my_t25=1036000 cdc_my_t26=1036000 cdc_my_t27=1036000 cdc_my_t28=1036000 cdc_my_t29=1036000 cdc_my_t30=1036000
+    per_table_nonzero 30 of 30  sum=31080000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.675
+  ELAPSED 118.132
+  FD_PEAK 29
+  FD_END 4
+  MEMPEAK=130768896
+  MEMSTAT=anon 425984 file 12615680 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-r2.log
+LEG ingestr tag=r2 tuned=no
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 44.3
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=0
+  INGESTR_WALL_S 1.0
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791110865.645974762 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r2.log
+LEG ingestr tag=r2 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 5.2 (container lifetime: it never reached full landing)
+  docker_state false 1 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 42.5
+  INGESTR_VERSION ingestr version v1.1.61
+  INGESTR_SOURCE_URI mysql+cdc://***@127.0.0.1:3313/bench?server_id=18888&dest_schema=default
+  INGESTR_TABLES 30
+  INGESTR_DEST_SCHEMA default (source-uri parameter dest_schema)
+  INGESTR_DEST_NAMING --cdc-table-naming table
+  INGESTR_DEFAULTS extract_parallelism=5 page_size=25000 loader_file_size=25000 batch_size=512 sql_limit=200000
+  INGESTR_WALL_S 1.1
+  EXITCODE 1
+  progress_lines 0
+  errors 0
+  poll_last 1791110886.481028461 rows=0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-ing-r2-tuned.log
+
+  --- pass B's own summary table ---
+
+ARM        TAG                    WALL_S      PEAK_MB STOPPED            DOCKER                 ROWS
+apitap     r1                      110.4        118.4 completed          false 0 (OOMKilled ExitCode) 31080000
+ingestr    r1                 5.4 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+ingestr    r1                 5.4 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+apitap     r2                      119.7        124.7 completed          false 0 (OOMKilled ExitCode) 31080000
+ingestr    r2                 5.4 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+ingestr    r2                 5.2 (container lifetime: it never reached full landing)          0.0 container_exited   false 1 (OOMKilled ExitCode) -
+
+MEDIAN apitap wall_s 115.1  rounds [110.4, 119.7]  peak_mb 124.7
+MEDIAN ingestr wall_s 5.4  rounds [5.4, 5.4, 5.4, 5.2]  peak_mb 0.0
+
+checksum verdicts per leg: the VERIFY lines above (the destination is dropped after each)
+
+
+===== 7. THE FIVE-MINUTE WINDOW
+  the writer: TICKS ticks x 30 tables x (100 INSERT + 100 UPDATE + 20 DELETE)
+  rows, every statement its own implicit transaction, SLEEP between ticks,
+  piped from the host into one mysql session on the source.
+  WINDOW_PROGRESS tick 100/450
+  WINDOW_PROGRESS tick 200/450
+  WINDOW_PROGRESS tick 300/450
+  WINDOW_PROGRESS tick 400/450
+  WINDOW_DONE ticks 450 per_table_ins 45000 per_table_upd 45000 per_table_del 9000
+  --- the writer's statements, two ticks of two tables, verbatim ---
+
+  --- every drain's receipt, the watermark, the binlog ---
+LEG apitap tag=window-bootstrap mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 105.6
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 111.1
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=30000000 wall_s=104.025 budget=8 tables_reporting=30 fd_now=4 fd_peak=29
+    per_table_rows cdc_my_t01=1000000 cdc_my_t02=1000000 cdc_my_t03=1000000 cdc_my_t04=1000000 cdc_my_t05=1000000 cdc_my_t06=1000000 cdc_my_t07=1000000 cdc_my_t08=1000000 cdc_my_t09=1000000 cdc_my_t10=1000000 cdc_my_t11=1000000 cdc_my_t12=1000000 cdc_my_t13=1000000 cdc_my_t14=1000000 cdc_my_t15=1000000 cdc_my_t16=1000000 cdc_my_t17=1000000 cdc_my_t18=1000000 cdc_my_t19=1000000 cdc_my_t20=1000000 cdc_my_t21=1000000 cdc_my_t22=1000000 cdc_my_t23=1000000 cdc_my_t24=1000000 cdc_my_t25=1000000 cdc_my_t26=1000000 cdc_my_t27=1000000 cdc_my_t28=1000000 cdc_my_t29=1000000 cdc_my_t30=1000000
+    per_table_nonzero 30 of 30  sum=30000000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.618
+  ELAPSED 104.025
+  FD_PEAK 29
+  FD_END 4
+  MEMPEAK=116518912
+  MEMSTAT=anon 421888 file 622592 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-window-bootstrap.log
+LEG apitap tag=drain1 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 133.1
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 55.2
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=397860 wall_s=131.443 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+    per_table_rows cdc_my_t01=13420 cdc_my_t02=13420 cdc_my_t03=13420 cdc_my_t04=13420 cdc_my_t05=13420 cdc_my_t06=13420 cdc_my_t07=13420 cdc_my_t08=13420 cdc_my_t09=13300 cdc_my_t10=13200 cdc_my_t11=13200 cdc_my_t12=13200 cdc_my_t13=13200 cdc_my_t14=13200 cdc_my_t15=13200 cdc_my_t16=13200 cdc_my_t17=13200 cdc_my_t18=13200 cdc_my_t19=13200 cdc_my_t20=13200 cdc_my_t21=13200 cdc_my_t22=13200 cdc_my_t23=13200 cdc_my_t24=13200 cdc_my_t25=13200 cdc_my_t26=13200 cdc_my_t27=13200 cdc_my_t28=13200 cdc_my_t29=13200 cdc_my_t30=13200
+    per_table_nonzero 30 of 30  sum=397860
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.635
+  ELAPSED 131.443
+  FD_PEAK 13
+  FD_END 4
+  MEMPEAK=57876480
+  MEMSTAT=anon 425984 file 11747328 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-drain1.log
+LEG apitap tag=drain2 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 384.5
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 55.5
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=1087140 wall_s=382.929 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+    per_table_rows cdc_my_t01=36080 cdc_my_t02=36080 cdc_my_t03=36080 cdc_my_t04=36080 cdc_my_t05=36080 cdc_my_t06=36080 cdc_my_t07=36080 cdc_my_t08=36080 cdc_my_t09=36200 cdc_my_t10=36300 cdc_my_t11=36300 cdc_my_t12=36300 cdc_my_t13=36300 cdc_my_t14=36300 cdc_my_t15=36300 cdc_my_t16=36300 cdc_my_t17=36300 cdc_my_t18=36300 cdc_my_t19=36300 cdc_my_t20=36300 cdc_my_t21=36300 cdc_my_t22=36300 cdc_my_t23=36300 cdc_my_t24=36300 cdc_my_t25=36300 cdc_my_t26=36300 cdc_my_t27=36300 cdc_my_t28=36300 cdc_my_t29=36300 cdc_my_t30=36300
+    per_table_nonzero 30 of 30  sum=1087140
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.803
+  ELAPSED 382.929
+  FD_PEAK 13
+  FD_END 4
+  MEMPEAK=58159104
+  MEMSTAT=anon 434176 file 8081408 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-drain2.log
+LEG apitap tag=drain3 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 513.5
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 47.8
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=1485000 wall_s=511.966 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+    per_table_rows cdc_my_t01=49500 cdc_my_t02=49500 cdc_my_t03=49500 cdc_my_t04=49500 cdc_my_t05=49500 cdc_my_t06=49500 cdc_my_t07=49500 cdc_my_t08=49500 cdc_my_t09=49500 cdc_my_t10=49500 cdc_my_t11=49500 cdc_my_t12=49500 cdc_my_t13=49500 cdc_my_t14=49500 cdc_my_t15=49500 cdc_my_t16=49500 cdc_my_t17=49500 cdc_my_t18=49500 cdc_my_t19=49500 cdc_my_t20=49500 cdc_my_t21=49500 cdc_my_t22=49500 cdc_my_t23=49500 cdc_my_t24=49500 cdc_my_t25=49500 cdc_my_t26=49500 cdc_my_t27=49500 cdc_my_t28=49500 cdc_my_t29=49500 cdc_my_t30=49500
+    per_table_nonzero 30 of 30  sum=1485000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.680
+  ELAPSED 511.966
+  FD_PEAK 13
+  FD_END 4
+  MEMPEAK=50155520
+  MEMSTAT=anon 319488 file 8093696 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-drain3.log
+LEG apitap tag=drain4 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 5.0
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 48.4
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=0 wall_s=3.011 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+    per_table_rows cdc_my_t01=0 cdc_my_t02=0 cdc_my_t03=0 cdc_my_t04=0 cdc_my_t05=0 cdc_my_t06=0 cdc_my_t07=0 cdc_my_t08=0 cdc_my_t09=0 cdc_my_t10=0 cdc_my_t11=0 cdc_my_t12=0 cdc_my_t13=0 cdc_my_t14=0 cdc_my_t15=0 cdc_my_t16=0 cdc_my_t17=0 cdc_my_t18=0 cdc_my_t19=0 cdc_my_t20=0 cdc_my_t21=0 cdc_my_t22=0 cdc_my_t23=0 cdc_my_t24=0 cdc_my_t25=0 cdc_my_t26=0 cdc_my_t27=0 cdc_my_t28=0 cdc_my_t29=0 cdc_my_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.701
+  ELAPSED 3.011
+  FD_PEAK 10
+  FD_END 4
+  MEMPEAK=50737152
+  MEMSTAT=anon 434176 file 9416704 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-drain4.log
+LEG apitap tag=drain5 mode=drain twice=1
+  stopped_by completed
+  wall_container_s 7.4
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 40.6
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=0 wall_s=2.747 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+    per_table_rows cdc_my_t01=0 cdc_my_t02=0 cdc_my_t03=0 cdc_my_t04=0 cdc_my_t05=0 cdc_my_t06=0 cdc_my_t07=0 cdc_my_t08=0 cdc_my_t09=0 cdc_my_t10=0 cdc_my_t11=0 cdc_my_t12=0 cdc_my_t13=0 cdc_my_t14=0 cdc_my_t15=0 cdc_my_t16=0 cdc_my_t17=0 cdc_my_t18=0 cdc_my_t19=0 cdc_my_t20=0 cdc_my_t21=0 cdc_my_t22=0 cdc_my_t23=0 cdc_my_t24=0 cdc_my_t25=0 cdc_my_t26=0 cdc_my_t27=0 cdc_my_t28=0 cdc_my_t29=0 cdc_my_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  DRAIN pass=2 rows=0 wall_s=3.152 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+    per_table_rows cdc_my_t01=0 cdc_my_t02=0 cdc_my_t03=0 cdc_my_t04=0 cdc_my_t05=0 cdc_my_t06=0 cdc_my_t07=0 cdc_my_t08=0 cdc_my_t09=0 cdc_my_t10=0 cdc_my_t11=0 cdc_my_t12=0 cdc_my_t13=0 cdc_my_t14=0 cdc_my_t15=0 cdc_my_t16=0 cdc_my_t17=0 cdc_my_t18=0 cdc_my_t19=0 cdc_my_t20=0 cdc_my_t21=0 cdc_my_t22=0 cdc_my_t23=0 cdc_my_t24=0 cdc_my_t25=0 cdc_my_t26=0 cdc_my_t27=0 cdc_my_t28=0 cdc_my_t29=0 cdc_my_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=2 before=4
+  FDCOUNT pass=2 after=4
+  IDEMPOTENT second_drain_rows=0
+  IMPORT_S 0.640
+  ELAPSED 2.747
+  FD_PEAK 10
+  FD_END 4
+  MEMPEAK=42536960
+  MEMSTAT=anon 430080 file 1208320 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-drain5.log
+LEG apitap tag=final mode=drain twice=1
+  stopped_by completed
+  wall_container_s 7.2
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 55.3
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=0 wall_s=2.751 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+    per_table_rows cdc_my_t01=0 cdc_my_t02=0 cdc_my_t03=0 cdc_my_t04=0 cdc_my_t05=0 cdc_my_t06=0 cdc_my_t07=0 cdc_my_t08=0 cdc_my_t09=0 cdc_my_t10=0 cdc_my_t11=0 cdc_my_t12=0 cdc_my_t13=0 cdc_my_t14=0 cdc_my_t15=0 cdc_my_t16=0 cdc_my_t17=0 cdc_my_t18=0 cdc_my_t19=0 cdc_my_t20=0 cdc_my_t21=0 cdc_my_t22=0 cdc_my_t23=0 cdc_my_t24=0 cdc_my_t25=0 cdc_my_t26=0 cdc_my_t27=0 cdc_my_t28=0 cdc_my_t29=0 cdc_my_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  DRAIN pass=2 rows=0 wall_s=2.741 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+    per_table_rows cdc_my_t01=0 cdc_my_t02=0 cdc_my_t03=0 cdc_my_t04=0 cdc_my_t05=0 cdc_my_t06=0 cdc_my_t07=0 cdc_my_t08=0 cdc_my_t09=0 cdc_my_t10=0 cdc_my_t11=0 cdc_my_t12=0 cdc_my_t13=0 cdc_my_t14=0 cdc_my_t15=0 cdc_my_t16=0 cdc_my_t17=0 cdc_my_t18=0 cdc_my_t19=0 cdc_my_t20=0 cdc_my_t21=0 cdc_my_t22=0 cdc_my_t23=0 cdc_my_t24=0 cdc_my_t25=0 cdc_my_t26=0 cdc_my_t27=0 cdc_my_t28=0 cdc_my_t29=0 cdc_my_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=2 before=4
+  FDCOUNT pass=2 after=4
+  IDEMPOTENT second_drain_rows=0
+  IMPORT_S 0.767
+  ELAPSED 2.751
+  FD_PEAK 10
+  FD_END 4
+  MEMPEAK=58015744
+  MEMSTAT=anon 417792 file 16666624 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc-my/logs/apitap-bench-cdc-final.log
+
+    SHOW MASTER STATUS: mysql-bin.000005	7748752			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-224
+    binlogs on disk: 5 files, 13M
+    replication_connection_status rows: 0
+    window 1: ch_total_rows 30000000 -> 30361700
+      SHOW MASTER STATUS: mysql-bin.000005	666431348			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-15412
+      binlogs on disk: 5 files, 642M
+      replication_connection_status rows: 0
+    watermark: pos 21716959126 .. 21716959126 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain1 loadavg=14.18 10.32 8.60 memavail_kb=43966824 cached_kb=37980812 disk_avail=21G
+    window 2: ch_total_rows 30361700 -> 31350000
+      SHOW MASTER STATUS: mysql-bin.000006	696625235			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40724
+      binlogs on disk: 6 files, 1.7G
+      replication_connection_status rows: 0
+    watermark: pos 22361761902 .. 22361761902 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain2 loadavg=12.58 11.34 9.69 memavail_kb=43166072 cached_kb=37227076 disk_avail=20G
+    window 3: ch_total_rows 31350000 -> 32638400
+      SHOW MASTER STATUS: mysql-bin.000006	696625235			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40724
+      binlogs on disk: 6 files, 1.7G
+      replication_connection_status rows: 0
+    watermark: pos 26466429011 .. 26466429011 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain3 loadavg=7.79 9.36 9.33 memavail_kb=43000784 cached_kb=36894144 disk_avail=20G
+    window 4: ch_total_rows 32638400 -> 32638400
+      SHOW MASTER STATUS: mysql-bin.000006	696625235			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40724
+      binlogs on disk: 6 files, 1.7G
+      replication_connection_status rows: 0
+    watermark: pos 26466429011 .. 26466429011 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain4 loadavg=5.27 8.25 8.94 memavail_kb=42804700 cached_kb=36746904 disk_avail=20G
+    window 5: ch_total_rows 32638400 -> 32638400
+      SHOW MASTER STATUS: mysql-bin.000006	696625235			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40724
+      binlogs on disk: 6 files, 1.7G
+      replication_connection_status rows: 0
+    watermark: pos 26466429011 .. 26466429011 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain5 loadavg=3.38 7.03 8.46 memavail_kb=43053260 cached_kb=36671760 disk_avail=20G
+  WRITER WINDOW_DONE ticks 450 per_table_ins 45000 per_table_upd 45000 per_table_del 9000
+  WRITER progress lines: 4
+  WRITER_TOTAL ticks=450 tables=30 statements=40500 changes=2970000 writer_wall_s=1357.8 changes_per_s=2187
+  WRITER source row counts now — EXACT COUNT(*), and they must be 1000000 + 100·450 - 20·450 = 1036000:
+
+  --- the window's per-drain descriptors, from inside each container ---
+    apitap-bench-cdc-drain1.log:
+      DRAIN pass=1 rows=397860 wall_s=131.443 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 13
+      FD_END 4
+    apitap-bench-cdc-drain2.log:
+      DRAIN pass=1 rows=1087140 wall_s=382.929 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 13
+      FD_END 4
+    apitap-bench-cdc-drain3.log:
+      DRAIN pass=1 rows=1485000 wall_s=511.966 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 13
+      FD_END 4
+    apitap-bench-cdc-drain4.log:
+      DRAIN pass=1 rows=0 wall_s=3.011 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 10
+      FD_END 4
+    apitap-bench-cdc-drain5.log:
+      DRAIN pass=1 rows=0 wall_s=2.747 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      DRAIN pass=2 rows=0 wall_s=3.152 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+      FDCOUNT pass=2 before=4
+      FDCOUNT pass=2 after=4
+      IDEMPOTENT second_drain_rows=0
+      FD_PEAK 10
+      FD_END 4
+    apitap-bench-cdc-final.log:
+      DRAIN pass=1 rows=0 wall_s=2.751 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      DRAIN pass=2 rows=0 wall_s=2.741 budget=1 tables_reporting=30 fd_now=4 fd_peak=10
+      FDCOUNT pass=2 before=4
+      FDCOUNT pass=2 after=4
+      IDEMPOTENT second_drain_rows=0
+      FD_PEAK 10
+      FD_END 4
+
+  --- the window's final verification: destination vs source, FRESH digests ---
+  VERIFY_SUMMARY checked=30 of 30 match=30 mismatch=0
+  TOTAL_ROWS 30000000
+  VERIFY_SUMMARY checked=30 of 30 match=30 mismatch=0
+  TOTAL_ROWS 32638400
+  VERIFY cdc_my_t01 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+  VERIFY cdc_my_t02 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+  VERIFY cdc_my_t30 rows=1000000 MATCH 1000000|2147266635853629|2147375244801801|1|1000000
+  VERIFY cdc_my_t01 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+  VERIFY cdc_my_t02 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+  VERIFY cdc_my_t30 rows=1036000 MATCH 1036000|2224523367011423|2224564487451289|1|2045000
+  --- and the source's EXACT row counts after the window (COUNT(*), all thirty) ---
+    cdc_my_t01 1036000
+    cdc_my_t02 1036000
+    cdc_my_t03 1036000
+    cdc_my_t04 1036000
+    cdc_my_t05 1036000
+    cdc_my_t06 1036000
+    cdc_my_t07 1036000
+    cdc_my_t08 1036000
+    cdc_my_t09 1036000
+    cdc_my_t10 1036000
+    cdc_my_t11 1036000
+    cdc_my_t12 1036000
+    cdc_my_t13 1036000
+    cdc_my_t14 1036000
+    cdc_my_t15 1036000
+    cdc_my_t16 1036000
+    cdc_my_t17 1036000
+    cdc_my_t18 1036000
+    cdc_my_t19 1036000
+    cdc_my_t20 1036000
+    cdc_my_t21 1036000
+    cdc_my_t22 1036000
+    cdc_my_t23 1036000
+    cdc_my_t24 1036000
+    cdc_my_t25 1036000
+    cdc_my_t26 1036000
+    cdc_my_t27 1036000
+    cdc_my_t28 1036000
+    cdc_my_t29 1036000
+    cdc_my_t30 1036000
+
+===== 8. leak checks, taken with the window's state still intact
+== descriptors: peak and final, per leg, measured from inside each container ==
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FD_PEAK 13
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FD_PEAK 13
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FD_PEAK 13
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FD_PEAK 10
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FDCOUNT pass=2 before=4
+bench-cdc-my                        FDCOUNT pass=2 after=4
+bench-cdc-my                        IDEMPOTENT second_drain_rows=0
+bench-cdc-my                        FD_PEAK 10
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FDCOUNT pass=2 before=4
+bench-cdc-my                        FDCOUNT pass=2 after=4
+bench-cdc-my                        IDEMPOTENT second_drain_rows=0
+bench-cdc-my                        FD_PEAK 10
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FD_PEAK 29
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FD_PEAK 29
+bench-cdc-my                        FD_END 4
+bench-cdc-my                        FDCOUNT pass=1 before=4
+bench-cdc-my                        FDCOUNT pass=1 after=4
+bench-cdc-my                        FD_PEAK 29
+bench-cdc-my                        FD_END 4
+
+== the source's binlog: files, size, and who is attached ==
+  SHOW MASTER STATUS: mysql-bin.000006	696625235			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40724
+  binlogs on disk: 6 files, 1.7G
+  replication_connection_status rows: 0
+  binlog-dump / replica-IO threads: 0
+  Binlog_cache_disk_use = 27015
+  Binlog_cache_use = 40672
+  Binlog_stmt_cache_disk_use = 0
+  Binlog_stmt_cache_use = 52
+
+== _apitap_lease rows: a leaked lease is a table a peer cannot claim ==
+  rows=1660
+  UNCOLLECTED AND STILL LIVE = 0
+
+== staging / marker leftovers (run-scoped key tables, staging, locks) ==
+== _apitap_cdc_pending ==
+  (no _apitap_cdc_pending table)
+== _bruin_staging (ingestr's own staging schema) ==
+  tables=0
+== the group's own state rows ==
+  rows=60 mode=log_based cursor=_lsn last_rows_total=9920
+    group rows        source_id=mysql:bench.cdc_my_t22 n=1 distinct_watermarks=1 watermark=26466429011 .. 26466429011
+    server-identity rows n=30 distinct_watermarks=1 sentinel=16201828841002118240 last_rows=0..0
+    the group watermark, one value across all thirty tables: 1 distinct over 30 tables at 26466429011
+== another campaign's rows in the shared _apitap_state, untouched ==
+  cdc_pg_* rows still there: 0
+
+  --- what DID exist during a run: the run-scoped artifacts, from ClickHouse's
+  own dropped-table metadata, which names them ---
+
+===== 9. host state around every leg (loadavg / MemAvailable / Cached / disk free)
+  before apitap-bench-cdc-r1 loadavg=8.49 6.11 7.38 memavail_kb=43649420 cached_kb=36008376 disk_avail=23G
+  after  apitap-bench-cdc-r1 loadavg=8.97 7.20 7.64 memavail_kb=43479528 cached_kb=37189532 disk_avail=20G
+  before apitap-bench-cdc-ing-r1 loadavg=7.98 7.11 7.60 memavail_kb=42995440 cached_kb=33789700 disk_avail=23G
+  after  apitap-bench-cdc-ing-r1 loadavg=7.50 7.02 7.57 memavail_kb=43491424 cached_kb=33814324 disk_avail=23G
+  before apitap-bench-cdc-ing-r1-tuned loadavg=6.70 6.87 7.51 memavail_kb=43470232 cached_kb=33825600 disk_avail=23G
+  after  apitap-bench-cdc-ing-r1-tuned loadavg=6.49 6.83 7.49 memavail_kb=43509536 cached_kb=33809056 disk_avail=23G
+  before apitap-bench-cdc-r2 loadavg=5.68 6.62 7.41 memavail_kb=43463324 cached_kb=33821456 disk_avail=23G
+  after  apitap-bench-cdc-r2 loadavg=10.54 8.10 7.85 memavail_kb=43432600 cached_kb=37355744 disk_avail=20G
+  before apitap-bench-cdc-ing-r2 loadavg=9.65 8.09 7.85 memavail_kb=43194112 cached_kb=34007824 disk_avail=23G
+  after  apitap-bench-cdc-ing-r2 loadavg=9.20 8.02 7.83 memavail_kb=43443532 cached_kb=33977332 disk_avail=23G
+  before apitap-bench-cdc-ing-r2-tuned loadavg=7.97 7.81 7.77 memavail_kb=43456656 cached_kb=33960372 disk_avail=23G
+  after  apitap-bench-cdc-ing-r2-tuned loadavg=7.81 7.78 7.76 memavail_kb=43279404 cached_kb=33971432 disk_avail=23G
+
+===== 10. the rig afterwards
+== this campaign's containers ==
+apitap-bench-cdc-my  mysql:8.0  Up 2 hours  33060/tcp, 127.0.0.1:3313->3306/tcp
+apitap-bench-cdc-pg  postgres:16-alpine  Up 7 hours  127.0.0.1:5548->5432/tcp
+apitap-bench-cdc-ch  clickhouse/clickhouse-server:24.8  Up 9 hours  9009/tcp, 127.0.0.1:8128->8123/tcp, 127.0.0.1:9128->9000/tcp
+== this campaign's volume (on disk) ==
+  apitap-bench-cdc-my-data 17G
+== the seed (KEPT) ==
+  declared: 30 tables, columns each 15-15, 12.67 GiB on disk
+  EXACT row counts (COUNT(*), never information_schema's estimate):
+  cdc_my_t01 1036000
+  cdc_my_t02 1036000
+  cdc_my_t03 1036000
+  cdc_my_t04 1036000
+  cdc_my_t05 1036000
+  cdc_my_t06 1036000
+  cdc_my_t07 1036000
+  cdc_my_t08 1036000
+  cdc_my_t09 1036000
+  cdc_my_t10 1036000
+  cdc_my_t11 1036000
+  cdc_my_t12 1036000
+  cdc_my_t13 1036000
+  cdc_my_t14 1036000
+  cdc_my_t15 1036000
+  cdc_my_t16 1036000
+  cdc_my_t17 1036000
+  cdc_my_t18 1036000
+  cdc_my_t19 1036000
+  cdc_my_t20 1036000
+  cdc_my_t21 1036000
+  cdc_my_t22 1036000
+  cdc_my_t23 1036000
+  cdc_my_t24 1036000
+  cdc_my_t25 1036000
+  cdc_my_t26 1036000
+  cdc_my_t27 1036000
+  cdc_my_t28 1036000
+  cdc_my_t29 1036000
+  cdc_my_t30 1036000
+== the source's binlog ==
+  SHOW MASTER STATUS: mysql-bin.000006	698215527			f1540e09-bfa6-11f1-b3c5-3cb1c3be6eee:1-40788
+  binlogs on disk: 6 files, 1.7G
+  replication_connection_status rows: 0
+  binlog-dump / replica-IO threads: 0
+== destination leftovers (this campaign only) ==
+  cdc_my_* tables: 0
+  another campaign cdc_pg_* rows in _apitap_state (untouched): 0
+== replicas/slaves attached to the source ==
+  0
+== disk ==
+  /dev/sda1       339G  316G   23G  94% /
+
+===== 11. disk
+  /dev/sda1       339G  316G   23G  94% /
+  CH store: 1.3G	/var/lib/clickhouse/store
+  this campaign's MySQL volume: 17G	/var/lib/docker/volumes/apitap-bench-cdc-my-data/_data

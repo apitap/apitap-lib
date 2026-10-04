@@ -27,10 +27,16 @@
 # optional third argument is a WHERE clause); `raw` keeps the server's stderr;
 # `cols` prints the 30 per-column aggregates one per line; `row` prints ONE row's
 # digest as hex, which is what names the column a mismatch lives in.
+#
+# The three container/database names are overridable so the capped MySQL -> CH CDC
+# campaign can reuse these digest definitions verbatim rather than carrying a second
+# copy that could drift (that is the same move the PostgreSQL campaign made on its
+# own validator). With nothing exported the behaviour is byte-identical to what the
+# bulk campaign validated against.
 
-MY_C=apitap-bench-my
-CH_C=apitap-bench-ch
-MY_DB=bench
+MY_C=${MY_C:-apitap-bench-my}
+CH_C=${CH_C:-apitap-bench-ch}
+MY_DB=${MY_DB:-bench}
 
 myq()  { docker exec -i "$MY_C" mysql -uroot -pbench -N -B "$MY_DB" -e "$1"; }
 chq()  { docker exec -i "$CH_C" clickhouse-client --password bench -q "$1"; }
@@ -73,11 +79,35 @@ CH_AGG="SELECT concat(
 # one whole campaign nearly measured a validator that dropped the seconds).
 # An optional second argument is a WHERE clause, so a debug query is built from
 # the SAME aggregate the measurement uses and cannot drift from it.
+#
+# FINAL on the ClickHouse side, but only where it means something: a CDC lane can
+# land into ReplacingMergeTree (ingestr's `merge` strategy does), where a query
+# without FINAL can read several versions of one row and double-count the digest,
+# while a plain MergeTree — which apitap's CDC lane creates — REJECTS the keyword
+# outright ("Storage MergeTree doesn't support FINAL"). The engine therefore
+# decides, per table, rather than the validator assuming one shape for every tool.
+ch_final() {
+    local e
+    e=$(chq_ "SELECT engine FROM system.tables
+              WHERE database='default' AND name='$1'")
+    case "$e" in
+    Replacing*|VersionedCollapsing*|CollapsingMergeTree*) echo " FINAL" ;;
+    *) echo "" ;;
+    esac
+}
 srcsum() { local w=""; [[ -n "${2:-}" ]] && w=" WHERE $2"; myq_ "${MY_AGG//@TBL@/\`$1\`$w}"; }
-chsum()  { local w=""; [[ -n "${2:-}" ]] && w=" WHERE $2"; chq_ "${CH_AGG//@TBL@/\`default\`.\`$1\`$w}"; }
+chsum()  { local w=""; [[ -n "${2:-}" ]] && w=" WHERE $2"
+           chq_ "${CH_AGG//@TBL@/\`default\`.\`$1\`$(ch_final "$1")$w}"; }
+chrows() { chq_ "SELECT count() FROM \`default\`.\`$1\`$(ch_final "$1")${2:+ WHERE $2}"; }
 
 # 30 per-column aggregates, one per line, so a mismatch can be NAMED instead of
 # inferred (this is what found the CHAR(31) trap above).
+#
+# The closing paren of CONCAT_WS( was missing here until 2026-10-04, so this branch
+# answered with `ERROR 1064 ... near 'FROM ...'` for every table and the caller —
+# which pipes stderr away — saw an EMPTY result. A debug aid that silently returns
+# nothing is worse than one that errors loudly: `grep '^json_crc='` against empty
+# output prints nothing and reads as "compared, found no difference".
 MY_COLS="SELECT CONCAT_WS('|',
   'id_sum=', SUM(id), ' id_min=', MIN(id), ' id_max=', MAX(id),
   'small_str_crc=', SUM(IFNULL(CRC32(small_str),0)), ' small_str_len=', SUM(IFNULL(CHAR_LENGTH(small_str),0)),
@@ -93,7 +123,7 @@ MY_COLS="SELECT CONCAT_WS('|',
   'ts_crc=', SUM(IFNULL(CRC32(IFNULL(DATE_FORMAT(ts_val,'%Y-%m-%d %H:%i:%s.%f'),'~')),0)),
   'tstz_crc=', SUM(IFNULL(CRC32(IFNULL(DATE_FORMAT(ts_tz_val,'%Y-%m-%d %H:%i:%s.%f'),'~')),0)),
   'json_crc=', SUM(IFNULL(CRC32(CAST(json_val AS CHAR)),0)),
-  'extra_crc=', SUM(IFNULL(CRC32(extra_text),0)), ' extra_len=', SUM(IFNULL(CHAR_LENGTH(extra_text),0)) FROM @TBL@"
+  'extra_crc=', SUM(IFNULL(CRC32(extra_text),0)), ' extra_len=', SUM(IFNULL(CHAR_LENGTH(extra_text),0))) FROM @TBL@"
 
 CH_COLS="SELECT arrayStringConcat([
   'id_sum=', toString(sum(id)), ' id_min=', toString(min(id)), ' id_max=', toString(max(id)),
