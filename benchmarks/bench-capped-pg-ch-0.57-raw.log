@@ -1,0 +1,730 @@
+apitap 0.57.0 (PyPI) vs walshadow 0.1.2 — capped PostgreSQL -> ClickHouse
+raw log, generated 2026-10-04T00:29:21Z on the bench VPS
+host: 16 cores, 61 GB RAM, shared with production
+
+===== 1. the tools and their provenance
+$ ~/apitap-057-pullback/bin/python -c 'import apitap; ...'
+  apitap.__version__       0.57.0
+  interpreter              3.13.3 (abi3 wheel)
+  _apitap.abi3.so md5      41e9f7c252d3e1eb5403b70f87bf5435
+  site-packages is bind-mounted READ-ONLY into the cage at /py and put on
+  PYTHONPATH, so the PyPI wheel is what runs and nothing is built on this box.
+
+$ walshadow-stream --version   (from the release artifact, inside the image)
+  walshadow-stream 0.1.2 (73329e4)
+  release artifacts, sha256-verified against the published SHA256SUMS:
+    walshadow-0.1.2-x86_64-unknown-linux-gnu.tar.gz          (the daemon)
+    walshadow-pgext-0.1.2-pg18-x86_64-unknown-linux-gnu.tar.gz  (the PG module)
+  the image is postgres:18 with those two files dropped in — nothing compiled here:
+    built 2026-10-03T23:26:51.641449305Z
+    pg PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2)
+    -rw-rw-r-- 1 root root 507408 Oct  3 23:26 /usr/lib/postgresql/18/lib/walshadow.so
+  the shadow PostgreSQL's memory knobs are inherited from the SOURCE's
+  postgresql.conf, which BASE_BACKUP copies into the shadow data directory:
+    source max_connections = 60
+    source max_replication_slots = 10
+    source max_wal_senders = 10
+    source shared_buffers = 40968kB
+    source TimeZone = UTC
+    source wal_level = logical
+
+===== 2. the seed (10 identical tables, kept between every run)
+  cmp_pg_t01 rows=1000000
+  cmp_pg_t02 rows=1000000
+  cmp_pg_t03 rows=1000000
+  cmp_pg_t04 rows=1000000
+  cmp_pg_t05 rows=1000000
+  cmp_pg_t06 rows=1000000
+  cmp_pg_t07 rows=1000000
+  cmp_pg_t08 rows=1000000
+  cmp_pg_t09 rows=1000000
+  cmp_pg_t10 rows=1000000
+  10 tables x 15-15 columns, 2583 MB total
+  generated from id alone, then LIKE-cloned, so all ten are byte-identical:
+  the ten source aggregates are therefore identical, which is the check:
+    cmp_pg_t01 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t02 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t03 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t04 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t05 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t06 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t07 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t08 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t09 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    cmp_pg_t10 cached 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  seeding wall time: 63.7 s for all ten (excluded from every measurement)
+  the schema:
+                                                          Table "public.cmp_pg_t01"
+       Column    |              Type              | Collation | Nullable | Default | Storage  | Compression | Stats target | Description 
+    -------------+--------------------------------+-----------+----------+---------+----------+-------------+--------------+-------------
+     id          | integer                        |           | not null |         | plain    |             |              | 
+     small_str   | character varying(20)          |           |          |         | extended |             |              | 
+     medium_str  | character varying(100)         |           |          |         | extended |             |              | 
+     large_str   | character varying(500)         |           |          |         | extended |             |              | 
+     tiny_int    | smallint                       |           |          |         | plain    |             |              | 
+     regular_int | integer                        |           |          |         | plain    |             |              | 
+     big_int     | bigint                         |           |          |         | plain    |             |              | 
+     float_val   | double precision               |           |          |         | plain    |             |              | 
+     decimal_val | numeric(18,4)                  |           |          |         | main     |             |              | 
+     bool_val    | boolean                        |           |          |         | plain    |             |              | 
+     date_val    | date                           |           |          |         | plain    |             |              | 
+     ts_val      | timestamp(6) without time zone |           |          |         | plain    |             |              | 
+     ts_tz_val   | timestamp with time zone       |           |          |         | plain    |             |              | 
+     json_val    | json                           |           |          |         | extended |             |              | 
+     extra_text  | text                           |           |          |         | extended |             |              | 
+    Indexes:
+        "cmp_pg_t01_pkey" PRIMARY KEY, btree (id)
+    Not-null constraints:
+        "cmp_pg_t01_id_not_null1" NOT NULL "id"
+    Access method: heap
+    
+
+===== 3. the control (the validator proven both ways before anything was timed)
+== 0. the control table (1000 rows, the campaign's schema) ==
+SOURCE   1000|2151639950269|1|1000|31680|32000|37544|10|12|12|11
+
+== 1. AGREEMENT: apitap's landing equals the source ==
+APITAP   1000|2151639950269|1|1000|31680|32000|37544|10|12|12|11
+  GREEN agreement
+
+== 2. SENSITIVITY: one value in one row must move the digest ==
+TAMPERED 1000|2154172601381|1|1000|31680|32000|37525|10|12|12|11  (row: 777
+UPDATE 1)
+  GREEN sensitivity
+RESTORED 1000|2151639950269|1|1000|31680|32000|37544|10|12|12|11
+  GREEN reversible
+
+== 3. THE RIVAL: walshadow's landing passes the same validator ==
+WALSHADOW 1000|2151639950269|1|1000|31680|32000|37544|10|12|12|11
+  GREEN rival validates
+
+== the landed schema, as each tool built it ==
+id	Int32
+small_str	Nullable(String)
+medium_str	Nullable(String)
+large_str	Nullable(String)
+tiny_int	Nullable(Int16)
+regular_int	Nullable(Int32)
+big_int	Nullable(Int64)
+float_val	Nullable(Float64)
+decimal_val	Nullable(Decimal(18, 4))
+bool_val	Nullable(Bool)
+date_val	Nullable(Date32)
+ts_val	Nullable(DateTime64(6, \'UTC\'))
+ts_tz_val	Nullable(DateTime64(6, \'UTC\'))
+json_val	Nullable(String)
+extra_text	Nullable(String)
+_lsn	UInt64
+_xid	UInt32
+_commit_ts	DateTime64(6, \'UTC\')
+_is_deleted	Bool
+ReplacingMergeTree	CREATE TABLE default.cmp_ctrl (`id` Int32, `small_str` Nullable(String), `medium_str` Nullable(String), `large_str` Nullable(String), `tiny_int` Nullable(Int16), `regular_int` Nullable(Int32), `big_int` Nullable(Int64), `float_val` Nullable(Float64), `decimal_val` Nullable(Decimal(18, 4)), `bool_val` Nullable(Bool), `date_val` Nullable(Date32), `ts_val` Nullable(DateTime64(6, 'UTC')), `ts_tz_val` Nullable(DateTime64(6, 'UTC')), `json_val` Nullable(String), `extra_text` Nullable(String), `_lsn` UInt64, `_xid` UInt32, `_commit_ts` DateTime64(6, 'UTC'), `_is_deleted` Bool) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id SETTINGS index_granularity = 8192
+
+== cleanup: the destination tables go, the control table goes ==
+CONTROL GREEN x3
+  the two tools' landed schemas, as each built it:
+== the landed schema, as each tool built it ==
+id	Int32
+small_str	Nullable(String)
+medium_str	Nullable(String)
+large_str	Nullable(String)
+tiny_int	Nullable(Int16)
+regular_int	Nullable(Int32)
+big_int	Nullable(Int64)
+float_val	Nullable(Float64)
+decimal_val	Nullable(Decimal(18, 4))
+bool_val	Nullable(Bool)
+date_val	Nullable(Date32)
+ts_val	Nullable(DateTime64(6, \'UTC\'))
+ts_tz_val	Nullable(DateTime64(6, \'UTC\'))
+json_val	Nullable(String)
+extra_text	Nullable(String)
+_lsn	UInt64
+_xid	UInt32
+_commit_ts	DateTime64(6, \'UTC\')
+_is_deleted	Bool
+ReplacingMergeTree	CREATE TABLE default.cmp_ctrl (`id` Int32, `small_str` Nullable(String), `medium_str` Nullable(String), `large_str` Nullable(String), `tiny_int` Nullable(Int16), `regular_int` Nullable(Int32), `big_int` Nullable(Int64), `float_val` Nullable(Float64), `decimal_val` Nullable(Decimal(18, 4)), `bool_val` Nullable(Bool), `date_val` Nullable(Date32), `ts_val` Nullable(DateTime64(6, 'UTC')), `ts_tz_val` Nullable(DateTime64(6, 'UTC')), `json_val` Nullable(String), `extra_text` Nullable(String), `_lsn` UInt64, `_xid` UInt32, `_commit_ts` DateTime64(6, 'UTC'), `_is_deleted` Bool) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id SETTINGS index_granularity = 8192
+
+== cleanup: the destination tables go, the control table goes ==
+CONTROL GREEN x3
+
+===== 4. what each tool pays in the cage BEFORE it moves a row
+STARTUP cmp-apitap-import  peak_mb=15.7 state=false 0
+  APITAP_VERSION 0.57.0
+  WALL 0.752
+  MEMPEAK=16490496
+  MEMSTAT=anon 409600 file 1110016 shmem 0 
+STARTUP cmp-walshadow-import peak_mb=8.9 state=false 0
+  walshadow-stream 0.1.2 (73329e4)
+  WALL 0.022
+  MEMPEAK=9297920
+  MEMSTAT=anon 434176 file 0 shmem 0 
+  the walshadow figure is the floor of STARTING the binary only. Its
+  deployment unit also owns a PostgreSQL, whose floor is not in that number:
+  the attribution run below measures the whole container instead.
+
+===== 5. the campaign: 3 interleaved rounds, every leg checksum-verified
+  (the ladder and attribution runs of section 6/7 append to the same file
+   with round names of their own — ceil-* and attrib-* — and are filtered
+   out here; nothing is edited, the per-leg logs are the authority)
+LEG apitap round=1
+  stopped_by completed
+  wall_container_s 19.8 
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 119.2
+  host_sampled_peak_mb 0.0
+  APITAP_VERSION 0.57.0
+  ROWS 10000000
+  PIPE_BUDGET 8
+  IMPORT_S 0.599
+  ELAPSED 18.220
+  MEMSTAT=anon 405504 file 20705280 shmem 0 
+  poll_last 
+  log /home/ubuntu/bench-capped-pg/logs/cmp-apitap-r1.log
+LEG wsdefault round=1
+  stopped_by container_exited
+  wall_container_s 10.1 
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 255.2
+  poll_last 1791069685.732275258 rows=77824
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wsdefault-r1.log
+LEG wstuned round=1
+  stopped_by container_exited
+  wall_container_s 5.2 
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 255.4
+  poll_last 1791069702.174749015 rows=33190
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wstuned-r1.log
+LEG apitap round=2
+  stopped_by completed
+  wall_container_s 18.4 
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 115.9
+  host_sampled_peak_mb 0.0
+  APITAP_VERSION 0.57.0
+  ROWS 10000000
+  PIPE_BUDGET 8
+  IMPORT_S 0.785
+  ELAPSED 16.677
+  MEMSTAT=anon 413696 file 13721600 shmem 0 
+  poll_last 
+  log /home/ubuntu/bench-capped-pg/logs/cmp-apitap-r2.log
+LEG wsdefault round=2
+  stopped_by container_exited
+  wall_container_s 7.8 
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791069753.310365151 rows=93184
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wsdefault-r2.log
+LEG wstuned round=2
+  stopped_by container_exited
+  wall_container_s 5.3 
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791069769.595046732 rows=33190
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wstuned-r2.log
+LEG apitap round=3
+  stopped_by completed
+  wall_container_s 17.0 
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 114.3
+  host_sampled_peak_mb 0.0
+  APITAP_VERSION 0.57.0
+  ROWS 10000000
+  PIPE_BUDGET 8
+  IMPORT_S 0.606
+  ELAPSED 15.320
+  MEMSTAT=anon 417792 file 16072704 shmem 0 
+  poll_last 
+  log /home/ubuntu/bench-capped-pg/logs/cmp-apitap-r3.log
+LEG wsdefault round=3
+  stopped_by container_exited
+  wall_container_s 7.6 
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 255.9
+  poll_last 1791069819.092508890 rows=63488
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wsdefault-r3.log
+LEG wstuned round=3
+  stopped_by container_exited
+  wall_container_s 5.2 
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 255.8
+  poll_last 1791069835.472140513 rows=33190
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wstuned-r3.log
+
+  --- the checksums, per leg (dest dropped after each) ---
+VERIFY cmp_pg_t01 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t02 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t03 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t04 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t05 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t06 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t07 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t08 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t09 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t10 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t01 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t02 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t03 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t04 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t05 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t06 rows=77824 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=77824|166664091683742|1|77824|2464704|2490368|2919882|802|985|937|874
+VERIFY cmp_pg_t07 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t08 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t09 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t10 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t01 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t02 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t03 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t04 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t05 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t06 rows=66378 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=66378|142430709321548|1|66378|2102208|2124096|2490444|684|840|799|745
+VERIFY cmp_pg_t07 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t08 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t09 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t10 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t01 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t02 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t03 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t04 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t05 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t06 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t07 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t08 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t09 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t10 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t01 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t02 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t03 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t04 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t05 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t06 rows=93184 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=93184|199528605731495|1|93184|2951168|2981888|3496190|960|1179|1122|1047
+VERIFY cmp_pg_t07 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t08 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t09 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t10 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t01 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t02 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t03 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t04 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t05 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t06 rows=66378 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=66378|142430709321548|1|66378|2102208|2124096|2490444|684|840|799|745
+VERIFY cmp_pg_t07 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t08 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t09 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t10 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t01 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t02 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t03 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t04 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t05 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t06 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t07 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t08 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t09 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t10 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t01 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t02 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t03 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t04 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t05 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t06 rows=63488 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=63488|136236850861076|1|65570|2010688|2031616|2381992|654|804|765|713
+VERIFY cmp_pg_t07 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t08 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t09 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t10 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t01 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t02 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t03 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t04 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t05 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t06 rows=66378 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=66378|142430709321548|1|66378|2102208|2124096|2490444|684|840|799|745
+VERIFY cmp_pg_t07 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t08 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t09 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t10 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t01 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t02 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t03 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t04 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t05 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t06 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t07 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t08 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t09 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t10 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t01 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t02 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t03 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t04 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t05 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t06 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t07 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t08 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t09 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t10 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t01 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t02 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t03 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t04 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t05 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t06 rows=330752 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=330752|709458072375110|1|330752|10474976|10584064|12409508|3409|4186|3984|3716
+VERIFY cmp_pg_t07 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t08 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t09 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t10 rows=0 MISMATCH
+  src=1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+  dst=0|0|0|0|0|0|0|0|0|0|0
+VERIFY cmp_pg_t01 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t02 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t03 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t04 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t05 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t06 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t07 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t08 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t09 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t10 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t01 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t02 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t03 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t04 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t05 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t06 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t07 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t08 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t09 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+VERIFY cmp_pg_t10 rows=1000000 MATCH 1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+
+  --- and, per arm, the per-round host state and the in-cage receipt ---
+  host state (loadavg / MemAvailable / Cached / disk free) around every leg:
+    before cmp-apitap-r1 loadavg=2.75 3.26 2.73 memavail_kb=49019776 cached_kb=41405276 disk_avail=52G
+    after  cmp-apitap-r1 loadavg=3.72 3.46 2.81 memavail_kb=49100904 cached_kb=43250368 disk_avail=50G
+    before cmp-wsdefault-r1 loadavg=3.81 3.50 2.83 memavail_kb=48935488 cached_kb=43315864 disk_avail=50G
+    after  cmp-wsdefault-r1 loadavg=3.30 3.40 2.80 memavail_kb=49385592 cached_kb=42759888 disk_avail=50G
+    before cmp-wstuned-r1 loadavg=3.34 3.40 2.81 memavail_kb=49364164 cached_kb=42772864 disk_avail=50G
+    after  cmp-wstuned-r1 loadavg=3.23 3.38 2.81 memavail_kb=49401944 cached_kb=42374440 disk_avail=50G
+    before cmp-apitap-r2 loadavg=2.96 3.32 2.79 memavail_kb=49311752 cached_kb=42398400 disk_avail=50G
+    after  cmp-apitap-r2 loadavg=7.68 4.30 3.13 memavail_kb=49142968 cached_kb=43648916 disk_avail=47G
+    before cmp-wsdefault-r2 loadavg=7.61 4.45 3.19 memavail_kb=49540972 cached_kb=43730052 disk_avail=47G
+    after  cmp-wsdefault-r2 loadavg=7.40 4.46 3.20 memavail_kb=49651860 cached_kb=43153148 disk_avail=47G
+    before cmp-wstuned-r2 loadavg=6.87 4.45 3.21 memavail_kb=49552192 cached_kb=43170084 disk_avail=47G
+    after  cmp-wstuned-r2 loadavg=5.96 4.33 3.19 memavail_kb=49705444 cached_kb=42790060 disk_avail=47G
+    before cmp-apitap-r3 loadavg=5.58 4.30 3.19 memavail_kb=49727852 cached_kb=42805504 disk_avail=47G
+    after  cmp-apitap-r3 loadavg=6.38 4.54 3.29 memavail_kb=49389920 cached_kb=43092984 disk_avail=45G
+    before cmp-wsdefault-r3 loadavg=5.68 4.47 3.29 memavail_kb=49638936 cached_kb=43154048 disk_avail=45G
+    after  cmp-wsdefault-r3 loadavg=5.25 4.43 3.28 memavail_kb=49758844 cached_kb=42850888 disk_avail=45G
+    before cmp-wstuned-r3 loadavg=5.15 4.42 3.29 memavail_kb=49579036 cached_kb=42874928 disk_avail=45G
+    after  cmp-wstuned-r3 loadavg=4.67 4.34 3.27 memavail_kb=49743168 cached_kb=42632904 disk_avail=45G
+    before cmp-wsdefault-rceil-uncapped loadavg=2.80 3.30 3.16 memavail_kb=49807268 cached_kb=37107004 disk_avail=53G
+    after  cmp-wsdefault-rceil-uncapped loadavg=5.93 4.43 3.61 memavail_kb=49659160 cached_kb=34763212 disk_avail=55G
+    before cmp-wsdefault-rceil-uncapped loadavg=2.66 2.82 3.16 memavail_kb=49763372 cached_kb=34800220 disk_avail=55G
+    after  cmp-wsdefault-rceil-uncapped loadavg=3.33 3.19 3.25 memavail_kb=49477892 cached_kb=34683812 disk_avail=55G
+    before cmp-wsdefault-rceil-512m loadavg=2.89 3.10 3.22 memavail_kb=49218720 cached_kb=34703900 disk_avail=55G
+    after  cmp-wsdefault-rceil-512m loadavg=2.67 3.04 3.20 memavail_kb=49566120 cached_kb=34734072 disk_avail=55G
+    before cmp-wsdefault-rceil-1g loadavg=2.64 3.02 3.19 memavail_kb=49651072 cached_kb=34730216 disk_avail=55G
+    after  cmp-wsdefault-rceil-1g loadavg=4.82 4.10 3.59 memavail_kb=49416828 cached_kb=38455376 disk_avail=52G
+    before cmp-wsdefault-rceil-2g loadavg=3.97 3.94 3.55 memavail_kb=49351228 cached_kb=38454684 disk_avail=52G
+    after  cmp-wsdefault-rceil-2g loadavg=2.95 3.58 3.48 memavail_kb=49497432 cached_kb=42038736 disk_avail=49G
+    before cmp-wsdefault-rattrib-uncapped loadavg=2.27 3.00 3.26 memavail_kb=49530616 cached_kb=35045048 disk_avail=55G
+    after  cmp-wsdefault-rattrib-uncapped loadavg=2.70 3.07 3.28 memavail_kb=49401632 cached_kb=35033796 disk_avail=55G
+    before cmp-wsdefault-rattrib-uncapped loadavg=2.99 2.46 2.63 memavail_kb=49631672 cached_kb=31824488 disk_avail=58G
+    after  cmp-wsdefault-rattrib-uncapped loadavg=3.64 2.87 2.75 memavail_kb=49389484 cached_kb=35584832 disk_avail=55G
+
+===== 6. the cap ladder: the same walshadow leg at a bigger cage
+  upstream's DEFAULT configuration throughout (byte_budget 256 MiB, 8 inserters),
+  each rung from a pre-seeded source and an empty destination.
+===== wsceiling uncapped 512m 1g 2g  (2026-10-03T23:38:39Z)
+CEILING cap=--cpus=0.5
+before cmp-wsdefault-rceil-uncapped loadavg=2.66 2.82 3.16 memavail_kb=49763372 cached_kb=34800220 disk_avail=55G
+after  cmp-wsdefault-rceil-uncapped loadavg=3.33 3.19 3.25 memavail_kb=49477892 cached_kb=34683812 disk_avail=55G
+LEG wsdefault round=ceil-uncapped
+  stopped_by caught_up
+  wall_container_s 128.1 
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 799.7
+  host_sampled_peak_mb 799.2
+  poll_last 1791070846.108172955 rows=10000000
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wsdefault-rceil-uncapped.log
+VERIFY_SUMMARY match=10 mismatch=0
+TOTAL_ROWS 11285158
+CEILING cap=--cpus=0.5 --memory=512m --memory-swap=512m
+before cmp-wsdefault-rceil-512m loadavg=2.89 3.10 3.22 memavail_kb=49218720 cached_kb=34703900 disk_avail=55G
+after  cmp-wsdefault-rceil-512m loadavg=2.67 3.04 3.20 memavail_kb=49566120 cached_kb=34734072 disk_avail=55G
+LEG wsdefault round=ceil-512m
+  stopped_by container_exited
+  wall_container_s 10.2 
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 512.0
+  poll_last 1791070891.191545242 rows=330752
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wsdefault-rceil-512m.log
+VERIFY_SUMMARY match=0 mismatch=10
+TOTAL_ROWS 330752
+CEILING cap=--cpus=0.5 --memory=1g --memory-swap=1g
+before cmp-wsdefault-rceil-1g loadavg=2.64 3.02 3.19 memavail_kb=49651072 cached_kb=34730216 disk_avail=55G
+after  cmp-wsdefault-rceil-1g loadavg=4.82 4.10 3.59 memavail_kb=49416828 cached_kb=38455376 disk_avail=52G
+LEG wsdefault round=ceil-1g
+  stopped_by caught_up
+  wall_container_s 125.3 
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 770.7
+  host_sampled_peak_mb 770.7
+  poll_last 1791071026.984646957 rows=10000000
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wsdefault-rceil-1g.log
+VERIFY_SUMMARY match=10 mismatch=0
+TOTAL_ROWS 11517837
+CEILING cap=--cpus=0.5 --memory=2g --memory-swap=2g
+before cmp-wsdefault-rceil-2g loadavg=3.97 3.94 3.55 memavail_kb=49351228 cached_kb=38454684 disk_avail=52G
+after  cmp-wsdefault-rceil-2g loadavg=2.95 3.58 3.48 memavail_kb=49497432 cached_kb=42038736 disk_avail=49G
+LEG wsdefault round=ceil-2g
+  stopped_by caught_up
+  wall_container_s 131.6 
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 767.3
+  host_sampled_peak_mb 759.4
+  poll_last 1791071192.999159513 rows=10000000
+  log /home/ubuntu/bench-capped-pg/logs/cmp-wsdefault-rceil-2g.log
+VERIFY_SUMMARY match=10 mismatch=0
+TOTAL_ROWS 11417216
+
+===== 7. where walshadow's memory actually goes (uncapped attribution run)
+  ps inside the container at ~12 s and ~36 s of the uncapped leg:
+# attribution run: CAP=--cpus=0.5, round=attrib-uncapped
+
+=== ~12s after container start ===
+    PID   RSS    VSZ COMMAND
+      1 562956 1577732 walshadow-strea
+     30  3956   9348 ps
+     31  1972   5580 head
+     24  1872   2672 sh
+cgroup memory.current: 688484352
+anon 561020928
+file 671744
+shmem 0
+cgroup memory.peak:   741126144
+
+=== ~36s after container start ===
+    PID   RSS    VSZ COMMAND
+      1 587556 1694488 walshadow-strea
+     47  4012   9348 ps
+     48  2044   5580 head
+     41  1816   2672 sh
+cgroup memory.current: 769118208
+anon 586469376
+file 3076096
+shmem 0
+cgroup memory.peak:   827379712
+
+=== ~72s after container start ===
+    PID   RSS    VSZ COMMAND
+      1 603280 1661716 walshadow-strea
+     63  3980   9348 ps
+     64  2028   5580 head
+     57  1848   2672 sh
+cgroup memory.current: 743448576
+anon 604696576
+file 7454720
+shmem 0
+cgroup memory.peak:   827379712
+
+
+===== 8. host state around every leg
+before cmp-apitap-r1 loadavg=2.75 3.26 2.73 memavail_kb=49019776 cached_kb=41405276 disk_avail=52G
+after  cmp-apitap-r1 loadavg=3.72 3.46 2.81 memavail_kb=49100904 cached_kb=43250368 disk_avail=50G
+before cmp-wsdefault-r1 loadavg=3.81 3.50 2.83 memavail_kb=48935488 cached_kb=43315864 disk_avail=50G
+after  cmp-wsdefault-r1 loadavg=3.30 3.40 2.80 memavail_kb=49385592 cached_kb=42759888 disk_avail=50G
+before cmp-wstuned-r1 loadavg=3.34 3.40 2.81 memavail_kb=49364164 cached_kb=42772864 disk_avail=50G
+after  cmp-wstuned-r1 loadavg=3.23 3.38 2.81 memavail_kb=49401944 cached_kb=42374440 disk_avail=50G
+before cmp-apitap-r2 loadavg=2.96 3.32 2.79 memavail_kb=49311752 cached_kb=42398400 disk_avail=50G
+after  cmp-apitap-r2 loadavg=7.68 4.30 3.13 memavail_kb=49142968 cached_kb=43648916 disk_avail=47G
+before cmp-wsdefault-r2 loadavg=7.61 4.45 3.19 memavail_kb=49540972 cached_kb=43730052 disk_avail=47G
+after  cmp-wsdefault-r2 loadavg=7.40 4.46 3.20 memavail_kb=49651860 cached_kb=43153148 disk_avail=47G
+before cmp-wstuned-r2 loadavg=6.87 4.45 3.21 memavail_kb=49552192 cached_kb=43170084 disk_avail=47G
+after  cmp-wstuned-r2 loadavg=5.96 4.33 3.19 memavail_kb=49705444 cached_kb=42790060 disk_avail=47G
+before cmp-apitap-r3 loadavg=5.58 4.30 3.19 memavail_kb=49727852 cached_kb=42805504 disk_avail=47G
+after  cmp-apitap-r3 loadavg=6.38 4.54 3.29 memavail_kb=49389920 cached_kb=43092984 disk_avail=45G
+before cmp-wsdefault-r3 loadavg=5.68 4.47 3.29 memavail_kb=49638936 cached_kb=43154048 disk_avail=45G
+after  cmp-wsdefault-r3 loadavg=5.25 4.43 3.28 memavail_kb=49758844 cached_kb=42850888 disk_avail=45G
+before cmp-wstuned-r3 loadavg=5.15 4.42 3.29 memavail_kb=49579036 cached_kb=42874928 disk_avail=45G
+after  cmp-wstuned-r3 loadavg=4.67 4.34 3.27 memavail_kb=49743168 cached_kb=42632904 disk_avail=45G
+before cmp-wsdefault-rceil-uncapped loadavg=2.80 3.30 3.16 memavail_kb=49807268 cached_kb=37107004 disk_avail=53G
+after  cmp-wsdefault-rceil-uncapped loadavg=5.93 4.43 3.61 memavail_kb=49659160 cached_kb=34763212 disk_avail=55G
+before cmp-wsdefault-rceil-uncapped loadavg=2.66 2.82 3.16 memavail_kb=49763372 cached_kb=34800220 disk_avail=55G
+after  cmp-wsdefault-rceil-uncapped loadavg=3.33 3.19 3.25 memavail_kb=49477892 cached_kb=34683812 disk_avail=55G
+before cmp-wsdefault-rceil-512m loadavg=2.89 3.10 3.22 memavail_kb=49218720 cached_kb=34703900 disk_avail=55G
+after  cmp-wsdefault-rceil-512m loadavg=2.67 3.04 3.20 memavail_kb=49566120 cached_kb=34734072 disk_avail=55G
+before cmp-wsdefault-rceil-1g loadavg=2.64 3.02 3.19 memavail_kb=49651072 cached_kb=34730216 disk_avail=55G
+after  cmp-wsdefault-rceil-1g loadavg=4.82 4.10 3.59 memavail_kb=49416828 cached_kb=38455376 disk_avail=52G
+before cmp-wsdefault-rceil-2g loadavg=3.97 3.94 3.55 memavail_kb=49351228 cached_kb=38454684 disk_avail=52G
+after  cmp-wsdefault-rceil-2g loadavg=2.95 3.58 3.48 memavail_kb=49497432 cached_kb=42038736 disk_avail=49G
+before cmp-wsdefault-rattrib-uncapped loadavg=2.27 3.00 3.26 memavail_kb=49530616 cached_kb=35045048 disk_avail=55G
+after  cmp-wsdefault-rattrib-uncapped loadavg=2.70 3.07 3.28 memavail_kb=49401632 cached_kb=35033796 disk_avail=55G
+before cmp-wsdefault-rattrib-uncapped loadavg=2.99 2.46 2.63 memavail_kb=49631672 cached_kb=31824488 disk_avail=58G
+after  cmp-wsdefault-rattrib-uncapped loadavg=3.64 2.87 2.75 memavail_kb=49389484 cached_kb=35584832 disk_avail=55G
+
+===== 9. the rig afterwards
+== ClickHouse leftovers from this campaign:
+  tables matching the campaign: 0
+== PostgreSQL seeds (columns per seed, then exact row counts):
+  seeds: 10 tables, columns each 15-15
+  cmp_pg_t01 rows=1000000
+  cmp_pg_t02 rows=1000000
+  cmp_pg_t03 rows=1000000
+  cmp_pg_t04 rows=1000000
+  cmp_pg_t05 rows=1000000
+  cmp_pg_t06 rows=1000000
+  cmp_pg_t07 rows=1000000
+  cmp_pg_t08 rows=1000000
+  cmp_pg_t09 rows=1000000
+  cmp_pg_t10 rows=1000000
+== replication slots left on the source:
+  walshadow active=f
+== walshadow state on disk:
+  16K	/home/ubuntu/bench-capped-pg-ws
+== disk:
+  /dev/sda1       339G  283G   57G  84% /
