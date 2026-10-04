@@ -1,0 +1,774 @@
+apitap 0.57.0 (PyPI) vs walshadow 0.1.2 — capped PostgreSQL -> ClickHouse, CDC
+raw log, generated 2026-10-04T03:33:56Z on the bench VPS
+host: 16 cores, 61 GB RAM, shared with production
+
+===== 1. the tools and their provenance
+$ ~/apitap-057-pullback/bin/python -c 'import apitap; ...'
+  apitap.__version__       0.57.0
+  interpreter              3.13.3 (abi3 wheel)
+  _apitap.abi3.so md5      41e9f7c252d3e1eb5403b70f87bf5435
+  site-packages is bind-mounted READ-ONLY into the cage at /py and put on
+  PYTHONPATH, so the PyPI wheel is what runs and nothing is built on this box.
+  every leg re-asserts it from INSIDE the cage; e.g. the catch-up legs' own log:
+    APITAP_VERSION 0.57.0
+    APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+    APITAP_TABLES 30
+
+$ walshadow-stream --version   (from the release artifact, inside the image)
+  walshadow-stream 0.1.2 (73329e4)
+  release artifacts, sha256-verified against the published SHA256SUMS:
+    walshadow-0.1.2-x86_64-unknown-linux-gnu.tar.gz            (the daemon)
+    walshadow-pgext-0.1.2-pg16-x86_64-unknown-linux-gnu.tar.gz (the PG module)
+  the pg16 module, because this campaign's source is PostgreSQL 16 and the
+  shadow walshadow supervises is a physical copy of it — 'physical bootstrap
+  cannot cross major versions' applies to the module as much as to the data.
+  the image is the Debian-flavoured postgres:16, not the alpine one, because the
+  published module links against glibc (ldd: libc.so.6) and cannot load into musl.
+    f0645c15b80b20d55643bfd4dd285176488a3ca896cde910aa9747bcb61c7e01  walshadow-0.1.2-x86_64-unknown-linux-gnu.tar.gz
+    a1d42b9ad4979eb5cc753c4b982d6b5b50275a496c177e4c7e56c4f3a9d4cb22  walshadow-pgext-0.1.2-pg16-x86_64-unknown-linux-gnu.tar.gz
+    pg PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2)
+
+===== 2. the rig: this campaign's own two containers, and nothing else touched
+apitap-bench-cdc-ch  clickhouse/clickhouse-server:24.8  Up About an hour  9009/tcp, 127.0.0.1:8128->8123/tcp, 127.0.0.1:9128->9000/tcp
+apitap-bench-cdc-pg  postgres:16-alpine  Up About an hour  127.0.0.1:5548->5432/tcp
+    logical_decoding_work_mem = 262144kB
+    max_connections = 80
+    max_replication_slots = 10
+    max_slot_wal_keep_size = 6144MB
+    max_wal_senders = 10
+    max_wal_size = 4096MB
+    server_version = 16.13
+    shared_buffers = 163848kB
+    wal_level = logical
+    ClickHouse 24.8.14.39
+  the pg_hba entry walshadow needs and the official image omits (without it the
+  daemon retries forever on auth instead of failing):
+    local   replication     all                                     trust
+    host    replication     all             all                     trust
+
+===== 3. the seed: 30 identical tables, the bulk arm's schema verbatim
+  cdc_pg_t01 cols=15 281 MB
+  cdc_pg_t02 cols=15 281 MB
+  cdc_pg_t03 cols=15 281 MB
+  the seed's own digest, per table (all thirty identical = all thirty clones):
+    1000000|2147445026505068|1|1000000|31670112|32000000|37518996|10309|12658|12048|11235
+    ^ identical to the bulk arm's ten-table digest: same schema, same generator.
+  seeding wall time: 171.0 s for all thirty (excluded from every measurement)
+  the schema:
+                               Table "public.cdc_pg_t01"
+       Column    |              Type              | Collation | Nullable | Default 
+    -------------+--------------------------------+-----------+----------+---------
+     id          | integer                        |           | not null | 
+     small_str   | character varying(20)          |           |          | 
+     medium_str  | character varying(100)         |           |          | 
+     large_str   | character varying(500)         |           |          | 
+     tiny_int    | smallint                       |           |          | 
+     regular_int | integer                        |           |          | 
+     big_int     | bigint                         |           |          | 
+     float_val   | double precision               |           |          | 
+     decimal_val | numeric(18,4)                  |           |          | 
+     bool_val    | boolean                        |           |          | 
+     date_val    | date                           |           |          | 
+     ts_val      | timestamp(6) without time zone |           |          | 
+     ts_tz_val   | timestamp with time zone       |           |          | 
+     json_val    | json                           |           |          | 
+     extra_text  | text                           |           |          | 
+    Indexes:
+        "cdc_pg_t01_pkey" PRIMARY KEY, btree (id)
+    
+
+===== 4. the control: the validator AND the CDC lane proven before anything was timed
+== 0. the control table (1000 rows, the campaign's schema, one apitap slot) ==
+SOURCE   1000|2151639950269|1|1000|31680|32000|37544|10|12|12|11
+
+== 1. AGREEMENT: apitap's CDC landing equals the source ==
+APITAP   1000|2151639950269|1|1000|31680|32000|37544|10|12|12|11
+  the landing apitap built, before anyone else touches it:
+    engine=MergeTree
+    id Int32
+    small_str Nullable(String)
+    medium_str Nullable(String)
+    large_str Nullable(String)
+    tiny_int Nullable(Int16)
+    regular_int Nullable(Int32)
+    big_int Nullable(Int64)
+    float_val Nullable(Float64)
+    decimal_val Nullable(Decimal(18, 4))
+    bool_val Nullable(UInt8)
+    date_val Nullable(Date32)
+    ts_val Nullable(DateTime64(6))
+    ts_tz_val Nullable(DateTime64(6, \'UTC\'))
+    json_val Nullable(String)
+    extra_text Nullable(String)
+    state: cursor=_lsn mode=log_based watermark=12197718776 last_rows=1000
+  GREEN agreement
+
+== 2. SENSITIVITY: one value in one row must move the digest ==
+TAMPERED 1000|2154172601381|1|1000|31680|32000|37525|10|12|12|11
+  GREEN sensitivity
+RESTORED 1000|2151639950269|1|1000|31680|32000|37544|10|12|12|11
+  GREEN reversible
+
+== 3. THE CDC LANE: insert + update + delete, drained again ==
+SOURCE   1040|2228604318474|1|2000050|32928|33280|39026|11|13|12|12   (expected rows 1000 + 50 - 10 = 1040)
+APITAP   1040|2228604318474|1|2000050|32928|33280|39026|11|13|12|12
+  GREEN the change stream follows
+  the empty drain reported: IDEMPOTENT second_drain_rows=0
+  GREEN an empty drain is a no-op
+
+== 4. THE RIVAL: walshadow's landing passes the same validator (uncapped) ==
+  the rival leg will poll for 1040 rows, the source's current count
+WALSHADOW 1040|2228604318474|1|2000050|32928|33280|39026|11|13|12|12
+  GREEN the rival validates
+  the leg's own receipt:
+    LEG walshadow tag=ctrl tuned=no
+      stopped_by caught_up
+      wall_container_s 32.6 
+      docker_state false 0 (OOMKilled ExitCode)
+      cgroup_memory_peak_mb 252.1
+      host_sampled_peak_mb 251.6
+      poll_last 1791084824.288569371 rows=2080
+  the landing's shape, as walshadow built it:
+ReplacingMergeTree
+_lsn	UInt64
+_xid	UInt32
+_commit_ts	DateTime64(6, \'UTC\')
+_is_deleted	Bool
+
+== cleanup: the destination tables go, the control table goes ==
+CONTROL GREEN x4
+
+===== 5. PASS A — the cold catch-up on the source the brief specifies
+  30 tables x 1,000,000 rows, all 30 in ONE CDC group, arms interleaved
+  apitap · walshadow-default · walshadow-tuned, n=2 rounds, every leg
+  checksum-verified before the destination was dropped.
+LEG apitap tag=r1 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 66.2
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 105.2
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=30000000 wall_s=64.209 budget=8 tables_reporting=30 fd_now=4 fd_peak=30
+    per_table_rows cdc_pg_t01=1000000 cdc_pg_t02=1000000 cdc_pg_t03=1000000 cdc_pg_t04=1000000 cdc_pg_t05=1000000 cdc_pg_t06=1000000 cdc_pg_t07=1000000 cdc_pg_t08=1000000 cdc_pg_t09=1000000 cdc_pg_t10=1000000 cdc_pg_t11=1000000 cdc_pg_t12=1000000 cdc_pg_t13=1000000 cdc_pg_t14=1000000 cdc_pg_t15=1000000 cdc_pg_t16=1000000 cdc_pg_t17=1000000 cdc_pg_t18=1000000 cdc_pg_t19=1000000 cdc_pg_t20=1000000 cdc_pg_t21=1000000 cdc_pg_t22=1000000 cdc_pg_t23=1000000 cdc_pg_t24=1000000 cdc_pg_t25=1000000 cdc_pg_t26=1000000 cdc_pg_t27=1000000 cdc_pg_t28=1000000 cdc_pg_t29=1000000 cdc_pg_t30=1000000
+    per_table_nonzero 30 of 30  sum=30000000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.675
+  ELAPSED 64.209
+  FD_PEAK 30
+  FD_END 4
+  MEMPEAK=110329856
+  MEMSTAT=anon 417792 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-r1.log
+LEG walshadow tag=r1 tuned=no
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791081208.765668083 rows=0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r1.log
+LEG walshadow tag=r1 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791081225.191247908 rows=33190
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r1.log
+LEG apitap tag=r2 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 61.4
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 103.4
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=30000000 wall_s=59.499 budget=8 tables_reporting=30 fd_now=4 fd_peak=29
+    per_table_rows cdc_pg_t01=1000000 cdc_pg_t02=1000000 cdc_pg_t03=1000000 cdc_pg_t04=1000000 cdc_pg_t05=1000000 cdc_pg_t06=1000000 cdc_pg_t07=1000000 cdc_pg_t08=1000000 cdc_pg_t09=1000000 cdc_pg_t10=1000000 cdc_pg_t11=1000000 cdc_pg_t12=1000000 cdc_pg_t13=1000000 cdc_pg_t14=1000000 cdc_pg_t15=1000000 cdc_pg_t16=1000000 cdc_pg_t17=1000000 cdc_pg_t18=1000000 cdc_pg_t19=1000000 cdc_pg_t20=1000000 cdc_pg_t21=1000000 cdc_pg_t22=1000000 cdc_pg_t23=1000000 cdc_pg_t24=1000000 cdc_pg_t25=1000000 cdc_pg_t26=1000000 cdc_pg_t27=1000000 cdc_pg_t28=1000000 cdc_pg_t29=1000000 cdc_pg_t30=1000000
+    per_table_nonzero 30 of 30  sum=30000000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.621
+  ELAPSED 59.499
+  FD_PEAK 29
+  FD_END 4
+  MEMPEAK=108474368
+  MEMSTAT=anon 417792 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-r2.log
+LEG walshadow tag=r2 tuned=no
+  stopped_by container_exited
+  wall_container_s 10.3 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791081331.239204465 rows=70656
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r2.log
+LEG walshadow tag=r2 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 7.9 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791081350.579229257 rows=66378
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r2.log
+
+  --- pass A's checksums, per leg (the destination dropped after each) ---
+VERIFY cdc_pg_t01 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t02 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t03 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t04 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t05 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t06 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t07 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t08 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t09 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t10 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t11 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t12 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t13 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t14 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t15 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t16 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t17 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t18 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t19 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t20 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t21 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t22 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t23 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t24 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t25 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t26 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t27 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t28 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t29 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t30 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+VERIFY cdc_pg_t01 MISMATCH
+VERIFY cdc_pg_t02 MISMATCH
+VERIFY cdc_pg_t03 MISMATCH
+VERIFY cdc_pg_t04 MISMATCH
+VERIFY cdc_pg_t05 MISMATCH
+VERIFY cdc_pg_t06 MISMATCH
+VERIFY cdc_pg_t07 MISMATCH
+VERIFY cdc_pg_t08 MISMATCH
+VERIFY cdc_pg_t09 MISMATCH
+VERIFY cdc_pg_t10 MISMATCH
+VERIFY cdc_pg_t11 MISMATCH
+VERIFY cdc_pg_t12 MISMATCH
+VERIFY cdc_pg_t13 MISMATCH
+VERIFY cdc_pg_t14 MISMATCH
+VERIFY cdc_pg_t15 MISMATCH
+VERIFY cdc_pg_t16 MISMATCH
+VERIFY cdc_pg_t17 MISMATCH
+VERIFY cdc_pg_t18 MISMATCH
+VERIFY cdc_pg_t19 MISMATCH
+VERIFY cdc_pg_t20 MISMATCH
+VERIFY cdc_pg_t21 MISMATCH
+VERIFY cdc_pg_t22 MISMATCH
+VERIFY cdc_pg_t23 MISMATCH
+VERIFY cdc_pg_t24 MISMATCH
+VERIFY cdc_pg_t25 MISMATCH
+VERIFY cdc_pg_t26 MISMATCH
+VERIFY cdc_pg_t27 MISMATCH
+VERIFY cdc_pg_t28 MISMATCH
+VERIFY cdc_pg_t29 MISMATCH
+VERIFY cdc_pg_t30 MISMATCH
+
+===== 6. PASS B — the same legs on the source the window left behind
+  30 x 1,036,000 rows (the window's 2,970,000 changes are still in it), n=2, arms
+  interleaved the same way. This is the pass whose per-arm daemon logs are all
+  intact: pass A gave both walshadow arms of a round the same log file, so the
+  second truncated the first.
+LEG apitap tag=r1 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 67.2
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 134.3
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=31080000 wall_s=65.357 budget=8 tables_reporting=30 fd_now=4 fd_peak=30
+    per_table_rows cdc_pg_t01=1036000 cdc_pg_t02=1036000 cdc_pg_t03=1036000 cdc_pg_t04=1036000 cdc_pg_t05=1036000 cdc_pg_t06=1036000 cdc_pg_t07=1036000 cdc_pg_t08=1036000 cdc_pg_t09=1036000 cdc_pg_t10=1036000 cdc_pg_t11=1036000 cdc_pg_t12=1036000 cdc_pg_t13=1036000 cdc_pg_t14=1036000 cdc_pg_t15=1036000 cdc_pg_t16=1036000 cdc_pg_t17=1036000 cdc_pg_t18=1036000 cdc_pg_t19=1036000 cdc_pg_t20=1036000 cdc_pg_t21=1036000 cdc_pg_t22=1036000 cdc_pg_t23=1036000 cdc_pg_t24=1036000 cdc_pg_t25=1036000 cdc_pg_t26=1036000 cdc_pg_t27=1036000 cdc_pg_t28=1036000 cdc_pg_t29=1036000 cdc_pg_t30=1036000
+    per_table_nonzero 30 of 30  sum=31080000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.635
+  ELAPSED 65.357
+  FD_PEAK 30
+  FD_END 4
+  MEMPEAK=140779520
+  MEMSTAT=anon 425984 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-r1.log
+LEG walshadow tag=r1 tuned=no
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 255.9
+  poll_last 1791084381.939493115 rows=0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r1-def.log
+LEG walshadow tag=r1 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 5.5 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791084398.501670759 rows=33199
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r1-tuned.log
+LEG apitap tag=r2 mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 67.3
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 125.2
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=31080000 wall_s=65.409 budget=8 tables_reporting=30 fd_now=4 fd_peak=30
+    per_table_rows cdc_pg_t01=1036000 cdc_pg_t02=1036000 cdc_pg_t03=1036000 cdc_pg_t04=1036000 cdc_pg_t05=1036000 cdc_pg_t06=1036000 cdc_pg_t07=1036000 cdc_pg_t08=1036000 cdc_pg_t09=1036000 cdc_pg_t10=1036000 cdc_pg_t11=1036000 cdc_pg_t12=1036000 cdc_pg_t13=1036000 cdc_pg_t14=1036000 cdc_pg_t15=1036000 cdc_pg_t16=1036000 cdc_pg_t17=1036000 cdc_pg_t18=1036000 cdc_pg_t19=1036000 cdc_pg_t20=1036000 cdc_pg_t21=1036000 cdc_pg_t22=1036000 cdc_pg_t23=1036000 cdc_pg_t24=1036000 cdc_pg_t25=1036000 cdc_pg_t26=1036000 cdc_pg_t27=1036000 cdc_pg_t28=1036000 cdc_pg_t29=1036000 cdc_pg_t30=1036000
+    per_table_nonzero 30 of 30  sum=31080000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.604
+  ELAPSED 65.409
+  FD_PEAK 30
+  FD_END 4
+  MEMPEAK=131260416
+  MEMSTAT=anon 421888 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-r2.log
+LEG walshadow tag=r2 tuned=no
+  stopped_by container_exited
+  wall_container_s 5.4 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 255.6
+  poll_last 1791084505.628758891 rows=0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r2-def.log
+LEG walshadow tag=r2 tuned=tuned
+  stopped_by container_exited
+  wall_container_s 5.3 (container lifetime: it never reached full landing)
+  docker_state true 137 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 0.0
+  host_sampled_peak_mb 256.0
+  poll_last 1791084521.708877656 rows=33199
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-ws-r2-tuned.log
+
+===== 7. THE FIVE-MINUTE WINDOW
+  the writer: 450 ticks x 30 tables x (100 INSERT + 100 UPDATE + 20 DELETE) rows,
+  every statement its own implicit transaction, pg_sleep between ticks, piped
+  from the host into one psql session on the source. Counts are exact by
+  construction and the source's own row counts are the proof.
+  WINDOW_PROGRESS tick 100/450
+  WINDOW_PROGRESS tick 200/450
+  WINDOW_PROGRESS tick 300/450
+  WINDOW_PROGRESS tick 400/450
+  WINDOW_DONE ticks 450 per_table_ins 45000 per_table_upd 45000 per_table_del 9000 expected_rows 1036000
+  --- the writer's statements, one tick of two tables, verbatim ---
+    -- the CDC window's change stream: 2 ticks x 2 tables, 0.65s between ticks
+    -- per tick per table: 100 INSERT + 100 UPDATE + 20 DELETE rows
+    SET application_name = 'apitap-bench-cdc-window';
+    -- t00001 cdc_pg_t01
+    INSERT INTO cdc_pg_t01 (id, small_str, medium_str, large_str, tiny_int, regular_int, big_int, float_val, decimal_val, bool_val, date_val, ts_val, ts_tz_val, json_val, extra_text)
+               SELECT g,
+                      substr(md5(g::text), 1, 8),
+                      CASE WHEN g % 97  = 0 THEN NULL ELSE substr(md5((g * 7)::text), 1, 40) END,
+                      substr(md5((g * 13)::text), 1, 200),
+                      (g % 100)::smallint,
+                      g,
+                      g::bigint * 1000000,
+                      (g % 10000)::double precision / 8,
+                      CASE WHEN g % 89  = 0 THEN NULL ELSE ((g % 1000000)::numeric(18,4) / 100) END,
+                      (g % 2 = 0),
+                      date '2024-01-01' + (g % 900),
+                      timestamp '2024-01-01 00:00:00' + (g % 1000000) * interval '1 microsecond',
+                      timestamptz '2024-01-01 00:00:00+00' + (g % 1000000) * interval '1 microsecond',
+                      CASE WHEN g % 83  = 0 THEN NULL
+                           ELSE ('{"k":' || g || ',"s":"' || substr(md5(g::text), 1, 16) || '"}')::json END,
+                      CASE WHEN g % 79  = 0 THEN NULL ELSE 'extra-' || substr(md5((g * 3)::text), 1, 60) END
+               FROM generate_series(2000000, 2000099) AS g;
+    UPDATE cdc_pg_t01 SET regular_int = regular_int + 1 WHERE id BETWEEN 1 AND 100;
+    DELETE FROM cdc_pg_t01 WHERE id BETWEEN 900001 AND 900020;
+    -- t00001 cdc_pg_t02
+    INSERT INTO cdc_pg_t02 (id, small_str, medium_str, large_str, tiny_int, regular_int, big_int, float_val, decimal_val, bool_val, date_val, ts_val, ts_tz_val, json_val, extra_text)
+               SELECT g,
+                      substr(md5(g::text), 1, 8),
+                      CASE WHEN g % 97  = 0 THEN NULL ELSE substr(md5((g * 7)::text), 1, 40) END,
+                      substr(md5((g * 13)::text), 1, 200),
+                      (g % 100)::smallint,
+                      g,
+
+  --- every drain's receipt, the watermark, the slot's retained WAL ---
+LEG apitap tag=window-bootstrap mode=catchup twice=0
+  stopped_by completed
+  wall_container_s 60.7
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 101.3
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=30000000 wall_s=59.003 budget=8 tables_reporting=30 fd_now=4 fd_peak=30
+    per_table_rows cdc_pg_t01=1000000 cdc_pg_t02=1000000 cdc_pg_t03=1000000 cdc_pg_t04=1000000 cdc_pg_t05=1000000 cdc_pg_t06=1000000 cdc_pg_t07=1000000 cdc_pg_t08=1000000 cdc_pg_t09=1000000 cdc_pg_t10=1000000 cdc_pg_t11=1000000 cdc_pg_t12=1000000 cdc_pg_t13=1000000 cdc_pg_t14=1000000 cdc_pg_t15=1000000 cdc_pg_t16=1000000 cdc_pg_t17=1000000 cdc_pg_t18=1000000 cdc_pg_t19=1000000 cdc_pg_t20=1000000 cdc_pg_t21=1000000 cdc_pg_t22=1000000 cdc_pg_t23=1000000 cdc_pg_t24=1000000 cdc_pg_t25=1000000 cdc_pg_t26=1000000 cdc_pg_t27=1000000 cdc_pg_t28=1000000 cdc_pg_t29=1000000 cdc_pg_t30=1000000
+    per_table_nonzero 30 of 30  sum=30000000
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.695
+  ELAPSED 59.003
+  FD_PEAK 30
+  FD_END 4
+  MEMPEAK=106270720
+  MEMSTAT=anon 413696 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-window-bootstrap.log
+LEG apitap tag=drain1 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 97.9
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 65.6
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=534600 wall_s=96.577 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+    per_table_rows cdc_pg_t01=17820 cdc_pg_t02=17820 cdc_pg_t03=17820 cdc_pg_t04=17820 cdc_pg_t05=17820 cdc_pg_t06=17820 cdc_pg_t07=17820 cdc_pg_t08=17820 cdc_pg_t09=17820 cdc_pg_t10=17820 cdc_pg_t11=17820 cdc_pg_t12=17820 cdc_pg_t13=17820 cdc_pg_t14=17820 cdc_pg_t15=17820 cdc_pg_t16=17820 cdc_pg_t17=17820 cdc_pg_t18=17820 cdc_pg_t19=17820 cdc_pg_t20=17820 cdc_pg_t21=17820 cdc_pg_t22=17820 cdc_pg_t23=17820 cdc_pg_t24=17820 cdc_pg_t25=17820 cdc_pg_t26=17820 cdc_pg_t27=17820 cdc_pg_t28=17820 cdc_pg_t29=17820 cdc_pg_t30=17820
+    per_table_nonzero 30 of 30  sum=534600
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.584
+  ELAPSED 96.577
+  FD_PEAK 13
+  FD_END 4
+  MEMPEAK=68812800
+  MEMSTAT=anon 417792 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-drain1.log
+LEG apitap tag=drain2 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 194.1
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 64.4
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=1207800 wall_s=192.795 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+    per_table_rows cdc_pg_t01=40260 cdc_pg_t02=40260 cdc_pg_t03=40260 cdc_pg_t04=40260 cdc_pg_t05=40260 cdc_pg_t06=40260 cdc_pg_t07=40260 cdc_pg_t08=40260 cdc_pg_t09=40260 cdc_pg_t10=40260 cdc_pg_t11=40260 cdc_pg_t12=40260 cdc_pg_t13=40260 cdc_pg_t14=40260 cdc_pg_t15=40260 cdc_pg_t16=40260 cdc_pg_t17=40260 cdc_pg_t18=40260 cdc_pg_t19=40260 cdc_pg_t20=40260 cdc_pg_t21=40260 cdc_pg_t22=40260 cdc_pg_t23=40260 cdc_pg_t24=40260 cdc_pg_t25=40260 cdc_pg_t26=40260 cdc_pg_t27=40260 cdc_pg_t28=40260 cdc_pg_t29=40260 cdc_pg_t30=40260
+    per_table_nonzero 30 of 30  sum=1207800
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.584
+  ELAPSED 192.795
+  FD_PEAK 13
+  FD_END 4
+  MEMPEAK=67510272
+  MEMSTAT=anon 421888 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-drain2.log
+LEG apitap tag=drain3 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 195.5
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 65.4
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=1227600 wall_s=194.141 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+    per_table_rows cdc_pg_t01=40920 cdc_pg_t02=40920 cdc_pg_t03=40920 cdc_pg_t04=40920 cdc_pg_t05=40920 cdc_pg_t06=40920 cdc_pg_t07=40920 cdc_pg_t08=40920 cdc_pg_t09=40920 cdc_pg_t10=40920 cdc_pg_t11=40920 cdc_pg_t12=40920 cdc_pg_t13=40920 cdc_pg_t14=40920 cdc_pg_t15=40920 cdc_pg_t16=40920 cdc_pg_t17=40920 cdc_pg_t18=40920 cdc_pg_t19=40920 cdc_pg_t20=40920 cdc_pg_t21=40920 cdc_pg_t22=40920 cdc_pg_t23=40920 cdc_pg_t24=40920 cdc_pg_t25=40920 cdc_pg_t26=40920 cdc_pg_t27=40920 cdc_pg_t28=40920 cdc_pg_t29=40920 cdc_pg_t30=40920
+    per_table_nonzero 30 of 30  sum=1227600
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.659
+  ELAPSED 194.141
+  FD_PEAK 13
+  FD_END 4
+  MEMPEAK=68624384
+  MEMSTAT=anon 421888 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-drain3.log
+LEG apitap tag=drain4 mode=drain twice=0
+  stopped_by completed
+  wall_container_s 5.2
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 40.7
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=0 wall_s=3.723 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+    per_table_rows cdc_pg_t01=0 cdc_pg_t02=0 cdc_pg_t03=0 cdc_pg_t04=0 cdc_pg_t05=0 cdc_pg_t06=0 cdc_pg_t07=0 cdc_pg_t08=0 cdc_pg_t09=0 cdc_pg_t10=0 cdc_pg_t11=0 cdc_pg_t12=0 cdc_pg_t13=0 cdc_pg_t14=0 cdc_pg_t15=0 cdc_pg_t16=0 cdc_pg_t17=0 cdc_pg_t18=0 cdc_pg_t19=0 cdc_pg_t20=0 cdc_pg_t21=0 cdc_pg_t22=0 cdc_pg_t23=0 cdc_pg_t24=0 cdc_pg_t25=0 cdc_pg_t26=0 cdc_pg_t27=0 cdc_pg_t28=0 cdc_pg_t29=0 cdc_pg_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  IMPORT_S 0.721
+  ELAPSED 3.723
+  FD_PEAK 12
+  FD_END 4
+  MEMPEAK=42659840
+  MEMSTAT=anon 434176 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-drain4.log
+LEG apitap tag=drain5 mode=drain twice=1
+  stopped_by completed
+  wall_container_s 8.0
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 40.7
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=0 wall_s=3.201 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+    per_table_rows cdc_pg_t01=0 cdc_pg_t02=0 cdc_pg_t03=0 cdc_pg_t04=0 cdc_pg_t05=0 cdc_pg_t06=0 cdc_pg_t07=0 cdc_pg_t08=0 cdc_pg_t09=0 cdc_pg_t10=0 cdc_pg_t11=0 cdc_pg_t12=0 cdc_pg_t13=0 cdc_pg_t14=0 cdc_pg_t15=0 cdc_pg_t16=0 cdc_pg_t17=0 cdc_pg_t18=0 cdc_pg_t19=0 cdc_pg_t20=0 cdc_pg_t21=0 cdc_pg_t22=0 cdc_pg_t23=0 cdc_pg_t24=0 cdc_pg_t25=0 cdc_pg_t26=0 cdc_pg_t27=0 cdc_pg_t28=0 cdc_pg_t29=0 cdc_pg_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  DRAIN pass=2 rows=0 wall_s=3.462 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+    per_table_rows cdc_pg_t01=0 cdc_pg_t02=0 cdc_pg_t03=0 cdc_pg_t04=0 cdc_pg_t05=0 cdc_pg_t06=0 cdc_pg_t07=0 cdc_pg_t08=0 cdc_pg_t09=0 cdc_pg_t10=0 cdc_pg_t11=0 cdc_pg_t12=0 cdc_pg_t13=0 cdc_pg_t14=0 cdc_pg_t15=0 cdc_pg_t16=0 cdc_pg_t17=0 cdc_pg_t18=0 cdc_pg_t19=0 cdc_pg_t20=0 cdc_pg_t21=0 cdc_pg_t22=0 cdc_pg_t23=0 cdc_pg_t24=0 cdc_pg_t25=0 cdc_pg_t26=0 cdc_pg_t27=0 cdc_pg_t28=0 cdc_pg_t29=0 cdc_pg_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=2 before=4
+  FDCOUNT pass=2 after=4
+  IDEMPOTENT second_drain_rows=0
+  IMPORT_S 0.602
+  ELAPSED 3.201
+  FD_PEAK 12
+  FD_END 4
+  MEMPEAK=42692608
+  MEMSTAT=anon 425984 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-drain5.log
+LEG apitap tag=final mode=drain twice=1
+  stopped_by completed
+  wall_container_s 7.9
+  docker_state false 0 (OOMKilled ExitCode)
+  cgroup_memory_peak_mb 40.7
+  APITAP_VERSION 0.57.0
+  APITAP_SO_MD5 41e9f7c252d3e1eb5403b70f87bf5435
+  APITAP_TABLES 30
+  DRAIN pass=1 rows=0 wall_s=3.256 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+    per_table_rows cdc_pg_t01=0 cdc_pg_t02=0 cdc_pg_t03=0 cdc_pg_t04=0 cdc_pg_t05=0 cdc_pg_t06=0 cdc_pg_t07=0 cdc_pg_t08=0 cdc_pg_t09=0 cdc_pg_t10=0 cdc_pg_t11=0 cdc_pg_t12=0 cdc_pg_t13=0 cdc_pg_t14=0 cdc_pg_t15=0 cdc_pg_t16=0 cdc_pg_t17=0 cdc_pg_t18=0 cdc_pg_t19=0 cdc_pg_t20=0 cdc_pg_t21=0 cdc_pg_t22=0 cdc_pg_t23=0 cdc_pg_t24=0 cdc_pg_t25=0 cdc_pg_t26=0 cdc_pg_t27=0 cdc_pg_t28=0 cdc_pg_t29=0 cdc_pg_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=1 before=4
+  FDCOUNT pass=1 after=4
+  DRAIN pass=2 rows=0 wall_s=3.400 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+    per_table_rows cdc_pg_t01=0 cdc_pg_t02=0 cdc_pg_t03=0 cdc_pg_t04=0 cdc_pg_t05=0 cdc_pg_t06=0 cdc_pg_t07=0 cdc_pg_t08=0 cdc_pg_t09=0 cdc_pg_t10=0 cdc_pg_t11=0 cdc_pg_t12=0 cdc_pg_t13=0 cdc_pg_t14=0 cdc_pg_t15=0 cdc_pg_t16=0 cdc_pg_t17=0 cdc_pg_t18=0 cdc_pg_t19=0 cdc_pg_t20=0 cdc_pg_t21=0 cdc_pg_t22=0 cdc_pg_t23=0 cdc_pg_t24=0 cdc_pg_t25=0 cdc_pg_t26=0 cdc_pg_t27=0 cdc_pg_t28=0 cdc_pg_t29=0 cdc_pg_t30=0
+    per_table_nonzero 0 of 30  sum=0
+  FDCOUNT pass=2 before=4
+  FDCOUNT pass=2 after=4
+  IDEMPOTENT second_drain_rows=0
+  IMPORT_S 0.575
+  ELAPSED 3.256
+  FD_PEAK 12
+  FD_END 4
+  MEMPEAK=42708992
+  MEMSTAT=anon 417792 file 1183744 shmem 0 
+  MEMEVENTS=high 0 max 0 oom 0 oom_kill 0 
+  EXITCODE 0
+  log /home/ubuntu/bench-cdc/logs/apitap-bench-cdc-final.log
+
+    window 1: ch_total_rows 30000000 -> 30486000
+    slot: walshadow active= f wal_status= - retained= apitap_g25786459cc6 active= f wal_status= reserved retained= 416 MB 
+    watermark: lsn 10832350944 .. 10832350944 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain1 loadavg=8.65 6.97 6.71 memavail_kb=48702252 cached_kb=34087396 disk_avail=33G
+    window 2: ch_total_rows 30486000 -> 31584000
+    slot: walshadow active= f wal_status= - retained= apitap_g25786459cc6 active= f wal_status= reserved retained= 628 MB 
+    watermark: lsn 11423948760 .. 11423948760 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain2 loadavg=12.81 8.66 7.36 memavail_kb=48390440 cached_kb=35664244 disk_avail=32G
+    window 3: ch_total_rows 31584000 -> 32700000
+    slot: walshadow active= f wal_status= - retained= apitap_g25786459cc6 active= f wal_status= reserved retained= 34 MB 
+    watermark: lsn 12025112328 .. 12025112328 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain3 loadavg=9.31 8.62 7.58 memavail_kb=47790216 cached_kb=33642592 disk_avail=34G
+    window 4: ch_total_rows 32700000 -> 32700000
+    slot: walshadow active= f wal_status= - retained= apitap_g25786459cc6 active= f wal_status= reserved retained= 56 bytes 
+    watermark: lsn 12025113736 .. 12025113736 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain4 loadavg=4.16 7.20 7.16 memavail_kb=47956756 cached_kb=33537976 disk_avail=34G
+    window 5: ch_total_rows 32700000 -> 32700000
+    slot: walshadow active= f wal_status= - retained= apitap_g25786459cc6 active= f wal_status= reserved retained= 2816 bytes 
+    watermark: lsn 12025116440 .. 12025116440 distinct=1 tables=30
+    host: after  apitap-bench-cdc-drain5 loadavg=3.74 6.42 6.89 memavail_kb=47899900 cached_kb=33369584 disk_avail=35G
+  WRITER WINDOW_DONE ticks 450 per_table_ins 45000 per_table_upd 45000 per_table_del 9000 expected_rows 1036000
+  WRITER progress lines: 4
+  WRITER_TOTAL ticks=450 tables=30 transactions=13500 changes=2970000 writer_wall_s=811.1 changes_per_s=3662
+  WRITER source row counts now (must be 1000000 + 100·450 - 20·450 = 1036000):
+
+  --- the window's per-drain descriptors, from inside each container ---
+    apitap-bench-cdc-drain1.log:
+      DRAIN pass=1 rows=534600 wall_s=96.577 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 13
+      FD_END 4
+    apitap-bench-cdc-drain2.log:
+      DRAIN pass=1 rows=1207800 wall_s=192.795 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 13
+      FD_END 4
+    apitap-bench-cdc-drain3.log:
+      DRAIN pass=1 rows=1227600 wall_s=194.141 budget=1 tables_reporting=30 fd_now=4 fd_peak=13
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 13
+      FD_END 4
+    apitap-bench-cdc-drain4.log:
+      DRAIN pass=1 rows=0 wall_s=3.723 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      FD_PEAK 12
+      FD_END 4
+    apitap-bench-cdc-drain5.log:
+      DRAIN pass=1 rows=0 wall_s=3.201 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      DRAIN pass=2 rows=0 wall_s=3.462 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+      FDCOUNT pass=2 before=4
+      FDCOUNT pass=2 after=4
+      IDEMPOTENT second_drain_rows=0
+      FD_PEAK 12
+      FD_END 4
+    apitap-bench-cdc-final.log:
+      DRAIN pass=1 rows=0 wall_s=3.256 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+      FDCOUNT pass=1 before=4
+      FDCOUNT pass=1 after=4
+      DRAIN pass=2 rows=0 wall_s=3.400 budget=1 tables_reporting=30 fd_now=4 fd_peak=12
+      FDCOUNT pass=2 before=4
+      FDCOUNT pass=2 after=4
+      IDEMPOTENT second_drain_rows=0
+      FD_PEAK 12
+      FD_END 4
+
+  --- the window's final verification: destination against source, FRESH digests ---
+  VERIFY cdc_pg_t01 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+  VERIFY cdc_pg_t02 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+  VERIFY cdc_pg_t30 rows=1036000 MATCH 1036000|2225213684394444|1|2044999|32810240|33152000|38869668|10680|13114|12482|11640
+  VERIFY_SUMMARY checked=30 of 30 match=30 mismatch=0
+  TOTAL_ROWS 32700000
+
+===== 8. leak checks, taken with the window's state still intact
+== descriptors: peak and final, per leg, measured from inside each container ==
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 13
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 13
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 13
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 12
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FDCOUNT pass=2 before=4
+bench-cdc                           FDCOUNT pass=2 after=4
+bench-cdc                           IDEMPOTENT second_drain_rows=0
+bench-cdc                           FD_PEAK 12
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FDCOUNT pass=2 before=4
+bench-cdc                           FDCOUNT pass=2 after=4
+bench-cdc                           IDEMPOTENT second_drain_rows=0
+bench-cdc                           FD_PEAK 12
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 29
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 30
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 29
+bench-cdc                           FD_END 4
+bench-cdc                           FDCOUNT pass=1 before=4
+bench-cdc                           FDCOUNT pass=1 after=4
+bench-cdc                           FD_PEAK 30
+bench-cdc                           FD_END 4
+
+== replication slots and the WAL they retain ==
+  apitap_g25786459cc6 type=logical active=f wal_status=reserved retained=23 MB
+  walshadow type=physical active=f wal_status=- retained=
+  publications: apitap_g25786459cc6_pub
+  total WAL held by slots: 23 MB
+  spilly transactions on the slot(s): 0 txns / 0 spills / 0 bytes
+
+== _apitap_lease rows: a leaked lease is a table a peer cannot claim ==
+  rows=661
+  UNCOLLECTED AND STILL LIVE = 0
+
+== staging / marker leftovers (run-scoped key tables, staging, locks) ==
+== _apitap_cdc_pending ==
+  (no _apitap_cdc_pending table)
+== the group's own state rows ==
+  rows=30 mode=log_based cursor=_lsn distinct_watermarks=1 watermark=12025119224 .. 12025119224 last_rows_total=0
+
+  --- what DID exist during a run: the run-scoped artifacts, from ClickHouse's
+  own dropped-table metadata, which names them ---
+    default.cdc_ctrl_0tmd5t9rfxzfmh5__apitap_staging
+    default.cdc_ctrl_0tmd5telfxzkhqa__apitap_cdc_del
+    default.cdc_ctrl_0tmd5v5rfxzq44e__apitap_staging
+    default.cdc_ctrl_0tmd5valfxz7cbp__apitap_cdc_del
+    default.cdc_pg_t01_0tmd5ktrfxz8r4k__apitap_staging
+    default.cdc_pg_t02_0tmd5kwrfxz8r4l__apitap_staging
+    default.cdc_pg_t03_0tmd5kyrfxz8r4m__apitap_staging
+    default.cdc_pg_t04_0tmd5l0rfxz8r4n__apitap_staging
+    (and after every leg, the drop check reports 0 — nothing is left behind)
+
+===== 9. host state around every leg (loadavg / MemAvailable / Cached / disk free)
+  before apitap-bench-cdc-r1 loadavg=5.18 6.49 6.69 memavail_kb=48422612 cached_kb=25691056 disk_avail=42G
+  after  apitap-bench-cdc-r1 loadavg=19.91 10.71 8.14 memavail_kb=48251572 cached_kb=34235908 disk_avail=34G
+  before apitap-bench-cdc-ws-r1-def loadavg=17.84 10.84 8.24 memavail_kb=48407864 cached_kb=25749952 disk_avail=42G
+  after  apitap-bench-cdc-ws-r1-def loadavg=15.55 10.58 8.18 memavail_kb=48165576 cached_kb=25764816 disk_avail=42G
+  before apitap-bench-cdc-ws-r1-tuned loadavg=13.93 10.40 8.15 memavail_kb=48226508 cached_kb=25765960 disk_avail=42G
+  after  apitap-bench-cdc-ws-r1-tuned loadavg=12.90 10.24 8.11 memavail_kb=48398952 cached_kb=25768320 disk_avail=42G
+  before apitap-bench-cdc-r2 loadavg=12.03 10.15 8.10 memavail_kb=48176164 cached_kb=25773360 disk_avail=42G
+  after  apitap-bench-cdc-r2 loadavg=14.96 11.66 8.78 memavail_kb=48151864 cached_kb=34327248 disk_avail=34G
+  before apitap-bench-cdc-ws-r2-def loadavg=13.81 11.63 8.85 memavail_kb=48055476 cached_kb=25823132 disk_avail=42G
+  after  apitap-bench-cdc-ws-r2-def loadavg=12.86 11.47 8.81 memavail_kb=48250220 cached_kb=25826308 disk_avail=42G
+  before apitap-bench-cdc-ws-r2-tuned loadavg=11.11 11.14 8.73 memavail_kb=48247700 cached_kb=25825768 disk_avail=42G
+  after  apitap-bench-cdc-ws-r2-tuned loadavg=10.70 11.06 8.72 memavail_kb=48325204 cached_kb=25843420 disk_avail=42G
+
+===== 10. the rig afterwards
+== this campaign's containers ==
+apitap-bench-cdc-ch  clickhouse/clickhouse-server:24.8  Up About an hour  9009/tcp, 127.0.0.1:8128->8123/tcp, 127.0.0.1:9128->9000/tcp
+apitap-bench-cdc-pg  postgres:16-alpine  Up About an hour  127.0.0.1:5548->5432/tcp
+== this campaign's volumes (on disk) ==
+  apitap-bench-cdc-pg-data 15G
+  apitap-bench-cdc-ch-data 365M
+== walshadow's own state on disk (its container is gone) ==
+  17M
+== the seed (KEPT for the next campaign) ==
+  30 tables x 15-15 columns, 8419 MB
+== destination leftovers ==
+  cdc_pg_t* tables: 0
+== replication slots left ==
+  walshadow active=false
+== disk ==
+  /dev/sda1       339G  297G   42G  88% /
+
+===== 11. disk, and what the ClickHouse delayed-drop cost us
+  /dev/sda1       339G  297G   42G  88% /
+  CH store: 365M	/var/lib/clickhouse/store
+  measured during the campaign: without DROP TABLE ... SYNC, three consecutive
+  8 GB landings left 42 GB free -> 9.5 GB free, because ClickHouse keeps a
+  dropped table's metadata (and its parts on disk) for
+  database_atomic_delay_before_drop_table_sec = 480 s so UNDROP can find it.
+  CH's own description of that setting says the delay is IGNORED for a SYNC
+  drop; cmd_drop therefore drops SYNC, and the store went back to ~130 MB.

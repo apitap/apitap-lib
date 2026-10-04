@@ -40,9 +40,12 @@
 #   bash bench-capped-pg-ch-validator.sh cols src|dst TABLE     per column, one per line
 #   bash bench-capped-pg-ch-validator.sh row  src|dst TABLE ID   one row's digest, hex
 
-PG_C=apitap-bench-ws-pg
-CH_C=apitap-bench-ch
-PG_DB=bench
+# Overridable so a second campaign can reuse these digest definitions verbatim
+# rather than carrying a second copy that could drift: the CDC campaign exports
+# its own isolated containers and nothing else about this file changes.
+PG_C=${PG_C:-apitap-bench-ws-pg}
+CH_C=${CH_C:-apitap-bench-ch}
+PG_DB=${PG_DB:-bench}
 
 pgq()  { docker exec -i "$PG_C" psql -U postgres -d "$PG_DB" -Atc "$1"; }
 chq()  { docker exec -i "$CH_C" clickhouse-client --password bench -q "$1"; }
