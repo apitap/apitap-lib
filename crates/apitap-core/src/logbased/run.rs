@@ -1662,6 +1662,60 @@ async fn apply_windows(
             for (i, n) in r?.into_iter().enumerate() {
                 rows_per[i] += n;
             }
+        } else if matches!(dest, Dest::Ch(_)) && members.len() > 1 {
+            // A ClickHouse window's watermarks are ONE statement: the members'
+            // applies still overlap in lanes, each in a unit of its own, but
+            // their marks are closed together in a single unit over the whole
+            // group, where `ChStore::close_unit` writes one `_apitap_state`
+            // INSERT for the window. The fence, every predicate and every
+            // watermark value are unchanged — only the statement count drops.
+            let (sref, oref, mref) = (&src, &o, &members);
+            let fs: Vec<_> = (0..mref.len())
+                .map(|i| async move {
+                    let (dt, q, sid) = &mref[i];
+                    let (n, m) = apply_member_pending(t, dt, q, sid, oref, Some(sref)).await?;
+                    Ok::<_, Error>((i, n, m))
+                })
+                .collect();
+            let mut done = Vec::with_capacity(fs.len());
+            if lanes > 1 {
+                match settle_all(lanes, fs).await {
+                    Ok(v) => done = v,
+                    Err(e) => {
+                        for (dt, _, sid) in &members {
+                            dest.settle(dt, sid, false);
+                        }
+                        return Err(e);
+                    }
+                }
+            } else {
+                for f in fs {
+                    match f.await {
+                        Ok(v) => done.push(v),
+                        Err(e) => {
+                            for (dt, _, sid) in &members {
+                                dest.settle(dt, sid, false);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            done.sort_by_key(|(i, _, _)| *i);
+            let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
+            let marks: Vec<Watermark> = done.iter().map(|(_, _, m)| m.clone()).collect();
+            let r = async {
+                let h = t.open(&tables).await?;
+                t.close(h, marks).await
+            }
+            .await;
+            for (dt, _, sid) in &members {
+                dest.settle(dt, sid, r.is_ok());
+            }
+            r?;
+            for (i, n, _) in done {
+                rows_per[i] += n;
+            }
         } else if lanes > 1 && members.len() > 1 {
             // A BOUNDED pool of per-table units: `lanes` in flight, the rest
             // queued, each completion pulling the next. Unbounded would melt a
@@ -1742,6 +1796,26 @@ async fn apply_member(
     .await;
     dest.settle(dest_table, source_id, r.is_ok());
     r
+}
+
+/// One member's window in a unit of its own, closed with NO mark: the caller
+/// batches every member's mark into one group close, where the watermark
+/// statements are written. Only the ClickHouse replica/changelog group path
+/// calls this — a unit there is a predicate, not a transaction, so the data
+/// statements were already fenced when the empty close runs, and the eventual
+/// group close carries the same pinned-deadline proof for every mark.
+async fn apply_member_pending(
+    t: &Tenure<Dest>,
+    dest_table: &str,
+    qualified: &str,
+    source_id: &str,
+    o: &DrainOutcome,
+    src: Option<&PgPool>,
+) -> Result<(u64, Watermark)> {
+    let mut h = t.open(&[dest_table]).await?;
+    let (n, m) = t.dest().apply(&mut h.unit, dest_table, qualified, source_id, o, src).await?;
+    t.close(h, Vec::new()).await?;
+    Ok((n, m))
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────

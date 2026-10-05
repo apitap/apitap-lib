@@ -740,6 +740,7 @@ mod store {
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark};
     use crate::logbased::replay::{parse_ceiling, parse_facts, parse_pending, MarkerRow, Pending, StampFacts};
+    use crate::logbased::rowtext::copy_escape;
     use crate::naming::{artifact_ident, artifact_ident_tok, Artifact, ROOMY};
     use crate::sink::clickhouse::{ch_ident, ch_str, ChConn, ChGuard};
     use std::collections::{HashMap, HashSet};
@@ -909,6 +910,56 @@ mod store {
             t = ch_ident(table),
             s = ch_str(structure),
         )
+    }
+
+    /// The structure `input()` is told for the one-statement mark set.
+    pub(super) const STATE_BATCH_INPUT: &str =
+        "dest_key String, dest_table String, source_id String, lsn UInt64, rows UInt64";
+
+    /// One window's whole mark set as ONE `_apitap_state` INSERT: each member
+    /// is a row of `input()`, and each row is fenced by ITS OWN lease row —
+    /// the same "exists, not collected, more than the margin left" predicate
+    /// `owner_pred` spells per key, lifted to set membership — plus the unit's
+    /// pinned deadline, so the statement writes a row only where this run
+    /// still owns the table and its proof is continuous. The count the server
+    /// reports must equal the number of marks, or the window refuses and
+    /// replays (`written_rows` semantics: partial = not owner).
+    pub(super) fn state_batch_sql(token: &str, margin: u64, e0: u64, margin_us: u64) -> String {
+        format!(
+            "INSERT INTO `_apitap_state` (dest_table, source_id, cursor_col, watermark, mode, last_rows) \
+             SELECT dest_table, source_id, '{cursor}', toString(lsn), 'log_based', rows \
+             FROM input('{structure}') \
+             WHERE dest_key IN (SELECT dest_key FROM `{lease}` WHERE token = '{tok}' GROUP BY dest_key \
+                   HAVING count() > 0 AND argMax(collected, seq) = 0 AND \
+                   argMax(expires_at, seq) > now64(6) + INTERVAL {margin} SECOND) \
+             AND {pinned} FORMAT TabSeparated",
+            cursor = ch_str(STATE_CURSOR),
+            structure = ch_str(STATE_BATCH_INPUT),
+            lease = crate::lease::LEASE_TABLE,
+            tok = ch_str(token),
+            pinned = pinned_pred(e0, margin_us),
+        )
+    }
+
+    /// One TabSeparated `_apitap_state` row of the batch's `input()` body.
+    pub(super) fn render_state_batch_row(
+        key: &str,
+        table: &str,
+        source_id: &str,
+        lsn: u64,
+        rows: u64,
+        buf: &mut Vec<u8>,
+    ) {
+        copy_escape(key.as_bytes(), buf);
+        buf.push(b'\t');
+        copy_escape(table.as_bytes(), buf);
+        buf.push(b'\t');
+        copy_escape(source_id.as_bytes(), buf);
+        buf.push(b'\t');
+        buf.extend_from_slice(lsn.to_string().as_bytes());
+        buf.push(b'\t');
+        buf.extend_from_slice(rows.to_string().as_bytes());
+        buf.push(b'\n');
     }
 
     impl ChStore {
@@ -1280,6 +1331,17 @@ mod store {
             self.s.ch.exec_written(sql, &st).await
         }
 
+        /// The window's batched state INSERT: `body` is the input() rows, the
+        /// answer is the server's `written_rows`.
+        async fn insert_state_batch(&mut self, sql: &str, body: Vec<u8>) -> Result<Option<u64>> {
+            self.owed = true;
+            let st = owned_settings();
+            let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            self.s.ch
+                .insert_stream_written(sql, reqwest::Body::from(body), &st)
+                .await
+        }
+
         /// A read the server refuses to let write.
         pub(crate) async fn read(&mut self, sql: &str) -> Result<String> {
             self.s.note("read");
@@ -1614,6 +1676,35 @@ mod store {
         /// emptied therefore never moves the cursor.
         async fn close_unit<'a>(&'a self, mut u: ChUnit<'a>, _token: &str, marks: Vec<Watermark>) -> Result<()> {
             self.ensure_state_table().await?;
+            // A multi-member window's marks travel in ONE statement: every Set
+            // mark is a row of one `_apitap_state` INSERT, each fenced by its
+            // own lease row and the unit's pinned deadline — the same proof
+            // the per-member INSERT carries, one round trip instead of one per
+            // member (the measured largest statement class of the 30-table
+            // steady drain, benchmarks/cdc-steady-30t-0.58.md §6). A Clear
+            // mark (bootstrap rollback, single-table) and a single mark keep
+            // the sequential path. A missing summary header falls back to it
+            // too: the per-mark write is idempotent under ReplacingMergeTree.
+            if marks.len() > 1 && marks.iter().all(|m| matches!(m, Watermark::Set { .. })) {
+                for m in &marks {
+                    if let Watermark::Set { table, .. } = m {
+                        self.refuse_clustered(table).await?;
+                    }
+                }
+                u.keep(false).await?;
+                let mut body = Vec::with_capacity(64 * marks.len());
+                for m in &marks {
+                    if let Watermark::Set { table, source_id, lsn, rows } = m {
+                        render_state_batch_row(&self.lease_key(table), table, source_id, *lsn, *rows, &mut body);
+                    }
+                }
+                let sql = state_batch_sql(&u.token, owned_margin_secs(), u.pin.e0, margin_us());
+                match u.insert_state_batch(&sql, body).await? {
+                    Some(n) if n as usize == marks.len() => return Ok(()),
+                    Some(_) => return Err(no_longer_holds(&u.keys)),
+                    None => {}
+                }
+            }
             for m in &marks {
                 u.keep(false).await?;
                 match m {
@@ -2097,6 +2188,51 @@ mod tests {
             assert_eq!(*s.ops.lock().unwrap(), ["read", "read", "trim", "mark_pending", "insert"]);
             s.close_unit(u, "_tok", vec![mark]).await.unwrap();
             assert_eq!(s.ops.lock().unwrap().last(), Some(&"state"));
+        });
+    }
+
+    /// A multi-member window's marks are ONE `_apitap_state` INSERT: every
+    /// member is a row of it, fenced by its own lease key (the same
+    /// exists/not-collected/margin test) and the unit's pinned deadline. The
+    /// per-member state INSERT was the single largest statement class of the
+    /// measured 30-table steady drain (`benchmarks/cdc-steady-30t-0.58.md`
+    /// §6); the proof is the same, so only the statement count may change.
+    /// RED control: making the batch ineligible (marks.len() > 1 -> false)
+    /// issues one INSERT per mark and fails the count.
+    #[test]
+    fn a_windows_marks_are_one_state_statement() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let writes = Arc::new(AtomicUsize::new(0));
+            let w2 = writes.clone();
+            let url = mock_with(Arc::new(move |sql: &str| {
+                if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                    return (format!("{T0}\t{}\t3\n", T0 + ttl_secs() * 1_000_000), 0);
+                }
+                if sql.starts_with("INSERT INTO") && sql.contains("_apitap_state") {
+                    w2.fetch_add(1, SeqCst);
+                    // The batched form is one statement carrying three rows;
+                    // the per-mark form carries one each.
+                    let n = if sql.contains("dest_key String, dest_table String") { 3 } else { 1 };
+                    return (String::new(), n);
+                }
+                (String::new(), 1)
+            }))
+            .await;
+            let s = ChStore::connect(&url).unwrap();
+            let keys = vec![s.lease_key("t1"), s.lease_key("t2"), s.lease_key("t3")];
+            let u = s.open_unit(&keys, "_tok").await.unwrap();
+            let marks: Vec<Watermark> = keys
+                .iter()
+                .map(|k| Watermark::Set {
+                    table: k.split('.').nth(1).unwrap().to_string(),
+                    source_id: "sid".into(),
+                    lsn: 42,
+                    rows: 7,
+                })
+                .collect();
+            s.close_unit(u, "_tok", marks).await.unwrap();
+            assert_eq!(writes.load(SeqCst), 1, "a window's marks are one state INSERT");
         });
     }
 
