@@ -465,11 +465,32 @@ impl Dest {
         }
         match self {
             Dest::Bq(_) => bq_apply_lanes(),
+            Dest::Ch(_) => ch_apply_lanes(crate::pipeline::mem_limit_bytes()),
             // CPU-bound paths default to serial until a measured win says
             // otherwise — at 0.5 core, concurrent CPU work shares the same
             // quota; only the round-trip waits can overlap.
             _ => 1,
         }
+    }
+}
+
+/// Concurrent ClickHouse applies per window.
+///
+/// The measured 30-table steady profile at 0.5 CPU / 256 MB applied 10,072
+/// changes/s with the client at 13 % of its quota: each member's apply is a
+/// handful of statements that WAIT on the destination, and the serial loop
+/// pays that wait once per member. The members of one window are independent
+/// — each opens its own unit over its own lease key — so their statements may
+/// overlap without changing a single predicate, watermark or fence. Bounded
+/// by memory the way BigQuery's pool is: each in-flight apply renders only its
+/// table's slice of the window, and the slices partition one window, so the
+/// pool does not multiply the window's residency. Lever: `APITAP_CDC_APPLY_LANES`.
+fn ch_apply_lanes(mem: Option<u64>) -> usize {
+    const CAP: usize = 8;
+    match mem {
+        // ~96 MiB of working base, then one lane per 8 MiB of headroom.
+        Some(m) => ((m.saturating_sub(96 << 20) / (8 << 20)) as usize).clamp(1, CAP),
+        None => CAP,
     }
 }
 
@@ -2004,5 +2025,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(120)).await;
             assert!(!*ran.lock().unwrap(), "a dropped apply task ran on");
         });
+    }
+
+    /// A ClickHouse group overlaps its members' applies by default. The
+    /// measured 30-table window serializes half a dozen destination round
+    /// trips per member while the client sits at 13 % of its quota: the waits
+    /// are the wall, and the members' units are independent. The pool still
+    /// shrinks to serial when the memory headroom cannot hold one body.
+    #[test]
+    fn clickhouse_overlaps_members_by_default() {
+        assert_eq!(ch_apply_lanes(None), 8, "no cgroup limit: the cap, not serial");
+        assert_eq!(ch_apply_lanes(Some(256 << 20)), 8, "the capped-tier shape");
+        assert_eq!(ch_apply_lanes(Some(128 << 20)), 4);
+        assert_eq!(ch_apply_lanes(Some(96 << 20)), 1, "no headroom: one at a time");
+        assert_eq!(ch_apply_lanes(Some(32 << 20)), 1);
+    }
+
+    /// And the dispatch itself: a constructed ClickHouse destination answers
+    /// more than one lane with no env override, where 0.57.0 answered one.
+    /// The global override and the row stores' serial default are unchanged.
+    #[test]
+    fn row_stores_stay_serial_and_clickhouse_does_not() {
+        std::env::remove_var("APITAP_CDC_APPLY_LANES");
+        let d = Dest::Ch(ChDest::connect("clickhouse://default:@127.0.0.1:8123/default").unwrap());
+        assert!(d.apply_lanes() > 1, "ClickHouse must overlap its members by default");
     }
 }
