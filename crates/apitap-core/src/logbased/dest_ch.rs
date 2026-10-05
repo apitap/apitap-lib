@@ -596,7 +596,14 @@ async fn apply_unit(
     }
 
     // Clear the delete-set ∪ every upsert key first, so the insert phase is a
-    // plain bulk INSERT (same move as the pg apply).
+    // plain bulk INSERT (same move as the pg apply). The keys go through a
+    // per-run key table, and its DELETE is deliberately a subquery rather
+    // than an inlined IN-list: measured on the 25.8 destination with the
+    // real ownership predicate and 5,000 keys, the key-table form ran
+    // 20 ms / 209 statements per second (8 lanes) where the inlined list ran
+    // 66 ms / 77 per second — ClickHouse's constant-list DELETE evaluates far
+    // worse than the join against a small table, and the gap is why the
+    // inlining experiment was reverted (benchmarks/cdc-steady-30t-0.58.md).
     if !c.deletes.is_empty() || !c.upserts.is_empty() {
         let kt = u.key_table_reset(dest_table, pk_cols).await?;
         let mut buf = Vec::with_capacity(1 << 20);
@@ -750,8 +757,24 @@ mod store {
         /// Column types per table, for `input()` structures. Invalidated by
         /// every op that changes a table's shape.
         structures: Mutex<HashMap<String, HashMap<String, String>>>,
+        /// The last successful pin per key set, by the CLIENT clock. A unit
+        /// opened inside the previous pin's early window reuses it instead of
+        /// reading the lease again (see `cached_pin`).
+        pins: Mutex<HashMap<String, CachedPin>>,
         #[cfg(test)]
         pub(super) ops: Mutex<Vec<&'static str>>,
+    }
+
+    /// A successful pin, kept across the units of one key set. `e0` is the
+    /// deadline the lease read proved; `budget` is what it left at read time,
+    /// by the client clock. Reuse is gated on the same early threshold `keep`
+    /// uses, so the cache never outlives the proof window by more than
+    /// `budget/8` — and a claim needs `expires_at <= now`, which the cached
+    /// `e0` still refutes.
+    struct CachedPin {
+        e0: u64,
+        budget: std::time::Duration,
+        at: std::time::Instant,
     }
 
     /// One unit: a set of lease keys and the run that holds them. ClickHouse
@@ -819,6 +842,18 @@ mod store {
         owned_margin_secs() * 1_000_000
     }
 
+    /// The reuse verdict for a cached pin: `Some((e0, remaining budget))`
+    /// while less than an eighth of the budget has elapsed, `None` after —
+    /// the same threshold that makes a long unit re-read its pin, applied
+    /// across units. Pure, so the boundary is unit-tested.
+    pub(super) fn reuse_cached(
+        e0: u64,
+        budget: std::time::Duration,
+        elapsed: std::time::Duration,
+    ) -> Option<(u64, std::time::Duration)> {
+        (!repin_due(elapsed, budget, false)).then(|| (e0, budget.saturating_sub(elapsed)))
+    }
+
     /// Whether a unit re-reads its pin before its next statement: when forced,
     /// or once an EIGHTH of the pin's budget is spent. Early, so an owned
     /// statement starts with most of the budget ahead of it: the re-pin after
@@ -883,6 +918,7 @@ mod store {
                 ensured: Default::default(),
                 patch: Default::default(),
                 structures: Default::default(),
+                pins: Default::default(),
                 #[cfg(test)]
                 ops: Default::default(),
             })
@@ -1161,14 +1197,44 @@ mod store {
             let (now, e, owned) = (f.next().unwrap_or(0), f.next().unwrap_or(0), f.next().unwrap_or(0));
             let distinct = keys.iter().collect::<HashSet<_>>().len();
             match repin(now, e, owned as usize, distinct, margin_us(), prev) {
-                Some(e0) => Ok(Pin {
-                    e0,
-                    at: std::time::Instant::now(),
-                    budget: std::time::Duration::from_micros(e0 - now - margin_us()),
-                }),
+                Some(e0) => {
+                    let pin = Pin {
+                        e0,
+                        at: std::time::Instant::now(),
+                        budget: std::time::Duration::from_micros(e0 - now - margin_us()),
+                    };
+                    self.pins.lock().unwrap().insert(
+                        pin_key(keys),
+                        CachedPin { e0: pin.e0, budget: pin.budget, at: pin.at },
+                    );
+                    Ok(pin)
+                }
                 None => Err(no_longer_holds(keys)),
             }
         }
+
+        /// A pin for `keys` without a lease read when the last successful pin
+        /// for the same key set still has more than seven eighths of its
+        /// budget left. A unit boundary is not an ownership event: the run
+        /// held the keys a moment ago, renewals only raise `expires_at`, and a
+        /// claim needs the row to have LAPSED — which the cached `e0` still
+        /// refutes. The saved statement is one lease read per member per
+        /// window, the largest single class of statements the measured
+        /// 30-table steady drain issued (`benchmarks/cdc-steady-30t-0.58.md`).
+        fn cached_pin(&self, keys: &[String]) -> Option<Pin> {
+            let cache = self.pins.lock().unwrap();
+            let c = cache.get(&pin_key(keys))?;
+            let elapsed = c.at.elapsed();
+            reuse_cached(c.e0, c.budget, elapsed).map(|(e0, budget)| Pin {
+                e0,
+                at: std::time::Instant::now(),
+                budget,
+            })
+        }
+    }
+
+    fn pin_key(keys: &[String]) -> String {
+        keys.join("\u{1}")
     }
 
     impl ChUnit<'_> {
@@ -1296,7 +1362,8 @@ mod store {
         /// than relying on IF NOT EXISTS — `AS SELECT … WHERE 0` freezes the
         /// key's columns and types at creation. For the same reason its
         /// `input()` structure is read once per run: a TRUNCATE empties the
-        /// table and keeps its columns.
+        /// table and keeps its columns. It also owns the once-per-run
+        /// patch-mode ALTER on servers that need it (>= 25.7).
         pub(crate) async fn key_table_reset(&mut self, table: &str, pk_cols: &[String]) -> Result<String> {
             self.s.note("key_reset");
             let kt = artifact_ident_tok(table, Artifact::CdcDelete, ROOMY, &self.token);
@@ -1529,7 +1596,15 @@ mod store {
         /// statement rather than sending a window of statements that each
         /// write nothing.
         async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<ChUnit<'a>> {
-            let pin = self.pin(keys, token, None).await?;
+            // A reused pin is only ever taken while the last read's deadline
+            // still has seven eighths of its budget left; past that the unit
+            // reads the lease itself, with no `prev` — a fresh read, exactly
+            // as 0.57.0 opened every unit (nothing ran in between to fence
+            // out, and a claim would need the lapsed row this read checks).
+            let pin = match self.cached_pin(keys) {
+                Some(p) => p,
+                None => self.pin(keys, token, None).await?,
+            };
             Ok(ChUnit { s: self, keys: keys.to_vec(), token: token.to_string(), pin, owed: false })
         }
 
@@ -1803,7 +1878,7 @@ fn render_residue_row(
 #[cfg(test)]
 mod tests {
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
-    use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, structure};
+    use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, reuse_cached, structure};
     use super::*;
     use crate::lease::{owned_margin_secs, ttl_secs, Fence, LeaseStore};
     use crate::logbased::window::Layout;
@@ -2028,7 +2103,9 @@ mod tests {
     /// The key table is created once per run and TRUNCATEd per window, and
     /// its `input()` structure is read once. Forgetting the structure after
     /// every TRUNCATE re-read `system.columns` on every window — 51 extra
-    /// round trips on the T9 receipt's 10M-row run.
+    /// round trips on the T9 receipt's 10M-row run. The subquery DELETE it
+    /// feeds is kept on purpose: measured on 25.8, the inlined-list form ran
+    /// 3.6x slower per statement with the real ownership predicate.
     #[test]
     fn key_table_shape_is_read_once_per_run() {
         use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
@@ -2058,6 +2135,44 @@ mod tests {
             }
             assert_eq!(reads.load(SeqCst), 1, "the key table's columns were read again after a TRUNCATE");
             assert_eq!(s.ops.lock().unwrap().iter().filter(|o| **o == "key_reset").count(), 3);
+        });
+    }
+
+    /// A cached pin is reused only while less than an eighth of its budget
+    /// has elapsed — the same early threshold `keep` uses inside a unit.
+    #[test]
+    fn pin_reuse_window_is_an_eighth_of_the_budget() {
+        let b = std::time::Duration::from_secs(150);
+        assert_eq!(reuse_cached(42, b, std::time::Duration::ZERO), Some((42, b)));
+        let early = b / 16;
+        assert_eq!(reuse_cached(42, b, early), Some((42, b - early)), "early reuse must shrink the budget");
+        assert_eq!(reuse_cached(42, b, b / 8), None, "a stale pin was reused");
+        assert_eq!(reuse_cached(42, b, b), None);
+    }
+
+    /// Four units opened inside the first pin's window read the lease ONCE:
+    /// the statement the 30-table steady drain issued most (one per member
+    /// per window) is amortized across windows.
+    #[test]
+    fn pin_reads_are_amortized_across_units() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let pins = Arc::new(AtomicUsize::new(0));
+            let p2 = pins.clone();
+            let url = mock_with(Arc::new(move |sql: &str| {
+                if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                    p2.fetch_add(1, SeqCst);
+                    return (format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000), 0);
+                }
+                (String::new(), 1)
+            }))
+            .await;
+            let s = ChStore::connect(&url).unwrap();
+            let keys = vec![s.lease_key("t")];
+            for _ in 0..4 {
+                drop(s.open_unit(&keys, "_tok").await.unwrap());
+            }
+            assert_eq!(pins.load(SeqCst), 1, "a unit boundary re-read the lease");
         });
     }
 
