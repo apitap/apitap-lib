@@ -1666,22 +1666,19 @@ async fn apply_windows(
             // A BOUNDED pool of per-table units: `lanes` in flight, the rest
             // queued, each completion pulling the next. Unbounded would melt a
             // 100-table group against the destination's limits and make every
-            // transaction contend on the shared state rows.
-            use futures::stream::{StreamExt as _, TryStreamExt as _};
-            // Indices, not references: a closure taking `&(..)` and
-            // returning an async block trips higher-ranked lifetime
-            // inference ("FnOnce is not general enough").
+            // transaction contend on the shared state rows. Indices, not
+            // references: a closure taking `&(..)` and returning an async
+            // block trips higher-ranked lifetime inference ("FnOnce is not
+            // general enough").
             let (sref, oref, mref) = (&src, &o, &members);
-            let applied: Vec<(usize, u64)> = futures::stream::iter(0..mref.len())
+            let fs: Vec<_> = (0..mref.len())
                 .map(|i| async move {
                     let (dt, q, sid) = &mref[i];
                     let n = apply_member(t, dt, q, sid, oref, Some(sref)).await?;
                     Ok::<_, Error>((i, n))
                 })
-                .buffer_unordered(lanes)
-                .try_collect()
-                .await?;
-            for (i, n) in applied {
+                .collect();
+            for (i, n) in settle_all(lanes, fs).await? {
                 rows_per[i] += n;
             }
         } else {
@@ -1701,6 +1698,26 @@ async fn apply_windows(
         let _ = applied_tx.send(o.id.end());
     }
     Ok(rows_per)
+}
+
+/// Drive a bounded pool of per-member futures to completion, then report the
+/// first error in completion order.
+///
+/// Unlike `try_collect`, an error does NOT cancel the siblings already in
+/// flight: each member's unit settles on its own path (a committed unit's
+/// watermark stands; a dropped pg/my transaction rolls back; ClickHouse
+/// statements already ran and the window replays), which is the
+/// partial-landing shape the recovery model documents and `e2e_toast_rekey`
+/// pins — a group's first member closing while a later one fails. Cancelling
+/// the sibling also wasted its work and made that shape unreproducible.
+async fn settle_all<F, T>(lanes: usize, fs: Vec<F>) -> Result<Vec<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    use futures::stream::StreamExt as _;
+    let done: Vec<Result<T>> =
+        futures::stream::iter(fs).buffer_unordered(lanes).collect().await;
+    done.into_iter().collect()
 }
 
 /// One member's window in a unit of its own: open, apply, close — and then
@@ -2024,6 +2041,31 @@ mod tests {
             drop(apply);
             tokio::time::sleep(Duration::from_millis(120)).await;
             assert!(!*ran.lock().unwrap(), "a dropped apply task ran on");
+        });
+    }
+
+    /// A pool error waits for every sibling already in flight: a member that
+    /// started is not cancelled by another member's failure. The serial-era
+    /// shape — an earlier member closes, a later one fails — must stay
+    /// reproducible (e2e_toast_rekey's replay constructs itself from it).
+    /// `try_collect` dropped the slow sibling here, and the e2e leg caught it.
+    #[test]
+    fn a_pool_error_does_not_cancel_in_flight_siblings() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let sibling_ran = Arc::new(AtomicBool::new(false));
+            let s2 = sibling_ran.clone();
+            let fs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>> = vec![
+                Box::pin(async move { Err(Error::Transfer("boom".into())) }),
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    s2.store(true, SeqCst);
+                    Ok(1)
+                }),
+            ];
+            let r = settle_all(2, fs).await;
+            assert!(matches!(&r, Err(Error::Transfer(m)) if m == "boom"), "{r:?}");
+            assert!(sibling_ran.load(SeqCst), "the in-flight sibling was cancelled");
         });
     }
 
