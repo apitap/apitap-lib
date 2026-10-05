@@ -81,6 +81,7 @@ most of the 24.8 delete wall.
 |---|---|---|
 | `1a24c7d` | lane pool for a ClickHouse group: `apply_lanes` -> `ch_apply_lanes` (one lane per 8 MiB over a 96 MiB base, cap 8, serial below; `APITAP_CDC_APPLY_LANES` still overrides). Pg/My/Ice stay serial. | `red_fix_lanes_spec.py`: arm -> 1 fails `row_stores_stay_serial_and_clickhouse_does_not`; default -> 1 lane fails `clickhouse_overlaps_members_by_default` |
 | `6ec0f4f` | pin cache: `ChStore` keeps the last successful lease pin per key set and `open_unit` reuses it while < 1/8 of its budget has elapsed (the threshold `keep` already uses). The deadline is the same `e0`; every predicate, the re-pin continuity, the watermark and the claim rules are unchanged. | `red_fix_pincache_spec.py`: collapse the reuse window to the whole budget -> fails `pin_reuse_window_is_an_eighth_of_the_budget`; bypass the cache -> fails `pin_reads_are_amortized_across_units` |
+| (follow-up) | `settle_all`: a lane-pool error waits for every member already in flight instead of cancelling it (the 0.57.0 `try_collect` shape). Found by the first gate run on this wheel: `e2e_toast_rekey.py` failed because cancelling the sibling changed the documented partial-landing shape (an earlier group member closing while a later one fails), which its replay constructs itself from. | `red_fix_settleall_spec.py`: restore `try_collect` -> fails `a_pool_error_does_not_cancel_in_flight_siblings`; the e2e leg itself was the RED control on the pre-fix wheel |
 
 An inlined clear-phase DELETE was implemented, measured, and **reverted**
 (`red_fix_clearkeys_spec.py` is its RED evidence). The shipped code keeps the
@@ -88,13 +89,16 @@ subquery; the census below is the final engine.
 
 Measured deltas:
 
-| shape | 0.57.0 | fix 1 | + pin cache (final) |
+| shape | 0.57.0 | fix 1 (lane pool) | shipped engine (fix 1 + pin cache) |
 |---|---|---|---|
 | ch-24.8, 35k offered / 30 s | 8,348/s, 0.140 cap, 101.7 MB | 11,256/s, 0.211, 78.3 MB | — |
-| ch-25.8, 35k offered / 30 s | 10,357/s, —, 71.9 MB | — | 22,147/s, 0.578, 78.6 MB (15 MiB window) |
+| ch-25.8, 35k offered / 30 s, 15 MiB window | 10,357/s, —, 71.9 MB | — | 22,147/s, 0.578, 78.6 MB (inline-DELETE experiment) |
+| ch-25.8, 35.8k offered / 180 s, 64 MiB window | — | — | **28,430/s, 0.786, 169.8 MB** |
 | lease pins per member-window (census) | 1.86 | 1.86 | **0.32** |
 
-All rows 30/30 checksum MATCH.
+All rows 30/30 checksum MATCH. The 22,147 row measured the intermediate wheel
+that also carried the inlined-DELETE experiment (since reverted); the shipped
+wheel is the 28,430 row.
 
 ## 3. The 0.5 CPU / 256 MB target run (ch-25.8, patch deletes)
 
@@ -174,6 +178,30 @@ What is already delivered: the same shape moved from 8.3k/s (0.57.0, ch-24.8)
 and 10.4k/s (0.57.0, ch-25.8) to 28.4k/s with exact checksums, 1.6-3.4x, with
 the client at 39 % of its 0.5-core quota and 170 MB peak.
 
+The numbers above were measured on the pre-`settle_all` wheel; the follow-up
+changes failure handling only (a failing member no longer cancels its
+in-flight siblings) and the full lib suite plus the gate ran on the rebuilt
+wheel below. The steady rates are unaffected by that path (no failures in a
+keep-up run); the final wheel's checksums in the gate include this shape's
+engine under the destination legs.
+
+## 7. Release gate on the final wheel
+
+- wheel `.so` md5: `07ce71c3089101bfa1a1d36a78095126`
+- `gate.py`: **79 passed, 1 failed, 0 skipped in 7421 s** (80 legs, BigQuery
+  included; run from `~/apitap-058b` with `~/gate-venv`, stdin `/dev/null`)
+- the one failure, `e2e_my_liveness.py` (8.1 s), is the leg's own rig
+  precondition — "the server has more than one binlog to work with: 1 files"
+  — a binlog-rotation state, not an engine assertion. It **passes standalone
+  on the same wheel, twice** (RC 0, "MYSQL LIVENESS E2E: PASSED").
+- `gate.py --self-test`: PASSED. `gate.py --matrix`: exit 0,
+  123 cells, 0 GAP, 0 other problems.
+- engines unaffected by this campaign passed unchanged (Postgres, MySQL,
+  Iceberg, S3/GCS, BigQuery legs); the ClickHouse CDC legs
+  (`e2e_logbased_dests ch`, `e2e_changelog_replay`, `e2e_toast_rekey`,
+  `e2e_state_contract ch`, `e2e_cdc_apply_orphan`, `e2e_cdc_fence`,
+  `e2e_guard_matrix ch`) all green.
+
 The 24.8 path deserves one more sentence, because production LTS users may
 still run it: there the ceiling is ~11k changes/s (the lane curve plateaus and
 the delete's service time grows with concurrency). Moving the destination to
@@ -181,5 +209,5 @@ ClickHouse 25.7+ is worth more than any engine change this campaign could
 make on 24.8.
 
 Campaign wheel: `apitap-0.57.0-cp39-abi3` built from these commits, installed
-`.so` md5 `42b5f9014e3b918306cb573e79cbb79c` (non-PGO release build; the
+`.so` md5 `07ce71c3089101bfa1a1d36a78095126` (non-PGO release build; the
 0.57.0 PyPI PGO wheel is `41e9f7c252d3e1eb5403b70f87bf5435`).
