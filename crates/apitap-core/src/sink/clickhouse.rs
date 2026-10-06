@@ -647,28 +647,6 @@ impl ChConn {
         body: reqwest::Body,
         settings: &[(&str, &str)],
     ) -> Result<()> {
-        self.insert_stream_summary(query, body, settings).await.map(|_| ())
-    }
-
-    /// `insert_stream_with`, answering how many rows the server reported
-    /// writing (`X-ClickHouse-Summary`; `None` = the header is absent, which is
-    /// not zero). The summary is final under `wait_end_of_query=1`.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(crate) async fn insert_stream_written(
-        &self,
-        query: &str,
-        body: reqwest::Body,
-        settings: &[(&str, &str)],
-    ) -> Result<Option<u64>> {
-        self.insert_stream_summary(query, body, settings).await
-    }
-
-    async fn insert_stream_summary(
-        &self,
-        query: &str,
-        body: reqwest::Body,
-        settings: &[(&str, &str)],
-    ) -> Result<Option<u64>> {
         let resp = self
             .client
             .post(&self.base)
@@ -687,12 +665,6 @@ impl ChConn {
             .await
             .map_err(|e| Error::Transfer(format!("clickhouse insert: {e}")))?;
         let status = resp.status();
-        // Before the body: `text()` consumes the response, headers and all.
-        let written = resp
-            .headers()
-            .get("X-ClickHouse-Summary")
-            .and_then(|v| v.to_str().ok())
-            .and_then(summary_written_rows);
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             // 413 is never ClickHouse itself — it is a reverse proxy in front of
@@ -715,7 +687,7 @@ impl ChConn {
                 body.trim()
             )));
         }
-        Ok(written)
+        Ok(())
     }
 }
 
