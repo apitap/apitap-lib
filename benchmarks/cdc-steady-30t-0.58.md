@@ -414,3 +414,57 @@ on both destination versions.
   under; `pgbin_sample.py` filters its own `docker exec` shells out of the
   walsender count (they carry the pattern in their own cmdline — the artifact
   trap, again).
+
+## B2b — the adversarial review, the revert, and the safe re-land
+
+Two independent adversarial reviews of the six engine commits (B1
+`1a24c7d`/`6ec0f4f`/`fa56b6c`; B2 `279c302`/`0463694`/`c8d14fd`) confirmed two
+HIGH defects:
+
+1. **Bootstrap fan-out (from `1a24c7d`).** `apply_lanes()` was also driving
+   `bootstrap_group`: up to 8 full loads ran at once on a 30-table ClickHouse
+   bootstrap, and every `transfer_within` plans its pipes against the WHOLE
+   cgroup budget, so N loads each claimed the entire cage — the B2 wheel
+   OOM-killed the 30-table bootstrap in 256 MB, a load 0.57.0 ran serially in
+   179 MB, while the code comments still said "stay serial". Fixed in
+   `118bb05`: `bootstrap_lanes()` is separate (BigQuery's server-side jobs fan
+   out; every row store bootstraps serially).
+2. **Mark-set continuity (from `279c302`).** The group close opened a FRESH pin
+   (`prev = None`) and the member units closed empty, so `repin`'s continuity
+   check never ran for a member: one whose owned statement had started inside
+   its deadline and lost parts to a stall could have its watermark advanced
+   over data that never landed, with no replay. The commit's claim that the
+   group `e0` is "the minimum over every member's key" was not what the code
+   did.
+
+**Revert, then re-land safely.** The batch's own commit had measured it as
+wall-neutral, so it was reverted (`8d37853`) — but the revert then measured
+17,360/s on this report's keep-up protocol versus 24,995/s recorded for the
+buggy build (B2.5), so the batch is not free: the optimization is worth
+keeping SAFELY. `8919bd3` re-lands it: `Fence::open_unit_at` / `Tenure::open_at`
+carry a continuation deadline into the unit open, `apply_member_pending`
+returns each member's `pin_deadline()`, and the group close opens ONE unit over
+every carried member's key at `min(deadlines)` — `repin` then refuses exactly
+when any member's continuity broke. The per-member proof is intact; only the
+statement count drops.
+
+Measured after the re-land (30 tables, 0.5 CPU / 256 MB, 64 MiB windows,
+ch-25.8, writer 34,985 changes/s for 180 s, converged start):
+
+| arm | applied | wall | rate | cap_frac | MEMPEAK | checksum |
+|---|---|---|---|---|---|---|
+| re-land `69cc2ec8` | 5,550,000 | 307.1 s | 18,075/s | 0.43 | 203.5 MB | 30/30 after converge |
+| revert `aceb934e` | 6,300,000 | 362.9 s | 17,360/s | 0.41 | 196.2 MB | 30/30 |
+
+The earlier 24,995/s reading for the buggy build did not reproduce on the same
+box state; it stands only with its date and wheel (B2.5). What the re-land
+verifies: `e2e_toast_rekey.py` PASSED on its wheel (including "the attempt
+landed RP's re-key (D, U) and failed on RPB after it"), unit suite 409 passed,
+and the 30-table destination converged to 30/30.
+
+**A note on the measurement chain itself:** the "30/30 MISMATCH" readings
+during this work were validation-call artifacts, not engine faults — the table
+list was passed with its `public.` prefix, so the validator built
+`public."public.prof_pg_t01"` and returned an empty digest, and one converge
+ran against the default ClickHouse. The validators are parameterized (`CH_C`,
+bare table names); with those set correctly every converge validated 30/30.
