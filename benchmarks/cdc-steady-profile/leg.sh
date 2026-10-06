@@ -27,7 +27,7 @@ imp_s = time.time() - t_imp
 so = apitap._apitap.__file__
 print(f"APITAP_VERSION {apitap.__version__}", flush=True)
 print(f"APITAP_SO_MD5 {hashlib.md5(open(so,'rb').read()).hexdigest()}", flush=True)
-print(f"LEG_TAG {tag} pid={os.getpid()}", flush=True)
+print(f"LEG_TAG {tag} pid={os.getpid()} pg_binary={os.environ.get('APITAP_PG_BINARY','unset')}", flush=True)
 
 def stat(key, f="/sys/fs/cgroup/cpu.stat"):
     try:

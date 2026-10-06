@@ -21,7 +21,9 @@ WS="${5:?writer_s}"; TABLES="${6:?tables_csv}"; THREADS="${7:-4}"
 # The wheel under test; override SP to measure a freshly built venv.
 SP="${SP:-/home/ubuntu/apitap-057-pullback/lib/python3.13/site-packages}"
 CH_DST="${CH_DST:-clickhouse://default:bench@127.0.0.1:8124/default}"
-DB=$((WS + 120))
+# A catch-up after a writer longer than ~60 s needs more than WS+120: the
+# 180 s proof at 33.4k offered against a ~20k drain is ~130 s of tail alone.
+DB="${DB_S:-$((WS + 120))}"
 
 if [ "$ROUTE" = pg ]; then
   URL="postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src"
@@ -42,6 +44,7 @@ docker run --rm --name "prof-drain-$TAG" --network=host --cpus="$CPUS" --memory=
   -e "APITAP_CDC_APPLY_LANES=${APITAP_CDC_APPLY_LANES:-}" \
   -e "APITAP_CDC_WINDOW_BYTES=${APITAP_CDC_WINDOW_BYTES:-}" \
   -e "APITAP_DEBUG=${APITAP_DEBUG:-}" \
+  -e "APITAP_PG_BINARY=${APITAP_PG_BINARY:-}" \
   -e "APITAP_TAG=$TAG" -v "$HERE:/job:ro" python:3.13-slim sh /job/leg.sh > "$DLOG" 2>&1 &
 DPID=$!
 # artifact-first: the container exists, then the python process is up

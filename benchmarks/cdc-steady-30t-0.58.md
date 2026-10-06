@@ -211,3 +211,206 @@ make on 24.8.
 Campaign wheel: `apitap-0.57.0-cp39-abi3` built from these commits, installed
 `.so` md5 `07ce71c3089101bfa1a1d36a78095126` (non-PGO release build; the
 0.57.0 PyPI PGO wheel is `41e9f7c252d3e1eb5403b70f87bf5435`).
+
+# B2 — levers 1–3, the census correction, and the final keep-up
+
+Same shape as §1–§7 (30 × 1M-row `prof_pg_t01..t30`, one publication, one
+slot, 0.5 CPU / 256 MB unless a row says otherwise). B2 starts from the B1
+engine and lands two commits, measures a third and reverts it, then attacks
+the wall the B1 census pointed at — and finds the census pointed at the wrong
+wall. Everything below is on the wheel built from HEAD (`279c302`, `0463694`,
+`2d34c67`), `.so` md5 `08106acfca97b8dce2fc5818d5ef96c9` — a fresh build from
+the same tree on 2026-10-06 reproduced that md5 exactly, so the B2 baselines
+and the QA wheel are the same binary.
+
+## B2.1 What shipped
+
+| commit | what | RED on the VPS | measured |
+|---|---|---|---|
+| `279c302` | a window's whole mark set is ONE `_apitap_state` INSERT (`state_batch_sql` + `render_state_batch_row`; the group unit closes with every mark) | `red_b2_state_spec.py` | state writes 2,250 st / 71.4 s -> 74 st / 2.47 s in one 6.4M-change run; wall inside drift (the apply side hides behind the drain-side windows) |
+| `0463694` | `ch_apply_lanes` reads the cgroup CPU quota (`cpu_limit_cores`) and the measured per-lane cost (20 MiB/lane over a 96 MiB base, `round(16*c)` floored at 8, cap 16) | `red_b2_lanes_spec.py`, `red_b2_cpu_spec.py` | 4-CPU point survives 256 MB (24 lanes OOM-killed it before); 2-CPU MEMPEAK 250.6 -> 148.6 MB |
+
+## B2.2 Lever 3 — group pin + lease-create memo: measured, no wall win, reverted
+
+The WIP made two changes under A/B: (a) the pin cache's exact-key hit gained a
+SUBSET hit, so the group unit's single lease read (all 30 member keys, `e0` =
+the minimum over the set) serves every member unit of the same window, and the
+group unit is opened before the lanes instead of at the close; (b) the
+`CREATE TABLE IF NOT EXISTS _apitap_lease` round trip is memoized once per
+process and destination (`ensure_lease_table`).
+
+A/B/A on ch-25.8, 0.5 CPU / 256 MB, 64 MiB windows, writer ~35.6k/s for 60 s
+(`b2-l3ab.out`; the l2 arm is HEAD `08106acf`, the l3 arms the WIP `aba58aae`):
+
+| arm | changes | wall s | busy s | busy rate | cap_frac | MEMPEAK | checksum |
+|---|---|---|---|---|---|---|---|
+| l3-a (WIP) | 2,148,000 | 98.034 | 87.422 | 24,570.5/s | 0.6953 | 153.1 MB | 30/30 |
+| l2-a (HEAD) | 2,151,000 | 100.611 | 88.219 | 24,382.5/s | 0.6963 | 169.9 MB | 30/30 |
+| l3-b (WIP) | 2,135,000 | 101.128 | 89.446 | 23,869.2/s | 0.6977 | 158.9 MB | 30/30 |
+
+The census is where the lever actually shows — same window, server-side
+seconds (`windowcost.sh`):
+
+| class | HEAD (l2-a) | WIP (l3-a) |
+|---|---|---|
+| dest DELETE | 37.57 | 33.51 |
+| dest INSERT | 34.25 | 32.28 |
+| other | 31.84 | 27.18 |
+| key-table INSERT | 15.01 | 15.32 |
+| staging/other | 10.84 | 10.70 |
+| lease probe | **9.67 (852 st)** | **0.16 (12 st)** |
+| lease write | 3.89 | 4.35 |
+| state read | 1.84 | 1.60 |
+| key TRUNCATE | 1.59 | 1.56 |
+| DDL setup | 1.56 | 1.60 |
+| state write | 0.74 | 0.73 |
+| **total** | **~148.8 s** | **~129.0 s** |
+
+`CREATE TABLE IF NOT EXISTS _apitap_lease` per interval: HEAD 540, WIP 1 each
+(the memo works; the `lease_probe` class is that DDL plus the pin reads).
+So the WIP removes ~840 statements and 13 % of the destination's server time —
+and moves the busy rate by **−0.7 %** (two WIP legs vs one HEAD leg, all inside
+the ±3 % host noise). The removed statements ran inside the 8 apply lanes, off
+the critical path. Not committed: the working tree was restored to HEAD and
+this is the negative result.
+
+## B2.3 The census correction: the destination is not the wall at 0.5 CPU
+
+Three measurements, each cheap, redirect the attack:
+
+1. **The `windowcost.sh` window includes the harness's own validation.** The
+   `other` class is dominated by `validate30.sh`'s per-table MD5 aggregate
+   (29 queries, 20.7 s in one 2.14M-change run) and the `staging_other` class
+   by guard machinery (`system.mutations` waits, key-table drops); the engine's
+   own destination statements are DELETE 33.5 s + INSERT 32.3 s + key INSERT
+   15.3 s. The B1 report read `other` as engine work; it is mostly the
+   validator.
+2. **The debug window log prices the critical path.** In the 180-s proof
+   (73 windows): sum of drain windows **210.7 s** vs sum of apply windows
+   **63.2 s** (avg 2.89 s vs 0.87 s). The drain (WAL read + decode + collapse)
+   is 3.3x the apply; the drain chain alone bounds that run at ~29k/s even if
+   every destination statement were free.
+3. **The walsender alone has 2.5x headroom.** Two slots created before one
+   unpaced 7,165,000-change generation (7.26 GB of WAL, 1,014 B/change), then
+   drained with `pg_recvlogical` and no apitap in the loop (`b2r-wsprobe`):
+   text 91.5 s = **78,306 changes/s** at 0.976 core; binary 85.0 s =
+   **84,294/s** at 0.973 core. The source can feed far more than the pipeline
+   takes.
+
+The wall at 0.5 CPU is the client pipeline itself. The cleanest number is the
+pure catch-up of that probe backlog: 7,165,000 changes in **226.2 s =
+31,679/s at cap_frac 0.9494** (cpu 110.0 s = 15.35 µs/change, MEMPEAK
+163.1 MB, 30/30). At 15 µs/change the 0.5-core ceiling is 33,333/s exactly:
+the target needs the quota ~100 % used AND no per-change regression. The
+measured 94.9 % utilization is the whole gap.
+
+## B2.4 Binary pgoutput (opt-in): neutral on the wall, −9 % walsender CPU
+
+`APITAP_PG_BINARY=1` on the same 30-table keep-up (64 MiB, 0.5 CPU; text arm
+and binary arm in the same session):
+
+| arm | changes | busy s | busy rate | MEMPEAK | walsender CPU |
+|---|---|---|---|---|---|
+| text | 2,144,000 | 90.462 | 23,700.6/s | 163.1 MB | 70.30 s |
+| binary | 2,136,000 | 88.690 | 24,083.9/s | 176.9 MB | 64.27 s |
+
+The binary wire is more compact (108k-event windows instead of 96k at the same
+64 MiB budget) and cuts the walsender's own CPU by 9 %, but the end-to-end
+rate moves +1.6 % — inside noise. Left opt-in (the renderer's type coverage
+is a deliberate gate); it is not the lever for this shape.
+
+## B2.5 Final keep-up proof — writer >= 33.3k/s for 180 s
+
+25.8 (`apitap-bench-ch3`, `:8126`), 0.5 CPU / 256 MB, 64 MiB windows, default
+lanes (8), wheel `08106acf`:
+
+- writer offered **6,115,000 changes in 180.288 s = 33,918/s**, witnessed by
+  WAL LSN bracket (`12B/D9113490 -> 12E/5AFE2920`) and `pg_stat_user_tables`
+  counters (+6,115,000); 10.77 GB of WAL
+- applied **all 6,115,000**; busy 244.653 s = **24,995/s**; cap_frac 0.7701;
+  MEMPEAK **173.4 MB**; **30/30 checksum MATCH**
+- the drain did not keep up live (24,995/s against the 33,918/s offer); it
+  caught up ~60 s after the writer stopped, and the last three passes are rows=0
+
+24.8 (`apitap-bench-ch`, `:8124`), same shape (fresh 1 GB bootstrap first:
+30,000,000 rows in 75.6 s, MEMPEAK 766.3 MB — the bootstrap sizes buffers to
+the 1 GB budget, by design):
+
+- writer offered **6,125,000 changes in 180.065 s = 34,015/s** (witness
+  +6,125,000)
+- applied **all 6,125,000**; busy 245.653 s = **24,933/s**; cap_frac 0.7675;
+  MEMPEAK **196.8 MB**; **30/30 checksum MATCH**
+
+Both destinations now apply at the same rate at 0.5 CPU: the 24.8 DELETE wall
+(B1: ~11k/s ceiling) is hidden behind the client-side drain once the lane pool
+overlaps it. B1's "moving 24.8 to 25.7+ is worth more than any engine change"
+was true for the serial engine; at B2's overlap it is no longer the deciding
+factor at this quota.
+
+## B2.6 Scaling (fresh wheel, 32 MiB windows)
+
+Same shape as §4, converged between points, lanes default (`ch_apply_lanes`:
+8 at this cage at every quota), writer offered per row (witnessed). The host
+was loaded (loadavg 8–26, ClickHouse background merges from the campaign's own
+writes), so the levels are 5–10 % below the quiet-host §4 table; the shape is
+the same:
+
+| CPU quota | lanes | offered | applied | cap_frac | avg cores | MEMPEAK |
+|---|---|---|---|---|---|---|
+| 0.5 | 8 | 35,436/s | 22,981/s | 0.659 | 0.329 | 122.9 MB |
+| 1 | 8 | 53,736/s | 23,155/s | 0.499 | 0.499 | 124.4 MB |
+| 2 | 8 | 56,611/s | 23,673/s | 0.252 | 0.505 | 157.9 MB |
+| 4 | 8 | 56,648/s | 21,218/s | 0.114 | 0.457 | 210.4 MB |
+| 0.5 (64 MiB) | 8 | 35,446/s | 20,297/s | 0.648 | 0.324 | 175.7 MB |
+
+All points 30/30 MATCH. The curve is still flat and now for a measured reason:
+more quota does not buy rows because the client is not CPU-bound above 0.5
+cores (cap_frac 0.25 at 2 CPU, 0.11 at 4) and the destination is not the wall
+either (apply 0.87 s vs drain 2.89 s per window). The engine waits on the
+WAL stream and its own single-threaded pipeline, and the quota cannot shorten
+that. The 4-CPU point no longer OOM-kills: 210.4 MB peak at 32 MiB windows.
+
+## B2.7 Honest verdict on 2M/min
+
+**Not reached, and the campaign says plainly why.** The measured ceiling on
+this shape at 0.5 CPU is **31,679 changes/s = 1.90M/min** (pure catch-up, cap
+0.949, 30/30); the 3-minute paced proof applies at 24,995/s (25.8) and
+24,933/s (24.8) because the writer outruns the pipeline and the difference is
+drained after it stops. The target needs 33,333/s at 0.5 cores, i.e.
+15.0 µs/change with the quota 100 % busy; the engine measures 15.35 µs/change
+at 94.9 % busy. Both halves are marginal; neither the source (78–84k/s alone)
+nor the destination (apply = 30 % of the drain's critical path) is the
+binding constraint. The remaining gap is the client's per-change CPU, ~53 % of
+which is kernel TCP receive for a one-packet-per-change WAL stream — a cost a
+same-host Unix socket would largely remove, and one that a dedicated host (the
+B1 28.4k was measured on a quiet box; today's quietest run hit 31.7k) would
+lower. Neither is an engine change this campaign could land.
+
+What B2 delivered: the state batch and the quota-aware lanes (committed,
+RED-tested), the census corrected, lever 3 measured and rejected on evidence,
+binary pgoutput measured and left opt-in, and a final proof that is honest
+about the gap: 1.90M/min pure / ~1.50M/min paced, checksum-exact, under 200 MB
+on both destination versions.
+
+## B2.8 QA wheel and gate
+
+- QA wheel: built from HEAD (`py-apitap/Cargo.toml`), installed `.so` md5
+  `08106acfca97b8dce2fc5818d5ef96c9` — identical to the wheel's and to the
+  wheel every B2 run used; installed into `~/qa-venv` (md5 re-verified after
+  install).
+- `gate.py` on that venv (80 legs, BigQuery and GTID legs enabled):
+  **80 passed, 0 failed, 0 skipped in 7,352 s** (RC=0), including
+  `e2e_toast_rekey.py` in both variants.
+- The first full gate on the pre-fix B2 wheel (`08106acf`) came back 79/80:
+  `e2e_toast_rekey`'s CH replay case failed because the one-statement mark set
+  (`279c302`) dropped a succeeded member's watermark when a sibling failed.
+  That regression is fixed by `c8d14fd` (`settle_partial` + a group close over
+  the succeeded subset), whose wheel is `.so 5e00a8ad…`; the 80/80 above is
+  the gate on that fixed wheel, and the leg proves the per-member commit again
+  ("the attempt landed RP's re-key (D, U) and failed on RPB after it").
+- harness changes that go with this section: `keepup.sh` gained a `DB_S`
+  override (a 180-s writer needs more than WS+120 of tail) and an
+  `APITAP_PG_BINARY` passthrough; `leg.sh` prints the binary mode it runs
+  under; `pgbin_sample.py` filters its own `docker exec` shells out of the
+  walsender count (they carry the pattern in their own cmdline — the artifact
+  trap, again).

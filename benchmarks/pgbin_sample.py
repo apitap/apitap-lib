@@ -20,8 +20,12 @@ CONTAINER = "apitap-bench-pg-src"
 OUT = sys.argv[1]
 CLK_TCK = 100.0
 
+# The comm guard is load-bearing: the docker-exec shell and its grep carry
+# "walsender" in their OWN cmdline, and a bare cmdline grep counted every one
+# of them as a walsender (~300 x 0.04 s of noise in one 100 s drain).
 SNIPPET = (
     "for p in /proc/[0-9]*; do "
+    "[ \"$(cat $p/comm 2>/dev/null)\" = postgres ] || continue; "
     "grep -aq walsender $p/cmdline 2>/dev/null && "
     "echo -n \"${p#/proc/} \" && cat $p/stat; done; true"
 )

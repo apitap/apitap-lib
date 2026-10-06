@@ -1,0 +1,7 @@
+    53.58%  [kernel.kallsyms]   
+    24.24%  _apitap.abi3.so     
+    20.36%  libc.so.6           
+     1.43%  [vdso]              
+     0.39%  ld-linux-x86-64.so.2
+
+
