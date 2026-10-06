@@ -315,6 +315,16 @@ pub(crate) trait Fence: LeaseStore {
     }
     fn open_unit<'a>(&'a self, keys: &[String], token: &str)
         -> impl std::future::Future<Output = Result<Self::Unit<'a>>> + Send;
+    /// Like `open_unit`, but the unit's pin must CONTINUE the deadline `prev`:
+    /// on ClickHouse `repin` refuses an open whose `prev` lapsed (something may
+    /// have been fenced out since), which is how a group close keeps the
+    /// per-member continuity proof while writing every mark in one statement.
+    /// Destinations without a pinned deadline ignore it.
+    fn open_unit_at<'a>(&'a self, keys: &[String], token: &str, _prev: Option<u64>)
+        -> impl std::future::Future<Output = Result<Self::Unit<'a>>> + Send
+    {
+        self.open_unit(keys, token)
+    }
     /// Writes every mark (and on BigQuery/Iceberg the data commit) and commits.
     /// `Ok` = the destination accepted the unit as the owner's.
     fn close_unit<'a>(&'a self, u: Self::Unit<'a>, token: &str, marks: Vec<Watermark>)
@@ -401,6 +411,19 @@ impl<F: Fence> Tenure<F> {
     /// Open a unit over `tables`. Refused, with no I/O, once the run is
     /// winding down or the keeper has seen its claim taken.
     pub(crate) async fn open(&self, tables: &[&str]) -> Result<Held<'_, F>> {
+        self.open_inner(tables, None).await
+    }
+
+    /// [`open`](Self::open) with the unit's pin forced to continue `prev`:
+    /// a ClickHouse group close opens over every carried member's key and the
+    /// minimum of their deadlines, so a member whose deadline passed
+    /// un-renewed refuses the open — and the whole mark set replays — rather
+    /// than the batch blessing data a mutation may have skipped.
+    pub(crate) async fn open_at(&self, tables: &[&str], prev: Option<u64>) -> Result<Held<'_, F>> {
+        self.open_inner(tables, prev).await
+    }
+
+    async fn open_inner(&self, tables: &[&str], prev: Option<u64>) -> Result<Held<'_, F>> {
         use std::sync::atomic::Ordering::SeqCst;
         let keys: Vec<String> = tables.iter().map(|t| self.dest.lease_key(t)).collect();
         if self.closing.load(SeqCst) {
@@ -414,7 +437,7 @@ impl<F: Fence> Tenure<F> {
         if self.closing.load(SeqCst) {
             return Err(Error::Locked(format!("{}: the run is winding down", keys.join(", "))));
         }
-        let unit = self.dest.open_unit(&keys, self.run.token()).await?;
+        let unit = self.dest.open_unit_at(&keys, self.run.token(), prev).await?;
         Ok(Held { unit, tables: tables.iter().map(|t| t.to_string()).collect(), _inflight: g })
     }
 

@@ -42,8 +42,9 @@ DBG_ENV=""
 [ -n "$DEBUG" ] && DBG_ENV="-e APITAP_DEBUG=1"
 setsid nohup docker run --rm --name "prof-drain-$TAG" $CAP \
   -v "$SP:/py:ro" -e PYTHONPATH=/py $DBG_ENV \
-  -e "APITAP_SRC=$URL" -e "APITAP_DST=clickhouse://default:bench@127.0.0.1:8124/default" \
+  -e "APITAP_SRC=$URL" -e "APITAP_DST=${PROF_DST:-clickhouse://default:bench@127.0.0.1:8124/default}" \
   -e "APITAP_TABLE=$TABLE" -e "BUDGET_S=$DB" -e ZERO_STOP=99 -e CPUS=$CPUS \
+  -e "APITAP_CDC_WINDOW_BYTES=${APITAP_CDC_WINDOW_BYTES:-}" -e "APITAP_CDC_APPLY_LANES=${APITAP_CDC_APPLY_LANES:-}" \
   -e "APITAP_TAG=$TAG" -v "$HERE:/job:ro" python:3.13-slim sh /job/leg.sh > "$DLOG" 2>&1 < /dev/null &
 DPID=$!
 for _ in $(seq 1 120); do docker inspect prof-drain-$TAG >/dev/null 2>&1 && break; sleep 0.5; done

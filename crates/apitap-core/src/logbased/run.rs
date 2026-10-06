@@ -1703,6 +1703,74 @@ async fn apply_windows(
             for (i, n) in r?.into_iter().enumerate() {
                 rows_per[i] += n;
             }
+        } else if matches!(dest, Dest::Ch(_)) && members.len() > 1 {
+            // A ClickHouse window's watermarks are ONE statement, and it is
+            // carried by a unit opened at the MINIMUM of the members' pin
+            // deadlines (`open_at`): `repin`'s continuity check runs against
+            // that minimum, so a member whose deadline passed un-renewed
+            // refuses the whole close and the window replays — never a fresh
+            // group pin blessing data a mutation may have skipped. The
+            // members' applies still overlap in lanes; only the per-member
+            // `_apitap_state` round trips are gone.
+            let (sref, oref, mref) = (&src, &o, &members);
+            let fs: Vec<_> = (0..mref.len())
+                .map(|i| async move {
+                    let (dt, q, sid) = &mref[i];
+                    let (n, m, e0) =
+                        apply_member_pending(t, dt, q, sid, oref, Some(sref)).await?;
+                    Ok::<_, Error>((i, n, m, e0))
+                })
+                .collect();
+            let (mut done, err) = if lanes > 1 {
+                settle_partial(lanes, fs).await
+            } else {
+                let mut done = Vec::with_capacity(fs.len());
+                let mut err = None;
+                for f in fs {
+                    match f.await {
+                        Ok(v) => done.push(v),
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                (done, err)
+            };
+            done.sort_by_key(|(i, _, _, _)| *i);
+            let done_idx: Vec<usize> = done.iter().map(|(i, _, _, _)| *i).collect();
+            // Close what DID apply even when a sibling failed, in ONE unit
+            // opened at the members' MINIMUM deadline: `open_at` carries the
+            // minimum back into the pin's continuity check, so a member whose
+            // deadline passed un-renewed refuses the whole close and the
+            // window replays — never a fresh group pin blessing skipped parts.
+            let closed: Result<()> = if done.is_empty() {
+                Ok(())
+            } else {
+                let e0 = done.iter().map(|(_, _, _, e)| *e).min().unwrap_or(0);
+                let tables: Vec<&str> =
+                    done.iter().map(|(i, _, _, _)| members[*i].0.as_str()).collect();
+                let marks: Vec<Watermark> = done.iter().map(|(_, _, m, _)| m.clone()).collect();
+                async {
+                    let h = t.open_at(&tables, Some(e0)).await?;
+                    t.close(h, marks).await
+                }
+                .await
+            };
+            let closed_ok = closed.is_ok();
+            for (dt, _, sid) in &members {
+                let member_ok = closed_ok && done_idx.iter().any(|i| &members[*i].0 == dt);
+                dest.settle(dt, sid, member_ok);
+            }
+            if let Some(e) = err {
+                // The sibling's failure is the window's verdict; a close that
+                // also failed only means the others replay.
+                return Err(e);
+            }
+            closed?;
+            for (i, n, _, _) in done {
+                rows_per[i] += n;
+            }
         } else if lanes > 1 && members.len() > 1 {
             // A BOUNDED pool of per-table units: `lanes` in flight, the rest
             // queued, each completion pulling the next. Unbounded would melt a
@@ -1761,6 +1829,32 @@ where
     done.into_iter().collect()
 }
 
+/// Like [`settle_all`], but every result survives: the values that completed
+/// AND the first error seen. The ClickHouse group needs both — a sibling's
+/// failure must not drop the member units whose applies already landed, and
+/// their continuity checks still have to run before their marks are written.
+async fn settle_partial<F, T>(lanes: usize, fs: Vec<F>) -> (Vec<T>, Option<Error>)
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    use futures::stream::StreamExt as _;
+    let done: Vec<Result<T>> =
+        futures::stream::iter(fs).buffer_unordered(lanes).collect().await;
+    let mut ok = Vec::with_capacity(done.len());
+    let mut err = None;
+    for r in done {
+        match r {
+            Ok(v) => ok.push(v),
+            Err(e) => {
+                if err.is_none() {
+                    err = Some(e);
+                }
+            }
+        }
+    }
+    (ok, err)
+}
+
 /// One member's window in a unit of its own: open, apply, close — and then
 /// tell the destination whether that unit committed (`Dest::settle`), on
 /// every path, so a changelog's replay memo never holds a marker whose unit
@@ -1783,6 +1877,29 @@ async fn apply_member(
     .await;
     dest.settle(dest_table, source_id, r.is_ok());
     r
+}
+
+/// One member's window applied in a unit of its own, closed with NO mark: the
+/// caller batches every member's mark into one group close. The unit's pin
+/// deadline rides back with the mark, so the group close can open its ONE
+/// unit at the members' minimum deadline — the per-member continuity proof,
+/// kept while the statement count drops.
+async fn apply_member_pending(
+    t: &Tenure<Dest>,
+    dest_table: &str,
+    qualified: &str,
+    source_id: &str,
+    o: &DrainOutcome,
+    src: Option<&PgPool>,
+) -> Result<(u64, Watermark, u64)> {
+    let mut h = t.open(&[dest_table]).await?;
+    let (n, m) = t.dest().apply(&mut h.unit, dest_table, qualified, source_id, o, src).await?;
+    let e0 = match &h.unit {
+        Unit::Ch(u) => u.pin_deadline(),
+        _ => 0,
+    };
+    t.close(h, Vec::new()).await?;
+    Ok((n, m, e0))
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -2107,6 +2224,25 @@ mod tests {
             let r = settle_all(2, fs).await;
             assert!(matches!(&r, Err(Error::Transfer(m)) if m == "boom"), "{r:?}");
             assert!(sibling_ran.load(SeqCst), "the in-flight sibling was cancelled");
+        });
+    }
+
+    /// A sibling's failure must not drop the members that already applied:
+    /// their units are still open (their marks are written by the group close
+    /// after each runs its continuity check), so the helper that drives the
+    /// lane pool keeps every completed value AND the first error.
+    #[test]
+    fn settle_partial_keeps_the_values_a_sibling_failure_left() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let fs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>> = vec![
+                Box::pin(async move { Ok(1) }),
+                Box::pin(async move { Err(Error::Transfer("boom".into())) }),
+                Box::pin(async move { Ok(2) }),
+            ];
+            let (mut done, err) = settle_partial(3, fs).await;
+            done.sort_unstable();
+            assert_eq!(done, vec![1, 2], "the finished units' values survive the failure");
+            assert!(matches!(&err, Some(Error::Transfer(m)) if m == "boom"), "{err:?}");
         });
     }
 
