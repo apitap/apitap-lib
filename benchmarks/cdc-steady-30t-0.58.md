@@ -468,3 +468,11 @@ list was passed with its `public.` prefix, so the validator built
 `public."public.prof_pg_t01"` and returned an empty digest, and one converge
 ran against the default ClickHouse. The validators are parameterized (`CH_C`,
 bare table names); with those set correctly every converge validated 30/30.
+
+### B2.8b — final gate on the re-land wheel
+
+`gate.py` on the re-land engine (`.so` md5 `69cc2ec886a0d42e63781f3f62e53056`,
+non-PGO build of `8919bd3`): **80 passed, 0 failed, 0 skipped in 6,935 s**
+(RC=0), including `e2e_toast_rekey.py` (the leg the first B2 gate caught) and
+every BigQuery and GTID leg. The 80/80 recorded in B2.8 above was the fix for
+the earlier regression; this is the gate on the final engine of this campaign.
