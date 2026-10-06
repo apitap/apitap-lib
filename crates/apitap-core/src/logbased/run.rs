@@ -1701,42 +1701,50 @@ async fn apply_windows(
                     Ok::<_, Error>((i, n, m))
                 })
                 .collect();
-            let mut done = Vec::with_capacity(fs.len());
-            if lanes > 1 {
-                match settle_all(lanes, fs).await {
-                    Ok(v) => done = v,
-                    Err(e) => {
-                        for (dt, _, sid) in &members {
-                            dest.settle(dt, sid, false);
-                        }
-                        return Err(e);
-                    }
-                }
+            let (mut done, err) = if lanes > 1 {
+                settle_partial(lanes, fs).await
             } else {
+                let mut done = Vec::with_capacity(fs.len());
+                let mut err = None;
                 for f in fs {
                     match f.await {
                         Ok(v) => done.push(v),
                         Err(e) => {
-                            for (dt, _, sid) in &members {
-                                dest.settle(dt, sid, false);
-                            }
-                            return Err(e);
+                            err = Some(e);
+                            break;
                         }
                     }
                 }
-            }
+                (done, err)
+            };
             done.sort_by_key(|(i, _, _)| *i);
-            let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
-            let marks: Vec<Watermark> = done.iter().map(|(_, _, m)| m.clone()).collect();
-            let r = async {
-                let h = t.open(&tables).await?;
-                t.close(h, marks).await
-            }
-            .await;
+            // Close the marks of the members that DID apply, even when a
+            // sibling failed: their units committed data, and the group close
+            // is where those members' watermarks are written. The failed
+            // member is simply not in `done`.
+            let closed = if done.is_empty() {
+                Ok(())
+            } else {
+                let tables: Vec<&str> =
+                    done.iter().map(|(i, _, _)| members[*i].0.as_str()).collect();
+                let marks: Vec<Watermark> = done.iter().map(|(_, _, m)| m.clone()).collect();
+                async {
+                    let h = t.open(&tables).await?;
+                    t.close(h, marks).await
+                }
+                .await
+            };
+            let closed_ok = closed.is_ok();
             for (dt, _, sid) in &members {
-                dest.settle(dt, sid, r.is_ok());
+                let member_ok = closed_ok && done.iter().any(|(i, _, _)| &members[*i].0 == dt);
+                dest.settle(dt, sid, member_ok);
             }
-            r?;
+            if let Some(e) = err {
+                // The sibling's failure is the window's verdict; a subset
+                // close that also failed only means those members replay.
+                return Err(e);
+            }
+            closed?;
             for (i, n, _) in done {
                 rows_per[i] += n;
             }
@@ -1796,6 +1804,33 @@ where
     let done: Vec<Result<T>> =
         futures::stream::iter(fs).buffer_unordered(lanes).collect().await;
     done.into_iter().collect()
+}
+
+/// Like [`settle_all`], but every result survives: the values that completed
+/// AND the first error seen. The ClickHouse group needs both — a sibling's
+/// failure must not drop the marks of the members whose units already applied
+/// (their data is in the destination; without their watermark the next run
+/// replays them, and the pre-`279c302` per-member close used to commit them).
+async fn settle_partial<F, T>(lanes: usize, fs: Vec<F>) -> (Vec<T>, Option<Error>)
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    use futures::stream::StreamExt as _;
+    let done: Vec<Result<T>> =
+        futures::stream::iter(fs).buffer_unordered(lanes).collect().await;
+    let mut ok = Vec::with_capacity(done.len());
+    let mut err = None;
+    for r in done {
+        match r {
+            Ok(v) => ok.push(v),
+            Err(e) => {
+                if err.is_none() {
+                    err = Some(e);
+                }
+            }
+        }
+    }
+    (ok, err)
 }
 
 /// One member's window in a unit of its own: open, apply, close — and then
@@ -2164,6 +2199,27 @@ mod tests {
             let r = settle_all(2, fs).await;
             assert!(matches!(&r, Err(Error::Transfer(m)) if m == "boom"), "{r:?}");
             assert!(sibling_ran.load(SeqCst), "the in-flight sibling was cancelled");
+        });
+    }
+
+    /// A sibling's failure must not drop the members that already applied:
+    /// their units committed data, and the ClickHouse group close is where
+    /// their watermarks are written. `settle_all` loses them (its
+    /// `collect::<Result<Vec<_>>>` returns the error only); the
+    /// `e2e_toast_rekey` replay case constructs exactly this shape and caught
+    /// the one-statement mark set dropping the succeeded member's marker.
+    #[test]
+    fn settle_partial_keeps_the_values_a_sibling_failure_left() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let fs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>> = vec![
+                Box::pin(async move { Ok(1) }),
+                Box::pin(async move { Err(Error::Transfer("boom".into())) }),
+                Box::pin(async move { Ok(2) }),
+            ];
+            let (mut done, err) = settle_partial(3, fs).await;
+            done.sort_unstable();
+            assert_eq!(done, vec![1, 2], "the finished units' values survive the failure");
+            assert!(matches!(&err, Some(Error::Transfer(m)) if m == "boom"), "{err:?}");
         });
     }
 
