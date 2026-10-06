@@ -444,13 +444,14 @@ impl Dest {
     /// How many of a group's tables may be applied AT ONCE within one window.
     /// `1` = the serial loop.
     ///
-    /// Only BigQuery goes above 1: its per-table apply is a job round-trip that
-    /// spends almost no local CPU, so a serial group pays the round-trip once
-    /// per table. It is a bounded pool, not an unbounded fan-out — a 100-table
-    /// group firing 100 load jobs and 100 MERGE transactions at once would trip
-    /// BigQuery's concurrent-job limits and make every transaction contend on
-    /// the shared `_apitap_state` row set. The SQL/CH/MySQL paths each buffer a
-    /// staging body locally and are CPU-bound anyway, so they stay serial.
+    /// Only BigQuery went above 1 before the lane pool: its per-table apply is
+    /// a job round-trip that spends almost no local CPU, so a serial group
+    /// pays the round-trip once per table. It is a bounded pool, not an
+    /// unbounded fan-out — a 100-table group firing 100 load jobs and 100
+    /// MERGE transactions at once would trip BigQuery's concurrent-job limits
+    /// and make every transaction contend on the shared `_apitap_state` row
+    /// set. ClickHouse joins it with the measured lane pool below; the
+    /// CPU-bound Pg/MySQL paths stay serial.
     fn apply_lanes(&self) -> usize {
         // One lever for every destination: the per-table bodies are slices of
         // the SAME window (each event belongs to one table), so N concurrent
@@ -472,6 +473,22 @@ impl Dest {
             // CPU-bound paths default to serial until a measured win says
             // otherwise — at 0.5 core, concurrent CPU work shares the same
             // quota; only the round-trip waits can overlap.
+            _ => 1,
+        }
+    }
+
+    /// How many of a group's tables a BOOTSTRAP may load at once. This is NOT
+    /// the window lane pool: a window's lanes price SLICES of one window, but
+    /// a bootstrap loads WHOLE tables through `transfer_within`, and every one
+    /// of those plans its pipes against the entire cgroup budget
+    /// (`pipeline::knobs` reads the limit itself) — so N concurrent loads each
+    /// claim the whole cage. The first B2 wheel let the lane pool drive this
+    /// and OOM-killed the 30-table bootstrap in 256 MB, a load 0.57.0 ran
+    /// serially in 179 MB. Row stores therefore stay serial; only BigQuery's
+    /// server-side load jobs fan out, as they always have.
+    fn bootstrap_lanes(&self) -> usize {
+        match self {
+            Dest::Bq(_) => bq_apply_lanes(),
             _ => 1,
         }
     }
@@ -1327,7 +1344,7 @@ async fn bootstrap_group(
     // load is an independent replace from the ONE pinned snapshot, so gap-free
     // and duplicate-free are unchanged.
     use futures::stream::StreamExt as _;
-    let concurrency = dest.apply_lanes();
+    let concurrency = dest.bootstrap_lanes();
     let drop_slot = || async {
         let _ = sqlx::query("SELECT pg_drop_replication_slot($1)").bind(slot).execute(src).await;
     };
@@ -2250,5 +2267,19 @@ mod tests {
         std::env::remove_var("APITAP_CDC_APPLY_LANES");
         let d = Dest::Ch(ChDest::connect("clickhouse://default:@127.0.0.1:8123/default").unwrap());
         assert!(d.apply_lanes() > 1, "ClickHouse must overlap its members by default");
+    }
+
+    /// The window lane pool must NOT drive the bootstrap: a bootstrap loads
+    /// whole tables through `transfer_within`, and each of those plans its
+    /// pipes against the whole cgroup budget, so N concurrent loads each claim
+    /// the entire cage. The first B2 wheel wired `apply_lanes()` into the
+    /// bootstrap and OOM-killed the 30-table load in 256 MB that 0.57.0 ran
+    /// serially in 179 MB. Row stores answer 1; only BigQuery fans out.
+    #[test]
+    fn bootstrap_loads_stay_serial_for_row_stores() {
+        std::env::remove_var("APITAP_CDC_APPLY_LANES");
+        let ch = Dest::Ch(ChDest::connect("clickhouse://default:@127.0.0.1:8123/default").unwrap());
+        assert_eq!(ch.bootstrap_lanes(), 1, "ClickHouse bootstraps serially");
+        assert!(ch.apply_lanes() > 1, "…while its window apply still overlaps");
     }
 }
