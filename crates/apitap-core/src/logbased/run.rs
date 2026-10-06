@@ -465,7 +465,10 @@ impl Dest {
         }
         match self {
             Dest::Bq(_) => bq_apply_lanes(),
-            Dest::Ch(_) => ch_apply_lanes(crate::pipeline::mem_limit_bytes()),
+            Dest::Ch(_) => ch_apply_lanes(
+                crate::pipeline::mem_limit_bytes(),
+                crate::pipeline::cpu_limit_cores(),
+            ),
             // CPU-bound paths default to serial until a measured win says
             // otherwise — at 0.5 core, concurrent CPU work shares the same
             // quota; only the round-trip waits can overlap.
@@ -474,7 +477,8 @@ impl Dest {
     }
 }
 
-/// Concurrent ClickHouse applies per window.
+/// Concurrent ClickHouse applies per window, from BOTH the memory and the CPU
+/// budget.
 ///
 /// The measured 30-table steady profile at 0.5 CPU / 256 MB applied 10,072
 /// changes/s with the client at 13 % of its quota: each member's apply is a
@@ -485,13 +489,33 @@ impl Dest {
 /// by memory the way BigQuery's pool is: each in-flight apply renders only its
 /// table's slice of the window, and the slices partition one window, so the
 /// pool does not multiply the window's residency. Lever: `APITAP_CDC_APPLY_LANES`.
-fn ch_apply_lanes(mem: Option<u64>) -> usize {
-    const CAP: usize = 8;
-    match mem {
-        // ~96 MiB of working base, then one lane per 8 MiB of headroom.
-        Some(m) => ((m.saturating_sub(96 << 20) / (8 << 20)) as usize).clamp(1, CAP),
+///
+/// Memory: ~96 MiB of working base, then one lane per 20 MiB of headroom,
+/// floored at 1 and capped at 16. The 20 MiB is the measured WORST-CASE
+/// marginal lane cost on the 30-table shape, not the 2-CPU average: with
+/// 64 MiB windows, 16 lanes at 2 CPU peaked 250.6 MB in the 256 MB cage, and
+/// the same jump at 4 CPU — where the drain overlaps a second full window —
+/// OOM-killed the run. 20 MiB/lane resolves a 256 MB cage to 8 lanes whatever
+/// the quota (the bound the B1 campaign measured safe), and a 512 MB cage to
+/// 16.
+///
+/// CPU: destination-latency bound, so more quota may hold more statements in
+/// flight — but only while the memory bound holds them. `round(16*c)` with a
+/// floor of 8 (the measured best at 0.5 core) is the latency-side ask; the
+/// SMALLER of the two bounds wins. On the 256 MB target the memory bound wins
+/// at every quota; the quota only buys lanes from ~416 MB up, where 1 CPU
+/// reaches 16.
+fn ch_apply_lanes(mem: Option<u64>, cpu: Option<f64>) -> usize {
+    const CAP: usize = 16;
+    let mem_bound = match mem {
+        Some(m) => ((m.saturating_sub(96 << 20) / (20 << 20)) as usize).clamp(1, CAP),
         None => CAP,
-    }
+    };
+    let cpu_bound = match cpu {
+        Some(c) => ((c * 16.0).round() as usize).clamp(8, CAP),
+        None => CAP,
+    };
+    mem_bound.min(cpu_bound)
 }
 
 /// Concurrent BigQuery applies per window (also the group bootstrap's fan-out).
@@ -2143,18 +2167,23 @@ mod tests {
         });
     }
 
-    /// A ClickHouse group overlaps its members' applies by default. The
-    /// measured 30-table window serializes half a dozen destination round
-    /// trips per member while the client sits at 13 % of its quota: the waits
-    /// are the wall, and the members' units are independent. The pool still
-    /// shrinks to serial when the memory headroom cannot hold one body.
+    /// A ClickHouse group overlaps its members' applies by default, and the
+    /// lane count comes from BOTH budgets: the measured 0.5-core/256-MB target
+    /// shape keeps its 8; a 256 MB cage holds 8 at every quota (the 16-lane
+    /// 4-CPU point OOM-killed the run); a 512 MB cage lets the quota add lanes
+    /// up to the cap; a tiny cage still runs one at a time. The pool shrinks
+    /// to serial when the memory headroom cannot hold one body.
     #[test]
-    fn clickhouse_overlaps_members_by_default() {
-        assert_eq!(ch_apply_lanes(None), 8, "no cgroup limit: the cap, not serial");
-        assert_eq!(ch_apply_lanes(Some(256 << 20)), 8, "the capped-tier shape");
-        assert_eq!(ch_apply_lanes(Some(128 << 20)), 4);
-        assert_eq!(ch_apply_lanes(Some(96 << 20)), 1, "no headroom: one at a time");
-        assert_eq!(ch_apply_lanes(Some(32 << 20)), 1);
+    fn clickhouse_lanes_follow_cpu_and_memory_together() {
+        assert_eq!(ch_apply_lanes(None, None), 16, "no limits: the cap, not serial");
+        assert_eq!(ch_apply_lanes(Some(256 << 20), Some(0.5)), 8, "the target shape");
+        assert_eq!(ch_apply_lanes(Some(256 << 20), Some(1.0)), 8, "8 lanes fit the 256 MB cage");
+        assert_eq!(ch_apply_lanes(Some(256 << 20), Some(4.0)), 8, "4 CPU does not buy memory");
+        assert_eq!(ch_apply_lanes(Some(512 << 20), Some(1.0)), 16, "headroom: the quota adds lanes");
+        assert_eq!(ch_apply_lanes(Some(512 << 20), Some(0.5)), 8, "0.5 core stays at 8");
+        assert_eq!(ch_apply_lanes(Some(128 << 20), Some(4.0)), 1, "the memory bound wins");
+        assert_eq!(ch_apply_lanes(Some(96 << 20), Some(1.0)), 1, "no headroom: one at a time");
+        assert_eq!(ch_apply_lanes(Some(32 << 20), Some(4.0)), 1);
     }
 
     /// And the dispatch itself: a constructed ClickHouse destination answers

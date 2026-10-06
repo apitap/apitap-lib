@@ -138,6 +138,110 @@ pub(crate) fn mem_limit_bytes() -> Option<u64> {
     None
 }
 
+/// The container/cgroup CPU quota, in cores, if one is set.
+///
+/// v2 answers `cpu.max` as `"<quota> <period>"` in microseconds ("max" = no
+/// quota at that level); v1 answers through `cpu.cfs_quota_us` /
+/// `cpu.cfs_period_us` on the `cpu` controller's mount. The walk starts at
+/// this process's own cgroup — so `--cgroupns=host` and nested slices read
+/// their own quota instead of the host root's "max" — and takes the SMALLEST
+/// quota on the path to the mount root, the same rule the memory walk uses,
+/// because that is what the kernel enforces: a child capped at half a core
+/// inside a two-core parent is a half-core. A level that sets none ("max",
+/// absent files, a non-positive quota) limits nothing.
+///
+/// `None` = nothing on the path caps the process, which lane-sizing treats as
+/// "spend the memory headroom", not as a limit of zero.
+pub(crate) fn cpu_limit_cores() -> Option<f64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    // v2 unified hierarchy: one "0::<path>" line, one cgroup2 mount.
+    if let Some(rel) = own.lines().find_map(|l| l.strip_prefix("0::").map(str::trim)) {
+        if let Some((point, root)) = cgroup_mount(&mounts, "cgroup2", None) {
+            let rel = rel.strip_prefix(root.as_str()).unwrap_or(rel);
+            if let Some(cores) = smallest_cpu_limit_up(&point, rel, true) {
+                return Some(cores);
+            }
+        }
+    }
+    // v1 (or the hybrid host's real hierarchy): the process's line for the cpu
+    // controller, then the mount whose super-options carry it.
+    let rel = own.lines().find_map(|l| {
+        let mut f = l.splitn(3, ':');
+        f.next()?;
+        if !f.next()?.split(',').any(|c| c == "cpu") {
+            return None;
+        }
+        Some(f.next()?.trim().to_string())
+    })?;
+    let (point, root) = cgroup_mount(&mounts, "cgroup", Some("cpu"))?;
+    let rel = rel.strip_prefix(root.as_str()).unwrap_or(&rel);
+    smallest_cpu_limit_up(&point, rel, false)
+}
+
+/// The `(mount point, root)` of a cgroup hierarchy from `/proc/self/mountinfo`:
+/// `fstype` is `cgroup2` (unified) or `cgroup` (v1, where `controller` must be
+/// listed in the super-options).
+fn cgroup_mount(mounts: &str, fstype: &str, controller: Option<&str>) -> Option<(String, String)> {
+    mounts.lines().find_map(|l| {
+        let (pre, post) = l.split_once(" - ")?;
+        let mut post_f = post.split_whitespace();
+        if post_f.next()? != fstype {
+            return None;
+        }
+        if let Some(c) = controller {
+            // Super-options are the token after the (single) v1 fstype.
+            if !post_f.nth(1)?.split(',').any(|o| o == c) {
+                return None;
+            }
+        }
+        let mut pre_f = pre.split_whitespace().skip(3);
+        let root = pre_f.next()?.to_string();
+        let point = pre_f.next()?.to_string();
+        Some((point, root))
+    })
+}
+
+/// Read the CPU quota at every level from `<mount><rel>` up to `<mount>`, and
+/// return the smallest `quota/period` in cores. v2 keeps both numbers in one
+/// `cpu.max` file; v1 splits them across the two CFS files.
+fn smallest_cpu_limit_up(mount: &str, rel: &str, v2: bool) -> Option<f64> {
+    let mut dir = std::path::PathBuf::from(mount);
+    dir.push(rel.trim_start_matches('/'));
+    let mut best: Option<f64> = None;
+    loop {
+        let cores = if v2 {
+            std::fs::read_to_string(dir.join("cpu.max")).ok().and_then(|s| cpu_max_cores(s.trim()))
+        } else {
+            cfs_quota_cores(&dir)
+        };
+        if let Some(c) = cores {
+            best = Some(best.map_or(c, |b: f64| b.min(c)));
+        }
+        if dir.as_os_str().len() <= mount.len() || !dir.pop() {
+            break;
+        }
+    }
+    best
+}
+
+/// `cpu.max`'s `"<quota> <period>"` in cores; `None` for "max" at this level.
+fn cpu_max_cores(s: &str) -> Option<f64> {
+    let mut it = s.split_whitespace();
+    let quota: u64 = it.next()?.parse().ok()?;
+    let period: u64 = it.next()?.parse().ok()?;
+    (quota > 0 && period > 0).then(|| quota as f64 / period as f64)
+}
+
+/// v1's CFS pair in cores; a non-positive quota (the unconstrained `-1`)
+/// limits nothing.
+fn cfs_quota_cores(dir: &std::path::Path) -> Option<f64> {
+    let quota = std::fs::read_to_string(dir.join("cpu.cfs_quota_us")).ok()?;
+    let period = std::fs::read_to_string(dir.join("cpu.cfs_period_us")).ok()?;
+    let (q, p) = (quota.trim().parse::<i64>().ok()?, period.trim().parse::<u64>().ok()?);
+    (q > 0 && p > 0).then(|| q as f64 / p as f64)
+}
+
 /// Resolve this process's OWN memory cgroup through `/proc/self/cgroup` and
 /// `/proc/self/mountinfo`, then take the SMALLEST limit on the path from that
 /// cgroup up to the root.
@@ -160,17 +264,7 @@ fn cgroup_limit_from_proc() -> Option<u64> {
         // The mount whose filesystem type is cgroup2 gives the root on disk,
         // and its ROOT field says which part of `rel` is already included in
         // that mount point (the namespace case, where rel is just "/").
-        if let Some((mount_point, mount_root)) = mounts.lines().find_map(|l| {
-            let (pre, post) = l.split_once(" - ")?;
-            let mut post_f = post.split_whitespace();
-            if post_f.next()? != "cgroup2" {
-                return None;
-            }
-            let mut pre_f = pre.split_whitespace().skip(3);
-            let root = pre_f.next()?.to_string();
-            let point = pre_f.next()?.to_string();
-            Some((point, root))
-        }) {
+        if let Some((mount_point, mount_root)) = cgroup_mount(&mounts, "cgroup2", None) {
             let rel = rel.strip_prefix(&mount_root).unwrap_or(&rel);
             // Fall THROUGH on None rather than returning it. A hybrid host
             // (RHEL/CentOS 8, Amazon Linux 2 — systemd's hybrid mode) mounts
@@ -198,21 +292,7 @@ fn cgroup_limit_from_proc() -> Option<u64> {
         }
         Some(f.next()?.trim().to_string())
     })?;
-    let (point, root) = mounts.lines().find_map(|l| {
-        let (pre, post) = l.split_once(" - ")?;
-        let mut post_f = post.split_whitespace();
-        if post_f.next()? != "cgroup" {
-            return None;
-        }
-        // Super-options carry the controller list for v1 mounts.
-        if !post_f.nth(1)?.split(',').any(|o| o == "memory") {
-            return None;
-        }
-        let mut pre_f = pre.split_whitespace().skip(3);
-        let root = pre_f.next()?.to_string();
-        let point = pre_f.next()?.to_string();
-        Some((point, root))
-    })?;
+    let (point, root) = cgroup_mount(&mounts, "cgroup", Some("memory"))?;
     let rel = rel.strip_prefix(&root).unwrap_or(&rel);
     smallest_limit_up(&point, rel, "memory.limit_in_bytes", |v| {
         v.parse::<u64>().ok().filter(|n| *n < (1 << 60))
@@ -919,6 +999,95 @@ mod tests {
         );
         assert_eq!(none, None);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The CPU walk is the memory walk's rule: the SMALLEST quota on the path
+    /// applies, a level that names none limits nothing, and a leaf "max" inside
+    /// a capped parent is still capped by the parent. RED controls: replacing
+    /// `b.min(c)` with `c` fails the nested case; treating a missing file as
+    /// `Some(0.0)` fails the uncapped case; dropping the v1 split-file walk
+    /// fails the last assert.
+    #[test]
+    fn the_smallest_cpu_quota_on_the_path_is_the_one_that_applies() {
+        let base = std::env::temp_dir().join(format!(
+            "apitap-cpu-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let leaf = base.join("system.slice/app.service/container");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(base.join("system.slice/cpu.max"), "200000 100000\n").unwrap();
+        std::fs::write(leaf.join("cpu.max"), "50000 100000\n").unwrap();
+        std::fs::write(base.join("cpu.max"), "max 100000\n").unwrap();
+
+        assert_eq!(
+            smallest_cpu_limit_up(
+                base.to_str().unwrap(),
+                "/system.slice/app.service/container",
+                true
+            ),
+            Some(0.5)
+        );
+
+        // A leaf "max" does not erase the parent's quota.
+        std::fs::write(leaf.join("cpu.max"), "max 100000\n").unwrap();
+        assert_eq!(
+            smallest_cpu_limit_up(
+                base.to_str().unwrap(),
+                "/system.slice/app.service/container",
+                true
+            ),
+            Some(2.0)
+        );
+
+        // Nothing capped anywhere is not a limit of zero.
+        std::fs::remove_file(base.join("system.slice/cpu.max")).unwrap();
+        assert_eq!(
+            smallest_cpu_limit_up(
+                base.to_str().unwrap(),
+                "/system.slice/app.service/container",
+                true
+            ),
+            None
+        );
+
+        // v1's split files take the same minimum.
+        std::fs::write(base.join("system.slice/cpu.cfs_quota_us"), "250000\n").unwrap();
+        std::fs::write(base.join("system.slice/cpu.cfs_period_us"), "100000\n").unwrap();
+        assert_eq!(
+            smallest_cpu_limit_up(
+                base.to_str().unwrap(),
+                "/system.slice/app.service/container",
+                false
+            ),
+            Some(2.5)
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The mount lookup both walks share: a v1 line is only the cpu
+    /// controller's mount when the super-options list it (not `cpuacct`).
+    #[test]
+    fn cgroup_mount_matches_the_controller_not_its_neighbour() {
+        let mi = "36 25 0:32 / /sys/fs/cgroup/cpu rw,nosuid,nodev,noexec,relatime \
+                  - cgroup cgroup rw,cpu,cpuacct\n\
+                  37 25 0:33 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime \
+                  - cgroup cgroup rw,memory\n\
+                  29 25 0:30 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime \
+                  - cgroup2 cgroup2 rw\n";
+        assert_eq!(
+            cgroup_mount(mi, "cgroup", Some("cpu")),
+            Some(("/sys/fs/cgroup/cpu".to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            cgroup_mount(mi, "cgroup", Some("memory")),
+            Some(("/sys/fs/cgroup/memory".to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            cgroup_mount(mi, "cgroup2", None),
+            Some(("/sys/fs/cgroup".to_string(), "/".to_string()))
+        );
+        assert_eq!(cgroup_mount(mi, "cgroup", Some("cpuset")), None);
     }
 
     /// Locks the memory→pipes budget to the MEASURED 100 GB ladder
