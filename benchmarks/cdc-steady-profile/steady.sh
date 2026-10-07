@@ -20,7 +20,7 @@ if [ "$ROUTE" = pg ]; then
 else
   URL="mysql://root:bench@127.0.0.1:3307/bench"; TABLE="${PROF_TABLE:-prof_my_m}"
 fi
-SP=/home/ubuntu/apitap-057-pullback/lib/python3.13/site-packages
+SP="${SP:-/home/ubuntu/apitap-057-pullback/lib/python3.13/site-packages}"
 CAP="--network=host --cpus=$CPUS --memory=256m --memory-swap=256m"
 
 WLOG="$WORK/logs/$TAG.writer.log"
