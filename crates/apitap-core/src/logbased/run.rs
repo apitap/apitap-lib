@@ -1540,6 +1540,32 @@ async fn drain_group(
     // run. Silence would also be wrong, which is what this used to be.
     slot_wal_report(src, slot).await;
 
+    // PG 13+ reports a slot's WAL retention state through `wal_status`; `lost`
+    // means Postgres already removed the WAL the drain needed
+    // (max_slot_wal_keep_size), so continuity is gone and the old signal was
+    // the raw 55000 on START_REPLICATION (system review 2026-10-07, G0.6).
+    // The probe tolerates pre-13 servers, which have no such column.
+    let wal_status: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(wal_status AS TEXT) FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(slot)
+    .fetch_optional(src)
+    .await
+    .ok()
+    .flatten();
+    if let Some(s) = wal_status {
+        if slot_status_lost(&s) {
+            return Err(Error::Transfer(format!(
+                "log_based: slot {slot} is LOST on the source — Postgres removed the WAL \
+                 its drain had not confirmed (max_slot_wal_keep_size), so the changes \
+                 since the watermark no longer exist. Drop the slot (a lost slot cannot \
+                 stream), clear the group's state rows, and re-run: the next run \
+                 re-bootstraps with a full load. Size max_slot_wal_keep_size and the \
+                 drain schedule so the slot survives between runs."
+            )));
+        }
+    }
+
     // Reconcile against the slot before doing anything.
     let slot_row: Option<(Option<String>, bool)> = sqlx::query_as(
         "SELECT confirmed_flush_lsn::text, active FROM pg_replication_slots \
@@ -2126,6 +2152,14 @@ async fn ensure_publication(
 }
 
 /// Print (and warn about) the WAL a slot is retaining. Best-effort: a source
+/// A slot's `wal_status` of `lost` means Postgres already removed the WAL its
+/// drain needed; only that state is fatal up front — `unreserved` is a warning
+/// the retention report covers, `reserved`/`extended` are healthy (system
+/// review 2026-10-07, G0.6).
+fn slot_status_lost(status: &str) -> bool {
+    status.eq_ignore_ascii_case("lost")
+}
+
 /// without permission to read `pg_replication_slots` must not fail a transfer
 /// over a diagnostic.
 async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
@@ -2302,6 +2336,18 @@ mod tests {
             assert!(matches!(&r, Err(Error::Transfer(m)) if m == "boom"), "{r:?}");
             assert!(sibling_ran.load(SeqCst), "the in-flight sibling was cancelled");
         });
+    }
+
+    /// Only `lost` is refused up front; `unreserved` is a warning (the drain
+    /// MUST still run — it is the thing that catches up), and the healthy
+    /// states pass (system review 2026-10-07, G0.6).
+    #[test]
+    fn only_a_lost_slot_is_refused_up_front() {
+        assert!(slot_status_lost("lost"));
+        assert!(slot_status_lost("LOST"));
+        assert!(!slot_status_lost("reserved"));
+        assert!(!slot_status_lost("extended"));
+        assert!(!slot_status_lost("unreserved"));
     }
 
     /// Two pipelines that share a source and a destination table NAME but
