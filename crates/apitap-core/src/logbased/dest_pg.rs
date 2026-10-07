@@ -35,9 +35,56 @@ impl PgDest {
         &self.store
     }
 
-    /// Resolve every member's schema once, before a lease key is taken.
+    /// Resolve every member's schema once, before a lease key is taken —
+    /// then refuse a group this lane cannot keep safe (P4).
     pub(crate) async fn resolve_names(&self, tables: &[String]) -> Result<()> {
-        self.store.resolve_names(tables).await
+        self.store.resolve_names(tables).await?;
+        self.precheck_group_fks(tables).await
+    }
+
+    /// A group member that is the REFERENCED side of a foreign key is a data
+    /// hazard on this lane: the drain applies a changed key as
+    /// delete-then-insert, and deleting a parent row fires the reference —
+    /// CASCADE / SET NULL / SET DEFAULT silently rewrites child rows that
+    /// were never part of the change (children outside the group included),
+    /// and NO ACTION / RESTRICT aborts the apply mid-run. Refused at
+    /// admission, naming the constraint's two tables (system review
+    /// 2026-10-07, P4).
+    async fn precheck_group_fks(&self, tables: &[String]) -> Result<()> {
+        let qualified: Vec<String> = tables
+            .iter()
+            .map(|t| {
+                let p = self.store.parts_of(t);
+                format!("{}.{}", p.schema, p.bare)
+            })
+            .collect();
+        let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+            "SELECT pn.nspname || '.' || pcl.relname, n.nspname || '.' || cl.relname \
+             FROM pg_constraint c \
+             JOIN pg_class pcl ON pcl.oid = c.confrelid \
+             JOIN pg_namespace pn ON pn.oid = pcl.relnamespace \
+             JOIN pg_class cl ON cl.oid = c.conrelid \
+             JOIN pg_namespace n ON n.oid = cl.relnamespace \
+             WHERE c.contype = 'f' \
+               AND (pn.nspname || '.' || pcl.relname) = ANY($1)",
+        )
+        .bind(&qualified)
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based: foreign-key precheck: {e}")))?;
+        if let Some((parent, child)) = rows.first() {
+            return Err(Error::InvalidInput(format!(
+                "log_based: destination table {parent} is a member of this group and is \
+                 REFERENCED by a foreign key from {child}. The drain applies a changed \
+                 key as delete-then-insert, so deleting a parent row fires the \
+                 reference: ON DELETE CASCADE / SET NULL / SET DEFAULT silently \
+                 rewrites or removes child rows — rows outside this group included — \
+                 and NO ACTION / RESTRICT aborts the apply mid-run. Drop the foreign \
+                 key on the destination (source commits already carry referential \
+                 order) or keep one of the two tables out of this group."
+            )));
+        }
+        Ok(())
     }
 
     /// The drain's watermark, through the one verdict both lanes share.
@@ -362,6 +409,10 @@ mod store {
     }
 
     impl PgStore {
+        pub(super) fn pool(&self) -> &PgPool {
+            &self.pool
+        }
+
         pub(crate) async fn connect(url: &str) -> Result<Self> {
             let connect = |n: u32| async move {
                 PgPoolOptions::new()
@@ -401,7 +452,7 @@ mod store {
         /// can only be a qualified one written as such (every member is
         /// resolved before its first lease key), so the fallback is the name
         /// as written.
-        fn parts_of(&self, dest_table: &str) -> PgParts {
+        pub(super) fn parts_of(&self, dest_table: &str) -> PgParts {
             if let Some(p) = self.parts.lock().expect("parts").get(dest_table) {
                 return p.clone();
             }
