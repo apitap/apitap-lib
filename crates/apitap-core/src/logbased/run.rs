@@ -1736,7 +1736,7 @@ async fn drain_loop(
         // Confirm the PREVIOUS window once applied (bounds resident windows
         // to two and keeps the slot's confirmed LSN strictly behind commits).
         if let Some(p) = pending.take() {
-            if applied_rx.wait_for(|&a| a >= p).await.is_err() {
+            if wait_for_apply(ws, &mut applied_rx, p).await.is_err() {
                 break;
             }
             ws.standby_status(p, false).await?;
@@ -1755,11 +1755,42 @@ async fn drain_loop(
     // `drain`, and the seven gate legs that went red when this was a bare
     // confirmation.
     if let Some(p) = pending {
-        if applied_rx.wait_for(|&a| a >= p).await.is_ok() {
+        if wait_for_apply(ws, &mut applied_rx, p).await.is_ok() {
             ws.standby_status(p, false).await?;
         }
     }
     Ok(())
+}
+
+/// Wait for the apply task to land `p`, keeping the replication connection
+/// fed: a bare watch wait sent nothing, so an apply longer than the server's
+/// `wal_sender_timeout` (60 s default) got the walsender killed mid-run — in
+/// every run whose apply outlasted its drain (system review 2026-10-07,
+/// G0.4). While waiting, a standby status with the LATEST APPLIED lsn goes
+/// out every ≤10 s. A failed keepalive write is not a run error: the apply
+/// still owns the result, and a dead socket is reported by the next window.
+/// `Err` means the watch closed — the apply task died.
+async fn wait_for_apply(
+    ws: &mut crate::wire::walsender::Walsender,
+    applied_rx: &mut tokio::sync::watch::Receiver<u64>,
+    p: u64,
+) -> std::result::Result<(), ()> {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires immediately — skip it so a short wait sends
+    // nothing extra.
+    tick.tick().await;
+    let mut rx = applied_rx.clone();
+    loop {
+        tokio::select! {
+            r = rx.wait_for(|&a| a >= p) => {
+                return r.map(|_| ()).map_err(|_| ());
+            }
+            _ = tick.tick() => {
+                let _ = ws.standby_status(*applied_rx.borrow(), false).await;
+            }
+        }
+    }
 }
 
 /// The apply side: every window lands in units the tenure opens, so an
