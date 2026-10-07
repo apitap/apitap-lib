@@ -275,7 +275,12 @@ async fn apply_unit(
     }
 
     // Residue tail: serial, ordered (masked updates and their followers).
+    // Every value travels as a $n bind — a cell's text is embedded nowhere,
+    // so no quoting rule (backslash, newline, a quote in the payload) can be
+    // got wrong, which the old cell-literal rendering did for anything but a
+    // lone apostrophe (system review 2026-10-07, dest_pg binds).
     for op in &c.residue {
+        let mut binds: Vec<Option<String>> = Vec::new();
         let sql = match op {
             ResidueOp::MaskedUpdate { key, row } => {
                 let sets = wal_cols
@@ -285,17 +290,26 @@ async fn apply_unit(
                         !matches!(cell, Cell::UnchangedToast) && !pk_cols.contains(cname)
                     })
                     .map(|(cname, cell)| {
-                        format!("{} = {}", quote_ident(cname), cell_literal(cell))
+                        binds.push(bind_of(cell));
+                        format!("{} = ${}", quote_ident(cname), binds.len())
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 if sets.is_empty() {
                     continue;
                 }
-                format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, key))
+                let pred = key_pred_bound(pk_cols, key, &mut binds);
+                format!("UPDATE {ft} SET {sets} WHERE {pred}")
             }
             ResidueOp::Upsert { row } => {
-                let vals = row.iter().map(cell_literal).collect::<Vec<_>>().join(", ");
+                let vals = row
+                    .iter()
+                    .map(|cell| {
+                        binds.push(bind_of(cell));
+                        format!("${}", binds.len())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let updates = wal_cols
                     .iter()
                     .filter(|cname| !pk_cols.contains(cname))
@@ -313,7 +327,8 @@ async fn apply_unit(
                 )
             }
             ResidueOp::Delete { key } => {
-                format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key))
+                let pred = key_pred_bound(pk_cols, key, &mut binds);
+                format!("DELETE FROM {ft} WHERE {pred}")
             }
             ResidueOp::Rekey { old_key, row, .. } => {
                 // Move the row rather than delete-and-reinsert. The columns
@@ -328,7 +343,8 @@ async fn apply_unit(
                     .zip(row.iter())
                     .filter(|(_, cell)| !matches!(cell, Cell::UnchangedToast))
                     .map(|(cname, cell)| {
-                        format!("{} = {}", quote_ident(cname), cell_literal(cell))
+                        binds.push(bind_of(cell));
+                        format!("{} = ${}", quote_ident(cname), binds.len())
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -340,10 +356,15 @@ async fn apply_unit(
                 // Idempotent on replay by construction: once the move has
                 // been applied the old key is gone, so a re-applied window
                 // matches zero rows and changes nothing.
-                format!("UPDATE {ft} SET {sets} WHERE {}", key_pred(pk_cols, old_key))
+                let pred = key_pred_bound(pk_cols, old_key, &mut binds);
+                format!("UPDATE {ft} SET {sets} WHERE {pred}")
             }
         };
-        tx.execute(sql.as_str()).await.map_err(db_err)?;
+        let mut q = sqlx::query(&sql);
+        for b in &binds {
+            q = q.bind(b.as_deref());
+        }
+        q.execute(&mut **tx).await.map_err(db_err)?;
     }
 
     Ok((c.events, set(c.events)))
@@ -705,23 +726,31 @@ fn render_key_row(key: &[&[u8]], out: &mut Vec<u8>) {
 
 /// SQL literal for a residue value (untyped literal — the column's type
 /// drives the parse, exactly like a hand-written UPDATE).
-fn cell_literal(cell: &Cell) -> String {
+/// What one residue cell binds as: `None` is SQL NULL (a TOAST cell the
+/// source did not resend included — the literal path rendered it NULL too),
+/// `Some` is the cell's text as it arrived (system review 2026-10-07,
+/// dest_pg binds).
+fn bind_of(cell: &Cell) -> Option<String> {
     match cell {
-        Cell::Null | Cell::UnchangedToast => "NULL".into(),
-        Cell::Text(t) => format!("'{}'", String::from_utf8_lossy(t).replace('\'', "''")),
+        Cell::Null | Cell::UnchangedToast => None,
+        Cell::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
     }
 }
 
-fn key_pred(pk_cols: &[String], key: &[Vec<u8>]) -> String {
+/// The residue WHERE clause: every key value binds as the next `$n`; the
+/// clause carries column names only (system review 2026-10-07, dest_pg
+/// binds).
+fn key_pred_bound(
+    pk_cols: &[String],
+    key: &[Vec<u8>],
+    binds: &mut Vec<Option<String>>,
+) -> String {
     pk_cols
         .iter()
         .zip(key.iter())
         .map(|(c, v)| {
-            format!(
-                "{} = '{}'",
-                quote_ident(c),
-                String::from_utf8_lossy(v).replace('\'', "''")
-            )
+            binds.push(Some(String::from_utf8_lossy(v).into_owned()));
+            format!("{} = ${}", quote_ident(c), binds.len())
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -796,5 +825,22 @@ mod tests {
     fn qualified_quotes_each_half() {
         let p = PgParts { schema: "my.schema".into(), bare: "a\"b".into() };
         assert_eq!(p.qualified(), "\"my.schema\".\"a\"\"b\"");
+    }
+    /// Residue values bind, never embed: a payload carrying a quote, a
+    /// backslash or a newline must reach the database as a parameter — the
+    /// old literal rendering escaped only the apostrophe (system review
+    /// 2026-10-07, dest_pg binds).
+    #[test]
+    fn residue_keys_and_cells_bind_instead_of_embedding() {
+        let pk = vec!["id".to_string()];
+        let mut binds: Vec<Option<String>> = Vec::new();
+        let pred = key_pred_bound(&pk, &[b"x'; DROP TABLE t; --".to_vec()], &mut binds);
+        assert_eq!(pred, "\"id\" = $1");
+        assert_eq!(binds, vec![Some("x'; DROP TABLE t; --".to_string())]);
+
+        let poison = Cell::Text(b"a'b\\c\n".as_slice().into());
+        assert_eq!(bind_of(&poison).as_deref(), Some("a'b\\c\n"));
+        assert_eq!(bind_of(&Cell::Null), None);
+        assert_eq!(bind_of(&Cell::UnchangedToast), None);
     }
 }
