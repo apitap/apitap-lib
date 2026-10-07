@@ -325,9 +325,10 @@ pub(crate) async fn fetch_schema(
     db: &str,
     table: &str,
 ) -> Result<TableSchema> {
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_KEY AS CHAR), \
-         CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR) \
+         CAST(COLUMN_TYPE AS CHAR), CAST(DATA_TYPE AS CHAR), \
+         CAST(CHARACTER_SET_NAME AS CHAR) \
          FROM information_schema.columns \
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
     )
@@ -348,6 +349,29 @@ pub(crate) async fn fetch_schema(
     // The test is the catalog's own DATA_TYPE, which needs no version probe:
     // MariaDB's JSON is an alias for LONGTEXT and reports `longtext`, so only
     // a server with real binary JSON answers `json` here.
+    // A string column in a non-UTF-8 charset ships its bytes RAW in the
+    // binlog, while the bootstrap reads the same column through a utf8mb4
+    // connection (decoded) — the destination would hold a mix of encodings
+    // with no error (system review 2026-10-07, R2). Refuse and name the
+    // columns; the fix is a source-side conversion.
+    let bad_charset = non_utf8_string_columns(
+        rows.iter().map(|r| (r.0.as_str(), r.3.as_str(), r.4.as_deref())),
+    );
+    if !bad_charset.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "log_based: {db}.{table} has string column(s) in a non-UTF-8 charset: {}. \
+             The binlog carries their bytes in the column's own charset while a bootstrap \
+             reads them decoded through the utf8mb4 connection, so the destination would \
+             mix encodings with no error. Convert them at the source \
+             (ALTER TABLE … MODIFY <col> … CHARACTER SET utf8mb4), expose the column \
+             through a view that casts it, or use mode='replace'/'append' for this table.",
+            bad_charset
+                .iter()
+                .map(|(n, cs)| format!("{n} ({cs})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let json_cols: Vec<&str> = rows
         .iter()
         .filter(|r| r.3.eq_ignore_ascii_case("json"))
@@ -821,6 +845,27 @@ fn cells_bytes(row: &Tuple) -> usize {
 /// whatever the op is. Until 0.57.0 the replica body was built by the first
 /// ROWS event, so an op arriving before one — a TRUNCATE — found no body and
 /// was skipped (`continue`), or was parked and wiped at the window's end into
+/// Charsets whose bytes are UTF-8 (or a strict subset), so a binlog string can
+/// be stored as text as-is. `utf8` is utf8mb3's alias.
+fn charset_is_utf8_compatible(cs: &str) -> bool {
+    matches!(cs.to_ascii_lowercase().as_str(), "utf8" | "utf8mb3" | "utf8mb4" | "ascii")
+}
+
+/// String-typed columns whose charset is not UTF-8-compatible, in catalog
+/// order: `(name, charset)`. Input rows are `(name, data_type, charset)`.
+fn non_utf8_string_columns<'a>(
+    rows: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+) -> Vec<(String, String)> {
+    const STRING_TYPES: &[&str] =
+        &["char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set"];
+    rows.filter(|(_, dt, cs)| {
+        STRING_TYPES.iter().any(|t| dt.eq_ignore_ascii_case(t))
+            && cs.is_some_and(|c| !charset_is_utf8_compatible(c))
+    })
+    .map(|(n, _, cs)| (n.to_string(), cs.unwrap_or_default().to_string()))
+    .collect()
+}
+
 /// a body with no layout that every apply refused. An op with no layout at all
 /// is a broken decoder invariant (a map is registered only with its layout,
 /// and the TRUNCATE arm resolves one first), and is an error, never a skip.
@@ -942,6 +987,38 @@ fn is_ddl(sql: &str) -> bool {
     ["alter", "create", "drop", "rename", "truncate"]
         .iter()
         .any(|k| starts_with_word(s, k))
+}
+
+#[cfg(test)]
+mod charset_tests {
+    use super::{charset_is_utf8_compatible, non_utf8_string_columns};
+
+    /// A string column in a non-UTF-8 charset ships raw bytes in the binlog
+    /// while the bootstrap decodes it through a utf8mb4 connection; the CDC
+    /// precheck must refuse it and name it (system review 2026-10-07, R2).
+    #[test]
+    fn only_utf8_compatible_charsets_pass_the_cdc_precheck() {
+        assert!(charset_is_utf8_compatible("utf8mb4"));
+        assert!(charset_is_utf8_compatible("UTF8"));
+        assert!(charset_is_utf8_compatible("utf8mb3"));
+        assert!(charset_is_utf8_compatible("ascii"));
+        assert!(!charset_is_utf8_compatible("latin1"));
+        assert!(!charset_is_utf8_compatible("ucs2"));
+
+        let rows = [
+            ("a", "varchar", Some("latin1")),
+            ("b", "int", Some("latin1")), // not a string type
+            ("c", "text", Some("utf8mb4")),
+            ("d", "enum", Some("latin1")),
+            ("e", "varchar", None), // no charset reported: not a string column
+            ("f", "varchar", Some("ascii")),
+        ];
+        let bad = non_utf8_string_columns(rows.into_iter());
+        assert_eq!(
+            bad,
+            vec![("a".to_string(), "latin1".to_string()), ("d".to_string(), "latin1".to_string())]
+        );
+    }
 }
 
 #[cfg(test)]
