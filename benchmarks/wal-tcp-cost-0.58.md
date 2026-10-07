@@ -78,3 +78,25 @@ transport slice (loopback TCP + nftables) is under 10 %."
   `/tmp/tcpmeasure3.out`), plus the syscall thread trace in `/tmp/nano/`.
 - The earlier (idle-regime, wrong-filter) runs are in `/tmp/tcpmeasure*` and are
   superseded by the numbers above.
+
+## Second, independent dataset (container-capped)
+
+A parallel run used the same seed with the drain inside
+`--cpus=0.5 --memory=256m` and a writer at 25,905 changes/s with a different
+mix (**970.8 WAL bytes/change**): it applied 7,775,000 changes in 240 s =
+**32.4k changes/s at cap_frac 0.87** with **MEMPEAK 42.3 MB** — the same
+operating point the B2 report describes from the other side. Its raw artifacts
+are the `benchmarks/wal-tcp-cost/` harness and `~/waltcp/logs/` on the bench
+VPS (`main.drain.log`, `main.out`, `main.perf.data/symbols.txt`,
+`main.strace.txt`). Two observations from them:
+
+- the syscall mix repeats: `recvfrom` 115,293 / `epoll_wait` 125,624 over its
+  trace window (a near-1:1 ratio like the aligned window's 72k/78k), so the
+  coalescing result is not an artifact of one writer mix;
+- its `perf` call graph shows `epoll_wait → do_epoll_wait → ep_poll →
+  schedule_hrtimeout_range → schedule → finish_task_switch` (4.25 % of
+  samples): the kernel bucket is dominated by **timed polling and scheduler
+  work**, exactly the part a different transport does not remove.
+
+Both datasets agree: the transport is not the lever; the remaining cost is
+userspace per-change work plus timer/scheduler overhead in the poll loop.
