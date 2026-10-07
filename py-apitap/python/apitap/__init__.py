@@ -336,9 +336,15 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
     """Render a polars predicate as a SQL WHERE fragment, or None.
 
     Only a conservative subset crosses the wire: arithmetic (+ - * %) and
-    comparisons over non-string columns, equality/inequality on strings
-    (range comparisons on text differ between server collations and
-    polars byte order), AND/OR, boolean and numeric literals. Casts are
+    comparisons over non-string columns, equality on strings, AND/OR,
+    boolean and numeric literals. Range comparisons on text differ between
+    server collations and polars byte order; `<>` on text differs too, and
+    asymmetrically: a collation can make `<>` match FEWER rows (MySQL
+    `*_ci`: 'Active' <> 'ACTIVE ' is false there, true in polars; Postgres
+    `char(n)` ignores trailing spaces), and the dropped rows are exactly
+    what the client-side filter cannot recover. `=` can only match MORE
+    rows, which the client-side filter then removes — bandwidth, never
+    correctness — so it stays. (system review 2026-10-07, §0 #9). Casts are
     elided only around literals (polars' automatic widening) — a cast over
     a COLUMN changes values and must not be dropped. `!=` between two
     float subtrees is refused (Postgres defines NaN = NaN as true; IEEE
@@ -361,7 +367,10 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
 
     CMP = {"Eq": "=", "NotEq": "<>", "Lt": "<", "LtEq": "<=",
            "Gt": ">", "GtEq": ">="}
-    STR_OK = {"Eq", "NotEq"}
+    # Strings: ONLY equality crosses the wire. A server collation can drop
+    # rows for `<>` that polars keeps and the client-side filter can never
+    # bring back; `=` can only add rows the filter removes. See the docstring.
+    STR_OK = {"Eq"}
     ARITH = {"Plus": "+", "Minus": "-", "Multiply": "*", "Modulus": "%"}
     LOGIC = {"And": "AND", "Or": "OR", "LogicalAnd": "AND", "LogicalOr": "OR"}
     INT_T = {"Int", "Int8", "Int16", "Int32", "Int64",
