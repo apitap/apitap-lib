@@ -346,20 +346,24 @@ impl IcebergConn {
             .map_err(|e| Error::Transfer(format!("iceberg: created metadata didn't parse: {e}")))
     }
 
-    /// One optimistic-concurrency commit attempt. `Ok(false)` = requirement
-    /// conflict (someone else committed first — reload and retry).
+    /// One optimistic-concurrency commit attempt. The three outcomes the
+    /// caller must tell apart are `Done`, `Conflict` (someone else committed
+    /// first — reload and retry) and `Unknown` (a 5xx, 408, 429, or a
+    /// transport error after the POST was sent: the request may or may not
+    /// have landed). A definite 4xx comes back as `Err` (system review
+    /// 2026-10-07, H1).
     async fn commit_table(
         &self,
         table: &str,
         requirements: &[TableRequirement],
         updates: &[TableUpdate],
-    ) -> Result<bool> {
+    ) -> Result<CommitTry> {
         let body = serde_json::json!({
             "identifier": {"namespace": [self.namespace], "name": table},
             "requirements": requirements,
             "updates": updates,
         });
-        let r = self
+        let r = match self
             .req(
                 reqwest::Method::POST,
                 self.v1(&format!("namespaces/{}/tables/{}", enc_q(&self.namespace), enc_q(table))),
@@ -367,12 +371,67 @@ impl IcebergConn {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("iceberg commit: {e}")))?;
-        if matches!(r.status().as_u16(), 409 | 412) {
-            return Ok(false);
+        {
+            Ok(r) => r,
+            // A transport error after the POST was sent is the ambiguous
+            // case: the request may have been applied. The caller settles it
+            // against the table's own metadata, never by assuming failure.
+            Err(e) => {
+                return Ok(CommitTry::Unknown(Error::Transfer(format!("iceberg commit: {e}"))))
+            }
+        };
+        match commit_status_class(r.status().as_u16()) {
+            CommitClass::Done => Self::body_ok(r, "commit").await.map(|_| CommitTry::Done),
+            CommitClass::Conflict => Ok(CommitTry::Conflict),
+            CommitClass::Unknown => Ok(CommitTry::Unknown(Self::body_ok(r, "commit").await.unwrap_err())),
+            CommitClass::Failed => {
+                Self::body_ok(r, "commit").await?;
+                Ok(CommitTry::Done)
+            }
         }
-        Self::body_ok(r, "commit").await.map(|_| true)
     }
+}
+
+/// What one commit attempt told us.
+enum CommitTry {
+    Done,
+    Conflict,
+    /// The request may or may not have landed; the client-chosen snapshot id
+    /// decides (see `snapshot_landed`).
+    Unknown(Error),
+}
+
+/// HTTP status → attempt class. Pure, so the ambiguous/definite split is
+/// unit-testable: a 5xx/408/429 is `Unknown` (retryable and never a reason to
+/// sweep), a 4xx that is not a concurrency conflict is a definite rejection.
+#[derive(Debug, PartialEq, Eq)]
+enum CommitClass {
+    Done,
+    Conflict,
+    Unknown,
+    Failed,
+}
+
+fn commit_status_class(status: u16) -> CommitClass {
+    if (200..300).contains(&status) {
+        CommitClass::Done
+    } else if matches!(status, 409 | 412) {
+        CommitClass::Conflict
+    } else if (500..600).contains(&status) || matches!(status, 408 | 429) {
+        CommitClass::Unknown
+    } else {
+        CommitClass::Failed
+    }
+}
+
+/// The one rule an ambiguous commit is judged by: the snapshot id is chosen by
+/// THIS client (`fresh_snapshot_id`), so the table's own metadata answers
+/// whether the commit landed. An ambiguous failure that nevertheless left a
+/// snapshot must be treated as success — the failure path sweeps the run's
+/// data files, and deleting files a committed snapshot references corrupts
+/// the table (system review 2026-10-07, H1).
+fn snapshot_landed(meta: &TableMetadata, snapshot_id: i64) -> bool {
+    meta.snapshots().any(|s| s.snapshot_id() == snapshot_id)
 }
 
 fn enc_q(s: &str) -> String {
@@ -1399,15 +1458,34 @@ impl IcebergSink {
                 },
             ];
 
-            if self
-                .conn
-                .commit_table(&self.table, &requirements, &updates)
-                .await?
-            {
-                return Ok(());
+            match self.conn.commit_table(&self.table, &requirements, &updates).await? {
+                CommitTry::Done => return Ok(()),
+                CommitTry::Conflict => {
+                    // Someone committed between our load and now: reload,
+                    // re-derive parent/sequence, rebuild manifests, try again.
+                }
+                CommitTry::Unknown(e) => {
+                    // The status is unknown, but the snapshot id is OURS:
+                    // reload and ask whether this exact snapshot exists. If it
+                    // does, the commit landed — returning Ok keeps the caller
+                    // from sweeping the files this snapshot references (a lost
+                    // 5xx used to delete them and corrupt the table). If it
+                    // does not, retry with a small backoff; an absence on the
+                    // last attempt is the failure.
+                    let fresh = self.conn.load_table(&self.table).await?.ok_or_else(|| {
+                        Error::Transfer("iceberg: table vanished after an ambiguous commit".into())
+                    })?;
+                    if snapshot_landed(&fresh, snapshot_id) {
+                        return Ok(());
+                    }
+                    if attempt == 2 {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250u64 << attempt)).await;
+                    meta = fresh;
+                    continue;
+                }
             }
-            // Someone committed between our load and now: reload, re-derive
-            // parent/sequence, rebuild manifests, try again.
             meta = self
                 .conn
                 .load_table(&self.table)
@@ -1667,15 +1745,19 @@ pub(crate) async fn cdc_set_watermark(
         ]),
     }];
     let requirements = vec![TableRequirement::UuidMatch { uuid: meta.uuid() }];
-    if conn.commit_table(table, &requirements, &updates).await? {
-        Ok(())
-    } else {
-        // UuidMatch only fails when the table was dropped and recreated —
-        // stamping an LSN onto a stranger's table would corrupt it.
-        Err(Error::Transfer(format!(
-            "log_based: iceberg watermark commit for '{table}' conflicted — \
-             was the table replaced by another writer?"
-        )))
+    match conn.commit_table(table, &requirements, &updates).await? {
+        CommitTry::Done => Ok(()),
+        CommitTry::Conflict => {
+            // UuidMatch only fails when the table was dropped and recreated —
+            // stamping an LSN onto a stranger's table would corrupt it.
+            Err(Error::Transfer(format!(
+                "log_based: iceberg watermark commit for '{table}' conflicted — \
+                 was the table replaced by another writer?"
+            )))
+        }
+        // Props-only commit: no snapshot id exists to settle an ambiguous
+        // answer. Fail loudly; the caller's next run retries the stamp.
+        CommitTry::Unknown(e) => Err(e),
     }
 }
 
@@ -1994,12 +2076,28 @@ impl CdcBound {
                     snapshot_id: parent,
                 },
             ];
-            if self
-                .conn
-                .commit_table(&self.table, &requirements, &updates)
-                .await?
-            {
-                return Ok(());
+            match self.conn.commit_table(&self.table, &requirements, &updates).await? {
+                CommitTry::Done => return Ok(()),
+                CommitTry::Conflict => {}
+                CommitTry::Unknown(e) => {
+                    // The snapshot id is OURS: the table's metadata decides
+                    // whether the ambiguous answer was a landed commit, and a
+                    // landed one must never be reported as a failure — the
+                    // caller would re-apply the window or sweep files the
+                    // snapshot references (system review 2026-10-07, H1).
+                    let fresh = self.conn.load_table(&self.table).await?.ok_or_else(|| {
+                        Error::Transfer("iceberg: table vanished after an ambiguous commit".into())
+                    })?;
+                    if snapshot_landed(&fresh, snapshot_id) {
+                        return Ok(());
+                    }
+                    if attempt == 2 {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250u64 << attempt)).await;
+                    meta = fresh;
+                    continue;
+                }
             }
             meta = self
                 .conn
@@ -2116,6 +2214,25 @@ impl crate::sink::Loader for IcebergLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 5xx/408/429 commit answer is AMBIGUOUS, not a failure: the request
+    /// may have landed, and the caller's failure path sweeps the run's data
+    /// files — deleting what a committed snapshot references corrupts the
+    /// table (system review 2026-10-07, H1). Only a non-conflict 4xx is a
+    /// definite rejection.
+    #[test]
+    fn ambiguous_commit_statuses_are_never_failures() {
+        assert_eq!(commit_status_class(200), CommitClass::Done);
+        assert_eq!(commit_status_class(204), CommitClass::Done);
+        assert_eq!(commit_status_class(409), CommitClass::Conflict);
+        assert_eq!(commit_status_class(412), CommitClass::Conflict);
+        for s in [500, 502, 503, 504, 408, 429] {
+            assert_eq!(commit_status_class(s), CommitClass::Unknown, "status {s}");
+        }
+        for s in [400, 401, 403, 404, 422] {
+            assert_eq!(commit_status_class(s), CommitClass::Failed, "status {s}");
+        }
+    }
 
     #[test]
     fn s3_uri_split_handles_shapes() {
