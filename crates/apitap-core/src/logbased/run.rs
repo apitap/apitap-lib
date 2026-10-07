@@ -2235,7 +2235,7 @@ async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
     }
 }
 
-fn parse_size(v: &str) -> Option<u64> {
+pub(crate) fn parse_size(v: &str) -> Option<u64> {
     let v = v.trim();
     let (num, mult) = match v.chars().last() {
         Some('K') | Some('k') => (&v[..v.len() - 1], 1u64 << 10),

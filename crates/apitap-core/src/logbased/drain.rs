@@ -35,6 +35,34 @@ fn silence_budget() -> std::time::Duration {
         .unwrap_or(REPLICATION_SILENCE)
 }
 
+/// The most one transaction may buffer before the drain refuses: the v1
+/// protocol ships a transaction whole after its commit, so a giant write (an
+/// UPDATE over a whole table) cannot be landed in parts — past this cap the
+/// honest end is a refusal that names the cause, not an OOM (system review
+/// 2026-10-07, G0.1). `APITAP_TX_BUF_BYTES` raises or lowers it.
+const TX_BUF_LIMIT: usize = 256 << 20;
+
+fn tx_buf_limit() -> usize {
+    std::env::var("APITAP_TX_BUF_BYTES")
+        .ok()
+        .and_then(|v| crate::logbased::run::parse_size(&v))
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(TX_BUF_LIMIT)
+}
+
+fn tx_too_big(table: &str, bytes: usize, limit: usize) -> Error {
+    Error::Transfer(format!(
+        "log_based: one transaction's changes for {table} have buffered {} MiB \
+         (APITAP_TX_BUF_BYTES = {} MiB) — Postgres ships a transaction whole, so it \
+         cannot land in parts, and continuing would OOM. Split the write on the \
+         source, or raise APITAP_TX_BUF_BYTES (bytes, or a K/M/G suffix) if this \
+         process really has that much memory. The watermark is untouched: the next run re-reads the transaction.",
+        bytes >> 20,
+        limit >> 20
+    ))
+}
+
 struct RelState {
     table: Arc<str>,
     tracked: bool,
@@ -116,7 +144,9 @@ pub(crate) enum StreamOp {
 /// containers: past the budget the drain stops at the NEXT COMMIT BOUNDARY
 /// with `hit_budget` set (a single transaction larger than the budget still
 /// buffers whole — Postgres only ships a v1-protocol transaction after its
-/// commit, so sub-transaction spilling buys nothing upstream).
+/// commit, so sub-transaction spilling buys nothing upstream — but never past
+/// the hard cap `APITAP_TX_BUF_BYTES`, where the drain refuses instead of
+/// OOMing; system review G0.1).
 ///
 /// It also stops, `hit_budget` set, before a transaction whose Relation
 /// changed the layout of a table the window already holds: that transaction
@@ -138,8 +168,11 @@ pub(crate) async fn drain(
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
     let mut changelogs: HashMap<String, Changes> = HashMap::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
-    // if the drain aborts mid-transaction.
+    // if the drain aborts mid-transaction. `tx_bytes` is the current
+    // transaction's own charge against the hard cap (system review G0.1).
     let mut tx_buf: TxOps = Vec::new();
+    let mut tx_bytes = 0usize;
+    let tx_limit = tx_buf_limit();
     let mut end_lsn = start_lsn;
     // Approximate bytes buffered across tx_buf + collapsers. Collapse dedup
     // (last-write-wins) makes true memory smaller — the count is conservative.
@@ -249,7 +282,10 @@ pub(crate) async fn drain(
                 // (sub)transaction; outside one there is nothing to name.
                 let sub = change_xid.or(in_stream);
                 match msg {
-                PgoMessage::Begin { .. } => tx_buf.clear(),
+                PgoMessage::Begin { .. } => {
+                    tx_buf.clear();
+                    tx_bytes = 0;
+                }
                 PgoMessage::Commit { end_lsn: e, .. } => {
                     if relayout {
                         // The window ends at the previous commit; this one
@@ -259,6 +295,7 @@ pub(crate) async fn drain(
                         break;
                     }
                     flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+                    tx_bytes = 0;
                     end_lsn = e;
                     if e >= stop_line {
                         break;
@@ -364,6 +401,9 @@ pub(crate) async fn drain(
                         match in_stream {
                             Some(x) => {
                                 sess.stream_bytes += n;
+                                if sess.stream_bytes > tx_limit {
+                                    return Err(tx_too_big(&t, sess.stream_bytes, tx_limit));
+                                }
                                 sess.streams
                                     .get_mut(&x)
                                     .expect("stream open")
@@ -371,6 +411,10 @@ pub(crate) async fn drain(
                             }
                             None => {
                                 buf_bytes += n;
+                                tx_bytes += n;
+                                if tx_bytes > tx_limit {
+                                    return Err(tx_too_big(&t, tx_bytes, tx_limit));
+                                }
                                 tx_buf.push((t, op));
                             }
                         }
@@ -384,6 +428,9 @@ pub(crate) async fn drain(
                         match in_stream {
                             Some(x) => {
                                 sess.stream_bytes += n;
+                                if sess.stream_bytes > tx_limit {
+                                    return Err(tx_too_big(&t, sess.stream_bytes, tx_limit));
+                                }
                                 sess.streams
                                     .get_mut(&x)
                                     .expect("stream open")
@@ -391,6 +438,10 @@ pub(crate) async fn drain(
                             }
                             None => {
                                 buf_bytes += n;
+                                tx_bytes += n;
+                                if tx_bytes > tx_limit {
+                                    return Err(tx_too_big(&t, tx_bytes, tx_limit));
+                                }
                                 tx_buf.push((t, op));
                             }
                         }
@@ -403,6 +454,9 @@ pub(crate) async fn drain(
                         match in_stream {
                             Some(x) => {
                                 sess.stream_bytes += n;
+                                if sess.stream_bytes > tx_limit {
+                                    return Err(tx_too_big(&t, sess.stream_bytes, tx_limit));
+                                }
                                 sess.streams
                                     .get_mut(&x)
                                     .expect("stream open")
@@ -410,6 +464,10 @@ pub(crate) async fn drain(
                             }
                             None => {
                                 buf_bytes += n;
+                                tx_bytes += n;
+                                if tx_bytes > tx_limit {
+                                    return Err(tx_too_big(&t, tx_bytes, tx_limit));
+                                }
                                 tx_buf.push((t, op));
                             }
                         }
@@ -519,5 +577,28 @@ mod tests {
         assert_eq!(silence_budget(), std::time::Duration::from_secs(5));
         std::env::remove_var("APITAP_REPLICATION_SILENCE_SECS");
         assert_eq!(silence_budget(), REPLICATION_SILENCE);
+    }
+
+    /// The transaction cap may be tuned but not silently disabled: zero
+    /// falls back to the default (system review 2026-10-07, G0.1).
+    #[test]
+    fn a_zero_tx_cap_falls_back_to_the_default() {
+        std::env::remove_var("APITAP_TX_BUF_BYTES");
+        assert_eq!(tx_buf_limit(), TX_BUF_LIMIT);
+        std::env::set_var("APITAP_TX_BUF_BYTES", "0");
+        assert_eq!(tx_buf_limit(), TX_BUF_LIMIT);
+        std::env::set_var("APITAP_TX_BUF_BYTES", "512M");
+        assert_eq!(tx_buf_limit(), 512 << 20);
+        std::env::remove_var("APITAP_TX_BUF_BYTES");
+    }
+
+    /// The refusal must be actionable: it names the table, the size, and the
+    /// knob that changes the cap (system review 2026-10-07, G0.1).
+    #[test]
+    fn the_refusal_names_the_table_the_size_and_the_knob() {
+        let s = tx_too_big("public.big", 300 << 20, TX_BUF_LIMIT).to_string();
+        assert!(s.contains("public.big"), "{s}");
+        assert!(s.contains("300 MiB"), "{s}");
+        assert!(s.contains("APITAP_TX_BUF_BYTES"), "{s}");
     }
 }
