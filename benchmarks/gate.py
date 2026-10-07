@@ -231,6 +231,7 @@ LEGS = [
         proves={"bulk.sibling-cancel": ("my",)}),
 
     leg("e2e_fk_guard.py",         "a destination FK into a group is refused before any row moves"),
+    leg("e2e_my_charset_guard.py", "a non-UTF-8 string column is refused before a CDC run", {"mariadb"}),
 ]
 
 
