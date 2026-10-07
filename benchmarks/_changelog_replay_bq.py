@@ -198,7 +198,7 @@ def main():
         case("__current shows the new value", cur == "new", f"{cur!r}")
 
         print("== T2: a shorter replay appends nothing twice ==", flush=True)
-        ma(f"CREATE TABLE bench.{SHORT} (id BIGINT PRIMARY KEY, v VARCHAR(40000)) DEFAULT CHARSET=latin1")
+        ma(f"CREATE TABLE bench.{SHORT} (id BIGINT PRIMARY KEY, v MEDIUMTEXT) DEFAULT CHARSET=utf8mb4")
         ma(f"INSERT INTO bench.{SHORT} SELECT seq, 'b' FROM seq_1_to_10")
         drain(SHORT)
         snapshot(SHORT)
@@ -215,7 +215,7 @@ def main():
         case(f"{SHORT}__current equals the MariaDB table", same_as_source(SHORT))
 
         print("== T2b: a replay window that does not carry a table ==", flush=True)
-        ma(f"CREATE TABLE bench.{GU} (id BIGINT PRIMARY KEY, v VARCHAR(40000)) DEFAULT CHARSET=latin1")
+        ma(f"CREATE TABLE bench.{GU} (id BIGINT PRIMARY KEY, v MEDIUMTEXT) DEFAULT CHARSET=utf8mb4")
         ma(f"CREATE TABLE bench.{GT} (id BIGINT PRIMARY KEY, v VARCHAR(64))")
         ma(f"INSERT INTO bench.{GU} SELECT seq, 'b' FROM seq_1_to_10")
         ma(f"INSERT INTO bench.{GT} VALUES (0, 'seed')")   # an empty table bootstraps no table at all
