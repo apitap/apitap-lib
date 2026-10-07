@@ -290,11 +290,32 @@ fn transcode_field(ty: RbType, f: &[u8], out: &mut Vec<u8>) -> Result<()> {
         RbType::Bool => out.push(f[0]),
         RbType::Date32 => {
             let d = i32::from_be_bytes(f.try_into().map_err(|_| bad("date"))?);
-            out.extend((d + PG_EPOCH_DAYS).to_le_bytes());
+            // Postgres spells +infinity/-infinity as INT32_MAX/MIN days; adding
+            // the epoch offset without the sentinel check wraps them into
+            // garbage dates (system review 2026-10-07, P6). ClickHouse's
+            // Date32 has no infinity, so refuse by name with the remedy.
+            if d == i32::MAX || d == i32::MIN {
+                return Err(Error::Transfer(
+                    "pg binary COPY: date 'infinity' has no ClickHouse Date32 value — cast the \
+                     column to text in a source view, or filter those rows"
+                        .into(),
+                ));
+            }
+            let unix = d.checked_add(PG_EPOCH_DAYS).ok_or_else(|| bad("date"))?;
+            out.extend(unix.to_le_bytes());
         }
         RbType::Ts64 => {
             let t = i64::from_be_bytes(f.try_into().map_err(|_| bad("timestamp"))?);
-            out.extend((t + PG_EPOCH_MICROS).to_le_bytes());
+            // Same for timestamp/timestamptz (INT64_MAX/MIN microseconds).
+            if t == i64::MAX || t == i64::MIN {
+                return Err(Error::Transfer(
+                    "pg binary COPY: timestamp 'infinity' has no ClickHouse DateTime64 value — \
+                     cast the column to text in a source view, or filter those rows"
+                        .into(),
+                ));
+            }
+            let unix = t.checked_add(PG_EPOCH_MICROS).ok_or_else(|| bad("timestamp"))?;
+            out.extend(unix.to_le_bytes());
         }
         RbType::Decimal { width, scale } => {
             let v = numeric_to_scaled_i128(f, scale)?;
@@ -515,5 +536,27 @@ mod tests {
         out.clear();
         transcode_field(RbType::Ts64, &0i64.to_be_bytes(), &mut out).unwrap();
         assert_eq!(out, PG_EPOCH_MICROS.to_le_bytes());
+    }
+
+    /// Postgres spells infinity as INT32_MAX/MIN (date) and INT64_MAX/MIN
+    /// (timestamp) since its own epoch; adding the epoch offset wrapped them
+    /// into garbage dates with no error (system review 2026-10-07, P6).
+    /// ClickHouse has no infinity here, so the transcode must refuse — and
+    /// finite values must keep the checked arithmetic.
+    #[test]
+    fn infinity_dates_and_timestamps_are_refused_not_wrapped() {
+        for d in [i32::MAX, i32::MIN] {
+            let e = transcode_field(RbType::Date32, &d.to_be_bytes(), &mut Vec::new()).unwrap_err();
+            assert!(e.to_string().contains("infinity"), "{e}");
+        }
+        for t in [i64::MAX, i64::MIN] {
+            let e = transcode_field(RbType::Ts64, &t.to_be_bytes(), &mut Vec::new()).unwrap_err();
+            assert!(e.to_string().contains("infinity"), "{e}");
+        }
+        let mut out = Vec::new();
+        // A finite far-future date still rebases (checked, no wrap).
+        let d = 100_000i32; // ~2293-10-27, inside ClickHouse Date32's range.
+        transcode_field(RbType::Date32, &d.to_be_bytes(), &mut out).unwrap();
+        assert_eq!(out, (d + PG_EPOCH_DAYS).to_le_bytes());
     }
 }
