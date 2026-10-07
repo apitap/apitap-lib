@@ -229,6 +229,8 @@ LEGS = [
         proves={"bulk.sibling-cancel": ("bq",)}),
     leg("e2e_worker_cancel.py", "the same, into MySQL", argv=["my"],
         proves={"bulk.sibling-cancel": ("my",)}),
+
+    leg("e2e_fk_guard.py",         "a destination FK into a group is refused before any row moves"),
 ]
 
 
