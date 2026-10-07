@@ -232,6 +232,7 @@ LEGS = [
 
     leg("e2e_fk_guard.py",         "a destination FK into a group is refused before any row moves"),
     leg("e2e_my_charset_guard.py", "a non-UTF-8 string column is refused before a CDC run", {"mariadb"}),
+    leg("e2e_myengine_commit.py",  "a MyISAM transaction ends on its QUERY COMMIT", {"mariadb"}),
 ]
 
 
