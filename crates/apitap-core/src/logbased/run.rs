@@ -1025,7 +1025,7 @@ async fn run_group(
             // released them here and let the bulk lock cover the load, which
             // left the table free between the two and after the load, while
             // the drain still owned its slot and its watermark.)
-            bootstrap_group(src_url, dst_url, opts, &tenure, &src, slot, &ctxs).await
+            bootstrap_group(src_url, dst_url, opts, &tenure, &src, slot, &ctxs, budget_denom).await
         } else {
             let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty").get();
             drain_group(
@@ -1352,6 +1352,14 @@ async fn existing_slots(src: &PgPool, names: &[&str]) -> Result<Vec<(String, boo
     Ok(rows)
 }
 
+/// Bootstrap fan-out shared by `slots=N` groups: the destination's lane
+/// count divides by how many groups bootstrap at once, so the process keeps
+/// the documented memory ceiling no matter how many slots run in it (system
+/// review 2026-10-07, G0.8). The floor stays 1 — a group always loads.
+fn bootstrap_lanes_for(lanes: usize, groups: usize) -> usize {
+    (lanes / groups.max(1)).max(1)
+}
+
 async fn bootstrap_group(
     src_url: &str,
     dst_url: &str,
@@ -1360,6 +1368,7 @@ async fn bootstrap_group(
     src: &PgPool,
     slot: &str,
     ctxs: &[TableCtx],
+    budget_denom: usize,
 ) -> Result<Vec<(u64, usize)>> {
     let (dest, run) = (tenure.dest(), tenure.run());
     // A slot with no matching state is a leftover from an aborted bootstrap —
@@ -1414,7 +1423,7 @@ async fn bootstrap_group(
     // load is an independent replace from the ONE pinned snapshot, so gap-free
     // and duplicate-free are unchanged.
     use futures::stream::StreamExt as _;
-    let concurrency = dest.bootstrap_lanes();
+    let concurrency = bootstrap_lanes_for(dest.bootstrap_lanes(), budget_denom);
     let drop_slot = || async {
         let _ = sqlx::query("SELECT pg_drop_replication_slot($1)").bind(slot).execute(src).await;
     };
@@ -2409,6 +2418,18 @@ mod tests {
         std::env::set_var("APITAP_WINDOW_MAX_SECS", "30");
         assert_eq!(window_max_secs(), 30);
         std::env::remove_var("APITAP_WINDOW_MAX_SECS");
+    }
+
+    /// With `slots=N` groups bootstrapping at once, the destination fan-out
+    /// divides so the memory ceiling belongs to the process, not to each
+    /// group — and never reaches zero (system review 2026-10-07, G0.8).
+    #[test]
+    fn bootstrap_fan_out_divides_across_slots_but_never_reaches_zero() {
+        assert_eq!(bootstrap_lanes_for(4, 1), 4);
+        assert_eq!(bootstrap_lanes_for(4, 4), 1);
+        assert_eq!(bootstrap_lanes_for(2, 4), 1);
+        assert_eq!(bootstrap_lanes_for(8, 3), 2);
+        assert_eq!(bootstrap_lanes_for(0, 3), 1);
     }
 
     /// Two pipelines that share a source and a destination table NAME but
