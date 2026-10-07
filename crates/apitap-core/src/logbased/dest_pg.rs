@@ -279,6 +279,31 @@ async fn apply_unit(
     // so no quoting rule (backslash, newline, a quote in the payload) can be
     // got wrong, which the old cell-literal rendering did for anything but a
     // lone apostrophe (system review 2026-10-07, dest_pg binds).
+    //
+    // A parameter arrives as `text`, and `text` has no `=` operator against
+    // an integer (or any non-text) column — the old literals were coerced by
+    // the server, a parameter is not. So each value also names the column's
+    // own type, read once from the destination's catalog, and the placeholder
+    // is cast with it: `"id" = $3::integer`. The value still travels as a
+    // bind; nothing embeds (this cast bug is the regression
+    // e2e_logbased/e2e_toast_rekey caught).
+    let casts: std::collections::HashMap<String, String> = if c.residue.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let names: Vec<String> = wal_cols.to_vec();
+        let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
+             FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.attname::text = ANY($2)",
+        )
+        .bind(&ft)
+        .bind(&names)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().collect()
+    };
     for op in &c.residue {
         let mut binds: Vec<Option<String>> = Vec::new();
         let sql = match op {
@@ -291,22 +316,28 @@ async fn apply_unit(
                     })
                     .map(|(cname, cell)| {
                         binds.push(bind_of(cell));
-                        format!("{} = ${}", quote_ident(cname), binds.len())
+                        format!(
+                            "{} = ${}::{}",
+                            quote_ident(cname),
+                            binds.len(),
+                            cast_of(&casts, cname)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 if sets.is_empty() {
                     continue;
                 }
-                let pred = key_pred_bound(pk_cols, key, &mut binds);
+                let pred = key_pred_bound(pk_cols, key, &casts, &mut binds);
                 format!("UPDATE {ft} SET {sets} WHERE {pred}")
             }
             ResidueOp::Upsert { row } => {
-                let vals = row
+                let vals = wal_cols
                     .iter()
-                    .map(|cell| {
+                    .zip(row.iter())
+                    .map(|(cname, cell)| {
                         binds.push(bind_of(cell));
-                        format!("${}", binds.len())
+                        format!("${}::{}", binds.len(), cast_of(&casts, cname))
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -327,7 +358,7 @@ async fn apply_unit(
                 )
             }
             ResidueOp::Delete { key } => {
-                let pred = key_pred_bound(pk_cols, key, &mut binds);
+                let pred = key_pred_bound(pk_cols, key, &casts, &mut binds);
                 format!("DELETE FROM {ft} WHERE {pred}")
             }
             ResidueOp::Rekey { old_key, row, .. } => {
@@ -344,7 +375,12 @@ async fn apply_unit(
                     .filter(|(_, cell)| !matches!(cell, Cell::UnchangedToast))
                     .map(|(cname, cell)| {
                         binds.push(bind_of(cell));
-                        format!("{} = ${}", quote_ident(cname), binds.len())
+                        format!(
+                            "{} = ${}::{}",
+                            quote_ident(cname),
+                            binds.len(),
+                            cast_of(&casts, cname)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -356,7 +392,7 @@ async fn apply_unit(
                 // Idempotent on replay by construction: once the move has
                 // been applied the old key is gone, so a re-applied window
                 // matches zero rows and changes nothing.
-                let pred = key_pred_bound(pk_cols, old_key, &mut binds);
+                let pred = key_pred_bound(pk_cols, old_key, &casts, &mut binds);
                 format!("UPDATE {ft} SET {sets} WHERE {pred}")
             }
         };
@@ -737,12 +773,22 @@ fn bind_of(cell: &Cell) -> Option<String> {
     }
 }
 
-/// The residue WHERE clause: every key value binds as the next `$n`; the
-/// clause carries column names only (system review 2026-10-07, dest_pg
-/// binds).
+/// The column's own type, as `format_type` names it, for the placeholder
+/// cast; a column the catalog did not answer for falls back to `text`.
+fn cast_of(casts: &std::collections::HashMap<String, String>, col: &str) -> String {
+    casts
+        .get(col)
+        .cloned()
+        .unwrap_or_else(|| "text".to_string())
+}
+
+/// The residue WHERE clause: every key value binds as the next `$n`, cast to
+/// the column's own type (`integer = text` has no operator — system review
+/// 2026-10-07, dest_pg binds).
 fn key_pred_bound(
     pk_cols: &[String],
     key: &[Vec<u8>],
+    casts: &std::collections::HashMap<String, String>,
     binds: &mut Vec<Option<String>>,
 ) -> String {
     pk_cols
@@ -750,7 +796,7 @@ fn key_pred_bound(
         .zip(key.iter())
         .map(|(c, v)| {
             binds.push(Some(String::from_utf8_lossy(v).into_owned()));
-            format!("{} = ${}", quote_ident(c), binds.len())
+            format!("{} = ${}::{}", quote_ident(c), binds.len(), cast_of(casts, c))
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -833,9 +879,11 @@ mod tests {
     #[test]
     fn residue_keys_and_cells_bind_instead_of_embedding() {
         let pk = vec!["id".to_string()];
+        let mut casts = std::collections::HashMap::new();
+        casts.insert("id".to_string(), "integer".to_string());
         let mut binds: Vec<Option<String>> = Vec::new();
-        let pred = key_pred_bound(&pk, &[b"x'; DROP TABLE t; --".to_vec()], &mut binds);
-        assert_eq!(pred, "\"id\" = $1");
+        let pred = key_pred_bound(&pk, &[b"x'; DROP TABLE t; --".to_vec()], &casts, &mut binds);
+        assert_eq!(pred, "\"id\" = $1::integer");
         assert_eq!(binds, vec![Some("x'; DROP TABLE t; --".to_string())]);
 
         let poison = Cell::Text(b"a'b\\c\n".as_slice().into());
