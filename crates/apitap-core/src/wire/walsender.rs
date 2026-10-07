@@ -587,19 +587,73 @@ fn percent_decode(s: &str) -> Result<String> {
     String::from_utf8(out).map_err(|e| Error::InvalidInput(format!("url not utf-8: {e}")))
 }
 
+/// The `logical_decoding_work_mem` override, if the operator asked for one.
+///
+/// **Default: none — the server's own value stands.** apitap used to raise it
+/// to 1 GiB on EVERY replication session, including production instances whose
+/// settings the operator chose for their own memory budget; with `slots=N` a
+/// 2-4 GB source could be pushed into OOM by the client's knob (system review
+/// 2026-10-07, P5). Raising it does keep a big transaction's ReorderBuffer off
+/// pg_replslot spill files (measured 14.5 s → 11.9 s on a 500K-row-tx window),
+/// so `APITAP_DECODE_WORKMEM` remains as an explicit opt-in, honored up to
+/// 256 MiB — the client's own cage cannot put more to use — and anything
+/// larger is refused by name rather than silently clamped.
+fn decode_workmem_override() -> Result<Option<String>> {
+    const CAP: u64 = 256 << 20;
+    let Ok(v) = std::env::var("APITAP_DECODE_WORKMEM") else {
+        return Ok(None);
+    };
+    let v = v.trim().to_string();
+    if matches!(v.as_str(), "" | "0" | "off") {
+        return Ok(None);
+    }
+    let bytes = parse_pg_size(&v).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "APITAP_DECODE_WORKMEM='{v}' is not a Postgres size (e.g. '64MB', '256MB')"
+        ))
+    })?;
+    if bytes > CAP {
+        return Err(Error::InvalidInput(format!(
+            "APITAP_DECODE_WORKMEM='{v}' exceeds the 256 MiB cap: this setting is applied to the \
+             SOURCE database's decoding session, so a larger value risks the source's memory. \
+             Lower it, or leave it unset to follow the server's own logical_decoding_work_mem."
+        )));
+    }
+    Ok(Some(v))
+}
+
+/// Postgres GUC size strings: an integer or decimal followed by an optional
+/// unit (`kB`, `MB`, `GB`, `TB`, `B`, case-insensitive, space allowed).
+fn parse_pg_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: f64 = num.trim().parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1024.0,
+        "m" | "mb" => 1024.0 * 1024.0,
+        "g" | "gb" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((n * mult) as u64)
+}
+
 impl Walsender {
     /// Open a `replication=database` session and authenticate.
     ///
-    /// The first attempt rides GUCs in the startup `options` field: raising
-    /// `logical_decoding_work_mem` keeps a big transaction's ReorderBuffer
-    /// off pg_replslot spill files (measured 14.5s → 11.9s on a 500K-row-tx
-    /// window). It is PGC_USERSET, so no server config is needed — but if
-    /// the server rejects the options for any reason, retry plain rather
-    /// than fail a connection that worked fine before this optimization.
+    /// The startup `options` field carries an explicit
+    /// `APITAP_DECODE_WORKMEM` when (and only when) the operator set one, so a
+    /// big transaction's ReorderBuffer can stay off pg_replslot spill files.
+    /// By default nothing is raised: the server's own value applies. If the
+    /// server rejects the options for any reason, retry plain rather than fail
+    /// a connection that worked fine before this optimization.
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        let workmem =
-            std::env::var("APITAP_DECODE_WORKMEM").unwrap_or_else(|_| "1GB".to_string());
-        if !matches!(workmem.as_str(), "" | "0" | "off") {
+        if let Some(workmem) = decode_workmem_override()? {
             let opts = format!("-c logical_decoding_work_mem={workmem}");
             match Self::connect_with(url, Some(&opts), true).await {
                 Ok(ws) => return Ok(ws),
@@ -1247,9 +1301,10 @@ impl Walsender {
     /// a big transaction WHILE decoding it (blocks flush every
     /// `logical_decoding_work_mem`), so the client consumes concurrently
     /// with the server's own WAL scan instead of waiting for the full
-    /// decode. The threshold is deliberately kept LOW on this path (stream
-    /// early = pipeline long). If the server refuses v2 (pre-14), fall back
-    /// to v1 with a big work_mem so nothing spills to pg_replslot files.
+    /// decode. The flush threshold is the server's own value unless the
+    /// operator set `APITAP_DECODE_WORKMEM` (capped at 256 MiB); the client
+    /// never raises it implicitly. If the server refuses v2 (pre-14), fall
+    /// back to v1.
     ///
     /// `APITAP_PG_BINARY=1` adds `binary 'true'` (PG14+) to the first
     /// attempt: the walsender then ships `send`-format tuples instead of
@@ -1270,19 +1325,13 @@ impl Walsender {
             std::env::var("APITAP_PG_BINARY").as_deref(),
             Ok("1") | Ok("true") | Ok("on")
         );
-        // The connection already carries this as a startup option, and this
-        // SET used to overwrite it with a hard-coded 64MB — so
-        // APITAP_DECODE_WORKMEM was inert on the streaming path, while the
-        // savepoint refusal told operators to reach for it. Same source of
-        // truth in both places now.
-        //
-        // It is re-issued rather than trusted because the startup `options`
-        // attempt falls back to a plain connection when the server rejects
-        // it, and a run that quietly lost the setting is how a large
-        // transaction starts spilling to pg_replslot.
-        let workmem =
-            std::env::var("APITAP_DECODE_WORKMEM").unwrap_or_else(|_| "1GB".to_string());
-        if !matches!(workmem.as_str(), "" | "0" | "off") {
+        // Re-issued rather than trusted because the startup `options` attempt
+        // falls back to a plain connection when the server rejects it, and a
+        // run that quietly lost an explicit setting is how a large transaction
+        // starts spilling to pg_replslot. With no `APITAP_DECODE_WORKMEM` the
+        // server's own value stands (review P5: apitap used to raise 1 GiB on
+        // every session, including production sources it does not own).
+        if let Some(workmem) = decode_workmem_override()? {
             self.simple_query(&format!(
                 "SET logical_decoding_work_mem = '{}'",
                 workmem.replace('\'', "")
@@ -1719,6 +1768,35 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// The decode-work-memory policy: unset follows the server, an explicit
+    /// value is honored up to 256 MiB, anything larger or unparseable is a
+    /// loud refusal — never a silent 1 GiB raise on the user's source
+    /// (system review 2026-10-07, P5).
+    #[test]
+    fn decode_workmem_follows_the_server_unless_explicitly_capped() {
+        std::env::remove_var("APITAP_DECODE_WORKMEM");
+        assert_eq!(super::decode_workmem_override().unwrap(), None);
+        std::env::set_var("APITAP_DECODE_WORKMEM", "off");
+        assert_eq!(super::decode_workmem_override().unwrap(), None);
+        std::env::set_var("APITAP_DECODE_WORKMEM", "64MB");
+        assert_eq!(
+            super::decode_workmem_override().unwrap().as_deref(),
+            Some("64MB")
+        );
+        std::env::set_var("APITAP_DECODE_WORKMEM", "256 MB");
+        assert!(super::decode_workmem_override().is_ok());
+        std::env::set_var("APITAP_DECODE_WORKMEM", "1GB");
+        let e = super::decode_workmem_override().unwrap_err();
+        assert!(e.to_string().contains("256 MiB cap"), "{e}");
+        std::env::set_var("APITAP_DECODE_WORKMEM", "lots");
+        assert!(super::decode_workmem_override().is_err());
+        std::env::remove_var("APITAP_DECODE_WORKMEM");
+        assert_eq!(super::parse_pg_size("1.5GB"), Some(1_610_612_736));
+        assert_eq!(super::parse_pg_size("1024"), Some(1024));
+        assert_eq!(super::parse_pg_size("64 kb"), Some(65536));
+        assert_eq!(super::parse_pg_size("12x"), None);
+    }
+
     use super::*;
 
     /// RFC 7677's published SCRAM-SHA-256 test vector — including the
