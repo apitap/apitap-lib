@@ -9,14 +9,43 @@ resources scale up**.
 
 | metric | measured | source |
 |---|---|---|
-| CPU per change (6.45M-change census) | **57 µs/change** | 0.58 report §5 |
+| **client CPU per change, catch-up @0.5 CPU** | **15.35 µs/change** (31,679 ch/s = 95% of quota) | 0.58 report §6 |
+| **destination statement time per change (CH side)** | **57 µs/change** (367 s / 6.45M changes) | same §6 |
 | 30-table group, catch-up @0.5 CPU | **31,679 ch/s = 1.90M/min** | `cdc-steady-30t-0.58.md:376` |
-| 30-table group, paced/keep-up | ~**1.50M/min** | `:398` |
+| 30-table group, paced/keep-up | ~**1.50M/min** (25k/s) | `:398`, review §5.6 |
 | single-table 0.59 (release wheel) | 2.19M/min writer kept up with @0.40 core, 101 MB | leg b59-single2 |
 
-Target math: 50,000/s × 0.5 core = **10 µs/change** total budget. From 57 µs that is
-**5.7×**; the review's lever path (L1a…L6, §2 below) lands at 7.3–13.3 µs =
-42–65k/s = **2.5–3.9M/min** — enough with margin.
+**Two different cost families, two different lever sets.** 57 µs/change is NOT
+client CPU — it is ClickHouse statement time per change, and it is attacked in
+§0.2. The client-CPU target math is: 50,000/s × 0.5 core = **10 µs/change**;
+today's 15.35 µs is **1.6×** away, and the lever path lands inside:
+
+| stage | µs/change | ch/s @95% quota | M/min |
+|---|---|---|---|
+| today (MEASURED) | 15.35 | 31,679 | 1.90 |
+| + wave-2 levers, no L2 (ESTIMATE) | 11.3–13.3 | 35.7k–42.0k | 2.1–2.5 |
+| + L2 if it also pays at catch-up (ESTIMATE) | 7.3–11.3 | 42k–65k | 2.5–3.9 |
+| **target** | **9.5** | **50,000** | **3.0** |
+
+### 0.2 Destination-side budget (the other half of the wall)
+
+The 367 s of destination statement time per 6.45M changes decomposes as:
+
+- **state write**: one 28 ms INSERT per member per window, 2,250 in the run ≈ 63 s;
+- **per-active-member pair**: DELETE 66 ms p50 + INSERT 56 ms p50, 1,747 each ≈ 213 s;
+- concurrency only reaches **~1.6 statements** in flight.
+
+Levers, in order of measured headroom:
+
+1. **One batched state INSERT per window** (a group unit whose `owner_pred` is a
+   single multi-key subquery) — ~70 s of the 367 s.
+2. **Raise statement concurrency** (longer window cadence or a second apply
+   consumer) toward the client-CPU ceiling (~36k/s at 0.5 core).
+3. **Insert-only replica mode** (§3.5) removes the DELETE pair entirely — the
+   only route for a 30-table group with every table active.
+
+Keep-up today is 25k/s MEASURED; G1.1 + G1.4 alone lift it to ±29–35k/s before
+any per-change work. §5.7 (catch-up recv size) decides whether L2 pays there.
 
 ## 1. Hot-path map (real code, one change)
 
@@ -64,9 +93,9 @@ lanes** plus the key table — the most expensive statements; `changelog=True`
 | L5 | recycle per-window containers (maps, Vecs, 1+4 MiB render buffers) through a bounded return channel | 0.1–0.3 µs | medium |
 | L6 | per-window arena for cell `Vec`s; key render without `Vec<&[u8]>` | 0.15–0.3 µs | medium |
 
-Projection: without L2 **11.3–13.3 µs** (35.7–42k/s); with L2 **7.3–11.3 µs**
-(42–65k/s). 50k/s sits inside the range — provided L2 also lands at catch-up;
-**measure §5.7 first**: catch-up recv-size decides whether L2 pays there.
+Projection from today's measured **15.35 µs**: without L2 **11.3–13.3 µs**
+(35.7–42k/s); with L2 **7.3–11.3 µs** (42–65k/s). 50k/s sits inside the range —
+provided L2 also lands at catch-up; **measure §5.7 first**.
 
 ## 3. Low-level design per component
 
@@ -83,6 +112,11 @@ Projection: without L2 **11.3–13.3 µs** (35.7–42k/s); with L2 **7.3–11.3 
 - Frames are scanned synchronously: 5 B header → `advance`; payload `Bytes`
   *moved* (no `slice_ref`, no refcount promotion for REPLICA IDENTITY DEFAULT —
   `Cellv` already stores ranges into the frame; keep it that way).
+- **Interface**: `Walsender` keeps the write half (standby status, stop
+  replication); the read half and the recycled buffers move into the drain
+  window (`FrameScanner`). Replies to `reply_requested` keepalives still go out
+  on the write half; the coalescing wait is capped at 1 ms, so the reply
+  deadline (`wal_sender_timeout / 2`, 30 s default) is never at risk.
 
 ### 3.2 pgoutput decode
 - Keep the existing **zero-copy range** path (`CellR`/`Cellv`).
@@ -169,9 +203,11 @@ Projection: without L2 **11.3–13.3 µs** (35.7–42k/s); with L2 **7.3–11.3 
     monotonically** (a scaling regression is a FAIL).
 - Order: **measure §5.7 first** → L1a → L1b → L3 → L3b (A/B, drop if flat) →
   L4 → L5 → L6 → L2 A/B → MySQL C–G (G1.2 first) → CH insert-only.
-- Definition of done for 0.61: catch-up **≤11 µs/change MEASURED**, keep-up
-  50k/s paced checksum-exact at 0.5/256, both legs above green, full gate
-  green, 0.61.0 released with numbers (not estimates).
+- Definition of done for 0.61: catch-up **≤11 µs/change client CPU MEASURED**
+  (target 9.5), destination statement time reduced per §0.2 (batched state
+  writes; insert-only where the product chooses it), keep-up 50k/s paced
+  checksum-exact at 0.5/256, both legs above green, full gate green, 0.61.0
+  released with numbers (not estimates).
 
 ## 5. Deliberately not doing
 
