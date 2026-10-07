@@ -43,6 +43,16 @@ def dst(q):
     return sql("apitap-bench-pg-dst", "apitap_bench_dst", q)
 
 
+def wipe_state():
+    """An earlier attempt's watermark would make this run a drain of a slot
+    that may no longer exist; clear the destination's state rows so the next
+    run bootstraps fresh (stale slots with no state are dropped by bootstrap).
+    """
+    if dst("SELECT count(*) FROM information_schema.tables "
+           "WHERE table_name='_apitap_state'") != "0":
+        dst("DELETE FROM _apitap_state WHERE dest_table IN ('fk_parent', 'fk_child')")
+
+
 def drain(extra_env=None):
     """Run a CDC drain in a child so the refusal's stderr can be inspected."""
     code = (
@@ -56,6 +66,7 @@ def drain(extra_env=None):
 
 
 def main():
+    wipe_state()
     src("DROP TABLE IF EXISTS fk_child CASCADE; DROP TABLE IF EXISTS fk_parent CASCADE;")
     dst("DROP TABLE IF EXISTS fk_child CASCADE; DROP TABLE IF EXISTS fk_parent CASCADE;"
         "DROP TABLE IF EXISTS fk_out CASCADE;")
@@ -100,6 +111,7 @@ def main():
     dst("DROP TABLE IF EXISTS fk_child CASCADE; DROP TABLE IF EXISTS fk_parent CASCADE;"
         "DROP TABLE IF EXISTS fk_out CASCADE;")
     src("DROP TABLE IF EXISTS fk_child CASCADE; DROP TABLE IF EXISTS fk_parent CASCADE;")
+    wipe_state()
     print("✓ FK into a group member refused at admission with its remedy; outside-parent FK drains")
 
 
