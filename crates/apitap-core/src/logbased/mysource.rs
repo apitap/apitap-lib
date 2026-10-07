@@ -653,11 +653,29 @@ pub(crate) async fn drain_binlog(
             bl::TYPE_QUERY => {
                 let (db, sql) = bl::parse_query(body)?;
                 let head = sql.trim_start();
-                if head.len() >= 6 && head[..6].eq_ignore_ascii_case("begin") {
+                let verb = query_verb(head);
+                if verb == QueryVerb::Begin {
                     // Transaction opens: anything buffered from a torn
                     // previous attempt is stale.
                     tx_buf.clear();
-                } else if is_ddl(head) {
+                } else if verb == QueryVerb::Commit {
+                    // A non-transactional engine (MyISAM, Aria, MEMORY) commits
+                    // with an explicit `COMMIT` QUERY event and no XID: the
+                    // buffered ops are real and the watermark advances past this
+                    // event, exactly as for TYPE_XID. Without this arm MariaDB's
+                    // next GTID event cleared the buffer before it was drained
+                    // (the rows vanished silently) and MySQL held them until the
+                    // next XID (system review 2026-10-07, R1).
+                    drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
+                    end_mark = pack_pos(&sess.file, h.log_pos);
+                    if end_mark >= stop_line {
+                        break;
+                    }
+                    if buf_bytes >= max_buf_bytes {
+                        hit_budget = true;
+                        break;
+                    }
+                } else if verb == QueryVerb::Ddl {
                     // Anything already buffered belongs to the transaction this
                     // DDL implicitly committed, so it lands FIRST, under the
                     // layouts it was decoded against.
@@ -677,7 +695,7 @@ pub(crate) async fn drain_binlog(
                     // — it is DDL, it auto-commits, and it is its own commit
                     // boundary. Apply it here or it is lost, which is exactly
                     // what happened until 0.56.0.
-                    if head.len() >= 8 && head[..8].eq_ignore_ascii_case("truncate") {
+                    if starts_with_word(head, "truncate") {
                         match truncate_target(head, &db) {
                             // `sess.tracked` is the authority on what this run
                             // follows. The first draft asked `collapsers` instead
@@ -878,11 +896,84 @@ fn truncate_target(sql: &str, db: &str) -> Option<String> {
     })
 }
 
+/// Case-insensitive WORD-prefix test: `s` starts with `w` and the following
+/// character (if any) is not alphanumeric/underscore. The old spellings
+/// (`s[..k.len()].eq_ignore_ascii_case(k)`) compared a fixed slice, which
+/// could panic on a non-ASCII byte boundary — and the `begin` check even
+/// compared SIX bytes to a five-letter word, so a transaction-open never
+/// matched and a torn attempt's leftovers were never cleared.
+fn starts_with_word(s: &str, w: &str) -> bool {
+    s.get(..w.len()).is_some_and(|p| p.eq_ignore_ascii_case(w))
+        && s[w.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_')
+}
+
+/// What a binlog QUERY event's statement means to the drain loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryVerb {
+    Begin,
+    Commit,
+    Ddl,
+    Other,
+}
+
+/// Classify the QUERY statement. `COMMIT` matters because a non-transactional
+/// engine (MyISAM, Aria, MEMORY) ends its implicit transaction with an
+/// explicit `COMMIT` QUERY event and no XID — treating it as `Other` left the
+/// buffered rows to be cleared by the NEXT transaction's GTID event (MariaDB:
+/// silently lost) or held until the next XID (MySQL). See system review
+/// 2026-10-07, R1.
+fn query_verb(head: &str) -> QueryVerb {
+    if starts_with_word(head, "begin") {
+        QueryVerb::Begin
+    } else if starts_with_word(head, "commit") {
+        QueryVerb::Commit
+    } else if is_ddl(head) {
+        QueryVerb::Ddl
+    } else {
+        QueryVerb::Other
+    }
+}
+
 fn is_ddl(sql: &str) -> bool {
     let s = sql.trim_start();
     ["alter", "create", "drop", "rename", "truncate"]
         .iter()
-        .any(|k| s.len() >= k.len() && s[..k.len()].eq_ignore_ascii_case(k))
+        .any(|k| starts_with_word(s, k))
+}
+
+#[cfg(test)]
+mod query_verbs_tests {
+    use super::{is_ddl, query_verb, starts_with_word, QueryVerb};
+
+    /// The old `begin` check compared SIX bytes to a five-letter word (so a
+    /// transaction-open never matched) and `is_ddl` sliced fixed prefixes (a
+    /// panic on a non-ASCII boundary). The classifier must be
+    /// case-insensitive, word-bounded, and total — and `COMMIT` must be its
+    /// own verb, because a non-transactional engine commits through it with
+    /// no XID (system review 2026-10-07, R1).
+    #[test]
+    fn query_verbs_are_classified_by_word_not_by_fixed_slices() {
+        assert_eq!(query_verb("BEGIN"), QueryVerb::Begin);
+        assert_eq!(query_verb("begin;"), QueryVerb::Begin);
+        assert_eq!(query_verb("start transaction"), QueryVerb::Other);
+        assert_eq!(query_verb("COMMIT"), QueryVerb::Commit);
+        assert_eq!(query_verb("commit /*x*/"), QueryVerb::Commit);
+        assert_eq!(query_verb("COMMITMENT"), QueryVerb::Other);
+        assert_eq!(query_verb("TRUNCATE TABLE t"), QueryVerb::Ddl);
+        assert_eq!(query_verb("create table t (id int)"), QueryVerb::Ddl);
+        assert_eq!(query_verb("/* leading */ TRUNCATE t"), QueryVerb::Other);
+        // A byte at the old fixed-slice boundary that is not a char boundary:
+        // the fixed-slice spellings panicked here; the classifier must not.
+        assert_eq!(query_verb("12345é"), QueryVerb::Other);
+        assert!(starts_with_word("truncate t", "truncate"));
+        assert!(!starts_with_word("truncated", "truncate"));
+        assert!(!starts_with_word("beginning", "begin"));
+        assert!(is_ddl("drop table t"));
+        assert!(!is_ddl("commit"));
+    }
 }
 
 #[cfg(test)]
