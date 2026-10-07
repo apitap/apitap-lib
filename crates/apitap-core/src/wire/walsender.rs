@@ -111,6 +111,13 @@ impl Drop for Walsender {
     }
 }
 
+/// The opt-in that lets a cleartext/MD5 authentication downgrade through on
+/// an unverified channel; anything but exactly "1" is a no (system review
+/// 2026-10-07, auth downgrade).
+fn auth_downgrade_allowed() -> bool {
+    std::env::var("APITAP_ALLOW_INSECURE_AUTH").ok().as_deref() == Some("1")
+}
+
 /// The pump: forward every frame until the consumer hangs up, an error
 /// lands, or ReadyForQuery ends the replication conversation. No select!
 /// over the read — a frame read is never cancelled mid-way (protocol
@@ -865,10 +872,34 @@ impl Walsender {
                     let code = u32::from_be_bytes(
                         msg.get(0..4).ok_or_else(short)?.try_into().unwrap(),
                     );
+                    // A cleartext or MD5 request is a downgrade the PEER
+                    // chooses, not us: on an unverified channel a MITM can
+                    // ask for the password itself, and MD5 is offline-
+                    // crackable even over TLS. Allowed only when the channel
+                    // is verified (verify-full) or the operator opted in
+                    // (system review 2026-10-07, auth downgrade).
+                    let downgrade_ok =
+                        ci.ssl == SslMode::VerifyFull || auth_downgrade_allowed();
+                    let guard_downgrade = |what: &str| -> Result<()> {
+                        if downgrade_ok {
+                            return Ok(());
+                        }
+                        Err(Error::Transfer(format!(
+                            "walsender: the server asked for a {what}, which exposes \
+                             the password on an unverified channel (a MITM can ask \
+                             for cleartext, and MD5 is offline-crackable). Use \
+                             sslmode=verify-full, or set APITAP_ALLOW_INSECURE_AUTH=1 \
+                             if the network is trusted"
+                        )))
+                    };
                     match code {
                         0 => {} // AuthenticationOk
-                        3 => self.send_password(&ci.password).await?, // cleartext
+                        3 => {
+                            guard_downgrade("cleartext password")?;
+                            self.send_password(&ci.password).await?;
+                        }
                         5 => {
+                            guard_downgrade("MD5 password")?;
                             let salt: [u8; 4] =
                                 msg.get(4..8).ok_or_else(short)?.try_into().unwrap();
                             self.send_password(&md5_password(&ci.user, &ci.password, salt))
@@ -1852,6 +1883,19 @@ mod tests {
         std::env::set_var("APITAP_PUMP_BUF_BYTES", "8M");
         assert_eq!(super::pump_buf_limit(), 8 << 20);
         std::env::remove_var("APITAP_PUMP_BUF_BYTES");
+    }
+
+    /// A downgrade needs an explicit "1": unset, anything else, and even
+    /// "true" are refusals (system review 2026-10-07, auth downgrade).
+    #[test]
+    fn insecure_auth_downgrade_needs_an_explicit_one() {
+        std::env::remove_var("APITAP_ALLOW_INSECURE_AUTH");
+        assert!(!super::auth_downgrade_allowed());
+        std::env::set_var("APITAP_ALLOW_INSECURE_AUTH", "true");
+        assert!(!super::auth_downgrade_allowed());
+        std::env::set_var("APITAP_ALLOW_INSECURE_AUTH", "1");
+        assert!(super::auth_downgrade_allowed());
+        std::env::remove_var("APITAP_ALLOW_INSECURE_AUTH");
     }
 
     use super::*;
