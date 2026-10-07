@@ -929,25 +929,14 @@ async fn run_group(
         }
     }
 
-    // Stable slot/publication names. A group of ONE keeps the historical
-    // single-table naming so existing slots stay owned; bigger groups hash
-    // their sorted membership — changing membership means a NEW slot (and a
-    // loud partial-state error below until the old state is cleared).
-    let slot = if single {
-        let c = &ctxs[0];
-        format!("apitap_{}", hex_prefix(&format!("{}\u{1f}{}", c.source_id, c.dest_table), 12))
-    } else {
-        let mut pairs: Vec<String> = ctxs
-            .iter()
-            .map(|c| format!("{}\u{1f}{}", c.source_id, c.dest_table))
-            .collect();
-        pairs.sort_unstable();
-        format!("apitap_g{}", hex_prefix(&pairs.join("\u{1e}"), 11))
-    };
-    let publication = format!("{slot}_pub");
-
+    // Stable slot/publication names, destination-aware; `slot_legacy` is the
+    // pre-0.59 spelling a pipeline with existing state may still own. Which
+    // one this run uses is decided AFTER the state read (a fresh pipeline
+    // always uses the new name; one with state keeps its own slot), so
+    // `ensure_publication` moved inside the block below.
+    let (slot_new, slot_legacy) =
+        slot_names(&ctxs, single, &crate::pipeline::source_origin(dst_url));
     let qualified_all: Vec<&str> = ctxs.iter().map(|c| c.qualified.as_str()).collect();
-    ensure_publication(&src, &publication, &qualified_all).await?;
 
     // THE TENURE — before the bootstrap decision, before a watermark is read,
     // before a row moves. Lease first, then every member announced, then every
@@ -982,6 +971,34 @@ async fn run_group(
         }
         let have: Vec<&TableCtx> =
             ctxs.iter().zip(&wms).filter(|(_, w)| w.is_some()).map(|(c, _)| c).collect();
+        // Which slot name this run owns (system review 2026-10-07, P1). A
+        // pipeline WITH state keeps the slot it already established — the new
+        // destination-aware name when it has one, the legacy
+        // (destination-blind) name for pipelines that predate it — so an
+        // upgrade never orphans its own WAL. A fresh pipeline always uses the
+        // new name, and NO run probes or drops any other name: the pre-fix
+        // code dropped a same-named inactive slot, and a staging pipeline
+        // sharing the source and the destination table name could force
+        // production to re-bootstrap and lose the changelog across the gap.
+        let slot_owned = if have.is_empty() {
+            slot_new.clone()
+        } else {
+            let existing =
+                existing_slots(&src, &[slot_new.as_str(), slot_legacy.as_str()]).await?;
+            if existing.iter().any(|(n, _)| n == &slot_new) {
+                slot_new.clone()
+            } else if existing.iter().any(|(n, _)| n == &slot_legacy) {
+                slot_legacy.clone()
+            } else {
+                // Neither exists: keep the new name and let the drain's own
+                // missing-slot error explain (guided diagnostics land with
+                // G0.6).
+                slot_new.clone()
+            }
+        };
+        let publication = format!("{slot_owned}_pub");
+        ensure_publication(&src, &publication, &qualified_all).await?;
+        let slot = &slot_owned;
         if !have.is_empty() && have.len() != ctxs.len() {
             let missing: Vec<&str> = ctxs
                 .iter()
@@ -1008,14 +1025,14 @@ async fn run_group(
             // released them here and let the bulk lock cover the load, which
             // left the table free between the two and after the load, while
             // the drain still owned its slot and its watermark.)
-            bootstrap_group(src_url, dst_url, opts, &tenure, &src, &slot, &ctxs).await
+            bootstrap_group(src_url, dst_url, opts, &tenure, &src, slot, &ctxs).await
         } else {
             let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty").get();
             drain_group(
                 src_url,
                 &src,
                 tenure.clone(),
-                &slot,
+                slot,
                 &publication,
                 &ctxs,
                 wm,
@@ -1280,6 +1297,59 @@ async fn clear_group<'a>(tenure: &Tenure<Dest>, members: impl Iterator<Item = (&
             let _ = tenure.close(h, vec![mark]).await;
         }
     }
+}
+
+/// The slot/publication names a group may use: `(current, legacy)`.
+///
+/// The current hash includes the DESTINATION's normalized origin (credentials
+/// and query stripped). Before this, two pipelines that share a source and a
+/// destination table NAME but write to different destinations hashed
+/// identically, and each run treated the other's inactive slot as its own
+/// stale leftover and DROPPED it — forcing a re-bootstrap and losing the
+/// changelog history across the gap (system review 2026-10-07, P1). `legacy`
+/// is the pre-fix spelling: only a pipeline that already has state may adopt
+/// it, and no run ever drops a name it did not compute for itself.
+fn slot_names(ctxs: &[TableCtx], single: bool, dst_origin: &str) -> (String, String) {
+    if single {
+        let c = &ctxs[0];
+        (
+            format!(
+                "apitap_{}",
+                hex_prefix(
+                    &format!("{}\u{1f}{}\u{1f}{}", c.source_id, dst_origin, c.dest_table),
+                    12
+                )
+            ),
+            format!("apitap_{}", hex_prefix(&format!("{}\u{1f}{}", c.source_id, c.dest_table), 12)),
+        )
+    } else {
+        let mut new_pairs: Vec<String> = ctxs
+            .iter()
+            .map(|c| format!("{}\u{1f}{}\u{1f}{}", c.source_id, dst_origin, c.dest_table))
+            .collect();
+        new_pairs.sort_unstable();
+        let mut legacy_pairs: Vec<String> =
+            ctxs.iter().map(|c| format!("{}\u{1f}{}", c.source_id, c.dest_table)).collect();
+        legacy_pairs.sort_unstable();
+        (
+            format!("apitap_g{}", hex_prefix(&new_pairs.join("\u{1e}"), 11)),
+            format!("apitap_g{}", hex_prefix(&legacy_pairs.join("\u{1e}"), 11)),
+        )
+    }
+}
+
+/// Which of the given slot names exist on the source, and whether each is
+/// active. Read-only: no run ever drops a name it did not compute for itself.
+async fn existing_slots(src: &PgPool, names: &[&str]) -> Result<Vec<(String, bool)>> {
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT slot_name, active FROM pg_replication_slots WHERE slot_name = ANY($1)",
+    )
+    .bind(&names)
+    .fetch_all(src)
+    .await
+    .map_err(db_err)?;
+    Ok(rows)
 }
 
 async fn bootstrap_group(
@@ -2225,6 +2295,36 @@ mod tests {
             assert!(matches!(&r, Err(Error::Transfer(m)) if m == "boom"), "{r:?}");
             assert!(sibling_ran.load(SeqCst), "the in-flight sibling was cancelled");
         });
+    }
+
+    /// Two pipelines that share a source and a destination table NAME but
+    /// write to different destinations must not share a slot name — before
+    /// this, each run treated the other's inactive slot as its own stale
+    /// leftover and dropped it, forcing a re-bootstrap and losing the
+    /// changelog across the gap (system review 2026-10-07, P1). The legacy
+    /// name stays the destination-blind pre-fix hash, for adoption only.
+    #[test]
+    fn slot_names_carry_the_destination_identity() {
+        let ctx = |dest: &str| TableCtx {
+            table_arg: "t".into(),
+            qualified: "public.t".into(),
+            dest_table: dest.into(),
+            pk_cols: vec!["id".into()],
+            source_id: "postgres://h:5432/db::public.t".into(),
+        };
+        let (a, a_legacy) = slot_names(&[ctx("events")], true, "postgres://dst-a:5432/db");
+        let (b, b_legacy) = slot_names(&[ctx("events")], true, "postgres://dst-b:5432/db");
+        assert_ne!(a, b, "two destinations must not share a slot name");
+        assert_eq!(a_legacy, b_legacy, "the legacy name is the destination-blind pre-fix hash");
+        let (a2, _) = slot_names(&[ctx("events")], true, "postgres://dst-a:5432/db");
+        assert_eq!(a, a2, "the same source + destination + table is stable");
+        let (g1, g1_legacy) =
+            slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-a:5432/db");
+        let (g2, _) = slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-b:5432/db");
+        assert_ne!(g1, g2, "groups too");
+        let (_, g2_legacy) =
+            slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-b:5432/db");
+        assert_eq!(g1_legacy, g2_legacy);
     }
 
     /// A sibling's failure must not drop the members that already applied:
