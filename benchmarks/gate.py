@@ -235,6 +235,7 @@ LEGS = [
     leg("e2e_myengine_commit.py",  "a MyISAM transaction ends on its QUERY COMMIT", {"mariadb"}),
     leg("e2e_tx_cap.py",           "one transaction past the byte cap refuses; a fitting cap lands it"),
     leg("e2e_half_open.py",        "a frozen source fails the drain in its silence budget; the next run recovers"),
+    leg("e2e_two_destinations.py", "one source, two destinations: each resumes its own slot"),
 ]
 
 
