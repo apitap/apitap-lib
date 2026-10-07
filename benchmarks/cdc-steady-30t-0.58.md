@@ -381,10 +381,16 @@ drained after it stops. The target needs 33,333/s at 0.5 cores, i.e.
 at 94.9 % busy. Both halves are marginal; neither the source (78–84k/s alone)
 nor the destination (apply = 30 % of the drain's critical path) is the
 binding constraint. The remaining gap is the client's per-change CPU, ~53 % of
-which is kernel TCP receive for a one-packet-per-change WAL stream — a cost a
-same-host Unix socket would largely remove, and one that a dedicated host (the
-B1 28.4k was measured on a quiet box; today's quietest run hit 31.7k) would
-lower. Neither is an engine change this campaign could land.
+which the perf profile buckets into kernel time — but a follow-up measurement
+(`benchmarks/wal-tcp-cost-0.58.md`) shows that bucket is mostly syscalls,
+scheduler and memory accounting, NOT the TCP stack: the WAL stream is already
+coalesced (~0.61 packets and ~0.33 `recvfrom` per change at 39.5k changes/s),
+and the removable transport slice (loopback TCP + nftables) is under 10 % of
+the profile — a same-host Unix socket would buy single digits, not a
+multiplier. The remaining levers are userspace per-change costs (allocator,
+decode, rendering), a separate campaign; a dedicated quiet host would help
+more (the B1 28.4k was measured on a quiet box; today's quietest run hit
+31.7k).
 
 What B2 delivered: the state batch and the quota-aware lanes (committed,
 RED-tested), the census corrected, lever 3 measured and rejected on evidence,
