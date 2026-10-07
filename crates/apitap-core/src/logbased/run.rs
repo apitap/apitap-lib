@@ -1715,7 +1715,7 @@ async fn drain_loop(
     loop {
         let t_drain = std::time::Instant::now();
         let outcome =
-            drain(ws, &mut sess, cur, stop_line, key_cols, 3600, budget, &applied_rx, changelog).await?;
+            drain(ws, &mut sess, cur, stop_line, key_cols, window_max_secs(), budget, &applied_rx, changelog).await?;
         windows += 1;
         if dbg {
             eprintln!(
@@ -2160,6 +2160,20 @@ fn slot_status_lost(status: &str) -> bool {
     status.eq_ignore_ascii_case("lost")
 }
 
+/// How long one drain window may stay open. The byte budget usually closes a
+/// window within seconds; this only bites traffic on tables the run does not
+/// track, where a window could otherwise sit open for an hour (system review
+/// 2026-10-07, G0.3). The default stays 3600 until the legs batch measures a
+/// shorter one against the steady-state bench; `APITAP_WINDOW_MAX_SECS`
+/// (>= 5) bounds it now for operators who want 10–30 s windows.
+fn window_max_secs() -> u64 {
+    std::env::var("APITAP_WINDOW_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n >= 5)
+        .unwrap_or(3600)
+}
+
 /// without permission to read `pg_replication_slots` must not fail a transfer
 /// over a diagnostic.
 async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
@@ -2348,6 +2362,22 @@ mod tests {
         assert!(!slot_status_lost("reserved"));
         assert!(!slot_status_lost("extended"));
         assert!(!slot_status_lost("unreserved"));
+    }
+
+    /// The window deadline may be lowered but not to a value that cuts a
+    /// window before it can do anything: tiny or junk falls back (system
+    /// review 2026-10-07, G0.3).
+    #[test]
+    fn a_tiny_or_junk_window_deadline_falls_back_to_an_hour() {
+        std::env::remove_var("APITAP_WINDOW_MAX_SECS");
+        assert_eq!(window_max_secs(), 3600);
+        std::env::set_var("APITAP_WINDOW_MAX_SECS", "1");
+        assert_eq!(window_max_secs(), 3600);
+        std::env::set_var("APITAP_WINDOW_MAX_SECS", "junk");
+        assert_eq!(window_max_secs(), 3600);
+        std::env::set_var("APITAP_WINDOW_MAX_SECS", "30");
+        assert_eq!(window_max_secs(), 30);
+        std::env::remove_var("APITAP_WINDOW_MAX_SECS");
     }
 
     /// Two pipelines that share a source and a destination table NAME but
