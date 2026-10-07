@@ -1749,6 +1749,10 @@ async fn apply_windows(
     let t = &*tenure;
     let dest = t.dest();
     let mut rows_per = vec![0u64; members.len()];
+    // The Postgres lane never reported progress: only the MySQL lane called
+    // `add_rows` (system review 2026-10-07, G0.9), so an operator watching a
+    // pg drain saw a frozen counter and could not tell stuck from slow.
+    let mut reported_rows = 0u64;
     while let Some(o) = win_rx.recv().await {
         let t_apply = std::time::Instant::now();
         let lanes = dest.apply_lanes();
@@ -1875,6 +1879,9 @@ async fn apply_windows(
         }
         // Receiver may be gone on a drain-side abort — nothing to do.
         let _ = applied_tx.send(o.id.end());
+        let total: u64 = rows_per.iter().sum();
+        crate::progress::add_rows(total - reported_rows);
+        reported_rows = total;
     }
     Ok(rows_per)
 }
