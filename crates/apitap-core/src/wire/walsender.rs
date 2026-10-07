@@ -66,8 +66,28 @@ pub(crate) struct Walsender {
 }
 
 struct PumpHandle {
-    frames: mpsc::Receiver<(u8, bytes::Bytes)>,
+    frames: mpsc::Receiver<FramedBody>,
     task: tokio::task::JoinHandle<(BufReader<PgRead>, Result<()>)>,
+}
+
+/// One frame from the pump: tag, body, and the byte permit that keeps the
+/// channel's queued bytes bounded — the channel counts messages, not bytes,
+/// so a burst of large XLogData frames could otherwise blow the container
+/// before the consumer drained even a few (system review 2026-10-07, G0.2).
+type FramedBody = (u8, bytes::Bytes, tokio::sync::OwnedSemaphorePermit);
+
+/// How many bytes of read frames may wait in the pump channel;
+/// `APITAP_PUMP_BUF_BYTES` tunes it (bytes or a K/M/G suffix), zero or junk
+/// falls back so a typo cannot disable the bound.
+const PUMP_BUF_LIMIT: usize = 32 << 20;
+
+fn pump_buf_limit() -> usize {
+    std::env::var("APITAP_PUMP_BUF_BYTES")
+        .ok()
+        .and_then(|v| crate::logbased::run::parse_size(&v))
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(PUMP_BUF_LIMIT)
 }
 
 /// Close the socket when this type is dropped, whatever path got us here.
@@ -97,13 +117,22 @@ impl Drop for Walsender {
 /// desync is the documented trap).
 async fn pump_frames(
     mut rd: BufReader<PgRead>,
-    tx: mpsc::Sender<(u8, bytes::Bytes)>,
+    tx: mpsc::Sender<FramedBody>,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> (BufReader<PgRead>, Result<()>) {
     loop {
         match read_frame(&mut rd).await {
             Ok((tag, body)) => {
                 let done = tag == b'Z';
-                if tx.send((tag, body)).await.is_err() {
+                // The permit travels WITH the frame and is dropped by the
+                // consumer once it takes the frame, so queued bytes never
+                // exceed the budget (system review 2026-10-07, G0.2).
+                let want = body.len().min(u32::MAX as usize) as u32;
+                let permit = match std::sync::Arc::clone(&sem).acquire_many_owned(want).await {
+                    Ok(p) => p,
+                    Err(_) => return (rd, Ok(())),
+                };
+                if tx.send((tag, body, permit)).await.is_err() {
                     return (rd, Ok(()));
                 }
                 if done {
@@ -1387,7 +1416,8 @@ impl Walsender {
         // frames arrive through the channel while this task decodes.
         let rd = self.rd.take().expect("read half present at copy start");
         let (tx, rx) = mpsc::channel(8192);
-        let task = tokio::spawn(pump_frames(rd, tx));
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(pump_buf_limit()));
+        let task = tokio::spawn(pump_frames(rd, tx, sem));
         self.pump = Some(PumpHandle { frames: rx, task });
         Ok(())
     }
@@ -1408,7 +1438,7 @@ impl Walsender {
         loop {
             let (tag, msg) = match self.pump.as_mut() {
                 Some(p) => match p.frames.recv().await {
-                    Some(f) => f,
+                    Some((tag, msg, _permit)) => (tag, msg),
                     None => {
                         // Pump exited without a server CopyDone: an error or
                         // a hangup — join it and tell the truth.
@@ -1512,8 +1542,8 @@ impl Walsender {
                 async {
                     loop {
                         match pump.frames.recv().await {
-                            Some((b'Z', _)) | None => break,
-                            Some((b'E', msg)) => err = Some(parse_error(&msg)),
+                            Some((b'Z', _, _)) | None => break,
+                            Some((b'E', msg, _)) => err = Some(parse_error(&msg)),
                             Some(_) => {} // drain in-flight frames
                         }
                     }
@@ -1807,6 +1837,21 @@ mod tests {
         assert_eq!(super::parse_pg_size("1024"), Some(1024));
         assert_eq!(super::parse_pg_size("64 kb"), Some(65536));
         assert_eq!(super::parse_pg_size("12x"), None);
+    }
+
+    /// The pump's byte budget may be tuned but not silently disabled: zero
+    /// or junk falls back to the default (system review 2026-10-07, G0.2).
+    #[test]
+    fn a_zero_pump_queue_budget_falls_back_to_the_default() {
+        std::env::remove_var("APITAP_PUMP_BUF_BYTES");
+        assert_eq!(super::pump_buf_limit(), super::PUMP_BUF_LIMIT);
+        std::env::set_var("APITAP_PUMP_BUF_BYTES", "0");
+        assert_eq!(super::pump_buf_limit(), super::PUMP_BUF_LIMIT);
+        std::env::set_var("APITAP_PUMP_BUF_BYTES", "junk");
+        assert_eq!(super::pump_buf_limit(), super::PUMP_BUF_LIMIT);
+        std::env::set_var("APITAP_PUMP_BUF_BYTES", "8M");
+        assert_eq!(super::pump_buf_limit(), 8 << 20);
+        std::env::remove_var("APITAP_PUMP_BUF_BYTES");
     }
 
     use super::*;
