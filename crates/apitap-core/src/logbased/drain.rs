@@ -19,6 +19,22 @@ use crate::wire::walsender::{WalEvent, Walsender};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// How long a replication stream may say nothing before the drain treats it
+/// as a dead connection (system review 2026-10-07, G0.5). Server keepalives
+/// arrive every `wal_sender_timeout / 2` — 30 s by default — so two silent
+/// minutes is unambiguous. `APITAP_REPLICATION_SILENCE_SECS` may lower it
+/// (tests) but not disable it: zero or junk falls back to the default.
+const REPLICATION_SILENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn silence_budget() -> std::time::Duration {
+    std::env::var("APITAP_REPLICATION_SILENCE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .filter(|d| !d.is_zero())
+        .unwrap_or(REPLICATION_SILENCE)
+}
+
 struct RelState {
     table: Arc<str>,
     tracked: bool,
@@ -172,12 +188,24 @@ pub(crate) async fn drain(
             // exactly as it always did — see `crate::shutdown`.
             break;
         }
-        // No per-event timeout: cancelling next_event mid-read would tear a
-        // half-consumed frame off the stream (protocol desync), and a timer
-        // per message is real overhead at millions of events. The server's
-        // keepalives (~wal_sender_timeout/2) wake this loop on idle streams,
-        // so the deadline above is checked at least that often.
-        let ev = ws.next_event().await?;
+        // The pump owns the socket, so cancelling this wait cannot tear a
+        // frame off the stream (the old concern was about reading the socket
+        // directly); a wait that times out ends the run at the last
+        // watermark, which drops the connection rather than muddling on. The
+        // server keepalives every ~wal_sender_timeout/2 (30 s by default)
+        // normally wake this loop — when they stop, the connection is dead
+        // (half-open socket, NAT rebind) and without this budget the drain
+        // parked forever (system review 2026-10-07, G0.5).
+        let ev = tokio::time::timeout(silence_budget(), ws.next_event())
+            .await
+            .map_err(|_| {
+                Error::Transfer(format!(
+                    "log_based: replication stream silent for {}s — the source's \
+                     keepalives stopped (half-open connection?); aborting at the \
+                     last committed watermark",
+                    silence_budget().as_secs()
+                ))
+            })??;
         match ev {
             None => break,
             Some(WalEvent::Keepalive { wal_end, reply_requested }) => {
@@ -471,5 +499,25 @@ fn tracked(rels: &HashMap<u32, RelState>, rel_id: u32) -> Result<Option<Arc<str>
             "log_based: row event for unknown relation {rel_id} — pgoutput \
              must send Relation first; protocol desync?"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The knob may shorten the wait, but never removes it: zero and junk
+    /// must fall back to the default or a half-open socket parks forever
+    /// (system review 2026-10-07, G0.5).
+    #[test]
+    fn a_zero_or_junk_silence_budget_falls_back_to_the_default() {
+        std::env::set_var("APITAP_REPLICATION_SILENCE_SECS", "0");
+        assert_eq!(silence_budget(), REPLICATION_SILENCE);
+        std::env::set_var("APITAP_REPLICATION_SILENCE_SECS", "not-a-number");
+        assert_eq!(silence_budget(), REPLICATION_SILENCE);
+        std::env::set_var("APITAP_REPLICATION_SILENCE_SECS", "5");
+        assert_eq!(silence_budget(), std::time::Duration::from_secs(5));
+        std::env::remove_var("APITAP_REPLICATION_SILENCE_SECS");
+        assert_eq!(silence_budget(), REPLICATION_SILENCE);
     }
 }

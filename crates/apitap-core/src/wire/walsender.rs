@@ -681,6 +681,18 @@ impl Walsender {
             .await
             .map_err(|e| Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port)))?;
         stream.set_nodelay(true).ok();
+        // A replication socket can go half-open (NAT rebind, silent
+        // middlebox) and the kernel then parks every read forever. Keepalive
+        // makes the death visible: probes start after 60 s and repeat every
+        // 10 s, so a read errors in a bounded couple of minutes (system
+        // review 2026-10-07, G0.5).
+        {
+            use socket2::{SockRef, TcpKeepalive};
+            let ka = TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(10));
+            SockRef::from(&stream).set_tcp_keepalive(&ka).ok();
+        }
         // TLS is negotiated BEFORE the startup message, so it happens here or
         // not at all.
         let (r, w) = match ci.ssl {
