@@ -54,7 +54,8 @@ total = 0
 while True:
     t0 = time.time()
     try:
-        r = apitap.transfer(src, dst,
+        import os as _os
+        r = apitap.transfer(src, dst, engine=(_os.environ.get('APITAP_ENGINE') or None),
                            tables=[t for t in table.split(",") if t], mode="log_based")
     except Exception as exc:                                  # noqa: BLE001
         print(f"RAISED {type(exc).__name__}: {exc}", flush=True)
