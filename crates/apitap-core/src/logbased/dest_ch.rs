@@ -798,9 +798,14 @@ fn insert_only_cols(cols: &[String]) -> Vec<String> {
 }
 
 /// One TabSeparated row suffix for insert-only: the window's LSN and the
-/// tombstone flag. Appended AFTER the rendered source columns, matching
-/// `insert_only_cols`.
+/// tombstone flag. The renderers end their row WITH a newline, so the suffix
+/// takes that newline back first — appending after it made the pair a row of
+/// its own ("Line feed found where tab is expected", seen live in
+/// e2e_ch_insert_only).
 fn insert_only_suffix(buf: &mut Vec<u8>, ver: u64, deleted: bool) {
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
     buf.extend_from_slice(format!("\t{ver}\t{}\n", u8::from(deleted)).as_bytes());
 }
 
@@ -2192,12 +2197,12 @@ mod tests {
     fn insert_only_rows_carry_the_bookkeeping_pair() {
         let cols = super::insert_only_cols(&["id".to_string(), "v".to_string()]);
         assert_eq!(cols, vec!["id", "v", "_apitap_ver", "_apitap_deleted"]);
-        let mut buf = Vec::new();
+        let mut buf = b"a\tb\n".to_vec();
         super::insert_only_suffix(&mut buf, 4242, false);
-        assert_eq!(String::from_utf8(buf).unwrap(), "\t4242\t0\n");
-        let mut buf = Vec::new();
+        assert_eq!(String::from_utf8(buf).unwrap(), "a\tb\t4242\t0\n");
+        let mut buf = b"a\tb\n".to_vec();
         super::insert_only_suffix(&mut buf, 4242, true);
-        assert_eq!(String::from_utf8(buf).unwrap(), "\t4242\t1\n");
+        assert_eq!(String::from_utf8(buf).unwrap(), "a\tb\t4242\t1\n");
     }
 
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
