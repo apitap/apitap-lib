@@ -76,24 +76,23 @@ struct PumpHandle {
 /// before the consumer drained even a few (system review 2026-10-07, G0.2).
 type FramedBody = (u8, bytes::Bytes, tokio::sync::OwnedSemaphorePermit);
 
-/// Default `SO_RCVLOWAT` on the walsender socket: epoll wakes only once this
-/// much is queued, so one `recv` carries a backlog chunk instead of whatever
-/// single message arrived. `recv()` itself ignores the low watermark, and the
-/// pump's 2 ms timer covers idle streams — without it a stream quieter than
-/// the watermark would never wake (system review 2026-10-07 §5.3 L2; measured
-/// 2026-10-08: recvfrom ~5 KB, 22% of catch-up CPU in recvfrom+epoll).
-const READ_LOWAT: usize = 64 << 10;
+/// Default pre-refill coalescing sleep: when the reader's buffer is empty,
+/// wait this long before the next fill so one `recv` carries more than the
+/// last arriving message. Measured 2026-10-08: recvfrom averages ~5 KB in
+/// both modes and 22% of catch-up CPU sits in recvfrom+epoll, because epoll
+/// wakes on the first arrival. A `SO_RCVLOWAT` experiment made the tokio
+/// reader park forever (ET epoll + watermark, killed by wal_sender_timeout in
+/// 60 s), so the sleep is the safe form: it never delays a read that has data
+/// — it only lets more accumulate first (system review 2026-10-07 §5.3 L2).
+const READ_COALESCE_US: u64 = 500;
 
-/// `APITAP_READ_LOWAT` (bytes or K/M): unset = 64 KiB; `0`/`off` disables
-/// (the A/B control); zero/junk falls back to the default.
-fn read_lowat() -> usize {
-    match std::env::var("APITAP_READ_LOWAT") {
+/// `APITAP_READ_COALESCE_US` (microseconds): unset = 500; `0`/`off` disables
+/// (the A/B control); junk falls back — a typo cannot silently change it.
+fn read_coalesce_us() -> u64 {
+    match std::env::var("APITAP_READ_COALESCE_US") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
-        Ok(v) => crate::logbased::run::parse_size(&v)
-            .and_then(|n| usize::try_from(n).ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(READ_LOWAT),
-        Err(_) => READ_LOWAT,
+        Ok(v) => v.parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(READ_COALESCE_US),
+        Err(_) => READ_COALESCE_US,
     }
 }
 
@@ -148,20 +147,14 @@ async fn pump_frames(
     tx: mpsc::Sender<FramedBody>,
     sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> (BufReader<PgRead>, Result<()>) {
-    let lowat_on = read_lowat() > 0;
+    let coalesce_us = read_coalesce_us();
     loop {
-        // When the reader's buffer is empty, give the socket up to 2 ms to
-        // accumulate to the low watermark before the next fill: one recv per
-        // ~64 KB instead of one per ~5 KB. `recv` ignores SO_RCVLOWAT, so a
-        // quiet stream still drains on the timer (keepalives included).
-        if lowat_on && rd.buffer().is_empty() {
-            if let PgRead::Tcp(s) = rd.get_ref() {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(2),
-                    s.readable(),
-                )
-                .await;
-            }
+        // When the reader's buffer is empty, let more data accumulate before
+        // the next fill: one recv per several KB instead of one per arrival.
+        // A plain sleep, deliberately: it cannot park a read that has data —
+        // the read itself proceeds exactly as before (keepalives included).
+        if coalesce_us > 0 && rd.buffer().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_micros(coalesce_us)).await;
         }
         match read_frame(&mut rd).await {
             Ok((tag, body)) => {
@@ -763,22 +756,6 @@ impl Walsender {
                 .with_time(std::time::Duration::from_secs(60))
                 .with_interval(std::time::Duration::from_secs(10));
             SockRef::from(&stream).set_tcp_keepalive(&ka).ok();
-            let lowat = read_lowat();
-            if lowat > 0 {
-                // A 1 MiB receive buffer so the watermark has room to pay off.
-                SockRef::from(&stream).set_recv_buffer_size(1 << 20).ok();
-                let fd = std::os::fd::AsRawFd::as_raw_fd(&stream);
-                let v = lowat as libc::c_int;
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_RCVLOWAT,
-                        &v as *const libc::c_int as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    );
-                }
-            }
         }
         // TLS is negotiated BEFORE the startup message, so it happens here or
         // not at all.
@@ -1949,22 +1926,22 @@ mod tests {
         std::env::remove_var("APITAP_ALLOW_INSECURE_AUTH");
     }
 
-    /// The read watermark knob: unset = 64 KiB, 0/off disables (A/B control),
+    /// The coalescing knob: unset = 500 µs, 0/off disables (A/B control),
     /// junk falls back — a typo cannot silently turn coalescing off
     /// (system review 2026-10-07 §5.3 L2).
     #[test]
-    fn the_read_watermark_has_a_safe_default_and_an_off_switch() {
-        std::env::remove_var("APITAP_READ_LOWAT");
-        assert_eq!(super::read_lowat(), super::READ_LOWAT);
-        std::env::set_var("APITAP_READ_LOWAT", "0");
-        assert_eq!(super::read_lowat(), 0);
-        std::env::set_var("APITAP_READ_LOWAT", "off");
-        assert_eq!(super::read_lowat(), 0);
-        std::env::set_var("APITAP_READ_LOWAT", "junk");
-        assert_eq!(super::read_lowat(), super::READ_LOWAT);
-        std::env::set_var("APITAP_READ_LOWAT", "128K");
-        assert_eq!(super::read_lowat(), 128 << 10);
-        std::env::remove_var("APITAP_READ_LOWAT");
+    fn the_read_coalescer_has_a_safe_default_and_an_off_switch() {
+        std::env::remove_var("APITAP_READ_COALESCE_US");
+        assert_eq!(super::read_coalesce_us(), super::READ_COALESCE_US);
+        std::env::set_var("APITAP_READ_COALESCE_US", "0");
+        assert_eq!(super::read_coalesce_us(), 0);
+        std::env::set_var("APITAP_READ_COALESCE_US", "off");
+        assert_eq!(super::read_coalesce_us(), 0);
+        std::env::set_var("APITAP_READ_COALESCE_US", "junk");
+        assert_eq!(super::read_coalesce_us(), super::READ_COALESCE_US);
+        std::env::set_var("APITAP_READ_COALESCE_US", "2000");
+        assert_eq!(super::read_coalesce_us(), 2000);
+        std::env::remove_var("APITAP_READ_COALESCE_US");
     }
 
     use super::*;
