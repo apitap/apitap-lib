@@ -477,6 +477,7 @@ is off.
 | `APITAP_WINDOW_MAX_SECS` | `3600` | wall-clock cap on one window |
 | `APITAP_TX_BUF_BYTES` | 256 MiB | the one-transaction buffer cap behind the refusal |
 | `APITAP_REPLICATION_SILENCE_SECS` | `120` | silence budget on the replication socket (lower only) |
+| `APITAP_READ_LOWAT` | `64K` | receive watermark on the plain-TCP replication socket so one `recvfrom` carries a backlog chunk instead of ~5 KB (8–16× fewer syscalls, measured on 0.59.0); the reader waits at most 2 ms for it, so keepalives still flow; `0`/`off` disables (the A/B control) |
 | `APITAP_DECODE_WORKMEM` | server value | per-session `logical_decoding_work_mem`, ≤ 256 MiB |
 | `APITAP_CDC_APPLY_LANES` | auto (ClickHouse `min((mem−96 MiB)/20 MiB, 16·cores)` clamped 1–16; BigQuery ≤ 8; Postgres/MySQL 1) | concurrent table applies per window |
 | `APITAP_CH_MAX_BODY` | one request per pipe | cap each ClickHouse request body (`512K`, `64M`) for a proxy with a body limit |
