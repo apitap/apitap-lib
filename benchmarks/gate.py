@@ -237,6 +237,7 @@ LEGS = [
     leg("e2e_half_open.py",        "a frozen source fails the drain in its silence budget; the next run recovers"),
     leg("e2e_two_destinations.py", "one source, two destinations: each resumes its own slot"),
     leg("e2e_cdc_progress.py",     "a Postgres drain reports rows while it runs"),
+    leg("e2e_ch_insert_only.py",   "a Replacing destination takes the tombstone path, FINAL exact"),
 ]
 
 

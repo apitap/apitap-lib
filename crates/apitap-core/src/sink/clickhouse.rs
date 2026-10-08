@@ -1357,7 +1357,7 @@ impl crate::sink::Sink for ChSink {
         _durable: bool,
         mode: Mode,
     ) -> Result<()> {
-        let ddl_list = if self.dest_structure.is_empty() {
+        let mut ddl_list = if self.dest_structure.is_empty() {
             plan.cols
                 .iter()
                 .zip(lane.cols.iter())
@@ -1406,6 +1406,17 @@ impl crate::sink::Sink for ChSink {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        // A Replacing-family engine that names the tombstone bookkeeping pair
+        // (design §14) gets the columns created with the table: the engine
+        // string references them at CREATE time and the drain's insert-only
+        // path needs them. The bulk load delivers source columns only — the
+        // DEFAULTs fill the rest.
+        let engine_idents = self.ddl.engine_arg_idents();
+        for (name, ty) in [("_apitap_ver", "UInt64"), ("_apitap_deleted", "UInt8")] {
+            if engine_idents.iter().any(|i| i == name) {
+                ddl_list.push_str(&format!(", {} {} DEFAULT 0", ch_ident(name), ty));
+            }
+        }
         // ATTACH PARTITION FROM requires equal sorting/primary keys, so a mirrored
         // staging table must copy the destination's keys, not guess from the cursor;
         // for tables apitap creates, the user's order_by wins over the cursor.
@@ -1481,6 +1492,9 @@ impl crate::sink::Sink for ChSink {
             let cols: std::collections::HashSet<&str> =
                 plan.cols.iter().map(|c| c.name.as_str()).collect();
             for ident in self.ddl.engine_arg_idents() {
+                if ident == "_apitap_ver" || ident == "_apitap_deleted" {
+                    continue;
+                }
                 if !cols.contains(ident.as_str()) {
                     return Err(Error::InvalidInput(format!(
                         "engine references column '{ident}', which the source \
