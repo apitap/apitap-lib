@@ -857,3 +857,22 @@ benar (sampler lama rusak), (2) A/B `APITAP_PG_BINARY=1` (B2.4: −9% CPU
 walsender; kemungkinan lebih besar di keep-up), (3) kalau terkonfirmasi:
 >50 rb/s di 0,5 core hanya mungkin lewat source-side (biner) atau menambah
 slot di atas 1 core (rezim C) — bukan lagi kerja klien.
+
+### 14.4 Enam tuas klien netral — dinding per-slot walsender (2026-10-08)
+
+A/B `wsab` (pace ~49,5 rb/s): arm pgoutput teks vs biner **identik** (CPU klien
+0,154 vs 0,178 core; biner malah sedikit lebih berat di keep-up). Sampler
+walsender gagal lagi (busybox `ps` di container — pakai loop `/proc/*/cmdline`
+di percobaan berikut).
+
+Rekap semua tuas yang diukur netral pada pace 50 rb/s: jumlah statement
+(insert-only), sesi per pass (follow), ukuran window (floor 8 MiB), biner.
+Sementara CPU klien 0,15–0,38 dari 0,5 dan CH ~38 % sibuk. **Satu-satunya
+penjelasan yang konsisten: laju decode walsender per slot di keep-up
+(~30 µs/change ≈ 33 rb/s) adalah dindingnya** — cocok dengan B2.4 (32,8 µs
+keep-up vs 12,5 backlog).
+
+**Konsekuensi target:** 50 rb/s @0,5 core = **2 slot** (2 tabel, ~25 rb/s
+masing-masing; klien 8,6 µs/change × 50 rb/s = 0,43 core, muat; server 2×25
+rb/s di bawah plafon per-slot). Di atas itu = rezim C: core tambahan → slot
+tambahan. Kerja klien per-change sudah bukan tuas untuk angka ini.
