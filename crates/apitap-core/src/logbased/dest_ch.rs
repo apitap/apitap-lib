@@ -1092,20 +1092,30 @@ mod store {
                 return *v;
             }
             let tbl = ch_str(table);
-            let body = self
+            // A LEFT JOIN, not correlated subqueries: ClickHouse refuses a
+            // subquery that reads the parent's non-constant columns
+            // (UNSUPPORTED_METHOD on 24.8), and the silent failure cost a
+            // build cycle — the error now reaches APITAP_DEBUG.
+            let body = match self
                 .ch
                 .read(&format!(
-                    "SELECT engine, \
-                            (SELECT countIf(c.name = '_apitap_ver') FROM system.columns c \
-                              WHERE c.database = t.database AND c.table = t.name), \
-                            (SELECT countIf(c.name = '_apitap_deleted') FROM system.columns c \
-                              WHERE c.database = t.database AND c.table = t.name) \
+                    "SELECT t.engine, countIf(c.name = '_apitap_ver'), \
+                            countIf(c.name = '_apitap_deleted') \
                      FROM system.tables t \
-                     WHERE t.database = currentDatabase() AND t.name = '{tbl}' LIMIT 1 \
-                     FORMAT TabSeparated"
+                     LEFT JOIN system.columns c ON c.database = t.database AND c.table = t.name \
+                     WHERE t.database = currentDatabase() AND t.name = '{tbl}' \
+                     GROUP BY t.engine LIMIT 1 FORMAT TabSeparated"
                 ))
                 .await
-                .unwrap_or_default();
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    if std::env::var("APITAP_DEBUG").is_ok() {
+                        eprintln!("[insert-only] detection query failed for {table}: {e}");
+                    }
+                    String::new()
+                }
+            };
             let mut f = body.trim().split('\t');
             let engine = f.next().unwrap_or("").trim();
             let has_ver = f.next().unwrap_or("0").trim() == "1";
