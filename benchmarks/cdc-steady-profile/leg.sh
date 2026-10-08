@@ -56,6 +56,7 @@ while True:
     try:
         import os as _os
         r = apitap.transfer(src, dst, engine=(_os.environ.get('APITAP_ENGINE') or None),
+                           slots=(int(_os.environ['APITAP_SLOTS']) if _os.environ.get('APITAP_SLOTS') else None),
                            tables=[t for t in table.split(",") if t], mode="log_based")
     except Exception as exc:                                  # noqa: BLE001
         print(f"RAISED {type(exc).__name__}: {exc}", flush=True)
