@@ -587,6 +587,13 @@ async fn apply_unit(
         lsn: id.end(),
         rows,
     };
+    // Where a window's apply time goes (APITAP_DEBUG): phase timers, one
+    // line per window. Off by default; a couple of `Instant::now()` when on.
+    let dbg = std::env::var("APITAP_DEBUG").is_ok();
+    let t0 = std::time::Instant::now();
+    let mut t_trunc = std::time::Duration::ZERO;
+    let mut t_clear = std::time::Duration::ZERO;
+    let mut t_ins = std::time::Duration::ZERO;
     // Before the window's first DDL: a table that turned Replicated mid-run.
     u.refuse_clustered(dest_table).await?;
     let Some(w) = w else {
@@ -602,6 +609,7 @@ async fn apply_unit(
     if c.truncate {
         u.clear_owned(dest_table).await?;
     }
+    t_trunc = t0.elapsed();
 
     // Clear the delete-set ∪ every upsert key first, so the insert phase is a
     // plain bulk INSERT (same move as the pg apply). The keys go through a
@@ -637,6 +645,7 @@ async fn apply_unit(
         };
         u.delete_owned(dest_table, &pred).await?;
     }
+    t_clear = t0.elapsed();
 
     if insert_only {
         let ver = id.end();
@@ -664,6 +673,7 @@ async fn apply_unit(
         }
         u.insert_owned(dest_table, wal_cols, buf).await?;
     }
+    t_ins = t0.elapsed();
 
     // Residue tail: serial, ordered. Masked TOAST updates read the missing
     // columns back from the destination, then delete + reinsert the patched
@@ -777,6 +787,21 @@ async fn apply_unit(
                 }
             }
         }
+    }
+    if dbg {
+        let total = t0.elapsed();
+        eprintln!(
+            "[apply] {dest_table} up={} del={} res={} trunc={:.1}ms clear={:.1}ms \
+             ins={:.1}ms residue={:.1}ms total={:.1}ms",
+            c.upserts.len(),
+            c.deletes.iter().count(),
+            c.residue.len(),
+            t_trunc.as_secs_f64() * 1e3,
+            (t_clear - t_trunc).as_secs_f64() * 1e3,
+            (t_ins - t_clear).as_secs_f64() * 1e3,
+            (total - t_ins).as_secs_f64() * 1e3,
+            total.as_secs_f64() * 1e3,
+        );
     }
     Ok((c.events, set(c.events)))
 }
