@@ -1643,8 +1643,9 @@ async fn drain_group(
         .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
         .collect();
     let apply = AbortOnDrop::spawn(apply_windows(tenure, src.clone(), members, win_rx, applied_tx));
+    let follow = follow_secs().map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let drained = run_overlapped(
-        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog),
+        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src),
         apply,
     )
     .await;
@@ -1714,7 +1715,10 @@ async fn drain_loop(
     key_cols: &HashMap<String, Vec<String>>,
     budget: usize,
     changelog: bool,
+    follow: Option<std::time::Instant>,
+    src: &sqlx::PgPool,
 ) -> Result<()> {
+    let mut stop_line = stop_line;
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let mut sess = DrainSession::default();
     let mut cur = wm;
@@ -1722,6 +1726,11 @@ async fn drain_loop(
     // The previous window's end_lsn: sent to the applier, not yet confirmed.
     let mut pending: Option<u64> = None;
     loop {
+        if let Some(deadline) = follow {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
         let t_drain = std::time::Instant::now();
         let outcome =
             drain(ws, &mut sess, cur, stop_line, key_cols, window_max_secs(), budget, &applied_rx, changelog).await?;
@@ -1755,7 +1764,24 @@ async fn drain_loop(
             cur = end;
         }
         if !hit {
-            break;
+            let Some(deadline) = follow else { break };
+            // Follow mode: same session, rolling stop line. Ask the source
+            // where its WAL ends now and drain the delta; a quiet source
+            // parks briefly instead of spinning.
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let now: (String,) = sqlx::query_as("SELECT pg_current_wal_lsn()::text")
+                .fetch_one(src)
+                .await
+                .map_err(db_err)?;
+            let now = lsn_from_string(&now.0)?;
+            if now > stop_line {
+                stop_line = now;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            continue;
         }
     }
     // Wait for the final in-flight window, then confirm it. A caught-up drain
@@ -2200,6 +2226,18 @@ fn slot_status_lost(status: &str) -> bool {
     status.eq_ignore_ascii_case("lost")
 }
 
+/// `APITAP_FOLLOW_SECS`: run the drain as one continuous session for this many
+/// seconds — the walsender, tenure, pin cache and key table stay, and the stop
+/// line rolls with the source. Measured motivation: ~1 s of session setup per
+/// pass, 107 passes in a 200 s paced run (design §14.1). Unset/0/junk = off
+/// (today's one-shot shape).
+fn follow_secs() -> Option<u64> {
+    match std::env::var("APITAP_FOLLOW_SECS") {
+        Ok(v) => v.parse::<u64>().ok().filter(|n| *n > 0),
+        Err(_) => None,
+    }
+}
+
 /// How long one drain window may stay open. The byte budget usually closes a
 /// window within seconds; this only bites traffic on tables the run does not
 /// track, where a window could otherwise sit open for an hour (system review
@@ -2402,6 +2440,21 @@ mod tests {
         assert!(!slot_status_lost("reserved"));
         assert!(!slot_status_lost("extended"));
         assert!(!slot_status_lost("unreserved"));
+    }
+
+    /// The follow knob: unset, zero and junk are all off; a positive number
+    /// is the duration (design §14.1).
+    #[test]
+    fn follow_secs_is_off_unless_positive() {
+        std::env::remove_var("APITAP_FOLLOW_SECS");
+        assert_eq!(follow_secs(), None);
+        std::env::set_var("APITAP_FOLLOW_SECS", "0");
+        assert_eq!(follow_secs(), None);
+        std::env::set_var("APITAP_FOLLOW_SECS", "junk");
+        assert_eq!(follow_secs(), None);
+        std::env::set_var("APITAP_FOLLOW_SECS", "60");
+        assert_eq!(follow_secs(), Some(60));
+        std::env::remove_var("APITAP_FOLLOW_SECS");
     }
 
     /// The window deadline may be lowered but not to a value that cuts a
