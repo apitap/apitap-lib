@@ -24,6 +24,7 @@ use crate::wire::pgoutput::lsn_to_string;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use bytes::Buf as _;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -219,8 +220,20 @@ async fn read_frame(rd: &mut BufReader<PgRead>) -> Result<(u8, bytes::Bytes)> {
     }
     // BytesMut, so every text cell downstream is a refcounted slice of this
     // one allocation instead of getting its own malloc (see pgoutput::Cell).
-    let mut body = bytes::BytesMut::zeroed(len - 4);
-    rd.read_exact(&mut body).await.map_err(io_err)?;
+    // `with_capacity` + `read_buf`: the old `zeroed` paid calloc, a zero-fill
+    // and a memcpy per frame (~1 KB each at 1M frames/window); `read_buf`
+    // fills through `BufMut` and never writes a zero nobody reads (L1a,
+    // system review 2026-10-07 §5.3).
+    let want = len - 4;
+    let mut body = bytes::BytesMut::with_capacity(want);
+    while body.len() < want {
+        let n = rd.read_buf(&mut body).await.map_err(io_err)?;
+        if n == 0 {
+            return Err(Error::Transfer(
+                "walsender: stream ended inside a frame body".into(),
+            ));
+        }
+    }
     Ok((head[0], body.freeze()))
 }
 
@@ -1525,10 +1538,12 @@ impl Walsender {
                             let wal_start =
                                 u64::from_be_bytes(msg[1..9].try_into().unwrap());
                             // bytes 9..17 wal_end, 17..25 server clock — unused.
-                            // A Bytes slice, so dropping the header is a
-                            // pointer bump — the old `drain(..25)` memmoved
-                            // every payload at ~1M events/window.
-                            let payload = msg.slice(25..);
+                            // `advance` on the owned Bytes: a pointer bump
+                            // with no refcount promotion — `slice(25..)`
+                            // allocated a second handle per frame (L1a,
+                            // system review 2026-10-07 §5.3).
+                            let mut payload = msg;
+                            payload.advance(25);
                             return Ok(Some(WalEvent::XLogData { wal_start, payload }));
                         }
                         Some(b'k') => {
