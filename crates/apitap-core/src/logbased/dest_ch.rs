@@ -734,6 +734,12 @@ async fn apply_unit(
 }
 
 /// Everything that reaches the server. See the module doc.
+/// Insert-only applies when the destination table's engine is a Replacing
+/// family engine and it carries both bookkeeping columns (design §14).
+fn is_insert_only_shape(engine: &str, has_ver: bool, has_deleted: bool) -> bool {
+    engine.starts_with("ReplacingMergeTree") && has_ver && has_deleted
+}
+
 mod store {
     use super::{ch_engine_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, PENDING, STATE_CURSOR};
     use crate::error::{Error, Result};
@@ -762,6 +768,11 @@ mod store {
         /// opened inside the previous pin's early window reuses it instead of
         /// reading the lease again (see `cached_pin`).
         pins: Mutex<HashMap<String, CachedPin>>,
+        /// Once-per-run insert-only verdict per destination table (design
+        /// §14): a Replacing-family engine carrying `_apitap_ver` and
+        /// `_apitap_deleted` takes the tombstone path instead of
+        /// delete-then-insert. One catalog round trip per table, cached.
+        insert_only: Mutex<HashMap<String, bool>>,
         #[cfg(test)]
         pub(super) ops: Mutex<Vec<&'static str>>,
     }
@@ -970,6 +981,7 @@ mod store {
                 patch: Default::default(),
                 structures: Default::default(),
                 pins: Default::default(),
+                insert_only: Default::default(),
                 #[cfg(test)]
                 ops: Default::default(),
             })
@@ -978,6 +990,43 @@ mod store {
         fn note(&self, _op: &'static str) {
             #[cfg(test)]
             self.ops.lock().unwrap().push(_op);
+        }
+
+        /// Insert-only detection (design §14): one catalog round trip per
+        /// table per run. Any failure — unknown table, old server without
+        /// `system.columns`, transport — reads as "not insert-only", which is
+        /// exactly today's behaviour.
+        async fn detect_insert_only(&self, table: &str) -> bool {
+            if let Some(v) = self.insert_only.lock().unwrap().get(table) {
+                return *v;
+            }
+            let tbl = ch_str(table);
+            let body = self
+                .ch
+                .read(&format!(
+                    "SELECT engine, \
+                            (SELECT countIf(c.name = '_apitap_ver') FROM system.columns c \
+                              WHERE c.database = t.database AND c.table = t.name), \
+                            (SELECT countIf(c.name = '_apitap_deleted') FROM system.columns c \
+                              WHERE c.database = t.database AND c.table = t.name) \
+                     FROM system.tables t WHERE t.name = '{tbl}' LIMIT 1 \
+                     FORMAT TabSeparated"
+                ))
+                .await
+                .unwrap_or_default();
+            let mut f = body.trim().split('\t');
+            let engine = f.next().unwrap_or("").trim();
+            let has_ver = f.next().unwrap_or("0").trim() == "1";
+            let has_deleted = f.next().unwrap_or("0").trim() == "1";
+            let v = super::is_insert_only_shape(engine, has_ver, has_deleted);
+            self.insert_only.lock().unwrap().insert(table.to_string(), v);
+            if v {
+                crate::progress::note(&format!(
+                    "insert-only apply: {table} (ReplacingMergeTree with tombstones; \
+                     readers need FINAL or __current)"
+                ));
+            }
+            v
         }
 
         pub(crate) fn ch_guard(&self) -> ChGuard {
@@ -1693,6 +1742,12 @@ mod store {
                     // deadline that passed un-renewed refuses the open.
                     Some(p) => self.pin(&keys, &token, Some(p)).await?,
                 };
+                // Slice 1 of the insert-only plan (design §14): detect and
+                // cache per table; the apply path still runs today's shape
+                // until the staged rollout reaches it. Groups are slice 3.
+                if keys.len() == 1 {
+                    self.detect_insert_only(&keys[0]).await;
+                }
                 Ok(ChUnit { s: self, keys, token, pin, owed: false })
             }
         }
@@ -1995,6 +2050,22 @@ fn render_residue_row(
 
 #[cfg(test)]
 mod tests {
+    /// The insert-only shape rule (design §14): Replacing family + both
+    /// bookkeeping columns; anything else stays on the classic replica path.
+    #[test]
+    fn insert_only_needs_a_replacing_engine_and_both_columns() {
+        assert!(super::is_insert_only_shape("ReplacingMergeTree", true, true));
+        assert!(super::is_insert_only_shape(
+            "ReplacingMergeTree(_apitap_ver, _apitap_deleted)",
+            true,
+            true
+        ));
+        assert!(!super::is_insert_only_shape("MergeTree", true, true));
+        assert!(!super::is_insert_only_shape("ReplacingMergeTree", true, false));
+        assert!(!super::is_insert_only_shape("ReplacingMergeTree", false, true));
+        assert!(!super::is_insert_only_shape("", true, true));
+    }
+
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
     use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, reuse_cached, structure};
     use super::*;
