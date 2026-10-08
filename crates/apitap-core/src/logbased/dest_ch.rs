@@ -109,9 +109,17 @@ impl ChDest {
     }
 
     /// After a replica bootstrap, inside the unit whose close writes the state
-    /// row: drop the scratch names older releases left untokenized.
+    /// row: drop the scratch names older releases left untokenized, and — when
+    /// the destination is a Replacing-family table the user asked for — add
+    /// the tombstone bookkeeping columns so the drain can take the insert-only
+    /// path (design §14, slice 2). A classic MergeTree replica is untouched.
     pub(crate) async fn bootstrap_finish(&self, u: &mut ChUnit<'_>, dest_table: &str) -> Result<()> {
-        u.drop_legacy_scratch(dest_table).await
+        u.drop_legacy_scratch(dest_table).await?;
+        let engine = self.store.engine_of(dest_table).await;
+        if engine.starts_with("ReplacingMergeTree") {
+            u.exec_owned(&insert_only_columns_ddl(dest_table)).await?;
+        }
+        Ok(())
     }
 
     /// changelog=true, once, right after the bootstrap's bulk load: rebuild the
@@ -740,6 +748,17 @@ fn is_insert_only_shape(engine: &str, has_ver: bool, has_deleted: bool) -> bool 
     engine.starts_with("ReplacingMergeTree") && has_ver && has_deleted
 }
 
+/// The ALTER that gives a Replacing-family destination its tombstone
+/// bookkeeping columns (design §14, slice 2). Idempotent on purpose: a
+/// re-bootstrap runs it again.
+fn insert_only_columns_ddl(table: &str) -> String {
+    format!(
+        "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS _apitap_ver UInt64 DEFAULT 0, \
+         ADD COLUMN IF NOT EXISTS _apitap_deleted UInt8 DEFAULT 0",
+        t = ch_ident(table)
+    )
+}
+
 mod store {
     use super::{ch_engine_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, PENDING, STATE_CURSOR};
     use crate::error::{Error, Result};
@@ -992,6 +1011,22 @@ mod store {
             self.ops.lock().unwrap().push(_op);
         }
 
+        /// The destination table's engine, read once per bootstrap; a missing
+        /// table or an old server reads as empty (the caller's default).
+        pub(super) async fn engine_of(&self, table: &str) -> String {
+            let tbl = ch_str(table);
+            self.ch
+                .read(&format!(
+                    "SELECT engine FROM system.tables \
+                     WHERE database = currentDatabase() AND name = '{tbl}' LIMIT 1 \
+                     FORMAT TabSeparated"
+                ))
+                .await
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        }
+
         /// Insert-only detection (design §14): one catalog round trip per
         /// table per run. Any failure — unknown table, old server without
         /// `system.columns`, transport — reads as "not insert-only", which is
@@ -1009,7 +1044,8 @@ mod store {
                               WHERE c.database = t.database AND c.table = t.name), \
                             (SELECT countIf(c.name = '_apitap_deleted') FROM system.columns c \
                               WHERE c.database = t.database AND c.table = t.name) \
-                     FROM system.tables t WHERE t.name = '{tbl}' LIMIT 1 \
+                     FROM system.tables t \
+                     WHERE t.database = currentDatabase() AND t.name = '{tbl}' LIMIT 1 \
                      FORMAT TabSeparated"
                 ))
                 .await
@@ -1376,7 +1412,7 @@ mod store {
 
 
 
-        async fn exec_owned(&mut self, sql: &str) -> Result<String> {
+        pub(super) async fn exec_owned(&mut self, sql: &str) -> Result<String> {
             self.owed = true;
             let st = owned_settings();
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -2064,6 +2100,17 @@ mod tests {
         assert!(!super::is_insert_only_shape("ReplacingMergeTree", true, false));
         assert!(!super::is_insert_only_shape("ReplacingMergeTree", false, true));
         assert!(!super::is_insert_only_shape("", true, true));
+    }
+
+    /// The bookkeeping DDL names both columns, is idempotent, and quotes the
+    /// table (design §14, slice 2).
+    #[test]
+    fn insert_only_columns_ddl_is_idempotent_and_complete() {
+        let ddl = super::insert_only_columns_ddl("prof_pg_m");
+        assert!(ddl.contains("`prof_pg_m`"), "{ddl}");
+        assert!(ddl.contains("_apitap_ver UInt64 DEFAULT 0"), "{ddl}");
+        assert!(ddl.contains("_apitap_deleted UInt8 DEFAULT 0"), "{ddl}");
+        assert_eq!(ddl.matches("IF NOT EXISTS").count(), 2, "{ddl}");
     }
 
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
