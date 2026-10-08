@@ -1567,7 +1567,17 @@ impl crate::sink::Sink for ChSink {
             // accepts() never offers it — negotiation can't get here.
             WireFormat::PgCopyBinary => unreachable!("guarded by accepts()"),
         };
-        self.insert_sql = format!("INSERT INTO {} FORMAT {fmt}", self.staging_t);
+        // The explicit delivered-column list: a Replacing-family table carries
+        // the tombstone bookkeeping columns (design §14) that the bulk load
+        // does not send — without the list ClickHouse expects them in the
+        // stream and fails reading row 1. DEFAULTs fill the rest.
+        let delivered = plan
+            .cols
+            .iter()
+            .map(|c| ch_ident(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.insert_sql = format!("INSERT INTO {} ({delivered}) FORMAT {fmt}", self.staging_t);
         // The announcement has done its job: staging EXISTS now, and staging is
         // what the scan reads. Dropping the lock here keeps a killed run's
         // leftovers at ONE object rather than two, so the operator's cleanup
