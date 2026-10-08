@@ -876,3 +876,25 @@ keep-up vs 12,5 backlog).
 masing-masing; klien 8,6 µs/change × 50 rb/s = 0,43 core, muat; server 2×25
 rb/s di bawah plafon per-slot). Di atas itu = rezim C: core tambahan → slot
 tambahan. Kerja klien per-change sudah bukan tuas untuk angka ini.
+
+### 14.5 Koreksi penting: mungkin drain SUDAH mengejar — akuntansi ledger vs event
+
+`b61-slots` (2 tabel, slots=2, pace ledger 48,6 rb/s): drain pass 2 = 7,90 jt
+changes/218 s = 36,2 rb/s, **pass 3 = 0 rows (caught up penuh)**, CPU klien
+0,176 core rata-rata, sampler menunjukkan >1 walsender selama run.
+
+Rasio drain/ledger **36/49 = 73 % konsisten di SEMUA konfigurasi** (6 tuas
+netral, slots=2 netral) — pola khas perbedaan denominator, bukan dinding:
+writer menulis pasangan insert+delete net-zero per tx (`--ins 100 --del`
+default 0, docstring-nya memperingatkan tx no-op tetap menaikkan ledger),
+sementara drain menghitung event yang benar-benar terkirim/terhitung.
+Ditambah fakta **pass terakhir = 0 di setiap run**, bukti kuat drain tidak
+tertinggal.
+
+**Kesimpulan 14.4 dikoreksi:** dinding 36 rb/s belum terbukti; yang terbukti
+adalah (a) enam tuas klien netral, (b) drain caught-up penuh di tiap run,
+(c) CPU klien ≤0,38/0,5 dan CH ≤38 %. Eksperimen penentu berikutnya: mix
+**murni update pada band bergulir** (tanpa collapse, tanpa pasangan net-zero,
+single tabel) → bandingkan ledger writer, counter `pg_stat_user_tables`, dan
+events drain — kalau ketiganya sama, drain sudah mengejar ~49 rb/s raw
+(≈2,94 jt/menit) di 0,5 core.
