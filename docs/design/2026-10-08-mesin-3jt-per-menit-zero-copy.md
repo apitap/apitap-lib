@@ -736,3 +736,20 @@ Insiden disk 2026-10-08 (dua kali / penuh; penyebab: 77 volume dangling + log
 JSON container `ch3`/`ch` yang loop error rotasi internal CH saat disk penuh;
 PG source crash WAL) sudah ditangani dan dicatat di memori; CH di-restart,
 log di-truncate, PG pulih utuh (1 jt baris).
+
+### 13.6 Hasil A/B L1a — netral, tidak diklaim menang (commit `7314d37`)
+
+6 pasang berselang-seling (old = wheel coal `0ae36c5a`, new = wheel L1a `9343a2ed`):
+
+| mode | pair | old (µs) | new (µs) |
+|---|---|---|---|
+| catch-up | 1–3 | 9,60 / 9,27 / 10,31 | 9,59 / 9,95 / 10,46 |
+| keep-up | 1–3 | 9,90 / 9,90 / 9,86 | 10,27 / 9,97 / 9,86 |
+
+Rata-rata: catch-up 9,73 → 10,00 µs; keep-up 9,89 → 10,03 µs — **flat, di dalam
+noise** (variasi antar-pair ±0,5 µs > estimasi efek 0,3–0,6 µs). Catatan: rig saat
+itu juga menjalankan bench attribusi orphan dari `~/apitap-lib`, yang menaikkan
+lantai noise. Keputusan: kode **dipertahankan** (behavior-identik, menghapus
+zero-fill + refcount per frame; tidak ada klaim menang), dan anggaran L1a di §2
+tidak lagi dipakai untuk proyeksi. Pelajaran: dua tuas kecil berurutan (coalescer
+lalu L1a) sebaiknya di-A/B dalam satu kampanye dengan n≥5 bila efeknya <1 µs.
