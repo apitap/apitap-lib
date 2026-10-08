@@ -648,3 +648,61 @@ biner = bytes mentah (RowBinary String) dan COPY binary field yang sama. Tipe ta
 `infinity` tetap ditolak (0.59). Leg `e2e_binary_default.py` menambah baris tipe:
 jsonb, numeric(38,10), timestamptz, uuid, bytea, bool, dan satu array teks (harus
 fallback ke teks, bukan gagal).
+
+## 13. Hasil pengukuran §9.1 (2026-10-08, wheel 0.59.0, kandang 0,5/256)
+
+Dua run `steady.sh` di rig yang sama (single-table `prof_pg_m`, SP = gate-venv 0.59.0).
+
+### 13.1 Keep-up (writer paced 35 rb/s, 150 s; perf 30 s + strace penuh run)
+
+- Writer: 5.231.000 changes / 150,09 s = **34.853 ch/s** (target 35 rb).
+- Drain: 5.623.000 changes / 180,27 s = **31.193 ch/s** (1,87 jt/menit), CPU 70,6 s
+  = **0,3915 core** (78 % kuota). `passes=101` → **1,78 s per pass** (setup/teardown
+  tiap pass; G1.4 follow mode menyasar ini).
+- Syscall census (strace penuh run): `recvfrom` **498.424** (≈**5,05 KB/recv**,
+  0,089/change), `epoll_wait` 539.323, `writev` 3.476, `sendto` 6.950.
+- Profil `perf -g`: `_raw_spin_unlock_irqrestore` **13,07 %** +
+  `finish_task_switch` 6,80 % + `_raw_spin_unlock_irq` 2,44 % ≈ **22 % scheduler/spin**;
+  malloc family (calloc 1,31 + malloc 1,23 + cfree 1,06 + `clear_page_erms` 1,25)
+  ≈ **4,9 %**; `pgoutput::Reader::tuple` 2,55 %; `rowbinary::try_tuple_at` 2,13 %;
+  `pump_frames` 1,68 %; `hashbrown::rustc_entry` 1,58 %; `bytes::shared_drop` 1,50 %;
+  **`sha2::compress256` 1,38 %** = SCRAM per sesi (101 autentikasi — hilang di follow
+  mode); `read_exact::poll` 1,11 %.
+
+### 13.2 Catch-up (writer unpaced 188 rb/s, 90 s; drain 240 s)
+
+- Writer: 16.966.000 changes / 90,09 s = **188.321 ch/s** (max).
+- Drain: 10.240.000 changes / 276,19 s = **37.075 ch/s**, CPU 125,6 s =
+  **0,4546 core (91 % kuota)**; `passes=4`; belum tuntas mengejar dalam budget
+  (butuh ±458 s untuk 16,97 jt) — **laju catch-up 37 rb/s** (lebih cepat dari
+  keep-up 31 rb/s).
+- Syscall census: `recvfrom` **996.826** (≈**4,9 KB/recv**), `epoll_wait` 1.069.396;
+  waktu syscall: recvfrom 20,5 s (16,3 % CPU) + epoll 7,6 s (6 %) ≈ **22 % CPU di
+  syscall**.
+- **Temuan kunci: ukuran recv sudah ~5 KB di kedua mode, dan itu dibatasi kapasitas
+  `BufReader` 8 KiB (komentar di `walsender.rs` menyebut tokio default).** Menaikkan
+  buffer baca ke 64–256 KiB langsung memotong jumlah syscall ~8–16×; estimasi hemat
+  **10–18 % CPU catch-up** (≈1,5–2,7 µs/change) — L2 jadi tuas catch-up juga, bukan
+  hanya keep-up.
+
+### 13.3 Simbol libc (diminta §9.1 #3)
+
+`addr2line` dengan libc6-dbg image yang sama:
+
+- `0x9a72e` = **`__syscall_cancel_arch`** (`syscall_cancel.S:56`) — trampolin
+  pembatalan pthread untuk **setiap syscall libc**: 1,04 % itu ongkos syscall lagi.
+- `0x1628d9` = **`__memcpy_avx_unaligned_erms`** — salinan memcpy (0,89 % user;
+  berpasangan dengan `rep_movs_alternative` 2,86 % kernel).
+
+### 13.4 Konsekuensi untuk urutan kerja
+
+1. **Naikkan buffer baca lebih dulu** (bagian dari L1a, tanpa perlu FrameScanner):
+   satu perubahan kecil (`BufReader` capacity / read_buf langsung ke buffer besar),
+   hemat dua digit persen di kedua mode — kandidat tuas pertama yang di-A/B.
+2. **Follow mode naik prioritas**: 101 sesi/180 s = spin 22 % + SCRAM 1,4 % +
+   setup 1,78 s/pass; lebih besar dari seluruh L3–L6 digabung di keep-up.
+3. Scheduler/spin 22 % juga sebagian efek park/unpark per refill kecil — ikut turun
+   saat buffer baca membesar.
+4. Walsender server CPU per change **belum terukur** (sampler batch 2 rusak —
+   semua 0; perlu sampler per-pid `/proc/<pid>/stat`); tetap pending bersama leg
+   lintas host dan TLS per change.
