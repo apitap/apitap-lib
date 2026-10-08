@@ -61,7 +61,24 @@ against were OOM-killed in ~21 s on the small box and had landed **zero rows**
 when cut on the big one. The same belief now covers CDC: on one 650K-event
 replication window with every tool capped at 0.5 vCPU / 256 MB, apitap
 catches up in **12 s** where ape-dts takes 22 s and pipelinewise 227 s —
-all three row-matched ([benchmarks/logbased-cdc.md](benchmarks/logbased-cdc.md)). Every step got here the same way: one lever at a
+all three row-matched ([benchmarks/logbased-cdc.md](benchmarks/logbased-cdc.md)).
+In the same cage, **thirty tables in one CDC group** catch up 30M rows in
+**63.8 s at a 105 MB peak** while walshadow is OOM-killed before landing
+71K of them ([bench-capped-pg-ch-cdc-0.57.md](benchmarks/bench-capped-pg-ch-cdc-0.57.md)),
+and the steady-state record on that group is **31,679 changes/s = 1.90M/min**
+pure catch-up at 0.5 CPU, checksum-exact
+([cdc-steady-30t-0.58.md](benchmarks/cdc-steady-30t-0.58.md)). At fleet scale —
+180M changes out of four sharded Postgres into one ClickHouse, both movers
+capped at 6 CPU / 2 GB — apitap finishes in 125 s of apply work at ~3 µs of
+CPU per change where PeerDB did not finish ([docs/vs.md](docs/vs.md)).
+
+The next tiny-box goal is written down as plainly as the first one was:
+**3 million changes per minute of CDC on 0.5 vCPU / 256 MB**, and throughput
+that rises by itself when the box grows. Today's honest number is 1.9M/min
+catch-up and ~1.5M/min keep-up; the review that found the gap and the two
+design documents that close it are in
+[docs/review/2026-10-07-system-review-3jt-per-menit.md](docs/review/2026-10-07-system-review-3jt-per-menit.md)
+and [docs/design/](docs/design/). Every step got here the same way: one lever at a
 time, measured, checksum-validated, and written down in
 [benchmarks/README.md](benchmarks/README.md) including the caveats and our own
 mistakes — the profiling story behind the last 2-2.5× is
@@ -112,6 +129,18 @@ durability semantics, troubleshooting — lives in [docs/usage.md](docs/usage.md
   and applied as bulk statements — clear the touched keys, insert the final
   images — so the destination server does the work and the client barely
   needs a CPU. Row-at-a-time appliers pay per event; this pays per window.
+- **Own wire clients, no driver in the hot path.** Postgres `COPY` and the
+  replication stream are read by apitap's own walsender client straight off
+  the socket; MySQL rows and binlog events by its own hand-rolled MySQL
+  client (TLS included); `pgoutput` cells are byte ranges into the frame
+  they arrived in, not copies. The row data is copied once, from the kernel
+  into a buffer, and once more into the destination's wire body.
+- **A memory model that is priced, not hoped.** Every pipe has a byte price
+  (chunk buffers plus what the destination holds per pipe); the planner reads
+  the cgroup's CPU **and** memory limits and fits as many pipes as the budget
+  allows, thinning the chunk size before it drops a pipe. The same reading
+  sizes CDC windows and apply lanes. Peak RSS is a planning input, and a
+  release leg fails when a plan does not fit the cage it was planned into.
 
 **Measured against [ingestr](https://github.com/bruin-data/ingestr)** — running their
 own benchmark (their exact schema, value generators, and CLI invocation, at their
@@ -159,6 +188,24 @@ pipe buffers, not table size.)
 apitap scales with the cores you give it and with the databases'; ingestr barely
 moves between 0.5 and 16 vCPUs — a mostly serial pipeline. Full per-tier numbers and
 methodology live in [benchmarks/README.md](benchmarks/README.md).
+
+**Ten tables at once, the tool alone capped at 0.5 vCPU / 256 MB** (apitap 0.57.0
+from PyPI, every landed table checksum-matched, three interleaved rounds; the
+databases are ordinary uncapped servers):
+
+| job | apitap | the other tool |
+|---|---|---|
+| Postgres → ClickHouse, 10 × 1M rows, one call | **18.4 s**, 119 MB peak, 30/30 MATCH | walshadow 0.1.2: OOM-killed in 6/6 legs, ≤93K rows landed |
+| MySQL → ClickHouse, 10 × 1M rows, one call | **36.1 s**, 99 MB peak, 30/30 MATCH | ingestr 1.1.61: OOM-killed in 6/6 legs, 0 rows |
+| Postgres → ClickHouse **CDC**, 30 tables in one group, 30M-row bootstrap | **63.8 s**, 105 MB peak, 60/60 MATCH | walshadow 0.1.2: OOM-killed in 8/8 legs |
+| MySQL → ClickHouse **CDC**, 30 tables in one group, 30M-row bootstrap | **106.2 s**, 119 MB peak, 60/60 MATCH | ingestr 1.1.61: refuses ClickHouse as a CDC destination (exit 1, 0 rows) |
+
+Ledgers: [pg→ch](benchmarks/bench-capped-pg-ch-0.57.md) ·
+[my→ch](benchmarks/bench-capped-my-ch-0.57.md) ·
+[pg→ch CDC](benchmarks/bench-capped-pg-ch-cdc-0.57.md) ·
+[my→ch CDC](benchmarks/bench-capped-my-ch-cdc-0.57.md) · and the one that says
+**no**: a 0.5 CPU drain cannot absorb 1M changed rows per table per minute across
+30 tables ([the stress ledger](benchmarks/bench-capped-pg-ch-cdc-stress-0.57.md)).
 
 The ClickHouse route moves 10M rows in ~10s because the tool never touches text:
 Postgres streams `COPY (FORMAT binary)`, apitap transcodes it in-flight to ClickHouse
@@ -214,11 +261,42 @@ use it for rebuildable destinations.
   holds data, and nothing can prove a live loader is not still writing into it.
   ([the matrix, the window, and what a killed run leaves](docs/failure-modes.md))
 
+- **Refuse rather than corrupt or hang** (0.59.0, "safety first"). A CDC drain
+  no longer has a way to buffer without end or to park forever: one source
+  transaction is capped at 256 MiB of buffered changes (`APITAP_TX_BUF_BYTES`)
+  and refused with its table and size instead of OOM-killing the container;
+  the replication socket carries TCP keepalives and a 120 s silence budget
+  (`APITAP_REPLICATION_SILENCE_SECS`), so a half-open connection fails the
+  run and the next run recovers every row; a slot whose `wal_status` is
+  `lost` is refused with its remedy before replication starts; a destination
+  foreign key into a CDC group, a MySQL string column in a non-UTF-8 charset,
+  and `infinity` dates are refused before a row moves. Replication slot names
+  carry the destination's identity, so one source feeding two destinations
+  gives each its own slot. A cleartext or MD5 password request on an
+  unverified channel is refused unless the connection is `verify-full`
+  (`APITAP_ALLOW_INSECURE_AUTH=1` to override); MySQL connections to any
+  non-loopback host require TLS since 0.55.1 unless the URL says
+  `ssl-mode=disabled`. Error messages never echo a password: a URL that fails
+  to parse is shown with the secret struck out and the offending character
+  named.
+- **Stoppable and observable.** A `log_based` run takes the first SIGTERM as
+  a request to land the window in flight and exit cleanly (`apitap.request_stop()`
+  does the same from another thread; a second SIGTERM is not absorbed), and
+  every run reports progress — a live line on a terminal, `key=value` or JSON
+  lines in a container — including CDC windows, applied changes, and the WAL
+  the slot is retaining on the source
+  ([stopping](docs/usage.md#stopping-a-run-on-purpose) ·
+  [progress](docs/usage.md#progress-while-it-runs)).
+
 The failure modes these guarantees do *not* cover — a killed process, a cut
 connection, a DDL change mid-run, a CDC schedule paused past the source's
 retention — are written down, each one produced on purpose against live servers,
 in [docs/failure-modes.md](docs/failure-modes.md). What is stable enough to
 depend on, and what may still move, is [docs/stability.md](docs/stability.md).
+Every sentence those pages promise about the guard, the lease, the apply
+contracts and memory is a row in the release gate's claim matrix
+(`benchmarks/gate.py --matrix`), proved by a leg that asks the server, not the
+exit code; 0.59.0 shipped on **87 passed, 0 failed, 0 skipped**.
 
 ## Roadmap
 
@@ -258,7 +336,14 @@ depend on, and what may still move, is [docs/stability.md](docs/stability.md).
       `changelog=True` turns an analytical destination into an append-only
       audit trail (`_apitap_op` per row, a `<table>__current` view) instead of a
       replica — free on the Postgres lane, 34% faster on the MySQL one
-      ([the ledger](benchmarks/changelog-cdc.md))
+      ([the ledger](benchmarks/changelog-cdc.md)). Steady state on a
+      30-table group at 0.5 CPU: **1.90M changes/min** pure catch-up and
+      ~1.50M/min paced, checksum-exact, under 200 MB
+      ([the 0.58 campaign](benchmarks/cdc-steady-30t-0.58.md)); a single
+      table kept up with a 2.19M/min writer at 0.40 core and 101 MB
+      ([0.59.0 release notes](docs/review/2026-10-07-release-0.59.0.md)).
+      The 3M/min target is open and designed, not claimed (see
+      [docs/design/](docs/design/))
 - [x] Postgres & MySQL → Polars / Arrow — `apitap.read(src, table=…)`:
       parallel range pipes decoded into Arrow batches in Rust, handed
       to Python zero-copy (hand-rolled Arrow C stream, no pyarrow
@@ -317,22 +402,58 @@ depend on, and what may still move, is [docs/stability.md](docs/stability.md).
 ## Development
 
 ```bash
-cargo test -p apitap-core          # engine tests
-uv pip install -e py-apitap        # build the Python package (needs Rust)
+cargo test -p apitap-core          # engine tests (MSRV 1.94; vendored sqlx-core in vendor/)
+uv pip install -e py-apitap        # build the Python package with maturin (needs Rust)
+python benchmarks/gate.py --matrix # release pre-flight: every claim × engine, exit 0 or do not tag
 ```
+
+The wheel is `abi3` for CPython ≥ 3.9, built once and published for
+`manylinux_x86_64`; aarch64 and macOS wheels are on the road to 1.0
+([docs/stability.md](docs/stability.md)). The release gate and what it needs
+(a Postgres with logical replication, MySQL 8.4 and MariaDB, ClickHouse, MinIO +
+a REST Iceberg catalog, a BigQuery project, two older wheels for the upgrade
+legs) are described in [benchmarks/README.md](benchmarks/README.md#the-release-gate).
 
 ### Architecture (adding a database)
 
-One generic driver (`crates/apitap-core/src/driver.rs`) runs every route's lifecycle —
-probe → wire-format negotiation → staging → parallel span workers → count → atomic
-swap. Databases live in `crates/apitap-core/src/connectors/<name>.rs` and implement
-`Source` (probe the schema, plan read spans, run decode/encode workers) and/or `Sink`
-(staging DDL from the neutral column model, one streaming loader per worker, the
-swap). A new destination is one connector file plus a dispatch arm in `transfer()`;
-it immediately works with every source that produces a wire format it accepts.
-Encoders are deliberately per-(source, format) and fully monomorphized — there is no
-neutral in-memory IR, because the fast lanes (raw `COPY` passthrough, binary→RowBinary
-transcode) *are* the product.
+Everything lives in one crate, `crates/apitap-core`; `py-apitap` is a thin PyO3
+shim that releases the GIL and hands back a report (and an Arrow C stream for
+`read()`), with no logic of its own.
+
+- `pipeline/mod.rs` runs every bulk route's lifecycle — probe → cursor →
+  destination state → wire-format negotiation → staging → parallel span
+  workers (the `Pipes` crew in `pipe.rs`) → count → atomic swap — and holds the
+  memory planner (`fit`) that reads the cgroup limits. `pipeline/dispatch.rs` is
+  the route table: a `routes!` macro pairs every source with every destination
+  it serves, with a per-route CPU profile, and a test fails the build if a pair
+  is neither implemented nor explicitly deferred with a reason.
+- `source/*.rs` implement `Source` (probe the schema, plan read spans, run the
+  decode/encode workers); `sink/*.rs` implement `Sink` (staging DDL from the
+  neutral column model, one streaming `Loader` per worker, the swap, the
+  incremental state row). `wire/` holds the encoders and wire clients:
+  `pgcopy`, `rowbinary`, `pgmytsv`, `arrowcol`, `bqparquet`, the Postgres
+  walsender/COPY client (`walsender.rs`), the `pgoutput` decoder, and the MySQL
+  wire and binlog decoders (`mywire.rs`, `mybinlog.rs`).
+- `logbased/` is batch CDC: `run.rs` (slots, groups, bootstrap, the drain/apply
+  pipeline and its lanes), `drain.rs` + `collapse.rs` + `window.rs` (a window
+  collapsed per key), `myrun.rs`/`mysource.rs` for the binlog lane, and one
+  `dest_*.rs` apply per destination. `naming.rs`, `guard.rs` and `lease.rs` are
+  the run identity, the announce-then-check guard and the lease every CDC
+  write is fenced on; `shutdown.rs` is the SIGTERM handler; `progress.rs` the
+  reporter.
+- `read_impl.rs` is `apitap.read()`: the same span workers feeding Arrow column
+  builders (`wire/arrowcol.rs`), exported through the hand-rolled C Data
+  Interface in `py-apitap/src/capsule.rs`.
+
+A new destination is one `sink/<name>.rs` plus its `routes!` arms (and a
+`logbased/dest_<name>.rs` if it should take CDC); it then works with every source
+that produces a wire format it accepts. Encoders are deliberately
+per-(source, format) and fully monomorphized — there is no neutral in-memory IR,
+because the fast lanes (raw `COPY` passthrough, binary→RowBinary transcode) *are*
+the product. Design notes: [docs/design/log_based.md](docs/design/log_based.md)
+(the CDC contracts), the two 2026-10-08 documents in [docs/design/](docs/design/)
+(the road to 3M changes/min and automatic scaling), and the reviews in
+[docs/review/](docs/review/).
 
 ## License
 

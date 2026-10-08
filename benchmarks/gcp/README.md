@@ -37,10 +37,12 @@ SRC_IP=10.a.b.c DST_IP=10.d.e.f ./bench_a.sh bench_data_1m bench_data_10m
 
 ## Round B — MySQL source (MySQL→MySQL, MySQL→ClickHouse)
 
-MySQL→MySQL is not on PyPI yet, so Round B installs apitap from a locally-built
-wheel of the `feat/mysql-sink` branch. Build it with `../pgo-build.sh` (or a
-plain `maturin build --release -m py-apitap/Cargo.toml`) and copy the `.whl` to
-bench-ingest.
+Every route Round B runs has been on PyPI since 0.13.0, so `setup-ingest.sh`
+installs the released `pip install apitap` by default. (When Round B was first
+recorded, MySQL→MySQL lived on a branch and the wheel was built locally — the
+`APITAP_WHEEL=` hook that made that possible is still there: point it at any
+`.whl` from `maturin build --release -m py-apitap/Cargo.toml` or
+`../pgo-build.sh` to benchmark an unreleased build.)
 
 ```bash
 export PROJECT=your-project ZONE=us-east1-b
@@ -50,14 +52,25 @@ export PROJECT=your-project ZONE=us-east1-b
 ROLE=source FAMILY=mysql ./setup-dbs.sh
 # on bench-dest:
 ROLE=dest ./setup-dbs.sh
-# on bench-ingest (point at the branch wheel):
-APITAP_WHEEL=~/apitap-0.5.0-*.whl ./setup-ingest.sh
+# on bench-ingest (PyPI release; or APITAP_WHEEL=~/apitap-*.whl ./setup-ingest.sh):
+./setup-ingest.sh
 
 # on bench-ingest:
 SRC_IP=10.a.b.c DST_IP=10.d.e.f ./bench_b.sh bench_my_1m bench_my_10m
 
 ./teardown.sh
 ```
+
+## Later rounds, and where their harnesses live
+
+- **Round C (100 GB, three machines) and Round D (how small can the mover be)**
+  are written up in [`../gcp-benchmark.md`](../gcp-benchmark.md); they reuse
+  `provision.sh`/`setup-dbs.sh`/`setup-ingest.sh` with the 232M-row seed from
+  the OVH ladder.
+- **The 100-table CDC ledger** ([`../gcp-cdc-100tables.md`](../gcp-cdc-100tables.md),
+  13 parts: `slots=N`, the sharded-source record, apitap vs PeerDB) ran on its
+  own per-round rigs assembled in those parts, not on these scripts; the
+  ledger carries each round's commands and the harness bugs it caught.
 
 ## Reading the output
 

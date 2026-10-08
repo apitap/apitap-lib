@@ -81,7 +81,7 @@ Each pair negotiates the fastest wire format both sides speak — for example:
 | `postgres://` → `mysql://` | binary COPY rendered in-flight as `LOAD DATA` text |
 | `mysql://` → `postgres://` | wire decode → binary COPY (exact decimals to `DECIMAL(65,30)`) |
 | `clickhouse://` → `clickhouse://` | `RowBinary` relayed untouched — 10M rows server-to-server in 8.4 s, or 20.6 s in a 256 MB container |
-| `postgres://`/`mysql://` → `clickhouse://`/`bigquery://`/…, `mode="log_based"` | change streams: 40M+ changes verified per source at **34–135K changes/s** on **half a core**, by row width AND capture plane — MySQL binlog 84K/s (5 cols, update-only) to 135K/s (insert-heavy), Postgres WAL 51K/s (5 cols) to 34K/s (15 wide cols); `changelog=True` lifts the MySQL lane to **113.8K/s** ([stress ledger](https://apitap.dev/docs/cdc-stress), [changelog ledger](https://github.com/apitap/apitap-lib/blob/main/benchmarks/changelog-cdc.md)) |
+| `postgres://`/`mysql://` → `clickhouse://`/`bigquery://`/…, `mode="log_based"` | change streams: 40M+ changes verified per source at **34–135K changes/s** on **half a core**, by row width AND capture plane — MySQL binlog 84K/s (5 cols, update-only) to 135K/s (insert-heavy), Postgres WAL 51K/s (5 cols) to 34K/s (15 wide cols); `changelog=True` lifts the MySQL lane to **113.8K/s** ([stress ledger](https://apitap.dev/docs/cdc-stress), [changelog ledger](https://github.com/apitap/apitap-lib/blob/main/benchmarks/changelog-cdc.md)). A **30-table group** of 15-column tables in one slot, same half core: **1.90M changes/min** pure catch-up, ~1.50M/min paced, checksum-exact under 200 MB ([0.58 campaign](https://github.com/apitap/apitap-lib/blob/main/benchmarks/cdc-steady-30t-0.58.md)) |
 | any → `bigquery://` (bulk) | Parquet or CSV load jobs — free path, sandbox-safe (CDC into BigQuery needs a billed project) |
 
 Every transfer stages and swaps in atomically — readers never see a partial table,
@@ -130,6 +130,22 @@ its connectorx backend was OOM-killed on all four routes at the same 4 GB cap.
 ² dlt has no native MySQL destination; via its documented `sqlalchemy` path it is
 28–52× slower (measured at 1M).
 
+**The tool alone capped at 0.5 vCPU / 256 MB, ten tables in one call** (apitap
+0.57.0 from PyPI, three interleaved rounds, every landed table checksum-matched):
+Postgres → ClickHouse 10M rows in **18.4 s** at a 119 MB peak where walshadow
+0.1.2 is OOM-killed in every leg; MySQL → ClickHouse in **36.1 s** at 99 MB where
+ingestr 1.1.61 is OOM-killed in every leg; a **30-table CDC group** bootstraps
+30M rows in **63.8 s** at 105 MB and then drains windows at a peak that does not
+trend up. Ledgers:
+[pg→ch](https://github.com/apitap/apitap-lib/blob/main/benchmarks/bench-capped-pg-ch-0.57.md) ·
+[my→ch](https://github.com/apitap/apitap-lib/blob/main/benchmarks/bench-capped-my-ch-0.57.md) ·
+[pg→ch CDC](https://github.com/apitap/apitap-lib/blob/main/benchmarks/bench-capped-pg-ch-cdc-0.57.md) ·
+[my→ch CDC](https://github.com/apitap/apitap-lib/blob/main/benchmarks/bench-capped-my-ch-cdc-0.57.md).
+At fleet scale, 180M changes from four sharded Postgres into one ClickHouse with
+both movers capped at 6 CPU / 2 GB, apitap completes 400/400 tables in 125 s of
+apply work at ~3 µs of CPU per change where PeerDB did not finish
+([docs/vs.md](https://github.com/apitap/apitap-lib/blob/main/docs/vs.md)).
+
 Full methodology, validation queries, and honest caveats — including what these
 runs do *not* show:
 [benchmarks/README.md](https://github.com/apitap/apitap-lib/blob/main/benchmarks/README.md).
@@ -148,6 +164,9 @@ apitap.transfer(
     chunk_bytes=None,    # per-send coalescing, default 4 MiB
     durable=True,        # False = UNLOGGED staging on Postgres dests (~-30% wall)
     engine=None, order_by=None, on_cluster=None,   # ClickHouse DDL
+    partition_by=None,   # analytical dests: PARTITION BY of the created table (monthly on a column)
+    changelog=False,     # log_based into ClickHouse/BigQuery: append every change, keep history
+    slots=None,          # log_based, many tables, Postgres: drain over N replication slots
 ) -> TransferReport      # .rows, .elapsed_ms, .parallel, .tables
 ```
 
@@ -189,7 +208,31 @@ The GIL is released for the whole transfer. Errors are `ValueError` for bad inpu
 (unknown table, unsupported type — always at probe time, never mid-copy) and
 `RuntimeError` for transfer failures — with `apitap.LockedError` (a
 `RuntimeError` subclass) for the one case a scheduler wants to branch on:
-another run already holds this destination table.
+another run already holds this destination table. A multi-table run with some
+failed tables raises `apitap.MultiTransferError`, whose `.report` lists every
+table's outcome; the tables that succeeded are already committed.
+
+**Stopping and watching a run.** A `mode="log_based"` run takes the first
+SIGTERM — what Kubernetes, Airflow and systemd send — as a request to land the
+window in flight, advance the watermark and exit 0; a second SIGTERM is not
+absorbed. `apitap.request_stop()` asks the same from another thread or from a
+host that owns its signal handlers. Every run reports progress with no flag: a
+rewritten line on a terminal, plain `key=value` lines every 30 s in a container
+or DAG log, or one JSON object per line with `APITAP_PROGRESS=json` — rows or
+changes, bytes, windows, pipes, and the WAL a replication slot is retaining on
+the source ([stopping](https://github.com/apitap/apitap-lib/blob/main/docs/usage.md#stopping-a-run-on-purpose) ·
+[progress](https://github.com/apitap/apitap-lib/blob/main/docs/usage.md#progress-while-it-runs)).
+
+**Safe by default.** MySQL connections to any non-loopback host require TLS
+(say `ssl-mode=disabled` in the URL to send credentials in clear on purpose);
+Postgres refuses a cleartext or MD5 password request on a channel that is not
+`sslmode=verify-full`, since a man-in-the-middle can ask for one. A CDC drain
+refuses — with the table, the size and the knob — rather than buffering one
+source transaction without end, fails a half-open replication socket inside a
+silence budget instead of parking forever, and refuses a lost replication slot,
+a destination foreign key into a CDC group, or a non-UTF-8 MySQL column before a
+row moves. No error message ever echoes a password: a URL that fails to parse is
+shown with the secret struck out and the offending character named.
 
 ### `apitap.read()` → Arrow / polars
 
@@ -293,6 +336,10 @@ troubleshooting:
       binary-protocol rows straight into Arrow, 1.8× a driver-based full
       drain (5.5× on thin scans) at 0.5 vCPU / 256 MB; cross-engine joins
       (MySQL × Postgres) are one ordinary polars expression
+- [ ] **3M changes/min of CDC on 0.5 vCPU / 256 MB**, rising by itself when
+      the box grows — measured today: 1.90M/min catch-up on a 30-table group;
+      the design is written and the levers are measured one at a time
+      ([docs/design](https://github.com/apitap/apitap-lib/tree/main/docs/design))
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
 - [ ] Snowflake destination
 - [ ] aarch64 + macOS wheels

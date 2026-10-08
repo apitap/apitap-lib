@@ -52,6 +52,66 @@ Companion write-ups in this directory:
   MATCH**; dlt+pyiceberg and the hand-written pyiceberg path OOM-killed at
   the cap; ingestr has no Iceberg destination.
   Raw: [iceberg-showdown-raw.log](iceberg-showdown-raw.log).
+- **[bench-capped-pg-ch-0.57.md](bench-capped-pg-ch-0.57.md)** — the capped
+  tier, Postgres → ClickHouse: 10 × 1M rows in one job at **0.5 CPU / 256 MB**,
+  **apitap 0.57.0 median 18.4 s, 119 MB peak, 30/30 MATCH**; walshadow 0.1.2
+  OOM-killed in 6/6 legs (its base backup alone needs ~550 MB; at 1 GB it
+  lands all ten in ~125 s). Raw: [bench-capped-pg-ch-0.57-raw.log](bench-capped-pg-ch-0.57-raw.log).
+- **[bench-capped-pg-ch-cdc-0.57.md](bench-capped-pg-ch-cdc-0.57.md)** — the
+  same tier, **CDC**: thirty tables in ONE group (one slot, one publication,
+  one call), **30M-row bootstrap in a median 63.8 s at 105 MB, 60/60 MATCH**;
+  walshadow OOM-killed in 8/8 legs; then a five-minute window of 2.97M
+  changes drained at a 65.6 MB peak that does not trend up.
+- **[bench-capped-my-ch-cdc-0.57.md](bench-capped-my-ch-cdc-0.57.md)** — the
+  MySQL-source twin: 30 tables, **30M-row bootstrap in 106.2 s at 119 MB,
+  60/60 MATCH**, then 2.97M changes at a flat 55.5 MB peak — and the honest
+  number that started the next campaign: **2,880 changes/s** while busy, the
+  MySQL group applying its members serially.
+- **[bench-capped-pg-ch-cdc-stress-0.57.md](bench-capped-pg-ch-cdc-stress-0.57.md)**
+  — the question "can 0.5 CPU / 256 MB absorb 1,000,000 changed rows per table
+  per minute across 30 tables?" and the answer **no**, with the shape of the
+  no: the writer offered ~1.03M/table/min, the slot was lost before the drain
+  committed a change, and the refusal said so.
+- **[cdc-steady-30t-0.58.md](cdc-steady-30t-0.58.md)** — the 0.58 campaign on
+  that 30-table group: quota-aware apply lanes, one batched state write per
+  window, the statement census, binary pgoutput measured and left opt-in, and
+  the record that stands — **31,679 changes/s = 1.90M/min pure catch-up at
+  0.5 CPU (15.35 µs/change, 163 MB, 30/30)**, ~1.50M/min paced; the curve is
+  flat above 1 CPU and the ledger says why. The 2M/min verdict is "not
+  reached", in those words.
+- **[wal-tcp-cost-0.58.md](wal-tcp-cost-0.58.md)** — the measurement B2.7
+  asked for: the WAL stream is already coalesced to ~0.6 packets per change,
+  the removable transport share is single digits, so a Unix socket is not the
+  lever — the per-change cost is userspace and scheduler, which is where the
+  3M/min design goes ([docs/design/](../docs/design/)).
+- **[cdc-stress.md](cdc-stress.md)** — 80M changes through a 256 MB box: ten
+  tables into ClickHouse from Postgres and from MySQL, CDC side at
+  0.5 CPU / 256 MB, writer unconstrained; 40M rows verified per source. The
+  v0.30.0 update on the page: 132K changes/s on the 5-column rig, 37K/s on
+  the 15-wide-column rig — 92% of what `pg_recvlogical` manages in the same
+  cage doing nothing but receiving.
+- **[changelog-cdc.md](changelog-cdc.md)** — `changelog=True` vs replica:
+  free on the Postgres lane, 34% faster on the MySQL one (113.8K/s), and
+  where the recorded 132–135K/s headline comes from.
+- **[gcp-cdc-100tables.md](gcp-cdc-100tables.md)** — the 13-part ledger: 100
+  tables × 15 columns, 10M and 100M changes per round, the serial bottleneck
+  found (one walsender per slot), `slots=N` swept (4 slots: 121,789 →
+  278,947 changes/s), the 100M/minute attempt from four sharded sources, and
+  apitap vs PeerDB at equal cages — including the rounds that refuted our own
+  theories. The summary is in [docs/vs.md](../docs/vs.md).
+- **[read-showdown.md](read-showdown.md)** — `apitap.read()` → polars vs
+  connectorx and ADBC, with the audit that retracted one of our own numbers
+  (5.2× became 2.6×, and the page says why).
+- **[tpch-cross-engine.md](tpch-cross-engine.md)** — TPC-H SF 33.34 across a
+  live Postgres and a live MySQL, landed as a Parquet lake and joined, every
+  stage inside 0.5 CPU / 256 MB.
+- **[wan-latency.md](wan-latency.md)** — what added RTT costs a transfer: the
+  prediction that parallel pipes widen the gap under latency was tested and
+  came back false (the gap narrows), with the netem rig that showed it.
+- Engineering ledgers behind the releases, kept as written:
+  [cdc-apply-0.28.0.md](cdc-apply-0.28.0.md), [cdc-apply-profile.md](cdc-apply-profile.md),
+  [ch-ingest-r3.md](ch-ingest-r3.md), [ch-ingest-receipts.md](ch-ingest-receipts.md),
+  [bq-cdc-optimize.md](bq-cdc-optimize.md), [drepper-notes.md](drepper-notes.md).
 
 ## What the harness measures (and how)
 
@@ -97,6 +157,13 @@ To keep it apples-to-apples we run **ingestr's own benchmark**, not one we inven
 - **Work**: both tools perform a full refresh of the same table into the same
   destination database. apitap runs with **zero configuration** — no knobs set; it
   auto-sizes to whatever CPU/memory it finds.
+
+The later comparisons on this page and in the companion ledgers keep that rule
+and widen the field: dlt in all three of its backends, ape-dts and pipelinewise
+on CDC, walshadow and PeerDB on ClickHouse, connectorx and ADBC on `read()`.
+Every rival runs its own documented or source-verified best configuration, a
+number counts only after the destination is read back and matches the source,
+and a run that was wrong is kept on the page with the correction.
 
 ## Validation — a time only counts if the data is right
 
@@ -503,7 +570,10 @@ source ~/apitap-057.env                     # the variables below
 ```
 
 A skipped leg is a reported leg: the gate exits 3 when anything was skipped, and
-the summary names the capability that was missing.
+the summary names the capability that was missing. The 0.59.0 wheel shipped on
+**87 legs — 87 passed, 0 failed, 0 skipped** (63 scripts, several run once per
+engine) in 7,289 s; its log and bench are in
+[docs/review/2026-10-07-release-0.59.0.md](../docs/review/2026-10-07-release-0.59.0.md).
 
 **What the rig needs.**
 
@@ -569,6 +639,13 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_changelog_percolumn --> `e2e_changelog_percolumn.py` | per-column changelog config |
 | <!-- claim: leg.e2e_parquet_capped --> `e2e_parquet_capped.py` | parquet pipes fit the memory cage they are planned into |
 | <!-- claim: leg.e2e_iceberg_merge_capped --> `e2e_iceberg_merge_capped.py` | an Iceberg merge delta does not grow memory |
+| <!-- claim: leg.e2e_fk_guard --> `e2e_fk_guard.py` | a destination FK into a CDC group is refused before any row moves; an FK whose parent is outside the group drains |
+| <!-- claim: leg.e2e_my_charset_guard --> `e2e_my_charset_guard.py` | a non-UTF-8 MySQL string column is refused before a CDC run; utf8mb4 drains clean |
+| <!-- claim: leg.e2e_myengine_commit --> `e2e_myengine_commit.py` | a MyISAM/Aria transaction ends on its QUERY `COMMIT` and lands; autocommit beside it too |
+| <!-- claim: leg.e2e_tx_cap --> `e2e_tx_cap.py` | one transaction past `APITAP_TX_BUF_BYTES` is refused with nothing landed; a fitting cap lands it whole |
+| <!-- claim: leg.e2e_half_open --> `e2e_half_open.py` | a frozen source fails the drain inside its silence budget; the next run recovers every row |
+| <!-- claim: leg.e2e_two_destinations --> `e2e_two_destinations.py` | one source into two destinations: each bootstraps and resumes its own slot |
+| <!-- claim: leg.e2e_cdc_progress --> `e2e_cdc_progress.py` | a Postgres drain reports a non-zero count while it is still running |
 
 ## Multi-table on the tiny box — TPC-H, 10 × 1M rows, 256 MB / 0.5 CPU
 
