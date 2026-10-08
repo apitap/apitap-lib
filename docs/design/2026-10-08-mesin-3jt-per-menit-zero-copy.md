@@ -706,3 +706,33 @@ Dua run `steady.sh` di rig yang sama (single-table `prof_pg_m`, SP = gate-venv 0
 4. Walsender server CPU per change **belum terukur** (sampler batch 2 rusak —
    semua 0; perlu sampler per-pid `/proc/<pid>/stat`); tetap pending bersama leg
    lintas host dan TLS per change.
+
+### 13.5 Hasil A/B tuas 1 — coalescer baca (`APITAP_READ_COALESCE_US`, commit `61bb224`)
+
+12 run berselang-seling (6 pasang, n=3 per mode), wheel 0.59.0+coalescer, kandang
+0,5 CPU / 256 MB, single-table, checksum per run OK, satu build untuk kedua sisi.
+Kontrol = `APITAP_READ_COALESCE_US=0` (perilaku lama), perlakuan = default 500 µs.
+
+| mode | pair | old (µs/change) | new (µs/change) |
+|---|---|---|---|
+| catch-up | 1 | 12,30 | 9,40 |
+| catch-up | 2 | 12,41 | 9,17 |
+| catch-up | 3 | 12,39 | 9,85 |
+| keep-up | 1 | 12,22 | 9,42 |
+| keep-up | 2 | 12,21 | 9,06 |
+| keep-up | 3 | 12,35 | 9,28 |
+
+- Catch-up: rata-rata **12,37 → 9,47 µs (−23,4 %)**; CPU 0,465 → 0,358 core.
+- Keep-up: rata-rata **12,26 → 9,25 µs (−24,5 %)**; CPU 0,384 → 0,290 core.
+- Laju kedua arm sama (writer-bound di bentuk ini): keep-up ±31,3 rb/s,
+  catch-up ±37–38,6 rb/s — yang berubah adalah CPU per change, yaitu plafon.
+- **Target 0.61 (≤9,5 µs/change) sudah tercapai oleh satu tuas ini**, sebelum
+  L1a/L1b/L3–L6. Sisa levers kini menaikkan margin dan plafon di >1 core.
+
+Catatan: percobaan pertama tuas ini (`SO_RCVLOWAT` + readiness, commit `56c347a`)
+menggantungkan reader (ET epoll + watermark; sesi dibunuh `wal_sender_timeout`
+60 s) dan direvert di `61bb224`; bentuk aman adalah sleep yang dibatasi.
+Insiden disk 2026-10-08 (dua kali / penuh; penyebab: 77 volume dangling + log
+JSON container `ch3`/`ch` yang loop error rotasi internal CH saat disk penuh;
+PG source crash WAL) sudah ditangani dan dicatat di memori; CH di-restart,
+log di-truncate, PG pulih utuh (1 jt baris).
