@@ -1732,8 +1732,9 @@ async fn drain_loop(
             }
         }
         let t_drain = std::time::Instant::now();
+        let follow_ctx = follow.map(|d| (src, FOLLOW_FLOOR, d));
         let outcome =
-            drain(ws, &mut sess, cur, stop_line, key_cols, window_max_secs(), budget, &applied_rx, changelog).await?;
+            drain(ws, &mut sess, cur, stop_line, key_cols, window_max_secs(), budget, &applied_rx, changelog, follow_ctx).await?;
         windows += 1;
         if dbg {
             eprintln!(
@@ -2225,6 +2226,11 @@ async fn ensure_publication(
 fn slot_status_lost(status: &str) -> bool {
     status.eq_ignore_ascii_case("lost")
 }
+
+/// The follow floor (design §14.2): in follow mode a window is not sealed at
+/// the first caught-up point; it fills to this many buffered bytes (or the
+/// follow deadline) so the ~constant per-window DELETE is amortised.
+const FOLLOW_FLOOR: usize = 8 << 20;
 
 /// `APITAP_FOLLOW_SECS`: run the drain as one continuous session for this many
 /// seconds — the walsender, tenure, pin cache and key table stay, and the stop

@@ -163,7 +163,9 @@ pub(crate) async fn drain(
     max_buf_bytes: usize,
     applied: &tokio::sync::watch::Receiver<u64>,
     changelog: bool,
+    follow: Option<(&sqlx::PgPool, usize, std::time::Instant)>,
 ) -> Result<DrainOutcome> {
+    let mut stop_line = stop_line;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
     let mut changelogs: HashMap<String, Changes> = HashMap::new();
@@ -249,6 +251,33 @@ pub(crate) async fn drain(
                     ws.standby_status(*applied.borrow(), false).await?;
                 }
                 if wal_end >= stop_line && tx_buf.is_empty() && sess.streams.is_empty() {
+                    // Follow floor (design §14.2): the per-window DELETE cost
+                    // is ~constant, so sealing every caught-up delta kept
+                    // windows at ~4k changes and follow at 36k/s. Keep THIS
+                    // window open, roll the stop line, and fill to the floor
+                    // (or the follow deadline) before sealing.
+                    if let Some((src, floor, deadline)) = follow {
+                        let buffered = buf_bytes + sess.stream_bytes;
+                        if buffered < floor && std::time::Instant::now() < deadline {
+                            let now: (String,) =
+                                sqlx::query_as("SELECT pg_current_wal_lsn()::text")
+                                    .fetch_one(src)
+                                    .await
+                                    .map_err(|e| {
+                                        Error::Transfer(format!(
+                                            "log_based: follow lsn read: {e}"
+                                        ))
+                                    })?;
+                            let now = crate::wire::pgoutput::lsn_from_string(&now.0)?;
+                            if now > stop_line {
+                                stop_line = now;
+                            } else {
+                                tokio::time::sleep(std::time::Duration::from_millis(200))
+                                    .await;
+                            }
+                            continue;
+                        }
+                    }
                     // Server has shipped everything up to the stop-line and
                     // we're at a boundary: caught up.
                     //
