@@ -76,6 +76,27 @@ struct PumpHandle {
 /// before the consumer drained even a few (system review 2026-10-07, G0.2).
 type FramedBody = (u8, bytes::Bytes, tokio::sync::OwnedSemaphorePermit);
 
+/// Default `SO_RCVLOWAT` on the walsender socket: epoll wakes only once this
+/// much is queued, so one `recv` carries a backlog chunk instead of whatever
+/// single message arrived. `recv()` itself ignores the low watermark, and the
+/// pump's 2 ms timer covers idle streams — without it a stream quieter than
+/// the watermark would never wake (system review 2026-10-07 §5.3 L2; measured
+/// 2026-10-08: recvfrom ~5 KB, 22% of catch-up CPU in recvfrom+epoll).
+const READ_LOWAT: usize = 64 << 10;
+
+/// `APITAP_READ_LOWAT` (bytes or K/M): unset = 64 KiB; `0`/`off` disables
+/// (the A/B control); zero/junk falls back to the default.
+fn read_lowat() -> usize {
+    match std::env::var("APITAP_READ_LOWAT") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
+        Ok(v) => crate::logbased::run::parse_size(&v)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(READ_LOWAT),
+        Err(_) => READ_LOWAT,
+    }
+}
+
 /// How many bytes of read frames may wait in the pump channel;
 /// `APITAP_PUMP_BUF_BYTES` tunes it (bytes or a K/M/G suffix), zero or junk
 /// falls back so a typo cannot disable the bound.
@@ -127,7 +148,21 @@ async fn pump_frames(
     tx: mpsc::Sender<FramedBody>,
     sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> (BufReader<PgRead>, Result<()>) {
+    let lowat_on = read_lowat() > 0;
     loop {
+        // When the reader's buffer is empty, give the socket up to 2 ms to
+        // accumulate to the low watermark before the next fill: one recv per
+        // ~64 KB instead of one per ~5 KB. `recv` ignores SO_RCVLOWAT, so a
+        // quiet stream still drains on the timer (keepalives included).
+        if lowat_on && rd.buffer().is_empty() {
+            if let PgRead::Tcp(s) = rd.get_ref() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(2),
+                    s.readable(),
+                )
+                .await;
+            }
+        }
         match read_frame(&mut rd).await {
             Ok((tag, body)) => {
                 let done = tag == b'Z';
@@ -728,6 +763,22 @@ impl Walsender {
                 .with_time(std::time::Duration::from_secs(60))
                 .with_interval(std::time::Duration::from_secs(10));
             SockRef::from(&stream).set_tcp_keepalive(&ka).ok();
+            let lowat = read_lowat();
+            if lowat > 0 {
+                // A 1 MiB receive buffer so the watermark has room to pay off.
+                SockRef::from(&stream).set_recv_buffer_size(1 << 20).ok();
+                let fd = std::os::fd::AsRawFd::as_raw_fd(&stream);
+                let v = lowat as libc::c_int;
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVLOWAT,
+                        &v as *const libc::c_int as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+            }
         }
         // TLS is negotiated BEFORE the startup message, so it happens here or
         // not at all.
@@ -1896,6 +1947,24 @@ mod tests {
         std::env::set_var("APITAP_ALLOW_INSECURE_AUTH", "1");
         assert!(super::auth_downgrade_allowed());
         std::env::remove_var("APITAP_ALLOW_INSECURE_AUTH");
+    }
+
+    /// The read watermark knob: unset = 64 KiB, 0/off disables (A/B control),
+    /// junk falls back — a typo cannot silently turn coalescing off
+    /// (system review 2026-10-07 §5.3 L2).
+    #[test]
+    fn the_read_watermark_has_a_safe_default_and_an_off_switch() {
+        std::env::remove_var("APITAP_READ_LOWAT");
+        assert_eq!(super::read_lowat(), super::READ_LOWAT);
+        std::env::set_var("APITAP_READ_LOWAT", "0");
+        assert_eq!(super::read_lowat(), 0);
+        std::env::set_var("APITAP_READ_LOWAT", "off");
+        assert_eq!(super::read_lowat(), 0);
+        std::env::set_var("APITAP_READ_LOWAT", "junk");
+        assert_eq!(super::read_lowat(), super::READ_LOWAT);
+        std::env::set_var("APITAP_READ_LOWAT", "128K");
+        assert_eq!(super::read_lowat(), 128 << 10);
+        std::env::remove_var("APITAP_READ_LOWAT");
     }
 
     use super::*;
