@@ -753,3 +753,55 @@ lantai noise. Keputusan: kode **dipertahankan** (behavior-identik, menghapus
 zero-fill + refcount per frame; tidak ada klaim menang), dan anggaran L1a di §2
 tidak lagi dipakai untuk proyeksi. Pelajaran: dua tuas kecil berurutan (coalescer
 lalu L1a) sebaiknya di-A/B dalam satu kampanye dengan n≥5 bila efeknya <1 µs.
+
+## 14. Insert-only ClickHouse: rencana implementasi (dari angka 2026-10-08)
+
+**Angka yang memutuskan** (run `b61-3mb`, penulis paced 49.729 ch/s, 90 s):
+
+- drain 4,62 jt changes / 131,8 s = **35,1 rb/s**; CPU klien hanya **0,32/0,5 core**;
+- CH: `QueryTimeMicroseconds` +53,4 s untuk run itu, InsertQuery +822, SelectQuery
+  +981 → **~11,6 µs/change waktu CH, ~38 % sibuk**;
+- artinya kedua sisi menganggur: dindingnya **serialisasi 5 statement per window**
+  (TRUNCATE kt, INSERT kt, DELETE, INSERT dest, state) dalam satu lane.
+
+Insert-only memangkas ke **2 statement** (INSERT tombstone+rows, state) dan
+menghapus DELETE/key-table (213 s dari 367 s di census 0,58).
+
+**Trigger (tanpa argumen API baru).** `engine=` sudah ada. Bila engine tabel
+tujuan adalah `ReplacingMergeTree` DAN tabel punya kolom `_apitap_ver` (UInt64)
++ `_apitap_deleted` (UInt8), apply beralih otomatis ke insert-only. Deteksi:
+satu query `system.tables`/`system.columns` saat unit pertama dibuka per tabel,
+di-cache di `ChStore` (pola pin-cache yang sudah ada).
+
+**Skema.** Bootstrap membuat/menuntut kolom `_apitap_ver UInt64 DEFAULT 0`,
+`_apitap_deleted UInt8 DEFAULT 0`; `ORDER BY` = key kolom; tanpa PK/unique.
+`_apitap_ver` = LSN window (monoton per key lintas window).
+
+**Apply (dest_ch.rs, jalur baru `apply_unit_insert_only`):**
+
+1. upsert: row image akhir → baris dengan `_apitap_deleted=0, _apitap_ver=lsn`;
+2. delete: HANYA kolom key + `_apitap_deleted=1, _apitap_ver=lsn`;
+3. satu INSERT per window per tabel (RowBinary, kolom eksplisit);
+4. state: satu INSERT mark set (sudah dibatch sejak 0.58);
+5. fence/owner predicate tetap di INSERT; lease tetap.
+
+**Pembaca.** `FINAL` (CH ≥23.x menghapus baris `is_deleted`) atau view
+`__current` argMax yang sudah dipunyai mode changelog. Didokumentasikan sebagai
+keputusan produk: default tetap replika klasik untuk engine MergeTree biasa;
+`is_shape_ok` ditolak campuran (tabel insert-only untuk replika klasik dan
+sebaliknya).
+
+**Verifikasi.**
+
+- RED: unit `detect_insert_only` (engine+kolom → true; MergeTree biasa → false;
+  kolom kurang → false) — 2 mutasi (deteksi selalu true; kolom diabaikan);
+- leg baru `e2e_ch_insert_only.py` (§9.3): Replacing+is_deleted → satu INSERT per
+  window; `FINAL` = source; replika klasik ditolak masuk tabel insert-only;
+  tombstone menghapus baris dari `FINAL`; `_apitap_ver` monoton;
+- A/B kandang 0,5/256: pace 50 rb/s, n≥3 — target drain **≥50 rb/s** dengan
+  CH ≤1,5× waktu klien.
+
+**Urutan aman (default tidak berubah sampai flag aktif):** (1) deteksi + cache +
+flag di unit (tanpa perubahan perilaku) → suite + RED; (2) DDL bootstrap kolom +
+`ORDER BY`; (3) jalur apply insert-only; (4) leg + A/B; (5) dokumentasi
+`FINAL`/`__current` di docs/usage.md.
