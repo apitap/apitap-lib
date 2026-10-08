@@ -838,3 +838,22 @@ jangan seal; gulirkan stop-line dan lanjut mengisi window yang sama sampai
 ≥8 MiB atau ≥1–2 s (controller §6.3), baru seal. Dengan DELETE ~85 ms per
 window terbagi ke ~26 rb changes, biaya per-change turun ~7×; digabung
 insert-only (DELETE hilang) target 50 rb/s jadi realistis.
+
+### 14.3 Lantai window diukur (2026-10-08) — dinding ada di SOURCE
+
+`b61-floor` (follow 210 s + floor 8 MiB, pace 49,5 rb/s): pass 2 = 7,64 jt
+changes / 210,9 s = **36,2 rb/s** — tidak bergerak dari follow polos (36,1)
+maupun pass-loop (35). Empat tuas klien (statement count, sesi/pass, ukuran
+window, insert-only) semuanya menyisakan ~36 rb/s, sementara CPU klien 0,32–0,38
+dari 0,5 dan CH ~38% sibuk.
+
+**Kesimpulan: dinding ~36 rb/s ada di sisi source** — decode walsender
+keep-up ~27–33 µs/change (B2.4: 32,8 µs keep-up vs 12,5 backlog; satu slot
+pg_recvlogical = 78–84 rb/s di mode backlog). Ini persis §9.1 #1 yang belum
+terukur langsung.
+
+**Berikutnya:** (1) ukur CPU walsender dengan sampler `/proc/<pid>/stat` yang
+benar (sampler lama rusak), (2) A/B `APITAP_PG_BINARY=1` (B2.4: −9% CPU
+walsender; kemungkinan lebih besar di keep-up), (3) kalau terkonfirmasi:
+>50 rb/s di 0,5 core hanya mungkin lewat source-side (biner) atau menambah
+slot di atas 1 core (rezim C) — bukan lagi kerja klien.

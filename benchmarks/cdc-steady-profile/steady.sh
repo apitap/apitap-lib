@@ -48,6 +48,7 @@ setsid nohup docker run --rm --name "prof-drain-$TAG" $CAP \
   -e "APITAP_READ_COALESCE_US=${APITAP_READ_COALESCE_US:-}" \
   -e "APITAP_ENGINE=${APITAP_ENGINE:-}" \
   -e "APITAP_FOLLOW_SECS=${APITAP_FOLLOW_SECS:-}" \
+  -e "APITAP_PG_BINARY=${APITAP_PG_BINARY:-}" \
   -e "APITAP_TAG=$TAG" -v "$HERE:/job:ro" python:3.13-slim sh /job/leg.sh > "$DLOG" 2>&1 < /dev/null &
 DPID=$!
 for _ in $(seq 1 120); do docker inspect prof-drain-$TAG >/dev/null 2>&1 && break; sleep 0.5; done
