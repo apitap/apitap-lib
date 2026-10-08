@@ -822,3 +822,19 @@ Run `b61-dbg` (pace 50 rb/s, APITAP_DEBUG): 169 window, tiap window mencetak
 bergulir) — tanpa itu, angka paced tidak akan bergerak berapa pun lebar apply
 dipangkas. Insert-only tetap dipertahankan (menghapus DELETE 63–104 ms/window;
 menjadi penting saat follow mode membuat window besar terus-menerus).
+
+### 14.2 Follow mode diukur (2026-10-08) — bukan setup pass, tapi ukuran window
+
+Run `b61-follow` (pace 49,5 rb/s, `APITAP_FOLLOW_SECS=210`): satu sesi
+berjalan 210,7 s memindahkan 7,60 jt changes = **36,1 rb/s** — sama dengan
+pass-loop (35 rb/s), jadi setup per-pass BUKAN dinding utama.
+
+Yang terlihat: biaya fase clear/DELETE ~konstan per window (63–104 ms), dan
+di follow tiap window = delta sejak apply terakhir → window tetap kecil
+(~3,6–4,5 rb changes) → DELETE tetap mendominasi per-change.
+
+**Tuas berikutnya: lantai window di follow** — saat caught-up di stop-line,
+jangan seal; gulirkan stop-line dan lanjut mengisi window yang sama sampai
+≥8 MiB atau ≥1–2 s (controller §6.3), baru seal. Dengan DELETE ~85 ms per
+window terbagi ke ~26 rb changes, biaya per-change turun ~7×; digabung
+insert-only (DELETE hilang) target 50 rb/s jadi realistis.
