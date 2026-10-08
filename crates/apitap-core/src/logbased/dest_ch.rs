@@ -612,7 +612,13 @@ async fn apply_unit(
     // 66 ms / 77 per second — ClickHouse's constant-list DELETE evaluates far
     // worse than the join against a small table, and the gap is why the
     // inlining experiment was reverted (benchmarks/cdc-steady-30t-0.58.md).
-    if !c.deletes.is_empty() || !c.upserts.is_empty() {
+    // Slice 3 (design §14): a Replacing-family destination takes the
+    // tombstone path for the bulk — no key table, no DELETE; the ordered
+    // residue tail below stays as-is (it deletes before it inserts, so no
+    // same-version tie can arise).
+    let insert_only = u.insert_only(dest_table).await;
+
+    if !insert_only && (!c.deletes.is_empty() || !c.upserts.is_empty()) {
         let kt = u.key_table_reset(dest_table, pk_cols).await?;
         let mut buf = Vec::with_capacity(1 << 20);
         for key in c.deletes.iter() {
@@ -632,7 +638,26 @@ async fn apply_unit(
         u.delete_owned(dest_table, &pred).await?;
     }
 
-    if !c.upserts.is_empty() {
+    if insert_only {
+        let ver = id.end();
+        if !c.upserts.is_empty() {
+            let mut buf = Vec::with_capacity(4 << 20);
+            for row in &c.upserts {
+                render_ch_row(row, oids, &mut buf)?;
+                insert_only_suffix(&mut buf, ver, false);
+            }
+            u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+        }
+        if !c.deletes.is_empty() {
+            let mut buf = Vec::with_capacity(1 << 20);
+            for key in c.deletes.iter() {
+                let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+                render_ch_key(&refs, &pk_oids, &mut buf)?;
+                insert_only_suffix(&mut buf, ver, true);
+            }
+            u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf).await?;
+        }
+    } else if !c.upserts.is_empty() {
         let mut buf = Vec::with_capacity(4 << 20);
         for row in &c.upserts {
             render_ch_row(row, oids, &mut buf)?;
@@ -680,7 +705,12 @@ async fn apply_unit(
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
                 render_residue_row(&full, oids, &missing, &mut buf)?;
-                u.insert_owned(dest_table, wal_cols, buf).await?;
+                if insert_only {
+                    insert_only_suffix(&mut buf, id.end(), false);
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                } else {
+                    u.insert_owned(dest_table, wal_cols, buf).await?;
+                }
             }
             ResidueOp::Upsert { row } => {
                 let key: Vec<Vec<u8>> = row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect();
@@ -688,7 +718,12 @@ async fn apply_unit(
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
                 render_ch_row_cells(row, oids, &mut buf)?;
-                u.insert_owned(dest_table, wal_cols, buf).await?;
+                if insert_only {
+                    insert_only_suffix(&mut buf, id.end(), false);
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                } else {
+                    u.insert_owned(dest_table, wal_cols, buf).await?;
+                }
             }
             ResidueOp::Delete { key } => {
                 let pred = key_pred(pk_cols, key, &pk_oids)?;
@@ -734,7 +769,12 @@ async fn apply_unit(
                 u.delete_owned(dest_table, &old_pred).await?;
                 let mut buf = Vec::new();
                 render_residue_row(&full, oids, &missing, &mut buf)?;
-                u.insert_owned(dest_table, wal_cols, buf).await?;
+                if insert_only {
+                    insert_only_suffix(&mut buf, id.end(), false);
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                } else {
+                    u.insert_owned(dest_table, wal_cols, buf).await?;
+                }
             }
         }
     }
@@ -746,6 +786,22 @@ async fn apply_unit(
 /// family engine and it carries both bookkeeping columns (design §14).
 fn is_insert_only_shape(engine: &str, has_ver: bool, has_deleted: bool) -> bool {
     engine.starts_with("ReplacingMergeTree") && has_ver && has_deleted
+}
+
+/// The column list an insert-only row is written with: the source columns
+/// plus the bookkeeping pair, in that order (design §14, slice 3).
+fn insert_only_cols(cols: &[String]) -> Vec<String> {
+    let mut c = cols.to_vec();
+    c.push("_apitap_ver".to_string());
+    c.push("_apitap_deleted".to_string());
+    c
+}
+
+/// One TabSeparated row suffix for insert-only: the window's LSN and the
+/// tombstone flag. Appended AFTER the rendered source columns, matching
+/// `insert_only_cols`.
+fn insert_only_suffix(buf: &mut Vec<u8>, ver: u64, deleted: bool) {
+    buf.extend_from_slice(format!("\t{ver}\t{}\n", u8::from(deleted)).as_bytes());
 }
 
 /// The ALTER that gives a Replacing-family destination its tombstone
@@ -1437,6 +1493,12 @@ mod store {
                 .await
         }
 
+        /// The cached insert-only verdict for this unit's destination table
+        /// (design §14); the first call per run reads the catalog.
+        pub(crate) async fn insert_only(&self, table: &str) -> bool {
+            self.s.detect_insert_only(table).await
+        }
+
         /// A read the server refuses to let write.
         pub(crate) async fn read(&mut self, sql: &str) -> Result<String> {
             self.s.note("read");
@@ -2111,6 +2173,21 @@ mod tests {
         assert!(ddl.contains("_apitap_ver UInt64 DEFAULT 0"), "{ddl}");
         assert!(ddl.contains("_apitap_deleted UInt8 DEFAULT 0"), "{ddl}");
         assert_eq!(ddl.matches("IF NOT EXISTS").count(), 2, "{ddl}");
+    }
+
+    /// The insert-only row shape: columns end with the bookkeeping pair, and
+    /// the suffix carries the window LSN with the tombstone flag (design §14,
+    /// slice 3).
+    #[test]
+    fn insert_only_rows_carry_the_bookkeeping_pair() {
+        let cols = super::insert_only_cols(&["id".to_string(), "v".to_string()]);
+        assert_eq!(cols, vec!["id", "v", "_apitap_ver", "_apitap_deleted"]);
+        let mut buf = Vec::new();
+        super::insert_only_suffix(&mut buf, 4242, false);
+        assert_eq!(String::from_utf8(buf).unwrap(), "\t4242\t0\n");
+        let mut buf = Vec::new();
+        super::insert_only_suffix(&mut buf, 4242, true);
+        assert_eq!(String::from_utf8(buf).unwrap(), "\t4242\t1\n");
     }
 
     use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
