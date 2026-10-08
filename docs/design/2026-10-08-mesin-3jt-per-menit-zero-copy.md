@@ -805,3 +805,20 @@ sebaliknya).
 flag di unit (tanpa perubahan perilaku) → suite + RED; (2) DDL bootstrap kolom +
 `ORDER BY`; (3) jalur apply insert-only; (4) leg + A/B; (5) dokumentasi
 `FINAL`/`__current` di docs/usage.md.
+
+### 14.1 Instrumentasi apply (2026-10-08) — dua temuan yang mengubah urutan
+
+Run `b61-dbg` (pace 50 rb/s, APITAP_DEBUG): 169 window, tiap window mencetak
+`[apply] up=… del=… trunc/clear/ins/residue/total`.
+
+- **Clear phase (key-table reset + INSERT kt + DELETE): 63–104 ms/window** —
+  2–3× INSERT (36–45 ms), dan cocok dengan DELETE p50 61 ms (0,58). Insert-only
+  menghapus tepat ini; berguna saat window besar/rate tinggi.
+- **Tapi di pace 50 rb/s, ~1 s setup/pass × 107 pass ≈ setengah wall 200 s.**
+  Apply (≈125 ms/window) tersembunyi di overlap drain/apply. Dinding paced =
+  **loop pass** (sesi walsender + tenure + pin + state dibangun ulang tiap pass).
+
+**Urutan baru:** G1.4 **follow mode** naik ke depan (satu sesi, stop-line
+bergulir) — tanpa itu, angka paced tidak akan bergerak berapa pun lebar apply
+dipangkas. Insert-only tetap dipertahankan (menghapus DELETE 63–104 ms/window;
+menjadi penting saat follow mode membuat window besar terus-menerus).
