@@ -30,7 +30,7 @@ rm -f "$WLOG" "$DLOG"
 echo "[steady] tag=$TAG route=$ROUTE rate=$RATE writer_s=$WS drain_budget_s=$DB delay=$DELAY cpus=$CPUS threads=$THREADS"
 DIALECT=$ROUTE; [ "$ROUTE" = my ] && DIALECT=mysql
 setsid nohup "$HOME/prof-venv/bin/python" "$HERE/writer.py" --dialect "$DIALECT" --url "$URL" \
-  --tables "$TABLE" --threads "$THREADS" --rate "$RATE" --duration "$WS" > "$WLOG" 2>&1 < /dev/null &
+  --tables "$TABLE" --threads "$THREADS" --rate "$RATE" --duration "$WS" ${WRITER_EXTRA:-} > "$WLOG" 2>&1 < /dev/null &
 WPID=$!
 # wait for the artifact, not the process
 for _ in $(seq 1 60); do grep -q WRITER_TICK "$WLOG" 2>/dev/null && break; sleep 0.5; done
