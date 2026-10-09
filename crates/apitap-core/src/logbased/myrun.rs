@@ -178,7 +178,7 @@ where
 /// Later runs: drain windows from `start` to the live stop-line, handing
 /// each window to `apply_window` (which lands it and returns once every
 /// destination committed) before the next window is drained.
-pub(crate) async fn drain_windows<F, Fut>(
+pub(crate) async fn drain_windows(
     src_url: &str,
     pool: &MySqlPool,
     ctxs: &[MyCtx],
@@ -187,12 +187,8 @@ pub(crate) async fn drain_windows<F, Fut>(
     max_secs: u64,
     max_buf_bytes: usize,
     changelog: bool,
-    mut apply_window: F,
-) -> Result<u64>
-where
-    F: FnMut(DrainOutcome) -> Fut,
-    Fut: std::future::Future<Output = Result<u64>>,
-{
+    win_tx: tokio::sync::mpsc::Sender<DrainOutcome>,
+) -> Result<u64> {
     mysource::precheck(pool).await?;
     let (live_file, live_pos) = master_position(pool).await?;
     let stop_line = pack_pos(&live_file, live_pos);
@@ -279,7 +275,14 @@ where
         if end == watermark && o.is_empty() {
             break;
         }
-        watermark = apply_window(o).await?;
+        if win_tx.send(o).await.is_err() {
+            // Apply task died — its JoinHandle carries the real error.
+            break;
+        }
+        watermark = end;
+        // A long catch-up drains window after window; the number says which
+        // one is running, so a stalled run is distinguishable from a slow one.
+        crate::progress::next_window();
         if !hit_budget && watermark >= stop_line {
             break;
         }

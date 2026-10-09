@@ -1148,7 +1148,7 @@ async fn run_group_mysql(
     let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
     let members: Vec<String> = ctxs.iter().map(|c| c.dest_table.clone()).collect();
     dest.resolve_names(&members).await?;
-    let tenure = Tenure::acquire(dest.clone(), &members, run).await?;
+    let tenure = Arc::new(Tenure::acquire(dest.clone(), &members, run).await?);
 
     // Everything from here is inside one arm so the tenure is given back on
     // EVERY exit — a drain that fails for any reason must not leave its lock
@@ -1233,53 +1233,37 @@ async fn run_group_mysql(
         // paid the /2 overlap budget — windows were half the size for no
         // reason and the per-window costs doubled per change.
         let budget = cdc_full_window_budget();
-        let dbg = std::env::var("APITAP_DEBUG").is_ok();
-        // One counter PER TABLE. A single group-wide counter handed the same
-        // total to every member, so a 10-table group reported 10× the changes it
-        // actually applied (the data was right; the number was not).
-        let rows_applied: Vec<std::cell::Cell<u64>> =
-            ctxs.iter().map(|_| std::cell::Cell::new(0u64)).collect();
 
         // Armed for the incremental drain only — the bootstrap branch above returns
         // before reaching here. See `crate::shutdown` and the note in `drain_group`.
         let _stop = crate::shutdown::Guard::install();
 
-        myrun::drain_windows(
-            src_url,
-            &pool,
-            &ctxs,
-            wm,
-            &seed,
-            30,
-            budget,
-            opts.changelog,
-            |outcome| {
-                let (tenure, ctxs, rows_applied) = (&tenure, &ctxs, &rows_applied);
-                async move {
-                    let end = outcome.id.end();
-                    for (c, acc) in ctxs.iter().zip(rows_applied.iter()) {
-                        // Every member applies — a table with no traffic in this
-                        // window still advances its watermark. One unit each.
-                        let n = apply_member(tenure, &c.dest_table, &c.qualified, &c.source_id, &outcome, None)
-                            .await?;
-                        acc.set(acc.get() + n);
-                        crate::progress::add_rows(n);
-                    }
-                    // A long catch-up drains window after window; the number says
-                    // which one is running, so a stalled run is distinguishable
-                    // from a slow one.
-                    crate::progress::next_window();
-                    if dbg {
-                        eprintln!("[my cdc] window applied → watermark {end}");
-                    }
-                    Ok(end)
-                }
+        // G1.2: the SAME overlapped shape as the Postgres lane — the binlog
+        // drain keeps decoding window N+1 while a spawned apply task lands
+        // window N (one unit per member; `apply_windows` batches the group
+        // close), instead of waiting for every member's apply before the next
+        // drain. `None` = no Postgres pool: MySQL windows have no
+        // TOAST-unchanged refetch to resolve.
+        let members: Vec<crate::logbased::dest_bq::Member> = ctxs
+            .iter()
+            .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
+            .collect();
+        let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(1);
+        let (applied_tx, _applied_rx) = tokio::sync::watch::channel::<u64>(wm);
+        let apply =
+            AbortOnDrop::spawn(apply_windows(tenure.clone(), None, members, win_rx, applied_tx));
+        let drained = run_overlapped(
+            async {
+                myrun::drain_windows(src_url, &pool, &ctxs, wm, &seed, 30, budget, opts.changelog, win_tx)
+                    .await
+                    .map(|_| ())
             },
+            apply,
         )
         .await?;
 
         stamp(&tenure, &adopt, server).await?;
-        Ok::<Vec<(u64, usize)>, Error>(rows_applied.iter().map(|a| (a.get(), 1)).collect())
+        Ok::<Vec<(u64, usize)>, Error>(drained.into_iter().map(|r| (r, 1)).collect())
     }
     .await;
     // Waits for every open unit, stops and joins the keeper, then per member
@@ -1645,7 +1629,7 @@ async fn drain_group(
         .iter()
         .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
         .collect();
-    let apply = AbortOnDrop::spawn(apply_windows(tenure, src.clone(), members, win_rx, applied_tx));
+    let apply = AbortOnDrop::spawn(apply_windows(tenure, Some(src.clone()), members, win_rx, applied_tx));
     let follow = follow_secs().map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let drained = run_overlapped(
         drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src),
@@ -1837,7 +1821,7 @@ async fn wait_for_apply(
 /// cannot pass a unit still open here.
 async fn apply_windows(
     tenure: Arc<Tenure<Dest>>,
-    src: PgPool,
+    src: Option<PgPool>,
     members: Vec<crate::logbased::dest_bq::Member>,
     mut win_rx: tokio::sync::mpsc::Receiver<DrainOutcome>,
     applied_tx: tokio::sync::watch::Sender<u64>,
@@ -1882,12 +1866,12 @@ async fn apply_windows(
             // group pin blessing data a mutation may have skipped. The
             // members' applies still overlap in lanes; only the per-member
             // `_apitap_state` round trips are gone.
-            let (sref, oref, mref) = (&src, &o, &members);
+            let (sref, oref, mref) = (src.as_ref(), &o, &members);
             let fs: Vec<_> = (0..mref.len())
                 .map(|i| async move {
                     let (dt, q, sid) = &mref[i];
                     let (n, m, e0) =
-                        apply_member_pending(t, dt, q, sid, oref, Some(sref)).await?;
+                        apply_member_pending(t, dt, q, sid, oref, sref).await?;
                     Ok::<_, Error>((i, n, m, e0))
                 })
                 .collect();
@@ -1949,11 +1933,11 @@ async fn apply_windows(
             // references: a closure taking `&(..)` and returning an async
             // block trips higher-ranked lifetime inference ("FnOnce is not
             // general enough").
-            let (sref, oref, mref) = (&src, &o, &members);
+            let (sref, oref, mref) = (src.as_ref(), &o, &members);
             let fs: Vec<_> = (0..mref.len())
                 .map(|i| async move {
                     let (dt, q, sid) = &mref[i];
-                    let n = apply_member(t, dt, q, sid, oref, Some(sref)).await?;
+                    let n = apply_member(t, dt, q, sid, oref, sref).await?;
                     Ok::<_, Error>((i, n))
                 })
                 .collect();
@@ -1962,7 +1946,7 @@ async fn apply_windows(
             }
         } else {
             for (i, (dt, q, sid)) in members.iter().enumerate() {
-                rows_per[i] += apply_member(t, dt, q, sid, &o, Some(&src)).await?;
+                rows_per[i] += apply_member(t, dt, q, sid, &o, src.as_ref()).await?;
             }
         }
         if std::env::var("APITAP_DEBUG").is_ok() {
