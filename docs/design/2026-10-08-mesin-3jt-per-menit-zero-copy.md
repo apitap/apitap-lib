@@ -1016,3 +1016,15 @@ semantik; jalur PG baru (follow/insert-only) netral untuk leg lama.
 `[1, min(tables, 8)]` (hukum terukur §14.9). Smoke live: 2 tabel @0,5 core →
 N=2, bootstrap 2 jt baris 5,9 s, `AUTO_OK rows=2.000.000`. Suite 429, RED 2/2,
 `cargo check -p apitap-python` OK.
+
+### 14.15 Full gate 82/88 + 6 rerun bersih = 88/88 efektif (2026-10-08)
+
+Gate penuh di wheel akumulatif: **82 passed, 6 failed, 0 skipped (8273 s)**.
+Enam fail semuanya berakar non-kode dan sudah hijau saat diuji ulang bersih:
+`failure_modes`/`http_deadline`/`tls_mysql` (fixture lama pg-src yang hilang
+saat recreate: `bench_data_10m`, `bench_data_10m_cap`, `tls_src_seed` — sudah
+di-seed ulang), `tls` (reader log dockerd wedged akibat truncate massal saat
+insiden disk — beres dengan restart container CH/tls; pelajaran: truncate log
+container hanya lewat restart sesudahnya atau pakai rotasi), `sigterm_my`
+(flake) dan `bq_multi_drain` (kontensi dengan debug paralel).
+**Nol regresi dari coalescer/insert-only/follow/G1.2/G1.3/slots-auto.**
