@@ -914,3 +914,18 @@ Mix murni update (`--update 1000 --ins 0`, band tetap, 120 s @49,2 rb/s):
 **Dua pekerjaan baru:** (1) cari bug undercount ~14,5 % di penghitung event
 (semua angka laju selama ini undercount; perbaiki dulu sebelum A/B berikutnya),
 (2) baru setelah itu tentukan dinding riil. Korektnes data TIDAK terpengaruh.
+
+### 14.7 Instrumentasi event (b61-ev) — gap ada di server→stream, bukan apitap
+
+Mix murni update, DEBUG, 177 window: **decoded == collapsed = 3.611.000** (drain
+menghitung apa pun yang diterimanya, tanpa kehilangan decode→collapse), sementara
+**witness `n_tup_upd` = 4.462.000**. Selisih 19 % ada di **batas pgoutput→stream**:
+server menghitung 4,46 jt update, stream mengirim 3,61 jt pesan. Data destination
+tetap **MATCH**.
+
+Konsekuensi: (1) bukan bug apitap; (2) **semua perbandingan "drain vs ledger"
+kita memakai denominator berbeda** — metrik sah = *delivered* changes/s, dan
+drain mengonsumsi 100 % yang dikirim; (3) langkah berikutnya untuk angka jujur:
+hitung pesan pgoutput di sisi server (atau pakai mix yang 1:1, mis. update pada
+band bergulir + `pg_waldump`/`pg_recvlogical` sebagai referensi independen).
+Korektnes data tidak pernah terpengaruh (validasi MATCH di semua run).
