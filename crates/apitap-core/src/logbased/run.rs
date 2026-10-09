@@ -436,7 +436,7 @@ impl Dest {
     /// window; the CPU-bound paths stay on the small default.
     fn cdc_window_bytes(&self) -> usize {
         match self {
-            Dest::Bq(_) => cdc_bq_window_budget(),
+            Dest::Bq(_) => cdc_full_window_budget(),
             _ => cdc_window_budget(),
         }
     }
@@ -601,11 +601,11 @@ fn cdc_window_budget() -> usize {
     env_window_override().unwrap_or_else(|| (window_budget() / 2).clamp(1 << 20, 24 << 20))
 }
 
-/// Per-window budget for the LATENCY-bound BigQuery apply: each window is one
-/// load + MERGE job round-trip, so a bigger window amortizes that fixed cost.
-/// Use the full per-window budget (no /2, no 24 MiB clamp) — measured to roughly
-/// halve wall time vs the CPU-path default, while staying inside the 256 MiB cap.
-fn cdc_bq_window_budget() -> usize {
+/// The FULL per-window budget (no /2, no 24 MiB clamp). For the latency-bound
+/// lanes whose windows do not overlap: BigQuery (each window is a load + MERGE
+/// round-trip, measured to roughly halve wall time) and — since G1.3 — MySQL,
+/// whose apply loop never overlapped yet paid the halved PG budget.
+fn cdc_full_window_budget() -> usize {
     env_window_override().unwrap_or_else(window_budget)
 }
 
@@ -1229,7 +1229,10 @@ async fn run_group_mysql(
             .map(|c| c.source_id.as_str())
             .collect::<Vec<_>>()
             .join("\x1e");
-        let budget = dest.cdc_window_bytes();
+        // G1.3: the MySQL lane never overlapped its drain and apply, yet it
+        // paid the /2 overlap budget — windows were half the size for no
+        // reason and the per-window costs doubled per change.
+        let budget = cdc_full_window_budget();
         let dbg = std::env::var("APITAP_DEBUG").is_ok();
         // One counter PER TABLE. A single group-wide counter handed the same
         // total to every member, so a 10-table group reported 10× the changes it
