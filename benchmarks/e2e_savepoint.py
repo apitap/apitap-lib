@@ -227,7 +227,7 @@ print("== leg 3: the recovery the message promises actually works ==")
 # so that is what the message names and what this leg exercises.
 pg("ALTER SYSTEM RESET debug_logical_replication_streaming")
 pg("SELECT pg_reload_conf()")
-r2 = drain(workmem="1GB")
+r2 = drain(workmem="256MB")  # the P5 cap: larger values are refused by name
 src = pg(f"SELECT count(*)||'|'||sum(id) FROM {T}")
 dst = ch(f"SELECT count()||'|'||sum(id) FROM {T}")
 case("with room to buffer it, the same window applies cleanly",
