@@ -991,3 +991,11 @@ Dengan ini **kedua jalur berada di kelas target 3 jt/menit @0,5 core**:
 PG→CH 49,3 rb/s (slots=2, §14.9) dan MySQL→CH ~48,7 rb/s offered tercapai.
 Sisa: `slots` otomatis dari cgroup (rezim C), follow mode untuk MySQL
 (pass-loop 196/108 masih ada), dan gate leg baru untuk jalur ini.
+
+### 14.12 Follow MySQL (`02be3d3`) — pass-loop hilang
+
+`b61-myfl2` (pace 48,6 rb/s, `APITAP_FOLLOW_SECS=200`): pass 2 = **201,6 s,
+3,53 jt changes dalam SATU sesi binlog** (sebelumnya 78–196 pass × setup).
+Pass 3+ hanya loop kosong milik rig (0,2 s). Caught up; CPU aktif ~0,21–0,41.
+Jalur MySQL kini: 2.880/s → ~40–49 rb/s delivered dengan follow + G1.2/G1.3,
+VALIDATE MATCH.
