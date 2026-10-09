@@ -279,7 +279,21 @@ pub(crate) async fn drain_windows(
         let hit_budget = o.hit_budget;
         let end = o.id.end();
         if end == watermark && o.is_empty() {
-            break;
+            // Caught up: the binlog said "nothing new". In follow mode this is
+            // not the end — roll the stop line and wait for the next change;
+            // without follow it is exactly the old break.
+            let Some(deadline) = follow else { break };
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let (lf, lp) = master_position(pool).await?;
+            let now = pack_pos(&lf, lp);
+            if now > stop_line {
+                stop_line = now;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            continue;
         }
         if win_tx.send(o).await.is_err() {
             // Apply task died — its JoinHandle carries the real error.
