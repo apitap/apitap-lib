@@ -191,7 +191,13 @@ pub(crate) async fn drain_windows(
 ) -> Result<u64> {
     mysource::precheck(pool).await?;
     let (live_file, live_pos) = master_position(pool).await?;
-    let stop_line = pack_pos(&live_file, live_pos);
+    let mut stop_line = pack_pos(&live_file, live_pos);
+    // Follow mode (the MySQL twin of the Postgres lane's APITAP_FOLLOW_SECS):
+    // the binlog drain kept a pass loop of its own — measured 196 passes in
+    // 91 s at 20k/s — so the session/setup cost dominated exactly as it did on
+    // the PG side before follow. One session, a rolling stop line.
+    let follow = crate::logbased::run::follow_secs()
+        .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
     // A watermark AHEAD of the server's own position is not "up to date" — it
     // is impossible on a log that only grows. Either the binlog was reset or
     // rebuilt (RESET MASTER, a restored dump, a rebuilt replica), or this URL
@@ -283,13 +289,25 @@ pub(crate) async fn drain_windows(
         // A long catch-up drains window after window; the number says which
         // one is running, so a stalled run is distinguishable from a slow one.
         crate::progress::next_window();
-        if !hit_budget && watermark >= stop_line {
-            break;
-        }
-        if !hit_budget && end < stop_line {
-            // Deadline stop with nothing new to fetch — leave the rest for
-            // the next scheduled run rather than spinning.
-            break;
+        if !hit_budget {
+            let Some(deadline) = follow else {
+                // One-shot: the old shape, byte for byte.
+                if watermark >= stop_line || end < stop_line {
+                    break;
+                }
+                continue;
+            };
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let (lf, lp) = master_position(pool).await?;
+            let now = pack_pos(&lf, lp);
+            if now > stop_line {
+                stop_line = now;
+            } else if watermark >= stop_line {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            continue;
         }
     }
     Ok(watermark)

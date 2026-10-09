@@ -2224,7 +2224,7 @@ const FOLLOW_FLOOR: usize = 8 << 20;
 /// line rolls with the source. Measured motivation: ~1 s of session setup per
 /// pass, 107 passes in a 200 s paced run (design §14.1). Unset/0/junk = off
 /// (today's one-shot shape).
-fn follow_secs() -> Option<u64> {
+pub(crate) fn follow_secs() -> Option<u64> {
     match std::env::var("APITAP_FOLLOW_SECS") {
         Ok(v) => v.parse::<u64>().ok().filter(|n| *n > 0),
         Err(_) => None,
