@@ -999,3 +999,13 @@ Sisa: `slots` otomatis dari cgroup (rezim C), follow mode untuk MySQL
 Pass 3+ hanya loop kosong milik rig (0,2 s). Caught up; CPU aktif ~0,21–0,41.
 Jalur MySQL kini: 2.880/s → ~40–49 rb/s delivered dengan follow + G1.2/G1.3,
 VALIDATE MATCH.
+
+### 14.13 Verifikasi produksi jalur baru (2026-10-08)
+
+Dengan wheel yang memuat coalescer + insert-only + follow (PG & MySQL) +
+G1.2/G1.3, batch leg fokus dijalankan: **13/13 PASS** —
+`e2e_mariadb_cdc`, `e2e_cdc_types`, `e2e_myengine_commit`,
+`e2e_my_charset_guard`, `e2e_sigterm_my`, `e2e_bootstrap_lock` (pg+my),
+`e2e_changelog_my`, `e2e_logbased_dests` (ch/my/ice), `e2e_toast_rekey`
+(bq skip tanpa BQ_SA di shell ini). Refactor apply MySQL tidak merusak
+semantik; jalur PG baru (follow/insert-only) netral untuk leg lama.
