@@ -898,3 +898,19 @@ adalah (a) enam tuas klien netral, (b) drain caught-up penuh di tiap run,
 single tabel) → bandingkan ledger writer, counter `pg_stat_user_tables`, dan
 events drain — kalau ketiganya sama, drain sudah mengejar ~49 rb/s raw
 (≈2,94 jt/menit) di 0,5 core.
+
+### 14.6 Eksperimen penentu (b61-upd, mix murni update) — data benar, penghitung salah
+
+Mix murni update (`--update 1000 --ins 0`, band tetap, 120 s @49,2 rb/s):
+
+- **WITNESS server: 5.905.000 changes** (pg_stat deltas = ledger) — server benar
+  memproduksi 5,9 jt event.
+- **VALIDATE: VERDICT MATCH** — isi destination **eksak**; tidak ada data hilang.
+- Drain melaporkan **5.050.000** events → **undercount ~14,5 %** di penghitung
+  drain (bukan event hilang; stream dikonsumsi penuh, pass 3 = 0).
+- Rate riil = 5,905 jt / 187 s ≈ **31,6 rb/s**; drain baru tuntas setelah writer
+  berhenti (120 s) — jadi plafon riil saat ini **~31–36 rb/s**, di bawah 49 rb/s.
+
+**Dua pekerjaan baru:** (1) cari bug undercount ~14,5 % di penghitung event
+(semua angka laju selama ini undercount; perbaiki dulu sebelum A/B berikutnya),
+(2) baru setelah itu tentukan dinding riil. Korektnes data TIDAK terpengaruh.
