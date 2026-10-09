@@ -563,7 +563,7 @@ def transfer(
     on_cluster: str | None = None,
     partition_by: str | dict[str, str] | None = None,
     changelog: bool = False,
-    slots: int | None = None,
+    slots: int | str | None = None,
 ) -> TransferReport:
     """Copy one table, a list of tables, or a whole schema from ``src`` to ``dst``.
 
@@ -734,6 +734,9 @@ def transfer(
             MySQL) and Iceberg REFUSE it loudly rather than quietly hand back a
             replica; every bulk mode ignores it.
         slots: ``mode="log_based"``, multi-table, Postgres sources only —
+            an int, or ``"auto"`` to derive N from the cgroup CPU quota (one
+            slot per ~0.25 core, clamped to the table count and 8; measured:
+            2 slots at 0.5 core delivered ~2.96M changes/min).
             split the tables across N replication slots and drain them
             CONCURRENTLY. Postgres decodes each slot in ONE walsender process
             that saturates a core long before apitap does; on the measured

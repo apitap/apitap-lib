@@ -248,6 +248,10 @@ pub struct TransferOptions {
     /// binlog stream — N groups would each decode the full binlog for zero
     /// shared gain), and `slots=0`.
     pub slots: Option<usize>,
+    /// `slots="auto"`: derive N from the client's cgroup CPU quota (one slot
+    /// per ~0.25 core, clamped to the table count and 8). Measured basis:
+    /// 0.5 core -> 2 slots delivered 2.96M changes/min (§14.9).
+    pub slots_auto: bool,
 }
 
 impl Default for TransferOptions {
@@ -264,6 +268,7 @@ impl Default for TransferOptions {
             on_cluster: None,
             partition_by: None,
             slots: None,
+            slots_auto: false,
             partition_by_per_table: std::collections::HashMap::new(),
             order_by_per_table: std::collections::HashMap::new(),
             changelog: false,

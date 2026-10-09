@@ -114,6 +114,27 @@ fn cpu_quota_cores() -> Option<f64> {
 }
 
 /// Returns `(rows, elapsed_ms, parallel)`; the Python wrapper turns it into a report.
+/// `slots` accepts an int or "auto" (derive N from the cgroup CPU quota).
+fn split_slots(
+    slots: Option<pyo3::Bound<'_, pyo3::PyAny>>,
+) -> pyo3::PyResult<(Option<usize>, bool)> {
+    match slots {
+        None => Ok((None, false)),
+        Some(v) => {
+            if let Ok(n) = v.extract::<usize>() {
+                return Ok((Some(n), false));
+            }
+            if v.extract::<String>()
+                .map(|s| s.eq_ignore_ascii_case("auto"))
+                .unwrap_or(false)
+            {
+                return Ok((None, true));
+            }
+            Err(PyValueError::new_err("slots must be an int or \"auto\""))
+        }
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (src, dst, table, *, dest_table=None, parallel=None, cursor=None, chunk_bytes=None, durable=true, mode="replace", engine=None, order_by=None, on_cluster=None, partition_by=None, partition_by_per_table=None, order_by_per_table=None, changelog=false, slots=None))]
 #[allow(clippy::too_many_arguments)]
@@ -135,11 +156,12 @@ fn transfer(
     partition_by_per_table: Option<std::collections::HashMap<String, String>>,
     order_by_per_table: Option<std::collections::HashMap<String, String>>,
     changelog: bool,
-    slots: Option<usize>,
+    slots: Option<pyo3::Bound<'_, pyo3::PyAny>>,
 ) -> PyResult<(u64, u64, usize)> {
     let mode: apitap_core::Mode = mode
         .parse()
         .map_err(|e: apitap_core::Error| PyValueError::new_err(e.to_string()))?;
+    let (slots, slots_auto) = split_slots(slots)?;
     let opts = apitap_core::TransferOptions {
         parallel,
         cursor,
@@ -155,6 +177,7 @@ fn transfer(
         order_by_per_table: order_by_per_table.unwrap_or_default(),
         changelog,
         slots,
+        slots_auto,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
     let out = py.detach(|| {
@@ -197,7 +220,7 @@ fn transfer_many(
     partition_by_per_table: Option<std::collections::HashMap<String, String>>,
     order_by_per_table: Option<std::collections::HashMap<String, String>>,
     changelog: bool,
-    slots: Option<usize>,
+    slots: Option<pyo3::Bound<'_, pyo3::PyAny>>,
 ) -> PyResult<(u64, usize, Vec<(String, u64, u64, usize, Option<String>)>)> {
     let mode: apitap_core::Mode = mode
         .parse()
@@ -216,6 +239,7 @@ fn transfer_many(
                 .collect::<PyResult<_>>()?,
         ),
     };
+    let (slots, slots_auto) = split_slots(slots)?;
     let opts = apitap_core::TransferOptions {
         parallel,
         cursor,
@@ -231,6 +255,7 @@ fn transfer_many(
         order_by_per_table: order_by_per_table.unwrap_or_default(),
         changelog,
         slots,
+        slots_auto,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
     let out = py.detach(|| {

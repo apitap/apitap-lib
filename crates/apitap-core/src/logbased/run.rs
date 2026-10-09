@@ -640,6 +640,13 @@ pub(crate) async fn run_many(
                 .into(),
         ));
     }
+    if opts.slots_auto {
+        let n = auto_slots(tables.len());
+        if n > 1 {
+            return run_sloted(src_url, dst_url, tables, opts, n, started).await;
+        }
+        // One slot is the single-slot path below.
+    }
     match opts.slots.unwrap_or(1) {
         0 => {
             return Err(Error::InvalidInput(
@@ -2224,6 +2231,18 @@ const FOLLOW_FLOOR: usize = 8 << 20;
 /// line rolls with the source. Measured motivation: ~1 s of session setup per
 /// pass, 107 passes in a 200 s paced run (design §14.1). Unset/0/junk = off
 /// (today's one-shot shape).
+/// `slots="auto"`: one slot per ~0.25 core of the client's quota, clamped to
+/// `[1, min(tables, 8)]`. The 0.25 divisor is measured: 2 slots at 0.5 core
+/// delivered 2.96M changes/min with the client at 0.43 cores (§14.9).
+fn auto_slots_for(cores: f64, tables: usize) -> usize {
+    let n = (cores / 0.25).round() as usize;
+    n.clamp(1, tables.min(8))
+}
+
+fn auto_slots(tables: usize) -> usize {
+    auto_slots_for(crate::pipeline::cpu_limit_cores().unwrap_or(1.0), tables)
+}
+
 pub(crate) fn follow_secs() -> Option<u64> {
     match std::env::var("APITAP_FOLLOW_SECS") {
         Ok(v) => v.parse::<u64>().ok().filter(|n| *n > 0),
@@ -2433,6 +2452,18 @@ mod tests {
         assert!(!slot_status_lost("reserved"));
         assert!(!slot_status_lost("extended"));
         assert!(!slot_status_lost("unreserved"));
+    }
+
+    /// `slots="auto"`: the measured law — one slot per 0.25 core, clamped to
+    /// the table count and 8 (design §14.9).
+    #[test]
+    fn auto_slots_is_one_per_quarter_core_clamped_to_tables_and_eight() {
+        assert_eq!(auto_slots_for(0.5, 2), 2);
+        assert_eq!(auto_slots_for(0.5, 1), 1);
+        assert_eq!(auto_slots_for(1.0, 30), 4);
+        assert_eq!(auto_slots_for(0.1, 4), 1);
+        assert_eq!(auto_slots_for(8.0, 3), 3);
+        assert_eq!(auto_slots_for(2.0, 100), 8);
     }
 
     /// The follow knob: unset, zero and junk are all off; a positive number
