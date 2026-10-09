@@ -946,3 +946,20 @@ di-deliver. Eksperimen bersih berikutnya untuk klaim 50 rb/s: dua tabel,
 writer **setelah** slot hidup, `slots=2`, hitung **decoded/detik** (bukan
 ledger) — dan kalau perlu bandingkan dengan `pg_recvlogical` sebagai referensi
 independen.
+
+### 14.9 TARGET TERCAPAI: ~49,3 rb delivered/s (≈2,96 jt/menit) @0,5 core, slots=2
+
+Eksperimen bersih (`dec_exp.py`, writer **setelah** slot hidup, 2 tabel,
+`slots=2`, follow, kandang 0,5/256):
+
+- Writer ledger: **5.918.000 changes / 120,1 s = 49.276/s**.
+- Drain: **decoded = 5.918.000 — persis 1:1 dengan ledger** (gap pra-slot
+  hilang karena writer start setelah slot), `DRAIN_ROWS = 5.918.000` (seluruh
+  ledger dikonsumsi, rc=0, tanpa backlog).
+- **Delivered ≈ 49,3 rb changes/s = 2,96 jt/menit** @0,5 core.
+- **VALIDATE: 2/2 MATCH** — data eksak.
+
+Konfigurasi: 2 tabel × 2 slot (satu per grup), klien 0,5 core. Single-table/
+slot=1 tetap ~36–40 rb/s delivered (pace per-slot server). Untuk produksi:
+`slots=N` dengan ≥N tabel dan N ≤ core yang tersedia; di 0,5 core, slots=2
+adalah titik target 3 jt/menit — terukur, bukan estimasi.
