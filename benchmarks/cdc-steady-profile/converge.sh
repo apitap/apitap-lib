@@ -21,6 +21,7 @@ docker run --rm --name "prof-conv-$TAG" --network=host --cpus=$CPUS --memory=256
   -v "$SP:/py:ro" -e PYTHONPATH=/py \
   -e "APITAP_SRC=$URL" -e "APITAP_DST=$CH_DST" \
   -e "APITAP_TABLE=$TABLES" -e "BUDGET_S=$BUDGET" -e ZERO_STOP=2 -e CPUS=$CPUS \
+  -e "APITAP_SLOTS=${APITAP_SLOTS:-}" \
   -e "APITAP_CDC_APPLY_LANES=${APITAP_CDC_APPLY_LANES:-}" \
   -e "APITAP_CDC_WINDOW_BYTES=${APITAP_CDC_WINDOW_BYTES:-}" \
   -e "APITAP_TAG=conv-$TAG" -v "$HERE:/job:ro" python:3.13-slim sh /job/leg.sh 2>&1 | tee "$DLOG" \
@@ -29,5 +30,5 @@ if [ "${SKIP_VALIDATE:-0}" = "1" ]; then
   echo "[converge] validate skipped (SKIP_VALIDATE=1)"
 else
   echo "[converge] digest:"
-  bash "$HERE/validate30.sh" "$ROUTE" "$TABLES"
+  bash "$HERE/validate30.sh" "$ROUTE" "$(printf '%s' "$TABLES" | sed 's/public\.//g')"
 fi
