@@ -929,3 +929,20 @@ drain mengonsumsi 100 % yang dikirim; (3) langkah berikutnya untuk angka jujur:
 hitung pesan pgoutput di sisi server (atau pakai mix yang 1:1, mis. update pada
 band bergulir + `pg_waldump`/`pg_recvlogical` sebagai referensi independen).
 Korektnes data tidak pernah terpengaruh (validasi MATCH di semua run).
+
+### 14.8 Mikro-test HOT + penjelasan final gap (2026-10-08)
+
+`ev_micro`: tabel HOT (tanpa index di `v`) vs non-HOT (dengan index) —
+**dua-duanya 1:1** (witness 1000 = decoded 1000). HOT bukan penyebab.
+
+Penjelasan gap ~19 % di run besar: **event sebelum slot dibuat**. Writer mulai
+~10 s sebelum drain; slot dibuat saat bootstrap (EXPORT_SNAPSHOT) — update pada
+10 s itu (±11 % dari total) sudah tercakup di snapshot bootstrap dan memang
+tidak dikirim ulang lewat stream (data eksak). Sisanya batas pass.
+
+**Posisi angka yang jujur:** ~38–40 rb **delivered** changes/s (≈2,3–2,4 jt/menit)
+di 0,5 core, CPU 0,36/0,5, data MATCH; apitap mengonsumsi 100 % yang
+di-deliver. Eksperimen bersih berikutnya untuk klaim 50 rb/s: dua tabel,
+writer **setelah** slot hidup, `slots=2`, hitung **decoded/detik** (bukan
+ledger) — dan kalau perlu bandingkan dengan `pg_recvlogical` sebagai referensi
+independen.
