@@ -182,6 +182,10 @@ pub(crate) async fn drain(
     let mut hit_budget = false;
     let dbg_stream = std::env::var("APITAP_DEBUG").is_ok();
 
+    // Raw tracked row-change messages decoded this window (APITAP_DEBUG):
+    // compared against the collapsed event count to localise the ~14.5 %
+    // accounting gap between witness, decode and collapse (design §14.6).
+    let mut decoded = 0u64;
     let mut in_stream: Option<u32> = None;
     // A Relation in the transaction being read changed the layout of a table
     // this window already holds a body for: the transaction goes to the next
@@ -425,6 +429,7 @@ pub(crate) async fn drain(
                 }
                 PgoMessage::Insert { rel_id, new } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
+                        decoded += 1;
                         let n = cells_bytes(&new);
                         let op = StreamOp::Insert(new);
                         match in_stream {
@@ -451,6 +456,7 @@ pub(crate) async fn drain(
                 }
                 PgoMessage::Update { rel_id, old, new } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
+                        decoded += 1;
                         let old = old.map(|o| o.tuple);
                         let n = cells_bytes(&new) + old.as_ref().map_or(0, cells_bytes);
                         let op = StreamOp::Update(old, new);
@@ -478,6 +484,7 @@ pub(crate) async fn drain(
                 }
                 PgoMessage::Delete { rel_id, old } => {
                     if let Some(t) = tracked(&sess.rels, rel_id)? {
+                        decoded += 1;
                         let n = cells_bytes(&old.tuple);
                         let op = StreamOp::Delete(old.tuple);
                         match in_stream {
@@ -523,11 +530,18 @@ pub(crate) async fn drain(
         }
     }
 
-    Ok(DrainOutcome {
+    let outcome = DrainOutcome {
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
         id: WindowId::new(start_lsn, end_lsn),
         hit_budget,
-    })
+    };
+    if dbg_stream {
+        eprintln!(
+            "[events] decoded={decoded} collapsed={}",
+            outcome.events()
+        );
+    }
+    Ok(outcome)
 }
 
 /// The layout a table's first op of the window builds its body with.
