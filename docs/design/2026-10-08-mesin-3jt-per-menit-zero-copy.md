@@ -1009,3 +1009,10 @@ G1.2/G1.3, batch leg fokus dijalankan: **13/13 PASS** —
 `e2e_changelog_my`, `e2e_logbased_dests` (ch/my/ice), `e2e_toast_rekey`
 (bq skip tanpa BQ_SA di shell ini). Refactor apply MySQL tidak merusak
 semantik; jalur PG baru (follow/insert-only) netral untuk leg lama.
+
+### 14.14 slots="auto" (`7079b71`) — rezim C tanpa knob
+
+`slots="auto"` menerima int atau "auto"; N = `round(cores/0.25)` di-clamp
+`[1, min(tables, 8)]` (hukum terukur §14.9). Smoke live: 2 tabel @0,5 core →
+N=2, bootstrap 2 jt baris 5,9 s, `AUTO_OK rows=2.000.000`. Suite 429, RED 2/2,
+`cargo check -p apitap-python` OK.
