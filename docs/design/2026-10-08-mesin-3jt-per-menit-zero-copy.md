@@ -963,3 +963,31 @@ Konfigurasi: 2 tabel × 2 slot (satu per grup), klien 0,5 core. Single-table/
 slot=1 tetap ~36–40 rb/s delivered (pace per-slot server). Untuk produksi:
 `slots=N` dengan ≥N tabel dan N ≤ core yang tersedia; di 0,5 core, slots=2
 adalah titik target 3 jt/menit — terukur, bukan estimasi.
+
+### 14.10 G1.3 dikerjakan; G1.2 adalah pekerjaan utama berikutnya
+
+G1.3 (budget penuh untuk MySQL, `cdc_full_window_budget`) masuk; suite 429.
+**G1.2 tetap tugas utama sesi berikutnya**: `myrun::drain_windows` harus
+mengirim window lewat channel dan `run_group_mysql` memakai
+`apply_windows` + `run_overlapped` yang sama dengan Postgres — dengan
+`apply_windows` menerima `Option<PgPool>` (MySQL tidak punya pool PG untuk
+resolve TOAST, yang memang tak ada di jalur binlog). Sasaran: 2,9 rb/s →
+10–22 rb/s (review), lalu insert-only menambah margin.
+
+### 14.11 G1.2 SELESAI — MySQL menyusul ke kelas 50 rb/s (2026-10-08)
+
+G1.2 (`024b41d`): `myrun::drain_windows` mengirim window lewat channel,
+`run_group_mysql` memakai `apply_windows` + `run_overlapped` yang sama dengan
+Postgres (overlap drain/apply; `apply_windows` kini menerima `Option<PgPool>`
+karena window binlog tak punya refetch TOAST). Digabung G1.3 (budget penuh):
+
+- **20 rb/s offered**: drain 2,46 jt changes/91,3 s (27 rb/s reported),
+  **caught up** (passes akhir rows=0), CPU **0,25/0,5**; **VALIDATE MATCH**.
+  Dari 2.880/s → ~7×.
+- **50 rb/s offered** (48.682/s ledger): drain 4,53 jt/111,5 s, **caught up**,
+  CPU **0,41/0,5** (82% kuota); **VALIDATE MATCH**. ≈14–17× dari baseline.
+
+Dengan ini **kedua jalur berada di kelas target 3 jt/menit @0,5 core**:
+PG→CH 49,3 rb/s (slots=2, §14.9) dan MySQL→CH ~48,7 rb/s offered tercapai.
+Sisa: `slots` otomatis dari cgroup (rezim C), follow mode untuk MySQL
+(pass-loop 196/108 masih ada), dan gate leg baru untuk jalur ini.
