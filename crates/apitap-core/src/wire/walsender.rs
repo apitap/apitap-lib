@@ -227,6 +227,19 @@ impl FrameScanner {
 /// — it only lets more accumulate first (system review 2026-10-07 §5.3 L2).
 const READ_COALESCE_US: u64 = 500;
 
+/// `APITAP_PG_BINARY` tri-state: `1/true/on` forces binary pgoutput on every
+/// lane, `0/off/false` forces it off, unset defers to the caller — which
+/// turns it ON for ClickHouse destinations (the RowBinary body path, measured
+/// +15% there) and leaves every other lane on text (their renderers are
+/// text-native; the binary wire is neutral for them, but no win is claimed).
+pub(crate) fn pg_binary_setting() -> Option<bool> {
+    match std::env::var("APITAP_PG_BINARY").ok().as_deref() {
+        Some("1") | Some("true") | Some("on") => Some(true),
+        Some("0") | Some("off") | Some("false") => Some(false),
+        _ => None,
+    }
+}
+
 /// `APITAP_READ_COALESCE_US` (microseconds): unset = 500; `0`/`off` disables
 /// (the A/B control); junk falls back — a typo cannot silently change it.
 fn read_coalesce_us() -> u64 {
@@ -1510,11 +1523,9 @@ impl Walsender {
         slot: &str,
         start_lsn: u64,
         publication: &str,
+        want_binary: bool,
     ) -> Result<()> {
-        let binary = matches!(
-            std::env::var("APITAP_PG_BINARY").as_deref(),
-            Ok("1") | Ok("true") | Ok("on")
-        );
+        let binary = want_binary;
         // Re-issued rather than trusted because the startup `options` attempt
         // falls back to a plain connection when the server rejects it, and a
         // run that quietly lost an explicit setting is how a large transaction
@@ -2181,7 +2192,7 @@ mod tests {
                 sql.simple_query("TRUNCATE walsmoke").await.expect("truncate");
 
                 let lsn = pgoutput::lsn_from_string(&consistent_point).unwrap();
-                ws.start_replication("apitap_walsmoke", lsn, "walsmoke_pub")
+                ws.start_replication("apitap_walsmoke", lsn, "walsmoke_pub", false)
                     .await
                     .expect("start replication");
 

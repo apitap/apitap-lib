@@ -1622,7 +1622,12 @@ async fn drain_group(
     // recorded memory ceiling intact.
     let budget = (tenure.dest().cdc_window_bytes() / budget_denom.max(1)).max(1 << 20);
     let mut ws = Walsender::connect(src_url).await?;
-    ws.start_replication(slot, wm, publication).await?;
+    // Binary pgoutput: the CH lane takes it by default (P4's RowBinary body
+    // path, +15% measured); other lanes stay on text unless the env forces
+    // it. The negotiation falls back to text on pre-14 servers either way.
+    let want_binary = crate::wire::walsender::pg_binary_setting()
+        .unwrap_or(matches!(tenure.dest(), Dest::Ch(_)));
+    ws.start_replication(slot, wm, publication, want_binary).await?;
     // P4: the CH lane renders RowBinary bodies straight from send-format
     // cells when the session actually negotiated `binary 'true'`. Other
     // lanes and changelog bodies keep the text path (their renderers and
