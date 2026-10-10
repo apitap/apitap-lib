@@ -105,3 +105,24 @@ Ordered, measured, A/B-first (candidates, each with the harness above):
 4. MySQL parity: the MySQL lane apply path (windows + follow) has the most
    headroom (17.1k/s, 0.72 cap — it is the only lane with both spare quota
    AND the lowest rate).
+
+## 4. Knob sweep (2026-10-10, PG lane, PREBUILD backlog arms)
+
+`benchmarks/cdc-steady-profile/heavy30-ab.sh`: each arm generates 6M changes
+(NTX=100 per round, both rounds, no drain — a real backlog), then starts the
+capped drain and measures pure catch-up. Same cage, same wheel, same shape.
+
+| arm | catch-up rate | MEMPEAK | cap_frac | note |
+|---|---|---|---|---|
+| base1 (defaults) | 24.6k/s | 89.6 MB | 0.66 | |
+| `FOLLOW_SECS=30` | 17.7k/s | 105.1 MB | 0.48 | **-30%: follow parks between floors** |
+| `CDC_WINDOW_BYTES=128MiB` | **OOM-killed (137)** | - | - | window > the 256 MB cage |
+| `slots=4` | 24.7k/s | 96.5 MB | 0.65 | neutral (client, not decode) |
+| `CDC_APPLY_LANES=16` | 27.1k/s | 97.6 MB | 0.70 | inside the noise |
+| base2 (defaults repeat) | 27.0k/s | 98.0 MB | 0.70 | **noise band ~+/-5%** |
+
+**Verdict: the knob space is exhausted.** Every arm except the two negative
+results sits inside the base1/base2 noise band (24.6 vs 27.0k/s on identical
+configs). The wall at this shape is the per-change client cost with ~1KB rows
+(memory movement), exactly the target of the zero-copy plan — the 100k/s goal
+needs engine work (P1/P2/L1b/L3/L4), not configuration.

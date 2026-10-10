@@ -90,7 +90,7 @@ gen_round() { # A|B — per table: 1000 txs of 1000 changes (700U+150I+150D / 40
       docker exec -i "$MY_C" mysql -uroot -pbench "$MY_DB" < "$SQL" 2>/dev/null
     fi
     echo "ROUND $round t$i done $(date -u +%H:%M:%S)"
-    if ! docker inspect "prof-heavy-$TAG" >/dev/null 2>&1; then
+    if [ "${PREBUILD:-0}" != "1" ] && ! docker inspect "prof-heavy-$TAG" >/dev/null 2>&1; then
       echo "DRAIN_DIED after round $round table $i — generation aborted"
       return 1
     fi
@@ -99,29 +99,50 @@ gen_round() { # A|B — per table: 1000 txs of 1000 changes (700U+150I+150D / 40
   return 0
 }
 
-docker rm -f "prof-heavy-$TAG" >/dev/null 2>&1
-echo "== drain up: $SP | slots=${SLOTS:-default} | budget=${BUDGET}s =="
-docker run -d --name "prof-heavy-$TAG" --network=host --cpus=$CPUS --memory=256m --memory-swap=256m \
-  -v "$SP:/py:ro" -e PYTHONPATH=/py \
-  -e "APITAP_SRC=$URL" -e "APITAP_DST=$CH_DST" \
-  -e "APITAP_TABLE=$TBL" -e "BUDGET_S=$BUDGET" -e "ZERO_STOP=99" -e "CPUS=$CPUS" \
-  -e "APITAP_SLOTS=$SLOTS" \
-  -e "APITAP_TAG=$TAG" -v "$HERE:/job:ro" python:3.13-slim sh /job/leg.sh >/dev/null
-for _ in $(seq 1 180); do docker inspect "prof-heavy-$TAG" >/dev/null 2>&1 && break; sleep 1; done
-sleep 12
+launch_drain() {
+  local ZS=99; [ "${PREBUILD:-0}" = "1" ] && ZS=3
+  docker rm -f "prof-heavy-$TAG" >/dev/null 2>&1
+  echo "== drain up: $SP | slots=${SLOTS:-default} | budget=${BUDGET}s =="
+  docker run -d --name "prof-heavy-$TAG" --network=host --cpus=$CPUS --memory=256m --memory-swap=256m \
+    -v "$SP:/py:ro" -e PYTHONPATH=/py \
+    -e "APITAP_SRC=$URL" -e "APITAP_DST=$CH_DST" \
+    -e "APITAP_TABLE=$TBL" -e "BUDGET_S=$BUDGET" -e "ZERO_STOP=$ZS" -e "CPUS=$CPUS" \
+    -e "APITAP_SLOTS=$SLOTS" \
+    -e "APITAP_FOLLOW_SECS=${APITAP_FOLLOW_SECS:-}" \
+    -e "APITAP_CDC_WINDOW_BYTES=${APITAP_CDC_WINDOW_BYTES:-}" \
+    -e "APITAP_CDC_APPLY_LANES=${APITAP_CDC_APPLY_LANES:-}" \
+    -e "APITAP_READ_COALESCE_US=${APITAP_READ_COALESCE_US:-}" \
+    -e "APITAP_ENGINE=${APITAP_ENGINE:-}" \
+    -e "APITAP_PG_BINARY=${APITAP_PG_BINARY:-}" \
+    -e "APITAP_TAG=$TAG" -v "$HERE:/job:ro" python:3.13-slim sh /job/leg.sh >/dev/null
+  for _ in $(seq 1 180); do docker inspect "prof-heavy-$TAG" >/dev/null 2>&1 && break; sleep 1; done
+  sleep 12
+}
 
-WF="$LOGS/$TAG.witness"
-: > "$WF"
-W0=$(witness); T0=$(date +%s); echo "W0 $W0" >> "$WF"
-echo "== round A (1000 changes/tx; 700U+150I+150D) =="
-if gen_round A; then
+if [ "${PREBUILD:-0}" = "1" ]; then
+  WF="$LOGS/$TAG.witness"; : > "$WF"
+  W0=$(witness); T0=$(date +%s); echo "W0 $W0" >> "$WF"
+  echo "== round A (prebuild; 1000 changes/tx) =="
+  gen_round A || true
   W1=$(witness); T1=$(date +%s); echo "W1 $W1" >> "$WF"
-  echo "== round B (1000 changes/tx; 400U+300I+300D) =="
+  echo "== round B (prebuild; 1000 changes/tx) =="
   gen_round B || true
   W2=$(witness); T2=$(date +%s); echo "W2 $W2" >> "$WF"
+  launch_drain
 else
-  W1=$(witness); T1=$(date +%s); echo "W1 $W1" >> "$WF"
-  W2="$W1"; T2=$T1; echo "W2 $W2" >> "$WF"
+  launch_drain
+  WF="$LOGS/$TAG.witness"; : > "$WF"
+  W0=$(witness); T0=$(date +%s); echo "W0 $W0" >> "$WF"
+  echo "== round A (1000 changes/tx; 700U+150I+150D) =="
+  if gen_round A; then
+    W1=$(witness); T1=$(date +%s); echo "W1 $W1" >> "$WF"
+    echo "== round B (1000 changes/tx; 400U+300I+300D) =="
+    gen_round B || true
+    W2=$(witness); T2=$(date +%s); echo "W2 $W2" >> "$WF"
+  else
+    W1=$(witness); T1=$(date +%s); echo "W1 $W1" >> "$WF"
+    W2="$W1"; T2=$T1; echo "W2 $W2" >> "$WF"
+  fi
 fi
 
 echo "== waiting for the drain (budget ${BUDGET}s) =="
@@ -137,7 +158,8 @@ echo "== validate =="
 CH_C="$CH_CT" PG_C="$PG_C" MY_C="$MY_C" bash "$HERE/validate30.sh" "$ROUTE" "$TVAL" | tail -3
 
 {
-  echo "TAG $TAG route=$ROUTE slots=${SLOTS:-default} cpus=$CPUS"
+  echo "TAG $TAG route=$ROUTE slots=${SLOTS:-default} cpus=$CPUS ntx=${NTX:-1000}"
+  echo "ARM follow=${APITAP_FOLLOW_SECS:-off} window=${APITAP_CDC_WINDOW_BYTES:-default} lanes=${APITAP_CDC_APPLY_LANES:-default} coalesce=${APITAP_READ_COALESCE_US:-default} engine=${APITAP_ENGINE:-default} pgbinary=${APITAP_PG_BINARY:-off} sp=$SP"
   echo "W0 $W0"; echo "W1 $W1"; echo "W2 $W2"
   echo "GEN_A_S $((T1-T0)) GEN_B_S $((T2-T1))"
   echo "DRAIN_STATE $STATE"
