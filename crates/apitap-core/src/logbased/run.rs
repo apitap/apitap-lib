@@ -390,7 +390,7 @@ impl Dest {
             }
             (_, _, Slice::Changelog(_)) => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             (Dest::Pg(d), Unit::Pg(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
-            (Dest::Ch(d), Unit::Ch(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id, o.rb).await,
+            (Dest::Ch(d), Unit::Ch(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id, o.binary).await,
             (Dest::My(d), Unit::My(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
             (Dest::Ice(d), Unit::Ice(u), Slice::Replica(w)) => {
                 let src = src.ok_or_else(|| {
@@ -1261,7 +1261,7 @@ async fn run_group_mysql(
             AbortOnDrop::spawn(apply_windows(tenure.clone(), None, members, win_rx, applied_tx));
         let drained = run_overlapped(
             async {
-                myrun::drain_windows(src_url, &pool, &ctxs, wm, &seed, 30, budget, opts.changelog, win_tx, matches!(*dest, Dest::Ch(_)).then_some(crate::logbased::window::RbBody::MyText))
+                myrun::drain_windows(src_url, &pool, &ctxs, wm, &seed, 30, budget, opts.changelog, win_tx)
                     .await
                     .map(|_| ())
             },

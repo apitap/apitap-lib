@@ -274,26 +274,15 @@ pub(crate) enum Slice<'a> {
 }
 
 /// One drained window, as both drains hand it to the applies.
-/// Which RowBinary body plan this window's apply should use (P4 and its
-/// MySQL twin). The cells' SOURCE format differs per lane: the Postgres
-/// binary lane carries send-format bytes (`transcode_field`), the MySQL lane
-/// carries text the binlog decoder rendered (`emit_text_field`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum RbBody {
-    /// pgoutput `binary 'true'`: cells are Postgres send-format bytes.
-    PgBinary,
-    /// MySQL lane: cells are text, parsed per the destination's CH types.
-    MyText,
-}
-
 pub(crate) struct DrainOutcome {
     pub bodies: Bodies,
     pub id: WindowId,
     /// Apply this window and drain again at once: the drain stopped at the
     /// memory budget, or at a layout change, not at the stop-line.
     pub hit_budget: bool,
-    /// RowBinary body plan, `None` for the text path.
-    pub rb: Option<RbBody>,
+    /// The stream negotiated `binary 'true'` AND this lane renders RowBinary
+    /// bodies: the tuples' cells are send-format bytes, not text.
+    pub binary: bool,
 }
 
 impl DrainOutcome {

@@ -504,7 +504,6 @@ pub(crate) async fn drain_binlog(
     max_secs: u64,
     max_buf_bytes: usize,
     changelog: bool,
-    rb: Option<crate::logbased::window::RbBody>,
 ) -> Result<DrainOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     let mut collapsers: HashMap<String, Collapser> = HashMap::new();
@@ -809,7 +808,9 @@ pub(crate) async fn drain_binlog(
     }
 
     Ok(DrainOutcome {
-        rb,
+        // The MySQL lane is text-native end to end; RowBinary bodies are a
+        // Postgres-source feature (P4).
+        binary: false,
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
         id: WindowId::new(start, end_mark),
         hit_budget,

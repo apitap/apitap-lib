@@ -25,8 +25,7 @@ use crate::logbased::replay::{Ask, MarkerRow, Memo, ReplayPlan, WindowId};
 use crate::logbased::rowtext::{
     ch_key_literal, render_ch_key, render_ch_key_binary, render_ch_key_rb, render_ch_row,
     render_ch_row_binary_as_text, render_ch_row_cells, render_ch_row_cells_binary,
-    render_ch_row_rb, render_ch_row_rb_from_text, render_ch_value, row_key_refs,
-    row_key_refs_cells, tsv_unescape,
+    render_ch_row_rb, render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
 };
 use crate::logbased::window::TableWindow;
 use crate::sink::clickhouse::{ch_ident, ch_str};
@@ -264,9 +263,9 @@ impl ChDest {
         w: Option<&TableWindow<Collapsed>>,
         id: &WindowId,
         source_id: &str,
-        rb: Option<crate::logbased::window::RbBody>,
+        binary: bool,
     ) -> Result<(u64, Watermark)> {
-        apply_unit(u, dest_table, w, id, source_id, rb).await
+        apply_unit(u, dest_table, w, id, source_id, binary).await
     }
 }
 
@@ -583,7 +582,7 @@ async fn apply_unit(
     w: Option<&TableWindow<Collapsed>>,
     id: &WindowId,
     source_id: &str,
-    rb: Option<crate::logbased::window::RbBody>,
+    binary: bool,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
@@ -610,31 +609,20 @@ async fn apply_unit(
     let pk_oids = l.key_oids();
     let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
 
-    // P4 and its MySQL twin: when every column of the PHYSICAL destination
-    // table maps to a RowBinary type, the bodies go out as RowBinary — no
-    // text escaping, and the wire carries typed values instead of their text
-    // spellings. The cell SOURCE format decides the plan: Postgres binary
-    // send-format (transcode) or MySQL text (parse). Any unmapped column (or
-    // a text lane) keeps the whole table on the TSV path.
-    let pg_binary = matches!(rb, Some(crate::logbased::window::RbBody::PgBinary));
-    let (row_rb, key_rb): (Option<RbPlan>, Option<RbPlan>) = match rb {
-        Some(crate::logbased::window::RbBody::PgBinary) => {
-            let types = u.column_types(dest_table).await?;
-            let w = rb_types_for(wal_cols, &types, oids);
-            let p = if w.is_some() {
-                rb_types_for(pk_cols, &types, &pk_oids)
-            } else {
-                None
-            };
-            (w.map(RbPlan::Pg), p.map(RbPlan::Pg))
-        }
-        Some(crate::logbased::window::RbBody::MyText) => {
-            // Key tombstones stay TSV on the text lane (the key table is
-            // text-native); only the row bodies go RowBinary.
-            let types = u.column_types(dest_table).await?;
-            (rb_parse_types_for(wal_cols, &types).map(RbPlan::My), None)
-        }
-        None => (None, None),
+    // P4: a binary stream's cells are pgoutput send-format bytes. When every
+    // column of the PHYSICAL destination table maps to a RowBinary type, the
+    // bodies go out as RowBinary — no text render, no escaping, and the
+    // wire carries typed values instead of their text spellings. Any unmapped
+    // column (or a text stream) keeps the whole table on the TSV path.
+    let rb_types: Option<Vec<(crate::wire::rowbinary::RbType, bool)>> = if binary {
+        rb_types_for(wal_cols, &u.column_types(dest_table).await?, oids)
+    } else {
+        None
+    };
+    let pk_rb_types: Option<Vec<(crate::wire::rowbinary::RbType, bool)>> = if rb_types.is_some() {
+        rb_types_for(pk_cols, &u.column_types(dest_table).await?, &pk_oids)
+    } else {
+        None
     };
 
     if c.truncate {
@@ -662,7 +650,7 @@ async fn apply_unit(
         let mut buf = Vec::with_capacity(1 << 20);
         for key in c.deletes.iter() {
             let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-            if pg_binary {
+            if binary {
                 render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
             } else {
                 render_ch_key(&refs, &pk_oids, &mut buf)?;
@@ -670,7 +658,7 @@ async fn apply_unit(
         }
         for row in &c.upserts {
             let refs = row_key_refs(row, pk_idx);
-            if pg_binary {
+            if binary {
                 render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
             } else {
                 render_ch_key(&refs, &pk_oids, &mut buf)?;
@@ -691,17 +679,17 @@ async fn apply_unit(
         let ver = id.end();
         if !c.upserts.is_empty() {
             let mut buf = Vec::with_capacity(4 << 20);
-            match &row_rb {
-                Some(plan) => {
+            match &rb_types {
+                Some(rt) => {
                     for row in &c.upserts {
-                        render_rb_row(plan, row, &mut buf)?;
+                        render_ch_row_rb(row, rt, &mut buf)?;
                         insert_only_suffix_rb(&mut buf, ver, false);
                     }
                     u.insert_owned_rb(dest_table, &insert_only_cols(wal_cols), buf).await?;
                 }
                 None => {
                     for row in &c.upserts {
-                        if pg_binary {
+                        if binary {
                             render_ch_row_binary_as_text(row, oids, &mut buf)?;
                         } else {
                             render_ch_row(row, oids, &mut buf)?;
@@ -714,8 +702,8 @@ async fn apply_unit(
         }
         if !c.deletes.is_empty() {
             let mut buf = Vec::with_capacity(1 << 20);
-            match &key_rb {
-                Some(RbPlan::Pg(prt)) => {
+            match &pk_rb_types {
+                Some(prt) => {
                     for key in c.deletes.iter() {
                         let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
                         render_ch_key_rb(&refs, prt, &mut buf)?;
@@ -723,10 +711,10 @@ async fn apply_unit(
                     }
                     u.insert_owned_rb(dest_table, &insert_only_cols(pk_cols), buf).await?;
                 }
-                _ => {
+                None => {
                     for key in c.deletes.iter() {
                         let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-                        if pg_binary {
+                        if binary {
                             render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
                         } else {
                             render_ch_key(&refs, &pk_oids, &mut buf)?;
@@ -739,16 +727,16 @@ async fn apply_unit(
         }
     } else if !c.upserts.is_empty() {
         let mut buf = Vec::with_capacity(4 << 20);
-        match &row_rb {
-            Some(plan) => {
+        match &rb_types {
+            Some(rt) => {
                 for row in &c.upserts {
-                    render_rb_row(plan, row, &mut buf)?;
+                    render_ch_row_rb(row, rt, &mut buf)?;
                 }
                 u.insert_owned_rb(dest_table, wal_cols, buf).await?;
             }
             None => {
                 for row in &c.upserts {
-                    if pg_binary {
+                    if binary {
                         render_ch_row_binary_as_text(row, oids, &mut buf)?;
                     } else {
                         render_ch_row(row, oids, &mut buf)?;
@@ -773,7 +761,7 @@ async fn apply_unit(
                     .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
                     .map(|(i, _)| i)
                     .collect();
-                let pred = key_pred(pk_cols, key, &pk_oids, pg_binary)?;
+                let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
                     let body = u.read(&format!("SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated")).await?;
@@ -799,7 +787,7 @@ async fn apply_unit(
                 }
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
-                render_residue_row(&full, oids, &missing, pg_binary, &mut buf)?;
+                render_residue_row(&full, oids, &missing, binary, &mut buf)?;
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
@@ -809,10 +797,10 @@ async fn apply_unit(
             }
             ResidueOp::Upsert { row } => {
                 let key: Vec<Vec<u8>> = row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect();
-                let pred = key_pred(pk_cols, &key, &pk_oids, pg_binary)?;
+                let pred = key_pred(pk_cols, &key, &pk_oids, binary)?;
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
-                if pg_binary {
+                if binary {
                     render_ch_row_cells_binary(row, oids, &mut buf)?;
                 } else {
                     render_ch_row_cells(row, oids, &mut buf)?;
@@ -825,7 +813,7 @@ async fn apply_unit(
                 }
             }
             ResidueOp::Delete { key } => {
-                let pred = key_pred(pk_cols, key, &pk_oids, pg_binary)?;
+                let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
                 u.delete_owned(dest_table, &pred).await?;
             }
             ResidueOp::Rekey { old_key, row, .. } => {
@@ -841,7 +829,7 @@ async fn apply_unit(
                     .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
                     .map(|(i, _)| i)
                     .collect();
-                let old_pred = key_pred(pk_cols, old_key, &pk_oids, pg_binary)?;
+                let old_pred = key_pred(pk_cols, old_key, &pk_oids, binary)?;
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
                     let body =
@@ -867,7 +855,7 @@ async fn apply_unit(
                 }
                 u.delete_owned(dest_table, &old_pred).await?;
                 let mut buf = Vec::new();
-                render_residue_row(&full, oids, &missing, pg_binary, &mut buf)?;
+                render_residue_row(&full, oids, &missing, binary, &mut buf)?;
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
@@ -928,33 +916,6 @@ fn insert_only_suffix(buf: &mut Vec<u8>, ver: u64, deleted: bool) {
 fn insert_only_suffix_rb(buf: &mut Vec<u8>, ver: u64, deleted: bool) {
     buf.extend_from_slice(&ver.to_le_bytes());
     buf.push(u8::from(deleted));
-}
-
-/// One window's RowBinary plan: per-column types in the lane's cell format.
-enum RbPlan {
-    Pg(Vec<(crate::wire::rowbinary::RbType, bool)>),
-    My(Vec<(crate::wire::rowbinary::RbParse, bool)>),
-}
-
-fn render_rb_row(plan: &RbPlan, row: &crate::wire::pgoutput::Tuple, out: &mut Vec<u8>) -> Result<()> {
-    match plan {
-        RbPlan::Pg(t) => render_ch_row_rb(row, t, out),
-        RbPlan::My(t) => render_ch_row_rb_from_text(row, t, out),
-    }
-}
-
-/// (RbParse, nullable) per column for the MySQL lane's text cells.
-fn rb_parse_types_for(
-    cols: &[String],
-    types: &std::collections::HashMap<String, String>,
-) -> Option<Vec<(crate::wire::rowbinary::RbParse, bool)>> {
-    cols.iter()
-        .map(|c| {
-            types
-                .get(c)
-                .and_then(|t| crate::wire::rowbinary::rb_parse_type_from_ch(t))
-        })
-        .collect()
 }
 
 /// (RbType, nullable) per column from the destination table's DESCRIBE map;
