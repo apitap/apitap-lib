@@ -524,7 +524,7 @@ pub(crate) async fn drain(
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
         id: WindowId::new(start_lsn, end_lsn),
         hit_budget,
-        binary: keep_binary,
+        rb: keep_binary.then_some(crate::logbased::window::RbBody::PgBinary),
     };
     if dbg_stream {
         eprintln!(

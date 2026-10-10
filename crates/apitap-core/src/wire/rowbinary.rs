@@ -149,6 +149,271 @@ pub(crate) fn rb_type_for_cdc(oid: u32, ch: RbType) -> Option<RbType> {
     })
 }
 
+/// The TEXT-to-RowBinary parse plan for one column (the MySQL lane's cells
+/// arrive as text from the binlog decoder; the destination body is RowBinary).
+/// Distinct from `RbType` because a text parse needs to know int-vs-float,
+/// which `Swap(w)` alone cannot say.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RbParse {
+    /// Signed int of the given width (2/4/8).
+    Int(usize),
+    /// Unsigned int of the given width.
+    UInt(usize),
+    /// Float of the given width (4/8).
+    Float(usize),
+    /// 1-byte bool/Int8/UInt8: "0"/"1" (MySQL tinyint text).
+    Bool,
+    /// Date32: "YYYY-MM-DD" -> days since 1970.
+    Date32,
+    /// DateTime64(6): "YYYY-MM-DD HH:MM:SS[.ffffff]" -> micros since 1970.
+    Ts64,
+    /// Decimal(P,S): text -> scaled i64 of the given width (4/8/16).
+    Decimal { width: usize, scale: u32 },
+    /// Text-ish: raw bytes, varint length (no escaping).
+    String,
+}
+
+/// ClickHouse column type -> (RbParse, nullable) for the TEXT path.
+pub(crate) fn rb_parse_type_from_ch(ch: &str) -> Option<(RbParse, bool)> {
+    let (inner, nullable) = match ch.strip_prefix("Nullable(").and_then(|s| s.strip_suffix(')')) {
+        Some(i) => (i, true),
+        None => (ch, false),
+    };
+    let ty = match inner {
+        "Bool" | "Int8" | "UInt8" => RbParse::Bool,
+        "Int16" => RbParse::Int(2),
+        "UInt16" => RbParse::UInt(2),
+        "Int32" => RbParse::Int(4),
+        "UInt32" => RbParse::UInt(4),
+        "Int64" => RbParse::Int(8),
+        "UInt64" => RbParse::UInt(8),
+        "Float32" => RbParse::Float(4),
+        "Float64" => RbParse::Float(8),
+        "Date32" => RbParse::Date32,
+        s if s.starts_with("DateTime64(6") => RbParse::Ts64,
+        "String" => RbParse::String,
+        s if s.starts_with("Decimal(") => {
+            let (p, sc) = parse_ch_decimal(s)?;
+            RbParse::Decimal {
+                width: if p <= 9 {
+                    4
+                } else if p <= 18 {
+                    8
+                } else {
+                    16
+                },
+                scale: sc,
+            }
+        }
+        _ => return None,
+    };
+    Some((ty, nullable))
+}
+
+/// Emit one TEXT cell as a RowBinary field per `RbParse`.
+pub(crate) fn emit_text_field(ty: RbParse, t: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    match ty {
+        RbParse::Bool => {
+            let b = match t {
+                b"0" | b"false" => 0u8,
+                b"1" | b"true" => 1u8,
+                other => {
+                    return Err(Error::Transfer(format!(
+                        "mysql text body: '{}' is not a bool",
+                        String::from_utf8_lossy(other)
+                    )))
+                }
+            };
+            out.push(b);
+        }
+        RbParse::Int(w) => {
+            let v = parse_i64(t)?;
+            match w {
+                2 => out.extend_from_slice(&(v as i16).to_le_bytes()),
+                4 => out.extend_from_slice(&(v as i32).to_le_bytes()),
+                8 => out.extend_from_slice(&v.to_le_bytes()),
+                _ => unreachable!("int width"),
+            }
+        }
+        RbParse::UInt(w) => {
+            let v = parse_u64(t)?;
+            match w {
+                2 => out.extend_from_slice(&(v as u16).to_le_bytes()),
+                4 => out.extend_from_slice(&(v as u32).to_le_bytes()),
+                8 => out.extend_from_slice(&v.to_le_bytes()),
+                _ => unreachable!("uint width"),
+            }
+        }
+        RbParse::Float(w) => {
+            let v = parse_f64(t)?;
+            match w {
+                4 => out.extend_from_slice(&(v as f32).to_le_bytes()),
+                8 => out.extend_from_slice(&v.to_le_bytes()),
+                _ => unreachable!("float width"),
+            }
+        }
+        RbParse::Date32 => out.extend_from_slice(&parse_date_days(t)?.to_le_bytes()),
+        RbParse::Ts64 => out.extend_from_slice(&parse_datetime_micros(t)?.to_le_bytes()),
+        RbParse::Decimal { width, scale } => {
+            let v = parse_decimal_scaled(t, scale)?;
+            match width {
+                4 => out.extend_from_slice(&(v as i32).to_le_bytes()),
+                8 => out.extend_from_slice(&v.to_le_bytes()),
+                16 => out.extend_from_slice(&i128::from(v).to_le_bytes()),
+                _ => unreachable!("decimal width"),
+            }
+        }
+        RbParse::String => {
+            varint(t.len() as u64, out);
+            out.extend_from_slice(t);
+        }
+    }
+    Ok(())
+}
+
+fn parse_i64(t: &[u8]) -> Result<i64> {
+    let s = std::str::from_utf8(t)
+        .map_err(|_| Error::Transfer("mysql text body: non-UTF8 number".into()))?;
+    s.parse::<i64>()
+        .map_err(|_| Error::Transfer(format!("mysql text body: '{s}' is not an int")))
+}
+
+fn parse_u64(t: &[u8]) -> Result<u64> {
+    let s = std::str::from_utf8(t)
+        .map_err(|_| Error::Transfer("mysql text body: non-UTF8 number".into()))?;
+    s.parse::<u64>()
+        .map_err(|_| Error::Transfer(format!("mysql text body: '{s}' is not an uint")))
+}
+
+fn parse_f64(t: &[u8]) -> Result<f64> {
+    let s = std::str::from_utf8(t)
+        .map_err(|_| Error::Transfer("mysql text body: non-UTF8 number".into()))?;
+    s.parse::<f64>()
+        .map_err(|_| Error::Transfer(format!("mysql text body: '{s}' is not a float")))
+}
+
+/// Days since 1970-01-01 from "YYYY-MM-DD" (Howard Hinnant's days_from_civil;
+/// no chrono, no allocation — this runs per date cell).
+fn parse_date_days(t: &[u8]) -> Result<i32> {
+    let bad = || Error::Transfer(format!(
+        "mysql text body: '{}' is not a YYYY-MM-DD date",
+        String::from_utf8_lossy(t)
+    ));
+    if t.len() != 10 || t[4] != b'-' || t[7] != b'-' {
+        return Err(bad());
+    }
+    let y = parse_digits(&t[0..4]).ok_or_else(bad)? as i64;
+    let m = parse_digits(&t[5..7]).ok_or_else(bad)? as i64;
+    let d = parse_digits(&t[8..10]).ok_or_else(bad)? as i64;
+    Ok(days_from_civil(y, m, d) as i32)
+}
+
+/// Micros since 1970 from "YYYY-MM-DD HH:MM:SS[.ffffff]" (fraction optional).
+fn parse_datetime_micros(t: &[u8]) -> Result<i64> {
+    let bad = || Error::Transfer(format!(
+        "mysql text body: '{}' is not a YYYY-MM-DD HH:MM:SS datetime",
+        String::from_utf8_lossy(t)
+    ));
+    if t.len() < 19 || t[4] != b'-' || t[7] != b'-' || t[10] != b' ' || t[13] != b':' || t[16] != b':' {
+        return Err(bad());
+    }
+    let y = parse_digits(&t[0..4]).ok_or_else(bad)? as i64;
+    let mo = parse_digits(&t[5..7]).ok_or_else(bad)? as i64;
+    let d = parse_digits(&t[8..10]).ok_or_else(bad)? as i64;
+    let h = parse_digits(&t[11..13]).ok_or_else(bad)? as i64;
+    let mi = parse_digits(&t[14..16]).ok_or_else(bad)? as i64;
+    let s = parse_digits(&t[17..19]).ok_or_else(bad)? as i64;
+    let mut frac = 0i64;
+    if t.len() > 20 && t[19] == b'.' {
+        let f = &t[20..];
+        if f.len() > 6 || !f.iter().all(u8::is_ascii_digit) {
+            return Err(bad());
+        }
+        let mut v = parse_digits(f).ok_or_else(bad)? as i64;
+        for _ in f.len()..6 {
+            v *= 10;
+        }
+        frac = v;
+    } else if t.len() != 19 {
+        return Err(bad());
+    }
+    let days = days_from_civil(y, mo, d);
+    Ok(((days * 86_400 + h * 3_600 + mi * 60 + s) * 1_000_000) + frac)
+}
+
+fn parse_digits(t: &[u8]) -> Option<u64> {
+    if t.is_empty() || !t.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut v = 0u64;
+    for &b in t {
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(v)
+}
+
+/// Hinnant's days_from_civil: days since 1970-01-01 for a proleptic Gregorian
+/// date. Valid for the full MySQL year range.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// "123.4567" -> i64 scaled by 10^scale (extra fraction digits truncated,
+/// missing ones padded), matching ClickHouse's text parse of Decimal(P,S).
+fn parse_decimal_scaled(t: &[u8], scale: u32) -> Result<i64> {
+    let bad = || {
+        Error::Transfer(format!(
+            "mysql text body: '{}' is not a decimal",
+            String::from_utf8_lossy(t)
+        ))
+    };
+    let s = std::str::from_utf8(t).map_err(|_| bad())?;
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(bad());
+    }
+    let mut int_scaled: i64 = 0;
+    for b in int_part.bytes() {
+        if !b.is_ascii_digit() {
+            return Err(bad());
+        }
+        int_scaled = int_scaled
+            .checked_mul(10)
+            .and_then(|x| x.checked_add((b - b'0') as i64))
+            .ok_or_else(bad)?;
+    }
+    int_scaled = int_scaled.checked_mul(10i64.pow(scale)).ok_or_else(bad)?;
+    let mut frac: i64 = 0;
+    let mut digits = 0u32;
+    for b in frac_part.bytes() {
+        if digits == scale {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            return Err(bad());
+        }
+        frac = frac * 10 + (b - b'0') as i64;
+        digits += 1;
+    }
+    for _ in digits..scale {
+        frac *= 10;
+    }
+    let total = int_scaled.checked_add(frac).ok_or_else(bad)?;
+    Ok(if neg { -total } else { total })
+}
+
 fn parse_ch_decimal(s: &str) -> Option<(u32, u32)> {
     let inner = s.strip_prefix("Decimal(")?.strip_suffix(')')?;
     let (p, sc) = inner.split_once(',')?;
@@ -682,5 +947,93 @@ mod tests {
         assert_eq!(rb_type_for_cdc(17, RbType::String), None); // bytea
         assert_eq!(rb_type_for_cdc(1009, RbType::String), None); // text[]
         assert_eq!(rb_type_for_cdc(1083, RbType::String), None); // time
+    }
+
+    /// The MySQL text lane's field emitter: byte-exact RowBinary, and bad
+    /// input refuses loudly (never a silently wrong value).
+    #[test]
+    fn text_fields_emit_rowbinary_bytes() {
+        let mut out = Vec::new();
+        emit_text_field(RbParse::Int(4), b"42", &mut out).unwrap();
+        assert_eq!(out, vec![42, 0, 0, 0]);
+
+        out.clear();
+        emit_text_field(RbParse::Int(2), b"-7", &mut out).unwrap();
+        assert_eq!(out, (-7i16).to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::UInt(8), b"18446744073709551615", &mut out).unwrap();
+        assert_eq!(out, u64::MAX.to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Float(8), b"1.5", &mut out).unwrap();
+        assert_eq!(out, 1.5f64.to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Bool, b"1", &mut out).unwrap();
+        assert_eq!(out, vec![1]);
+
+        out.clear();
+        emit_text_field(RbParse::String, b"hi", &mut out).unwrap();
+        assert_eq!(out, vec![2, b'h', b'i']);
+
+        out.clear();
+        emit_text_field(RbParse::Date32, b"1970-01-02", &mut out).unwrap();
+        assert_eq!(out, 1i32.to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Date32, b"1969-12-31", &mut out).unwrap();
+        assert_eq!(out, (-1i32).to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Ts64, b"1970-01-01 00:00:01.5", &mut out).unwrap();
+        assert_eq!(out, 1_500_000i64.to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Ts64, b"2026-10-10 12:34:56.123456", &mut out).unwrap();
+        let expect = days_from_civil(2026, 10, 10) * 86_400_000_000
+            + 12 * 3_600_000_000
+            + 34 * 60_000_000
+            + 56_000_000
+            + 123_456;
+        assert_eq!(out, expect.to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Decimal { width: 8, scale: 4 }, b"12.3456", &mut out).unwrap();
+        assert_eq!(out, 123_456i64.to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Decimal { width: 8, scale: 4 }, b"-0.0001", &mut out).unwrap();
+        assert_eq!(out, (-1i64).to_le_bytes().to_vec());
+
+        out.clear();
+        emit_text_field(RbParse::Decimal { width: 8, scale: 4 }, b"7", &mut out).unwrap();
+        assert_eq!(out, 70_000i64.to_le_bytes().to_vec());
+
+        assert!(emit_text_field(RbParse::Int(4), b"12x", &mut Vec::new()).is_err());
+        assert!(emit_text_field(RbParse::Date32, b"2026/10/10", &mut Vec::new()).is_err());
+        assert!(emit_text_field(RbParse::Ts64, b"nope", &mut Vec::new()).is_err());
+        assert!(
+            emit_text_field(RbParse::Decimal { width: 8, scale: 4 }, b"a.b", &mut Vec::new())
+                .is_err()
+        );
+    }
+
+    /// The MySQL lane's CH-type mapping mirrors the pg one.
+    #[test]
+    fn ch_column_types_map_to_text_parses() {
+        assert_eq!(rb_parse_type_from_ch("Nullable(Int32)"), Some((RbParse::Int(4), true)));
+        assert_eq!(rb_parse_type_from_ch("Int32"), Some((RbParse::Int(4), false)));
+        assert_eq!(rb_parse_type_from_ch("Nullable(Float64)"), Some((RbParse::Float(8), true)));
+        assert_eq!(rb_parse_type_from_ch("Nullable(Int8)"), Some((RbParse::Bool, true)));
+        assert_eq!(rb_parse_type_from_ch("Nullable(Date32)"), Some((RbParse::Date32, true)));
+        assert_eq!(rb_parse_type_from_ch("Nullable(DateTime64(6))"), Some((RbParse::Ts64, true)));
+        assert_eq!(rb_parse_type_from_ch("Nullable(String)"), Some((RbParse::String, true)));
+        assert_eq!(
+            rb_parse_type_from_ch("Nullable(Decimal(18, 4))"),
+            Some((RbParse::Decimal { width: 8, scale: 4 }, true))
+        );
+        assert_eq!(rb_parse_type_from_ch("DateTime64(3)"), None);
+        assert_eq!(rb_parse_type_from_ch("Array(Int32)"), None);
     }
 }

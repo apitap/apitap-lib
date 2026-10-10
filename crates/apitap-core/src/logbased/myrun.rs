@@ -188,6 +188,7 @@ pub(crate) async fn drain_windows(
     max_buf_bytes: usize,
     changelog: bool,
     win_tx: tokio::sync::mpsc::Sender<DrainOutcome>,
+    rb: Option<crate::logbased::window::RbBody>,
 ) -> Result<u64> {
     mysource::precheck(pool).await?;
     let (live_file, live_pos) = master_position(pool).await?;
@@ -274,6 +275,7 @@ pub(crate) async fn drain_windows(
             max_secs,
             max_buf_bytes,
             changelog,
+            rb,
         )
         .await?;
         let hit_budget = o.hit_budget;

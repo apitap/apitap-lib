@@ -216,6 +216,50 @@ pub(crate) fn render_ch_row_rb(
     Ok(())
 }
 
+/// One full row for a `FORMAT RowBinary` body from the MySQL lane: the cells
+/// are TEXT (the binlog decoder's rendering) and each parses per the
+/// destination's CH type into the RowBinary field (P4's MySQL twin).
+pub(crate) fn render_ch_row_rb_from_text(
+    row: &Tuple,
+    types: &[(crate::wire::rowbinary::RbParse, bool)],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if row.len() != types.len() {
+        return Err(Error::Transfer(format!(
+            "log_based: row has {} columns but the destination table declared {}",
+            row.len(),
+            types.len()
+        )));
+    }
+    for (i, cell) in row.views().enumerate() {
+        let (ty, nullable) = types[i];
+        match cell {
+            Cellv::Null => {
+                if !nullable {
+                    return Err(Error::Transfer(
+                        "NULL in a column ClickHouse declared non-nullable".into(),
+                    ));
+                }
+                out.push(1); // Nullable(T): null flag, no value
+            }
+            Cellv::Text(t) => {
+                if nullable {
+                    out.push(0);
+                }
+                crate::wire::rowbinary::emit_text_field(ty, t, out)?;
+            }
+            Cellv::UnchangedToast => {
+                return Err(Error::Transfer(
+                    "log_based: unchanged-TOAST cell reached the bulk path — \
+                     collapse bug"
+                        .into(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One full row for a TSV body when the stream is binary but the table has a
 /// column outside the RowBinary set: every send-format cell converts to its
 /// Postgres text form first (the pre-P4 behaviour, kept as the correctness
