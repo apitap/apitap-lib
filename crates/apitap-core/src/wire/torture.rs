@@ -484,6 +484,147 @@ async fn walsender_frames_survive_hostile_lengths() {
     }
 }
 
+/// The CopyBoth window scanner (L1b) against a peer that controls the read
+/// boundaries: frames written one byte at a time force a window edge through
+/// every frame, and every payload must come out byte-exact — including a
+/// payload handed out BEFORE later refills, which must stay valid and
+/// unchanged (the window is refcounted, never clobbered in place).
+#[tokio::test]
+async fn scanner_carries_partial_frames_across_refills() {
+    use tokio::io::AsyncWriteExt;
+    let (client, mut server) = socket_pair().await;
+    let (r, _w) = client.into_split();
+    let mut rd = tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
+    let mut scan = super::walsender::FrameScanner::new();
+
+    // 64 CopyData frames with distinct payloads, sizes straddling 100 B;
+    // every 16th carries the keepalive subtype byte so both shapes ride the
+    // same window (the scanner itself is subtype-agnostic).
+    let frames: Vec<Vec<u8>> = (0..64u8)
+        .map(|i| {
+            let payload: Vec<u8> = (0..97 + i as usize)
+                .map(|j| i.wrapping_add(j as u8))
+                .collect();
+            let mut body = Vec::with_capacity(25 + payload.len());
+            body.push(if i % 16 == 15 { b'k' } else { b'w' });
+            body.extend_from_slice(&(i as u64).to_be_bytes());
+            body.extend_from_slice(&[0u8; 16]);
+            body.extend_from_slice(&payload);
+            let mut f = vec![b'd'];
+            f.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            f.extend_from_slice(&body);
+            f
+        })
+        .collect();
+    let all: Vec<u8> = frames.concat();
+    let writer = tokio::spawn(async move {
+        for b in all {
+            server.write_all(&[b]).await.expect("write");
+            tokio::task::yield_now().await;
+        }
+        server.shutdown().await.ok();
+    });
+
+    let mut held: Option<bytes::Bytes> = None;
+    let mut expected_first: Vec<u8> = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let (tag, body) = scan.next_raw(&mut rd).await.expect("frame");
+        assert_eq!(tag, b'd');
+        assert_eq!(&body[..], &f[5..], "frame {i} not byte-exact");
+        if i == 0 {
+            expected_first = body[25..].to_vec();
+            held = Some(body);
+        } else if let Some(h) = &held {
+            assert_eq!(&h[25..], &expected_first[..], "held frame was clobbered");
+        }
+    }
+    writer.await.expect("writer task");
+}
+
+/// The scanner refuses the same hostile lengths as the per-frame reader —
+/// BY THE CAP, before anything waits on the announced payload — and a stream
+/// that ends mid-frame surfaces an error instead of hanging.
+#[tokio::test]
+async fn scanner_survives_hostile_lengths() {
+    use tokio::io::AsyncWriteExt;
+    let hostile: Vec<(Vec<u8>, bool)> = vec![
+        (vec![b'd', 0x40, 0x00, 0x00, 0x01], true),
+        (vec![b'd', 0xFF, 0xFF, 0xFF, 0xFF], true),
+        (vec![b'E', 0x80, 0x00, 0x00, 0x00], true),
+        (vec![b'd', 0x00, 0x00, 0x00, 0x00], false),
+        (vec![b'd', 0x00, 0x00, 0x00, 0x03], false),
+        (vec![b'd', 0x00], false),
+        (vec![b'C', 0x00, 0x00, 0x10, 0x00, b'x', b'y'], false),
+    ];
+    for (bytes, expect_cap) in hostile {
+        let (client, mut server) = socket_pair().await;
+        let (r, _w) = client.into_split();
+        let mut rd = tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
+        let mut scan = super::walsender::FrameScanner::new();
+        server.write_all(&bytes).await.expect("write");
+        server.shutdown().await.ok();
+        drop(server);
+        let got = scan.next_raw(&mut rd).await;
+        assert!(
+            got.is_err(),
+            "a truncated frame must not be accepted: {bytes:?}"
+        );
+        if expect_cap {
+            let msg = format!("{:?}", got.unwrap_err());
+            assert!(
+                msg.contains("1 GB protocol limit"),
+                "a frame announcing more than the protocol permits must be refused \
+                 by the SIZE CAP — got: {msg}"
+            );
+        }
+    }
+}
+
+/// A frame larger than the 1 MiB window grows it (append-only; split-off
+/// slices stay valid) and still comes out byte-exact.
+#[tokio::test]
+async fn scanner_grows_for_frames_beyond_the_window() {
+    use tokio::io::AsyncWriteExt;
+    let (client, mut server) = socket_pair().await;
+    let (r, _w) = client.into_split();
+    let mut rd = tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
+    let mut scan = super::walsender::FrameScanner::new();
+    let payload: Vec<u8> = (0..2_500_000u32).map(|i| (i % 251) as u8).collect();
+    let mut f = vec![b'd'];
+    f.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+    f.extend_from_slice(&payload);
+    let total = f.len();
+    let writer = tokio::spawn(async move {
+        for chunk in f.chunks(64 << 10) {
+            server.write_all(chunk).await.expect("write");
+            tokio::task::yield_now().await;
+        }
+        server.shutdown().await.ok();
+    });
+    let (tag, body) = scan.next_raw(&mut rd).await.expect("frame");
+    assert_eq!(tag, b'd');
+    assert_eq!(body.len(), total - 5);
+    assert_eq!(&body[..], &payload[..]);
+    writer.await.expect("writer task");
+}
+
+/// The half-open guarantee rides the refill: a silent stream errors with the
+/// "silent for … half-open" message (the shape `e2e_half_open.py` greps),
+/// bounded by the same env knob the per-event timeout used.
+#[tokio::test]
+async fn scanner_times_out_a_silent_stream() {
+    std::env::set_var("APITAP_REPLICATION_SILENCE_SECS", "1");
+    let (client, _server) = socket_pair().await;
+    let (r, _w) = client.into_split();
+    let mut rd = tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
+    let mut scan = super::walsender::FrameScanner::new();
+    let got = scan.next_raw(&mut rd).await;
+    let msg = format!("{:?}", got.expect_err("silent stream must error"));
+    assert!(msg.contains("silent for"), "got: {msg}");
+    assert!(msg.contains("half-open"), "got: {msg}");
+    std::env::remove_var("APITAP_REPLICATION_SILENCE_SECS");
+}
+
 /// The MySQL packet reader, against a chain of maximum-size continuations.
 ///
 /// One packet is capped at 16 MB by the protocol, but a larger payload is a

@@ -30,18 +30,21 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 // rustls comes through tokio-rustls so the two can never disagree on version.
 use tokio_rustls::rustls;
-use tokio::sync::mpsc;
 
 /// Microseconds between the Unix and Postgres (2000-01-01) epochs.
 const PG_EPOCH_OFFSET_US: i64 = 946_684_800_000_000;
 
-/// The socket rides as SPLIT halves so the CopyBoth read side can move into
-/// its own pump task (TCP is full-duplex — standby writes never contend).
-/// The pump is the ape-dts daemon shape adopted batch-side: a task whose
-/// only job is recv+frame, so the ~50K syscalls/s of a busy walsender run
-/// on their own core while decode+collapse consume from a channel.
+/// The socket rides as SPLIT halves so the CopyBoth read side can be scanned
+/// synchronously by the drain (TCP is full-duplex — standby writes never
+/// contend). The 0.59/0.60 shape put the read half in a pump task behind an
+/// mpsc channel; at the <=0.6-core quota that is the runtime the CDC drain
+/// actually runs on, the channel hop and the per-frame `read_exact` are pure
+/// overhead — measured as the per-change wall of the 3M/min design
+/// (2026-10-08 §4.1, L1b). The read half is now one owned 1 MiB window
+/// scanned in place (`FrameScanner` below).
 pub(crate) struct Walsender {
-    /// Read half — `None` while the pump task owns it (CopyBoth mode).
+    /// Read half — owned directly; the scanner borrows it per refill and
+    /// simple queries read it directly outside CopyBoth.
     rd: Option<BufReader<PgRead>>,
     wr: BufWriter<PgWrite>,
     /// Set once START_REPLICATION enters CopyBoth mode.
@@ -63,19 +66,150 @@ pub(crate) struct Walsender {
     co_left: usize,
     /// ErrorResponse body accumulates here ('E' payload spans windows too).
     co_err: Vec<u8>,
-    pump: Option<PumpHandle>,
+    /// The CopyBoth read half's window scanner, `Some` exactly while
+    /// `copying`.
+    scan: Option<FrameScanner>,
 }
 
-struct PumpHandle {
-    frames: mpsc::Receiver<FramedBody>,
-    task: tokio::task::JoinHandle<(BufReader<PgRead>, Result<()>)>,
+/// The CopyBoth read half, scanned synchronously over one owned window
+/// (design 2026-10-08 §4.1, L1b). The 0.60 shape paid, per WAL frame: one
+/// `BytesMut::with_capacity` + two `read_exact` awaits in the pump task, one
+/// mpsc hop and one semaphore permit. Here a 1 MiB window is filled by one
+/// `read_buf` syscall, and frames are handed out as `split_to` slices of that
+/// window — no per-frame allocation, no task, no channel. A frame cut by the
+/// window edge carries only its fragment into the next fill (the tail stays
+/// in place; `BytesMut::reserve` copies just it when growth is needed), and
+/// the half-open silence budget costs one timer per refill instead of one per
+/// event.
+pub(crate) struct FrameScanner {
+    /// Unconsumed bytes: the partial frame tail plus whatever whole frames
+    /// the consumer has not taken. Split-off frames keep the allocation
+    /// alive by refcount, so handing slices out never invalidates them.
+    win: bytes::BytesMut,
+    /// When the last refill returned bytes; the silence deadline is anchored
+    /// here, so the half-open budget costs one timer per refill.
+    last_refill: std::time::Instant,
+    silence: std::time::Duration,
+    coalesce_us: u64,
 }
 
-/// One frame from the pump: tag, body, and the byte permit that keeps the
-/// channel's queued bytes bounded — the channel counts messages, not bytes,
-/// so a burst of large XLogData frames could otherwise blow the container
-/// before the consumer drained even a few (system review 2026-10-07, G0.2).
-type FramedBody = (u8, bytes::Bytes, tokio::sync::OwnedSemaphorePermit);
+/// The scan window's fill target: one syscall per ~1 MiB instead of one per
+/// ~1 KB frame. Memory is 1-2 allocations of this size per slot, fixed.
+const SCAN_WINDOW: usize = 1 << 20;
+
+impl FrameScanner {
+    pub(crate) fn new() -> Self {
+        Self {
+            win: bytes::BytesMut::with_capacity(SCAN_WINDOW),
+            last_refill: std::time::Instant::now(),
+            silence: crate::logbased::drain::silence_budget(),
+            coalesce_us: read_coalesce_us(),
+        }
+    }
+
+    /// One whole frame if the window holds one; `None` when it needs a
+    /// refill. The announced length is validated against the 1 GB protocol
+    /// cap BEFORE anything waits on the payload — a hostile length must not
+    /// grow the window.
+    fn step(&mut self) -> Result<Option<(u8, bytes::Bytes)>> {
+        let w = &self.win[..];
+        if w.len() < 5 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+        if !(4..=MAX_FRAME).contains(&len) {
+            return Err(Error::Transfer(format!(
+                "walsender: message announces {len} bytes, past the 1 GB \
+                 protocol limit — the peer on this socket is not answering \
+                 the Postgres frontend protocol"
+            )));
+        }
+        let total = 1 + len;
+        if w.len() < total {
+            return Ok(None);
+        }
+        let mut f = self.win.split_to(total).freeze();
+        let tag = f[0];
+        // Pointer bump past the 5-byte header (tag + length), not a second
+        // handle: the body stays a slice of the same window allocation.
+        f.advance(5);
+        Ok(Some((tag, f)))
+    }
+
+    /// Refill the window: drain the BufReader's own buffer first (the
+    /// startup handshake may have left bytes there), else one socket read
+    /// into spare capacity. Bounded by the silence budget — the one timer
+    /// per refill that keeps the half-open guarantee (G0.5).
+    async fn refill(&mut self, rd: &mut BufReader<PgRead>) -> Result<()> {
+        // The pre-refill coalescing sleep stays: it lets one recv carry more
+        // than the first arriving frame (L2, measured 2026-10-08). Only when
+        // the window is empty — a carried partial frame is never delayed.
+        if self.coalesce_us > 0 && self.win.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_micros(self.coalesce_us)).await;
+        }
+        let buffered = {
+            let b = rd.buffer();
+            if b.is_empty() {
+                0
+            } else {
+                self.win.extend_from_slice(b);
+                b.len()
+            }
+        };
+        if buffered > 0 {
+            rd.consume(buffered);
+            self.last_refill = std::time::Instant::now();
+            return Ok(());
+        }
+        if self.win.capacity() == self.win.len() {
+            self.win.reserve(SCAN_WINDOW);
+        }
+        let silent = || {
+            Error::Transfer(format!(
+                "log_based: replication stream silent for {}s — the source's \
+                 keepalives stopped (half-open connection?); aborting at the \
+                 last committed watermark",
+                self.silence.as_secs()
+            ))
+        };
+        let Some(remaining) = (self.last_refill + self.silence)
+            .checked_duration_since(std::time::Instant::now())
+        else {
+            return Err(silent());
+        };
+        let n = match tokio::time::timeout(
+            remaining,
+            rd.get_mut().read_buf(&mut self.win),
+        )
+        .await
+        {
+            Ok(r) => r.map_err(io_err)?,
+            Err(_) => return Err(silent()),
+        };
+        if n == 0 {
+            return Err(Error::Transfer(
+                "walsender: stream ended unexpectedly".into(),
+            ));
+        }
+        self.last_refill = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// The next raw frame, refilling as needed. Cancel-safe: a `read_buf`
+    /// future dropped by the silence timeout has consumed nothing, and a
+    /// timeout ends the whole run rather than resuming mid-frame.
+    pub(crate) async fn next_raw(
+        &mut self,
+        rd: &mut BufReader<PgRead>,
+    ) -> Result<(u8, bytes::Bytes)> {
+        loop {
+            if let Some(f) = self.step()? {
+                return Ok(f);
+            }
+            self.refill(rd).await?;
+        }
+    }
+}
 
 /// Default pre-refill coalescing sleep: when the reader's buffer is empty,
 /// wait this long before the next fill so one `recv` carries more than the
@@ -97,87 +231,23 @@ fn read_coalesce_us() -> u64 {
     }
 }
 
-/// How many bytes of read frames may wait in the pump channel;
-/// `APITAP_PUMP_BUF_BYTES` tunes it (bytes or a K/M/G suffix), zero or junk
-/// falls back so a typo cannot disable the bound.
-const PUMP_BUF_LIMIT: usize = 32 << 20;
-
-fn pump_buf_limit() -> usize {
-    std::env::var("APITAP_PUMP_BUF_BYTES")
-        .ok()
-        .and_then(|v| crate::logbased::run::parse_size(&v))
-        .and_then(|n| usize::try_from(n).ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(PUMP_BUF_LIMIT)
-}
-
-/// Close the socket when this type is dropped, whatever path got us here.
+/// The socket closes when this type is dropped, whatever path got us here.
 ///
 /// The plaintext transport did this for free: `TcpStream::into_split` gives
 /// an `OwnedWriteHalf` that shuts the write side down on drop. The TLS
 /// transport does NOT — `tokio::io::split` halves have no `Drop` and share
-/// one lock, so the fd survives until BOTH halves go, and the read half lives
-/// in the pump task, parked in `read_frame` waiting for a frame that is never
-/// coming.
-///
-/// The visible cost was a replication slot left `active` after an aborted TLS
-/// run, so the NEXT run refused it as in use — a failure the plaintext path
-/// did not have, which appeared the moment TLS did. Aborting the pump drops
-/// the read half; the write half goes with `self`.
-impl Drop for Walsender {
-    fn drop(&mut self) {
-        if let Some(pump) = self.pump.take() {
-            pump.task.abort();
-        }
-    }
-}
+/// one lock, so the fd survives until BOTH halves go. With the read half in
+/// a pump task (the 0.59/0.60 shape) the write half dropping left the read
+/// half parked in `read_frame` on a dead connection; a replication slot
+/// stayed `active` and the NEXT run refused it as in use. The scanner owns
+/// no task — the read half is a field of `self` again, so both halves go
+/// with one drop and this failure mode cannot exist.
 
 /// The opt-in that lets a cleartext/MD5 authentication downgrade through on
 /// an unverified channel; anything but exactly "1" is a no (system review
 /// 2026-10-07, auth downgrade).
 fn auth_downgrade_allowed() -> bool {
     std::env::var("APITAP_ALLOW_INSECURE_AUTH").ok().as_deref() == Some("1")
-}
-
-/// The pump: forward every frame until the consumer hangs up, an error
-/// lands, or ReadyForQuery ends the replication conversation. No select!
-/// over the read — a frame read is never cancelled mid-way (protocol
-/// desync is the documented trap).
-async fn pump_frames(
-    mut rd: BufReader<PgRead>,
-    tx: mpsc::Sender<FramedBody>,
-    sem: std::sync::Arc<tokio::sync::Semaphore>,
-) -> (BufReader<PgRead>, Result<()>) {
-    let coalesce_us = read_coalesce_us();
-    loop {
-        // When the reader's buffer is empty, let more data accumulate before
-        // the next fill: one recv per several KB instead of one per arrival.
-        // A plain sleep, deliberately: it cannot park a read that has data —
-        // the read itself proceeds exactly as before (keepalives included).
-        if coalesce_us > 0 && rd.buffer().is_empty() {
-            tokio::time::sleep(std::time::Duration::from_micros(coalesce_us)).await;
-        }
-        match read_frame(&mut rd).await {
-            Ok((tag, body)) => {
-                let done = tag == b'Z';
-                // The permit travels WITH the frame and is dropped by the
-                // consumer once it takes the frame, so queued bytes never
-                // exceed the budget (system review 2026-10-07, G0.2).
-                let want = body.len().min(u32::MAX as usize) as u32;
-                let permit = match std::sync::Arc::clone(&sem).acquire_many_owned(want).await {
-                    Ok(p) => p,
-                    Err(_) => return (rd, Ok(())),
-                };
-                if tx.send((tag, body, permit)).await.is_err() {
-                    return (rd, Ok(()));
-                }
-                if done {
-                    return (rd, Ok(()));
-                }
-            }
-            Err(e) => return (rd, Err(e)),
-        }
-    }
 }
 
 /// Postgres caps a protocol message at 1 GB (PQ_LARGE_MESSAGE_LIMIT), so any
@@ -839,7 +909,7 @@ impl Walsender {
             co_tag: 0,
             co_left: 0,
             co_err: Vec::new(),
-            pump: None,
+            scan: None,
         };
         ws.startup(&ci, options, replication).await?;
         Ok(ws)
@@ -1039,7 +1109,7 @@ impl Walsender {
         let rd = self
             .rd
             .as_mut()
-            .expect("direct read while the pump owns the read half");
+            .expect("direct read outside CopyBoth");
         read_frame(rd).await
     }
 
@@ -1158,7 +1228,7 @@ impl Walsender {
             let rd = self
                 .rd
                 .as_mut()
-                .expect("copy_out while the pump owns the read half");
+                .expect("copy_out while the read half is present");
             // ONE await per window; everything below is a sync scan.
             let avail = rd.fill_buf().await.map_err(io_err)?;
             if avail.is_empty() {
@@ -1293,7 +1363,7 @@ impl Walsender {
         let rd = self
             .rd
             .as_mut()
-            .expect("copy_out while the pump owns the read half");
+            .expect("copy_out while the read half is present");
         let buffered_len = {
             let b = rd.buffer();
             if !b.is_empty() {
@@ -1484,45 +1554,24 @@ impl Walsender {
                 "walsender: START_REPLICATION did not enter copy mode".into(),
             ));
         }
-        // Hand the read half to the pump: from here until stop_replication,
-        // frames arrive through the channel while this task decodes.
-        let rd = self.rd.take().expect("read half present at copy start");
-        let (tx, rx) = mpsc::channel(8192);
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(pump_buf_limit()));
-        let task = tokio::spawn(pump_frames(rd, tx, sem));
-        self.pump = Some(PumpHandle { frames: rx, task });
+        // Hand the read half to the scanner: from here until
+        // stop_replication, frames arrive through the owned window while
+        // this task decodes — no pump task, no channel (L1b).
+        self.scan = Some(FrameScanner::new());
         Ok(())
-    }
-
-    /// Take the pump down and reclaim the read half, surfacing its error.
-    async fn join_pump(&mut self, pump: PumpHandle) -> Result<()> {
-        let (rd, res) = pump
-            .task
-            .await
-            .map_err(|e| Error::Transfer(format!("walsender pump join: {e}")))?;
-        self.rd = Some(rd);
-        res
     }
 
     /// Next CopyBoth event. `None` when the server ended the stream.
     pub(crate) async fn next_event(&mut self) -> Result<Option<WalEvent>> {
         assert!(self.copying, "next_event outside CopyBoth");
         loop {
-            let (tag, msg) = match self.pump.as_mut() {
-                Some(p) => match p.frames.recv().await {
-                    Some((tag, msg, _permit)) => (tag, msg),
-                    None => {
-                        // Pump exited without a server CopyDone: an error or
-                        // a hangup — join it and tell the truth.
-                        let pump = self.pump.take().expect("pump present");
-                        self.copying = false;
-                        self.join_pump(pump).await?;
-                        return Err(Error::Transfer(
-                            "walsender: stream ended unexpectedly".into(),
-                        ));
-                    }
-                },
-                None => self.read_message().await?,
+            let (tag, msg) = {
+                let rd = self
+                    .rd
+                    .as_mut()
+                    .expect("read half present in CopyBoth");
+                let scan = self.scan.as_mut().expect("scanner present in CopyBoth");
+                scan.next_raw(rd).await?
             };
             match tag {
                 b'd' => {
@@ -1596,76 +1645,62 @@ impl Walsender {
     /// Leave CopyBoth mode cleanly (CopyDone handshake) so the session can
     /// run further simple queries or close gracefully.
     pub(crate) async fn stop_replication(&mut self) -> Result<()> {
-        if let Some(mut pump) = self.pump.take() {
-            if self.copying {
-                self.send_msg(b'c', &[]).await?;
-                self.copying = false;
-            }
-            // Bounded. This waits for the server to finish the CopyBoth
-            // conversation, and a path that is half-dead — a NAT or load
-            // balancer that reaped the flow without sending an RST — never
-            // sends the ReadyForQuery this loop is waiting for. Unbounded, a
-            // run that had already failed then parked here indefinitely
-            // instead of returning the error it was carrying. The drain is
-            // over either way; the only question is how long to be polite
-            // about it.
-            const DRAIN_SECS: u64 = 30;
-            let mut err: Option<Error> = None;
-            let drained = tokio::time::timeout(
-                std::time::Duration::from_secs(DRAIN_SECS),
-                async {
-                    loop {
-                        match pump.frames.recv().await {
-                            Some((b'Z', _, _)) | None => break,
-                            Some((b'E', msg, _)) => err = Some(parse_error(&msg)),
-                            Some(_) => {} // drain in-flight frames
-                        }
-                    }
-                },
-            )
-            .await;
-            if drained.is_err() {
-                // Nothing left to salvage from this connection: abort the
-                // pump, which drops the read half, and let the socket close.
-                pump.task.abort();
-                self.copying = false;
-                return match err {
-                    Some(e) => Err(e),
-                    None => Err(Error::Transfer(format!(
-                        "walsender: the server did not finish the replication \
-                         conversation within {DRAIN_SECS}s — the connection is \
-                         half-open (a firewall or load balancer reaped it). The \
-                         window's data is unaffected; re-run to continue from the \
-                         watermark."
-                    ))),
-                };
-            }
-            let res = self.join_pump(pump).await;
-            return match err {
-                Some(e) => Err(e),
-                None => res,
-            };
-        }
         if !self.copying {
             return Ok(());
         }
         self.send_msg(b'c', &[]).await?;
-        loop {
-            let (tag, msg) = self.read_message().await?;
-            match tag {
-                b'd' | b'N' | b'C' | b'c' => {} // drain in-flight data
-                b'E' => return Err(parse_error(&msg)),
-                b'Z' => {
-                    self.copying = false;
-                    return Ok(());
+        // Bounded. This waits for the server to finish the CopyBoth
+        // conversation, and a path that is half-dead — a NAT or load
+        // balancer that reaped the flow without sending an RST — never
+        // sends the ReadyForQuery this loop is waiting for. Unbounded, a
+        // run that had already failed then parked here indefinitely
+        // instead of returning the error it was carrying. The drain is
+        // over either way; the only question is how long to be polite
+        // about it.
+        const DRAIN_SECS: u64 = 30;
+        let mut err: Option<Error> = None;
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(DRAIN_SECS),
+            async {
+                loop {
+                    let (tag, msg) = {
+                        let rd = self
+                            .rd
+                            .as_mut()
+                            .expect("read half present in CopyBoth");
+                        let scan = self
+                            .scan
+                            .as_mut()
+                            .expect("scanner present in CopyBoth");
+                        scan.next_raw(rd).await?
+                    };
+                    match tag {
+                        b'Z' => return Ok(()),
+                        b'E' => err = Some(parse_error(&msg)),
+                        _ => {} // drain in-flight frames (d/c/N/C)
+                    }
                 }
-                other => {
-                    return Err(Error::Transfer(format!(
-                        "walsender stop: unexpected message {:?}",
-                        other as char
-                    )))
-                }
-            }
+            },
+        )
+        .await;
+        self.copying = false;
+        self.scan = None;
+        match drained {
+            Ok(Ok(())) => match err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
+            Ok(Err(e)) => Err(e),
+            Err(_) => match err {
+                Some(e) => Err(e),
+                None => Err(Error::Transfer(format!(
+                    "walsender: the server did not finish the replication \
+                     conversation within {DRAIN_SECS}s — the connection is \
+                     half-open (a firewall or load balancer reaped it). The \
+                     window's data is unaffected; re-run to continue from the \
+                     watermark."
+                ))),
+            },
         }
     }
 }
@@ -1911,21 +1946,6 @@ mod tests {
         assert_eq!(super::parse_pg_size("1024"), Some(1024));
         assert_eq!(super::parse_pg_size("64 kb"), Some(65536));
         assert_eq!(super::parse_pg_size("12x"), None);
-    }
-
-    /// The pump's byte budget may be tuned but not silently disabled: zero
-    /// or junk falls back to the default (system review 2026-10-07, G0.2).
-    #[test]
-    fn a_zero_pump_queue_budget_falls_back_to_the_default() {
-        std::env::remove_var("APITAP_PUMP_BUF_BYTES");
-        assert_eq!(super::pump_buf_limit(), super::PUMP_BUF_LIMIT);
-        std::env::set_var("APITAP_PUMP_BUF_BYTES", "0");
-        assert_eq!(super::pump_buf_limit(), super::PUMP_BUF_LIMIT);
-        std::env::set_var("APITAP_PUMP_BUF_BYTES", "junk");
-        assert_eq!(super::pump_buf_limit(), super::PUMP_BUF_LIMIT);
-        std::env::set_var("APITAP_PUMP_BUF_BYTES", "8M");
-        assert_eq!(super::pump_buf_limit(), 8 << 20);
-        std::env::remove_var("APITAP_PUMP_BUF_BYTES");
     }
 
     /// A downgrade needs an explicit "1": unset, anything else, and even

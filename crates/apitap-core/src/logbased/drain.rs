@@ -26,7 +26,7 @@ use std::sync::Arc;
 /// (tests) but not disable it: zero or junk falls back to the default.
 const REPLICATION_SILENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
-fn silence_budget() -> std::time::Duration {
+pub(crate) fn silence_budget() -> std::time::Duration {
     std::env::var("APITAP_REPLICATION_SILENCE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -227,24 +227,13 @@ pub(crate) async fn drain(
             // exactly as it always did — see `crate::shutdown`.
             break;
         }
-        // The pump owns the socket, so cancelling this wait cannot tear a
-        // frame off the stream (the old concern was about reading the socket
-        // directly); a wait that times out ends the run at the last
-        // watermark, which drops the connection rather than muddling on. The
-        // server keepalives every ~wal_sender_timeout/2 (30 s by default)
-        // normally wake this loop — when they stop, the connection is dead
-        // (half-open socket, NAT rebind) and without this budget the drain
-        // parked forever (system review 2026-10-07, G0.5).
-        let ev = tokio::time::timeout(silence_budget(), ws.next_event())
-            .await
-            .map_err(|_| {
-                Error::Transfer(format!(
-                    "log_based: replication stream silent for {}s — the source's \
-                     keepalives stopped (half-open connection?); aborting at the \
-                     last committed watermark",
-                    silence_budget().as_secs()
-                ))
-            })??;
+        // The scanner owns the read half and bounds its own refills with the
+        // silence budget — one timer per ~1 MiB refill, not per event (L1b).
+        // The server keepalives every ~wal_sender_timeout/2 (30 s by default)
+        // normally wake the refill; when they stop, the connection is dead
+        // (half-open socket, NAT rebind) and the scanner errors at the last
+        // committed watermark (system review 2026-10-07, G0.5).
+        let ev = ws.next_event().await?;
         match ev {
             None => break,
             Some(WalEvent::Keepalive { wal_end, reply_requested }) => {
