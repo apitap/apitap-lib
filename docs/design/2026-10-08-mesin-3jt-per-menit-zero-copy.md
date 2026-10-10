@@ -1051,3 +1051,31 @@ turun ~9 % (0,70 → 0,64) — penghematan syscall/alokasi nyata, sebagian
 tertutup dinding lain di shape 1 KB. Di-keep sebagai fondasi P1/P2 (preseden
 L1a: netral, tanpa klaim menang). MEMPEAK +9 MB (window di-pin) — masih jauh
 di bawah 256 MB. Suite 433/0. Budget pump 32 MiB hilang dari model memori.
+
+### 14.17 P4 body RowBinary diukur — +15% laju, −14% CPU (2026-10-10)
+
+`d1b2a4f` + `b5af4e5`: aliran pgoutput biner mempertahankan sel send-format
+(tanpa rebuild teks per baris di decode), apply CH meresolve (RbType, nullable)
+dari DESCRIBE tabel FISIK + aturan konversi per-OID pgoutput (jsonb strip
+version; bytea/array/tak dikenal → fallback TSV seluruh tabel), body baris +
+tombstone dirender lewat `transcode_field` ke `FORMAT RowBinary`. Semua jalur
+KEY mengkonversi key biner→teks lebih dulu (key table clear-phase, predicate
+residue, tombstone fallback); stream biner dengan kolom unmapped merender
+kembali ke teks (bentuk pra-P4) alih-alih menulis byte biner ke parser TSV.
+
+A/B interleaved (heavy30 PREBUILD, 6 jt changes/arm, `APITAP_PG_BINARY=1`,
+0,5 CPU/256 MB, pg→CH ch3, wheel `.so` `2a869dcc` vs 0.60 `62facb07`):
+
+| arm | rate | cap_frac | MEMPEAK |
+|---|---|---|---|
+| 0.60 (oldb1/oldb2) | 25.5 / 26.6k/s | 0.751 / 0.708 | 109 / 88 MB |
+| P4 (p4b1/p4b2) | **30.2 / 29.8k/s** | **0.639 / 0.634** | 119 / 113 MB |
+
+Verdict: **+15,1 % laju, −14 % cap_frac**, kedua arm P4 di atas kedua arm lama
+(tanpa overlap noise), 30/30 checksum MATCH di keempat arm. MEMPEAK +25 MB
+(window mem-pin frame sedikit lebih lama + buffer body) — masih jauh di bawah
+256 MB. Koreksi kumulatif dari baseline awal: 24,6 → 30,0k/s (+22 % bersama
+L1b). Temuan tengah jalan: key biner bocor ke body TSV (tertangkap oleh CH
+"expected '\n'" di arm pertama — bukti validasi hidup). Default
+`APITAP_PG_BINARY` tetap opt-in sampai gate penuh berikutnya memvalidasi mode
+biner di semua lane (jalur non-CH memakai rebuild teks, aman; lihat §4.4).
