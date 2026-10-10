@@ -1099,3 +1099,25 @@ string (~1.4 KB string dari ~1.5 KB row). Bukan win terbukti → **direvert**
 terukur ~25.6k/s @0,5 core (cap_frac 0.94, CPU-saturasi) — lane my kini
 CPU-bound, bukan body-bound; lever berikutnya untuk lane ini adalah pekerjaan
 per-change CPU (arena decoder mybinlog, key u64), bukan format body.
+
+### 14.19 Baseline apple-to-apple vs 0.58 + dinding baru: utilisasi (2026-10-10)
+
+0.61.0 rilis (wheel `.so` f6be51b1) diukur di KEDUA shape, 30 tabel × 1 jt
+row, catch-up PREBUILD, 0,5 CPU/256 MB, pg→CH ch3, default binary:
+
+| shape | 0.58 | 0.61.0 | delta |
+|---|---|---|---|
+| 460 B row (shape 0.58) | 31.7k/s @ cap 0.949 | **39.7k/s @ cap 0.702** | **+25 %** |
+| ~1 KB row (shape campaign) | — | 31.7k/s @ cap 0.657 | — |
+
+- Per-byte: 1 KB shape = ~41 MB/s (vs 0.58 ~14.6 MB/s) — 2.8×.
+- Bootstrap 460 B: 30 jt row dalam 84.7 s (354k row/s), MEMPEAK 142 MB.
+- my→CH catch-up 25.6k/s (0.58: 2.88k/s pre-G1.2).
+- 30/30 checksum MATCH di semua arm.
+
+**Temuan kunci: dinding pg→CH kini SERIALISASI, bukan CPU** — cap_frac hanya
+0.66–0.70 (30 %+ kuota menganggur) padahal 0.58 mentok di 0.949. Lever
+berikutnya: naikkan utilisasi (overlap drain-apply, jumlah lane, ukuran
+window) — pada efisiensi sekarang, utilisasi 0.95 setara ~50–57k/s di 0,5
+core. Ini juga jawaban untuk hukum skala: dengan cap 0.70 di 0,5 core, 1 core
+seharusnya memberi ~55–60k/s bila dindingnya benar-benar CPU.
