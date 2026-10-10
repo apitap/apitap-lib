@@ -1028,3 +1028,26 @@ insiden disk — beres dengan restart container CH/tls; pelajaran: truncate log
 container hanya lewat restart sesudahnya atau pakai rotasi), `sigterm_my`
 (flake) dan `bq_multi_drain` (kontensi dengan debug paralel).
 **Nol regresi dari coalescer/insert-only/follow/G1.2/G1.3/slots-auto.**
+
+### 14.16 L1b FrameScanner terpasang + diukur (2026-10-10)
+
+`dad499a`: separuh baca CopyBoth menjadi `FrameScanner` sinkron — satu window
+1 MiB milik pembaca, satu `read_buf` per refill, frame = irisan `split_to`
+window (tanpa alokasi per frame, tanpa task pump, tanpa channel; budget sunyi
+pindah dari per-event ke per-refill). Torture baru: carry antar refill,
+panjang hostile ditolak cap 1 GB sebelum menunggu payload, window tumbuh untuk
+frame >1 MiB, timeout half-open mempertahankan pesan "silent for … half-open".
+
+A/B interleaved (heavy30 PREBUILD, 6 jt changes/arm, 30 tabel × row ~1 KB,
+0,5 CPU/256 MB, pg→CH ch3):
+
+| arm | wall | rate | cap_frac | MEMPEAK |
+|---|---|---|---|---|
+| 0.60 (old1/old2) | 228.9 / 222.3 s | 26.2 / 27.0k/s | 0.694 / 0.708 | 105 MB |
+| L1b (l1b1/l1b2) | 223.8 / 211.9 s | 26.8 / 28.3k/s | 0.642 / 0.640 | 114 / 115 MB |
+
+Verdict: laju +3,7 % (tepi noise band ±5 %) tetapi cap_frac reproducible
+turun ~9 % (0,70 → 0,64) — penghematan syscall/alokasi nyata, sebagian
+tertutup dinding lain di shape 1 KB. Di-keep sebagai fondasi P1/P2 (preseden
+L1a: netral, tanpa klaim menang). MEMPEAK +9 MB (window di-pin) — masih jauh
+di bawah 256 MB. Suite 433/0. Budget pump 32 MiB hilang dari model memori.
