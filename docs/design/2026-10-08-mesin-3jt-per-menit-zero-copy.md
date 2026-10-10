@@ -1079,3 +1079,23 @@ L1b). Temuan tengah jalan: key biner bocor ke body TSV (tertangkap oleh CH
 "expected '\n'" di arm pertama — bukti validasi hidup). Default
 `APITAP_PG_BINARY` tetap opt-in sampai gate penuh berikutnya memvalidasi mode
 biner di semua lane (jalur non-CH memakai rebuild teks, aman; lihat §4.4).
+
+### 14.18 P4-kembar MySQL (MyText) diukur — netral, direvert (2026-10-10)
+
+`e444393`: body RowBinary untuk lane MySQL (sel teks binlog di-parse per tipe
+CH lewat `emit_text_field`; plan `RbBody` di DrainOutcome). A/B interleaved
+(heavy30 my PREBUILD, 6 jt changes/arm, `.so` 3db444b5 vs 2a869dcc):
+
+| arm | rate | cap_frac | MEMPEAK |
+|---|---|---|---|
+| lama (oldmy1/oldmy2) | 25.8 / 25.4k/s | 0.943 / 0.943 | 140 / 132 MB |
+| baru (newmy1/newmy2) | 25.9 / 28.5k/s | 0.957 / 0.955 | 146 / 147 MB |
+
+Verdict: mean +6 % TAPI band noise lane ini lebar (newmy2 outlier; newmin
+25.9 hampir menyentuh oldmax 25.8) dan cap_frac baru LEBIH TINGGI — parse
+teks menambah CPU kita sementara win volume kecil pada shape yang didominasi
+string (~1.4 KB string dari ~1.5 KB row). Bukan win terbukti → **direvert**
+(`d55ff64`; preseden B2 lever 3). Catatan penting: catch-up ceiling lane my
+terukur ~25.6k/s @0,5 core (cap_frac 0.94, CPU-saturasi) — lane my kini
+CPU-bound, bukan body-bound; lever berikutnya untuk lane ini adalah pekerjaan
+per-change CPU (arena decoder mybinlog, key u64), bukan format body.
