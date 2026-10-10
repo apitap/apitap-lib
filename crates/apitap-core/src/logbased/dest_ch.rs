@@ -23,8 +23,8 @@ use crate::logbased::changelog::Changes;
 use crate::logbased::collapse::{Collapsed, ResidueOp};
 use crate::logbased::replay::{Ask, MarkerRow, Memo, ReplayPlan, WindowId};
 use crate::logbased::rowtext::{
-    ch_key_literal, render_ch_key, render_ch_row, render_ch_row_cells,
-    render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
+    ch_key_literal, render_ch_key, render_ch_key_rb, render_ch_row, render_ch_row_cells,
+    render_ch_row_rb, render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
 };
 use crate::logbased::window::TableWindow;
 use crate::sink::clickhouse::{ch_ident, ch_str};
@@ -262,8 +262,9 @@ impl ChDest {
         w: Option<&TableWindow<Collapsed>>,
         id: &WindowId,
         source_id: &str,
+        binary: bool,
     ) -> Result<(u64, Watermark)> {
-        apply_unit(u, dest_table, w, id, source_id).await
+        apply_unit(u, dest_table, w, id, source_id, binary).await
     }
 }
 
@@ -580,6 +581,7 @@ async fn apply_unit(
     w: Option<&TableWindow<Collapsed>>,
     id: &WindowId,
     source_id: &str,
+    binary: bool,
 ) -> Result<(u64, Watermark)> {
     let set = |rows: u64| Watermark::Set {
         table: dest_table.to_string(),
@@ -605,6 +607,22 @@ async fn apply_unit(
     let ft = ch_ident(dest_table);
     let pk_oids = l.key_oids();
     let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
+
+    // P4: a binary stream's cells are pgoutput send-format bytes. When every
+    // column of the PHYSICAL destination table maps to a RowBinary type, the
+    // bodies go out as RowBinary — no text render, no escaping, and the
+    // wire carries typed values instead of their text spellings. Any unmapped
+    // column (or a text stream) keeps the whole table on the TSV path.
+    let rb_types: Option<Vec<(crate::wire::rowbinary::RbType, bool)>> = if binary {
+        rb_types_for(wal_cols, &u.column_types(dest_table).await?, oids)
+    } else {
+        None
+    };
+    let pk_rb_types: Option<Vec<(crate::wire::rowbinary::RbType, bool)>> = if rb_types.is_some() {
+        rb_types_for(pk_cols, &u.column_types(dest_table).await?, &pk_oids)
+    } else {
+        None
+    };
 
     if c.truncate {
         u.clear_owned(dest_table).await?;
@@ -651,27 +669,60 @@ async fn apply_unit(
         let ver = id.end();
         if !c.upserts.is_empty() {
             let mut buf = Vec::with_capacity(4 << 20);
-            for row in &c.upserts {
-                render_ch_row(row, oids, &mut buf)?;
-                insert_only_suffix(&mut buf, ver, false);
+            match &rb_types {
+                Some(rt) => {
+                    for row in &c.upserts {
+                        render_ch_row_rb(row, rt, &mut buf)?;
+                        insert_only_suffix_rb(&mut buf, ver, false);
+                    }
+                    u.insert_owned_rb(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                }
+                None => {
+                    for row in &c.upserts {
+                        render_ch_row(row, oids, &mut buf)?;
+                        insert_only_suffix(&mut buf, ver, false);
+                    }
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                }
             }
-            u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
         }
         if !c.deletes.is_empty() {
             let mut buf = Vec::with_capacity(1 << 20);
-            for key in c.deletes.iter() {
-                let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-                render_ch_key(&refs, &pk_oids, &mut buf)?;
-                insert_only_suffix(&mut buf, ver, true);
+            match &pk_rb_types {
+                Some(prt) => {
+                    for key in c.deletes.iter() {
+                        let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+                        render_ch_key_rb(&refs, prt, &mut buf)?;
+                        insert_only_suffix_rb(&mut buf, ver, true);
+                    }
+                    u.insert_owned_rb(dest_table, &insert_only_cols(pk_cols), buf).await?;
+                }
+                None => {
+                    for key in c.deletes.iter() {
+                        let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+                        render_ch_key(&refs, &pk_oids, &mut buf)?;
+                        insert_only_suffix(&mut buf, ver, true);
+                    }
+                    u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf).await?;
+                }
             }
-            u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf).await?;
         }
     } else if !c.upserts.is_empty() {
         let mut buf = Vec::with_capacity(4 << 20);
-        for row in &c.upserts {
-            render_ch_row(row, oids, &mut buf)?;
+        match &rb_types {
+            Some(rt) => {
+                for row in &c.upserts {
+                    render_ch_row_rb(row, rt, &mut buf)?;
+                }
+                u.insert_owned_rb(dest_table, wal_cols, buf).await?;
+            }
+            None => {
+                for row in &c.upserts {
+                    render_ch_row(row, oids, &mut buf)?;
+                }
+                u.insert_owned(dest_table, wal_cols, buf).await?;
+            }
         }
-        u.insert_owned(dest_table, wal_cols, buf).await?;
     }
     t_ins = t0.elapsed();
 
@@ -832,6 +883,33 @@ fn insert_only_suffix(buf: &mut Vec<u8>, ver: u64, deleted: bool) {
         buf.pop();
     }
     buf.extend_from_slice(format!("\t{ver}\t{}\n", u8::from(deleted)).as_bytes());
+}
+
+/// The tombstone suffix in RowBinary: `_apitap_ver` UInt64 little-endian,
+/// then `_apitap_deleted` UInt8 — the physical types the DDL gives them.
+fn insert_only_suffix_rb(buf: &mut Vec<u8>, ver: u64, deleted: bool) {
+    buf.extend_from_slice(&ver.to_le_bytes());
+    buf.push(u8::from(deleted));
+}
+
+/// (RbType, nullable) per column from the destination table's DESCRIBE map;
+/// `None` (→ the whole table stays TSV) when any column's type is outside
+/// `rb_type_from_ch`'s covered set.
+fn rb_types_for(
+    cols: &[String],
+    types: &std::collections::HashMap<String, String>,
+    oids: &[u32],
+) -> Option<Vec<(crate::wire::rowbinary::RbType, bool)>> {
+    cols.iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let (ch, nullable) = types
+                .get(c)
+                .and_then(|t| crate::wire::rowbinary::rb_type_from_ch(t))?;
+            let ty = crate::wire::rowbinary::rb_type_for_cdc(*oids.get(i)?, ch)?;
+            Some((ty, nullable))
+        })
+        .collect()
 }
 
 /// The ALTER that gives a Replacing-family destination its tombstone
@@ -1023,6 +1101,17 @@ mod store {
         let cl = cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
         format!(
             "INSERT INTO {t} ({cl}) SELECT {cl} FROM input('{s}') WHERE {pred} FORMAT TabSeparated",
+            t = ch_ident(table),
+            s = ch_str(structure),
+        )
+    }
+
+    /// The P4 twin of `insert_owned_sql`: same `input()` structure, same
+    /// ownership predicate, RowBinary body.
+    pub(super) fn insert_owned_rb_sql(table: &str, cols: &[String], structure: &str, pred: &str) -> String {
+        let cl = cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+        format!(
+            "INSERT INTO {t} ({cl}) SELECT {cl} FROM input('{s}') WHERE {pred} FORMAT RowBinary",
             t = ch_ident(table),
             s = ch_str(structure),
         )
@@ -1565,6 +1654,28 @@ mod store {
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
             self.owed = true;
             self.s.ch.insert_stream_with(&sql, reqwest::Body::from(body), &st).await
+        }
+
+        /// The RowBinary twin of `insert_owned` (P4): `body` is RowBinary
+        /// bytes per the same `input()` structure.
+        pub(crate) async fn insert_owned_rb(&mut self, table: &str, cols: &[String], body: Vec<u8>) -> Result<()> {
+            self.s.note("insert");
+            self.keep(false).await?;
+            let s = structure(cols, &self.s.types(table).await?)?;
+            let sql = insert_owned_rb_sql(table, cols, &s, &self.pred());
+            let st = owned_settings();
+            let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            self.owed = true;
+            self.s.ch.insert_stream_with(&sql, reqwest::Body::from(body), &st).await
+        }
+
+        /// The destination table's column → ClickHouse type map (DESCRIBE,
+        /// cached per run).
+        pub(crate) async fn column_types(
+            &self,
+            table: &str,
+        ) -> Result<std::collections::HashMap<String, String>> {
+            self.s.types(table).await
         }
 
         fn delete_mode(&self, table: &str) -> &'static str {

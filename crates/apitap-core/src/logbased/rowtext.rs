@@ -170,6 +170,68 @@ pub(crate) fn render_ch_row(row: &Tuple, oids: &[u32], out: &mut Vec<u8>) -> Res
     Ok(())
 }
 
+/// One full row for a ClickHouse `FORMAT RowBinary` body (P4): the cells are
+/// pgoutput send-format bytes and go straight through `transcode_field` — no
+/// text render, no escaping, no per-cell allocation. `types` is the PHYSICAL
+/// destination table's (RbType, nullable) per column, resolved once per table
+/// by the apply unit.
+pub(crate) fn render_ch_row_rb(
+    row: &Tuple,
+    types: &[(crate::wire::rowbinary::RbType, bool)],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if row.len() != types.len() {
+        return Err(Error::Transfer(format!(
+            "log_based: row has {} columns but the destination table declared {}",
+            row.len(),
+            types.len()
+        )));
+    }
+    for (i, cell) in row.views().enumerate() {
+        let (ty, nullable) = types[i];
+        match cell {
+            Cellv::Null => {
+                if !nullable {
+                    return Err(Error::Transfer(
+                        "NULL in a column ClickHouse declared non-nullable".into(),
+                    ));
+                }
+                out.push(1); // Nullable(T): null flag, no value
+            }
+            Cellv::Text(t) => {
+                if nullable {
+                    out.push(0);
+                }
+                crate::wire::rowbinary::transcode_field(ty, t, out)?;
+            }
+            Cellv::UnchangedToast => {
+                return Err(Error::Transfer(
+                    "log_based: unchanged-TOAST cell reached the bulk path — \
+                     collapse bug"
+                        .into(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Key cells for a `FORMAT RowBinary` body (the insert-only tombstone row).
+pub(crate) fn render_ch_key_rb(
+    key: &[&[u8]],
+    types: &[(crate::wire::rowbinary::RbType, bool)],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    for (i, k) in key.iter().enumerate() {
+        let (ty, nullable) = types[i];
+        if nullable {
+            out.push(0);
+        }
+        crate::wire::rowbinary::transcode_field(ty, k, out)?;
+    }
+    Ok(())
+}
+
 /// Residue-tail variants over OWNED cells (`ResidueOp` materializes rows out
 /// of the frame-native fast path; rare by design).
 pub(crate) fn render_ch_row_cells(row: &[Cell], oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
@@ -446,5 +508,42 @@ mod tests {
         let back = tsv_unescape(std::str::from_utf8(&esc).unwrap()).unwrap();
         assert_eq!(back, b"a\tb\nc\\d");
         assert_eq!(tsv_unescape("\\N"), None);
+    }
+
+    /// The P4 row renderer, byte-exact: nullable flags, BE→LE swap, varint
+    /// string lengths — and a NULL into a non-nullable column refuses.
+    #[test]
+    fn rowbinary_row_bytes_are_the_bulk_encoding() {
+        use crate::wire::pgoutput::CellR;
+        use crate::wire::rowbinary::RbType;
+        let frame = bytes::Bytes::from_static(&[0x00, 0x00, 0x00, 0x2A, b'h', b'i']);
+        let row = Tuple {
+            frame,
+            cells: vec![CellR::Text(0, 4), CellR::Null, CellR::Text(4, 2)],
+        };
+        let types = [
+            (RbType::Swap(4), true),
+            (RbType::String, true),
+            (RbType::String, false),
+        ];
+        let mut out = Vec::new();
+        render_ch_row_rb(&row, &types, &mut out).unwrap();
+        assert_eq!(out, vec![0, 42, 0, 0, 0, 1, 2, b'h', b'i']);
+
+        // A NULL into a non-nullable column is refused by name (the NULL
+        // cell is column 1, so THAT column carries the non-nullable type).
+        let types_nn = [
+            (RbType::Swap(4), true),
+            (RbType::String, false),
+            (RbType::String, false),
+        ];
+        let mut out2 = Vec::new();
+        assert!(render_ch_row_rb(&row, &types_nn, &mut out2).is_err());
+
+        // Keys ride the same encoding without null flags.
+        let key: [&[u8]; 1] = [&[0x00, 0x00, 0x00, 0x2A]];
+        let mut kout = Vec::new();
+        render_ch_key_rb(&key, &[(RbType::Swap(4), false)], &mut kout).unwrap();
+        assert_eq!(kout, vec![42, 0, 0, 0]);
     }
 }

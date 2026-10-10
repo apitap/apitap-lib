@@ -75,6 +75,86 @@ pub(crate) fn rb_type(udt: &str, precision: Option<i32>, scale: Option<i32>) -> 
     })
 }
 
+/// ClickHouse column type (as `DESCRIBE TABLE` spells it) → (RbType, nullable).
+/// The CDC RowBinary body resolves the PHYSICAL destination table's types once
+/// per table (dest_ch), so the body always matches what the bootstrap created:
+/// a pgoutput Relation message carries no nullability, and only the table
+/// knows it. Anything unrecognised returns `None` and the whole table falls
+/// back to the TSV path — correctness first.
+pub(crate) fn rb_type_from_ch(ch: &str) -> Option<(RbType, bool)> {
+    let (inner, nullable) = match ch.strip_prefix("Nullable(").and_then(|s| s.strip_suffix(')')) {
+        Some(i) => (i, true),
+        None => (ch, false),
+    };
+    let ty = match inner {
+        // One-byte passthrough: pg bool lands as UInt8 (the bulk lane's
+        // shape); Bool and Int8 share the encoding.
+        "Bool" | "UInt8" | "Int8" => RbType::Bool,
+        "Int16" | "UInt16" => RbType::Swap(2),
+        "Int32" | "UInt32" => RbType::Swap(4),
+        "Int64" | "UInt64" => RbType::Swap(8),
+        "Float32" => RbType::Swap(4),
+        "Float64" => RbType::Swap(8),
+        "Date32" => RbType::Date32,
+        // ONLY microsecond DateTime64: the wire transcodes int64 micros, and
+        // a bare DateTime / another precision would silently mis-scale.
+        s if s.starts_with("DateTime64(6") => RbType::Ts64,
+        "String" => RbType::String,
+        "UUID" => RbType::Uuid,
+        "JSON" => RbType::JsonB,
+        s if s.starts_with("Decimal(") => {
+            let (p, sc) = parse_ch_decimal(s)?;
+            RbType::Decimal {
+                width: if p <= 9 {
+                    4
+                } else if p <= 18 {
+                    8
+                } else {
+                    16
+                },
+                scale: sc,
+            }
+        }
+        _ => return None,
+    };
+    Some((ty, nullable))
+}
+
+/// The conversion rule for one CDC column: the PHYSICAL ClickHouse type gives
+/// the encoding width and nullability (rb_type_from_ch), the pgoutput column
+/// OID gives the CONVERSION — jsonb's version header must be stripped, bytea's
+/// binary form (raw bytes) does not match its `\x…` text shape in ClickHouse,
+/// and so on. `None` → the whole table stays on the TSV path.
+pub(crate) fn rb_type_for_cdc(oid: u32, ch: RbType) -> Option<RbType> {
+    Some(match oid {
+        16 => match ch { RbType::Bool => ch, _ => return None },                  // bool
+        20 => match ch { RbType::Swap(8) => ch, _ => return None },               // int8
+        21 => match ch { RbType::Swap(2) => ch, _ => return None },               // int2
+        23 => match ch { RbType::Swap(4) => ch, _ => return None },               // int4
+        700 => match ch { RbType::Swap(4) => ch, _ => return None },              // float4
+        701 => match ch { RbType::Swap(8) => ch, _ => return None },              // float8
+        1082 => match ch { RbType::Date32 => ch, _ => return None },              // date
+        1114 | 1184 => match ch { RbType::Ts64 => ch, _ => return None },         // ts/tstz
+        1700 => match ch {                                                        // numeric
+            RbType::Decimal { .. } | RbType::NumericF64 => ch,
+            _ => return None,
+        },
+        2950 => match ch { RbType::Uuid => ch, _ => return None },                // uuid
+        25 | 1043 | 1042 | 19 | 114 => match ch {                                 // text-ish
+            RbType::String => ch,
+            _ => return None,
+        },
+        3802 => match ch { RbType::String => RbType::JsonB, _ => return None },   // jsonb: strip version
+        _ => return None, // bytea, arrays, oid/time/char, unknown — TSV fallback
+    })
+}
+
+fn parse_ch_decimal(s: &str) -> Option<(u32, u32)> {
+    let inner = s.strip_prefix("Decimal(")?.strip_suffix(')')?;
+    let (p, sc) = inner.split_once(',')?;
+    Some((p.trim().parse().ok()?, sc.trim().parse().ok()?))
+}
+
 /// Streaming transcoder. Feed it Postgres binary-COPY bytes in arbitrary chunk sizes;
 /// it emits RowBinary bytes for every COMPLETE tuple and buffers partial tuples across
 /// chunk boundaries (sqlx yields one chunk per CopyData message, but never trust
@@ -273,7 +353,7 @@ pub(crate) fn varint(mut v: u64, out: &mut Vec<u8>) {
     }
 }
 
-fn transcode_field(ty: RbType, f: &[u8], out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn transcode_field(ty: RbType, f: &[u8], out: &mut Vec<u8>) -> Result<()> {
     match ty {
         // Fixed-width bswap forms (not iter().rev(): a runtime-length reversed iterator
         // compiles to a per-byte loop; this is the single most-executed match arm).
@@ -558,5 +638,49 @@ mod tests {
         let d = 100_000i32; // ~2293-10-27, inside ClickHouse Date32's range.
         transcode_field(RbType::Date32, &d.to_be_bytes(), &mut out).unwrap();
         assert_eq!(out, (d + PG_EPOCH_DAYS).to_le_bytes());
+    }
+
+    /// The P4 destination-side mapping: ClickHouse DESCRIBE spellings to the
+    /// (RbType, nullable) the RowBinary body renderer uses. Anything outside
+    /// the covered set MUST return None — that is the whole-table TSV
+    /// fallback, not a guess.
+    #[test]
+    fn ch_column_types_map_to_rowbinary() {
+        assert_eq!(rb_type_from_ch("Nullable(String)"), Some((RbType::String, true)));
+        assert_eq!(rb_type_from_ch("Int32"), Some((RbType::Swap(4), false)));
+        assert_eq!(rb_type_from_ch("Nullable(Int16)"), Some((RbType::Swap(2), true)));
+        assert_eq!(rb_type_from_ch("Nullable(Int64)"), Some((RbType::Swap(8), true)));
+        assert_eq!(rb_type_from_ch("Nullable(Float64)"), Some((RbType::Swap(8), true)));
+        assert_eq!(rb_type_from_ch("Nullable(UInt8)"), Some((RbType::Bool, true)));
+        assert_eq!(rb_type_from_ch("Nullable(Date32)"), Some((RbType::Date32, true)));
+        assert_eq!(rb_type_from_ch("Nullable(DateTime64(6))"), Some((RbType::Ts64, true)));
+        assert_eq!(rb_type_from_ch("DateTime64(6, 'UTC')"), Some((RbType::Ts64, false)));
+        assert_eq!(
+            rb_type_from_ch("Nullable(Decimal(18, 4))"),
+            Some((RbType::Decimal { width: 8, scale: 4 }, true))
+        );
+        assert_eq!(rb_type_from_ch("Nullable(UUID)"), Some((RbType::Uuid, true)));
+        // Outside the covered set: TSV fallback, never a mis-scaled write.
+        assert_eq!(rb_type_from_ch("DateTime"), None);
+        assert_eq!(rb_type_from_ch("DateTime64(3)"), None);
+        assert_eq!(rb_type_from_ch("Array(Int32)"), None);
+        assert_eq!(rb_type_from_ch("Nullable(FixedString(4))"), None);
+    }
+
+    /// The CDC conversion rule: the PG OID refines the CH encoding — jsonb
+    /// strips its version header, bytea (raw binary vs the `\x…` text the
+    /// column holds) and any unknown OID fall back to TSV.
+    #[test]
+    fn cdc_oid_rules_refine_the_ch_type() {
+        assert_eq!(rb_type_for_cdc(3802, RbType::String), Some(RbType::JsonB));
+        assert_eq!(rb_type_for_cdc(25, RbType::String), Some(RbType::String));
+        assert_eq!(rb_type_for_cdc(1043, RbType::String), Some(RbType::String));
+        assert_eq!(rb_type_for_cdc(114, RbType::String), Some(RbType::String));
+        assert_eq!(rb_type_for_cdc(23, RbType::Swap(4)), Some(RbType::Swap(4)));
+        assert_eq!(rb_type_for_cdc(23, RbType::Swap(8)), None); // width mismatch
+        assert_eq!(rb_type_for_cdc(1700, RbType::Decimal { width: 8, scale: 4 }), Some(RbType::Decimal { width: 8, scale: 4 }));
+        assert_eq!(rb_type_for_cdc(17, RbType::String), None); // bytea
+        assert_eq!(rb_type_for_cdc(1009, RbType::String), None); // text[]
+        assert_eq!(rb_type_for_cdc(1083, RbType::String), None); // time
     }
 }

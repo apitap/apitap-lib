@@ -164,6 +164,7 @@ pub(crate) async fn drain(
     applied: &tokio::sync::watch::Receiver<u64>,
     changelog: bool,
     follow: Option<(&sqlx::PgPool, usize, std::time::Instant)>,
+    keep_binary: bool,
 ) -> Result<DrainOutcome> {
     let mut stop_line = stop_line;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
@@ -299,7 +300,7 @@ pub(crate) async fn drain(
             }
             Some(WalEvent::XLogData { payload, .. }) => {
                 let (msg, change_xid) =
-                    pgoutput::decode(&payload, in_stream.is_some(), &sess.rel_oids)?;
+                    pgoutput::decode(&payload, in_stream.is_some(), &sess.rel_oids, keep_binary)?;
                 // Inside a stream block every change names its own
                 // (sub)transaction; outside one there is nothing to name.
                 let sub = change_xid.or(in_stream);
@@ -523,6 +524,7 @@ pub(crate) async fn drain(
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
         id: WindowId::new(start_lsn, end_lsn),
         hit_budget,
+        binary: keep_binary,
     };
     if dbg_stream {
         eprintln!(

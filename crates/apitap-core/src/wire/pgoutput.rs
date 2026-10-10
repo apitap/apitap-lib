@@ -283,7 +283,7 @@ impl<'a> Reader<'a> {
         self.pos += nul + 1;
         Ok(s)
     }
-    fn tuple(&mut self, oids: Option<&[u32]>) -> Result<Tuple> {
+    fn tuple(&mut self, oids: Option<&[u32]>, keep_binary: bool) -> Result<Tuple> {
         let n = self.u16()? as usize;
         let mut cells = Vec::with_capacity(n);
         // Indices of `'b'` cells (their CellR ranges point at BINARY bytes
@@ -320,7 +320,13 @@ impl<'a> Reader<'a> {
                 }
             });
         }
-        if bin_idx.is_empty() {
+        if bin_idx.is_empty() || keep_binary {
+            // `keep_binary` (a RowBinary destination body) wants the
+            // send-format bytes UNTOUCHED: the destination renderer
+            // transcodes them straight to ClickHouse RowBinary, so the
+            // text rebuild below — one allocation and one text render per
+            // row — is skipped entirely. Text streams take the same exit
+            // (nothing to rebuild).
             return Ok(Tuple { frame: self.src.clone(), cells });
         }
         // Binary tuple: rebuild an OWNED frame with every `'b'` cell rendered
@@ -382,6 +388,7 @@ pub(crate) fn decode(
     payload: &bytes::Bytes,
     in_stream: bool,
     rel_oids: &RelOids,
+    keep_binary: bool,
 ) -> Result<(PgoMessage, Option<u32>)> {
     let mut r = Reader::new(payload);
     let tag = r.u8()?;
@@ -471,7 +478,7 @@ pub(crate) fn decode(
                     )))
                 }
             }
-            PgoMessage::Insert { rel_id, new: r.tuple(oids)? }
+            PgoMessage::Insert { rel_id, new: r.tuple(oids, keep_binary)? }
         }
         b'U' => {
             let rel_id = r.u32()?;
@@ -479,7 +486,7 @@ pub(crate) fn decode(
             let mut old = None;
             let mut kind = r.u8()?;
             if kind == b'K' || kind == b'O' {
-                old = Some(OldImage { full: kind == b'O', tuple: r.tuple(oids)? });
+                old = Some(OldImage { full: kind == b'O', tuple: r.tuple(oids, keep_binary)? });
                 kind = r.u8()?;
             }
             if kind != b'N' {
@@ -488,7 +495,7 @@ pub(crate) fn decode(
                     kind as char
                 )));
             }
-            PgoMessage::Update { rel_id, old, new: r.tuple(oids)? }
+            PgoMessage::Update { rel_id, old, new: r.tuple(oids, keep_binary)? }
         }
         b'D' => {
             let rel_id = r.u32()?;
@@ -502,7 +509,7 @@ pub(crate) fn decode(
             }
             PgoMessage::Delete {
                 rel_id,
-                old: OldImage { full: kind == b'O', tuple: r.tuple(oids)? },
+                old: OldImage { full: kind == b'O', tuple: r.tuple(oids, keep_binary)? },
             }
         }
         b'T' => {
@@ -560,7 +567,7 @@ mod tests {
         in_stream: bool,
         oids: &RelOids,
     ) -> Result<PgoMessage> {
-        decode(payload, in_stream, oids).map(|(m, _)| m)
+        decode(payload, in_stream, oids, false).map(|(m, _)| m)
     }
 
     fn frame(parts: &[&[u8]]) -> bytes::Bytes {

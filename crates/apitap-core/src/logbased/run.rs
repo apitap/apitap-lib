@@ -390,7 +390,7 @@ impl Dest {
             }
             (_, _, Slice::Changelog(_)) => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             (Dest::Pg(d), Unit::Pg(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
-            (Dest::Ch(d), Unit::Ch(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
+            (Dest::Ch(d), Unit::Ch(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id, o.binary).await,
             (Dest::My(d), Unit::My(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
             (Dest::Ice(d), Unit::Ice(u), Slice::Replica(w)) => {
                 let src = src.ok_or_else(|| {
@@ -1623,6 +1623,11 @@ async fn drain_group(
     let budget = (tenure.dest().cdc_window_bytes() / budget_denom.max(1)).max(1 << 20);
     let mut ws = Walsender::connect(src_url).await?;
     ws.start_replication(slot, wm, publication).await?;
+    // P4: the CH lane renders RowBinary bodies straight from send-format
+    // cells when the session actually negotiated `binary 'true'`. Other
+    // lanes and changelog bodies keep the text path (their renderers and
+    // readers are text-native).
+    let keep_binary = !changelog && matches!(tenure.dest(), Dest::Ch(_)) && ws.stream_binary();
 
     // Overlapped windows (ape-dts's daemon trick, batch-shaped): the drain
     // loop keeps the walsender and decodes window N+1 WHILE a spawned apply
@@ -1639,7 +1644,7 @@ async fn drain_group(
     let apply = AbortOnDrop::spawn(apply_windows(tenure, Some(src.clone()), members, win_rx, applied_tx));
     let follow = follow_secs().map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let drained = run_overlapped(
-        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src),
+        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src, keep_binary),
         apply,
     )
     .await;
@@ -1711,6 +1716,7 @@ async fn drain_loop(
     changelog: bool,
     follow: Option<std::time::Instant>,
     src: &sqlx::PgPool,
+    keep_binary: bool,
 ) -> Result<()> {
     let mut stop_line = stop_line;
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
@@ -1728,7 +1734,7 @@ async fn drain_loop(
         let t_drain = std::time::Instant::now();
         let follow_ctx = follow.map(|d| (src, FOLLOW_FLOOR, d));
         let outcome =
-            drain(ws, &mut sess, cur, stop_line, key_cols, window_max_secs(), budget, &applied_rx, changelog, follow_ctx).await?;
+            drain(ws, &mut sess, cur, stop_line, key_cols, window_max_secs(), budget, &applied_rx, changelog, follow_ctx, keep_binary).await?;
         windows += 1;
         if dbg {
             eprintln!(

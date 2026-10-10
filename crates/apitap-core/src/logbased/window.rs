@@ -280,6 +280,9 @@ pub(crate) struct DrainOutcome {
     /// Apply this window and drain again at once: the drain stopped at the
     /// memory budget, or at a layout change, not at the stop-line.
     pub hit_budget: bool,
+    /// The stream negotiated `binary 'true'` AND this lane renders RowBinary
+    /// bodies: the tuples' cells are send-format bytes, not text.
+    pub binary: bool,
 }
 
 impl DrainOutcome {

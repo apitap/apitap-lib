@@ -219,11 +219,16 @@ fn pgoutput_survives_anything_a_peer_can_send() {
     for seed in pgoutput_corpus() {
         for m in mutations(&seed, &mut rng) {
             for in_stream in [false, true] {
-                // The contract is "Ok or Err" — the value is not the point,
-                // the absence of a panic is.
-                match decode(&bytes::Bytes::from(m.clone()), in_stream, &oids) {
-                    Ok(_) => ok += 1,
-                    Err(_) => err += 1,
+                // P4: both decode exits — the text-rebuild path and the
+                // keep-binary path (RowBinary destination bodies) — face the
+                // same corpus.
+                for keep_binary in [false, true] {
+                    // The contract is "Ok or Err" — the value is not the
+                    // point, the absence of a panic is.
+                    match decode(&bytes::Bytes::from(m.clone()), in_stream, &oids, keep_binary) {
+                        Ok(_) => ok += 1,
+                        Err(_) => err += 1,
+                    }
                 }
             }
         }
@@ -231,9 +236,16 @@ fn pgoutput_survives_anything_a_peer_can_send() {
     for _ in 0..4000 {
         let len = rng.below(64);
         let buf: Vec<u8> = (0..len).map(|_| (rng.next() & 0xFF) as u8).collect();
-        match decode(&bytes::Bytes::from(buf), rng.next() & 1 == 0, &oids) {
-            Ok(_) => ok += 1,
-            Err(_) => err += 1,
+        for keep_binary in [false, true] {
+            match decode(
+                &bytes::Bytes::from(buf.clone()),
+                rng.next() & 1 == 0,
+                &oids,
+                keep_binary,
+            ) {
+                Ok(_) => ok += 1,
+                Err(_) => err += 1,
+            }
         }
     }
     // The harness has to prove its own reach. If everything errored, this

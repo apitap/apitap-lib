@@ -69,6 +69,12 @@ pub(crate) struct Walsender {
     /// The CopyBoth read half's window scanner, `Some` exactly while
     /// `copying`.
     scan: Option<FrameScanner>,
+    /// Whether THIS CopyBoth session actually negotiated `binary 'true'`
+    /// (the v2b START_REPLICATION entered copy mode) — the CDC drain reads
+    /// it to decide whether tuple cells are send-format bytes (RowBinary
+    /// destination bodies) or text. A pre-14 server falls back to text and
+    /// this stays false.
+    stream_binary: bool,
 }
 
 /// The CopyBoth read half, scanned synchronously over one owned window
@@ -910,6 +916,7 @@ impl Walsender {
             co_left: 0,
             co_err: Vec::new(),
             scan: None,
+            stream_binary: false,
         };
         ws.startup(&ci, options, replication).await?;
         Ok(ws)
@@ -1532,6 +1539,9 @@ impl Walsender {
             // A refusal (pre-14 server) falls through to the text attempts —
             // simple_query drains to ReadyForQuery, the session stays usable.
             let _ = self.simple_query(&v2b).await;
+            if self.copying {
+                self.stream_binary = true;
+            }
         }
         if !self.copying {
             let v2 = format!(
@@ -1559,6 +1569,13 @@ impl Walsender {
         // this task decodes — no pump task, no channel (L1b).
         self.scan = Some(FrameScanner::new());
         Ok(())
+    }
+
+    /// Whether the running CopyBoth session negotiated `binary 'true'` — see
+    /// the field docs. Read once per run by the drain to pick destination
+    /// body formats.
+    pub(crate) fn stream_binary(&self) -> bool {
+        self.stream_binary
     }
 
     /// Next CopyBoth event. `None` when the server ended the stream.
@@ -2173,7 +2190,7 @@ mod tests {
                 while commits < 2 {
                     match ws.next_event().await.expect("event") {
                         Some(WalEvent::XLogData { payload, .. }) => {
-                            match pgoutput::decode(&payload, false, &Default::default()).map(|(m, _)| m)
+                            match pgoutput::decode(&payload, false, &Default::default(), false).map(|(m, _)| m)
                                 .expect("decode")
                             {
                                 PgoMessage::Insert { new, .. } => {

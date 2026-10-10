@@ -808,6 +808,9 @@ pub(crate) async fn drain_binlog(
     }
 
     Ok(DrainOutcome {
+        // The MySQL lane is text-native end to end; RowBinary bodies are a
+        // Postgres-source feature (P4).
+        binary: false,
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
         id: WindowId::new(start, end_mark),
         hit_budget,
