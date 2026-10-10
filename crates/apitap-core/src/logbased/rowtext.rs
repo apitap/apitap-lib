@@ -216,6 +216,84 @@ pub(crate) fn render_ch_row_rb(
     Ok(())
 }
 
+/// One full row for a TSV body when the stream is binary but the table has a
+/// column outside the RowBinary set: every send-format cell converts to its
+/// Postgres text form first (the pre-P4 behaviour, kept as the correctness
+/// fallback).
+pub(crate) fn render_ch_row_binary_as_text(
+    row: &Tuple,
+    oids: &[u32],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let mut tmp = Vec::new();
+    for (i, cell) in row.views().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
+        match cell {
+            Cellv::Null => out.extend_from_slice(b"\\N"),
+            Cellv::Text(t) => {
+                tmp.clear();
+                crate::wire::pgbindec::render(oids[i], t, &mut tmp)?;
+                render_ch_value(&tmp, oids[i], out)?;
+            }
+            Cellv::UnchangedToast => {
+                return Err(Error::Transfer(
+                    "log_based: unchanged-TOAST cell reached the bulk path — \
+                     collapse bug"
+                        .into(),
+                ))
+            }
+        }
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+/// One full row for a TSV body when the stream is binary AND the cells are
+/// owned (`ResidueOp` rows): the same conversion as
+/// `render_ch_row_binary_as_text`, over `Cell`s.
+pub(crate) fn render_ch_row_cells_binary(row: &[Cell], oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
+    let mut tmp = Vec::new();
+    for (i, cell) in row.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
+        match cell {
+            Cell::Null => out.extend_from_slice(b"\\N"),
+            Cell::Text(t) => {
+                tmp.clear();
+                crate::wire::pgbindec::render(oids[i], t, &mut tmp)?;
+                render_ch_value(&tmp, oids[i], out)?;
+            }
+            Cell::UnchangedToast => {
+                return Err(Error::Transfer(
+                    "log_based: unchanged-TOAST cell reached the bulk path — \
+                     collapse bug"
+                        .into(),
+                ))
+            }
+        }
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+/// One key row into a TSV body when the stream is binary: the key cells are
+/// send-format bytes, so each converts to its Postgres text form first — the
+/// key table and every predicate are text-native. Allocates per key; the
+/// clear phase of the binary path only.
+pub(crate) fn render_ch_key_binary(key: &[&[u8]], oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
+    let mut conv: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+    for (i, k) in key.iter().enumerate() {
+        let mut t = Vec::new();
+        crate::wire::pgbindec::render(oids[i], k, &mut t)?;
+        conv.push(t);
+    }
+    let refs: Vec<&[u8]> = conv.iter().map(|k| k.as_slice()).collect();
+    render_ch_key(&refs, oids, out)
+}
+
 /// Key cells for a `FORMAT RowBinary` body (the insert-only tombstone row).
 pub(crate) fn render_ch_key_rb(
     key: &[&[u8]],

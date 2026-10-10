@@ -23,7 +23,8 @@ use crate::logbased::changelog::Changes;
 use crate::logbased::collapse::{Collapsed, ResidueOp};
 use crate::logbased::replay::{Ask, MarkerRow, Memo, ReplayPlan, WindowId};
 use crate::logbased::rowtext::{
-    ch_key_literal, render_ch_key, render_ch_key_rb, render_ch_row, render_ch_row_cells,
+    ch_key_literal, render_ch_key, render_ch_key_binary, render_ch_key_rb, render_ch_row,
+    render_ch_row_binary_as_text, render_ch_row_cells, render_ch_row_cells_binary,
     render_ch_row_rb, render_ch_value, row_key_refs, row_key_refs_cells, tsv_unescape,
 };
 use crate::logbased::window::TableWindow;
@@ -357,7 +358,7 @@ async fn read_base(
     let key_list = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
     let mut preds = Vec::with_capacity(keys.len());
     for k in keys {
-        preds.push(format!("({})", key_pred(pk_cols, k, pk_oids)?));
+        preds.push(format!("({})", key_pred(pk_cols, k, pk_oids, false)?));
     }
     let pre = before_window(plan);
     let body = u
@@ -649,10 +650,19 @@ async fn apply_unit(
         let mut buf = Vec::with_capacity(1 << 20);
         for key in c.deletes.iter() {
             let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-            render_ch_key(&refs, &pk_oids, &mut buf)?;
+            if binary {
+                render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
+            } else {
+                render_ch_key(&refs, &pk_oids, &mut buf)?;
+            }
         }
         for row in &c.upserts {
-            render_ch_key(&row_key_refs(row, pk_idx), &pk_oids, &mut buf)?;
+            let refs = row_key_refs(row, pk_idx);
+            if binary {
+                render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
+            } else {
+                render_ch_key(&refs, &pk_oids, &mut buf)?;
+            }
         }
         u.insert_owned(&kt, pk_cols, buf).await?;
         let kq = ch_ident(&kt);
@@ -679,7 +689,11 @@ async fn apply_unit(
                 }
                 None => {
                     for row in &c.upserts {
-                        render_ch_row(row, oids, &mut buf)?;
+                        if binary {
+                            render_ch_row_binary_as_text(row, oids, &mut buf)?;
+                        } else {
+                            render_ch_row(row, oids, &mut buf)?;
+                        }
                         insert_only_suffix(&mut buf, ver, false);
                     }
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
@@ -700,7 +714,11 @@ async fn apply_unit(
                 None => {
                     for key in c.deletes.iter() {
                         let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-                        render_ch_key(&refs, &pk_oids, &mut buf)?;
+                        if binary {
+                            render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
+                        } else {
+                            render_ch_key(&refs, &pk_oids, &mut buf)?;
+                        }
                         insert_only_suffix(&mut buf, ver, true);
                     }
                     u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf).await?;
@@ -718,7 +736,11 @@ async fn apply_unit(
             }
             None => {
                 for row in &c.upserts {
-                    render_ch_row(row, oids, &mut buf)?;
+                    if binary {
+                        render_ch_row_binary_as_text(row, oids, &mut buf)?;
+                    } else {
+                        render_ch_row(row, oids, &mut buf)?;
+                    }
                 }
                 u.insert_owned(dest_table, wal_cols, buf).await?;
             }
@@ -739,7 +761,7 @@ async fn apply_unit(
                     .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
                     .map(|(i, _)| i)
                     .collect();
-                let pred = key_pred(pk_cols, key, &pk_oids)?;
+                let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
                     let body = u.read(&format!("SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated")).await?;
@@ -765,7 +787,7 @@ async fn apply_unit(
                 }
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
-                render_residue_row(&full, oids, &missing, &mut buf)?;
+                render_residue_row(&full, oids, &missing, binary, &mut buf)?;
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
@@ -775,10 +797,14 @@ async fn apply_unit(
             }
             ResidueOp::Upsert { row } => {
                 let key: Vec<Vec<u8>> = row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect();
-                let pred = key_pred(pk_cols, &key, &pk_oids)?;
+                let pred = key_pred(pk_cols, &key, &pk_oids, binary)?;
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
-                render_ch_row_cells(row, oids, &mut buf)?;
+                if binary {
+                    render_ch_row_cells_binary(row, oids, &mut buf)?;
+                } else {
+                    render_ch_row_cells(row, oids, &mut buf)?;
+                }
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
@@ -787,7 +813,7 @@ async fn apply_unit(
                 }
             }
             ResidueOp::Delete { key } => {
-                let pred = key_pred(pk_cols, key, &pk_oids)?;
+                let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
                 u.delete_owned(dest_table, &pred).await?;
             }
             ResidueOp::Rekey { old_key, row, .. } => {
@@ -803,7 +829,7 @@ async fn apply_unit(
                     .filter(|(_, cell)| matches!(cell, Cell::UnchangedToast))
                     .map(|(i, _)| i)
                     .collect();
-                let old_pred = key_pred(pk_cols, old_key, &pk_oids)?;
+                let old_pred = key_pred(pk_cols, old_key, &pk_oids, binary)?;
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
                     let body =
@@ -829,7 +855,7 @@ async fn apply_unit(
                 }
                 u.delete_owned(dest_table, &old_pred).await?;
                 let mut buf = Vec::new();
-                render_residue_row(&full, oids, &missing, &mut buf)?;
+                render_residue_row(&full, oids, &missing, binary, &mut buf)?;
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
@@ -2257,12 +2283,23 @@ fn render_ch_row_trim(
 }
 
 /// `col = lit AND …` for one replica-identity key, typed by OID.
-fn key_pred(pk_cols: &[String], key: &[Vec<u8>], pk_oids: &[u32]) -> Result<String> {
+fn key_pred(pk_cols: &[String], key: &[Vec<u8>], pk_oids: &[u32], binary: bool) -> Result<String> {
     Ok(pk_cols
         .iter()
         .zip(key.iter())
         .zip(pk_oids.iter())
-        .map(|((c, v), &oid)| Ok(format!("{} = {}", ch_ident(c), ch_key_literal(v, oid)?)))
+        .map(|((c, v), &oid)| {
+            // Binary streams store send-format key bytes: convert to the
+            // Postgres text form before the literal (predicates are text).
+            let lit = if binary {
+                let mut t = Vec::new();
+                crate::wire::pgbindec::render(oid, v, &mut t)?;
+                ch_key_literal(&t, oid)?
+            } else {
+                ch_key_literal(v, oid)?
+            };
+            Ok(format!("{} = {}", ch_ident(c), lit))
+        })
         .collect::<Result<Vec<_>>>()?
         .join(" AND "))
 }
@@ -2274,8 +2311,10 @@ fn render_residue_row(
     row: &[Cell],
     oids: &[u32],
     verbatim: &[usize],
+    binary: bool,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let mut tmp = Vec::new();
     for (i, cell) in row.iter().enumerate() {
         if i > 0 {
             out.push(b'\t');
@@ -2284,6 +2323,13 @@ fn render_residue_row(
             Cell::Null => out.extend_from_slice(b"\\N"),
             Cell::Text(t) if verbatim.contains(&i) => {
                 crate::logbased::rowtext::copy_escape(t, out)
+            }
+            // A binary stream's WAL cells are send-format bytes; the readback
+            // cells (verbatim) are already destination-dialect text.
+            Cell::Text(t) if binary => {
+                tmp.clear();
+                crate::wire::pgbindec::render(oids[i], t, &mut tmp)?;
+                render_ch_value(&tmp, oids[i], out)?;
             }
             Cell::Text(t) => render_ch_value(t, oids[i], out)?,
             Cell::UnchangedToast => {
