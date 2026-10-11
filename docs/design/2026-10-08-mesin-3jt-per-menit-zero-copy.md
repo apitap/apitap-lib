@@ -1166,3 +1166,28 @@ Drain kalah tipis saat ronde A (offer 31,3k > 26,5k live), mengejar penuh di
 ronde B (offer < kapasitas) dan konvergen tanpa intervensi. Bandingkan run
 full 0.60-era (23,9k/s busy): **+11 % live**. Sisa jarak ke catch-up (31,7k/s)
 adalah backlog yang menumpuk selama ronde A.
+
+### 14.22 Insert-only di cage fokus + dua bug harness (2026-10-11)
+
+Diagnostik fase drain (instrumentasi `[drain]` baru, APITAP_DEBUG): pada 468
+window, **recv = 149,9 s (92 %)**, decode 5,0 s, flush 6,1 s, seal 1,3 s —
+client memproses ~480k changes/s; dindingnya adalah runtime single-thread
+yang berbagi jatah antara drain dan apply (recv-wait = menunggu di-poll).
+Maka lever 0,5 core = **meringankan apply**: mode insert-only (ReplacingMergeTree
++ tombstone) menghapus key-table + DELETE per window.
+
+Hasil (30 tabel × 1 jt row 1 KB, 256 MB / 0,5 core, PREBUILD 6 jt changes,
+wheel 0.61 + instrumentasi):
+
+| jalur | rate | cap_frac |
+|---|---|---|
+| MergeTree klasik (key table + DELETE) | 33.8k/s | 0.688 |
+| **Replacing + insert-only** | **39.3k/s (+16 %)** | 0.715 |
+
+30/30 checksum MATCH di keduanya (validator FINAL otomatis untuk Replacing).
+
+Dua bug harness yang ditemukan & diperbaiki: (1) `leg.sh` rig VPS masih versi
+lama tanpa pass-through `engine=`/`slots=` — semua arm sebelumnya berjalan
+slots=None dan bootstrap mengabaikan engine= (arm slots4/8 lama VOID); (2)
+versi repo memakai `int(APITAP_SLOTS)` yang crash pada `"auto"` — kini string
+diteruskan apa adanya (API menerima int atau "auto").
