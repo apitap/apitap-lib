@@ -1191,3 +1191,12 @@ lama tanpa pass-through `engine=`/`slots=` — semua arm sebelumnya berjalan
 slots=None dan bootstrap mengabaikan engine= (arm slots4/8 lama VOID); (2)
 versi repo memakai `int(APITAP_SLOTS)` yang crash pada `"auto"` — kini string
 diteruskan apa adanya (API menerima int atau "auto").
+
+### 14.16 Grup 10-tabel MySQL @0,5 core — terkejar penuh (2026-10-11, wheel 0.61.0)
+
+Fixture: `prof_my_m` + `prof_my_m2..m10` (10 × 1 jt baris, gaya `prep.sh`).
+Penulis paced **48.956 ch/s** (120 s, 10 tabel); drain: bootstrap 10 jt baris
+dalam 39,5 s (8 lane), lalu satu sesi follow memindahkan seluruh 5,01 jt
+changes sisa; total **15,01 jt applied, CPU 0,29/0,5 core**.
+**VALIDATE 10/10 MATCH.** Residual "grup MySQL belum terukur" tertutup:
+grup 10-tabel tetap di kelas ~49 rb/s offered — sama dengan single-table.
