@@ -1146,3 +1146,23 @@ lain netral — fixed-cost window hanya sebagian kecil idle.
 Arah 100k/s karena itu STRUKTURAL (§5 P3/rezim B): paralelisme drain/apply
 yang benar-benar memakai core tambahan (grup multi-slot paralel penuh, apply
 terpisah per core), bukan knob.
+
+### 14.21 Angka LIVE di cage fokus (256 MB / 0,5 core) — 2026-10-11
+
+Shape user: 30 tabel × 1 jt row, 15 kolom, `large_str` ~1 KB, satu run, dest
+CH 25.8, wheel rilis 0.61.0 (`.so` f6be51b1), `APITAP_FOLLOW_SECS=30`, CDC
+berjalan BERSAMA generation (dua ronde × 30 jt changes):
+
+| metrik | nilai |
+|---|---|
+| offered → applied | 60,000,000 → **60,000,000 (100 %)** |
+| laju LIVE | **26.5k changes/s** (busy 2,261 s) |
+| checksum | **30/30 MATCH** |
+| MEM (live) | 82 MB / 256 MB |
+| bootstrap 30 jt row | 235 s, MEMPEAK 192 MB, 30/30 |
+| offer generation | A 31.3k/s (960 s), B 22.9k/s (1,313 s) |
+
+Drain kalah tipis saat ronde A (offer 31,3k > 26,5k live), mengejar penuh di
+ronde B (offer < kapasitas) dan konvergen tanpa intervensi. Bandingkan run
+full 0.60-era (23,9k/s busy): **+11 % live**. Sisa jarak ke catch-up (31,7k/s)
+adalah backlog yang menumpuk selama ronde A.
