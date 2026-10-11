@@ -1200,3 +1200,17 @@ dalam 39,5 s (8 lane), lalu satu sesi follow memindahkan seluruh 5,01 jt
 changes sisa; total **15,01 jt applied, CPU 0,29/0,5 core**.
 **VALIDATE 10/10 MATCH.** Residual "grup MySQL belum terukur" tertutup:
 grup 10-tabel tetap di kelas ~49 rb/s offered — sama dengan single-table.
+
+### 14.17 Batas final kedua jalur @0,5 core (2026-10-12, wheel 0.61.0)
+
+- **PG (slots=2, 2 tabel) @64,3 rb/s offered**: decoded **1:1 dengan ledger**
+  (7.720.000 = 7.720.000), seluruhnya dikonsumsi, VALIDATE 2/2 MATCH; laju
+  **delivered 52.694/s berkelanjutan** — sedikit tertinggal di pace 64 rb,
+  tuntas di ekor (~23 s). **PG: >50 rb/s delivered terukur.**
+- **MySQL (grup 10 tabel) @48,96 rb/s offered**: terkejar penuh (CPU 0,29/0,5),
+  VALIDATE 10/10 MATCH; @62,7 rb/s offered: tertinggal lalu tuntas setelah
+  writer berhenti (plafon ~50–55 rb/s delivered).
+
+Kesimpulan gerakan: **kedua jalur di kelas 3 jt/menit @0,5 core, dengan batas
+atas terukur** — PG 52,7 rb/s delivered (slots=2), MySQL ~49–55 rb/s. Di atas
+itu butuh kerja struktural P3 (tugas sesi paralel).
