@@ -1121,3 +1121,28 @@ berikutnya: naikkan utilisasi (overlap drain-apply, jumlah lane, ukuran
 window) — pada efisiensi sekarang, utilisasi 0.95 setara ~50–57k/s di 0,5
 core. Ini juga jawaban untuk hukum skala: dengan cap 0.70 di 0,5 core, 1 core
 seharusnya memberi ~55–60k/s bila dindingnya benar-benar CPU.
+
+### 14.20 Skala resource DATAR + sumbernya (2026-10-10)
+
+0.61.0 rilis, shape 460 B, 30 tabel, catch-up, cage memori tetap 256 MB:
+
+| quota CPU | rate | avg cores terpakai | cap_frac |
+|---|---|---|---|
+| 0.5 | 38.5k/s | 0.34 | 0.68 |
+| 1.0 | **41.0k/s** | 0.40 | 0.40 |
+| 2.0 | **38.4k/s** | 0.39 | 0.19 |
+
+Kurva datar: 4× kuota = 0 tambahan. Pemakaian CPU terkunci ~0.40 core
+terlepas kuota — pipeline menunggu (I/O CH + serialisasi channel; satu task
+drain, satu stream apply, `win_tx` kapasitas 1). Ini penyebab lokal dari
+kurva datar yang 0.58 catat tanpa penjelasan.
+
+Diagnostik window (APITAP_DEBUG, default 16 MiB/window): 240 window untuk 6 jt
+changes = 24k events/window, budget_hit tiap window; drain 0.6–0.7 s/window,
+apply per tabel-window 137–417 ms (clear+ins; latensi CH). `win64` (32 MiB/
+window) = 39.0k/s (+2–4 %), `win128` **OOM di 256 MB**. Lane/slot/window knobs
+lain netral — fixed-cost window hanya sebagian kecil idle.
+
+Arah 100k/s karena itu STRUKTURAL (§5 P3/rezim B): paralelisme drain/apply
+yang benar-benar memakai core tambahan (grup multi-slot paralel penuh, apply
+terpisah per core), bukan knob.
