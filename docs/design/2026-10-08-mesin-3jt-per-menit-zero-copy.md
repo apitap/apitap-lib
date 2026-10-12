@@ -1428,3 +1428,27 @@ prioritas:
    pglogical menunjukkan plugin bisa emit format arbitrer).
 9. **Topologi thread/futex**: kurangi handoff antar-thread (runtime workers
    terukur netral; prioritas rendah sampai (1) selesai).
+
+### 14.27 Bedah sys (strace 3×) + status inventaris #1–#9 (2026-10-12)
+
+**Dekomposisi sys (attach 22 dtk ke drain hidup, 0,5 core):** epoll_wait ~40 %
+dari CPU-sys dengan **200 rb panggilan (9,1 rb/s)**, recvfrom ~25 % (16,9 rb,
+766/s), write/writev ~7 %, sisanya kecil; clock_nanosleep = *wall* (driver
+python), bukan CPU. Probe per-thread: badai epoll ADA DI THREAD DRAIN SENDIRI
+(bukan asyncio — binding sudah `detach`+`block_on`), pola kuasi-kontinu
+50–90 µs tanpa timer-loop di kode → churn parker/readiness tokio
+(~7,5 change per epoll_wait). SO_RCVBUF kini 4 MiB (`8b9dcbc`,
+`APITAP_RECV_BUF_BYTES`, RED 2/2, suite 442).
+
+**Status inventaris §14.26:** #1 selesai (di atas). #2 blocking reader =
+satu-satunya lever bersisa ber-signal (~−1 s/d −3 % rate; rewrite transport
+butuh desain cancel-safety tersendiri — jangan di-rush). #3 SmallVec:
+gain teoretis ~0,4 % (1 alloc/baris ÷ 7 µs) — **di bawah floor noise ±5 %,
+butuh dependensi baru → tidak dikerjakan** (dicatat sebagai keputusan).
+#4 audit: jalur biner→RowBinary LANGSUNG sudah ada (`render_ch_row_rb`,
+dest_ch.rs:685; fallback teks hanya utk tipe CK tak dikenal) → SELESAI oleh
+P4. #5 kompresi lz4: sisa kandidat ~0,5–1 % (body sudah lokal/plaintext di
+bench; di produksi TLS yang menyalin). #6 selesai (`8b9dcbc`). #7 native
+protocol & #8 plugin server-side: kelas arsitektur, di luar rig. Catatan
+metodologi: setelah #6 terpasang di wheel, ukur n=3 baru vs baseline L3+L4
+(47,9/47,9/48,3; 6,98 µs).
