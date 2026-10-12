@@ -1383,3 +1383,18 @@ sesungguhnya diukur ulang dengan wheel baru berisi L3+L4 (n=3, arm
 `l34a..c`). Catatan tambahan: output debug `[drain]`/`[log_based]` TIDAK
 muncul di log rig (`DEBUG=1` terjawab 0 baris) — profil fase harus lewat
 `docker run` manual dengan `APITAP_DEBUG=1`, atau pipa rig diperbaiki dulu.
+
+**Hasil n=3 biner L3+L4 (wheel manylinux_2_34):**
+
+| arm | rate | CPU | CPU/change |
+|---|---|---|---|
+| l34a | 47,9 rb/s | 0,328 | 6,84 µs |
+| l34b | 47,9 rb/s | 0,347 | 7,25 µs |
+| l34c | 48,3 rb/s | 0,331 | 6,84 µs |
+
+Sebaran trio sangat rapat (47,9–48,3) — mesin sedang tenang. **L3+L4 =
+−6,3 % CPU/change** (mean 6,98 vs 7,45 µs pra-L3/L4) dan +3 % rate (mean
+48,0 vs 46,7); komparasi lintas-sesi tidak sepenuhnya bersih (kuintet lama
+lebih bising), tapi arah CPU konsisten dengan split user/sys yang normal
+dan rate naik karena rig separuh-waktu-tunggu. Plateau sekarang ~48 rb/s
+@0,33 core.
