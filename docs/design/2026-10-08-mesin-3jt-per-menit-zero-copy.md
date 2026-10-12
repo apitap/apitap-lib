@@ -1483,3 +1483,23 @@ liburing #536 (streaming: epoll > io_uring). Fitur di-revert (`git revert`),
 rig forward ikut di-revert. **Inventaris §14.26 tuntas: #1✅ #2❌(regresi)
 #3❌(sub-noise) #4✅ #5/#7/#8 (tanpa bukti signal) #6✅(netral).** Plateau
 rig final: ~48–49 rb/s @0,34 core, CPU/change ~7,0 µs.
+
+### 14.29 Pass tuas build-config: v3 + mimalloc DIUKUR — keduanya regresi (2026-10-12)
+
+Dua lever build-config yang belum pernah dicoba: `target-cpu=x86-64-v3`
+(AVX2/BMI2 — default wheel generik) dan allocator `mimalloc` (pengganti
+glibc). n=3 masing-masing @0,5 core vs baseline generik+glibc (48,8 rb/s,
+7,00 µs):
+
+| build | rate (n=3) | CPU/change |
+|---|---|---|
+| generik + glibc (baseline) | 49,5/48,9/48,1 (mean 48,8) | 7,00 µs |
+| v3 + mimalloc | 48,3/47,1/47,5 (mean 47,6) | 7,21 µs |
+| **v3 only (glibc)** | **46,6/47,3/47,3 (mean 47,1)** | **7,32 µs** |
+
+Keduanya **−2,5 s/d −3,5 %** — konsisten lintas dua build berbeda waktu.
+Kemungkinan: guest QEMU "Haswell no TSX" men-downclock AVX2, dan/atau drift
+mesin; apa pun sebabnya, tidak ada bukti kemenangan di box ini → **tidak
+di-ship** (repo tetap generik + glibc; tak ada perubahan kode dari pass ini).
+Pelajaran: pada kelas VPS ini, tuning flag/allocator masuk pita noise-negatif
+— plafon ~48–49 rb/s @0,34 core bertahan sebagai angka final rig.
