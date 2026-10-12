@@ -1295,3 +1295,30 @@ terukur ulang di §14.18; sesi paralel: 38,5/41,0/38,4). CPU 0,34–0,48 dari 0,
 2. **Pipeline multi-core (regime B)** — pembaca blocking thread dengan recv
    besar + decode/apply di runtime terpisah; memindahkan park/sys dari jalur
    kritis. (Flat-scaling hanya pecah kalau ini ada.)
+
+### 14.22 Mandat 120 rb/s — status final terukur (2026-10-12)
+
+**Skala slots terbukti** (PG→CH, insert-only + parallel apply, catch-up,
+core setara per slot):
+
+| slots / cores | rate terukur | CPU | catatan |
+|---|---|---|---|
+| 1 / 0,5 | 44–45 rb/s | 0,34–0,48 | flat di 1–2 core (satu task drain) |
+| 2 / 2 | **70,8 rb/s** | 0,54/2 | caught up penuh |
+| 3 / 3 | **85,0 rb/s** | 0,64/3 | caught up penuh |
+| 4 / 4 | **~99–101 rb/s offered, terkejar penuh** | <0,7/4 | tail kosong (caught up) |
+
+**Plafon offer lokal = sumber PG bench VPS ini: ~100 rb/s** (writer 4 atau 8
+thread, tabel segar, paced 120 rb — tak pernah tercapai). Jadi **120 rb/s tidak
+bisa di-offer di rig lokal ini**, bukan karena drain (drain tak pernah
+tertinggal di offer mana pun hingga 101 rb). Proyeksi per-slot (~25–30 rb/s)
+menaruh 120 rb di **slots=4–5 dengan sumber kelas GCP** (yang sanggup 200 rb+,
+per campaign §Part 8) — atau 5–6 slot di sini bila sumber dipercepat.
+
+**Insiden & pembersihan:** disk penuh lagi saat run slots=4 pertama (pg_wal
+97 GB dipin 3 slot basi + base 55 GB bloat 30 tabel `prof_pg_t*` heavy) → PG
+source crash, recovery; dibersihkan: slot dirs dihapus, `prof_pg_t01..t30`
+di-drop, checkpoint, binlog MySQL dipurge → **disk 100% → 55% (153 GB bebas)**.
+Pelajaran operasional: (1) slot basi WAJIB dibersihkan setelah run yang
+state-nya di-wipe; (2) tabel update-heavy membloat ~1,8 GB/1 jt baris per
+kampanye; (3) run slots besar butuh cek disk sebelum mulai.
