@@ -1271,3 +1271,27 @@ bukan I/O). LEG 10,1 jt/228 s = 44,2 rb/s; sys 53,7 s dari 89,6 s CPU.
 (pola `co_win`/`co_refill` yang sudah teruji di plane COPY), baca frame inline
 tanpa channel dan tanpa wake per frame; target memangkas ~10 rb epoll_wait/detik
 dan hop-nya. Setelah itu regime B (reader besar) dan apply paralel insert-only.
+
+### 14.21 Koreksi & status konsolidasi (2026-10-12)
+
+**Koreksi §14.20:** census itu berjalan di kode yang SUDAH memuat scanner
+(`dad499a` L1b, `d1b2a4f` P4 RowBinary, `1865088` binary tri-state — semua di
+main sejak 10–11 Okt). Jadi epoll_wait 2,2 jt (9,7 rb/detik) BUKAN hop
+pump→channel (pump sudah dibuang) — itu park refill scanner (~4,7 rb: 4,86 GB /
+1 MiB window) + task apply/timer/channel-window. Pelajarannya: hop dihapus,
+**jumlah park tetap ~10 rb/detik** — wall-nya pola tunggu serial, bukan satu
+komponen.
+
+**Status konsolidasi tuas (semua SUDAH di main/0.61-era):** coalescer,
+scanner/L1b, RowBinary/P4, binary-default CH (+15%), insert-only (+16%),
+follow (PG+MySQL), window depth, slots + auto, G1.2/G1.3.
+**Hasil tetap: PG ~44–45 rb/s @0,5 core, FLAT di 1–2 core** (44,7 rb di 1 core
+terukur ulang di §14.18; sesi paralel: 38,5/41,0/38,4). CPU 0,34–0,48 dari 0,5.
+
+**Sisa jalur ke 120 rb/s (dua item struktural, keduanya teridentifikasi angka):**
+1. **Apply paralel insert-only** — window append-only ber-versi LSN di-apply
+   konkuren (buffer_unordered), state ditulis pada prefix kontigu (replay
+   idempoten); memutus rantai statement serial antar-window.
+2. **Pipeline multi-core (regime B)** — pembaca blocking thread dengan recv
+   besar + decode/apply di runtime terpisah; memindahkan park/sys dari jalur
+   kritis. (Flat-scaling hanya pecah kalau ini ada.)
