@@ -1255,7 +1255,7 @@ async fn run_group_mysql(
             .iter()
             .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
             .collect();
-        let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(1);
+        let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(window_depth());
         let (applied_tx, _applied_rx) = tokio::sync::watch::channel::<u64>(wm);
         let apply =
             AbortOnDrop::spawn(apply_windows(tenure.clone(), None, members, win_rx, applied_tx));
@@ -1640,7 +1640,7 @@ async fn drain_group(
     // reports a window fully committed (watch channel carries the last
     // committed end_lsn back) — never past unapplied WAL, exactly like the
     // serial loop, just off the clock.
-    let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(1);
+    let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(window_depth());
     let (applied_tx, applied_rx) = tokio::sync::watch::channel::<u64>(wm);
     let members: Vec<crate::logbased::dest_bq::Member> = ctxs
         .iter()
@@ -1649,7 +1649,7 @@ async fn drain_group(
     let apply = AbortOnDrop::spawn(apply_windows(tenure, Some(src.clone()), members, win_rx, applied_tx));
     let follow = follow_secs().map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let drained = run_overlapped(
-        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src, keep_binary),
+        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src, keep_binary, window_depth()),
         apply,
     )
     .await;
@@ -1722,15 +1722,18 @@ async fn drain_loop(
     follow: Option<std::time::Instant>,
     src: &sqlx::PgPool,
     keep_binary: bool,
+    depth: usize,
 ) -> Result<()> {
     let mut stop_line = stop_line;
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let mut sess = DrainSession::default();
     let mut cur = wm;
     let mut windows = 0u32;
-    // The previous window's end_lsn: sent to the applier, not yet confirmed.
-    let mut pending: Option<u64> = None;
-    loop {
+    // The windows sent to the applier and not yet confirmed, oldest first;
+    // `depth` bounds them so the drain runs ahead of the applies instead of
+    // stalling on their round trips (design §14.18).
+    let mut pending: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    'windows: loop {
         if let Some(deadline) = follow {
             if std::time::Instant::now() >= deadline {
                 break;
@@ -1757,17 +1760,19 @@ async fn drain_loop(
             // Apply task died — its JoinHandle carries the real error.
             break;
         }
-        // Confirm the PREVIOUS window once applied (bounds resident windows
-        // to two and keeps the slot's confirmed LSN strictly behind commits).
-        if let Some(p) = pending.take() {
+        if end > cur {
+            pending.push_back(end);
+            cur = end;
+        }
+        // Confirm the OLDEST windows once applied, keeping at most `depth`
+        // unconfirmed: resident windows are bounded and the slot's confirmed
+        // LSN stays strictly behind commits.
+        while pending.len() > depth {
+            let p = pending.pop_front().expect("depth >= 1 keeps one");
             if wait_for_apply(ws, &mut applied_rx, p).await.is_err() {
-                break;
+                break 'windows;
             }
             ws.standby_status(p, false).await?;
-        }
-        if end > cur {
-            pending = Some(end);
-            cur = end;
         }
         if !hit {
             let Some(deadline) = follow else { break };
@@ -1795,7 +1800,7 @@ async fn drain_loop(
     // carried it to the destination; nothing extra to send — see the note in
     // `drain`, and the seven gate legs that went red when this was a bare
     // confirmation.
-    if let Some(p) = pending {
+    while let Some(p) = pending.pop_front() {
         if wait_for_apply(ws, &mut applied_rx, p).await.is_ok() {
             ws.standby_status(p, false).await?;
         }
@@ -2261,6 +2266,22 @@ pub(crate) fn follow_secs() -> Option<u64> {
     }
 }
 
+/// How many drain windows may sit between the drain's frontier and the applied
+/// watermark (APITAP_WINDOW_DEPTH, default 1 = the historical shape: one window
+/// applying while the next drains). The flat-scaling measurement pinned the
+/// wall on this serialisation — the drain stalled on each apply's ClickHouse
+/// round trips instead of running ahead (design §14.18). Every unconfirmed
+/// window holds its buffered bytes, so the default stays 1 until a cage-aware
+/// budget prices the extra depth.
+fn window_depth() -> usize {
+    std::env::var("APITAP_WINDOW_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
 /// How long one drain window may stay open. The byte budget usually closes a
 /// window within seconds; this only bites traffic on tables the run does not
 /// track, where a window could otherwise sit open for an hour (system review
@@ -2475,6 +2496,23 @@ mod tests {
         assert_eq!(auto_slots_for(0.1, 4), 1);
         assert_eq!(auto_slots_for(8.0, 3), 3);
         assert_eq!(auto_slots_for(2.0, 100), 8);
+    }
+
+    /// The window-depth knob: default 1 (the historical shape), zero/junk
+    /// fall back, and the value clamps at 8 (design §14.18).
+    #[test]
+    fn window_depth_defaults_to_one_and_clamps_at_eight() {
+        std::env::remove_var("APITAP_WINDOW_DEPTH");
+        assert_eq!(window_depth(), 1);
+        std::env::set_var("APITAP_WINDOW_DEPTH", "0");
+        assert_eq!(window_depth(), 1);
+        std::env::set_var("APITAP_WINDOW_DEPTH", "junk");
+        assert_eq!(window_depth(), 1);
+        std::env::set_var("APITAP_WINDOW_DEPTH", "4");
+        assert_eq!(window_depth(), 4);
+        std::env::set_var("APITAP_WINDOW_DEPTH", "99");
+        assert_eq!(window_depth(), 8);
+        std::env::remove_var("APITAP_WINDOW_DEPTH");
     }
 
     /// The follow knob: unset, zero and junk are all off; a positive number
