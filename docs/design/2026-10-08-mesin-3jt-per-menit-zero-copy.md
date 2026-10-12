@@ -1452,3 +1452,20 @@ bench; di produksi TLS yang menyalin). #6 selesai (`8b9dcbc`). #7 native
 protocol & #8 plugin server-side: kelas arsitektur, di luar rig. Catatan
 metodologi: setelah #6 terpasang di wheel, ukur n=3 baru vs baseline L3+L4
 (47,9/47,9/48,3; 6,98 µs).
+
+**Hasil #6 (SO_RCVBUF 4 MiB) n=3 biner rcv (L3+L4+#6):**
+
+| arm | rate | CPU/change |
+|---|---|---|
+| rcvA/B/C | 49,5 / 48,9 / 48,1 rb/s | 6,88 / 6,93 / 7,21 µs |
+| baseline L3+L4 | 47,9 / 47,9 / 48,3 | 6,98 µs |
+
+**+1,7 % rate (mean 48,8 vs 48,0), CPU/change netral** — di dalam batas noise,
+sesuai prediksi (recvfrom copy-bound; overhead per-call sudah teramortisasi
+di ~29 KB/recv). Selama pengukuran sempat terjadi insiden disk lagi (pg_wal
+151 GB dari slot bocor run gagal → server crash; dibersihkan via pg_replslot
++ CHECKPOINT → disk 56 %). **Status final inventaris:** #1 ✅, #4 ✅ (sudah
+ada), #6 ✅ terukur netral s/d +2 %, #3 ❌ dilewati (sub-noise + dep baru),
+#5/#7/#8 tersisa tanpa bukti signal di rig ini, **#2 (blocking reader)** =
+satu-satunya lever bersisa ber-signal (~1–3 %, butuh desain cancel-safety).
+Plateau rig: ~48–49 rb/s @0,34 core, CPU/change ~7,0 µs.
