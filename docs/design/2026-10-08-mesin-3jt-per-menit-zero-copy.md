@@ -1347,3 +1347,26 @@ key flat/u64, index rel padat, arena, recycle buffer; est. 1–2 µs) menurunkan
 ~8 → ~6 µs di sini → ~85–90 rb/s @0,5 core di VPS, ~4 µs di kelas produksi →
 **120 rb/s@0,5 core tercapai di kelas produksi lewat L3–L6**; di VPS butuh
 ~0,7–0,9 core.
+
+### 14.24 L3+L4 diukur: pita noise 0,5 core & disiplin n≥3 (2026-10-12)
+
+Dua lever CPU-per-change berikutnya dikerjakan (L3 key int → i64, L4 slot
+relasi padat) dengan suite 440/441 + RED 2/2 & 3/3; keduanya LOLOS gerbang
+kebenaran. Angka 0,5 core (PG catch-up, rig sama):
+
+| arm | rate | CPU | CPU/change |
+|---|---|---|---|
+| pra-L3 (n=3) | 43,6 / 44,4 / 44,9 rb/s | 0,34–0,40 | 7,7–9,0 µs |
+| + L3 | 46,3 rb/s | 0,344 | 7,42 µs |
+| + L4 run 1 | 49,2 rb/s | 0,350 | 7,12 µs |
+| + L4 run 2 | 44,0 rb/s | 0,343 | 7,80 µs |
+
+**Kesimpulan jujur:** L3+L4 konsisten menurunkan CPU/change ~5–8 %
+(7,7–9,0 → 7,1–7,8 µs) dan rate duduk di puncak pita lama (43,6–49,2),
+tapi **satu arm tidak bisa membedakan lever <5 %** — varians antar-run ±5 %,
+dan split user/sys antar-run berayun (user 18–66 s) menandakan noise VPS.
+Plafon rig tetap ~44–49 rb/s @0,5 core. Pelajaran metodologi: lever
+berikutnya harus diukur **n≥3 per arm** (±40 mnt/set) atau lewat counter
+CPU/change yang sudah ada, bukan rate tunggal. Sisa L5/L6 (arena window,
+recycle buffer) diperkirakan berukuran sama (1–2 %) — nilainya untuk
+menaikkan margin per-core, bukan lompatan ke 120 rb/s di VPS ini.
