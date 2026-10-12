@@ -97,6 +97,40 @@ pub(crate) struct FrameScanner {
     last_refill: std::time::Instant,
     silence: std::time::Duration,
     coalesce_us: u64,
+    /// `Some` exactly on the blocking-reader path (inventory #2): the scanner
+    /// consumes whole chunk buffers from the reader thread instead of
+    /// filling `win` from the socket.
+    blocked: Option<BlockedState>,
+}
+
+/// The blocking-reader scanner state: whole chunks from the reader thread,
+/// frames sliced out of them in place.
+struct BlockedState {
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    /// The chunk frames are sliced out of (zero copy via `split_to`).
+    cur: bytes::BytesMut,
+    /// Leftover when a frame spans chunks. The spanning frame is stitched
+    /// from `tail` plus a bounded prefix of `cur`, so a chunk boundary
+    /// copies the frame at most — never the chunk.
+    tail: bytes::BytesMut,
+    /// The channel closed: no more chunks will come.
+    eof: bool,
+}
+
+impl BlockedState {
+    /// Move any leftover into `tail`, then adopt the chunk. The chunk just
+    /// left the channel, so its refcount is one and adoption is free; the
+    /// fallback (a still-shared chunk) copies, which cannot happen on this
+    /// path but keeps the invariant without an `unsafe`.
+    fn push(&mut self, chunk: bytes::Bytes) {
+        if !self.cur.is_empty() {
+            self.tail.extend_from_slice(&self.cur);
+            self.cur.clear();
+        }
+        self.cur = chunk
+            .try_into_mut()
+            .unwrap_or_else(|c| bytes::BytesMut::from(&c[..]));
+    }
 }
 
 /// The scan window's fill target: one syscall per ~1 MiB instead of one per
@@ -110,6 +144,7 @@ impl FrameScanner {
             last_refill: std::time::Instant::now(),
             silence: crate::logbased::drain::silence_budget(),
             coalesce_us: read_coalesce_us(),
+            blocked: None,
         }
     }
 
@@ -208,11 +243,134 @@ impl FrameScanner {
         &mut self,
         rd: &mut BufReader<PgRead>,
     ) -> Result<(u8, bytes::Bytes)> {
+        if let PgRead::Blocked(b) = rd.get_mut() {
+            if self.blocked.is_none() {
+                // A closed placeholder keeps the enum valid while the live
+                // receiver moves into the scanner.
+                let (tx, placeholder) = tokio::sync::mpsc::channel(1);
+                drop(tx);
+                let rx = std::mem::replace(&mut b.rx, placeholder);
+                self.blocked = Some(BlockedState {
+                    rx,
+                    cur: bytes::BytesMut::new(),
+                    tail: bytes::BytesMut::new(),
+                    eof: false,
+                });
+            }
+            loop {
+                if let Some(f) = self.step_blocked()? {
+                    return Ok(f);
+                }
+                self.refill_blocked().await?;
+                // After EOF nothing more arrives; an incomplete frame at
+                // this point is a truncated stream, exactly as in the async
+                // path.
+                if self.blocked.as_ref().is_some_and(|s| s.eof) {
+                    return Err(Error::Transfer(
+                        "walsender: stream ended unexpectedly".into(),
+                    ));
+                }
+            }
+        }
         loop {
             if let Some(f) = self.step()? {
                 return Ok(f);
             }
             self.refill(rd).await?;
+        }
+    }
+
+    /// `step` for the blocking window: frames are sliced out of `cur`; a
+    /// frame spanning a chunk boundary is stitched from `tail` plus a
+    /// bounded prefix of `cur` (inventory #2).
+    fn step_blocked(&mut self) -> Result<Option<(u8, bytes::Bytes)>> {
+        let s = self.blocked.as_mut().expect("blocked state");
+        fn parse_len(head: &[u8]) -> Result<usize> {
+            let len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+            if !(4..=MAX_FRAME).contains(&len) {
+                return Err(Error::Transfer(format!(
+                    "walsender: message announces {len} bytes, past the 1 GB \
+                     protocol limit — the peer on this socket is not answering \
+                     the Postgres frontend protocol"
+                )));
+            }
+            Ok(1 + len)
+        }
+        if !s.tail.is_empty() {
+            if s.tail.len() < 5 {
+                if s.cur.is_empty() {
+                    return Ok(None);
+                }
+                let need = 5 - s.tail.len();
+                let take = need.min(s.cur.len());
+                let part = s.cur.split_to(take);
+                s.tail.extend_from_slice(&part);
+                if s.tail.len() < 5 {
+                    return Ok(None);
+                }
+            }
+            let total = parse_len(&s.tail)?;
+            if s.tail.len() + s.cur.len() < total {
+                return Ok(None);
+            }
+            let from_cur = (total - s.tail.len()).min(s.cur.len());
+            let mut f = bytes::BytesMut::with_capacity(total);
+            f.extend_from_slice(&s.tail);
+            f.extend_from_slice(&s.cur.split_to(from_cur));
+            s.tail.clear();
+            let mut f = f.freeze();
+            let tag = f[0];
+            f.advance(5);
+            return Ok(Some((tag, f)));
+        }
+        if s.cur.len() < 5 {
+            return Ok(None);
+        }
+        let total = parse_len(&s.cur)?;
+        if s.cur.len() < total {
+            // The frame spans the chunk edge: keep what we have and stitch
+            // on the next chunk.
+            s.tail = s.cur.split();
+            return Ok(None);
+        }
+        let mut f = s.cur.split_to(total).freeze();
+        let tag = f[0];
+        f.advance(5);
+        Ok(Some((tag, f)))
+    }
+
+    /// One chunk from the reader thread, under the same silence budget as
+    /// the async refill: the budget's job — a half-open socket must not
+    /// park forever — is now the timeout on the channel.
+    async fn refill_blocked(&mut self) -> Result<()> {
+        let silent = || {
+            Error::Transfer(format!(
+                "log_based: replication stream silent for {}s — the source's \
+                 keepalives stopped (half-open connection?); aborting at the \
+                 last committed watermark",
+                self.silence.as_secs()
+            ))
+        };
+        let Some(remaining) = (self.last_refill + self.silence)
+            .checked_duration_since(std::time::Instant::now())
+        else {
+            return Err(silent());
+        };
+        let s = self.blocked.as_mut().expect("blocked state");
+        if s.eof {
+            return Ok(());
+        }
+        match tokio::time::timeout(remaining, s.rx.recv()).await {
+            Ok(Some(chunk)) => {
+                s.push(chunk);
+                self.last_refill = std::time::Instant::now();
+                Ok(())
+            }
+            Ok(None) => {
+                s.eof = true;
+                Ok(())
+            }
+            Err(_) => Err(silent()),
         }
     }
 }
@@ -262,6 +420,28 @@ fn recv_buffer_bytes() -> usize {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
         Ok(v) => v.parse::<usize>().ok().filter(|n| *n > 0).unwrap_or(RECV_BUF_BYTES),
         Err(_) => RECV_BUF_BYTES,
+    }
+}
+
+/// Which reader the plaintext replication socket gets (untried-levers
+/// inventory #2, design §14.27): `APITAP_READER=blocking` runs a dedicated
+/// OS thread that blocks in `recv` on a dup'd descriptor and hands whole
+/// chunk buffers over a channel — the drain's event loop then parks on the
+/// channel (futex) instead of waking the tokio reactor on every socket
+/// readiness (measured 9.1k epoll_wait/s on the drain thread, ~40 % of its
+/// sys time). Anything else — including junk — keeps the async path.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ReaderMode {
+    Async,
+    Blocking,
+}
+
+fn reader_mode() -> ReaderMode {
+    match std::env::var("APITAP_READER") {
+        Ok(v) if v.eq_ignore_ascii_case("blocking") || v.eq_ignore_ascii_case("blocked") => {
+            ReaderMode::Blocking
+        }
+        _ => ReaderMode::Async,
     }
 }
 
@@ -368,6 +548,97 @@ pub(crate) type Rows = Vec<Vec<Option<String>>>;
 pub(super) enum PgRead {
     Tcp(OwnedReadHalf),
     Tls(tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// `APITAP_READER=blocking`: a dedicated thread blocks in `recv` on a
+    /// dup'd descriptor and ships whole chunk buffers here (inventory #2).
+    Blocked(BlockedRead),
+}
+
+/// Handle of the blocking reader thread. Dropping it stops the thread
+/// (flag + the 1 s receive timeout make the recheck prompt); only the
+/// thread ever touches or closes the descriptor.
+struct BlockedRead {
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for BlockedRead {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Spawn the blocking reader for `parent_fd`. Failures are the caller's to
+/// swallow (it falls back to the async path): the drain must not die over
+/// an optimization.
+fn spawn_blocking_reader(parent_fd: std::os::unix::io::RawFd) -> std::io::Result<BlockedRead> {
+    let fd = unsafe { libc::dup(parent_fd) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The tokio socket is nonblocking; this reader wants the opposite, plus
+    // a 1 s receive timeout so it rechecks the stop flag and exits without
+    // anyone having to race a shutdown() onto a descriptor it does not own.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    std::thread::Builder::new()
+        .name("apitap-wal-reader".into())
+        .spawn(move || {
+            let mut b = bytes::BytesMut::with_capacity(SCAN_WINDOW);
+            loop {
+                if stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let n = unsafe {
+                    libc::recv(
+                        fd,
+                        b.as_mut_ptr() as *mut libc::c_void,
+                        b.capacity(),
+                        0,
+                    )
+                };
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    // SO_RCVTIMEO reports as EAGAIN/EWOULDBLOCK; anything
+                    // else is a dead socket.
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) {
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
+                    break;
+                }
+                // One copy (kernel → user) per chunk, exactly like any
+                // recv; the chunk then travels by refcount.
+                unsafe { b.set_len(n as usize) };
+                let chunk = b.split().freeze();
+                b = bytes::BytesMut::with_capacity(SCAN_WINDOW);
+                if tx.blocking_send(chunk).is_err() {
+                    break;
+                }
+            }
+            unsafe { libc::close(fd) };
+        })?;
+    Ok(BlockedRead { rx, stop })
 }
 
 /// Write half of either transport.
@@ -383,6 +654,14 @@ impl tokio::io::AsyncRead for PgRead {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
+            // The CopyBoth data plane reads through `FrameScanner`'s
+            // blocking branch, never through AsyncRead; anything else
+            // reaching here is a bug worth failing loudly.
+            PgRead::Blocked(_) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "walsender: blocking reader has no AsyncRead plane \
+                 (APITAP_READER=blocking)",
+            ))),
             PgRead::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             PgRead::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
@@ -1597,6 +1876,27 @@ impl Walsender {
                 "walsender: START_REPLICATION did not enter copy mode".into(),
             ));
         }
+        // `APITAP_READER=blocking` (inventory #2): hand the plaintext read
+        // half to a dedicated recv thread instead of leaving the socket
+        // with the tokio reactor — the drain then parks on the chunk
+        // channel (futex) rather than waking epoll on every socket
+        // readiness. The write half stays async; the thread blocks in
+        // recv on its own dup'd descriptor. TLS cannot take this path
+        // (rustls owns the state machine), and a spawn failure falls back
+        // to the async reader — the drain must not die over an
+        // optimization.
+        if matches!(reader_mode(), ReaderMode::Blocking) {
+            let blocked = match self.rd.as_mut().map(BufReader::get_mut) {
+                Some(PgRead::Tcp(h)) => {
+                    use std::os::unix::io::AsRawFd;
+                    spawn_blocking_reader(h.as_ref().as_raw_fd()).ok()
+                }
+                _ => None,
+            };
+            if let Some(b) = blocked {
+                self.rd = Some(BufReader::new(PgRead::Blocked(b)));
+            }
+        }
         // Hand the read half to the scanner: from here until
         // stop_replication, frames arrive through the owned window while
         // this task decodes — no pump task, no channel (L1b).
@@ -2027,6 +2327,73 @@ mod tests {
         std::env::set_var("APITAP_RECV_BUF_BYTES", "1048576");
         assert_eq!(super::recv_buffer_bytes(), 1 << 20);
         std::env::remove_var("APITAP_RECV_BUF_BYTES");
+    }
+
+    /// The reader-mode knob: only an explicit blocking opt-in switches;
+    /// junk keeps the async reader (untried-levers inventory #2).
+    #[test]
+    fn the_reader_mode_knob_only_opts_in_on_an_explicit_blocking() {
+        std::env::remove_var("APITAP_READER");
+        assert_eq!(super::reader_mode(), super::ReaderMode::Async);
+        std::env::set_var("APITAP_READER", "blocking");
+        assert_eq!(super::reader_mode(), super::ReaderMode::Blocking);
+        std::env::set_var("APITAP_READER", "Blocked");
+        assert_eq!(super::reader_mode(), super::ReaderMode::Blocking);
+        std::env::set_var("APITAP_READER", "junk");
+        assert_eq!(super::reader_mode(), super::ReaderMode::Async);
+        std::env::remove_var("APITAP_READER");
+    }
+
+    /// Inventory #2: the blocking scanner slices frames out of whole chunk
+    /// buffers and stitches a frame that spans a chunk boundary from its
+    /// fragments — only the frame is copied, never the chunk.
+    #[test]
+    fn the_blocked_scanner_slices_chunks_and_stitches_spanning_frames() {
+        fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![tag];
+            v.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            v.extend_from_slice(body);
+            v
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(tx);
+        let mut sc = FrameScanner {
+            win: bytes::BytesMut::new(),
+            last_refill: std::time::Instant::now(),
+            silence: std::time::Duration::from_secs(1),
+            coalesce_us: 0,
+            blocked: Some(BlockedState {
+                rx,
+                cur: bytes::BytesMut::new(),
+                tail: bytes::BytesMut::new(),
+                eof: false,
+            }),
+        };
+        let a = frame(b'w', b"aaaa");
+        let b_ = frame(b'k', b"bbbbbbbb");
+        let c = frame(b'w', b"cc");
+        // Chunk 1: all of A plus the first 3 bytes of B.
+        let mut c1 = a.clone();
+        c1.extend_from_slice(&b_[..3]);
+        sc.blocked.as_mut().unwrap().push(bytes::Bytes::from(c1));
+        let (t, f) = sc.step_blocked().unwrap().expect("frame A complete");
+        assert_eq!(t, b'w');
+        assert_eq!(&f[..], b"aaaa");
+        assert!(
+            sc.step_blocked().unwrap().is_none(),
+            "B spans the boundary and must wait for the next chunk"
+        );
+        // Chunk 2: the rest of B plus all of C.
+        let mut c2 = b_[3..].to_vec();
+        c2.extend_from_slice(&c);
+        sc.blocked.as_mut().unwrap().push(bytes::Bytes::from(c2));
+        let (t, f) = sc.step_blocked().unwrap().expect("B stitched");
+        assert_eq!(t, b'k');
+        assert_eq!(&f[..], b"bbbbbbbb");
+        let (t, f) = sc.step_blocked().unwrap().expect("frame C");
+        assert_eq!(t, b'w');
+        assert_eq!(&f[..], b"cc");
+        assert!(sc.step_blocked().unwrap().is_none());
     }
 
     /// The coalescing knob: unset = 500 µs, 0/off disables (A/B control),
