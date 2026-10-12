@@ -1398,3 +1398,33 @@ Sebaran trio sangat rapat (47,9–48,3) — mesin sedang tenang. **L3+L4 =
 lebih bising), tapi arah CPU konsisten dengan split user/sys yang normal
 dan rate naik karena rig separuh-waktu-tunggu. Plateau sekarang ~48 rb/s
 @0,33 core.
+
+### 14.26 Inventaris tuas BELUM dicoba (riset 2026-10-12) — jawaban "pasti ada cara lain"
+
+Riset eksternal (spiceai PR#11702 zero-copy+binary decode, pg-walstream hot-path
+notes, liburing #536 streaming-vs-pingpong, PeerDB proto v2/v4, dokumen output
+plugin PG). Temuan kunci: **di mode streaming (1 koneksi, data kontinu — kasus
+kita) epoll MENGALAHKAN io_uring**; jadi arahnya bukan io_uring tapi
+memperbaiki pola epoll & memangkas syscall. Tuas yang belum dicoba, urut
+prioritas:
+
+1. **Bedah sys-time** (0,17 dari ~0,35 core!): strace/`/proc` counters → tentukan
+   recv/epoll vs futex/alloc. Pending: ptrace perms di VPS (`sudo strace -p`).
+2. **Blocking reader thread** (bukan tokio readiness): `recv` blocking 512 KiB–1 MiB
+   di thread khusus + SO_RCVBUF 4 MiB; target komponen epoll_wait/recv sys.
+   Preseden: multishot/blocking lebih hemat di streaming; census kami epoll_wait
+   ~9,7 rb/s.
+3. **SmallVec<[CellR;16]>** untuk cells (pg-walstream) — hilangkan alloc baris
+   kecil; L5-lite sebelum arena penuh.
+4. **Biner → RowBinary langsung** (tanpa render teks per baris/`pgbindec`):
+   spiceai mengukur −58 % decode via zero-copy+binary; cek apakah jalur
+   APITAP_PG_BINARY kita masih lewat teks per sel.
+5. **Kompresi body HTTP (lz4)** + window lebih besar → byte & copy klien turun,
+   dekompresi pindah ke server CH (CPU server tidak dihitung di mandat 0,5).
+6. **SO_RCVBUF 4 MiB + recv 1 MiB** (coalescer kita sudah ~29 KiB/recv; naikkan).
+7. **Native/HTTP-tuning CH client** kalau probe menunjukkan overhead HTTP.
+8. **(Nuklir) output plugin kustom server-side** yang mengemit baris
+   siap-RowBinary — CPU parse pindah ke walsender PG (butuh kontrol server;
+   pglogical menunjukkan plugin bisa emit format arbitrer).
+9. **Topologi thread/futex**: kurangi handoff antar-thread (runtime workers
+   terukur netral; prioritas rendah sampai (1) selesai).
