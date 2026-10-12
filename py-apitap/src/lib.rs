@@ -53,36 +53,46 @@ fn rt() -> &'static Runtime {
     RT.get_or_init(|| Runtime::new().expect("tokio runtime"))
 }
 
-/// log_based rides a fresh current_thread runtime on the CALLING thread
-/// instead of the shared multi-thread one. The CDC pipeline is three tasks
-/// (frame pump, decode+collapse, apply) whose Bytes cells share refcounts:
-/// on the multi-thread runtime the tasks land on different workers and the
-/// atomic increments ping-pong cache lines between cores — a post-knife
-/// flamegraph put bytes::shared_clone at 14.4% of samples with an ~18%
-/// futex/syscall pool beside it. On one thread the atomics are uncontended
-/// and the channel hops never cross cores. I/O overlap survives (tasks
-/// interleave cooperatively at every await); only true CPU parallelism is
-/// lost, which the capped tier never had — and the historical receipt is
-/// that log_based's number "does not move" between the full box and half a
-/// core. Bulk lanes keep the shared runtime: their parallel range pipes DO
-/// use the cores.
+/// log_based's runtime is chosen by the quota, per the scale law
+/// (design 2026-10-08 §5.2 — three regimes, one function):
+///
+/// - **A (≤ 1.0 core)**: `current_thread` on the calling thread. Measured
+///   win at the half-core tier (RSS −10MB, wall neutral): the pipeline's
+///   `Bytes` cells share refcounts, and on a multi-thread runtime the
+///   drain/apply tasks land on different workers — the atomic ping-pong was
+///   14.4% of samples with an 18% futex/syscall pool beside it. With at most
+///   one core there is no CPU to parallelise anyway.
+/// - **B (1.0–1.75)**: a fresh 2-worker multi-thread runtime — thread 1
+///   scans/decodes/collapses, thread 2 renders/applies. L1b changed the
+///   hand-off from one refcount per FRAME to one per 1 MiB window, which is
+///   what makes the second thread worth its cross-core atomics (§5.2 note).
+/// - **C (≥ 1.75)**: the slot fan-out runs N pipelines; the runtime gets
+///   2 workers per pipeline (§5.6: N × 2) so each pipeline's drain/apply
+///   overlap has real threads.
+///
+/// Bulk lanes keep the shared runtime: their parallel range pipes DO use
+/// the cores.
 fn run_cdc<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    // Quota-aware: current_thread is a measured win at the half-core tier
-    // (RSS −10MB, wall neutral) but it CAPS the pipeline at one thread — a
-    // 1-core proof run used only 0.55 cores of a 1.0 quota and gained just
-    // 8%. Above ~0.6 core of quota the multi-thread runtime gets the pump,
-    // drain and apply genuinely overlapping again.
-    if cpu_quota_cores().map_or(true, |q| q <= 0.6) {
-        tokio::runtime::Builder::new_current_thread()
+    let workers = match cpu_quota_cores() {
+        Some(c) if c >= 1.75 => Some((c.round() as usize).saturating_mul(2).max(2)),
+        Some(c) if c >= 1.0 => Some(2),
+        _ => None,
+    };
+    match workers {
+        Some(n) => tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(n)
+            .enable_all()
+            .build()
+            .expect("tokio multi_thread runtime")
+            .block_on(fut),
+        None => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio current_thread runtime")
-            .block_on(fut)
-    } else {
-        rt().block_on(fut)
+            .block_on(fut),
     }
 }
 

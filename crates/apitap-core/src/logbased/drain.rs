@@ -182,6 +182,12 @@ pub(crate) async fn drain(
     let mut buf_bytes = 0usize;
     let mut hit_budget = false;
     let dbg_stream = std::env::var("APITAP_DEBUG").is_ok();
+    // APITAP_DEBUG phase timers: where the drain's wall actually goes
+    // (recv/decode/flush/seal). `Instant::now()` per phase per event is ~60ns
+    // and this path is debug-only.
+    let mut t_recv = std::time::Duration::ZERO;
+    let mut t_dec = std::time::Duration::ZERO;
+    let mut t_flush = std::time::Duration::ZERO;
 
     // Raw tracked row-change messages decoded this window (APITAP_DEBUG):
     // compared against the collapsed event count to localise the ~14.5 %
@@ -198,7 +204,9 @@ pub(crate) async fn drain(
     let mut carried_to_stop = false;
     if let Some((ops, e)) = sess.carry.take() {
         buf_bytes += ops.iter().map(|(_, o)| op_bytes(o)).sum::<usize>();
+        let t_ph = std::time::Instant::now();
         flush_ops(ops, &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+        t_flush += t_ph.elapsed();
         end_lsn = e;
         carried_to_stop = e >= stop_line;
     }
@@ -234,7 +242,9 @@ pub(crate) async fn drain(
         // normally wake the refill; when they stop, the connection is dead
         // (half-open socket, NAT rebind) and the scanner errors at the last
         // committed watermark (system review 2026-10-07, G0.5).
+        let t_ph = std::time::Instant::now();
         let ev = ws.next_event().await?;
+        t_recv += t_ph.elapsed();
         match ev {
             None => break,
             Some(WalEvent::Keepalive { wal_end, reply_requested }) => {
@@ -299,8 +309,10 @@ pub(crate) async fn drain(
                 }
             }
             Some(WalEvent::XLogData { payload, .. }) => {
+                let t_ph = std::time::Instant::now();
                 let (msg, change_xid) =
                     pgoutput::decode(&payload, in_stream.is_some(), &sess.rel_oids, keep_binary)?;
+                t_dec += t_ph.elapsed();
                 // Inside a stream block every change names its own
                 // (sub)transaction; outside one there is nothing to name.
                 let sub = change_xid.or(in_stream);
@@ -317,7 +329,9 @@ pub(crate) async fn drain(
                         hit_budget = true;
                         break;
                     }
+                    let t_ph = std::time::Instant::now();
                     flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+                    t_flush += t_ph.elapsed();
                     tx_bytes = 0;
                     end_lsn = e;
                     if e >= stop_line {
@@ -346,7 +360,9 @@ pub(crate) async fn drain(
                         break;
                     }
                     buf_bytes += n;
+                    let t_ph = std::time::Instant::now();
                     flush_ops(ops, &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+                    t_flush += t_ph.elapsed();
                     end_lsn = e;
                     if e >= stop_line {
                         break;
@@ -520,6 +536,7 @@ pub(crate) async fn drain(
         }
     }
 
+    let t_seal = std::time::Instant::now();
     let outcome = DrainOutcome {
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
         id: WindowId::new(start_lsn, end_lsn),
@@ -530,6 +547,15 @@ pub(crate) async fn drain(
         eprintln!(
             "[events] decoded={decoded} collapsed={}",
             outcome.events()
+        );
+        let t_seal = t_seal.elapsed();
+        eprintln!(
+            "[drain] recv={:.2}s decode={:.2}s flush={:.2}s seal={:.3}s total={:.2}s",
+            t_recv.as_secs_f64(),
+            t_dec.as_secs_f64(),
+            t_flush.as_secs_f64(),
+            t_seal.as_secs_f64(),
+            (t_recv + t_dec + t_flush + t_seal).as_secs_f64(),
         );
     }
     Ok(outcome)

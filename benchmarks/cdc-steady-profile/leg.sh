@@ -55,8 +55,11 @@ while True:
     t0 = time.time()
     try:
         import os as _os
+        _slots = _os.environ.get('APITAP_SLOTS') or None
+        if _slots is not None and _slots != 'auto':
+            _slots = int(_slots)  # the API takes an int or "auto", not "4"
         r = apitap.transfer(src, dst, engine=(_os.environ.get('APITAP_ENGINE') or None),
-                           slots=(_os.environ.get('APITAP_SLOTS') or None),
+                           slots=_slots,
                            tables=[t for t in table.split(",") if t], mode="log_based")
     except Exception as exc:                                  # noqa: BLE001
         print(f"RAISED {type(exc).__name__}: {exc}", flush=True)

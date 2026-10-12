@@ -50,12 +50,19 @@ witness() {
 }
 
 disk_guard() {
-  local free
+  local free n=0
   while :; do
     free=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
     [ "${free:-0}" -ge 25 ] && return 0
     echo "DISK_GUARD free=${free}G paused $(date -u +%H:%M:%S)"
     if [ "$ROUTE" = my ]; then my_binlog_purge_keep 6; fi
+    n=$((n+1))
+    # PREBUILD deadlock guard: with no drain running nothing frees WAL, so a
+    # pause can never end — abort loudly instead of hanging forever.
+    if [ "${PREBUILD:-0}" = "1" ] && [ "$n" -ge 6 ]; then
+      echo "DISK_DEADLOCK free=${free}G after $((n*30))s with no drain — free space and re-run"
+      return 1
+    fi
     sleep 30
   done
 }
@@ -103,7 +110,8 @@ launch_drain() {
   local ZS=99; [ "${PREBUILD:-0}" = "1" ] && ZS=3
   docker rm -f "prof-heavy-$TAG" >/dev/null 2>&1
   echo "== drain up: $SP | slots=${SLOTS:-default} | budget=${BUDGET}s =="
-  docker run -d --name "prof-heavy-$TAG" --network=host --cpus=$CPUS --memory=256m --memory-swap=256m \
+  local MEM="${MEM:-256m}"
+  docker run -d --name "prof-heavy-$TAG" --network=host --cpus=$CPUS --memory=$MEM --memory-swap=$MEM \
     -v "$SP:/py:ro" -e PYTHONPATH=/py \
     -e "APITAP_SRC=$URL" -e "APITAP_DST=$CH_DST" \
     -e "APITAP_TABLE=$TBL" -e "BUDGET_S=$BUDGET" -e "ZERO_STOP=$ZS" -e "CPUS=$CPUS" \
@@ -114,6 +122,7 @@ launch_drain() {
     -e "APITAP_READ_COALESCE_US=${APITAP_READ_COALESCE_US:-}" \
     -e "APITAP_ENGINE=${APITAP_ENGINE:-}" \
     -e "APITAP_PG_BINARY=${APITAP_PG_BINARY:-}" \
+    -e "APITAP_DEBUG=${APITAP_DEBUG:-}" \
     -e "APITAP_TAG=$TAG" -v "$HERE:/job:ro" python:3.13-slim sh /job/leg.sh >/dev/null
   for _ in $(seq 1 180); do docker inspect "prof-heavy-$TAG" >/dev/null 2>&1 && break; sleep 1; done
   sleep 12
