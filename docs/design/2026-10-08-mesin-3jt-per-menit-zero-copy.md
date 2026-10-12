@@ -1237,3 +1237,24 @@ konkuren** (tak ada delete yang mengikat urutan antar-window) dan **state write
 bisa dijarangkan** (replay insert-only idempoten oleh versi). Itu P3 slice
 berikutnya menuju 120 rb/s — knob depth dipertahankan (default 1, nol dampak;
 berguna setelah apply paralel).
+
+### 14.19 Stacking diukur — dinding PG = 63% CPU di syscall socket (2026-10-12)
+
+Insert-only + window 32 MiB + D=1, kandang 0,5 core:
+
+| arm | rate sustained | CPU | sys |
+|---|---|---|---|
+| PG (insert-only, 32 MiB) | 43,0–43,9 rb/s | 0,35 | **73,8 s dari 116,7 s = 63%** |
+| MySQL (insert-only, 32 MiB) | 48,7 rb/s | 0,41 | 3,9 s = **10%** |
+
+Semua tuas klien mentok ~45 rb/s di PG, dan **63% CPU-nya di kernel (recvfrom
+walsender + copy + memcg)** — sementara jalur wire MySQL cuma 10%. Kontras ini
+menutup perdebatan: dinding PG adalah **jalur baca socket walsender**, bukan
+statement/window/CPU-decode.
+
+**Dua lever struktural menuju 120 rb/s:**
+1. **Regime B** — thread pembaca blocking dengan recv besar (64 KB–1 MB),
+   terpisah dari runtime decode/apply; memindahkan biaya sys ke pembaca yang
+   menunggu (dan memecah flat-scaling di >1 core).
+2. **Apply paralel insert-only** — window append-only ber-versi LSN bisa
+   di-apply konkuren; state dijarangkan (replay idempoten oleh versi).
