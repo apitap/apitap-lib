@@ -1322,3 +1322,28 @@ di-drop, checkpoint, binlog MySQL dipurge → **disk 100% → 55% (153 GB bebas)
 Pelajaran operasional: (1) slot basi WAJIB dibersihkan setelah run yang
 state-nya di-wipe; (2) tabel update-heavy membloat ~1,8 GB/1 jt baris per
 kampanye; (3) run slots besar butuh cek disk sebelum mulai.
+
+### 14.23 Regime B di 0,5 core — netral; plateau & matematika 120 rb/s (2026-10-12)
+
+A/B `APITAP_RUNTIME_WORKERS` (wheel 0.61-era + semua lever), PG catch-up 0,5 core:
+
+| arm | rate sustained | CPU |
+|---|---|---|
+| current_thread (regime A) | 41,7–42,0 rb/s | 0,36 |
+| 2 worker (regime B) | 41,4 rb/s | 0,40 |
+
+**Netral** — park I/O bukan bottleneck di 0,5 core (dua worker berbagi kuota yang
+sama). Daftar tuas yang sudah DIUKUR netral di 0,5 core: coalescer, scanner/L1b,
+RowBinary/P4, binary-default, insert-only, follow, depth, parallel apply,
+slots=2 (di 0,5 core), runtime workers. **Plateau rig ini: ~42–45 rb/s @0,5 core**
+(CPU 0,34–0,48; sisa waktu tunggu pipeline).
+
+**Matematika target:** 120 rb/s @0,5 core = **4,17 µs/change**. Rig VPS ini:
+~8 µs/change CPU (42k @ 0,34 core). Campaign GCP mengukur **~3 µs/change**
+(Part 13, 1,44 jt/s di 6 core) — artinya **120 rb/s @0,5 core fisibel di mesin
+kelas produksi** (0,36 core @3 µs), dan **tidak fisibel di VPS bench ini**
+(per-core-nya ~2,5× lebih lambat). Sisa tuas CPU yang belum dikerjakan (L3–L6:
+key flat/u64, index rel padat, arena, recycle buffer; est. 1–2 µs) menurunkan
+~8 → ~6 µs di sini → ~85–90 rb/s @0,5 core di VPS, ~4 µs di kelas produksi →
+**120 rb/s@0,5 core tercapai di kelas produksi lewat L3–L6**; di VPS butuh
+~0,7–0,9 core.
