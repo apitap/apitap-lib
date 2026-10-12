@@ -250,6 +250,21 @@ fn read_coalesce_us() -> u64 {
     }
 }
 
+/// Receive-buffer size the replication socket asks the kernel for
+/// (`APITAP_RECV_BUF_BYTES`): unset = 4 MiB, `0`/`off` leaves the kernel
+/// default. A window then lands in one or two larger reads instead of many
+/// small ones; capped by `net.core.rmem_max` (untried-levers inventory #6,
+/// design §14.26).
+const RECV_BUF_BYTES: usize = 4 << 20;
+
+fn recv_buffer_bytes() -> usize {
+    match std::env::var("APITAP_RECV_BUF_BYTES") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
+        Ok(v) => v.parse::<usize>().ok().filter(|n| *n > 0).unwrap_or(RECV_BUF_BYTES),
+        Err(_) => RECV_BUF_BYTES,
+    }
+}
+
 /// The socket closes when this type is dropped, whatever path got us here.
 ///
 /// The plaintext transport did this for free: `TcpStream::into_split` gives
@@ -847,6 +862,13 @@ impl Walsender {
             .await
             .map_err(|e| Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port)))?;
         stream.set_nodelay(true).ok();
+        // Bursts land in fewer, larger reads with a bigger receive buffer
+        // (inventory #6, design §14.26). `0` leaves the kernel default.
+        let rcvbuf = recv_buffer_bytes();
+        if rcvbuf > 0 {
+            use socket2::SockRef;
+            SockRef::from(&stream).set_recv_buffer_size(rcvbuf).ok();
+        }
         // A replication socket can go half-open (NAT rebind, silent
         // middlebox) and the kernel then parks every read forever. Keepalive
         // makes the death visible: probes start after 60 s and repeat every
@@ -1987,6 +2009,24 @@ mod tests {
         std::env::set_var("APITAP_ALLOW_INSECURE_AUTH", "1");
         assert!(super::auth_downgrade_allowed());
         std::env::remove_var("APITAP_ALLOW_INSECURE_AUTH");
+    }
+
+    /// The receive-buffer knob: unset = the 4 MiB default, 0/off leaves the
+    /// kernel default, junk falls back — a typo cannot silently turn the
+    /// bump off (untried-levers inventory #6).
+    #[test]
+    fn recv_buffer_bytes_defaults_disables_and_rejects_junk() {
+        std::env::remove_var("APITAP_RECV_BUF_BYTES");
+        assert_eq!(super::recv_buffer_bytes(), super::RECV_BUF_BYTES);
+        std::env::set_var("APITAP_RECV_BUF_BYTES", "0");
+        assert_eq!(super::recv_buffer_bytes(), 0);
+        std::env::set_var("APITAP_RECV_BUF_BYTES", "off");
+        assert_eq!(super::recv_buffer_bytes(), 0);
+        std::env::set_var("APITAP_RECV_BUF_BYTES", "not-a-number");
+        assert_eq!(super::recv_buffer_bytes(), super::RECV_BUF_BYTES);
+        std::env::set_var("APITAP_RECV_BUF_BYTES", "1048576");
+        assert_eq!(super::recv_buffer_bytes(), 1 << 20);
+        std::env::remove_var("APITAP_RECV_BUF_BYTES");
     }
 
     /// The coalescing knob: unset = 500 µs, 0/off disables (A/B control),
