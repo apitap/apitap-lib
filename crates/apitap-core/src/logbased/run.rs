@@ -1842,6 +1842,34 @@ async fn wait_for_apply(
 /// The apply side: every window lands in units the tenure opens, so an
 /// evicted or winding-down run writes nothing more, and `Tenure::release`
 /// cannot pass a unit still open here.
+/// Close one window's member results in ONE unit at the members' minimum pin
+/// deadline and write their marks — the group-close shape, reused by the
+/// parallel insert-only path so the state advances on the contiguous prefix
+/// (design §14.21 item 1).
+async fn close_prefix_window(
+    t: &Tenure<Dest>,
+    dest: &Dest,
+    members: &[crate::logbased::dest_bq::Member],
+    per: Vec<(u64, Watermark, u64)>,
+    rows_per: &mut [u64],
+    applied_tx: &tokio::sync::watch::Sender<u64>,
+    end: u64,
+) -> Result<()> {
+    let e0 = per.iter().map(|(_, _, e)| *e).min().unwrap_or(0);
+    let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
+    let marks: Vec<Watermark> = per.iter().map(|(_, m, _)| m.clone()).collect();
+    let h = t.open_at(&tables, Some(e0)).await?;
+    t.close(h, marks).await?;
+    for (dt, _, sid) in members {
+        dest.settle(dt, sid, true);
+    }
+    for (i, (n, _, _)) in per.into_iter().enumerate() {
+        rows_per[i] += n;
+    }
+    let _ = applied_tx.send(end);
+    Ok(())
+}
+
 async fn apply_windows(
     tenure: Arc<Tenure<Dest>>,
     src: Option<PgPool>,
@@ -1947,6 +1975,54 @@ async fn apply_windows(
             closed?;
             for (i, n, _, _) in done {
                 rows_per[i] += n;
+            }
+        } else if parallel_apply() && matches!(dest, Dest::Ch(_)) {
+            // Parallel insert-only apply (design §14.21 item 1): versioned
+            // append-only windows may land out of order, so up to `depth`
+            // applies run concurrently and the state advances only on the
+            // contiguous prefix (insert-only replay is idempotent by version,
+            // so a lagging watermark is safe).
+            use futures::stream::StreamExt as _;
+            let depth = window_depth().max(2);
+            let mut seq = 0u64;
+            let mut expected = 0u64;
+            let mut done: std::collections::BTreeMap<u64, (Vec<(u64, Watermark, u64)>, u64)> =
+                std::collections::BTreeMap::new();
+            let mut inflight = futures::stream::FuturesUnordered::new();
+            loop {
+                tokio::select! {
+                    win = win_rx.recv(), if inflight.len() < depth => {
+                        let Some(o) = win else { break };
+                        let id = seq;
+                        seq += 1;
+                        let end = o.id.end();
+                        let sref = src.as_ref();
+                        let mref = &members;
+                        inflight.push(async move {
+                            let mut per = Vec::with_capacity(mref.len());
+                            for (dt, q, sid) in mref.iter() {
+                                per.push(apply_member_pending(t, dt, q, sid, &o, sref).await?);
+                            }
+                            Ok::<_, Error>((id, per, end))
+                        });
+                    }
+                    Some(res) = inflight.next(), if !inflight.is_empty() => {
+                        let (id, per, end) = res?;
+                        done.insert(id, (per, end));
+                        while let Some((per, end)) = done.remove(&expected) {
+                            close_prefix_window(t, dest, &members, per, &mut rows_per, &applied_tx, end).await?;
+                            expected += 1;
+                        }
+                    }
+                }
+            }
+            while let Some(res) = inflight.next().await {
+                let (id, per, end) = res?;
+                done.insert(id, (per, end));
+                while let Some((per, end)) = done.remove(&expected) {
+                    close_prefix_window(t, dest, &members, per, &mut rows_per, &applied_tx, end).await?;
+                    expected += 1;
+                }
             }
         } else if lanes > 1 && members.len() > 1 {
             // A BOUNDED pool of per-table units: `lanes` in flight, the rest
@@ -2266,6 +2342,14 @@ pub(crate) fn follow_secs() -> Option<u64> {
     }
 }
 
+/// `APITAP_PARALLEL_APPLY=1`: insert-only destinations may apply windows
+/// concurrently (versioned append-only rows land out of order safely; the
+/// state advances only on the contiguous prefix). Off by default until the
+/// A/B proves it; the detection wiring comes after.
+fn parallel_apply() -> bool {
+    std::env::var("APITAP_PARALLEL_APPLY").ok().as_deref() == Some("1")
+}
+
 /// How many drain windows may sit between the drain's frontier and the applied
 /// watermark (APITAP_WINDOW_DEPTH, default 1 = the historical shape: one window
 /// applying while the next drains). The flat-scaling measurement pinned the
@@ -2496,6 +2580,19 @@ mod tests {
         assert_eq!(auto_slots_for(0.1, 4), 1);
         assert_eq!(auto_slots_for(8.0, 3), 3);
         assert_eq!(auto_slots_for(2.0, 100), 8);
+    }
+
+    /// The parallel-apply switch: exactly "1" turns it on; anything else is
+    /// off (design §14.21 item 1).
+    #[test]
+    fn parallel_apply_needs_an_explicit_one() {
+        std::env::remove_var("APITAP_PARALLEL_APPLY");
+        assert!(!parallel_apply());
+        std::env::set_var("APITAP_PARALLEL_APPLY", "true");
+        assert!(!parallel_apply());
+        std::env::set_var("APITAP_PARALLEL_APPLY", "1");
+        assert!(parallel_apply());
+        std::env::remove_var("APITAP_PARALLEL_APPLY");
     }
 
     /// The window-depth knob: default 1 (the historical shape), zero/junk
