@@ -1258,3 +1258,16 @@ statement/window/CPU-decode.
    menunggu (dan memecah flat-scaling di >1 core).
 2. **Apply paralel insert-only** — window append-only ber-versi LSN bisa
    di-apply konkuren; state dijarangkan (replay idempoten oleh versi).
+
+### 14.20 Census recv (2026-10-12) — coalescer bekerja; dinding = epoll_wait 9,7 rb/detik
+
+Catch-up dengan coalescer aktif (strace penuh run): **recvfrom 168.316 calls
+(≈29 KB/recv — coalescer BEKERJA, dulu ~5 KB)**; tapi **epoll_wait 2.212.672
+calls ≈ 9.700/detik** — runtime park/wake ~10 rb kali/detik, biaya hop
+pump→channel→drain per frame (temuan "recv 92%" sesi paralel = scheduling,
+bukan I/O). LEG 10,1 jt/228 s = 44,2 rb/s; sys 53,7 s dari 89,6 s CPU.
+
+**Lever 1 konkret = L1b: buang task pump** — drain memiliki socket langsung
+(pola `co_win`/`co_refill` yang sudah teruji di plane COPY), baca frame inline
+tanpa channel dan tanpa wake per frame; target memangkas ~10 rb epoll_wait/detik
+dan hop-nya. Setelah itu regime B (reader besar) dan apply paralel insert-only.
