@@ -76,12 +76,20 @@ fn run_cdc<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    let workers = match cpu_quota_cores() {
+    // `APITAP_RUNTIME_WORKERS` overrides the quota-derived choice (the A/B
+    // knob for re-testing regime B at the half-core tier after L1b changed
+    // the hand-off refcount granularity); 1 = current_thread, as before.
+    let workers = apitap_core::runtime_workers_override().or_else(|| match cpu_quota_cores() {
         Some(c) if c >= 1.75 => Some((c.round() as usize).saturating_mul(2).max(2)),
         Some(c) if c >= 1.0 => Some(2),
         _ => None,
-    };
+    });
     match workers {
+        Some(1) | None => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio current_thread runtime")
+            .block_on(fut),
         Some(n) => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
             .enable_all()

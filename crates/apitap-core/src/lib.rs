@@ -94,6 +94,16 @@ impl std::str::FromStr for Mode {
     }
 }
 
+/// `APITAP_RUNTIME_WORKERS`: unset/junk/0 -> `None` (the quota decides);
+/// `1` -> `Some(1)` (current_thread); N -> N worker threads. Exists so the
+/// regime-B question can be re-measured at the half-core tier.
+pub fn runtime_workers_override() -> Option<usize> {
+    std::env::var("APITAP_RUNTIME_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+}
+
 /// Tuning for [`transfer`]. `Default` = auto: parallelism from the CPU count and the
 /// cgroup memory budget, 4 MiB send coalescing, cursor auto-detected from the table's
 /// integer primary key.
@@ -565,4 +575,24 @@ pub async fn transfer_schema(
         ));
     }
     pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::Schema(schema), opts).await
+}
+
+#[cfg(test)]
+mod runtime_workers_tests {
+    /// The runtime-workers knob: unset/junk/0 -> None (quota decides), 1 ->
+    /// Some(1) (current_thread), N -> N (regime B re-test at half core).
+    #[test]
+    fn runtime_workers_override_is_none_unless_positive() {
+        std::env::remove_var("APITAP_RUNTIME_WORKERS");
+        assert_eq!(super::runtime_workers_override(), None);
+        std::env::set_var("APITAP_RUNTIME_WORKERS", "0");
+        assert_eq!(super::runtime_workers_override(), None);
+        std::env::set_var("APITAP_RUNTIME_WORKERS", "junk");
+        assert_eq!(super::runtime_workers_override(), None);
+        std::env::set_var("APITAP_RUNTIME_WORKERS", "1");
+        assert_eq!(super::runtime_workers_override(), Some(1));
+        std::env::set_var("APITAP_RUNTIME_WORKERS", "2");
+        assert_eq!(super::runtime_workers_override(), Some(2));
+        std::env::remove_var("APITAP_RUNTIME_WORKERS");
+    }
 }
