@@ -1370,3 +1370,16 @@ berikutnya harus diukur **n≥3 per arm** (±40 mnt/set) atau lewat counter
 CPU/change yang sudah ada, bukan rate tunggal. Sisa L5/L6 (arena window,
 recycle buffer) diperkirakan berukuran sama (1–2 %) — nilainya untuk
 menaikkan margin per-core, bukan lompatan ke 120 rb/s di VPS ini.
+
+### 14.25 Koreksi: angka 14.24 mengukur biner pra-L3/L4; kalibrasi noise n=5 (2026-10-12)
+
+Ketahuan saat probe fase: wheel di `gate-venv` masih build `wheel61s`
+(commit `c9a104a`) — commit L3 (`40b5fcd`) dan L4 (`fccc73f`) BELUM pernah
+masuk wheel. Artinya lima "arm" 46,3/49,2/44,0/47,2/47,0 rb/s adalah
+**biner yang sama**: itu kalibrasi noise yang bagus (rentang 44,0–49,2 =
+**±5,5 %** di sekitar 46,7; CPU/change 7,12–7,80 µs, mean 7,45), tapi
+**bukan** pengukuran L3/L4. Klaim efek L3/L4 di 14.24 dibatalkan; efek
+sesungguhnya diukur ulang dengan wheel baru berisi L3+L4 (n=3, arm
+`l34a..c`). Catatan tambahan: output debug `[drain]`/`[log_based]` TIDAK
+muncul di log rig (`DEBUG=1` terjawab 0 baris) — profil fase harus lewat
+`docker run` manual dengan `APITAP_DEBUG=1`, atau pipa rig diperbaiki dulu.
