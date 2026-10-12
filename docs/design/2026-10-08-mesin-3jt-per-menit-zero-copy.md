@@ -1469,3 +1469,17 @@ ada), #6 ✅ terukur netral s/d +2 %, #3 ❌ dilewati (sub-noise + dep baru),
 #5/#7/#8 tersisa tanpa bukti signal di rig ini, **#2 (blocking reader)** =
 satu-satunya lever bersisa ber-signal (~1–3 %, butuh desain cancel-safety).
 Plateau rig: ~48–49 rb/s @0,34 core, CPU/change ~7,0 µs.
+
+### 14.28 #2 blocking reader DIUKUR: regresi → di-revert (2026-10-12)
+
+A/B interleaved n=3 (wheel sama, 0,5 core): **blocking = 47,7 rb/s @0,484
+core (sys 95 dtk) vs async = 48,4 rb/s @0,345 core (sys 45 dtk)** — rate
+−1,4 %, CPU +40 %, sys ×2,1, cap_frac 0,97 (mentok kuota). Penyebab:
+copy kedua per byte (kernel→buffer→Bytes), futex/channel per chunk, dan
+dua thread berebut kuota 0,5 core → CFS throttling. **Angka strace
+7 µs/epoll_wait itu inflated ptrace** — biaya riil epoll churn kecil dan
+tidak bisa dibeli kembali dengan hop thread. Ini konsisten dengan temuan
+liburing #536 (streaming: epoll > io_uring). Fitur di-revert (`git revert`),
+rig forward ikut di-revert. **Inventaris §14.26 tuntas: #1✅ #2❌(regresi)
+#3❌(sub-noise) #4✅ #5/#7/#8 (tanpa bukti signal) #6✅(netral).** Plateau
+rig final: ~48–49 rb/s @0,34 core, CPU/change ~7,0 µs.
