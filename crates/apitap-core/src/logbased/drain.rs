@@ -74,7 +74,22 @@ struct RelState {
 /// "row event for unknown relation".
 #[derive(Default)]
 pub(crate) struct DrainSession {
-    rels: HashMap<u32, RelState>,
+    /// Dense relation slots (L4, design §4.2): pgoutput names a relation by
+    /// oid on every row event, and the old registry answered with an
+    /// `Arc<str>` clone per event plus a SipHash lookup — and flush looked
+    /// the same table up by name again. Every row event now resolves
+    /// `oid → u16` once (behind a last-rel cache) and every per-table
+    /// structure is one `Vec` index away.
+    rels: HashMap<u32, u16>,
+    /// Table name → slot: a dropped-and-recreated table announces a NEW oid
+    /// under the SAME name and reuses the slot its window state lives in.
+    slot_by_name: HashMap<Arc<str>, u16>,
+    /// Per-table state, indexed by slot; only grows when a new table
+    /// appears.
+    slots: Vec<RelState>,
+    /// The last (oid, slot) resolved: the hot stream is one table, and this
+    /// turns the per-row map lookup into one compare.
+    last_rel: Option<(u32, u16)>,
     /// Column type OIDs by rel_id (every Relation seen, tracked or not) —
     /// the schema `pgoutput::decode` needs to render `binary 'true'` tuples
     /// back to text. Unused (empty lookups) on text-mode streams.
@@ -96,13 +111,38 @@ pub(crate) struct DrainSession {
     /// (sub)transaction that produced it — pgoutput prefixes every streamed
     /// change with that, and it is the only way to undo a savepoint rollback
     /// instead of refusing it.
-    streams: HashMap<u32, Vec<(Arc<str>, StreamOp, u32)>>,
+    streams: HashMap<u32, Vec<(u16, StreamOp, u32)>>,
     /// Bytes held by `streams`. It lives on the SESSION and not in `drain`'s
     /// locals because the buffers do: a streamed transaction survives a
     /// window boundary, and a per-call counter forgets it the moment the next
     /// drain starts. The memory it holds does not go anywhere, so the budget
     /// that is supposed to bound this process's RSS has to keep counting it.
     stream_bytes: usize,
+}
+
+impl DrainSession {
+    /// Dense slot (L4, §4.2) for a table name. A recreated table announces a
+    /// new oid under the same name and must land in the slot its window
+    /// state (collapsers, changelogs) already lives in.
+    fn rel_slot(&mut self, table: &str, tracked: bool) -> Result<u16> {
+        let slot = match self.slot_by_name.get(table) {
+            Some(&s) => s,
+            None => {
+                let s = u16::try_from(self.slots.len()).map_err(|_| {
+                    Error::Transfer(
+                        "log_based: more than 65535 distinct tables in one session".into(),
+                    )
+                })?;
+                self.slot_by_name.insert(Arc::from(table), s);
+                self.slots.push(RelState { table: Arc::from(table), tracked });
+                s
+            }
+        };
+        // A re-announce may flip `tracked` (the layout followed a column
+        // change); the slot itself never changes.
+        self.slots[usize::from(slot)].tracked = tracked;
+        Ok(slot)
+    }
 }
 
 /// Truthful residency: a buffered row pins its WHOLE frame plus the range
@@ -125,8 +165,9 @@ fn op_bytes(op: &StreamOp) -> usize {
     }
 }
 
-/// One transaction's row ops, in WAL order, each with its table.
-type TxOps = Vec<(Arc<str>, StreamOp)>;
+/// One transaction's row ops, in WAL order, each with its relation slot
+/// (L4, §4.2 — the slot is the table identity now, not an `Arc<str>`).
+type TxOps = Vec<(u16, StreamOp)>;
 
 /// Buffered op of a streamed (not-yet-committed) transaction.
 pub(crate) enum StreamOp {
@@ -168,8 +209,10 @@ pub(crate) async fn drain(
 ) -> Result<DrainOutcome> {
     let mut stop_line = stop_line;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
-    let mut collapsers: HashMap<String, Collapser> = HashMap::new();
-    let mut changelogs: HashMap<String, Changes> = HashMap::new();
+    // Dense per-slot window state (L4, §4.2): indexed by relation slot, so
+    // the flush costs no per-op hash and no table-name clone.
+    let mut collapsers: Vec<Option<Collapser>> = Vec::new();
+    let mut changelogs: Vec<Option<Changes>> = Vec::new();
     // Current transaction's buffered row ops — flushed at Commit, discarded
     // if the drain aborts mid-transaction. `tx_bytes` is the current
     // transaction's own charge against the hard cap (system review G0.1).
@@ -205,7 +248,7 @@ pub(crate) async fn drain(
     if let Some((ops, e)) = sess.carry.take() {
         buf_bytes += ops.iter().map(|(_, o)| op_bytes(o)).sum::<usize>();
         let t_ph = std::time::Instant::now();
-        flush_ops(ops, &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+        flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog)?;
         t_flush += t_ph.elapsed();
         end_lsn = e;
         carried_to_stop = e >= stop_line;
@@ -330,7 +373,7 @@ pub(crate) async fn drain(
                         break;
                     }
                     let t_ph = std::time::Instant::now();
-                    flush_ops(tx_buf.drain(..), &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+                    flush_ops(tx_buf.drain(..), sess, &mut collapsers, &mut changelogs, changelog)?;
                     t_flush += t_ph.elapsed();
                     tx_bytes = 0;
                     end_lsn = e;
@@ -361,7 +404,7 @@ pub(crate) async fn drain(
                     }
                     buf_bytes += n;
                     let t_ph = std::time::Instant::now();
-                    flush_ops(ops, &mut collapsers, &mut changelogs, &sess.layouts, changelog)?;
+                    flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog)?;
                     t_flush += t_ph.elapsed();
                     end_lsn = e;
                     if e >= stop_line {
@@ -420,6 +463,7 @@ pub(crate) async fn drain(
                     let table = format!("{}.{}", r.namespace, r.name);
                     let layout = Layout::from_relation(&r, key_cols)?;
                     let tracked = layout.is_some();
+                    let slot = sess.rel_slot(&table, tracked)?;
                     if let Some(new) = layout {
                         // pgoutput re-sends a Relation on every relcache
                         // invalidation, and most change nothing (an ANALYZE,
@@ -427,14 +471,17 @@ pub(crate) async fn drain(
                         // the window's bodies were built with, and only then
                         // does a window holding a body of the table end.
                         if sess.layouts.get(&table).map_or(true, |old| **old != new) {
-                            relayout |= collapsers.contains_key(&table) || changelogs.contains_key(&table);
+                            let i = usize::from(slot);
+                            relayout |= collapsers.get(i).is_some_and(|c| c.is_some())
+                                || changelogs.get(i).is_some_and(|c| c.is_some());
                             sess.layouts.insert(table.clone(), Arc::new(new));
                         }
                     }
-                    sess.rels.insert(r.rel_id, RelState { table: table.as_str().into(), tracked });
+                    sess.rels.insert(r.rel_id, slot);
+                    sess.last_rel = Some((r.rel_id, slot));
                 }
                 PgoMessage::Insert { rel_id, new } => {
-                    if let Some(t) = tracked(&sess.rels, rel_id)? {
+                    if let Some(t) = tracked(sess, rel_id)? {
                         decoded += 1;
                         let n = cells_bytes(&new);
                         let op = StreamOp::Insert(new);
@@ -442,7 +489,7 @@ pub(crate) async fn drain(
                             Some(x) => {
                                 sess.stream_bytes += n;
                                 if sess.stream_bytes > tx_limit {
-                                    return Err(tx_too_big(&t, sess.stream_bytes, tx_limit));
+                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
                                 }
                                 sess.streams
                                     .get_mut(&x)
@@ -453,7 +500,7 @@ pub(crate) async fn drain(
                                 buf_bytes += n;
                                 tx_bytes += n;
                                 if tx_bytes > tx_limit {
-                                    return Err(tx_too_big(&t, tx_bytes, tx_limit));
+                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, tx_bytes, tx_limit));
                                 }
                                 tx_buf.push((t, op));
                             }
@@ -461,7 +508,7 @@ pub(crate) async fn drain(
                     }
                 }
                 PgoMessage::Update { rel_id, old, new } => {
-                    if let Some(t) = tracked(&sess.rels, rel_id)? {
+                    if let Some(t) = tracked(sess, rel_id)? {
                         decoded += 1;
                         let old = old.map(|o| o.tuple);
                         let n = cells_bytes(&new) + old.as_ref().map_or(0, cells_bytes);
@@ -470,7 +517,7 @@ pub(crate) async fn drain(
                             Some(x) => {
                                 sess.stream_bytes += n;
                                 if sess.stream_bytes > tx_limit {
-                                    return Err(tx_too_big(&t, sess.stream_bytes, tx_limit));
+                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
                                 }
                                 sess.streams
                                     .get_mut(&x)
@@ -481,7 +528,7 @@ pub(crate) async fn drain(
                                 buf_bytes += n;
                                 tx_bytes += n;
                                 if tx_bytes > tx_limit {
-                                    return Err(tx_too_big(&t, tx_bytes, tx_limit));
+                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, tx_bytes, tx_limit));
                                 }
                                 tx_buf.push((t, op));
                             }
@@ -489,7 +536,7 @@ pub(crate) async fn drain(
                     }
                 }
                 PgoMessage::Delete { rel_id, old } => {
-                    if let Some(t) = tracked(&sess.rels, rel_id)? {
+                    if let Some(t) = tracked(sess, rel_id)? {
                         decoded += 1;
                         let n = cells_bytes(&old.tuple);
                         let op = StreamOp::Delete(old.tuple);
@@ -497,7 +544,7 @@ pub(crate) async fn drain(
                             Some(x) => {
                                 sess.stream_bytes += n;
                                 if sess.stream_bytes > tx_limit {
-                                    return Err(tx_too_big(&t, sess.stream_bytes, tx_limit));
+                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
                                 }
                                 sess.streams
                                     .get_mut(&x)
@@ -508,7 +555,7 @@ pub(crate) async fn drain(
                                 buf_bytes += n;
                                 tx_bytes += n;
                                 if tx_bytes > tx_limit {
-                                    return Err(tx_too_big(&t, tx_bytes, tx_limit));
+                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, tx_bytes, tx_limit));
                                 }
                                 tx_buf.push((t, op));
                             }
@@ -517,7 +564,7 @@ pub(crate) async fn drain(
                 }
                 PgoMessage::Truncate { rel_ids, .. } => {
                     for rid in rel_ids {
-                        if let Some(t) = tracked(&sess.rels, rid)? {
+                        if let Some(t) = tracked(sess, rid)? {
                             let op = StreamOp::Truncate;
                             match in_stream {
                                 Some(x) => sess.streams.get_mut(&x).expect("stream open").push((
@@ -537,6 +584,32 @@ pub(crate) async fn drain(
     }
 
     let t_seal = std::time::Instant::now();
+    // The window's bodies leave by table name (the destinations speak
+    // names); the dense slots are the drain's internal form. One String per
+    // active table at the seal is nothing next to the per-op hashing the
+    // slots removed from the window.
+    let collapsers: HashMap<String, Collapser> = sess
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, st)| {
+            collapsers
+                .get_mut(i)
+                .and_then(Option::take)
+                .map(|c| (st.table.to_string(), c))
+        })
+        .collect();
+    let changelogs: HashMap<String, Changes> = sess
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, st)| {
+            changelogs
+                .get_mut(i)
+                .and_then(Option::take)
+                .map(|c| (st.table.to_string(), c))
+        })
+        .collect();
     let outcome = DrainOutcome {
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
         id: WindowId::new(start_lsn, end_lsn),
@@ -570,23 +643,29 @@ fn layout_of(layouts: &HashMap<String, Arc<Layout>>, table: &str) -> Result<Arc<
 
 /// Land one committed transaction's buffered ops in the per-window
 /// collapsers (lazy: the Relation may have arrived in an earlier window —
-/// the session's layouts remember).
+/// the session's layouts remember). Ops carry dense slots (L4, §4.2), so
+/// neither the op's table nor its collapser costs a hash.
 fn flush_ops(
-    ops: impl IntoIterator<Item = (Arc<str>, StreamOp)>,
-    collapsers: &mut HashMap<String, Collapser>,
-    changelogs: &mut HashMap<String, Changes>,
-    layouts: &HashMap<String, Arc<Layout>>,
+    ops: impl IntoIterator<Item = (u16, StreamOp)>,
+    sess: &DrainSession,
+    collapsers: &mut Vec<Option<Collapser>>,
+    changelogs: &mut Vec<Option<Changes>>,
     changelog: bool,
 ) -> Result<()> {
-    for (table, op) in ops {
+    for (slot, op) in ops {
+        let i = usize::from(slot);
+        let table = &sess.slots[i].table;
         // changelog=true captures every operation verbatim; the collapser is
         // bypassed entirely (it exists to reduce a window to one image per key,
         // which is the opposite of an audit trail).
         if changelog {
-            if !changelogs.contains_key(table.as_ref()) {
-                changelogs.insert(table.to_string(), Changes::new(layout_of(layouts, &table)?));
+            if changelogs.len() <= i {
+                changelogs.resize_with(i + 1, || None);
             }
-            let c = changelogs.get_mut(table.as_ref()).expect("changelog just ensured");
+            if changelogs[i].is_none() {
+                changelogs[i] = Some(Changes::new(layout_of(&sess.layouts, table)?));
+            }
+            let c = changelogs[i].as_mut().expect("changelog just ensured");
             match op {
                 StreamOp::Insert(row) => c.insert(row),
                 StreamOp::Update(old, row) => c.update(old.as_ref(), row),
@@ -595,10 +674,13 @@ fn flush_ops(
             }
             continue;
         }
-        if !collapsers.contains_key(table.as_ref()) {
-            collapsers.insert(table.to_string(), Collapser::new(layout_of(layouts, &table)?));
+        if collapsers.len() <= i {
+            collapsers.resize_with(i + 1, || None);
         }
-        let c = collapsers.get_mut(table.as_ref()).expect("collapser just ensured");
+        if collapsers[i].is_none() {
+            collapsers[i] = Some(Collapser::new(layout_of(&sess.layouts, table)?));
+        }
+        let c = collapsers[i].as_mut().expect("collapser just ensured");
         match op {
             StreamOp::Insert(row) => c.insert(row)?,
             StreamOp::Update(old, row) => c.update(old.as_ref(), row)?,
@@ -609,20 +691,56 @@ fn flush_ops(
     Ok(())
 }
 
-fn tracked(rels: &HashMap<u32, RelState>, rel_id: u32) -> Result<Option<Arc<str>>> {
-    match rels.get(&rel_id) {
-        Some(st) if st.tracked => Ok(Some(st.table.clone())),
-        Some(_) => Ok(None),
-        None => Err(Error::Transfer(format!(
-            "log_based: row event for unknown relation {rel_id} — pgoutput \
-             must send Relation first; protocol desync?"
-        ))),
-    }
+/// Resolve a row event's relation to its dense slot (L4, §4.2). The
+/// last-rel cache is a pure win because one table's stream is the hot case;
+/// a miss costs one u32 hash. The oid must be known either way, or the
+/// stream is desynced — an untracked table still resolves and reports
+/// `None`.
+fn tracked(sess: &mut DrainSession, rel_id: u32) -> Result<Option<u16>> {
+    let slot = match sess.last_rel {
+        Some((oid, slot)) if oid == rel_id => slot,
+        _ => {
+            let slot = *sess.rels.get(&rel_id).ok_or_else(|| {
+                Error::Transfer(format!(
+                    "log_based: row event for unknown relation {rel_id} — pgoutput \
+                     must send Relation first; protocol desync?"
+                ))
+            })?;
+            sess.last_rel = Some((rel_id, slot));
+            slot
+        }
+    };
+    Ok(sess.slots[usize::from(slot)].tracked.then_some(slot))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L4 (§4.2): relations resolve to dense slots — a repeat resolution
+    /// rides the last-rel cache, an unknown oid is a protocol error, an
+    /// untracked table reports None, and a recreated table (new oid, same
+    /// name) reuses its slot so name-scoped window state keeps working.
+    #[test]
+    fn relation_slots_are_dense_cached_and_name_stable() {
+        let mut sess = DrainSession::default();
+        assert_eq!(sess.rel_slot("public.t", true).unwrap(), 0);
+        assert_eq!(sess.rel_slot("public.u", false).unwrap(), 1);
+        assert_eq!(sess.rel_slot("public.t", true).unwrap(), 0);
+        sess.rels.insert(100, 0);
+        sess.rels.insert(101, 1);
+        assert_eq!(tracked(&mut sess, 100).unwrap(), Some(0));
+        // Cache hit on a repeat: with the map emptied after the first
+        // resolution, only the cache can answer.
+        sess.rels.clear();
+        assert_eq!(tracked(&mut sess, 100).unwrap(), Some(0));
+        sess.rels.insert(101, 1);
+        assert_eq!(tracked(&mut sess, 101).unwrap(), None);
+        assert!(tracked(&mut sess, 999).is_err());
+        // Recreated table: new oid, same name, same slot.
+        assert_eq!(sess.rel_slot("public.t", true).unwrap(), 0);
+        assert_eq!(sess.slots.len(), 2);
+    }
 
     /// The knob may shorten the wait, but never removes it: zero and junk
     /// must fall back to the default or a half-open socket parks forever
