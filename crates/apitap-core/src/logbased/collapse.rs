@@ -28,6 +28,38 @@ use std::sync::Arc;
 /// NULLs are illegal in identity keys (Postgres enforces NOT NULL on them).
 pub(crate) type Key = Vec<Vec<u8>>;
 
+/// The map's key: a single-integer identity short-circuits to an i64 — the
+/// canonical production shape — while everything else keeps the owned column
+/// texts. The fast path saves two allocations per change (system review
+/// 2026-10-07 §5.3, L3).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum K {
+    I64(i64),
+    V(Key),
+}
+
+impl K {
+    /// The owned column-texts form that residue ops and DeleteSet entries
+    /// need; the i64 path pays one small allocation, and only for a delete
+    /// or a masked tail op.
+    fn materialize(self) -> Key {
+        match self {
+            K::I64(v) => vec![v.to_string().into_bytes()],
+            K::V(k) => k,
+        }
+    }
+}
+
+/// The single-int fast path's parser. The fast path is only sound when
+/// materialising the i64 reproduces the source text byte for byte, so
+/// `+7`, `007` and whitespace fall back to the owned form (which is always
+/// correct) — the round trip is guarded, not assumed.
+fn parse_i64_key(t: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(t).ok()?;
+    let v: i64 = s.parse().ok()?;
+    (v.to_string().as_bytes() == t).then_some(v)
+}
+
 /// The keys whose destination rows must go, each once, in no particular
 /// order. A set by construction: `Collapser::finish` reads it off the key map,
 /// where a key can only be once. It used to be a Vec pushed at every delete, so
@@ -135,7 +167,7 @@ pub(crate) struct Collapser {
     /// foldhash: the keys are our own PK bytes from a database we connect
     /// to — hashDoS is not in the threat model, and SipHash was 6.5% of the
     /// capped my→ch drain's samples.
-    map: HashMap<Key, Slot, foldhash::fast::RandomState>,
+    map: HashMap<K, Slot, foldhash::fast::RandomState>,
     /// Row images by insertion order. The KEY is not stored here — an earlier
     /// version kept `(Key, Vec<Cell>)` and `finish()` threw the key away,
     /// which cost a clone per upsert for nothing.
@@ -158,10 +190,17 @@ impl Collapser {
     }
 
     /// Key of a FULL row tuple (new image) — from the key column indices.
-    fn key_of_row(&self, row: &Tuple) -> Result<Key> {
-        self.layout
-            .key_idx()
-            .iter()
+    /// A single-int identity takes the i64 fast path (L3, §5.3).
+    fn key_of_row(&self, row: &Tuple) -> Result<K> {
+        let idx = self.layout.key_idx();
+        if idx.len() == 1 {
+            if let Some(Cellv::Text(t)) = row.get(idx[0]) {
+                if let Some(v) = parse_i64_key(t) {
+                    return Ok(K::I64(v));
+                }
+            }
+        }
+        idx.iter()
             .map(|&i| match row.get(i) {
                 // Key stays owned (`Vec<Vec<u8>>`) on purpose: a Bytes key
                 // would pin the whole frame it was carved from, and a
@@ -181,13 +220,14 @@ impl Collapser {
                         .into(),
                 )),
             })
-            .collect()
+            .collect::<Result<Key>>()
+            .map(K::V)
     }
 
     /// Key of an OLD image. `K` images carry ONLY key columns as Text, with
     /// non-key columns Null; `O` (FULL) images carry everything — either
     /// way the key columns are at the same indices.
-    fn key_of_old(&self, old: &Tuple) -> Result<Key> {
+    fn key_of_old(&self, old: &Tuple) -> Result<K> {
         self.key_of_row(old)
     }
 
@@ -244,8 +284,8 @@ impl Collapser {
                     // this move rather than in the set phase before it — where
                     // this UPDATE would pick it up and move the wrong row.
                     self.residue.push(ResidueOp::Rekey {
-                        old_key: old_key.clone(),
-                        new_key: new_key.clone(),
+                        old_key: old_key.clone().materialize(),
+                        new_key: new_key.clone().materialize(),
                         row: row.to_cells(),
                     });
                     // A set-phase upsert already queued for the old key stays
@@ -273,7 +313,7 @@ impl Collapser {
                     // ordered tail. The key is only cloned on the masked
                     // path, where the op itself must carry it.
                     if toast {
-                        let key = e.key().clone();
+                        let key = e.key().clone().materialize();
                         self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
                     } else {
                         self.residue.push(ResidueOp::Upsert { row: row.to_cells() });
@@ -293,14 +333,14 @@ impl Collapser {
                     // key goes sticky. A pending SET-phase upsert stays where
                     // it is (phases run before the tail — correct order), and
                     // so does a pending delete.
-                    let key = e.key().clone();
+                    let key = e.key().clone().materialize();
                     self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
                     e.insert(Slot::Residue { del: slot.del() });
                 }
             },
             Entry::Vacant(e) => {
                 if toast {
-                    let key = e.key().clone();
+                    let key = e.key().clone().materialize();
                     self.residue.push(ResidueOp::MaskedUpdate { key, row: row.to_cells() });
                     e.insert(Slot::Residue { del: false });
                 } else {
@@ -333,11 +373,11 @@ impl Collapser {
     /// A delete, and the old-identity kill on a PK-changing update.
     /// Entry-shaped like the rest; a residue-slotted key follows the ordered
     /// tail.
-    fn put_delete(&mut self, key: Key) {
+    fn put_delete(&mut self, key: K) {
         match self.map.entry(key) {
             Entry::Occupied(mut e) => match *e.get() {
                 Slot::Residue { .. } => {
-                    let key = e.key().clone();
+                    let key = e.key().clone().materialize();
                     self.residue.push(ResidueOp::Delete { key });
                 }
                 Slot::Upsert { seq, .. } => {
@@ -362,7 +402,8 @@ impl Collapser {
     fn finish(self) -> Collapsed {
         // One pass over the key map at the window's end: no per-event cost,
         // and each deleted key moves out instead of being cloned at its delete.
-        let deletes = DeleteSet(self.map.into_iter().filter(|(_, s)| s.del()).map(|(k, _)| k).collect());
+        let deletes =
+            DeleteSet(self.map.into_iter().filter(|(_, s)| s.del()).map(|(k, _)| k.materialize()).collect());
         Collapsed {
             deletes,
             upserts: self.upserts.into_iter().flatten().collect(),
@@ -371,6 +412,23 @@ impl Collapser {
             events: self.events,
         }
     }
+}
+
+/// The single-int fast path (L3): canonical integer text parses; anything
+/// whose i64 round-trip differs — `+7`, leading zeros, whitespace, junk,
+/// overflow — falls back, because materialising must be byte-exact.
+#[test]
+fn only_canonical_integer_text_takes_the_u64_path() {
+    assert_eq!(parse_i64_key(b"42"), Some(42));
+    assert_eq!(parse_i64_key(b"-7"), Some(-7));
+    assert_eq!(parse_i64_key(b"0"), Some(0));
+    assert_eq!(parse_i64_key(b"+7"), None);
+    assert_eq!(parse_i64_key(b"007"), None);
+    assert_eq!(parse_i64_key(b" 42"), None);
+    assert_eq!(parse_i64_key(b"junk"), None);
+    assert_eq!(parse_i64_key(b"99999999999999999999"), None);
+    assert_eq!(K::I64(42).materialize(), vec![b"42".to_vec()]);
+    assert_eq!(K::I64(-7).materialize(), vec![b"-7".to_vec()]);
 }
 
 /// Random windows for the property tests here and in `resolve.rs`: any mix of
