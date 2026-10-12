@@ -1214,3 +1214,26 @@ grup 10-tabel tetap di kelas ~49 rb/s offered — sama dengan single-table.
 Kesimpulan gerakan: **kedua jalur di kelas 3 jt/menit @0,5 core, dengan batas
 atas terukur** — PG 52,7 rb/s delivered (slots=2), MySQL ~49–55 rb/s. Di atas
 itu butuh kerja struktural P3 (tugas sesi paralel).
+
+### 14.18 P3 depth diukur (2026-10-12) — depth saja tidak cukup; lever = apply paralel insert-only
+
+`APITAP_WINDOW_DEPTH` (drain boleh berlari `depth` window di depan apply;
+default 1 = bentuk lama). Matriks catch-up PG + MySQL, wheel 0.61.0+depth:
+
+| arm | rate sustained | CPU |
+|---|---|---|
+| PG 0,5 core, D=1 | 44,1 / 43,1 rb/s | 0,34 core (68%) |
+| PG 0,5 core, D=4 | 41,5 / 40,8 rb/s (−5%) | 0,34 |
+| PG 1 core, D=4 | 42,4 / 44,7 rb/s — **flat tetap** | 0,41 |
+| MySQL 0,5 core, D=4 | 46,3 rb/s (50 rb offered, caught up) | 0,41 |
+
+**Depth saja tidak memecah flat-scaling**: `apply_windows` tetap memproses
+window satu per satu; rantai statement CH per window (kt→delete→insert→state,
+~130 ms) tidak memendek dengan mengantre lebih dalam.
+
+**Lever yang benar (dari hasil ini):** di mode insert-only rantai tinggal
+INSERT + state, dan karena append-only ber-versi LSN, **window bisa di-apply
+konkuren** (tak ada delete yang mengikat urutan antar-window) dan **state write
+bisa dijarangkan** (replay insert-only idempoten oleh versi). Itu P3 slice
+berikutnya menuju 120 rb/s — knob depth dipertahankan (default 1, nol dampak;
+berguna setelah apply paralel).
