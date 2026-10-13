@@ -1503,3 +1503,25 @@ mesin; apa pun sebabnya, tidak ada bukti kemenangan di box ini → **tidak
 di-ship** (repo tetap generik + glibc; tak ada perubahan kode dari pass ini).
 Pelajaran: pada kelas VPS ini, tuning flag/allocator masuk pita noise-negatif
 — plafon ~48–49 rb/s @0,34 core bertahan sebagai angka final rig.
+
+### 14.30 Profil perf (user+sys): 15% habis di task-switch/park (2026-10-12)
+
+`perf record -F 499 -g` 12 dtk pada drain (0,5 core, 1734 sampel):
+
+| item | % | jalur |
+|---|---|---|
+| **finish_task_switch** | **14,5** | ← ep_poll ← schedule_hrtimeout_range (park ber-timer via `epoll_wait`) |
+| epoll_wait total (children) | 26,5 | termasuk ep_send_events 3,2 |
+| libc 0x9a72e (syscall frame) | 5,2 | tak tersimbolkan (clock/syscall wrapper) |
+| `pgoutput::Reader::tuple` | 3,2 | decode tuple |
+| closure drain | 2,9 | loop utama |
+| `rep_movs_alternative` | 2,4 | copy recvfrom (kernel) |
+
+**Diagnosis: ~15 % CPU = biaya park/wake runtime tokio** (setiap park
+ber-timer = hrtimer + context switch ~2–5 µs; ≈9 rb park/dtk, satu per ~5
+change). Ini bukan I/O copy (recv 2,4 %) dan bukan decode (3,2 %) — ini
+_overhead arsitektur async_ di skala 48 rb change/dtk pada satu thread.
+Sweep env knob park (COALESCE 0/2000/5000 vs 500) dijalankan untuk mengukur
+apakah timer coalescer memicu sebagian besar park; bila tidak, sisa jalan
+adalah mengganti pola park (bukan rewrite transport, yang sudah terbukti
+regresi di §14.28).
