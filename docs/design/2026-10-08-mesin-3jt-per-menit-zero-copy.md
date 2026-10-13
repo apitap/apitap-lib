@@ -1559,3 +1559,18 @@ Uji: `should_coalesce()` dipanggil di SETIAP refill (n=2 @0,5 core):
 pada laju arrival yang sudah seimbang; park yang tersisa bukan penyebab
 dominan. Perubahan di-revert (uncommitted), default §14.31 (5 ms empty-only)
 tetap. **Angka final rig: ~6,8 µs/change, ~48 rb/s @0,33–0,35 core.**
+
+### 14.33 Hipotesis spin koneksi CH (`epoll_wait` 10 rb/s) DIUJI — netral (2026-10-12)
+
+Probe fdinfo mengungkap driver tokio spin ~10 rb `epoll_wait`/dtk pada fd 8
+(socket ke ClickHouse :8124, `epoll_wait(fd3, EPOLLIN|EPOLLOUT…) = 1` dengan
+timeout 5→1 ms berulang). Hipotesis: koneksi pooled-idle hyper tidak
+dikonsumsi. Uji `APITAP_HTTP_POOL_IDLE_MS` (0 = tanpa reuse vs 5000 =
+default): **6,94 vs 6,94 µs/change — identik**. Artinya spin itu tidak
+membakar CPU nyata; "14% finish_task_switch" di perf sebagian besar atribusi
+scheduler atas konteks switch proses yang memang idle (0,33 dari 0,5 kuota),
+bukan overhead yang bisa dipanen. Knob tetap ada (default 5000, berguna
+untuk tuning TLS/remote) dengan test+RED; rig mem-forward-nya.
+**Batas akhir yang konsisten: ~6,9 µs/change, ~48 rb/s @0,33 core di rig ini
+— tiga serangan berturut-turut (coalescer lanjutan, pool, blocking reader)
+menghasilkan satu win (default 5 ms, −6%) dan dua netral/negatif.**
