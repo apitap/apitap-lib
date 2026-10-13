@@ -1543,3 +1543,19 @@ window kosong), sweep `APITAP_READ_COALESCE_US` @0,5 core:
 sebagai penjaga kontrak, RED 1/1). Latensi tambahan ≤5 ms hanya saat window
 kosong — jauh di bawah `wal_sender_timeout/2`. Ini kemenangan pertama di
 arsitektur async sendiri (bukan lever mikro): −5,7 s/d −7,1 % CPU/change.
+
+### 14.32 Always-coalesce (setiap refill): diukur — tidak menang, di-revert (2026-10-12)
+
+Menyusul §14.31, hipotesis lanjutan: karena tail parsial hampir selalu ada,
+gate "empty-only" membuat refill tanpa sleep → park per batch kedatangan.
+Uji: `should_coalesce()` dipanggil di SETIAP refill (n=2 @0,5 core):
+
+| varian | CPU/change | rate |
+|---|---|---|
+| empty-only 5 ms (defA/B, §14.31) | **6,85 / 6,74** | 48,2 / 47,2 |
+| always-coalesce 5 ms (defC/D) | 7,15 / 6,96 | 45,7 / 47,0 |
+
+**+3,9 % (lebih buruk)** — sleep tiap refill menambah deadtime read-ahead
+pada laju arrival yang sudah seimbang; park yang tersisa bukan penyebab
+dominan. Perubahan di-revert (uncommitted), default §14.31 (5 ms empty-only)
+tetap. **Angka final rig: ~6,8 µs/change, ~48 rb/s @0,33–0,35 core.**
