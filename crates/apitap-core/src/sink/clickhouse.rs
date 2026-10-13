@@ -454,7 +454,9 @@ impl ChConn {
                 database
             },
             // Below the server's 10 s `keep_alive_timeout`; see `client_idle`.
-            client: crate::http::client_idle(std::time::Duration::from_secs(5)),
+            client: crate::http::client_idle(std::time::Duration::from_millis(
+                crate::http::pool_idle_ms(),
+            )),
         })
     }
 

@@ -64,6 +64,22 @@ pub(crate) fn client() -> reqwest::Client {
 /// request". A running process usually notices the FIN first — a process
 /// that was stopped (a frozen VM, a SIGSTOP, a starved cgroup) does not, and
 /// its first statement after the pause was the one that failed.
+/// Idle-pool lifetime for pooled HTTP connections (`APITAP_HTTP_POOL_IDLE_MS`):
+/// unset = 5000 ms (the historical default), `0` disables connection reuse
+/// entirely. The park-cost pass (2026-10-12, §14.33) found the drain's tokio
+/// driver spinning ~10k epoll_wait/s on an always-ready pooled ClickHouse
+/// socket between requests (fdinfo: EPOLLIN|EPOLLOUT|ET fired forever); a
+/// fresh loopback connection costs almost nothing, a remote TLS one costs a
+/// handshake — hence the knob, not a hardcoded choice.
+pub(crate) fn pool_idle_ms() -> u64 {
+    std::env::var("APITAP_HTTP_POOL_IDLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(POOL_IDLE_MS)
+}
+
+const POOL_IDLE_MS: u64 = 5000;
+
 pub(crate) fn client_idle(idle: Duration) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
         .connect_timeout(env_secs("APITAP_HTTP_CONNECT_TIMEOUT", CONNECT_SECS))
@@ -87,6 +103,22 @@ pub(crate) fn client_idle(idle: Duration) -> reqwest::Client {
 
 #[cfg(test)]
 mod tests {
+    /// The pool-idle knob: unset = 5000 ms, 0 disables reuse, junk falls
+    /// back (a typo must not silently change connection semantics).
+    #[test]
+    fn pool_idle_ms_defaults_disables_and_rejects_junk() {
+        // Literal, not the symbol: a drift of the default must be a test
+        // failure, not something the assertion follows silently.
+        std::env::remove_var("APITAP_HTTP_POOL_IDLE_MS");
+        assert_eq!(super::pool_idle_ms(), 5000);
+        std::env::set_var("APITAP_HTTP_POOL_IDLE_MS", "0");
+        assert_eq!(super::pool_idle_ms(), 0);
+        std::env::set_var("APITAP_HTTP_POOL_IDLE_MS", "junk");
+        assert_eq!(super::pool_idle_ms(), 5000);
+        std::env::set_var("APITAP_HTTP_POOL_IDLE_MS", "250");
+        assert_eq!(super::pool_idle_ms(), 250);
+        std::env::remove_var("APITAP_HTTP_POOL_IDLE_MS");
+    }
     use super::*;
 
     #[test]
