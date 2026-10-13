@@ -46,6 +46,15 @@ that number, end to end.
    It prints `changes=... rate=.../s cpu/change=...us target<=4.17us ->
    PASS|FAIL` and exits non-zero on FAIL.
 
+## Saturation requirement
+
+The metric is only meaningful when the source OFFERS more than the target:
+below ~130k changes/s the engine is wait-bound, the fixed park/wake cost per
+window does not amortise over enough changes, and cpu/change inflates by
+construction (a bench smoke at ~1.8k offered changes/s measured 49 µs/change
+while sitting at 0.09 of the 0.5-core quota). Raise pgbench `-c/-j`, or
+accept that the run is measuring the source.
+
 ## Reading the number
 
 - **`cpu/change ≤ 4.17 µs` = PASS.** That is 120k/s at exactly half a core.

@@ -85,21 +85,25 @@ def main() -> int:
 
     import apitap
 
-    # Bootstrap first: a bounded transfer from the current watermark.
-    print(f"[validate] bootstrap {table} ...", flush=True)
-    apitap.transfer(src, dst, table)
+    # mode="log_based" is the whole point: the default is a bulk replace
+    # (a first smoke ran a copy and measured nothing — 200k rows re-copied
+    # in 0.4 s while the actual CDC never started).
+    print(f"[validate] bootstrap {table} (log_based) ...", flush=True)
+    apitap.transfer(src, dst, table, mode="log_based")
 
-    # Catch-up + follow under the cage; the engine reads the windows/knobs
-    # from the environment, exactly as in production.
+    # Catch-up + follow under the cage; the engine reads windows/knobs from
+    # the environment, exactly as in production. `transfer` returns
+    # (rows, elapsed_ms, parallel) — rows is the CHANGES this run applied,
+    # the honest numerator for an update-heavy source (a destination
+    # row-count does not move when pgbench UPDATEs rows).
     os.environ["APITAP_FOLLOW_SECS"] = str(int(seconds))
-    rows0 = _dest_rows(dst, table)
     print(f"[validate] catch-up/follow for {seconds:.0f}s (CPUQuota={CPU_QUOTA}) ...", flush=True)
     t0 = time.monotonic()
     cpu0 = _cpu_seconds()
-    apitap.transfer(src, dst, table)
+    report = apitap.transfer(src, dst, table, mode="log_based")
+    rows = report.rows
     wall = time.monotonic() - t0
     cpu = _cpu_seconds() - cpu0
-    rows = max(0, _dest_rows(dst, table) - rows0)
 
     us_per_change = (cpu / rows * 1e6) if rows > 0 else float("inf")
     rate = rows / wall if wall > 0 else 0.0
@@ -110,28 +114,6 @@ def main() -> int:
         f"target<={TARGET_US_PER_CHANGE}us -> {'PASS' if ok else 'FAIL'}"
     )
     return 0 if ok else 1
-
-
-def _dest_rows(dst: str, table: str) -> int:
-    """Row count of the destination table via ClickHouse's HTTP interface."""
-    import base64
-    import urllib.request
-
-    url = dst.replace("clickhouse://", "http://", 1)
-    scheme, rest = url.split("://", 1)
-    creds, hostrest = (rest.split("@", 1) if "@" in rest else (None, rest))
-    host, db = hostrest.split("/", 1)
-    auth = ""
-    if creds:
-        auth = "Basic " + base64.b64encode(creds.encode()).decode()
-    req = urllib.request.Request(
-        f"{scheme}://{host}/?database={db}",
-        data=f"SELECT count() FROM {table}".encode(),
-        headers={"Authorization": auth} if auth else {},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return int(r.read().strip())
 
 
 if __name__ == "__main__":
