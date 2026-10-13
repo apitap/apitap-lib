@@ -225,7 +225,14 @@ impl FrameScanner {
 /// reader park forever (ET epoll + watermark, killed by wal_sender_timeout in
 /// 60 s), so the sleep is the safe form: it never delays a read that has data
 /// — it only lets more accumulate first (system review 2026-10-07 §5.3 L2).
-const READ_COALESCE_US: u64 = 500;
+///
+/// The value was 500 µs until the park-cost pass (dev 2026-10-12, §14.31):
+/// perf showed ~15 % of CPU in park/task-switch, and each emptied window
+/// costs one timed park. Sweep at 0.5 core: off = 10.0 µs/change (disaster),
+/// 500 µs = 7.0–7.2, 2 ms = 6.93, **5 ms = 6.71/6.91 (n=2)**, 10 ms = 6.75
+/// (no further gain) — the knee, −6 % CPU/change for ≤5 ms of added latency
+/// on an empty window, far below `wal_sender_timeout/2`.
+const READ_COALESCE_US: u64 = 5000;
 
 /// `APITAP_PG_BINARY` tri-state: `1/true/on` forces binary pgoutput on every
 /// lane, `0/off/false` forces it off, unset defers to the caller — which
@@ -2036,6 +2043,9 @@ mod tests {
     fn the_read_coalescer_has_a_safe_default_and_an_off_switch() {
         std::env::remove_var("APITAP_READ_COALESCE_US");
         assert_eq!(super::read_coalesce_us(), super::READ_COALESCE_US);
+        // The tuned default is part of the contract: a drift back to the
+        // 500 µs of old would silently undo the measured win (§14.31).
+        assert_eq!(super::READ_COALESCE_US, 5000);
         std::env::set_var("APITAP_READ_COALESCE_US", "0");
         assert_eq!(super::read_coalesce_us(), 0);
         std::env::set_var("APITAP_READ_COALESCE_US", "off");

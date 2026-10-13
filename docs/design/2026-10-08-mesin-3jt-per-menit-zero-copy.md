@@ -1525,3 +1525,21 @@ Sweep env knob park (COALESCE 0/2000/5000 vs 500) dijalankan untuk mengukur
 apakah timer coalescer memicu sebagian besar park; bila tidak, sisa jalan
 adalah mengganti pola park (bukan rewrite transport, yang sudah terbukti
 regresi di §14.28).
+
+### 14.31 Default coalescer 500→5000 µs: −6 % CPU/change (knee di 5 ms) (2026-10-12)
+
+Menyusul profil §14.30 (15 % CPU = park/task-switch; satu timed park per
+window kosong), sweep `APITAP_READ_COALESCE_US` @0,5 core:
+
+| coalesce | CPU/change | rate |
+|---|---|---|
+| off | 10,01 µs (cap 0,95!) | 47,5 rb/s |
+| 500 (lama) | 7,22 / 7,00 µs | 47,8–48,4 |
+| 2000 | 6,93 µs | 48,1 |
+| **5000** | **6,71 / 6,91 (n=2)** | 48,7 / 47,9 |
+| 10000 | 6,75 µs (tak lebih baik) | 47,1 |
+
+**Knee di ~5 ms**; default diubah 500→5000 (`assert_eq!` nilai di test knob
+sebagai penjaga kontrak, RED 1/1). Latensi tambahan ≤5 ms hanya saat window
+kosong — jauh di bawah `wal_sender_timeout/2`. Ini kemenangan pertama di
+arsitektur async sendiri (bukan lever mikro): −5,7 s/d −7,1 % CPU/change.
