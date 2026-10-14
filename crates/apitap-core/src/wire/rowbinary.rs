@@ -104,6 +104,13 @@ pub(crate) fn rb_type_from_ch(ch: &str) -> Option<(RbType, bool)> {
         "JSON" => RbType::JsonB,
         s if s.starts_with("Decimal(") => {
             let (p, sc) = parse_ch_decimal(s)?;
+            // Decimal(P > 38) is Decimal256 on the wire (width 32); this
+            // transcoder only renders up to 16 bytes, and mapping 256 to 16
+            // misaligned the whole stream — refuse so the caller falls back
+            // to text (review P1-10).
+            if p > 38 {
+                return None;
+            }
             RbType::Decimal {
                 width: if p <= 9 {
                     4
@@ -367,7 +374,7 @@ pub(crate) fn transcode_field(ty: RbType, f: &[u8], out: &mut Vec<u8>) -> Result
             }
             _ => return Err(Error::Transfer(format!("field width {} != {w}", f.len()))),
         },
-        RbType::Bool => out.push(f[0]),
+        RbType::Bool => out.push(*f.first().ok_or_else(|| bad("bool"))?),
         RbType::Date32 => {
             let d = i32::from_be_bytes(f.try_into().map_err(|_| bad("date"))?);
             // Postgres spells +infinity/-infinity as INT32_MAX/MIN days; adding
@@ -399,9 +406,12 @@ pub(crate) fn transcode_field(ty: RbType, f: &[u8], out: &mut Vec<u8>) -> Result
         }
         RbType::Decimal { width, scale } => {
             let v = numeric_to_scaled_i128(f, scale)?;
+            // try_from, not `as`: a source column widened after bootstrap
+            // (int4 -> int8 with a small destination Decimal) wraps silently
+            // under `as` (review P1-10).
             match width {
-                4 => out.extend((v as i32).to_le_bytes()),
-                8 => out.extend((v as i64).to_le_bytes()),
+                4 => out.extend(i32::try_from(v).map_err(|_| bad("decimal"))?.to_le_bytes()),
+                8 => out.extend(i64::try_from(v).map_err(|_| bad("decimal"))?.to_le_bytes()),
                 _ => out.extend(v.to_le_bytes()),
             }
         }
@@ -437,6 +447,35 @@ fn bad(what: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// P1-10: Decimal(P>38) is Decimal256 on the wire — mapping it to the
+    /// 16-byte width misaligned every later column. Refuse (TSV fallback).
+    #[test]
+    fn decimal_over_38_falls_back_instead_of_misaligning() {
+        assert!(rb_type_from_ch("Decimal(38, 4)").is_some());
+        assert!(rb_type_from_ch("Decimal(76, 4)").is_none());
+        assert!(rb_type_from_ch("Nullable(Decimal(76, 4))").is_none());
+    }
+
+    /// P1-10: an empty bool field and a decimal that overflows its declared
+    /// destination width are errors — the old code indexed f[0] (panic) and
+    /// cast with `as` (silent wrap).
+    #[test]
+    fn bool_and_decimal_widths_fail_loudly() {
+        let mut out = Vec::new();
+        assert!(transcode_field(RbType::Bool, &[], &mut out).is_err());
+        let mut wire = Vec::new();
+        crate::wire::pgcopy::numeric_field_from_str("99999999999", &mut wire).unwrap();
+        let mut out = Vec::new();
+        assert!(transcode_field(
+            RbType::Decimal {
+                width: 4,
+                scale: 0
+            },
+            &wire[4..],
+            &mut out
+        )
+        .is_err());
+    }
     use super::*;
 
     /// Build one PG-binary field: int32 length + payload.
