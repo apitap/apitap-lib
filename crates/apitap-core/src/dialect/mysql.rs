@@ -67,6 +67,18 @@ pub(crate) fn host_is_loopback(url: &str) -> bool {
     }
 }
 
+/// The TLS default for a MySQL URL (0.55.1 for the bulk lanes, extended to
+/// the CDC lanes by the 2026-10-14 review, P0-4): a URL that says nothing
+/// about TLS and does not point at loopback gets `ssl-mode=VERIFY_IDENTITY`.
+/// Explicit modes of any value are honoured, including `disabled`.
+pub(crate) fn secure_url(url: &str) -> String {
+    if has_explicit_ssl_mode(url) || host_is_loopback(url) {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}ssl-mode=VERIFY_IDENTITY")
+}
+
 /// Does this URL already say what it wants from TLS?
 pub(crate) fn has_explicit_ssl_mode(url: &str) -> bool {
     reqwest::Url::parse(url)
@@ -123,5 +135,37 @@ mod tls_default_tests {
         let hint = tls_required_hint("mysql://u:p@prod-host/db");
         assert!(hint.contains("?ssl-mode=disabled"), "{hint}");
         assert!(hint.contains("prod-host"), "{hint}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P0-4: the CDC lanes now share this mapping with the bulk lanes —
+    /// remote + no mode gets verified TLS, explicit modes and loopback are
+    /// untouched.
+    #[test]
+    fn the_tls_default_appends_verify_identity_off_loopback() {
+        assert_eq!(
+            secure_url("mysql://u:p@db.example.com:3306/app"),
+            "mysql://u:p@db.example.com:3306/app?ssl-mode=VERIFY_IDENTITY"
+        );
+        assert_eq!(
+            secure_url("mysql://u:p@db.example.com/app?charset=utf8mb4"),
+            "mysql://u:p@db.example.com/app?charset=utf8mb4&ssl-mode=VERIFY_IDENTITY"
+        );
+        assert_eq!(
+            secure_url("mysql://u:p@127.0.0.1:3306/app"),
+            "mysql://u:p@127.0.0.1:3306/app"
+        );
+        assert_eq!(
+            secure_url("mysql://u:p@localhost/app"),
+            "mysql://u:p@localhost/app"
+        );
+        assert_eq!(
+            secure_url("mysql://u:p@db.example.com/app?ssl-mode=DISABLED"),
+            "mysql://u:p@db.example.com/app?ssl-mode=DISABLED"
+        );
     }
 }

@@ -744,19 +744,9 @@ impl MySqlSource {
         // plane cannot express it, and the read path uses both.
         crate::wire::mywire::check_ssl_mode(url)?;
         // TLS by default off-loopback, the same rule the MySQL DESTINATION
-        // follows since 0.55.1. sqlx's own default is PREFERRED — it tries TLS
-        // and falls back to plaintext if the server declines, which a
-        // man-in-the-middle can arrange by declining on the server's behalf. A
-        // URL that says nothing gets VERIFY_IDENTITY; one that says anything
-        // keeps what it says, including `disabled`.
-        let url = if crate::dialect::mysql::has_explicit_ssl_mode(url)
-            || crate::dialect::mysql::host_is_loopback(url)
-        {
-            url.to_string()
-        } else {
-            let sep = if url.contains('?') { '&' } else { '?' };
-            format!("{url}{sep}ssl-mode=VERIFY_IDENTITY")
-        };
+        // follows since 0.55.1 and the CDC lanes adopted with it (P0-4). The
+        // mapping lives in `dialect::mysql::secure_url` now — one copy.
+        let url = crate::dialect::mysql::secure_url(url);
         let url = url.as_str();
         let pool = MySqlPoolOptions::new()
             .max_connections(max_conns as u32)

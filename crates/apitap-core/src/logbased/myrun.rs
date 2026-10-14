@@ -124,9 +124,13 @@ pub(crate) async fn control_pool(src_url: &str) -> Result<MySqlPool> {
     // and it must not be the last thing to discover the URL asks for a mode
     // it cannot speak.
     crate::wire::mywire::check_ssl_mode(src_url)?;
+    // Same TLS default as the bulk lanes (review P0-4): sqlx's PREFERRED
+    // silently falls back to plaintext, which an on-path attacker arranges
+    // by declining on the server's behalf.
+    let url = crate::dialect::mysql::secure_url(src_url);
     MySqlPoolOptions::new()
         .max_connections(2)
-        .connect(src_url)
+        .connect(&url)
         .await
         .map_err(|e| Error::Transfer(format!("log_based: mysql source connect: {e}")))
 }
@@ -241,7 +245,10 @@ pub(crate) async fn drain_windows(
         )));
     }
 
-    let mut w = MyWire::connect(src_url).await?;
+    // The raw binlog plane gets the same default (review P0-4): mywire's
+    // own default is PREFERRED{explicit:false}, a silent downgrade.
+    let mut w =
+        MyWire::connect(&crate::dialect::mysql::secure_url(src_url)).await?;
     // Same moment the Postgres lane reports its slot's WAL: once per run,
     // before the stream opens, so an unattended pipeline has a number to alert
     // on rather than only a failure to react to.
