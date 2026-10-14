@@ -320,7 +320,11 @@ fn parse_handshake(p: &[u8]) -> Result<Handshake> {
     pos += 2;
     let mut caps = cap_low;
     let mut plugin = String::new();
-    if p.len() > pos + 1 + 2 {
+    // The extended block (charset, status, caps-high, auth length) needs
+    // four more bytes than the old `pos + 3` guard checked — a truncated
+    // handshake read past the buffer (review P1-9). Below the minimum the
+    // block is simply absent and the plugin defaults.
+    if p.len() >= pos + 6 {
         pos += 1 + 2; // charset + status
         let cap_high = u16::from_le_bytes([p[pos], p[pos + 1]]) as u32;
         caps |= cap_high << 16;
@@ -336,12 +340,12 @@ fn parse_handshake(p: &[u8]) -> Result<Handshake> {
             pos += n + 1;
         }
         if caps & CLIENT_PLUGIN_AUTH != 0 {
-            let end = p[pos..]
-                .iter()
-                .position(|&b| b == 0)
-                .map(|e| pos + e)
-                .unwrap_or(p.len());
-            plugin = String::from_utf8_lossy(&p[pos..end]).into_owned();
+            // `pos` can sit at or past the end when the fixed block is
+            // present but the plugin bytes are not — a slice start past the
+            // end panics (review P1-9).
+            let tail = p.get(pos..).unwrap_or(&[]);
+            let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+            plugin = String::from_utf8_lossy(&tail[..end]).into_owned();
         }
     }
     if plugin.is_empty() {
@@ -1133,6 +1137,62 @@ mod tests {
         // express — refused by name rather than silently moved either way.
         assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=verify_ca").is_err());
         assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=whatever").is_err());
+    }
+
+    /// HandshakeV10 builder for the truncation fuzz: proto 10, version
+    /// "8.0.0", thread id, 8B nonce-1, filler, caps low, charset, status,
+    /// caps high, auth len, 10B reserved, 12B nonce-2 + NUL, plugin name.
+    fn hs_sample(secure: bool, plugin_auth: bool) -> Vec<u8> {
+        let mut p = vec![10];
+        p.extend_from_slice(b"8.0.0\0");
+        p.extend_from_slice(&42u32.to_le_bytes());
+        p.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 0]);
+        let mut low = (CLIENT_PROTOCOL_41) as u16;
+        if secure {
+            low |= CLIENT_SECURE_CONNECTION as u16;
+        }
+        p.extend_from_slice(&low.to_le_bytes());
+        p.push(45);
+        p.extend_from_slice(&2u16.to_le_bytes());
+        let mut high = 0u16;
+        if plugin_auth {
+            high |= (CLIENT_PLUGIN_AUTH >> 16) as u16;
+        }
+        p.extend_from_slice(&high.to_le_bytes());
+        p.push(21);
+        p.extend_from_slice(&[0u8; 10]);
+        p.extend_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0]);
+        p.extend_from_slice(b"caching_sha2_password\0");
+        p
+    }
+
+    /// P1-9: every truncation of a handshake must return Ok or Err — never
+    /// panic. The old guard checked `pos + 3` where the fixed block reads
+    /// six bytes, and the plugin tail sliced `p[pos..]` with `pos` possibly
+    /// past the end. Both shapes are in the samples (with and without
+    /// CLIENT_SECURE_CONNECTION).
+    #[test]
+    fn any_truncated_handshake_errors_instead_of_panicking() {
+        for secure in [true, false] {
+            for plugin_auth in [true, false] {
+                let sample = hs_sample(secure, plugin_auth);
+                for cut in 0..sample.len() {
+                    let _ = parse_handshake(&sample[..cut]);
+                }
+                let hs = parse_handshake(&sample).unwrap();
+                assert!(hs.caps & CLIENT_PROTOCOL_41 != 0);
+                if secure && plugin_auth {
+                    // The full extended block: the named plugin is read.
+                    assert_eq!(hs.plugin, "caching_sha2_password");
+                } else {
+                    // Without both caps the parser never reads the plugin
+                    // bytes (the sample keeps them, which is exactly what a
+                    // cap-inconsistent truncation looks like) — the name
+                    // defaults and is never empty.
+                    assert!(!hs.plugin.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
