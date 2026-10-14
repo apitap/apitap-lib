@@ -455,11 +455,13 @@ impl PgSink {
     /// The sink-side pool alone — a multi-table run builds it once and binds one
     /// sink per table onto it.
     pub(crate) async fn shared_pool(url: &str, max_conns: usize) -> Result<PgPool> {
+        // TLS by default off-loopback (review P0-3); explicit modes honoured.
+        let url = crate::dialect::postgres::secure_url(url);
         PgPoolOptions::new()
             .max_connections(max_conns as u32)
-            .connect(url)
+            .connect(&url)
             .await
-            .map_err(|e| crate::urlerr::connect_err("postgres destination", url, e))
+            .map_err(|e| crate::urlerr::connect_err("postgres destination", &url, e))
     }
 
     /// Where an unqualified destination really lives, by the rule the CDC lane

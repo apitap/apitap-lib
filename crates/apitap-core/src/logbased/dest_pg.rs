@@ -471,12 +471,18 @@ mod store {
         }
 
         pub(crate) async fn connect(url: &str) -> Result<Self> {
-            let connect = |n: u32| async move {
-                PgPoolOptions::new()
-                    .max_connections(n)
-                    .connect(url)
-                    .await
-                    .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))
+            // TLS by default off-loopback (review P0-3); explicit modes
+            // honoured. The closure runs twice, so the String clones per call.
+            let url = crate::dialect::postgres::secure_url(url);
+            let connect = |n: u32| {
+                let url = url.clone();
+                async move {
+                    PgPoolOptions::new()
+                        .max_connections(n)
+                        .connect(&url)
+                        .await
+                        .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))
+                }
             };
             Ok(Self {
                 pool: connect(2).await?,

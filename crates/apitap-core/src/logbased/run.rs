@@ -852,9 +852,12 @@ async fn run_group(
     crate::wire::walsender::check_ssl_mode(src_url)?;
     let dest = std::sync::Arc::new(Dest::connect(dst_url).await?);
 
+    // The pool gets the TLS default (review P0-3); the walsender URL below
+    // keeps its own mode negotiation, so only this binding is rewritten.
+    let src_pool_url = crate::dialect::postgres::secure_url(src_url);
     let src = PgPoolOptions::new()
         .max_connections(2)
-        .connect(src_url)
+        .connect(&src_pool_url)
         .await
         .map_err(|e| Error::Transfer(format!("log_based: source connect: {e}")))?;
 

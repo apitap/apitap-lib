@@ -6,6 +6,23 @@ pub(crate) fn quote_ident(ident: &str) -> String {
     format!(r#""{}""#, ident.replace('"', r#""""#))
 }
 
+/// The Postgres TLS default (review 2026-10-14 P0-3), mirroring the MySQL
+/// side's rule from 0.55.1: a URL that says nothing about TLS and does not
+/// point at loopback gets `sslmode=verify-full`. sqlx's own default is
+/// `prefer` — it tries TLS and falls back to plaintext, then answers a
+/// cleartext password request over that fallback, which a man-in-the-middle
+/// arranges by answering SSLRequest `N` on the server's behalf. An explicit
+/// `sslmode` of any value is honoured, including `disable`.
+pub(crate) fn secure_url(url: &str) -> String {
+    if crate::dialect::mysql::has_explicit_ssl_mode(url)
+        || crate::dialect::mysql::host_is_loopback(url)
+    {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}sslmode=verify-full")
+}
+
 /// `public.events` → `"public"."events"` (each path segment quoted).
 pub(crate) fn quote_ident_path(path: &str) -> String {
     path.split('.')
@@ -18,6 +35,38 @@ pub(crate) fn quote_ident_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P0-3: remote + no sslmode gets verified TLS; explicit modes and
+    /// loopback hosts are untouched (the false-positive and the
+    /// false-negative both matter — one breaks plaintext dev servers, the
+    /// other reintroduces the downgrade).
+    #[test]
+    fn the_tls_default_appends_verify_full_off_loopback() {
+        assert_eq!(
+            secure_url("postgres://u:p@db.example.com/app"),
+            "postgres://u:p@db.example.com/app?sslmode=verify-full"
+        );
+        assert_eq!(
+            secure_url("postgres://u:p@db.example.com/app?application_name=x"),
+            "postgres://u:p@db.example.com/app?application_name=x&sslmode=verify-full"
+        );
+        assert_eq!(
+            secure_url("postgres://u:p@127.0.0.1:5432/app"),
+            "postgres://u:p@127.0.0.1:5432/app"
+        );
+        assert_eq!(
+            secure_url("postgres://u:p@localhost/app"),
+            "postgres://u:p@localhost/app"
+        );
+        assert_eq!(
+            secure_url("postgres://u:p@db.example.com/app?sslmode=disable"),
+            "postgres://u:p@db.example.com/app?sslmode=disable"
+        );
+        assert_eq!(
+            secure_url("postgres://u:p@db.example.com/app?sslmode=require"),
+            "postgres://u:p@db.example.com/app?sslmode=require"
+        );
+    }
 
     #[test]
     fn quoting_escapes_embedded_quotes_and_paths() {
