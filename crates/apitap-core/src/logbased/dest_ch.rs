@@ -1228,6 +1228,12 @@ mod store {
                 .to_string()
         }
 
+        /// The store-level name for the per-table insert-only probe — the
+        /// parallel-apply gate (review P0-7) needs it before any unit opens.
+        pub(crate) async fn insert_only(&self, table: &str) -> bool {
+            self.detect_insert_only(table).await
+        }
+
         /// Insert-only detection (design §14): one catalog round trip per
         /// table per run. Any failure — unknown table, old server without
         /// `system.columns`, transport — reads as "not insert-only", which is

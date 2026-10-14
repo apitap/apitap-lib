@@ -1890,6 +1890,28 @@ async fn apply_windows(
     while let Some(o) = win_rx.recv().await {
         let t_apply = std::time::Instant::now();
         let lanes = dest.apply_lanes();
+        // `APITAP_PARALLEL_APPLY=1` is only sound on a PROVEN insert-only
+        // destination: on the general path two windows' DELETE+INSERT sets
+        // are not commutative and the shared key table is truncated per
+        // window (review 2026-10-14 P0-7). The probe memoizes per table, so
+        // after the first window this is a map hit.
+        let parallel_ok = match dest {
+            Dest::Ch(ch) => {
+                if parallel_apply() {
+                    let mut ok = true;
+                    for (dt, _, _) in &members {
+                        if !ch.store().insert_only(dt).await {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
         if let Dest::Bq(_) = dest {
             // BigQuery: stage every table concurrently (one load job each),
             // then commit the whole group's MERGEs + watermarks in as few
@@ -1979,35 +2001,54 @@ async fn apply_windows(
             for (i, n, _, _) in done {
                 rows_per[i] += n;
             }
-        } else if parallel_apply() && matches!(dest, Dest::Ch(_)) {
+        } else if parallel_ok {
             // Parallel insert-only apply (design §14.21 item 1): versioned
             // append-only windows may land out of order, so up to `depth`
             // applies run concurrently and the state advances only on the
             // contiguous prefix (insert-only replay is idempotent by version,
             // so a lagging watermark is safe).
             use futures::stream::StreamExt as _;
+            // One builder for the per-window future: two inline `async`
+            // blocks are two anonymous types and FuturesUnordered refuses
+            // them — and the seed window must run the SAME path as its
+            // followers (review P0-7).
+            async fn apply_window(
+                t: &Tenure<Dest>,
+                src: Option<&PgPool>,
+                members: &[crate::logbased::dest_bq::Member],
+                o: DrainOutcome,
+                id: u64,
+            ) -> Result<(u64, Vec<(u64, Watermark, u64)>, u64)> {
+                let mut per = Vec::with_capacity(members.len());
+                let end = o.id.end();
+                for (dt, q, sid) in members.iter() {
+                    per.push(apply_member_pending(t, dt, q, sid, &o, src).await?);
+                }
+                Ok((id, per, end))
+            }
             let depth = window_depth().max(2);
             let mut seq = 0u64;
             let mut expected = 0u64;
             let mut done: std::collections::BTreeMap<u64, (Vec<(u64, Watermark, u64)>, u64)> =
                 std::collections::BTreeMap::new();
             let mut inflight = futures::stream::FuturesUnordered::new();
+            // The window this arm was entered with goes in FIRST: the old
+            // loop started its own `win_rx.recv()` and never applied it, so
+            // window 1 was lost while the watermarks advanced past it
+            // (review P0-7, W1).
+            let mut seed = Some(o);
             loop {
+                if let Some(o) = seed.take() {
+                    let id = seq;
+                    seq += 1;
+                    inflight.push(apply_window(t, src.as_ref(), &members, o, id));
+                }
                 tokio::select! {
                     win = win_rx.recv(), if inflight.len() < depth => {
                         let Some(o) = win else { break };
                         let id = seq;
                         seq += 1;
-                        let end = o.id.end();
-                        let sref = src.as_ref();
-                        let mref = &members;
-                        inflight.push(async move {
-                            let mut per = Vec::with_capacity(mref.len());
-                            for (dt, q, sid) in mref.iter() {
-                                per.push(apply_member_pending(t, dt, q, sid, &o, sref).await?);
-                            }
-                            Ok::<_, Error>((id, per, end))
-                        });
+                        inflight.push(apply_window(t, src.as_ref(), &members, o, id));
                     }
                     Some(res) = inflight.next(), if !inflight.is_empty() => {
                         let (id, per, end) = res?;
@@ -2027,6 +2068,10 @@ async fn apply_windows(
                     expected += 1;
                 }
             }
+            // Every window this arm could see was consumed and closed above;
+            // the shared tail would also resend the ENTRY window's end after
+            // later ones (a backwards watch value).
+            continue;
         } else if lanes > 1 && members.len() > 1 {
             // A BOUNDED pool of per-table units: `lanes` in flight, the rest
             // queued, each completion pulling the next. Unbounded would melt a
