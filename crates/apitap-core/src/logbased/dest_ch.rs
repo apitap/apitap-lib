@@ -701,27 +701,47 @@ async fn apply_unit(
             }
         }
         if !c.deletes.is_empty() {
-            let mut buf = Vec::with_capacity(1 << 20);
-            match &pk_rb_types {
-                Some(prt) => {
-                    for key in c.deletes.iter() {
-                        let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-                        render_ch_key_rb(&refs, prt, &mut buf)?;
-                        insert_only_suffix_rb(&mut buf, ver, true);
-                    }
-                    u.insert_owned_rb(dest_table, &insert_only_cols(pk_cols), buf).await?;
-                }
-                None => {
-                    for key in c.deletes.iter() {
-                        let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-                        if binary {
-                            render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
-                        } else {
-                            render_ch_key(&refs, &pk_oids, &mut buf)?;
+            // Keys with a LIVE upsert in this window keep only the upsert: a
+            // same-transaction DELETE + INSERT of K collapses to
+            // Upsert{del:true} and K also lands in `deletes`; writing the
+            // tombstone at the same `_apitap_ver` as the fresh row left the
+            // FINAL winner to chance and the row could vanish (review P0-2,
+            // reproduced by the pre-fix bench e2e).
+            let live: std::collections::HashSet<Vec<&[u8]>> = c
+                .upserts
+                .iter()
+                .map(|row| row_key_refs(row, pk_idx))
+                .collect();
+            let deletes: Vec<&Vec<Vec<u8>>> = c
+                .deletes
+                .iter()
+                .filter(|k| {
+                    !live.contains(&k.iter().map(|c| c.as_slice()).collect::<Vec<_>>())
+                })
+                .collect();
+            if !deletes.is_empty() {
+                let mut buf = Vec::with_capacity(1 << 20);
+                match &pk_rb_types {
+                    Some(prt) => {
+                        for key in deletes.iter() {
+                            let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+                            render_ch_key_rb(&refs, prt, &mut buf)?;
+                            insert_only_suffix_rb(&mut buf, ver, true);
                         }
-                        insert_only_suffix(&mut buf, ver, true);
+                        u.insert_owned_rb(dest_table, &insert_only_cols(pk_cols), buf).await?;
                     }
-                    u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf).await?;
+                    None => {
+                        for key in deletes.iter() {
+                            let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+                            if binary {
+                                render_ch_key_binary(&refs, &pk_oids, &mut buf)?;
+                            } else {
+                                render_ch_key(&refs, &pk_oids, &mut buf)?;
+                            }
+                            insert_only_suffix(&mut buf, ver, true);
+                        }
+                        u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf).await?;
+                    }
                 }
             }
         }
@@ -764,7 +784,18 @@ async fn apply_unit(
                 let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
-                    let body = u.read(&format!("SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated")).await?;
+                    // Insert-only tables need the LIVE row: without FINAL the
+                    // read can hit a tombstone or an older version, and the
+                    // patched re-insert would resurrect a stale value
+                    // (review P1-1).
+                    let body = if insert_only {
+                        u.read(&format!(
+                            "SELECT {sel} FROM {ft} FINAL WHERE {pred} AND _apitap_deleted = 0 FORMAT TabSeparated"
+                        ))
+                        .await?
+                    } else {
+                        u.read(&format!("SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated")).await?
+                    };
                     let Some(line) = body.lines().next() else {
                         return Err(Error::Transfer(
                             "log_based: masked update for a row missing at the destination — \
@@ -832,8 +863,14 @@ async fn apply_unit(
                 let old_pred = key_pred(pk_cols, old_key, &pk_oids, binary)?;
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
-                    let body =
-                        u.read(&format!("SELECT {sel} FROM {ft} WHERE {old_pred} FORMAT TabSeparated")).await?;
+                    let body = if insert_only {
+                        u.read(&format!(
+                            "SELECT {sel} FROM {ft} FINAL WHERE {old_pred} AND _apitap_deleted = 0 FORMAT TabSeparated"
+                        ))
+                        .await?
+                    } else {
+                        u.read(&format!("SELECT {sel} FROM {ft} WHERE {old_pred} FORMAT TabSeparated")).await?
+                    };
                     match body.lines().next() {
                         Some(line) => {
                             let fields: Vec<&str> = line.split('\t').collect();

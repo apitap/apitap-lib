@@ -89,6 +89,18 @@ def main():
     del_rows = ch(f"SELECT count() FROM {T} WHERE id = 2 AND _apitap_deleted = 1")
     assert del_rows == "1", "the delete is a tombstone row, not an absence"
 
+    # P0-2 (review 2026-10-14): DELETE + re-INSERT of the SAME key in one
+    # source transaction collapses to a live upsert with a pending delete;
+    # writing the fresh row AND its tombstone at the same `_apitap_ver` left
+    # the FINAL winner to chance, so the row could vanish. The window must
+    # keep only the live upsert.
+    pg(f"DELETE FROM {T} WHERE id = 1; INSERT INTO {T} VALUES (1, 'a3');")
+    r = run()
+    assert r.returncode == 0, r.stderr
+    assert ch(f"SELECT count() FROM {T} FINAL WHERE id = 1") == "1", \
+        "delete+reinsert of one key in one window keeps the row"
+    assert ch(f"SELECT v FROM {T} FINAL WHERE id = 1") == "a3", "the fresh image wins"
+
     wipe()
     print("✓ Replacing destination: bootstrap columns, tombstone round, FINAL exact, ver moves")
 
