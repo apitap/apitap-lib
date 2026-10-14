@@ -146,6 +146,27 @@ mod tests {
         numeric_to_scaled_i128(&out[4..], scale).unwrap()
     }
 
+    /// P0-6: a wire dscale past the i128 range must not reach `10i128.pow`
+    /// unchecked. `Less`: 10^128 wraps to a zero divisor in release (panic on
+    /// hostile input), and any real divisor that far out exceeds i128 anyway,
+    /// so the value is 0 at the declared scale. `Greater`: an overflowing
+    /// multiplier is an error, never a silently wrapped product.
+    #[test]
+    fn numeric_rescale_survives_hostile_dscale() {
+        // A real digit at wire dscale = 40: 10^40 exceeds i128, so the
+        // value is 0 at scale 0; the old unchecked pow wrapped in release
+        // (and panicked under overflow-checks) instead of truncating.
+        let forty = format!("0.{}1", "0".repeat(39));
+        let mut out = Vec::new();
+        numeric_field_from_str(&forty, &mut out).unwrap();
+        assert_eq!(numeric_to_scaled_i128(&out[4..], 0).unwrap(), 0);
+        // Declared scale past the i128 range with an integer value: the
+        // multiplier cannot exist and the result cannot fit — refuse.
+        let mut out = Vec::new();
+        numeric_field_from_str("5", &mut out).unwrap();
+        assert!(numeric_to_scaled_i128(&out[4..], 200).is_err());
+    }
+
     #[test]
     fn numeric_roundtrips_through_the_decoder() {
         assert_eq!(roundtrip("1234.5678", 4), 12_345_678);
@@ -342,10 +363,23 @@ pub(crate) fn numeric_to_scaled_i128(f: &[u8], scale: u32) -> Result<i128> {
     let diff = scale as i32 - dscale;
     Ok(match diff.cmp(&0) {
         std::cmp::Ordering::Equal => acc_scaled_dscale,
-        std::cmp::Ordering::Greater => acc_scaled_dscale
-            .checked_mul(10i128.pow(diff as u32))
-            .ok_or_else(|| bad("numeric overflow"))?,
-        std::cmp::Ordering::Less => acc_scaled_dscale / 10i128.pow((-diff) as u32),
+        std::cmp::Ordering::Greater => {
+            let mul = 10i128
+                .checked_pow(diff as u32)
+                .ok_or_else(|| bad("numeric overflow"))?;
+            acc_scaled_dscale
+                .checked_mul(mul)
+                .ok_or_else(|| bad("numeric overflow"))?
+        }
+        std::cmp::Ordering::Less => match 10i128.checked_pow((-diff) as u32) {
+            Some(div) => acc_scaled_dscale / div,
+            // |acc| < 10^39 for any i128; a divisor past the i128 range
+            // truncates the value to zero at this scale. The old unchecked
+            // pow wrapped 10^128 to a ZERO divisor in release — a
+            // divide-by-zero panic on a hostile wire dscale (review P0-6),
+            // and an overflowing multiplier silently wrapped in `Greater`.
+            None => 0,
+        },
     })
 }
 
