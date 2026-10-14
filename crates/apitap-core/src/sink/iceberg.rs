@@ -380,7 +380,10 @@ impl IcebergConn {
             }
         };
         match commit_status_class(r.status().as_u16()) {
-            CommitClass::Done => Self::body_ok(r, "commit").await.map(|_| CommitTry::Done),
+            // A 2xx IS done: the body is informational, and a proxy's
+            // truncated/empty 200 must not turn a landed commit into a
+            // failure the sweep then acts on (review P0-5).
+            CommitClass::Done => Ok(CommitTry::Done),
             CommitClass::Conflict => Ok(CommitTry::Conflict),
             CommitClass::Unknown => Ok(CommitTry::Unknown(Self::body_ok(r, "commit").await.unwrap_err())),
             CommitClass::Failed => {
@@ -389,6 +392,16 @@ impl IcebergConn {
             }
         }
     }
+}
+
+/// How a whole commit run ended. `Unknown` is NOT `Err`: the caller must
+/// not sweep under it — the catalog might have landed the snapshot, and
+/// deleting files a committed snapshot references corrupts the table. The
+/// caller surfaces the error (a re-run settles it) and keeps its orphans
+/// (review P0-5).
+enum CommitEnd {
+    Done,
+    Unknown(Error),
 }
 
 /// What one commit attempt told us.
@@ -1228,7 +1241,13 @@ impl crate::sink::Sink for IcebergSink {
             return Ok(());
         }
         let out = match self.commit(&s3, &files, mode).await {
-            Ok(()) => Ok(()),
+            Ok(CommitEnd::Done) => Ok(()),
+            Ok(CommitEnd::Unknown(e)) => {
+                // The catalog might have landed the snapshot: sweeping its
+                // files would corrupt a live table. Orphans are the cheaper
+                // risk; a re-run settles it (review P0-5).
+                Err(e)
+            }
             Err(e) => {
                 // The commit never happened — no snapshot references these
                 // objects; sweep them so a failed run leaves no stray bytes.
@@ -1258,7 +1277,7 @@ async fn sweep(s3: &S3Conn, files: &[FileDone]) {
 }
 
 impl IcebergSink {
-    async fn commit(&self, s3: &S3Conn, files: &[FileDone], mode: Mode) -> Result<()> {
+    async fn commit(&self, s3: &S3Conn, files: &[FileDone], mode: Mode) -> Result<CommitEnd> {
         let meta0 = self.meta.clone().expect("prepare ran");
         let schema = meta0.current_schema().clone();
         let pspec = meta0.default_partition_spec().as_ref().clone();
@@ -1293,9 +1312,14 @@ impl IcebergSink {
 
         // -- optimistic-concurrency commit loop
         let mut meta = meta0;
+        // Every attempt's snapshot id: a late-landing 504 from an earlier
+        // attempt must be visible to every later reload, or the next attempt
+        // commits the same content twice (review P0-5c).
+        let mut tried: Vec<i64> = Vec::new();
         for attempt in 0..3u32 {
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
+            tried.push(snapshot_id);
             let seq = meta.next_sequence_number();
             let parent = meta.current_snapshot_id();
 
@@ -1458,24 +1482,31 @@ impl IcebergSink {
             ];
 
             match self.conn.commit_table(&self.table, &requirements, &updates).await? {
-                CommitTry::Done => return Ok(()),
+                CommitTry::Done => return Ok(CommitEnd::Done),
                 CommitTry::Conflict => {
                     // Someone committed between our load and now: reload,
                     // re-derive parent/sequence, rebuild manifests, try again.
                 }
                 CommitTry::Unknown(e) => {
                     // The status is unknown, but the snapshot id is OURS:
-                    // reload and ask whether this exact snapshot exists. If it
-                    // does, the commit landed — returning Ok keeps the caller
-                    // from sweeping the files this snapshot references (a lost
-                    // 5xx used to delete them and corrupt the table). If it
-                    // does not, retry with a small backoff; an absence on the
-                    // last attempt is the failure.
-                    let fresh = self.conn.load_table(&self.table).await?.ok_or_else(|| {
-                        Error::Transfer("iceberg: table vanished after an ambiguous commit".into())
-                    })?;
-                    if snapshot_landed(&fresh, snapshot_id) {
-                        return Ok(());
+                    // reload and ask whether any attempt's snapshot exists.
+                    // If one does, the commit landed — returning Done keeps
+                    // the caller from sweeping the files it references (a
+                    // lost 5xx used to delete them and corrupt the table).
+                    // A FAILING reload is unknown, not failed (review
+                    // P0-5b): the sweep must not run on a maybe-committed
+                    // snapshot either.
+                    let fresh = match self.conn.load_table(&self.table).await {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            return Ok(CommitEnd::Unknown(Error::Transfer(
+                                "iceberg: table vanished after an ambiguous commit".into(),
+                            )))
+                        }
+                        Err(re) => return Ok(CommitEnd::Unknown(re)),
+                    };
+                    if tried.iter().any(|id| snapshot_landed(&fresh, *id)) {
+                        return Ok(CommitEnd::Done);
                     }
                     if attempt == 2 {
                         return Err(e);
@@ -1485,11 +1516,21 @@ impl IcebergSink {
                     continue;
                 }
             }
-            meta = self
-                .conn
-                .load_table(&self.table)
-                .await?
-                .ok_or_else(|| Error::Transfer("iceberg: table vanished mid-commit".into()))?;
+            meta = match self.conn.load_table(&self.table).await {
+                Ok(Some(t)) => t,
+                // Ambiguous like the Unknown arm: don't claim failure.
+                Ok(None) => {
+                    return Ok(CommitEnd::Unknown(Error::Transfer(
+                        "iceberg: table vanished mid-commit".into(),
+                    )))
+                }
+                Err(re) => return Ok(CommitEnd::Unknown(re)),
+            };
+            // A conflict can mask a LATE landing of an earlier attempt (the
+            // late-504 double-commit, review P0-5c).
+            if tried.iter().any(|id| snapshot_landed(&meta, *id)) {
+                return Ok(CommitEnd::Done);
+            }
         }
         Err(Error::Transfer(
             "iceberg: commit conflicted 3 times — another writer is racing this \
@@ -1890,7 +1931,11 @@ impl CdcBound {
         let run_id = uuid::Uuid::new_v4().simple().to_string();
         let mut uploaded: Vec<String> = Vec::new();
         match self.cdc_commit_inner(source_id, pk_idx, w, &run_id, &mut uploaded).await {
-            Ok(()) => Ok(()),
+            Ok(CommitEnd::Done) => Ok(()),
+            Ok(CommitEnd::Unknown(e)) => {
+                // Maybe-committed: leave the uploaded objects (review P0-5).
+                Err(e)
+            }
             Err(e) => {
                 // The commit never happened — no snapshot references these
                 // objects; sweep them so a failed window leaves no stray bytes.
@@ -1909,7 +1954,7 @@ impl CdcBound {
         w: CdcWindow,
         run_id: &str,
         uploaded: &mut Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<CommitEnd> {
         let CdcWindow { data, delete_ints, delete_texts, truncate, end_lsn } = w;
         let (data_file, added_rows, added_bytes) = match data {
             Some((bytes, rows)) => {
@@ -1964,9 +2009,13 @@ impl CdcBound {
         let schema = self.meta.current_schema().clone();
         let pspec = self.meta.default_partition_spec().as_ref().clone();
         let mut meta = self.meta.clone();
+        // See `commit`: every attempt's id is remembered for the later
+        // reloads (review P0-5c).
+        let mut tried: Vec<i64> = Vec::new();
         for attempt in 0..3u32 {
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
+            tried.push(snapshot_id);
             let seq = meta.next_sequence_number();
             let parent = meta.current_snapshot_id();
 
@@ -2076,19 +2125,26 @@ impl CdcBound {
                 },
             ];
             match self.conn.commit_table(&self.table, &requirements, &updates).await? {
-                CommitTry::Done => return Ok(()),
+                CommitTry::Done => return Ok(CommitEnd::Done),
                 CommitTry::Conflict => {}
                 CommitTry::Unknown(e) => {
                     // The snapshot id is OURS: the table's metadata decides
                     // whether the ambiguous answer was a landed commit, and a
                     // landed one must never be reported as a failure — the
                     // caller would re-apply the window or sweep files the
-                    // snapshot references (system review 2026-10-07, H1).
-                    let fresh = self.conn.load_table(&self.table).await?.ok_or_else(|| {
-                        Error::Transfer("iceberg: table vanished after an ambiguous commit".into())
-                    })?;
-                    if snapshot_landed(&fresh, snapshot_id) {
-                        return Ok(());
+                    // snapshot references (system review 2026-10-07, H1). A
+                    // failing reload is unknown, not failed (review P0-5b).
+                    let fresh = match self.conn.load_table(&self.table).await {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            return Ok(CommitEnd::Unknown(Error::Transfer(
+                                "iceberg: table vanished after an ambiguous commit".into(),
+                            )))
+                        }
+                        Err(re) => return Ok(CommitEnd::Unknown(re)),
+                    };
+                    if tried.iter().any(|id| snapshot_landed(&fresh, *id)) {
+                        return Ok(CommitEnd::Done);
                     }
                     if attempt == 2 {
                         return Err(e);
@@ -2098,11 +2154,21 @@ impl CdcBound {
                     continue;
                 }
             }
-            meta = self
-                .conn
-                .load_table(&self.table)
-                .await?
-                .ok_or_else(|| Error::Transfer("iceberg: table vanished mid-commit".into()))?;
+            meta = match self.conn.load_table(&self.table).await {
+                Ok(Some(t)) => t,
+                // Ambiguous like the Unknown arm: don't claim failure.
+                Ok(None) => {
+                    return Ok(CommitEnd::Unknown(Error::Transfer(
+                        "iceberg: table vanished mid-commit".into(),
+                    )))
+                }
+                Err(re) => return Ok(CommitEnd::Unknown(re)),
+            };
+            // A conflict can mask a LATE landing of an earlier attempt (the
+            // late-504 double-commit, review P0-5c).
+            if tried.iter().any(|id| snapshot_landed(&meta, *id)) {
+                return Ok(CommitEnd::Done);
+            }
         }
         Err(Error::Transfer(
             "iceberg: commit conflicted 3 times — another writer is racing this \
