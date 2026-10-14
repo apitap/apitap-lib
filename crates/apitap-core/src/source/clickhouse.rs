@@ -32,9 +32,12 @@ pub(crate) struct ChSource {
     engine: std::sync::Mutex<String>,
 }
 
-/// Quote an identifier the ClickHouse way (backticks, doubled inside).
+/// Quote an identifier the ClickHouse way. Inside backtick-quoting the
+/// escape is `\` — and the backslash must be escaped first or a name ending
+/// in `\` closes the quote early (P0-1, 2026-10-14 review; the old
+/// doubled-backtick form is SQLite, not ClickHouse).
 fn q(ident: &str) -> String {
-    format!("`{}`", ident.replace('`', "``"))
+    format!("`{}`", ident.replace('\\', "\\\\").replace('`', "\\`"))
 }
 
 /// `db.table` → a quoted, fully-qualified name (the URL's database when elided).
@@ -671,6 +674,13 @@ async fn count_of(conn: &ChConn, stmt: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// P0-1, source side: same escaping contract as `sink::clickhouse::ch_ident`.
+    #[test]
+    fn q_escapes_backslash_before_backtick() {
+        assert_eq!(q("plain"), "`plain`");
+        assert_eq!(q("a\\"), "`a\\\\`");
+        assert_eq!(q("x`y"), "`x\\`y`");
+    }
     use super::*;
 
     #[test]
@@ -730,7 +740,10 @@ mod tests {
     #[test]
     fn identifiers_and_literals_are_escaped() {
         assert_eq!(q("plain"), "`plain`");
-        assert_eq!(q("we`ird"), "`we``ird`");
+        // Contract change (P0-1, 2026-10-14): ClickHouse escapes inside
+        // backticks with a backslash, not by doubling (that is SQLite). The
+        // backslash-first escape also closes the backslash injection.
+        assert_eq!(q("we`ird"), "`we\\`ird`");
         assert_eq!(lit("o'hara"), "'o\\'hara'");
     }
 }

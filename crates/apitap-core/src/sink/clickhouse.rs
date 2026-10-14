@@ -748,8 +748,15 @@ fn max_body_bytes() -> u64 {
 }
 
 /// `` ` ``-quote a ClickHouse identifier.
+///
+/// ClickHouse treats `\` as the escape INSIDE backtick-quoting, so the
+/// backslash must be escaped first: escaping only the backtick let an
+/// identifier ending in `\` close the quote early and the rest of the name
+/// render as statement text — the 2026-10-14 review's REPRO (`` x\`, 42 AS
+/// injected_col -- ``). Backslash first, then backtick, and the whole name
+/// stays one literal identifier.
 pub(crate) fn ch_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "\\`"))
+    format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
 }
 
 /// Strip wrappers/metadata that don't change the wire encoding so an existing
@@ -2349,6 +2356,19 @@ impl Loader for ChLoader {
 
 #[cfg(test)]
 mod tests {
+    /// P0-1: the backslash is escaped BEFORE the backtick — the REPRO shape
+    /// stays inside one quoted identifier instead of rendering `42 AS
+    /// injected_col` as statement text.
+    #[test]
+    fn ch_ident_escapes_backslash_before_backtick() {
+        assert_eq!(ch_ident("plain"), "`plain`");
+        assert_eq!(ch_ident("a\\"), "`a\\\\`");
+        assert_eq!(ch_ident("x`y"), "`x\\`y`");
+        assert_eq!(
+            ch_ident("x\\`, 42 AS injected --"),
+            "`x\\\\\\`, 42 AS injected --`"
+        );
+    }
     use super::*;
 
     type Answer = std::sync::Arc<dyn Fn(&str) -> (bool, String) + Send + Sync>;
