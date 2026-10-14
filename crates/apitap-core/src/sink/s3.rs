@@ -395,8 +395,7 @@ impl S3Conn {
         let status = r.status();
         let body = r.text().await.unwrap_or_default();
         if !status.is_success() {
-            let mut excerpt = body;
-            excerpt.truncate(400);
+            let excerpt = super::char_excerpt(&body, 400);
             return Err(Error::Transfer(format!("s3 {what}: {status} {excerpt}")));
         }
         Ok(body)

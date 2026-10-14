@@ -243,8 +243,7 @@ impl IcebergConn {
         let status = r.status();
         let text = r.text().await.unwrap_or_default();
         if !status.is_success() {
-            let mut excerpt = text;
-            excerpt.truncate(500);
+            let excerpt = super::char_excerpt(&text, 500);
             return Err(Error::Transfer(format!("iceberg catalog {what}: {status} {excerpt}")));
         }
         serde_json::from_str(&text)

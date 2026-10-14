@@ -289,13 +289,33 @@ pub(crate) trait Sink: Sized + Send + Sync {
     }
 }
 
+/// A bounded, CHARACTER-SAFE excerpt for error bodies. A plain
+/// `String::truncate` panics when the cut lands inside a multi-byte char —
+/// a server echoing a non-ASCII key or table name does exactly that, and in
+/// Iceberg's unknown-outcome arm the panic would replace the
+/// `snapshot_landed` check (review 2026-10-14 P1-11).
+pub(crate) fn char_excerpt(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PipeResidency, Sink};
+    use super::{char_excerpt, PipeResidency, Sink};
     use crate::sink::{bigquery::BqSink, clickhouse::ChSink, gcs::GcsSink};
     use crate::sink::{iceberg::IcebergSink, mysql::MySqlSink, postgres::PgSink, s3::S3Sink};
     use crate::wire::bqparquet::parquet_residency;
     use crate::Mode;
+
+    /// P1-11: the excerpt is character-safe — a byte-wise truncate at 400
+    /// panics on a run of 3-byte chars (150 x "€" = 450 bytes, the cut lands
+    /// inside char 134), the helper cuts on a char boundary.
+    #[test]
+    fn error_excerpts_are_char_safe() {
+        let euros = "€".repeat(150);
+        assert_eq!(char_excerpt(&euros, 400).chars().count(), 150);
+        assert_eq!(char_excerpt(&"é".repeat(10), 3), "ééé");
+        assert_eq!(char_excerpt("ab", 10), "ab");
+    }
 
     /// The finish marker IS the commit decision for every channel-backed
     /// loader: a clean EOF means "the producer finished on purpose" and the
