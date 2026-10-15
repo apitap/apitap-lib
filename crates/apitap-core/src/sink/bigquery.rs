@@ -525,9 +525,41 @@ impl BqConn {
             let ms = if i < 24 { 500 } else { 2_000 };
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
-        Err(ScriptErr::Failed(format!(
-            "bigquery job {job_id} still running after 30 minutes"
-        )))
+        // 30 minutes without DONE. The caller releases the run's fence on a
+        // Failed, and an un-settled job that commits AFTER that release would
+        // double-apply this window next to its successor (review round 2
+        // R2-6). Cancel and SETTLE before reporting: a job that turns out
+        // DONE is a SUCCESS (it finished before the cancel took — the cancel
+        // of a completed job is a no-op), a DONE-with-error is the failure,
+        // and anything unsettled is an UNKNOWN fate, never
+        // committed-nothing.
+        let _ = self
+            .api(
+                reqwest::Method::POST,
+                format!("{BQ_BASE}/projects/{}/jobs/{job_id}/cancel{loc}", self.project),
+                Some(&serde_json::json!({})),
+            )
+            .await;
+        for _ in 0..30 {
+            let v = match self.api(reqwest::Method::GET, url.clone(), None).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            if v["status"]["state"].as_str() == Some("DONE") {
+                if let Some(err) = v["status"]["errorResult"].as_object() {
+                    return Err(ScriptErr::Failed(format!(
+                        "bigquery job {job_id} failed (cancelled after 30 minutes): {}",
+                        serde_json::to_string(err).unwrap_or_default()
+                    )));
+                }
+                return Ok(v);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Err(ScriptErr::transport(Error::Transfer(format!(
+            "bigquery job {job_id} exceeded 30 minutes and did not settle after a cancel              request — its fate is unknown; the window must not be treated as \
+             committed-nothing"
+        ))))
     }
 
     /// The location every job of this connection is submitted under. A job

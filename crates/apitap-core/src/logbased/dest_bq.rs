@@ -69,15 +69,22 @@ const CHUNK_BYTES: usize = 256 << 10;
 /// one is not. The replica path packs the same way — its MERGE and its
 /// watermark are one group too.
 fn pack_whole_groups(groups: Vec<Vec<String>>, limit: usize) -> Vec<Vec<String>> {
+    // BigQuery caps a multi-statement transaction at 100 referenced tables
+    // (~3 of them belong to the fixed state machinery): a 100-member group
+    // crossed it, and the script failed NON-retryably on every rerun while
+    // the slot pinned WAL (review round 2 R2-7). Cap the tables per batch.
+    const MAX_TABLES_PER_TXN: usize = 95;
     let mut out: Vec<Vec<String>> = Vec::new();
-    let (mut batch, mut len) = (Vec::new(), 0usize);
+    let (mut batch, mut len, mut tables) = (Vec::new(), 0usize, 0usize);
     for g in groups {
         let glen: usize = g.iter().map(String::len).sum();
-        if len + glen > limit && !batch.is_empty() {
+        if (len + glen > limit || tables >= MAX_TABLES_PER_TXN) && !batch.is_empty() {
             out.push(std::mem::take(&mut batch));
             len = 0;
+            tables = 0;
         }
         len += glen;
+        tables += 1;
         batch.extend(g);
     }
     if !batch.is_empty() {
@@ -2155,6 +2162,17 @@ mod store {
         /// failure keeps every member's claim (`lease::give_back_run`), and
         /// the collector that takes one deletes the fence (`lease_claim`).
         async fn close_run(&self, token: &str) -> Result<()> {
+            // Mark the fence claimed before deleting it: a takeover racing
+            // this delete then reads claimed (its own standalone UPDATE path)
+            // and never mistakes the gap for a free table (review round 2
+            // R2-6). Best-effort: the delete below is the real close.
+            let _ = self
+                .conn
+                .cdc_script(&format!(
+                    "UPDATE {} SET claimed = TRUE WHERE TRUE;",
+                    crate::sink::bigquery::fence_fq(&self.conn, token)
+                ))
+                .await;
             self.conn.table_delete(&fence_ident(token)).await
         }
     }
@@ -2655,6 +2673,18 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
 
     /// Every batch is one BigQuery transaction, so a changelog table's INSERT
     /// and its own watermark row must land in the SAME one. Split across two, a
+    /// R2-7: more than 95 table groups never share one transaction, whatever
+    /// the bytes say — BigQuery's 100-table cap would fail the script
+    /// non-retryably on every rerun.
+    #[test]
+    fn a_transaction_never_names_more_than_95_tables() {
+        let groups: Vec<Vec<String>> = (0..120).map(|i| vec![format!("G{i}")]).collect();
+        let batches = pack_whole_groups(groups, 1 << 20);
+        assert_eq!(batches.len(), 2, "120 groups split 95 + 25");
+        assert_eq!(batches[0].len(), 95);
+        assert_eq!(batches[1].len(), 25);
+    }
+
     /// failure in between commits the log rows without the watermark and the
     /// next run replays the whole window into an append-only table.
     #[test]
