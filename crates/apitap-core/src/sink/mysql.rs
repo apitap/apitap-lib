@@ -1288,6 +1288,17 @@ impl MySqlSink {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0)
                     > 0;
+                if exists && crate::naming::flipped_bootstrap(self.run.kind(), mode) {
+                    // (R2-2) The destination appeared while this bootstrap
+                    // loaded — a concurrent append from another source is
+                    // legal fan-in, and the branch below would rename the
+                    // table this run never created out of the way and drop
+                    // it. Refuse; the re-run reads the new state row.
+                    return Err(Error::InvalidInput(format!(
+                        "another run published {} while this first run was                          loading it — the table now exists and this run would                          have replaced it. Re-run: the new state row makes                          this an incremental load.",
+                        self.bare
+                    )));
+                }
                 if exists {
                     // Atomic across both tables: readers never see it missing.
                     // Both names carry THIS run's token, so the outgoing table

@@ -390,6 +390,35 @@ impl RunId {
     }
 }
 
+/// Did this run FLIP to Replace after probing the destination?
+///
+/// The token is minted before the state probe, so a bootstrap carries an
+/// Incremental token while it lands as Replace — and its publish must not
+/// destroy whatever appeared while it loaded: a concurrent bootstrap from
+/// another source is LEGAL fan-in by peer rules (different source hashes),
+/// but replacing it is not (review round 2 R2-2). The sinks use this to pick
+/// a non-destructive publish or to refuse.
+pub(crate) fn flipped_bootstrap(kind: LandKind, mode: crate::Mode) -> bool {
+    mode == crate::Mode::Replace && kind == LandKind::Incremental
+}
+
+#[cfg(test)]
+mod flipped_tests {
+    use super::*;
+
+    /// R2-2: only an Incremental token landing as Replace is a flipped
+    /// bootstrap. A true replace keeps its destructive swap; append/merge
+    /// land incrementally and never publish destructively.
+    #[test]
+    fn only_an_incremental_token_landing_as_replace_flips() {
+        assert!(flipped_bootstrap(LandKind::Incremental, crate::Mode::Replace));
+        assert!(!flipped_bootstrap(LandKind::Swap, crate::Mode::Replace));
+        assert!(!flipped_bootstrap(LandKind::Incremental, crate::Mode::Append));
+        assert!(!flipped_bootstrap(LandKind::Incremental, crate::Mode::Merge));
+        assert!(!flipped_bootstrap(LandKind::Cdc, crate::Mode::Replace));
+    }
+}
+
 /// What a run can read off a PEER's artifact name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PeerRun {

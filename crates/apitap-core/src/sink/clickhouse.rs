@@ -1992,6 +1992,36 @@ impl ChSink {
         };
         match mode {
             Mode::Replace => {
+                // (R2-2) A flipped bootstrap (Incremental token, Replace
+                // landing) refuses when the destination appeared while it
+                // loaded: every branch below EXCHANGEs or drops a table this
+                // run never created — a concurrent append from another source
+                // is legal fan-in, replacing it is not. A true Replace carries
+                // a Swap token. A probe that fails counts as EXISTS (refuse
+                // rather than destroy on an unproven absence).
+                if crate::naming::flipped_bootstrap(self.run.kind(), mode) {
+                    let probed = self
+                        .ch
+                        .exec(&format!(
+                            "SELECT count() FROM system.tables WHERE \
+                             database = currentDatabase() AND name = '{}'",
+                            ch_str(&self.final_bare)
+                        ))
+                        .await;
+                    let exists = match probed {
+                        Ok(b) => b.trim().parse::<u64>().unwrap_or(u64::MAX),
+                        Err(_) => u64::MAX,
+                    };
+                    if exists > 0 {
+                        return Err(Error::InvalidInput(format!(
+                            "another run published {} while this first run was \
+                             loading it — the table now exists and this run would \
+                             have replaced it. Re-run: the new state row makes \
+                             this an incremental load.",
+                            self.final_bare
+                        )));
+                    }
+                }
                 if self.ddl.on_cluster.is_some() {
                     // Cluster mode: staging was already created ON CLUSTER with
                     // the user's Replicated engine (see prepare), so the data is

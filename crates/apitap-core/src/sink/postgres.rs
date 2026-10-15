@@ -1130,10 +1130,18 @@ impl PgSink {
                     .begin()
                     .await
                     .map_err(|e| Error::Transfer(format!("swap begin: {e}")))?;
-                sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.final_t))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| Error::Transfer(format!("drop dest: {e}")))?;
+                // (R2-2) A flipped bootstrap (Incremental token, Replace
+                // landing) must not DROP: the RENAME below fails if the final
+                // table appeared while this run loaded — another source's
+                // bootstrap — the error sweeps this run's staging, and
+                // nothing is lost. A true Replace carries a Swap token and
+                // keeps the destructive swap.
+                if !crate::naming::flipped_bootstrap(self.run.kind(), mode) {
+                    sqlx::query(&format!("DROP TABLE IF EXISTS {}", self.final_t))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Transfer(format!("drop dest: {e}")))?;
+                }
                 sqlx::query(&format!(
                     "ALTER TABLE {} RENAME TO {}",
                     self.staging_t,
