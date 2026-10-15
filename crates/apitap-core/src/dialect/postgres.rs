@@ -103,12 +103,22 @@ pub(crate) fn quote_ident_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The PGSSLMODE-reading tests run in parallel with the one that sets it
+    /// (cargo's default); without a lock the setter's window leaks into the
+    /// readers and the suite goes flaky.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// P0-3: remote + no sslmode gets verified TLS; explicit modes and
     /// loopback hosts are untouched (the false-positive and the
     /// false-negative both matter — one breaks plaintext dev servers, the
     /// other reintroduces the downgrade).
     #[test]
     fn the_tls_default_appends_verify_full_off_loopback() {
+        let _env = env_guard();
         std::env::remove_var("PGSSLMODE");
         assert_eq!(
             secure_url("postgres://u:p@db.example.com/app"),
@@ -143,6 +153,7 @@ mod tests {
     /// explicit.
     #[test]
     fn sockets_overrides_and_pgsslmode_are_respected() {
+        let _env = env_guard();
         std::env::remove_var("PGSSLMODE");
         assert_eq!(
             secure_url("postgres:///app?host=/var/run/postgresql"),
