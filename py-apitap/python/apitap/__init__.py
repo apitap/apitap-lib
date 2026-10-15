@@ -230,6 +230,15 @@ class Reader:
         float_cols = {
             n for n, dt in schema.items() if dt in (pl.Float32, pl.Float64)
         }
+        # Float32/16 do not cross the wire safely: polars compares them
+        # widened against a Float64 literal while the server compares at the
+        # column's own precision, so the pushed predicate drops rows polars
+        # keeps (review R2-8). And LOGIC needs to know which operands are
+        # boolean — `&` on integers must never render as SQL AND.
+        float32_cols = {
+            n for n, dt in schema.items() if dt in (pl.Float32, pl.Float16)
+        }
+        bool_cols = {n for n, dt in schema.items() if dt == pl.Boolean}
         is_my = src.split("://", 1)[0].lower().startswith("mysql")
 
         def source(with_columns, predicate, n_rows, batch_size):
@@ -242,7 +251,8 @@ class Reader:
             # arrives: the pushdown is bandwidth, never correctness.
             where = (
                 _predicate_sql(
-                    predicate, set(schema.names()), str_cols, float_cols, is_my
+                    predicate, set(schema.names()), str_cols, float_cols,
+                    float32_cols, bool_cols, is_my
                 )
                 if predicate is not None
                 else None
@@ -332,7 +342,7 @@ class Reader:
         return rows
 
 
-def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
+def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_cols, is_my):
     """Render a polars predicate as a SQL WHERE fragment, or None.
 
     Only a conservative subset crosses the wire: arithmetic (+ - * %) and
@@ -371,7 +381,10 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
     # rows for `<>` that polars keeps and the client-side filter can never
     # bring back; `=` can only add rows the filter removes. See the docstring.
     STR_OK = {"Eq"}
-    ARITH = {"Plus": "+", "Minus": "-", "Multiply": "*", "Modulus": "%"}
+    # Modulus is NOT here on purpose: polars modulo is floored (-3 % 2 = 1),
+    # the servers truncate (-3 % 2 = -1) — the pushed predicate would drop
+    # rows polars keeps (review R2-8).
+    ARITH = {"Plus": "+", "Minus": "-", "Multiply": "*"}
     LOGIC = {"And": "AND", "Or": "OR", "LogicalAnd": "AND", "LogicalOr": "OR"}
     INT_T = {"Int", "Int8", "Int16", "Int32", "Int64",
              "UInt8", "UInt16", "UInt32", "UInt64"}
@@ -383,7 +396,7 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
         return '"' + name.replace('"', '""') + '"'
 
     def lit(v):
-        # -> (sql, stringy, floaty)
+        # -> (sql, stringy, floaty, booly)
         if isinstance(v, dict) and len(v) == 1:
             (t, x), = v.items()
             if t in ("Dyn", "Scalar"):
@@ -391,24 +404,24 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
             if t in INT_T:
                 if isinstance(x, bool) or not isinstance(x, int):
                     raise ValueError("non-int payload")
-                return str(x), False, False
+                return str(x), False, False, False
             if t in FLOAT_T:
                 if not isinstance(x, (int, float)) or isinstance(x, bool):
                     raise ValueError("non-float payload")
                 f = float(x)
                 if f != f or f in (float("inf"), float("-inf")):
                     raise ValueError("non-finite literal")
-                return repr(f), False, True
+                return repr(f), False, True, False
             if t == "Boolean":
                 if not isinstance(x, bool):
                     raise ValueError("non-bool payload")
-                return ("TRUE" if x else "FALSE"), False, False
+                return ("TRUE" if x else "FALSE"), False, False, True
             if t in ("String", "StrOwned", "Str"):
                 if not isinstance(x, str):
                     raise ValueError("non-str payload")
                 if "\x00" in x or "\\" in x:
                     raise ValueError("unsafe byte in literal")
-                return "'" + x.replace("'", "''") + "'", True, False
+                return "'" + x.replace("'", "''") + "'", True, False, False
             if t == "Date":
                 # Days since the epoch — both dialects take DATE 'Y-M-D', and
                 # a DATE column compares to it with identical ordering on
@@ -418,11 +431,11 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
                 import datetime
 
                 d = datetime.date(1970, 1, 1) + datetime.timedelta(days=x)
-                return "DATE '" + d.isoformat() + "'", False, False
+                return "DATE '" + d.isoformat() + "'", False, False, False
         raise ValueError(f"literal {v!r}")
 
     def walk(n):
-        # -> (sql, stringy, floaty)
+        # -> (sql, stringy, floaty, booly)
         if not isinstance(n, dict) or len(n) != 1:
             raise ValueError(f"node {n!r}")
         (k, v), = n.items()
@@ -430,7 +443,12 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
             name = v if isinstance(v, str) else v.get("name")
             if name not in allowed:
                 raise ValueError(f"unknown column {name!r}")
-            return quote(name), name in str_cols, name in float_cols
+            if name in float32_cols:
+                # Float32 columns compare at different precisions on the two
+                # sides (review R2-8): never push.
+                raise ValueError("float32 column")
+            return (quote(name), name in str_cols, name in float_cols,
+                    name in bool_cols)
         if k == "Literal":
             return lit(v)
         if k == "Cast":
@@ -443,6 +461,12 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
             if not (isinstance(inner, dict) and set(inner) == {"Literal"}):
                 raise ValueError("cast over non-literal")
             dt = json.dumps(v.get("dtype", ""))
+            if "Float32" in dt or "Float16" in dt:
+                # A Float32 literal cast must NOT be elided: polars compares
+                # the literal widened, the server at the column's precision,
+                # and the pushed predicate drops rows polars keeps (review
+                # R2-8).
+                raise ValueError("float32 literal cast")
             if not any(t in dt for t in ("Int", "Float", "UInt")):
                 raise ValueError("non-numeric cast")
             return walk(inner)
@@ -450,26 +474,31 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, is_my):
             op = v["op"]
             if not isinstance(op, str):
                 raise ValueError(f"op shape {op!r}")
-            left, ls, lf = walk(v["left"])
-            right, rs, rf = walk(v["right"])
+            left, ls, lf, lb = walk(v["left"])
+            right, rs, rf, rb = walk(v["right"])
             floaty = lf or rf
             if op in LOGIC:
-                return f"({left} {LOGIC[op]} {right})", False, False
+                # `&`/`|` on integers arrive as the same ops (review R2-8):
+                # rendering them as SQL AND/OR drops rows on MySQL and is a
+                # type error on Postgres. Boolean operands only.
+                if not (lb and rb):
+                    raise ValueError("logical op on non-boolean operands")
+                return f"({left} {LOGIC[op]} {right})", False, False, True
             if op in CMP:
                 if (ls or rs) and op not in STR_OK:
                     raise ValueError("string range comparison")
                 if op == "NotEq" and lf and rf:
                     raise ValueError("float != float (NaN semantics differ)")
-                return f"({left} {CMP[op]} {right})", False, False
+                return f"({left} {CMP[op]} {right})", False, False, True
             if op in ARITH:
                 if ls or rs:
                     raise ValueError("string arithmetic")
-                return f"({left} {ARITH[op]} {right})", False, floaty
+                return f"({left} {ARITH[op]} {right})", False, floaty, False
             raise ValueError(f"op {op!r}")
         raise ValueError(f"node kind {k!r}")
 
     try:
-        sql, stringy, _ = walk(ir)
+        sql, stringy, _, _ = walk(ir)
         return None if stringy else sql
     except Exception:
         return None
