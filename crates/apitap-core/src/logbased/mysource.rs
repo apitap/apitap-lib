@@ -392,6 +392,7 @@ pub(crate) async fn fetch_schema(
     Ok(TableSchema {
         names: rows.iter().map(|r| r.0.clone()).collect(),
         kinds: rows.iter().map(|r| crate::wire::mybinlog::catalog_kind(&r.3)).collect(),
+        binaries: rows.iter().map(|r| r.3.eq_ignore_ascii_case("binary")).collect(),
         key: rows.iter().map(|r| r.1 == "PRI").collect(),
         unsigned: rows
             .iter()
@@ -656,6 +657,7 @@ pub(crate) async fn drain_binlog(
                         }
                         for (i, c) in map.cols.iter_mut().enumerate() {
                             c.unsigned = sc.unsigned.get(i).copied().unwrap_or(false);
+                            c.binary = sc.binaries.get(i).copied().unwrap_or(false);
                             c.labels = sc.labels.get(i).cloned().flatten();
                         }
                     }

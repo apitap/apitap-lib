@@ -436,6 +436,7 @@ mod tests {
         let sc = TableSchema {
             names: vec!["a".into(), "id".into(), "b".into(), "k2".into()],
             kinds: vec![None; 4],
+            binaries: vec![false; 4],
             key: vec![true, false, false, false],
             unsigned: vec![false; 4],
             labels: vec![None; 4],
