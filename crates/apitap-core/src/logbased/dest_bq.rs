@@ -2223,7 +2223,7 @@ mod store {
                 return Err(Error::Transfer(format!(
                     "log_based: a BigQuery statement is missing its ';' and would \
                      swallow the COMMIT that follows it: {}",
-                    &bad[..bad.len().min(120)]
+                    crate::sink::char_excerpt(bad, 120)
                 )));
             }
             let (t0, jobs) = (std::time::Instant::now(), chunks.len());
