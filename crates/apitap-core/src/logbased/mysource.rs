@@ -391,6 +391,7 @@ pub(crate) async fn fetch_schema(
     // COLUMN_KEY='PRI' marks primary-key members.
     Ok(TableSchema {
         names: rows.iter().map(|r| r.0.clone()).collect(),
+        kinds: rows.iter().map(|r| crate::wire::mybinlog::catalog_kind(&r.3)).collect(),
         key: rows.iter().map(|r| r.1 == "PRI").collect(),
         unsigned: rows
             .iter()
@@ -619,6 +620,34 @@ pub(crate) async fn drain_binlog(
                                 sc.names.len(),
                                 map.cols.len()
                             )));
+                        }
+                        // The EVENT carries each column's type byte; the
+                        // catalog says what the table is NOW. A same-count
+                        // DDL in the gap (DROP a, ADD c / MODIFY x) slipped
+                        // past the length check and stamped one column's
+                        // attributes onto another — silent corruption (review
+                        // round 2 R2-1). Compare what maps unambiguously;
+                        // ENUM member order, unsigned flips and renames still
+                        // need binlog_row_metadata=FULL.
+                        for (i, c) in map.cols.iter().enumerate() {
+                            if let Some(expected) = sc.kinds.get(i).copied().flatten() {
+                                if expected != c.kind {
+                                    return Err(Error::InvalidInput(format!(
+                                        "log_based: {q} column {i} ({}) is type 0x{expected:02x} \
+                                         in the source catalog, but the binlog events in this \
+                                         window describe it as 0x{:02x} — the table was altered \
+                                         while these changes were being written, so the event \
+                                         and the catalog describe different shapes of it. \
+                                         Matching them by position across that gap is silent, \
+                                         wrong corruption; apitap refuses instead of guessing. \
+                                         Recovery: clear this table's apitap state on the \
+                                         destination and re-run, which bootstraps it from the \
+                                         schema it has now.",
+                                        sc.names.get(i).map(String::as_str).unwrap_or("?"),
+                                        c.kind
+                                    )));
+                                }
+                            }
                         }
                         for (i, c) in map.cols.iter_mut().enumerate() {
                             c.unsigned = sc.unsigned.get(i).copied().unwrap_or(false);

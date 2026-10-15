@@ -159,6 +159,9 @@ pub(crate) struct TableMap {
 #[derive(Debug, Clone)]
 pub(crate) struct TableSchema {
     pub names: Vec<String>,
+    /// The binlog TABLE_MAP type byte this catalog type should carry, per
+    /// column (`None`: no reliable mapping — the position check skips it).
+    pub kinds: Vec<Option<u8>>,
     /// Primary-key membership, positional with `names`.
     pub key: Vec<bool>,
     /// Unsigned flags, positional (binlog MINIMAL omits signedness).
@@ -320,6 +323,45 @@ fn bit(bm: &[u8], i: usize) -> bool {
 /// One row image: `present` says which columns the image carries; absent
 /// columns become `UnchangedToast` (the arm every apply path already
 /// treats as "do not touch"), matching MINIMAL/NOBLOB row images.
+/// The catalog's `DATA_TYPE` mapped to the binlog TABLE_MAP type byte —
+/// conservatively: an unmapped or ambiguous type yields `None`, and the
+/// schema-position check skips that column rather than refusing a legitimate
+/// table (review round 2 R2-1). The mapping exists so the drain can compare
+/// the shape the EVENT describes against the shape the CATALOG has NOW: when
+/// they differ, a DDL landed between the change and the drain.
+pub(crate) fn catalog_kind(dt: &str) -> Option<u8> {
+    let dt = dt.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    Some(match dt.as_str() {
+        "tinyint" => MT_TINY,
+        "smallint" => MT_SHORT,
+        "mediumint" => MT_INT24,
+        "int" | "integer" => MT_LONG,
+        "bigint" => MT_LONGLONG,
+        "float" => MT_FLOAT,
+        "double" => MT_DOUBLE,
+        "decimal" | "numeric" => MT_NEWDECIMAL,
+        // 5.6+ (and every supported MariaDB) ships the *2 encodings.
+        "timestamp" => MT_TIMESTAMP2,
+        "datetime" => MT_DATETIME2,
+        "time" => MT_TIME2,
+        "date" => MT_NEWDATE,
+        "year" => MT_YEAR,
+        "varchar" | "varbinary" => MT_VARCHAR,
+        "char" | "binary" => MT_STRING,
+        "bit" => MT_BIT,
+        "json" => MT_JSON,
+        "enum" => MT_ENUM,
+        "set" => MT_SET,
+        // TEXT rides MYSQL_TYPE_BLOB with a charset flag in the metadata; the
+        // size siblings share their blob counterparts' bytes.
+        "tinyblob" | "tinytext" => MT_TINY_BLOB,
+        "mediumblob" | "mediumtext" => MT_MEDIUM_BLOB,
+        "longblob" | "longtext" => MT_LONG_BLOB,
+        "blob" | "text" => MT_BLOB,
+        _ => return None,
+    })
+}
+
 fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Result<Tuple> {
     let n_present = (0..ncols).filter(|&i| bit(present, i)).count();
     let nullbm = r.take((n_present + 7) / 8)?.to_vec();
@@ -1097,6 +1139,25 @@ pub(crate) const TYPE_TX_PAYLOAD: u8 = EV_TRANSACTION_PAYLOAD;
 
 #[cfg(test)]
 mod tests {
+    /// R2-1: conservative DATA_TYPE → TABLE_MAP type-byte mapping.
+    #[test]
+    fn catalog_kinds_map_the_common_types_and_skip_the_rest() {
+        assert_eq!(catalog_kind("int"), Some(MT_LONG));
+        assert_eq!(catalog_kind("INT"), Some(MT_LONG));
+        assert_eq!(catalog_kind("bigint"), Some(MT_LONGLONG));
+        assert_eq!(catalog_kind("mediumint"), Some(MT_INT24));
+        assert_eq!(catalog_kind("varchar"), Some(MT_VARCHAR));
+        assert_eq!(catalog_kind("char"), Some(MT_STRING));
+        assert_eq!(catalog_kind("text"), Some(MT_BLOB));
+        assert_eq!(catalog_kind("longtext"), Some(MT_LONG_BLOB));
+        assert_eq!(catalog_kind("datetime"), Some(MT_DATETIME2));
+        assert_eq!(catalog_kind("timestamp"), Some(MT_TIMESTAMP2));
+        assert_eq!(catalog_kind("decimal"), Some(MT_NEWDECIMAL));
+        assert_eq!(catalog_kind("enum"), Some(MT_ENUM));
+        assert_eq!(catalog_kind("json"), Some(MT_JSON));
+        assert_eq!(catalog_kind("geometry"), None);
+        assert_eq!(catalog_kind("future_type"), None);
+    }
 
     /// Every case here was first observed as a DIFFERS line on a live server:
     /// the bootstrap wrote one value, a CDC update of the same row wrote
@@ -1490,7 +1551,7 @@ mod tests {
         );
         st.schemas.insert(
             "bench.t".into(),
-            TableSchema { names: vec!["id".into()], key: vec![true], unsigned: vec![false], labels: vec![None] },
+            TableSchema { names: vec!["id".into()], kinds: vec![None], key: vec![true], unsigned: vec![false], labels: vec![None] },
         );
         let ev = RowsEvent { table_id: 42, rows: vec![(None, Some(Tuple::from_cells(&[Cell::Text(bytes::Bytes::from_static(b"1"))])))] };
         let msgs = to_messages(&mut st, EV_WRITE_ROWS, ev).unwrap();
