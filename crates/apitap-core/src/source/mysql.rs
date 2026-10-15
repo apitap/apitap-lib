@@ -268,6 +268,17 @@ fn my_ar(c: &ColumnPlan) -> Result<(MyAr, Delivered)> {
 /// Fixed-width little-endian read with a loud width check (cold on the
 /// error path; the happy path compiles to one unaligned load).
 #[inline]
+/// `(MIN, MAX)` of a cursor column as text → i64 bounds, when both parse and
+/// fit. `None` when a bound does not parse OR exceeds i64 (a BIGINT UNSIGNED
+/// tail): the caller then falls back to the single full read. The text form
+/// exists because sqlx refuses to decode MIN/MAX of an UNSIGNED column into
+/// Option<i64> (review round 2 P1-5).
+fn cursor_bounds(lo: Option<&str>, hi: Option<&str>) -> Option<(i64, i64)> {
+    let l = lo?.parse::<i128>().ok()?;
+    let h = hi?.parse::<i128>().ok()?;
+    Some((i64::try_from(l).ok()?, i64::try_from(h).ok()?))
+}
+
 fn le<const N: usize>(b: &[u8]) -> Result<[u8; N]> {
     b.try_into()
         .map_err(|_| Error::Transfer(format!("mysql cell width {} (want {N})", b.len())))
@@ -1077,23 +1088,40 @@ impl Source for MySqlSource {
         if want > 1 {
             if let Some(col) = &int_cursor {
                 let qcol = my_ident(col);
-                let (lo, hi): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
-                    "SELECT MIN({qcol}), MAX({qcol}) FROM {src_t} WHERE true{dprobe}"
+                // CAST AS CHAR: sqlx refuses to decode MIN/MAX of an
+                // UNSIGNED column into Option<i64> ("SQL type INT UNSIGNED
+                // is not compatible"), which made every read() of a Laravel
+                // `increments` table fail — even with no parallel argument
+                // (review round 2 P1-5, reproduced). Text covers every
+                // unsigned width; a bound beyond i64 leaves the statements
+                // empty so the single full read below still runs.
+                let (lo, hi): (Option<String>, Option<String>) = sqlx::query_as(&format!(
+                    "SELECT CAST(MIN({qcol}) AS CHAR), CAST(MAX({qcol}) AS CHAR) \
+                     FROM {src_t} WHERE true{dprobe}"
                 ))
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| Error::InvalidInput(format!("min/max of cursor {col}: {e}")))?;
-                if let (Some(lo), Some(hi)) = (lo, hi) {
-                    for (rlo, rhi) in spans(lo, hi, want) {
-                        stmts.push(format!(
-                            "SELECT {select_list} FROM {src_t} \
-                             WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}"
-                        ));
+                match (lo.as_deref(), hi.as_deref()) {
+                    (Some(l), Some(h)) => {
+                        if let Some((lo, hi)) = cursor_bounds(Some(l), Some(h)) {
+                            for (rlo, rhi) in spans(lo, hi, want) {
+                                stmts.push(format!(
+                                    "SELECT {select_list} FROM {src_t} \
+                                     WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}"
+                                ));
+                            }
+                        }
+                        // else: a bound beyond i64 — the single full read
+                        // below covers it.
                     }
-                } else if delta.is_some() || lane.push_where.is_some() {
-                    // min/max proved zero surviving rows — read nothing
+                    // MIN/MAX NULL: zero surviving rows — read nothing
                     // instead of a full scan that returns nothing.
-                    stmts.push(format!("SELECT {select_list} FROM {src_t} WHERE false"));
+                    _ => {
+                        if delta.is_some() || lane.push_where.is_some() {
+                            stmts.push(format!("SELECT {select_list} FROM {src_t} WHERE false"));
+                        }
+                    }
                 }
             }
         }
@@ -1759,6 +1787,22 @@ async fn arrow_row_worker(
 
 #[cfg(test)]
 mod tests {
+    /// P1-5: unsigned bounds arrive as text; the helper parses them and, on a
+    /// BIGINT UNSIGNED tail beyond i64, refuses so the caller reads fully
+    /// instead of wrapping to a negative span.
+    #[test]
+    fn cursor_bounds_parse_unsigned_text_and_refuse_beyond_i64() {
+        assert_eq!(cursor_bounds(Some("5"), Some("10")), Some((5, 10)));
+        assert_eq!(cursor_bounds(Some("-3"), Some("-1")), Some((-3, -1)));
+        assert_eq!(cursor_bounds(Some("0"), Some("4294967295")), Some((0, 4294967295)));
+        assert_eq!(
+            cursor_bounds(Some("0"), Some("18446744073709551615")),
+            None,
+            "u64::MAX does not fit i64 — refuse, never wrap"
+        );
+        assert_eq!(cursor_bounds(None, Some("1")), None);
+        assert_eq!(cursor_bounds(Some("junk"), Some("1")), None);
+    }
     use super::*;
 
     /// The raw-plane row walker against a hand-built binary-protocol row:
