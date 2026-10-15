@@ -149,7 +149,12 @@ const ENTITIES: &[Entity] = &[
         wrap: None,
         accept: None,
         since: true,
-        cursor: Some("committed_at"),
+        // NO cursor: committer dates are client-set and non-monotonic, so an
+        // incremental watermark over them never loads a merged branch whose
+        // commits predate it and a single commit dated 2099 freezes the table
+        // (0 rows forever, no error). Replace-only until the lookback-and-
+        // merge-on-sha crawl exists (review round 2 R2-11).
+        cursor: None,
         drop_if_key: None,
         cols: &[
             // 40 hex today; 64 covers SHA-256 object format.
@@ -992,6 +997,17 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// R2-11: the commits entity must stay replace-only — a cursor over
+    /// client-set committer dates silently freezes or skips.
+    #[test]
+    fn the_commits_entity_is_replace_only() {
+        let e = super::ENTITIES.iter().find(|e| e.name == "commits").unwrap();
+        assert!(
+            e.cursor.is_none(),
+            "committer dates are client-set and non-monotonic; an incremental \
+             cursor freezes the table or skips merged branches (review R2-11)"
+        );
+    }
     use super::*;
 
     #[test]
@@ -1086,8 +1102,11 @@ mod tests {
                     col.name
                 );
             }
-            if e.since {
-                assert!(e.cursor.is_some(), "{} since without cursor", e.name);
+            // Incremental REQUIRES the API's ?since=; the converse is fine:
+            // an entity may support since and still stay replace-only (the
+            // commits cursor is gone on purpose — review round 2 R2-11).
+            if e.cursor.is_some() {
+                assert!(e.since, "{} cursor without since", e.name);
             }
         }
         assert_eq!(ENTITIES.len(), 10);
