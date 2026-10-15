@@ -117,6 +117,23 @@ impl GsheetsSource {
 
     /// Fetch a range as rows of display strings. Trailing blank cells are
     /// omitted by the API; callers pad against the header width.
+    /// The sheet's ALLOCATED grid rows (`rowCount`) — what the row pump
+    /// walks to. The values API omits TRAILING empty rows per request, so a
+    /// short or empty page is not end-of-data (review R2-9).
+    async fn grid_rows(&self, tab: &str) -> i64 {
+        self.get_json("", &[("fields", "sheets(properties(title,gridProperties(rowCount)))")])
+            .await
+            .ok()
+            .and_then(|meta| {
+                meta["sheets"].as_array().and_then(|arr| {
+                    arr.iter()
+                        .find(|s| s["properties"]["title"].as_str() == Some(tab))
+                        .and_then(|s| s["properties"]["gridProperties"]["rowCount"].as_i64())
+                })
+            })
+            .unwrap_or(-1)
+    }
+
     async fn values(&self, range: &str) -> Result<Vec<Vec<String>>> {
         let v = self
             .get_json(
@@ -318,15 +335,22 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
         let mut out: Vec<u8> = Vec::with_capacity(self.chunk + 64 * 1024);
         enc.open(&mut out);
         let page_rows = fetch_rows();
+        // The values API omits TRAILING empty rows per request: a short or
+        // even empty page is NOT end-of-data, and a blank row at a page edge
+        // used to end the read and silently drop everything after it
+        // (review R2-9). The sheet's allocated row count bounds the walk.
+        let grid_rows = self.src.grid_rows(&tab).await;
         let mut start = 2usize; // row 1 is the header
         let mut rows_sent: u64 = 0;
         loop {
+            let Some(next) = next_page_start(start, grid_rows) else { break };
+            start = next;
             let cells = format!("A{start}:ZZZ{}", start + page_rows - 1);
             let page = self.src.values(&GsheetsSource::range(&tab, &cells)).await?;
-            if page.is_empty() {
+            if page.is_empty() && grid_rows < 0 {
+                // No grid bound to walk to: emptiness is the only end known.
                 break;
             }
-            let got = page.len();
             for row in &page {
                 enc.row_start(ncols, &mut out);
                 for i in 0..ncols {
@@ -340,15 +364,37 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
                     pipe.send(buf).await?;
                 }
             }
-            if got < page_rows {
-                break;
-            }
-            start += got;
+            start += page_rows;
         }
         enc.close(&mut out);
         if !out.is_empty() {
             pipe.send(out).await?;
         }
         Ok(Rows::LoaderElseOwn(rows_sent))
+    }
+}
+
+/// Where the row pump's next range starts, or `None` past the allocated grid
+/// (`grid_rows < 0` = unknown: walk until a page comes back empty). Emptiness
+/// alone is NOT end-of-data — the API omits trailing blanks per request
+/// (review R2-9).
+fn next_page_start(start: usize, grid_rows: i64) -> Option<usize> {
+    if grid_rows >= 0 && start as i64 > grid_rows {
+        None
+    } else {
+        Some(start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// R2-9: the walk stops only past the allocated grid; an unknown grid
+    /// walks on (the caller handles emptiness).
+    #[test]
+    fn the_page_walk_is_bounded_by_the_grid_not_emptiness() {
+        assert_eq!(super::next_page_start(2, 1000), Some(2));
+        assert_eq!(super::next_page_start(1000, 1000), Some(1000));
+        assert_eq!(super::next_page_start(1001, 1000), None);
+        assert_eq!(super::next_page_start(99999, -1), Some(99999));
     }
 }
