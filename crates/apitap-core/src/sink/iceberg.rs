@@ -1316,6 +1316,10 @@ impl IcebergSink {
         // attempt must be visible to every later reload, or the next attempt
         // commits the same content twice (review P0-5c).
         let mut tried: Vec<i64> = Vec::new();
+        // Once ANY attempt answers Unknown, a later plain failure still
+        // leaves an earlier attempt able to land late — every later error
+        // stays Unknown so the sweep never touches its files (round-2 §1.2).
+        let mut ambiguous = false;
         for attempt in 0..3u32 {
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
@@ -1481,7 +1485,16 @@ impl IcebergSink {
                 },
             ];
 
-            match self.conn.commit_table(&self.table, &requirements, &updates).await? {
+            let commit_try = match self.conn.commit_table(&self.table, &requirements, &updates).await {
+                Ok(t) => t,
+                Err(e) => {
+                    if ambiguous {
+                        return Ok(CommitEnd::Unknown(e));
+                    }
+                    return Err(e);
+                }
+            };
+            match commit_try {
                 CommitTry::Done => return Ok(CommitEnd::Done),
                 CommitTry::Conflict => {
                     // Someone committed between our load and now: reload,
@@ -1508,8 +1521,9 @@ impl IcebergSink {
                     if tried.iter().any(|id| snapshot_landed(&fresh, *id)) {
                         return Ok(CommitEnd::Done);
                     }
+                    ambiguous = true;
                     if attempt == 2 {
-                        return Err(e);
+                        return Ok(CommitEnd::Unknown(e));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250u64 << attempt)).await;
                     meta = fresh;
@@ -1531,6 +1545,13 @@ impl IcebergSink {
             if tried.iter().any(|id| snapshot_landed(&meta, *id)) {
                 return Ok(CommitEnd::Done);
             }
+        }
+        if ambiguous {
+            return Ok(CommitEnd::Unknown(Error::Transfer(
+                "iceberg: commit conflicted 3 times (after an ambiguous attempt) — \
+                 another writer is racing this table; a re-run settles it"
+                    .into(),
+            )));
         }
         Err(Error::Transfer(
             "iceberg: commit conflicted 3 times — another writer is racing this \
@@ -2012,6 +2033,10 @@ impl CdcBound {
         // See `commit`: every attempt's id is remembered for the later
         // reloads (review P0-5c).
         let mut tried: Vec<i64> = Vec::new();
+        // Once ANY attempt answers Unknown, a later plain failure still
+        // leaves an earlier attempt able to land late — every later error
+        // stays Unknown so the sweep never touches its files (round-2 §1.2).
+        let mut ambiguous = false;
         for attempt in 0..3u32 {
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
@@ -2124,7 +2149,16 @@ impl CdcBound {
                     snapshot_id: parent,
                 },
             ];
-            match self.conn.commit_table(&self.table, &requirements, &updates).await? {
+            let commit_try = match self.conn.commit_table(&self.table, &requirements, &updates).await {
+                Ok(t) => t,
+                Err(e) => {
+                    if ambiguous {
+                        return Ok(CommitEnd::Unknown(e));
+                    }
+                    return Err(e);
+                }
+            };
+            match commit_try {
                 CommitTry::Done => return Ok(CommitEnd::Done),
                 CommitTry::Conflict => {}
                 CommitTry::Unknown(e) => {
@@ -2146,8 +2180,9 @@ impl CdcBound {
                     if tried.iter().any(|id| snapshot_landed(&fresh, *id)) {
                         return Ok(CommitEnd::Done);
                     }
+                    ambiguous = true;
                     if attempt == 2 {
-                        return Err(e);
+                        return Ok(CommitEnd::Unknown(e));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250u64 << attempt)).await;
                     meta = fresh;
@@ -2169,6 +2204,13 @@ impl CdcBound {
             if tried.iter().any(|id| snapshot_landed(&meta, *id)) {
                 return Ok(CommitEnd::Done);
             }
+        }
+        if ambiguous {
+            return Ok(CommitEnd::Unknown(Error::Transfer(
+                "iceberg: commit conflicted 3 times (after an ambiguous attempt) — \
+                 another writer is racing this table; a re-run settles it"
+                    .into(),
+            )));
         }
         Err(Error::Transfer(
             "iceberg: commit conflicted 3 times — another writer is racing this \
