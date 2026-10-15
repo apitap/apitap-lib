@@ -610,8 +610,13 @@ async fn worker<L: Loader>(
     let mut carry: Vec<u8> = Vec::new();
     let mut total = 0u64;
     while let Some(sql) = spans.next()? {
-        let expected = count_of(&conn, &sql).await?;
+        // No count() pre-query: it ran in a DIFFERENT snapshot than the
+        // stream, so a live table or an LB-routed replica made `got !=
+        // expected` fire on correct reads (review round 2 P1-12). The
+        // in-band checks below (mid-row trailing bytes; the exception
+        // signature a streamed 200 glues onto its body) are the detection.
         let mut resp = conn.query_stream(&sql).await?;
+        let mut raw_tail: Vec<u8> = Vec::with_capacity(512);
         let mut got = 0u64;
         carry.clear();
         loop {
@@ -622,6 +627,15 @@ async fn worker<L: Loader>(
                     return Err(Error::Transfer(format!("clickhouse read: {e}")))
                 }
             };
+            // A rolling window of the RAW stream: ClickHouse answers 200 for
+            // a mid-stream failure and glues the exception onto the body —
+            // at any byte offset, including a row boundary (the removed
+            // count check used to be what caught that; P1-12).
+            raw_tail.extend_from_slice(&piece);
+            if raw_tail.len() > 512 {
+                let cut = raw_tail.len() - 512;
+                raw_tail.drain(..cut);
+            }
             carry.extend_from_slice(&piece);
             let (rows, consumed) = count_rows(&carry, &skips);
             got += rows;
@@ -646,10 +660,11 @@ async fn worker<L: Loader>(
                 String::from_utf8_lossy(&carry[..carry.len().min(180)])
             )));
         }
-        if got != expected {
+        if glued_exception(&raw_tail) {
             return Err(Error::Transfer(format!(
-                "clickhouse: span returned {got} rows, count() says {expected} — \
-                 refusing to swap a short read in"
+                "clickhouse: the span stream carries a glued exception tail \
+                 (tail: {:?}) — the server failed mid-stream after a 200",
+                String::from_utf8_lossy(&raw_tail[raw_tail.len().saturating_sub(180)..])
             )));
         }
         total += got;
@@ -660,20 +675,26 @@ async fn worker<L: Loader>(
     Ok(Rows::Own(total))
 }
 
-async fn count_of(conn: &ChConn, stmt: &str) -> Result<u64> {
-    let tail = stmt
-        .split_once(" FROM ")
-        .map(|(_, r)| r)
-        .and_then(|r| r.split(" FORMAT ").next())
-        .ok_or_else(|| Error::Transfer("clickhouse: malformed span statement".into()))?;
-    let body = conn.exec(&format!("SELECT count() FROM {tail}")).await?;
-    body.trim()
-        .parse::<u64>()
-        .map_err(|e| Error::Transfer(format!("clickhouse: count() → {e}")))
+/// Does the stream's rolling tail carry a ClickHouse exception? A streamed
+/// query answers 200 and glues `Code: N. DB::Exception: …` onto the body
+/// (review P1-12). A data cell containing this exact marker is the cost of
+/// dropping the cross-snapshot count; the marker is rare enough that a false
+/// positive is a refusal, never wrong data.
+fn glued_exception(tail: &[u8]) -> bool {
+    String::from_utf8_lossy(tail).contains("DB::Exception")
 }
 
 #[cfg(test)]
 mod tests {
+    /// P1-12: the in-band glued-exception detector.
+    #[test]
+    fn a_glued_exception_tail_is_detected() {
+        assert!(super::glued_exception(
+            b"1\t2\nCode: 241. DB::Exception: Memory limit exceeded"
+        ));
+        assert!(!super::glued_exception(b"1\t2\n3\t4\n"));
+        assert!(!super::glued_exception(b""));
+    }
     /// P0-1, source side: same escaping contract as `sink::clickhouse::ch_ident`.
     #[test]
     fn q_escapes_backslash_before_backtick() {
