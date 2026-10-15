@@ -605,6 +605,9 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     // doesn't exist yet.
     let mut mode = opts.mode;
     let mut delta: Option<Delta> = None;
+    // For the post-announcement re-read (R2-3): the cursor the state row was
+    // read with, and the watermark it held then.
+    let mut incremental: Option<(String, Option<String>)> = None;
     if mode != Mode::Replace {
         let cursor = plan.cursor.clone().ok_or_else(|| {
             Error::InvalidInput(
@@ -618,6 +621,12 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         })?;
         let quoted = src.cursor_quoted(&col.udt)?;
         let st = sink.dest_state(&mut plan, mode, &cursor, source_id).await?;
+        // This read happens BEFORE `prepare` announces the run, and a peer
+        // can commit the table in between — its staging is then gone, the
+        // peer check below sees nothing, and this run loads (W, W2] a second
+        // time on a keyless table (review round 2 R2-3). The re-read after
+        // the announcement compares against this.
+        incremental = Some((cursor.clone(), st.watermark.clone()));
         if !st.exists {
             mode = Mode::Replace; // first run: bootstrap the table with a full load
         } else if let Some(wm) = st.watermark {
@@ -707,6 +716,28 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         // that never started — see `Sink::release_lock`.
         sink.release_lock().await;
         return Err(e);
+    }
+
+    // The announcement is visible now; re-read the state row the load's delta
+    // was built from. A peer that committed between that read and the
+    // announcement removed its staging, so nothing else refuses this run —
+    // and the load would repeat (W, W2] on a keyless table, silently (review
+    // round 2 R2-3; the residual window between this re-read and the
+    // finalize's own write is what the PG-side CAS follow-up closes).
+    if let Some((cursor, wm_read)) = &incremental {
+        let st2 = sink.dest_state(&mut plan, mode, cursor, source_id).await?;
+        if watermark_moved(wm_read, &st2.watermark) {
+            sink.release_lock().await;
+            return Err(Error::InvalidInput(
+                "another run committed this destination between this load's \
+                 watermark read and its announcement — loading now would repeat \
+                 the changes it already landed (duplicate rows on a keyless \
+                 table). Its staging is gone, so nothing else can refuse this \
+                 run; apitap refuses here. Re-run: the watermark this run would \
+                 have read is the one the peer wrote."
+                    .into(),
+            ));
+        }
     }
 
     // Everything from here to finalize runs inside this block so that ONE error
@@ -957,8 +988,25 @@ where
     Ok(results)
 }
 
+/// Did the destination watermark move between the load's read and the
+/// post-announcement re-read? (`None` = no watermark row: first run.) A move
+/// means a peer committed while this run was announcing (review R2-3).
+fn watermark_moved(read: &Option<String>, now: &Option<String>) -> bool {
+    read != now
+}
+
 #[cfg(test)]
 mod tests {
+    /// R2-3: any change — moved watermark, a row appearing or vanishing — is
+    /// a refusal, not a proceed.
+    #[test]
+    fn watermark_moved_detects_any_change() {
+        assert!(!super::watermark_moved(&None, &None));
+        assert!(!super::watermark_moved(&Some("5".into()), &Some("5".into())));
+        assert!(super::watermark_moved(&Some("5".into()), &Some("7".into())));
+        assert!(super::watermark_moved(&Some("5".into()), &None));
+        assert!(super::watermark_moved(&None, &Some("5".into())));
+    }
     use super::*;
     use crate::wire::bqparquet::parquet_residency;
 
