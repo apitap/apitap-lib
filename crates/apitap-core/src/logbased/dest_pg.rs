@@ -481,7 +481,14 @@ mod store {
                         .max_connections(n)
                         .connect(&url)
                         .await
-                        .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}")))
+                        .map_err(|e| {
+                            let hint = if crate::dialect::postgres::url_is_local(&url) {
+                                String::new()
+                            } else {
+                                format!(" — {}", crate::dialect::postgres::tls_required_hint(&url))
+                            };
+                            Error::Transfer(format!("log_based: dest connect: {e}{hint}"))
+                        })
                 }
             };
             Ok(Self {

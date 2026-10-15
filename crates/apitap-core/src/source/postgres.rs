@@ -54,7 +54,17 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
         })
         .connect(&url)
         .await
-        .map_err(|e| crate::urlerr::connect_err("postgres source", &url, e))
+        .map_err(|e| {
+            let base = crate::urlerr::connect_err("postgres source", &url, e);
+            if crate::dialect::postgres::url_is_local(&url) {
+                base
+            } else {
+                crate::error::Error::Connect(format!(
+                    "{base} — {}",
+                    crate::dialect::postgres::tls_required_hint(&url)
+                ))
+            }
+        })
 }
 
 pub(crate) struct PgSource {

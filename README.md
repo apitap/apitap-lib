@@ -166,7 +166,7 @@ keep running between runs.
 
 | scheme | form | notes |
 |---|---|---|
-| Postgres | `postgres://user:pass@host:5432/db?sslmode=verify-full` | `sslmode` = `disable` · `prefer` · `require` · `verify-full` (`verify-ca` is refused by name — it cannot be expressed safely). A cleartext or MD5 password request on a channel that is not `verify-full` is refused (`APITAP_ALLOW_INSECURE_AUTH=1` overrides). Unqualified table names mean `public.` |
+| Postgres | `postgres://user:pass@host:5432/db?sslmode=verify-full` | `sslmode` = `disable` · `prefer` · `require` · `verify-full` (`verify-ca` is refused by name — it cannot be expressed safely). TLS is **required for any non-loopback host** by default since 0.62 (`sslmode=verify-full`, appending to a URL that says nothing); Unix sockets and loopback are untouched, and a set `PGSSLMODE` counts as your explicit choice. A cleartext or MD5 password request on a channel that is not `verify-full` is refused (`APITAP_ALLOW_INSECURE_AUTH=1` overrides). Unqualified table names mean `public.` |
 | MySQL / MariaDB | `mysql://user:pass@host:3306/db?ssl-mode=verify_identity` | TLS is **required for any non-loopback host** since 0.55.1; `ssl-mode` = `disabled` (send in clear, on purpose) · `required` (encrypt, no verify) · `verify_ca` · `verify_identity` (default off-loopback). Tables are `db.table`; the URL's database is the default |
 | ClickHouse | `clickhouse://user:pass@host:8123/db` · `clickhouse+https://…:8443/db` | HTTP interface; `wait_end_of_query=1` so a failed INSERT is a failed run; `session_timezone=UTC` |
 | BigQuery | `bigquery://project/dataset?credentials=/path/key.json[&location=EU]` | service-account key; `GOOGLE_APPLICATION_CREDENTIALS` is the fallback. Bulk modes use the free load/copy-job path and work on sandbox projects; CDC needs billing (row-level DML) |
@@ -500,6 +500,7 @@ reference lanes and are not tuning knobs.
 | `invalid port number`, or a connect error naming a host you never typed | a password with `@ / ? # : [ ]` is being read as URL syntax | `quote(password, safe='')` before building the URL |
 | `mysql source connect TLS: server does not support TLS` | TLS is required off-loopback and the server has none | add `?ssl-mode=disabled` to send in clear on purpose, or enable TLS |
 | `sslmode=verify-ca is not implemented` | chain-only verification cannot be expressed safely | use `verify-full` or `require` |
+| `postgres source connect TLS: server does not support TLS`, or a certificate error naming a private CA | TLS is required off-loopback by default and the server has none / a CA rustls's roots do not carry | set `?sslmode=require` (encrypt, no verify) or `?sslmode=disable` (clear, on purpose) in the URL, or point `sslrootcert=/path/ca.crt` at its CA |
 | ClickHouse `413 Payload Too Large` | a proxy (nginx) caps request bodies | `APITAP_CH_MAX_BODY=512K` (bulk: also `chunk_bytes=256*1024`) |
 | `log_based: … Replicated… refused` | CDC into a replicated/cluster table would apply on one replica | point at one node and set `APITAP_CH_CDC_ALLOW_REPLICATED=1`, or use a non-replicated table |
 | `locked: another apitap run is already loading this table` | a live peer, or a dead one's leftovers | wait; a dead drain clears itself after the lease TTL; a dead bulk run's object is named in the message — drop it once |

@@ -689,6 +689,7 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
     let mut ssl = SslMode::Prefer { explicit: false };
     let mut root_cert = None;
     for (k, v) in u.query_pairs() {
+        // (the default fix lives after the loop — round 2 §1.1)
         if k == "sslrootcert" {
             root_cert = Some(v.to_string());
         }
@@ -743,6 +744,15 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
                  whose lane does support it."
             )));
         }
+    }
+    // The pools' default, on the replication socket too (round 2 §1.1.5):
+    // a URL that says nothing about TLS to a non-local host gets verified
+    // TLS. Explicit values parsed above always win, and a local host keeps
+    // `prefer`. Unix sockets are not supported on this plane.
+    if matches!(ssl, SslMode::Prefer { explicit: false })
+        && !crate::dialect::postgres::host_is_local(&host)
+    {
+        ssl = SslMode::VerifyFull;
     }
     Ok(ConnInfo {
         host,
@@ -2150,8 +2160,18 @@ mod tests {
         let ci = parse_url("postgres://u%40x:p%3Aw@h:5433/db").unwrap();
         assert_eq!((ci.user.as_str(), ci.password.as_str()), ("u@x", "p:w"));
         assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
-        // libpq's default, and so this client's.
-        assert_eq!(ci.ssl, SslMode::Prefer { explicit: false });
+        // NOT libpq's default any more off-loopback: the replication socket
+        // follows the pools and verifies TLS for a non-local host with no
+        // sslmode (round 2 §1.1.5); loopback keeps `prefer`.
+        assert_eq!(ci.ssl, SslMode::VerifyFull);
+        assert_eq!(
+            parse_url("postgres://u:p@127.0.0.1:5433/db").unwrap().ssl,
+            SslMode::Prefer { explicit: false }
+        );
+        assert_eq!(
+            parse_url("postgres://u:p@localhost/db").unwrap().ssl,
+            SslMode::Prefer { explicit: false }
+        );
         // An IPv6 literal must come out DIALLABLE, not URL-shaped: with the
         // brackets left on, connect() looks up "[::1]" in DNS.
         let ci6 = parse_url("postgres://u:p@[2001:db8::1]:5433/db").unwrap();

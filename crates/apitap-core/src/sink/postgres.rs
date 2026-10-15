@@ -461,7 +461,17 @@ impl PgSink {
             .max_connections(max_conns as u32)
             .connect(&url)
             .await
-            .map_err(|e| crate::urlerr::connect_err("postgres destination", &url, e))
+            .map_err(|e| {
+                let base = crate::urlerr::connect_err("postgres destination", &url, e);
+                if crate::dialect::postgres::url_is_local(&url) {
+                    base
+                } else {
+                    crate::error::Error::Connect(format!(
+                        "{base} — {}",
+                        crate::dialect::postgres::tls_required_hint(&url)
+                    ))
+                }
+            })
     }
 
     /// Where an unqualified destination really lives, by the rule the CDC lane

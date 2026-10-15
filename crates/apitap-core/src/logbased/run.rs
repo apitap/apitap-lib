@@ -859,7 +859,14 @@ async fn run_group(
         .max_connections(2)
         .connect(&src_pool_url)
         .await
-        .map_err(|e| Error::Transfer(format!("log_based: source connect: {e}")))?;
+        .map_err(|e| {
+            let hint = if crate::dialect::postgres::url_is_local(&src_pool_url) {
+                String::new()
+            } else {
+                format!(" — {}", crate::dialect::postgres::tls_required_hint(&src_pool_url))
+            };
+            Error::Transfer(format!("log_based: source connect: {e}{hint}"))
+        })?;
 
     // Resolve every member: real (schema, name) + PK on the source.
     let single = tables.len() == 1;
