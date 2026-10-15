@@ -847,7 +847,7 @@ async fn apply_unit(
                 let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
                 u.delete_owned(dest_table, &pred).await?;
             }
-            ResidueOp::Rekey { old_key, row, .. } => {
+            ResidueOp::Rekey { old_key, new_key, row } => {
                 // ClickHouse has no cheap row UPDATE, so the move is a readback
                 // + delete + insert like MaskedUpdate — except the readback
                 // addresses the OLD key. That is the whole difference: the row
@@ -891,6 +891,19 @@ async fn apply_unit(
                     }
                 }
                 u.delete_owned(dest_table, &old_pred).await?;
+                // Replay-idempotent (review round 2 R2-4): a replayed window
+                // can find the old key already gone (the readback skip above)
+                // and would then insert the moved row a SECOND time at the
+                // new key — two rows on MergeTree, a stale TOAST value on a
+                // Replacing table. Delete the destination key first; on a
+                // first execution that key is empty and the delete is free.
+                // Insert-only tables keep their versioned rows: the replay
+                // re-inserts the same image at the same `_apitap_ver`, and
+                // ReplacingMergeTree dedupes equal versions of equal content.
+                if !insert_only {
+                    let new_pred = key_pred(pk_cols, new_key, &pk_oids, binary)?;
+                    u.delete_owned(dest_table, &new_pred).await?;
+                }
                 let mut buf = Vec::new();
                 render_residue_row(&full, oids, &missing, binary, &mut buf)?;
                 if insert_only {
