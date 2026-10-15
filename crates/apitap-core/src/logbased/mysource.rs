@@ -630,8 +630,13 @@ pub(crate) async fn drain_binlog(
                         // ENUM member order, unsigned flips and renames still
                         // need binlog_row_metadata=FULL.
                         for (i, c) in map.cols.iter().enumerate() {
-                            if let Some(expected) = sc.kinds.get(i).copied().flatten() {
-                                if expected != c.kind {
+                            if let Some((expected, real)) = sc.kinds.get(i).copied().flatten() {
+                                // The folded 0xFE carries its real type in the
+                                // metadata (captured: ENUM/SET) — unfold the
+                                // event side before comparing (MASTER M-1).
+                                let got = crate::wire::mybinlog::event_real_type(c);
+                                let real_ok = real.is_none_or(|r| got == r);
+                                if expected != c.kind || !real_ok {
                                     return Err(Error::InvalidInput(format!(
                                         "log_based: {q} column {i} ({}) is type 0x{expected:02x} \
                                          in the source catalog, but the binlog events in this \

@@ -160,8 +160,9 @@ pub(crate) struct TableMap {
 pub(crate) struct TableSchema {
     pub names: Vec<String>,
     /// The binlog TABLE_MAP type byte this catalog type should carry, per
-    /// column (`None`: no reliable mapping — the position check skips it).
-    pub kinds: Vec<Option<u8>>,
+    /// column — `(raw byte, real type when folded 0xFE)` — or `None` when
+    /// there is no reliable mapping (the position check skips it).
+    pub kinds: Vec<Option<(u8, Option<u8>)>>,
     /// Primary-key membership, positional with `names`.
     pub key: Vec<bool>,
     /// Unsigned flags, positional (binlog MINIMAL omits signedness).
@@ -324,42 +325,58 @@ fn bit(bm: &[u8], i: usize) -> bool {
 /// columns become `UnchangedToast` (the arm every apply path already
 /// treats as "do not touch"), matching MINIMAL/NOBLOB row images.
 /// The catalog's `DATA_TYPE` mapped to the binlog TABLE_MAP type byte —
-/// conservatively: an unmapped or ambiguous type yields `None`, and the
-/// schema-position check skips that column rather than refusing a legitimate
-/// table (review round 2 R2-1). The mapping exists so the drain can compare
-/// the shape the EVENT describes against the shape the CATALOG has NOW: when
-/// they differ, a DDL landed between the change and the drain.
-pub(crate) fn catalog_kind(dt: &str) -> Option<u8> {
+/// `(type byte, real type when the byte is folded 0xFE)` — or `None` for a
+/// type without a reliable mapping, which the schema-position check skips
+/// rather than refusing a legitimate table.
+///
+/// CAPTURED LIVE (review MASTER rule 2; 8.0.46 :3307, 8.4 :3310, MariaDB
+/// 10.6 :3309, all three identical): DATE is **0x0A** (0x0E never appears on
+/// a supported server), every TEXT/BLOB size is **0xFC** (the size lives in
+/// the metadata byte), CHAR and BINARY are **0xFE**, and ENUM/SET ride the
+/// folded STRING byte **0xFE** with the real type (0xF7/0xF8) in the
+/// metadata's high byte. The first cut of this table believed the
+/// mysqlbinlog documentation instead of a server and refused every
+/// DATE/ENUM/SET/TEXT table on every drain (MASTER M-1, REPRO).
+pub(crate) fn catalog_kind(dt: &str) -> Option<(u8, Option<u8>)> {
     let dt = dt.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
     Some(match dt.as_str() {
-        "tinyint" => MT_TINY,
-        "smallint" => MT_SHORT,
-        "mediumint" => MT_INT24,
-        "int" | "integer" => MT_LONG,
-        "bigint" => MT_LONGLONG,
-        "float" => MT_FLOAT,
-        "double" => MT_DOUBLE,
-        "decimal" | "numeric" => MT_NEWDECIMAL,
-        // 5.6+ (and every supported MariaDB) ships the *2 encodings.
-        "timestamp" => MT_TIMESTAMP2,
-        "datetime" => MT_DATETIME2,
-        "time" => MT_TIME2,
-        "date" => MT_NEWDATE,
-        "year" => MT_YEAR,
-        "varchar" | "varbinary" => MT_VARCHAR,
-        "char" | "binary" => MT_STRING,
-        "bit" => MT_BIT,
-        "json" => MT_JSON,
-        "enum" => MT_ENUM,
-        "set" => MT_SET,
-        // TEXT rides MYSQL_TYPE_BLOB with a charset flag in the metadata; the
-        // size siblings share their blob counterparts' bytes.
-        "tinyblob" | "tinytext" => MT_TINY_BLOB,
-        "mediumblob" | "mediumtext" => MT_MEDIUM_BLOB,
-        "longblob" | "longtext" => MT_LONG_BLOB,
-        "blob" | "text" => MT_BLOB,
+        "tinyint" => (MT_TINY, None),
+        "smallint" => (MT_SHORT, None),
+        "mediumint" => (MT_INT24, None),
+        "int" | "integer" => (MT_LONG, None),
+        "bigint" => (MT_LONGLONG, None),
+        "float" => (MT_FLOAT, None),
+        "double" => (MT_DOUBLE, None),
+        "decimal" | "numeric" => (MT_NEWDECIMAL, None),
+        // 5.6+ (every supported server) ships the *2 encodings.
+        "timestamp" => (MT_TIMESTAMP2, None),
+        "datetime" => (MT_DATETIME2, None),
+        "time" => (MT_TIME2, None),
+        "date" => (MT_DATE, None),
+        "year" => (MT_YEAR, None),
+        "varchar" | "varbinary" => (MT_VARCHAR, None),
+        "char" | "binary" => (MT_STRING, None),
+        "enum" => (MT_STRING, Some(MT_ENUM)),
+        "set" => (MT_STRING, Some(MT_SET)),
+        "bit" => (MT_BIT, None),
+        "json" => (MT_JSON, None),
+        // ALL text/blob sizes arrive as MYSQL_TYPE_BLOB; the size is the
+        // metadata byte (captured: length_size 1/2/3/4 per size).
+        "tinytext" | "text" | "mediumtext" | "longtext" | "tinyblob" | "blob"
+        | "mediumblob" | "longblob" => (MT_BLOB, None),
         _ => return None,
     })
+}
+
+/// The EVENT column's real type: 0xFE folds the true type into the metadata
+/// (captured: ENUM=0xF7, SET=0xF8, CHAR/BINARY=0xFE); everything else is its
+/// own type byte.
+pub(crate) fn event_real_type(c: &ColDef) -> u8 {
+    if c.kind == MT_STRING {
+        string_meta(c.meta).0
+    } else {
+        c.kind
+    }
 }
 
 fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Result<Tuple> {
@@ -686,8 +703,13 @@ fn render_set(labels: &Option<std::sync::Arc<Vec<String>>>, v: u64) -> Result<Ve
 fn string_meta(meta: u16) -> (u8, u16) {
     let mut rt = (meta >> 8) as u8;
     let mut len = meta & 0xFF;
-    if rt >= 0xF1 {
-        // The upper bits of the length hide in the type byte.
+    // MySQL's own rule: the high length bits live in the type byte's bits
+    // 4-5 whenever they are not BOTH set. The old `rt >= 0xF1` guard missed
+    // the folded CHAR/BINARY bytes (0xEE/0xDE/0xCE for a 256-byte CHAR(64)
+    // utf8mb4, captured live), so those columns read a 1-byte length where
+    // the server wrote 2 and every later column of the row was misaligned
+    // (MASTER M-2).
+    if rt & 0x30 != 0x30 {
         len |= ((rt as u16 & 0x30) ^ 0x30) << 4;
         rt |= 0x30;
     }
@@ -1139,24 +1161,43 @@ pub(crate) const TYPE_TX_PAYLOAD: u8 = EV_TRANSACTION_PAYLOAD;
 
 #[cfg(test)]
 mod tests {
-    /// R2-1: conservative DATA_TYPE → TABLE_MAP type-byte mapping.
+    /// MASTER M-1: pinned to LIVE-CAPTURED bytes (8.0.46 :3307, 8.4 :3310,
+    /// MariaDB 10.6 :3309 — identical on all three): DATE is 0x0A, every
+    /// text/blob size is 0xFC, CHAR/BINARY are 0xFE, ENUM/SET ride folded
+    /// 0xFE with their real type. The first cut believed the docs and
+    /// refused every DATE/ENUM/SET/TEXT table on every drain.
     #[test]
-    fn catalog_kinds_map_the_common_types_and_skip_the_rest() {
-        assert_eq!(catalog_kind("int"), Some(MT_LONG));
-        assert_eq!(catalog_kind("INT"), Some(MT_LONG));
-        assert_eq!(catalog_kind("bigint"), Some(MT_LONGLONG));
-        assert_eq!(catalog_kind("mediumint"), Some(MT_INT24));
-        assert_eq!(catalog_kind("varchar"), Some(MT_VARCHAR));
-        assert_eq!(catalog_kind("char"), Some(MT_STRING));
-        assert_eq!(catalog_kind("text"), Some(MT_BLOB));
-        assert_eq!(catalog_kind("longtext"), Some(MT_LONG_BLOB));
-        assert_eq!(catalog_kind("datetime"), Some(MT_DATETIME2));
-        assert_eq!(catalog_kind("timestamp"), Some(MT_TIMESTAMP2));
-        assert_eq!(catalog_kind("decimal"), Some(MT_NEWDECIMAL));
-        assert_eq!(catalog_kind("enum"), Some(MT_ENUM));
-        assert_eq!(catalog_kind("json"), Some(MT_JSON));
+    fn catalog_kinds_pin_the_live_captured_bytes() {
+        assert_eq!(catalog_kind("int"), Some((MT_LONG, None)));
+        assert_eq!(catalog_kind("INT"), Some((MT_LONG, None)));
+        assert_eq!(catalog_kind("bigint"), Some((MT_LONGLONG, None)));
+        assert_eq!(catalog_kind("date"), Some((MT_DATE, None))); // 0x0a, never 0x0e
+        assert_eq!(catalog_kind("enum"), Some((MT_STRING, Some(MT_ENUM))));
+        assert_eq!(catalog_kind("set"), Some((MT_STRING, Some(MT_SET))));
+        assert_eq!(catalog_kind("tinytext"), Some((MT_BLOB, None))); // 0xfc all sizes
+        assert_eq!(catalog_kind("longtext"), Some((MT_BLOB, None)));
+        assert_eq!(catalog_kind("tinyblob"), Some((MT_BLOB, None)));
+        assert_eq!(catalog_kind("longblob"), Some((MT_BLOB, None)));
+        assert_eq!(catalog_kind("char"), Some((MT_STRING, None)));
+        assert_eq!(catalog_kind("binary"), Some((MT_STRING, None)));
+        assert_eq!(catalog_kind("varchar"), Some((MT_VARCHAR, None)));
+        assert_eq!(catalog_kind("datetime"), Some((MT_DATETIME2, None)));
+        assert_eq!(catalog_kind("timestamp"), Some((MT_TIMESTAMP2, None)));
+        assert_eq!(catalog_kind("decimal"), Some((MT_NEWDECIMAL, None)));
+        assert_eq!(catalog_kind("bit"), Some((MT_BIT, None)));
         assert_eq!(catalog_kind("geometry"), None);
         assert_eq!(catalog_kind("future_type"), None);
+    }
+
+    /// MASTER M-2: the folded CHAR/BINARY type byte (captured: CHAR(64)
+    /// utf8mb4 arrives as rt=0xEE with len-byte 0x00) unfolds to the real
+    /// STRING type and the full 256-byte length; the old `rt >= 0xF1` guard
+    /// never unfolded the folded bytes.
+    #[test]
+    fn folded_string_metadata_unfolds_the_high_length_bits() {
+        assert_eq!(string_meta(0xEE00), (MT_STRING, 256));
+        assert_eq!(string_meta(0xFE28), (MT_STRING, 40));
+        assert_eq!(string_meta((0xF7u16) << 8 | 0x01), (MT_ENUM, 1));
     }
 
     /// Every case here was first observed as a DIFFERS line on a live server:
