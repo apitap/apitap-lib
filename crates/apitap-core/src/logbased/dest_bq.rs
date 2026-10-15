@@ -1614,6 +1614,10 @@ mod store {
         /// committed (`read_state`), the lower bound of every changelog row
         /// this run can find at its stamps (`BqUnit::prune`).
         hint: std::sync::Mutex<HashMap<(String, String), String>>,
+        /// The next CDC staging rotation bucket (review round 2 R2-7): a long
+        /// follow-mode drain cycles its staging over four names so no single
+        /// table approaches BigQuery's per-table daily operation cap.
+        staging_rot: std::sync::atomic::AtomicUsize,
     }
 
     /// Rows past which a probe compacts `_apitap_cdc_pending`. One row per
@@ -1720,6 +1724,9 @@ mod store {
         token: String,
         keys: Vec<String>,
         groups: Vec<(String, Vec<String>)>,
+        /// This window's staging rotation bucket (R2-7), fixed per unit so the
+        /// load and the MERGE name the same table.
+        staging_bucket: usize,
     }
 
     /// One fenced transaction: the fence first, then `chunk`, then COMMIT.
@@ -1840,6 +1847,7 @@ mod store {
                 pending_ready: AtomicBool::new(false),
                 pending_compacted: AtomicBool::new(false),
                 hint: Default::default(),
+                staging_rot: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -2061,7 +2069,10 @@ mod store {
         /// one dataset never load into one table, and a collector sweeps a
         /// dead run's by its exact token.
         fn staging(&self, table: &str) -> String {
-            artifact_ident_tok(table, Artifact::CdcStaging, ROOMY, &self.token)
+            // The window's rotation bucket (R2-7): the load and the MERGE
+            // below share this unit, so both name one table.
+            let fam = Artifact::cdc_staging_family();
+            artifact_ident_tok(table, fam[self.staging_bucket], ROOMY, &self.token)
         }
 
         pub(crate) fn staging_fq(&self, table: &str) -> String {
@@ -2192,7 +2203,17 @@ mod store {
 
         /// No I/O: nothing is written until the close, and the close is fenced.
         async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<BqUnit<'a>> {
-            Ok(BqUnit { s: self, token: token.to_string(), keys: keys.to_vec(), groups: Vec::new() })
+            let staging_bucket = self
+                .staging_rot
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % crate::naming::Artifact::cdc_staging_family().len();
+            Ok(BqUnit {
+                s: self,
+                token: token.to_string(),
+                keys: keys.to_vec(),
+                groups: Vec::new(),
+                staging_bucket,
+            })
         }
 
         /// Each mark into its table's group, then the groups in as few fenced

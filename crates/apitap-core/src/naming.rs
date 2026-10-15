@@ -50,7 +50,15 @@ pub(crate) enum Artifact {
     CdcDelete,
     /// BigQuery's CDC staging table for one window's rows — tokenized by run,
     /// so two drains that share a dataset never load into one table.
+    /// `CdcStaging1..3` are the same artifact's ROTATION buckets (review
+    /// round 2 R2-7): BigQuery caps table-update operations per table per
+    /// day, and a long follow-mode drain reloads its staging every window, so
+    /// one name exhausts the quota in hours — `cdc_staging_family()` spreads
+    /// one run over four tables.
     CdcStaging,
+    CdcStaging1,
+    CdcStaging2,
+    CdcStaging3,
     /// The view that derives current state from a changelog table.
     Current,
     /// A run's declaration that it is working on this table — written FIRST,
@@ -79,9 +87,24 @@ impl Artifact {
         Artifact::ChangelogTmp,
         Artifact::CdcDelete,
         Artifact::CdcStaging,
+        Artifact::CdcStaging1,
+        Artifact::CdcStaging2,
+        Artifact::CdcStaging3,
         Artifact::Current,
         Artifact::Lock,
     ];
+
+    /// The CDC staging rotation buckets (review round 2 R2-7): a long
+    /// follow-mode drain cycles its staging through all four names, staying
+    /// under BigQuery's per-table daily operation cap.
+    pub(crate) fn cdc_staging_family() -> [Artifact; 4] {
+        [
+            Artifact::CdcStaging,
+            Artifact::CdcStaging1,
+            Artifact::CdcStaging2,
+            Artifact::CdcStaging3,
+        ]
+    }
 
     /// May apitap claim this suffix as its own?
     ///
@@ -114,7 +137,13 @@ impl Artifact {
             Artifact::CdcDelete => "__apitap_cdc_del",
             // Not a suffix of `__apitap_cdc_del`, nor it of this: the
             // ALL-driven tests pin that the two never share a name.
+            // The rotation buckets share the family stem; none is a SUFFIX
+            // of another (`ends_with` is the relation that matters), which
+            // the ALL-driven tests pin.
             Artifact::CdcStaging => "__apitap_cdc",
+            Artifact::CdcStaging1 => "__apitap_cdc1",
+            Artifact::CdcStaging2 => "__apitap_cdc2",
+            Artifact::CdcStaging3 => "__apitap_cdc3",
             Artifact::Current => "__current",
             Artifact::Lock => "__apitap_lock",
         }
@@ -1372,6 +1401,22 @@ pub(crate) mod compat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R2-7: the CDC staging rotation buckets mint four DISTINCT names for
+    /// the same (table, run), and every one is a reserved apitap suffix.
+    #[test]
+    fn the_staging_family_rotates_over_four_distinct_names() {
+        let fam = Artifact::cdc_staging_family();
+        assert_eq!(fam.len(), 4);
+        let names: std::collections::HashSet<String> = fam
+            .iter()
+            .map(|a| artifact_ident_tok("orders", *a, 63, "_0000000l000abcd"))
+            .collect();
+        assert_eq!(names.len(), 4, "every bucket must name a different table");
+        for a in fam {
+            assert!(a.reserved(), "{a:?} must stay a reserved namespace");
+        }
+    }
 
     /// The invariants below run over `Artifact::ALL`, not over a handful of
     /// examples. That is the point of the enum: a new artifact is tested by

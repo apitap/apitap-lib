@@ -2511,7 +2511,9 @@ impl crate::guard::GuardStore for BqGuard {
     async fn sweep_run(&self, bare: &str, token: &str) -> Result<()> {
         use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
         let mut first = Ok(());
-        for a in [Artifact::CdcStaging, Artifact::ChangelogTmp] {
+        let mut arts: Vec<Artifact> = vec![Artifact::ChangelogTmp];
+        arts.extend(Artifact::cdc_staging_family());
+        for a in arts {
             let r = self.conn.table_delete(&artifact_ident_tok(bare, a, ROOMY, token)).await;
             if first.is_ok() {
                 first = r;
