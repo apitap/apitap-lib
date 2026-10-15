@@ -1260,7 +1260,16 @@ fn cast_expr(name: &str, oid: u32, ty: &str) -> Result<String> {
 /// text — a staging column under an alias, or a staged old key: the moved-row
 /// MERGE casts `S.c` and `S._apitap_from_<j>` exactly as the plain form casts
 /// `c`. `name` is only for the messages.
+/// The column name embeds inside an `ERROR(FORMAT('…'))` string literal:
+/// escaped as a BigQuery string AND with `%` doubled (FORMAT interprets
+/// them) — a hostile destination column name must not break the literal or
+/// the format (MASTER M-64).
+fn error_name_literal(name: &str) -> String {
+    sql_str(name).replace('%', "%%")
+}
+
 fn cast_expr_of(src: &str, name: &str, oid: u32, ty: &str) -> Result<String> {
+    let nm = error_name_literal(name);
     let c = src.to_string();
     if oid == BOOL_OID {
         return Ok(match ty {
@@ -1268,13 +1277,13 @@ fn cast_expr_of(src: &str, name: &str, oid: u32, ty: &str) -> Result<String> {
                 "CASE WHEN {c} IS NULL THEN NULL \
                  WHEN {c} IN ('t','true','TRUE','1') THEN TRUE \
                  WHEN {c} IN ('f','false','FALSE','0') THEN FALSE \
-                 ELSE ERROR(FORMAT('log_based: bad bool text %s for column {name}', {c})) END"
+                 ELSE ERROR(FORMAT('log_based: bad bool text %s for column {nm}', {c})) END"
             ),
             "INT64" | "NUMERIC" | "BIGNUMERIC" | "FLOAT64" => format!(
                 "CASE WHEN {c} IS NULL THEN NULL \
                  WHEN {c} IN ('t','true','TRUE','1') THEN 1 \
                  WHEN {c} IN ('f','false','FALSE','0') THEN 0 \
-                 ELSE ERROR(FORMAT('log_based: bad bool text %s for column {name}', {c})) END"
+                 ELSE ERROR(FORMAT('log_based: bad bool text %s for column {nm}', {c})) END"
             ),
             "STRING" => c,
             other => {
@@ -1295,7 +1304,7 @@ fn cast_expr_of(src: &str, name: &str, oid: u32, ty: &str) -> Result<String> {
             "CASE WHEN {c} IS NULL THEN NULL \
              WHEN {c} IN ('t','true','TRUE','1') THEN TRUE \
              WHEN {c} IN ('f','false','FALSE','0') THEN FALSE \
-             ELSE ERROR(FORMAT('log_based: bad bool text %s for column {name}', {c})) END"
+             ELSE ERROR(FORMAT('log_based: bad bool text %s for column {nm}', {c})) END"
         ),
         "BYTES" => format!("IF({c} IS NULL, NULL, FROM_HEX(SUBSTR({c}, 3)))"),
         "DATE" => format!("CAST({c} AS DATE)"),
@@ -2284,6 +2293,14 @@ mod store {
 
 #[cfg(test)]
 mod tests {
+    /// MASTER M-64: a destination column name with quotes or % cannot break
+    /// the ERROR(FORMAT(...)) literal it embeds in.
+    #[test]
+    fn error_column_names_cannot_break_the_format_literal() {
+        assert_eq!(super::error_name_literal("o'brien"), "o\\'brien");
+        assert_eq!(super::error_name_literal("pct%x"), "pct%%x");
+        assert_eq!(super::error_name_literal("a\\b%"), "a\\\\b%%");
+    }
     use super::*;
     use crate::logbased::replay::replay_plan;
 
