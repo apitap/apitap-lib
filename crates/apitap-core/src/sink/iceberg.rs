@@ -1129,7 +1129,21 @@ impl crate::sink::Sink for IcebergSink {
         }
         self.conn.ensure_namespace().await?;
         let meta = match self.conn.load_table(&self.table).await? {
-            Some(m) => m,
+            Some(m) => {
+                // The bulk commit writes `partition(Struct::empty())`; an
+                // EXISTING partitioned table would instead fail inside
+                // iceberg-rust's construct_partition_summaries (a zip_eq
+                // panic) AFTER the whole load, leaving the claim behind and
+                // every later run refused (review round 2 R2-5). Same rule
+                // cdc_bind applies, moved up front where it costs nothing.
+                if !m.default_partition_spec().fields().is_empty() {
+                    return Err(Error::InvalidInput(format!(
+                        "iceberg table '{}' is partitioned — apitap writes                          unpartitioned tables only; land into an unpartitioned                          table, or export and partition it on the warehouse side",
+                        self.table
+                    )));
+                }
+                m
+            }
             None => {
                 let schema = build_schema(&names, &delivered)?;
                 self.conn.create_table(&self.table, &schema).await?
