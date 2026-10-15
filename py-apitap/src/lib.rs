@@ -48,9 +48,27 @@ fn to_py(e: apitap_core::Error) -> PyErr {
 
 /// One shared multi-thread runtime for every call (building one per call would pay
 /// thread-spawn latency each time).
-fn rt() -> &'static Runtime {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| Runtime::new().expect("tokio runtime"))
+///
+/// The runtime is tagged with the PID that built it: after a `fork()` the
+/// inherited runtime's worker threads do not exist in the child, so any
+/// `spawn` there hangs forever — a `multiprocessing`/Celery-prefork child
+/// deadlocks on its first task (review round 2 R2-10). A PID change rebuilds.
+fn rt() -> std::sync::Arc<Runtime> {
+    static RT: std::sync::Mutex<Option<(u32, std::sync::Arc<Runtime>)>> =
+        std::sync::Mutex::new(None);
+    let mut g = RT.lock().unwrap_or_else(|e| e.into_inner());
+    let pid = std::process::id();
+    if let Some((p, rt)) = &*g {
+        if *p == pid {
+            return rt.clone();
+        }
+    }
+    let rt = std::sync::Arc::new(Runtime::new().expect("tokio runtime"));
+    // The old runtime is leaked on purpose: its threads died with the fork,
+    // and dropping it would try to join them.
+    std::mem::forget(g.take());
+    *g = Some((pid, rt.clone()));
+    rt
 }
 
 /// log_based's runtime is chosen by the quota, per the scale law

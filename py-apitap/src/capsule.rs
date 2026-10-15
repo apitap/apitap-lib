@@ -370,7 +370,18 @@ unsafe extern "C" fn stream_get_schema(
 unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowArray) -> c_int {
     // SAFETY: per the contract above.
     let st = unsafe { &mut *((*s).private_data as *mut StreamState) };
-    match st.handle.next_batch() {
+    // A panic inside the read pipeline must NOT unwind across the FFI
+    // boundary: since Rust 1.81 that aborts the whole Python process
+    // (review round 2 R2-10). It becomes EIO + `last_error` instead.
+    let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st.handle.next_batch()));
+    let next = match pulled {
+        Ok(r) => r,
+        Err(_) => {
+            st.last_error = CString::new("read: the read pipeline panicked").ok();
+            return 5; // EIO
+        }
+    };
+    match next {
         Ok(Some(batch)) => {
             // SAFETY: `out` is writable, uninitialised array storage.
             unsafe { export_batch(batch, out) };

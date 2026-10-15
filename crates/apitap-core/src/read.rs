@@ -66,7 +66,12 @@ impl ReadHandle {
     /// Blocking pull (called from an arbitrary consumer thread, GIL
     /// released). `Ok(None)` = clean end of stream.
     pub fn next_batch(&mut self) -> Result<Option<ArrowBatch>> {
-        match self.rx.blocking_recv() {
+        // NOT `rx.blocking_recv()`: tokio refuses to block from inside a
+        // runtime context, and consumers like deltalake/datafusion pull from
+        // one — the panic (pre-1.81) or abort would kill the process (review
+        // round 2 R2-10). `futures::executor::block_on` polls from any
+        // thread; the producer side keeps running on the runtime's workers.
+        match futures::executor::block_on(self.rx.recv()) {
             Some(Ok(b)) => Ok(Some(b)),
             Some(Err(e)) => {
                 self.supervisor.abort();
