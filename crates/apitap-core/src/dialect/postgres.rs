@@ -26,7 +26,9 @@ fn effective_host(url: &reqwest::Url) -> Option<String> {
 /// either, because this must be decidable from the URL alone.
 pub(crate) fn host_is_local(h: &str) -> bool {
     let h = h.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
-    h.starts_with('/')
+    // `%2F…` is the same socket path, percent-encoded in the authority —
+    // without this it read as remote and got verify-full (MASTER M-50).
+    h.starts_with('/') || h.starts_with("%2f")
         || h == "localhost"
         || h == "::1"
         || h.parse::<std::net::Ipv4Addr>().map(|a| a.is_loopback()).unwrap_or(false)
@@ -162,6 +164,11 @@ mod tests {
         assert_eq!(
             secure_url("postgres:///app?host=%2Fvar%2Frun%2Fpostgresql"),
             "postgres:///app?host=%2Fvar%2Frun%2Fpostgresql"
+        );
+        // M-50: the socket path percent-encoded in the AUTHORITY.
+        assert_eq!(
+            secure_url("postgres://%2Fvar%2Flib%2Fpostgresql/db"),
+            "postgres://%2Fvar%2Flib%2Fpostgresql/db"
         );
         assert_eq!(
             secure_url("postgres://u:p@localhost/app?host=prod.example.com"),
