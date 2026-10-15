@@ -1904,7 +1904,7 @@ async fn apply_windows(
         // after the first window this is a map hit.
         let parallel_ok = match dest {
             Dest::Ch(ch) => {
-                if parallel_apply() {
+                if parallel_apply() && o.bodies.parallel_safe() {
                     let mut ok = true;
                     for (dt, _, _) in &members {
                         if !ch.store().insert_only(dt).await {
@@ -1919,6 +1919,18 @@ async fn apply_windows(
             }
             _ => false,
         };
+        // "Say so loudly" (round 2): the flag is not silently inert.
+        if parallel_apply() && !parallel_ok {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[log_based] APITAP_PARALLEL_APPLY ignored: the destination is \
+                     not proven insert-only, or this window carries residue/truncate; \
+                     applying serially"
+                );
+            }
+        }
         if let Dest::Bq(_) = dest {
             // BigQuery: stage every table concurrently (one load job each),
             // then commit the whole group's MERGEs + watermarks in as few
@@ -2077,7 +2089,11 @@ async fn apply_windows(
             }
             // Every window this arm could see was consumed and closed above;
             // the shared tail would also resend the ENTRY window's end after
-            // later ones (a backwards watch value).
+            // later ones (a backwards watch value). Replicate its progress
+            // contract here or the row counter freezes (round 2).
+            let total: u64 = rows_per.iter().sum();
+            crate::progress::add_rows(total - reported_rows);
+            reported_rows = total;
             continue;
         } else if lanes > 1 && members.len() > 1 {
             // A BOUNDED pool of per-table units: `lanes` in flight, the rest

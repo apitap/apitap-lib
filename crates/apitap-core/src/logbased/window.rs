@@ -264,6 +264,20 @@ impl Bodies {
             )
         })
     }
+
+    /// May this window ride the parallel-apply arm? Replica windows only,
+    /// and only when NO body carries a residue tail or a truncate: the
+    /// residue tail (readback + delete + insert) and a truncate both assume
+    /// the previous window has landed, so they are not commutative across
+    /// concurrent windows (round-2 review of the P0-7 fix).
+    pub(crate) fn parallel_safe(&self) -> bool {
+        match self {
+            Bodies::Replica(m) => m
+                .values()
+                .all(|w| w.body().residue.is_empty() && !w.body().truncate),
+            Bodies::Changelog(_) => false,
+        }
+    }
 }
 
 /// One table's part of a window, in its lane; `None` when the window had no
@@ -326,6 +340,31 @@ mod tests {
     }
     fn row(n: usize) -> Tuple {
         Tuple::from_cells(&(0..n).map(|i| t(&i.to_string())).collect::<Vec<_>>())
+    }
+
+    /// Round-2 (the P0-7 fix): residue and truncate windows, and every
+    /// changelog window, are refused by the parallel gate.
+    #[test]
+    fn parallel_safe_refuses_residue_truncate_and_changelog() {
+        use crate::logbased::collapse::{Collapsed, DeleteSet, ResidueOp};
+        let l = Layout::for_test(&["id", "v"], &[], &["id"]);
+        let make = |residue: Vec<ResidueOp>, truncate: bool| {
+            let simple = Collapsed {
+                deletes: DeleteSet::default(),
+                upserts: Vec::new(),
+                residue,
+                truncate,
+                events: 1,
+            };
+            Bodies::Replica(HashMap::from([(
+                "a".to_string(),
+                TableWindow::seal("a", l.clone(), simple).unwrap(),
+            )]))
+        };
+        assert!(make(Vec::new(), false).parallel_safe());
+        assert!(!make(vec![ResidueOp::Delete { key: Vec::new() }], false).parallel_safe());
+        assert!(!make(Vec::new(), true).parallel_safe());
+        assert!(!Bodies::Changelog(HashMap::new()).parallel_safe());
     }
 
     /// A1. A body whose rows are not all the layout's width is refused, naming
