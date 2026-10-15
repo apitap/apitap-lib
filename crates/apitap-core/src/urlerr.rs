@@ -40,10 +40,21 @@ use std::fmt::Display;
 /// Split what follows `scheme://` into (userinfo, host:port). See the module
 /// docs for why the last `@` is the right pivot and the first `/` is not.
 fn split_authority(rest: &str) -> (Option<&str>, &str) {
-    match rest.rsplit_once('@') {
-        Some((u, h)) => (Some(u), h.split(['/', '?', '#']).next().unwrap_or(h)),
-        None => (None, rest.split(['/', '?', '#']).next().unwrap_or(rest)),
+    if let Some((u, h)) = rest.rsplit_once('@') {
+        // An `@` whose tail carries `KEY=VALUE` before any `?` is INSIDE the
+        // query string, not a userinfo delimiter: `?user=a@corp&password=…`
+        // would otherwise print the secret as the host (MASTER M-47,
+        // security). A real password containing `/` or `?` still leaves a
+        // host[:port][/path] after the pivot — the case this function's
+        // first version died on — so the `=` test, not the `/` cut, is the
+        // discriminator.
+        let host_seg = h.split('?').next().unwrap_or(h);
+        if !host_seg.contains('=') {
+            return (Some(u), h.split(['/', '?', '#']).next().unwrap_or(h));
+        }
     }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    (None, authority)
 }
 
 pub(crate) fn sanitized(url: &str) -> String {
@@ -174,6 +185,17 @@ pub(crate) fn connect_err(what: &str, url: &str, e: impl Display) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// MASTER M-47: an `@` inside the QUERY string must never be the
+    /// userinfo pivot — the secret after it would print verbatim.
+    #[test]
+    fn an_at_in_the_query_never_leaks_the_password() {
+        let out = super::sanitized("postgres://host/db?user=a@corp&password=hunter2");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains("corp"), "{out}");
+        let ok = super::sanitized("postgres://u:pw@host:5432/db?x=1");
+        assert!(!ok.contains("pw"), "{ok}");
+        assert!(ok.contains("host:5432"), "{ok}");
+    }
     use super::*;
 
     fn err(url: &str) -> String {
