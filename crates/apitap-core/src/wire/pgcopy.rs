@@ -160,6 +160,13 @@ mod tests {
         let mut out = Vec::new();
         numeric_field_from_str(&forty, &mut out).unwrap();
         assert_eq!(numeric_to_scaled_i128(&out[4..], 0).unwrap(), 0);
+        // The round-2 review's exact divide-by-zero shape: ndigits = 0 with
+        // dscale = 200 — the zero fast path accepts it, and the old rescale
+        // divided by 10^200 wrapped to zero (panic in release).
+        let mut out = Vec::new();
+        numeric_field_from_str("0", &mut out).unwrap();
+        out[10..12].copy_from_slice(&200i16.to_be_bytes());
+        assert_eq!(numeric_to_scaled_i128(&out[4..], 4).unwrap(), 0);
         // Declared scale past the i128 range with an integer value: the
         // multiplier cannot exist and the result cannot fit — refuse.
         let mut out = Vec::new();
