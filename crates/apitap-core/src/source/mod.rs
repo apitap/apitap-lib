@@ -92,16 +92,24 @@ pub(crate) trait Source: Sized + Send + Sync {
 }
 
 /// Split `[lo, hi]` into at most `n` contiguous, non-overlapping, covering spans.
+///
+/// The arithmetic runs in i128: `hi - lo + 1` overflows i64 for the id ranges
+/// hash csids and UUID-derived keys produce (`i64::MIN ..= i64::MAX`), and the
+/// wrap made spans inverted — an empty "successful" run — or a zero step that
+/// read every row `n` times (review round 2 P1-6, both reproduced).
 pub(crate) fn spans(lo: i64, hi: i64, n: usize) -> Vec<(i64, i64)> {
-    let n = n.max(1) as i64;
-    let step = (hi - lo + 1 + n - 1) / n; // ceil
+    let n = n.max(1) as i128;
+    let (lo, hi) = (lo as i128, hi as i128);
+    let step = (hi - lo + 1 + n - 1) / n; // ceil, exact in i128
     let mut out = Vec::new();
     for k in 0..n {
         let rlo = lo + k * step;
         if rlo > hi {
             break;
         }
-        out.push((rlo, std::cmp::min(lo + (k + 1) * step - 1, hi)));
+        let rhi = std::cmp::min(lo + (k + 1) * step - 1, hi);
+        // rlo/rhi are inside [lo, hi] by construction.
+        out.push((rlo as i64, rhi as i64));
     }
     out
 }
@@ -109,6 +117,30 @@ pub(crate) fn spans(lo: i64, hi: i64, n: usize) -> Vec<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review round 2 P1-6: the full-width ranges. i64 arithmetic wrapped —
+    /// `(-1, MAX)` inverted every span (0 rows, "success") and `(MIN, MAX)`
+    /// produced a zero step (every row read 4x).
+    #[test]
+    fn spans_survive_full_width_ranges() {
+        let s = spans(i64::MIN, i64::MAX, 4);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s.first().unwrap().0, i64::MIN);
+        assert_eq!(s.last().unwrap().1, i64::MAX);
+        for w in s.windows(2) {
+            assert_eq!(w[0].1 + 1, w[1].0);
+        }
+        for (lo, hi) in [(-1, i64::MAX), (0, i64::MAX), (i64::MIN, -1)] {
+            let s = spans(lo, hi, 4);
+            assert_eq!(s.len(), 4, "({lo}, {hi})");
+            assert!(s.iter().all(|(a, b)| a <= b), "({lo}, {hi}): {s:?}");
+            assert_eq!(s.first().unwrap().0, lo);
+            assert_eq!(s.last().unwrap().1, hi);
+            for w in s.windows(2) {
+                assert_eq!(w[0].1 + 1, w[1].0);
+            }
+        }
+    }
 
     #[test]
     fn spans_cover_the_range_without_overlap() {
