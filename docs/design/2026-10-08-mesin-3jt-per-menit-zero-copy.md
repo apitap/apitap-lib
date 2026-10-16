@@ -1598,3 +1598,27 @@ jalur mengejar penuh (validasi eksak); di 62k keduanya tertinggal.
 
 Target ">50k/s" tercapai sebagai **kelas 3 jt/menit** (48–49k mengejar penuh @0,5 core, MATCH);
 di atas itu perlu core tambahan + slot menyesuaikan (rezim C, `slots="auto"`).
+
+### 14.18 Matriks plafon lengkap (2026-10-13)
+
+Empat konfigurasi @~61–63k offered (pace ledger, mix murni update, kandang 0,5 core):
+
+| konfigurasi | offered | drain wall (jendela writer 120 s) | CPU | verdict data |
+|---|---|---|---|---|
+| PG single (slots=1) | 61,5 rb/s | 215,9 s → tertinggal | 0,43/0,5 (85%) | MATCH |
+| PG slots=2 (2 tabel) | 61,4–62,6 rb/s | 171–174 s → tertinggal | 0,42–0,43/0,5 | MATCH |
+| MySQL single | 60,6 rb/s | 251,5 s → tertinggal | 0,31/0,5 (63%) | MATCH |
+| MySQL grup 10-tabel | 62,7 rb/s | 411 s → tertinggal | 0,28/0,5 (57%) | MATCH |
+
+Titik "mengejar penuh" @0,5 core (terukur, MATCH):
+- PG: ~49 rb/s (slots=2)
+- MySQL: 2,88 rb/s (lama) → ~49 rb/s (G1.2/G1.3/follow); grup 10-tabel ~49 rb/s
+
+**Kesimpulan plafon:**
+- **PG** tertinggal di 61k karena CPU 85% → dinding CPU core; tuas = tambah core + slot.
+- **MySQL** tertinggal di 61k dengan CPU 57–63% → **bukan CPU**; dinding di jalur apply
+  serial per grup (identik single & grup) → tuas = paralelisme apply (lanes) atau kurangi
+  biaya per-statement.
+- Di atas ~49 rb/s, "mengejar penuh" butuh lebih dari 0,5 core untuk kedua jalur.
+
+Semua konfigurasi MATCH (checksum eksak) — tidak ada kehilangan data di rentang mana pun.
