@@ -605,7 +605,16 @@ impl ChConn {
             let from_proxy_5xx = matches!(status.as_u16(), 502 | 503 | 504)
                 && body_read.is_ok()
                 && !body.contains("DB::Exception");
-            if from_proxy_5xx && attempt < BACKOFF_MS.len() {
+            // ...and a proxy 5xx proves "did not run" only for a 503 (no
+            // upstream to forward to). A 502/504 means the proxy FORWARDED
+            // the statement and lost the answer: a mutation may have run. A
+            // repeated EXCHANGE swaps the tables back (old data published,
+            // then the staging DROP deletes the new), a repeated ATTACH
+            // duplicates every row (MASTER review M-17). Reads (`readonly`)
+            // change nothing and still retry on all three.
+            let is_read = settings.iter().any(|(k, _)| *k == "readonly");
+            let outcome_unknown = from_proxy_5xx && !is_read && status.as_u16() != 503;
+            if from_proxy_5xx && !outcome_unknown && attempt < BACKOFF_MS.len() {
                 tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]))
                     .await;
                 attempt += 1;
@@ -620,7 +629,13 @@ impl ChConn {
                 return Err(Error::Transfer(format!(
                     "clickhouse {status}: {}{}",
                     body.trim(),
-                    if from_proxy {
+                    if outcome_unknown {
+                        " — a proxy or load balancer in front of ClickHouse forwarded \
+                         this statement and lost the answer, so whether it ran is \
+                         unknown; apitap does not repeat a statement that changes data \
+                         on that basis (a repeated EXCHANGE or ATTACH would corrupt the \
+                         table). Re-run once the proxy is healthy."
+                    } else if from_proxy {
                         " — this is not a ClickHouse exception, so it came from a \
                          proxy or load balancer in front of it (apitap already \
                          retried this statement)"
@@ -2446,6 +2461,72 @@ mod tests {
         });
         let g = ChGuard::new(ChConn::parse(&format!("clickhouse://default:x@127.0.0.1:{port}/default")).unwrap(), None);
         (g, seen)
+    }
+
+    /// A mock that answers the first `fails` requests with `status` and a
+    /// proxy's error page (no `DB::Exception`), then 200 "ok"; counts requests.
+    async fn proxy_status_mock(status: u16, fails: usize) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h2 = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let n = h2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let mut got = Vec::new();
+                    loop {
+                        let Ok(k) = c.read(&mut buf).await else { return };
+                        if k == 0 { return; }
+                        got.extend_from_slice(&buf[..k]);
+                        let t = String::from_utf8_lossy(&got).to_string();
+                        if let Some(h) = t.find("\r\n\r\n") {
+                            let len = t[..h].to_ascii_lowercase().lines()
+                                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .unwrap_or(0);
+                            if got.len() >= h + 4 + len { break; }
+                        }
+                    }
+                    let resp = if n < fails {
+                        let b = "<html><body>Gateway error</body></html>";
+                        format!("HTTP/1.1 {status} Proxy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                    };
+                    let _ = c.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("clickhouse://default:x@127.0.0.1:{port}/default"), hits)
+    }
+
+    /// M-17: a proxy 502/504 retries a read but never a mutation (the
+    /// proxy forwarded it — it may have run); a 503 retries both.
+    #[test]
+    fn a_forwarded_proxy_error_never_repeats_a_mutation() {
+        use std::sync::atomic::Ordering::SeqCst;
+        rt().block_on(async {
+            for status in [502u16, 503, 504] {
+                let (url, hits) = proxy_status_mock(status, 1).await;
+                let c = ChConn::parse(&url).unwrap();
+                assert_eq!(c.read("SELECT 1").await.unwrap(), "ok", "{status} read");
+                assert_eq!(hits.load(SeqCst), 2, "{status}: the read is retried");
+
+                let (url, hits) = proxy_status_mock(status, 1).await;
+                let c = ChConn::parse(&url).unwrap();
+                let r = c.exec("EXCHANGE TABLES `a` AND `b`").await;
+                if status == 503 {
+                    assert_eq!(r.unwrap(), "ok");
+                    assert_eq!(hits.load(SeqCst), 2, "503: never forwarded, retried");
+                } else {
+                    let e = r.unwrap_err().to_string();
+                    assert!(e.contains("unknown"), "{status}: {e}");
+                    assert_eq!(hits.load(SeqCst), 1, "{status}: the mutation is sent once");
+                }
+            }
+        });
     }
 
     fn rt() -> tokio::runtime::Runtime {

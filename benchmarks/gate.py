@@ -245,6 +245,7 @@ LEGS = [
     leg("e2e_ch_residue_crash.py", "a CH residue op cut between DELETE and INSERT replays exact"),
     leg("e2e_group_member_ahead.py", "a group member already past a window does not apply it again"),
     leg("e2e_pg_deferred_key_swap.py", "a DEFERRABLE-key swap keeps both rows"),
+    leg("e2e_ch_lb_504.py",        "an LB 504 after a forwarded EXCHANGE never republishes old data"),
 ]
 
 
