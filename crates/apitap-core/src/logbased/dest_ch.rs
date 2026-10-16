@@ -2120,7 +2120,15 @@ mod store {
                     self.keys.join(", ")
                 )));
             }
-            self.s.ch.exec(&format!("DROP TABLE {tq}")).await.map(|_| ())
+            // Published: the old table under the run's name goes best-effort.
+            // Failing here failed a window whose rebuild already landed
+            // (MASTER review M-62); a leftover is named by the next scan.
+            if let Err(e) = self.s.ch.exec(&format!("DROP TABLE {tq}")).await {
+                crate::progress::warn(&format!(
+                    "clickhouse: rebuilt {table}, but dropping {tmp} failed ({e}); drop it by hand"
+                ));
+            }
+            Ok(())
         }
 
         pub(crate) async fn current_view(&mut self, table: &str, pk_cols: &[String]) -> Result<()> {

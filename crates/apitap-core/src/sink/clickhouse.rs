@@ -956,6 +956,21 @@ impl ChSink {
         Ok(())
     }
 
+    /// The staging table after the publish: best-effort, because the data is
+    /// already live and its watermark written. A failure leaves the table
+    /// for the next run's scan to name rather than failing a run that
+    /// landed (or, for an append, re-landing it).
+    async fn drop_staging_after_publish(&self) {
+        if let Err(e) = self.ch.exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t)).await {
+            crate::progress::warn(&format!(
+                "clickhouse: published, but dropping {} failed ({e}); the next run of \
+                 this table will name it — drop it by hand (a table over \
+                 max_table_size_to_drop needs that setting raised)",
+                self.staging_t
+            ));
+        }
+    }
+
     /// A flipped bootstrap created the table this run publishes, so only THIS
     /// source's state row can be stale; a sibling source's row is not this
     /// run's to delete (M-11: the blanket DELETE wiped a peer's watermark).
@@ -2045,6 +2060,9 @@ impl ChSink {
                 // a Swap token. A probe that fails counts as EXISTS (refuse
                 // rather than destroy on an unproven absence).
                 let flipped = crate::naming::flipped_bootstrap(self.run.kind(), mode);
+                // A staging drop owed AFTER the publish: it runs once the state
+                // row is written, never between the two (M-62).
+                let mut drop_after = false;
                 if flipped {
                     let probed = self
                         .ch
@@ -2163,9 +2181,8 @@ impl ChSink {
                                 self.final_t, self.staging_t
                             ))
                             .await?;
-                        self.ch
-                            .exec(&format!("DROP TABLE {}", self.staging_t))
-                            .await?;
+                        // Published: the staging drop waits for the state row.
+                        drop_after = true;
                     } else {
                         // Replacing an EXISTING table goes through a shadow copy,
                         // which needs its own ZooKeeper path — only the ON CLUSTER
@@ -2255,24 +2272,28 @@ impl ChSink {
                             self.staging_t, self.final_t
                         ))
                         .await?;
-                    self.ch
-                        .exec(&format!("DROP TABLE {}", self.staging_t))
-                        .await?;
+                    // Published: the old data riding in the staging name is
+                    // dropped after the state row, best-effort (M-62).
+                    drop_after = true;
                 }
                 // Replace destroyed every source's rows — clear ALL stale state rows
                 // for this destination before the bootstrap (if any) re-inserts its own.
                 if flipped {
-                    return self.publish_state_flipped(staged_wm.as_deref(), rows).await;
+                    self.publish_state_flipped(staged_wm.as_deref(), rows).await?;
+                } else {
+                    self.ensure_state_table().await?;
+                    self.ch
+                        .exec(&format!(
+                            "DELETE FROM `_apitap_state` WHERE dest_table = '{}'",
+                            ch_str(&self.final_bare)
+                        ))
+                        .await?;
+                    if let Some(wm) = &staged_wm {
+                        self.write_state(wm, rows).await?;
+                    }
                 }
-                self.ensure_state_table().await?;
-                self.ch
-                    .exec(&format!(
-                        "DELETE FROM `_apitap_state` WHERE dest_table = '{}'",
-                        ch_str(&self.final_bare)
-                    ))
-                    .await?;
-                if let Some(wm) = &staged_wm {
-                    self.write_state(wm, rows).await?;
+                if drop_after {
+                    self.drop_staging_after_publish().await;
                 }
                 Ok(())
             }
@@ -2290,12 +2311,14 @@ impl ChSink {
                         self.final_t, self.staging_t
                     ))
                     .await?;
-                self.ch
-                    .exec(&format!("DROP TABLE {}", self.staging_t))
-                    .await?;
+                // The rows are published: the watermark must follow at once.
+                // A staging DROP failing first (max_table_size_to_drop, a
+                // lost answer) left no state row, so the next run appended
+                // the same delta again (MASTER review M-62).
                 if let Some(wm) = &staged_wm {
                     self.write_state(wm, rows).await?;
                 }
+                self.drop_staging_after_publish().await;
                 Ok(())
             }
             Mode::LogBased => Err(Error::InvalidInput(
