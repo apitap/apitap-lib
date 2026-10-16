@@ -232,7 +232,16 @@ async fn plan_read<S: Source>(
     let mut kinds = Vec::with_capacity(lane.cols.len());
     let mut schema = Vec::with_capacity(lane.cols.len());
     for (lc, pc) in lane.cols.iter_mut().zip(plan.cols.iter_mut()) {
-        let kind = match arrow_kind(&lc.delivered) {
+        // Postgres ships raw COPY BINARY: only the udts the Arrow builder
+        // decodes from send format may skip the cast. Everything else
+        // (time, interval, inet, arrays, domains, enums, unconstrained
+        // NUMERIC, …) would put send-format bytes into a Utf8 column
+        // (MASTER review M-8 / M-45).
+        let native = match dialect {
+            ReadDialect::Pg => pg_send_decodable(&pc.udt, pc.precision),
+            ReadDialect::My => true,
+        };
+        let kind = match arrow_kind(&lc.delivered).filter(|_| native) {
             Some(k) => k,
             None => {
                 match dialect {
@@ -414,8 +423,31 @@ impl Loader for ArrowLoader {
     }
 }
 
+/// Postgres udts whose COPY BINARY (`send`) form the Arrow builder decodes
+/// directly. NUMERIC qualifies only with a declared precision; the planner
+/// maps unconstrained NUMERIC to Float64, which its send form is not.
+fn pg_send_decodable(udt: &str, precision: Option<i32>) -> bool {
+    match udt {
+        "int2" | "int4" | "int8" | "float4" | "float8" | "bool" | "date" | "timestamp"
+        | "timestamptz" | "bytea" | "varchar" | "bpchar" | "text" | "name" => true,
+        "numeric" => precision.is_some_and(|p| p > 0),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_send_decodable_pg_udts_skip_the_text_cast() {
+        for u in ["int4", "timestamptz", "text", "bytea", "bool"] {
+            assert!(super::pg_send_decodable(u, None), "{u}");
+        }
+        assert!(super::pg_send_decodable("numeric", Some(12)));
+        for u in ["numeric", "time", "timetz", "interval", "inet", "money", "_int4", "oid", "citext", "my_enum"] {
+            assert!(!super::pg_send_decodable(u, None), "{u}");
+        }
+    }
     // The read lane's pipe calibration moved to pipeline::tests (T7), where the
     // one `fit` every lane uses is tested.
 }

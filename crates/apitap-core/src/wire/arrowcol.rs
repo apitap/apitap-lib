@@ -41,16 +41,18 @@ pub fn arrow_kind(d: &Delivered) -> Option<ArrowKind> {
         Delivered::Float32 => ArrowKind::Float32,
         Delivered::Float64 => ArrowKind::Float64,
         Delivered::Bool => ArrowKind::Bool,
-        // Same gate as the parquet lane (bqparquet::parquet_col_ok):
-        // unconstrained NUMERIC has no exact width, >38 digits exceed i128.
-        // Scale clamps to precision like the parquet schema does.
+        // Unconstrained NUMERIC has no exact width, >38 digits exceed i128.
+        // A scale above the precision (Postgres `NUMERIC(3,5)`: |v| < 0.001,
+        // five fractional digits) widens the precision instead of clamping
+        // the scale — clamping truncated every value (MASTER review M-45).
         Delivered::Decimal { p, s } => {
-            if *p == 0 || *p > 38 {
+            let p = (*p).max(*s);
+            if p == 0 || p > 38 {
                 return None;
             }
             ArrowKind::Decimal {
-                p: *p as u8,
-                s: (*s).min(*p) as i8,
+                p: p as u8,
+                s: *s as i8,
             }
         }
         Delivered::Date => ArrowKind::Date32,
