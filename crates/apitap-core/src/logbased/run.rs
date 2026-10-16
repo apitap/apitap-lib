@@ -2104,6 +2104,24 @@ async fn apply_windows(
             // window 1 was lost while the watermarks advanced past it
             // (review P0-7, W1).
             let mut seed = Some(o);
+            // Only the ENTRY window was checked before this arm; every later
+            // one is checked here (MASTER review M-9). A window carrying
+            // residue (TOAST-masked rows, rekeys) or a TRUNCATE is a
+            // barrier: everything in flight lands and closes first, then it
+            // applies ALONE, then concurrency resumes — otherwise a masked
+            // readback races its sibling's insert, or pre-truncate rows of a
+            // slower window survive the truncate.
+            let mut barrier = false;
+            macro_rules! settle {
+                ($res:expr) => {{
+                    let (id, per, end) = $res?;
+                    done.insert(id, (per, end));
+                    while let Some((per, end)) = done.remove(&expected) {
+                        close_prefix_window(t, dest, &members, per, &mut rows_per, &applied_tx, end).await?;
+                        expected += 1;
+                    }
+                }};
+            }
             loop {
                 if let Some(o) = seed.take() {
                     let id = seq;
@@ -2111,29 +2129,28 @@ async fn apply_windows(
                     inflight.push(apply_window(t, src.as_ref(), &members, o, id));
                 }
                 tokio::select! {
-                    win = win_rx.recv(), if inflight.len() < depth => {
+                    win = win_rx.recv(), if inflight.len() < depth && !barrier => {
                         let Some(o) = win else { break };
+                        if !o.bodies.parallel_safe() {
+                            while let Some(res) = inflight.next().await {
+                                settle!(res);
+                            }
+                            barrier = true;
+                        }
                         let id = seq;
                         seq += 1;
                         inflight.push(apply_window(t, src.as_ref(), &members, o, id));
                     }
                     Some(res) = inflight.next(), if !inflight.is_empty() => {
-                        let (id, per, end) = res?;
-                        done.insert(id, (per, end));
-                        while let Some((per, end)) = done.remove(&expected) {
-                            close_prefix_window(t, dest, &members, per, &mut rows_per, &applied_tx, end).await?;
-                            expected += 1;
+                        settle!(res);
+                        if inflight.is_empty() {
+                            barrier = false;
                         }
                     }
                 }
             }
             while let Some(res) = inflight.next().await {
-                let (id, per, end) = res?;
-                done.insert(id, (per, end));
-                while let Some((per, end)) = done.remove(&expected) {
-                    close_prefix_window(t, dest, &members, per, &mut rows_per, &applied_tx, end).await?;
-                    expected += 1;
-                }
+                settle!(res);
             }
             // Every window this arm could see was consumed and closed above;
             // the shared tail would also resend the ENTRY window's end after
