@@ -964,6 +964,9 @@ impl IcebergSink {
         }
         let mut max_i: Option<i64> = None;
         let mut max_s: Option<String> = None;
+        // FIXED_LEN_BYTE_ARRAY decimals (a MySQL BIGINT UNSIGNED lands as
+        // decimal(20,0)): big-endian two's complement, read as i128.
+        let mut max_d: Option<i128> = None;
         for rg in md.row_groups() {
             match rg.column(idx).statistics() {
                 Some(Statistics::Int64(v)) => {
@@ -973,6 +976,16 @@ impl IcebergSink {
                 Some(Statistics::Int32(v)) => {
                     let m = *v.max_opt().ok_or_else(no_stats)? as i64;
                     max_i = Some(max_i.map_or(m, |a| a.max(m)));
+                }
+                Some(Statistics::FixedLenByteArray(v)) => {
+                    let b = v.max_opt().ok_or_else(no_stats)?.data();
+                    if b.is_empty() || b.len() > 16 {
+                        return Err(no_stats());
+                    }
+                    let mut buf = if b[0] & 0x80 != 0 { [0xffu8; 16] } else { [0u8; 16] };
+                    buf[16 - b.len()..].copy_from_slice(b);
+                    let m = i128::from_be_bytes(buf);
+                    max_d = Some(max_d.map_or(m, |a| a.max(m)));
                 }
                 Some(Statistics::ByteArray(v)) => {
                     if !v.max_is_exact() {
@@ -1006,6 +1019,19 @@ impl IcebergSink {
             }
             (PhysicalType::INT64 | PhysicalType::INT32, None | Some(LogicalType::Integer { .. }), Some(m), _) => {
                 Ok(Some((m.to_string(), true)))
+            }
+            // A whole-number decimal is an integer cursor (an UNSIGNED BIGINT,
+            // or a NUMERIC(p,0)): the run-1 bootstrap writes it so, and run 2
+            // used to refuse to read it back (MASTER review M-34). A scaled
+            // decimal is refused as a cursor upstream and stays refused here.
+            (PhysicalType::INT64 | PhysicalType::INT32, Some(LogicalType::Decimal { scale: 0, .. }), Some(m), _) => {
+                Ok(Some((m.to_string(), true)))
+            }
+            (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Decimal { scale: 0, .. }), _, _) => {
+                match max_d {
+                    Some(m) => Ok(Some((m.to_string(), true))),
+                    None => Err(no_stats()),
+                }
             }
             (PhysicalType::BYTE_ARRAY, _, _, Some(m)) => Ok(Some((m, false))),
             _ => Err(no_stats()),
@@ -1152,7 +1178,10 @@ impl crate::sink::Sink for IcebergSink {
         let ids = conform_ids(&meta, &names, &delivered)?;
         self.cursor = plan.cursor.as_ref().and_then(|cur| {
             names.iter().position(|n| n == cur).map(|i| {
-                (i, matches!(delivered[i], Delivered::Int { .. }))
+                // A whole-number decimal (a MySQL BIGINT UNSIGNED arrives as
+                // decimal(20,0)) compares as a number: as a string, "99" beat
+                // "100" and the stored watermark went BACK (M-34, measured).
+                (i, matches!(delivered[i], Delivered::Int { .. } | Delivered::Decimal { s: 0, .. }))
             })
         });
         if mode == Mode::Merge {
@@ -1291,7 +1320,25 @@ async fn sweep(s3: &S3Conn, files: &[FileDone]) {
 }
 
 impl IcebergSink {
+    /// `commit_inner`, with the rule its `?` exits could not express: once an
+    /// attempt answered ambiguously, ANY later failure (a manifest GET, a
+    /// PUT) is Unknown too — that attempt may still land and reference these
+    /// files, so the caller must not sweep them (MASTER review M-14).
     async fn commit(&self, s3: &S3Conn, files: &[FileDone], mode: Mode) -> Result<CommitEnd> {
+        let mut ambiguous = false;
+        match self.commit_inner(s3, files, mode, &mut ambiguous).await {
+            Err(e) if ambiguous => Ok(CommitEnd::Unknown(e)),
+            other => other,
+        }
+    }
+
+    async fn commit_inner(
+        &self,
+        s3: &S3Conn,
+        files: &[FileDone],
+        mode: Mode,
+        ambiguous: &mut bool,
+    ) -> Result<CommitEnd> {
         let meta0 = self.meta.clone().expect("prepare ran");
         let schema = meta0.current_schema().clone();
         let pspec = meta0.default_partition_spec().as_ref().clone();
@@ -1333,13 +1380,27 @@ impl IcebergSink {
         // Once ANY attempt answers Unknown, a later plain failure still
         // leaves an earlier attempt able to land late — every later error
         // stays Unknown so the sweep never touches its files (round-2 §1.2).
-        let mut ambiguous = false;
+        // The flag is the caller's, so a `?` exit is judged by it too (M-14).
         for attempt in 0..3u32 {
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
             tried.push(snapshot_id);
             let seq = meta.next_sequence_number();
             let parent = meta.current_snapshot_id();
+            // A flipped bootstrap (a first append landing as an overwrite)
+            // found the table empty. A snapshot that is not one of its own
+            // attempts means a peer published meanwhile: overwriting it would
+            // drop the peer's rows from the live table after it reported
+            // success (MASTER review M-34). Refuse instead.
+            let flipped = crate::naming::flipped_bootstrap(self.run.kind(), mode);
+            if flipped && parent.is_some_and(|p| !tried.contains(&p)) {
+                return Err(Error::InvalidInput(format!(
+                    "another run published {} while this first run was loading it — \
+                     the table now has data and this run would have overwritten it. \
+                     Re-run: the table's state makes this an incremental load.",
+                    self.table
+                )));
+            }
 
             // Data manifest (avro via memory FileIO, PUT by our own client).
             let mut manifests: Vec<ManifestFile> = Vec::new();
@@ -1474,22 +1535,31 @@ impl IcebergSink {
                         k.starts_with("apitap.watermark.")
                             || k.starts_with("apitap.watermark-cursor.")
                     })
+                    // A flipped bootstrap sets its own keys below; removing
+                    // and setting one key in a single commit is not ordered.
+                    .filter(|k| !(flipped && (**k == self.wm_prop() || **k == self.cur_prop())))
                     .cloned()
                     .collect();
                 if !stale.is_empty() {
                     updates.push(TableUpdate::RemoveProperties { removals: stale });
                 }
-            } else if let Some(wm) = &new_wm {
-                let cursor_name = self
-                    .cursor
-                    .map(|(i, _)| self.names[i].clone())
-                    .unwrap_or_default();
-                updates.push(TableUpdate::SetProperties {
-                    updates: HashMap::from([
-                        (self.wm_prop(), wm.clone()),
-                        (self.cur_prop(), cursor_name),
-                    ]),
-                });
+            }
+            // A flipped bootstrap is a first incremental run: it seeds its own
+            // state like any append, or run 2 must rebuild the watermark from
+            // footer statistics — which a decimal cursor could not (M-34).
+            if mode != Mode::Replace || flipped {
+                if let Some(wm) = &new_wm {
+                    let cursor_name = self
+                        .cursor
+                        .map(|(i, _)| self.names[i].clone())
+                        .unwrap_or_default();
+                    updates.push(TableUpdate::SetProperties {
+                        updates: HashMap::from([
+                            (self.wm_prop(), wm.clone()),
+                            (self.cur_prop(), cursor_name),
+                        ]),
+                    });
+                }
             }
             let requirements = vec![
                 TableRequirement::UuidMatch { uuid: meta.uuid() },
@@ -1502,7 +1572,7 @@ impl IcebergSink {
             let commit_try = match self.conn.commit_table(&self.table, &requirements, &updates).await {
                 Ok(t) => t,
                 Err(e) => {
-                    if ambiguous {
+                    if *ambiguous {
                         return Ok(CommitEnd::Unknown(e));
                     }
                     return Err(e);
@@ -1535,7 +1605,7 @@ impl IcebergSink {
                     if tried.iter().any(|id| snapshot_landed(&fresh, *id)) {
                         return Ok(CommitEnd::Done);
                     }
-                    ambiguous = true;
+                    *ambiguous = true;
                     if attempt == 2 {
                         return Ok(CommitEnd::Unknown(e));
                     }
@@ -1560,7 +1630,7 @@ impl IcebergSink {
                 return Ok(CommitEnd::Done);
             }
         }
-        if ambiguous {
+        if *ambiguous {
             return Ok(CommitEnd::Unknown(Error::Transfer(
                 "iceberg: commit conflicted 3 times (after an ambiguous attempt) — \
                  another writer is racing this table; a re-run settles it"
@@ -1965,7 +2035,14 @@ impl CdcBound {
     ) -> Result<()> {
         let run_id = uuid::Uuid::new_v4().simple().to_string();
         let mut uploaded: Vec<String> = Vec::new();
-        match self.cdc_commit_inner(source_id, pk_idx, w, &run_id, &mut uploaded).await {
+        // Same rule as `commit` (M-14): a failure after an ambiguous attempt
+        // is Unknown, never a reason to delete what that attempt references.
+        let mut ambiguous = false;
+        let r = match self.cdc_commit_inner(source_id, pk_idx, w, &run_id, &mut uploaded, &mut ambiguous).await {
+            Err(e) if ambiguous => Ok(CommitEnd::Unknown(e)),
+            other => other,
+        };
+        match r {
             Ok(CommitEnd::Done) => Ok(()),
             Ok(CommitEnd::Unknown(e)) => {
                 // Maybe-committed: leave the uploaded objects (review P0-5).
@@ -1989,6 +2066,7 @@ impl CdcBound {
         w: CdcWindow,
         run_id: &str,
         uploaded: &mut Vec<String>,
+        ambiguous: &mut bool,
     ) -> Result<CommitEnd> {
         let CdcWindow { data, delete_ints, delete_texts, truncate, end_lsn } = w;
         let (data_file, added_rows, added_bytes) = match data {
@@ -2050,7 +2128,7 @@ impl CdcBound {
         // Once ANY attempt answers Unknown, a later plain failure still
         // leaves an earlier attempt able to land late — every later error
         // stays Unknown so the sweep never touches its files (round-2 §1.2).
-        let mut ambiguous = false;
+        // The flag is the caller's, so a `?` exit is judged by it too (M-14).
         for attempt in 0..3u32 {
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
@@ -2166,7 +2244,7 @@ impl CdcBound {
             let commit_try = match self.conn.commit_table(&self.table, &requirements, &updates).await {
                 Ok(t) => t,
                 Err(e) => {
-                    if ambiguous {
+                    if *ambiguous {
                         return Ok(CommitEnd::Unknown(e));
                     }
                     return Err(e);
@@ -2194,7 +2272,7 @@ impl CdcBound {
                     if tried.iter().any(|id| snapshot_landed(&fresh, *id)) {
                         return Ok(CommitEnd::Done);
                     }
-                    ambiguous = true;
+                    *ambiguous = true;
                     if attempt == 2 {
                         return Ok(CommitEnd::Unknown(e));
                     }
@@ -2219,7 +2297,7 @@ impl CdcBound {
                 return Ok(CommitEnd::Done);
             }
         }
-        if ambiguous {
+        if *ambiguous {
             return Ok(CommitEnd::Unknown(Error::Transfer(
                 "iceberg: commit conflicted 3 times (after an ambiguous attempt) — \
                  another writer is racing this table; a re-run settles it"

@@ -629,6 +629,8 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_ch_flipped_race --> `e2e_ch_flipped_race.py` | a CH first run that loses the race refuses; the peer keeps its table |
 | <!-- claim: leg.e2e_ch_drop_after_publish --> `e2e_ch_drop_after_publish.py` | a CH staging DROP refused after the publish never re-lands the delta |
 | <!-- claim: leg.e2e_refusal_leaves_nothing --> `e2e_refusal_leaves_nothing.py` | a run refused after its announcement leaves no staging behind |
+| <!-- claim: leg.e2e_ice_unsigned_cursor --> `e2e_ice_unsigned_cursor.py` | an Iceberg append on a BIGINT UNSIGNED cursor resumes after run 1 |
+| <!-- claim: leg.e2e_ice_late_commit --> `e2e_ice_late_commit.py` | a failure after an ambiguous Iceberg commit never sweeps what a late commit lands |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |
