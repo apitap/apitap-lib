@@ -110,13 +110,19 @@ class CutProxy:
 
 
 def wipe():
+    # Our slot is the one whose publication covers our tables — asked of the
+    # server BEFORE the tables go (a dropped table leaves its publication
+    # empty and the slot unfindable, holding WAL for ever).
+    for pub in set(pg("SELECT pubname FROM pg_publication_tables "
+                       f"WHERE tablename IN ({', '.join(repr(t) for t in (T,))})").split()):
+        pg(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+            f"WHERE slot_name = '{pub.removesuffix('_pub')}' AND NOT active")
+        pg(f"DROP PUBLICATION IF EXISTS {pub}")
     pg(f"DROP TABLE IF EXISTS {T}")
     ch(f"DROP TABLE IF EXISTS {T}")
     if ch("SELECT count() FROM system.tables WHERE database='default' "
           "AND name='_apitap_state'") != "0":
         ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_sync=1")
-    pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
-       f"WHERE NOT active AND slot_name LIKE '%{T}%'")
 
 
 def run(port):

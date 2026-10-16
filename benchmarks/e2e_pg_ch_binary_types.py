@@ -42,6 +42,14 @@ def ch(sql):
 
 
 def wipe():
+    # Our slot is the one whose publication covers our tables — asked of the
+    # server BEFORE the tables go (a dropped table leaves its publication
+    # empty and the slot unfindable, holding WAL for ever).
+    for pub in set(pg("SELECT pubname FROM pg_publication_tables "
+                       f"WHERE tablename IN ({', '.join(repr(t) for t in (DEF, TXT, SCALAR))})").split()):
+        pg(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+            f"WHERE slot_name = '{pub.removesuffix('_pub')}' AND NOT active")
+        pg(f"DROP PUBLICATION IF EXISTS {pub}")
     for t in (DEF, TXT, SCALAR):
         pg(f"DROP TABLE IF EXISTS {t}")
         ch(f"DROP TABLE IF EXISTS {t}")
@@ -50,8 +58,6 @@ def wipe():
             ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{t}' "
                "SETTINGS mutations_sync=1")
     pg("DROP TYPE IF EXISTS bt_mood; DROP DOMAIN IF EXISTS bt_pos")
-    pg("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
-       "WHERE NOT active AND slot_name LIKE '%bt\\_%'")
 
 
 def run(t, binary=None):
