@@ -178,16 +178,14 @@ impl FrameScanner {
                 self.silence.as_secs()
             ))
         };
-        let Some(remaining) = (self.last_refill + self.silence)
-            .checked_duration_since(std::time::Instant::now())
-        else {
-            return Err(silent());
-        };
-        let n = match tokio::time::timeout(
-            remaining,
-            rd.get_mut().read_buf(&mut self.win),
-        )
-        .await
+        // The budget times the READ itself, from its start (MASTER M-22):
+        // the old deadline was anchored at the last refill, so any consumer
+        // (apply) slower than the budget made the NEXT refill fail "silent
+        // for 120s" without reading a byte — a BigQuery MERGE or an Iceberg
+        // commit is enough, and follow then dies at the first slow apply. A
+        // read parked for the whole budget still means a half-open socket,
+        // which is the detection that matters.
+        let n = match tokio::time::timeout(self.silence, rd.get_mut().read_buf(&mut self.win)).await
         {
             Ok(r) => r.map_err(io_err)?,
             Err(_) => return Err(silent()),
