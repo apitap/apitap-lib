@@ -354,8 +354,15 @@ pub(crate) async fn drain(
                     // red that way. The end_lsn below travels through the
                     // ordinary window path, so every destination writes it the
                     // same way it writes any other watermark.
-                    if wal_end > end_lsn {
-                        end_lsn = wal_end;
+                    //
+                    // Never past the stop-line, though: a capped pass (members
+                    // at different heights, MASTER review M-55) stops at a
+                    // member's watermark, and a window ending beyond it would
+                    // straddle that member — it could neither skip it nor
+                    // apply it without replaying what it already holds.
+                    let caught_up_to = wal_end.min(stop_line);
+                    if caught_up_to > end_lsn {
+                        end_lsn = caught_up_to;
                     }
                     break;
                 }

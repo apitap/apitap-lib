@@ -1044,7 +1044,8 @@ async fn run_group(
             // the drain still owned its slot and its watermark.)
             bootstrap_group(src_url, dst_url, opts, &tenure, &src, slot, &ctxs, budget_denom).await
         } else {
-            let wm = wms.iter().map(|w| w.expect("all present")).min().expect("nonempty").get();
+            let floors: Vec<u64> = wms.iter().map(|w| w.expect("all present").get()).collect();
+            let wm = *floors.iter().min().expect("nonempty");
             drain_group(
                 src_url,
                 &src,
@@ -1053,6 +1054,7 @@ async fn run_group(
                 &publication,
                 &ctxs,
                 wm,
+                floors,
                 opts.changelog,
                 budget_denom,
             )
@@ -1241,6 +1243,9 @@ async fn run_group_mysql(
 
         // Drain from the group minimum — members ahead converge idempotently.
         let wm = marks.iter().flatten().copied().min().map_or(0, CdcWatermark::get);
+        // Each member's own position (M-55): see `member_cap`.
+        let floors: Vec<u64> = marks.iter().map(|m| m.map_or(0, CdcWatermark::get)).collect();
+        let cap = member_cap(wm, &floors);
         let seed = ctxs
             .iter()
             .map(|c| c.source_id.as_str())
@@ -1268,10 +1273,10 @@ async fn run_group_mysql(
         let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(window_depth());
         let (applied_tx, _applied_rx) = tokio::sync::watch::channel::<u64>(wm);
         let apply =
-            AbortOnDrop::spawn(apply_windows(tenure.clone(), None, members, win_rx, applied_tx));
+            AbortOnDrop::spawn(apply_windows(tenure.clone(), None, members, floors, win_rx, applied_tx));
         let drained = run_overlapped(
             async {
-                myrun::drain_windows(src_url, &pool, &ctxs, wm, &seed, 30, budget, opts.changelog, win_tx)
+                myrun::drain_windows(src_url, &pool, &ctxs, wm, cap, &seed, 30, budget, opts.changelog, win_tx)
                     .await
                     .map(|_| ())
             },
@@ -1313,6 +1318,13 @@ async fn clear_group<'a>(tenure: &Tenure<Dest>, members: impl Iterator<Item = (&
 /// changelog history across the gap (system review 2026-10-07, P1). `legacy`
 /// is the pre-fix spelling: only a pipeline that already has state may adopt
 /// it, and no run ever drops a name it did not compute for itself.
+/// The next member watermark above the group's minimum, if the members are
+/// not level: where a pass must stop so that no window straddles a member's
+/// watermark (MASTER review M-55).
+fn member_cap(min: u64, floors: &[u64]) -> Option<u64> {
+    floors.iter().copied().filter(|&f| f > min).min()
+}
+
 /// Whether every column of every tracked table has a type `pgbindec` can
 /// render from binary pgoutput. Any catalog error answers false — text is
 /// always correct, binary only faster.
@@ -1566,6 +1578,7 @@ async fn drain_group(
     publication: &str,
     ctxs: &[TableCtx],
     wm: u64,
+    floors: Vec<u64>,
     changelog: bool,
     budget_denom: usize,
 ) -> Result<Vec<(u64, usize)>> {
@@ -1654,6 +1667,13 @@ async fn drain_group(
         .await
         .map_err(db_err)?;
     let stop_line = lsn_from_string(&stop_line.0)?;
+    // Members at different heights (one committed a window a sibling did
+    // not): this pass stops at the next member watermark above the minimum,
+    // so no window straddles a member's watermark and every member either
+    // applies a window whole or skips it whole (MASTER review M-55). The
+    // members are level after it; the next run drains normally.
+    let cap = member_cap(wm, &floors);
+    let stop_line = cap.map_or(stop_line, |c| c.min(stop_line));
 
     let mut key_cols = HashMap::new();
     for c in ctxs {
@@ -1698,8 +1718,10 @@ async fn drain_group(
         .iter()
         .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
         .collect();
-    let apply = AbortOnDrop::spawn(apply_windows(tenure, Some(src.clone()), members, win_rx, applied_tx));
-    let follow = follow_secs().map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    let apply = AbortOnDrop::spawn(apply_windows(tenure, Some(src.clone()), members, floors, win_rx, applied_tx));
+    let follow = follow_secs()
+        .filter(|_| cap.is_none())
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let drained = run_overlapped(
         drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src, keep_binary, window_depth()),
         apply,
@@ -1908,16 +1930,20 @@ async fn close_prefix_window(
     t: &Tenure<Dest>,
     dest: &Dest,
     members: &[crate::logbased::dest_bq::Member],
-    per: Vec<(u64, Watermark, u64)>,
+    per: Vec<(u64, Option<Watermark>, u64)>,
     rows_per: &mut [u64],
     applied_tx: &tokio::sync::watch::Sender<u64>,
     end: u64,
 ) -> Result<()> {
-    let e0 = per.iter().map(|(_, _, e)| *e).min().unwrap_or(0);
-    let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
-    let marks: Vec<Watermark> = per.iter().map(|(_, m, _)| m.clone()).collect();
-    let h = t.open_at(&tables, Some(e0)).await?;
-    t.close(h, marks).await?;
+    // Members that skipped the window (already past it) carry no mark.
+    let marked: Vec<usize> = (0..per.len()).filter(|&i| per[i].1.is_some()).collect();
+    if !marked.is_empty() {
+        let e0 = marked.iter().map(|&i| per[i].2).min().unwrap_or(0);
+        let tables: Vec<&str> = marked.iter().map(|&i| members[i].0.as_str()).collect();
+        let marks: Vec<Watermark> = marked.iter().filter_map(|&i| per[i].1.clone()).collect();
+        let h = t.open_at(&tables, Some(e0)).await?;
+        t.close(h, marks).await?;
+    }
     for (dt, _, sid) in members {
         dest.settle(dt, sid, true);
     }
@@ -1932,6 +1958,11 @@ async fn apply_windows(
     tenure: Arc<Tenure<Dest>>,
     src: Option<PgPool>,
     members: Vec<crate::logbased::dest_bq::Member>,
+    // Each member's own stored watermark at drain start, aligned with
+    // `members`. The group drains from their MINIMUM, so a member already
+    // past a window must not apply it again (MASTER review M-55): its
+    // re-keys would hit duplicate keys and wedge the group.
+    floors: Vec<u64>,
     mut win_rx: tokio::sync::mpsc::Receiver<DrainOutcome>,
     applied_tx: tokio::sync::watch::Sender<u64>,
 ) -> Result<Vec<u64>> {
@@ -2009,12 +2040,12 @@ async fn apply_windows(
             // group pin blessing data a mutation may have skipped. The
             // members' applies still overlap in lanes; only the per-member
             // `_apitap_state` round trips are gone.
-            let (sref, oref, mref) = (src.as_ref(), &o, &members);
+            let (sref, oref, mref, fref) = (src.as_ref(), &o, &members, &floors);
             let fs: Vec<_> = (0..mref.len())
                 .map(|i| async move {
                     let (dt, q, sid) = &mref[i];
                     let (n, m, e0) =
-                        apply_member_pending(t, dt, q, sid, oref, sref).await?;
+                        apply_member_pending(t, dt, q, sid, oref, sref, fref[i]).await?;
                     Ok::<_, Error>((i, n, m, e0))
                 })
                 .collect();
@@ -2041,13 +2072,15 @@ async fn apply_windows(
             // minimum back into the pin's continuity check, so a member whose
             // deadline passed un-renewed refuses the whole close and the
             // window replays — never a fresh group pin blessing skipped parts.
-            let closed: Result<()> = if done.is_empty() {
+            // A member that skipped the window (already past it) has no mark.
+            let marked: Vec<_> = done.iter().filter(|(_, _, m, _)| m.is_some()).collect();
+            let closed: Result<()> = if marked.is_empty() {
                 Ok(())
             } else {
-                let e0 = done.iter().map(|(_, _, _, e)| *e).min().unwrap_or(0);
+                let e0 = marked.iter().map(|(_, _, _, e)| *e).min().unwrap_or(0);
                 let tables: Vec<&str> =
-                    done.iter().map(|(i, _, _, _)| members[*i].0.as_str()).collect();
-                let marks: Vec<Watermark> = done.iter().map(|(_, _, m, _)| m.clone()).collect();
+                    marked.iter().map(|(i, _, _, _)| members[*i].0.as_str()).collect();
+                let marks: Vec<Watermark> = marked.iter().filter_map(|(_, _, m, _)| m.clone()).collect();
                 async {
                     let h = t.open_at(&tables, Some(e0)).await?;
                     t.close(h, marks).await
@@ -2083,20 +2116,21 @@ async fn apply_windows(
                 t: &Tenure<Dest>,
                 src: Option<&PgPool>,
                 members: &[crate::logbased::dest_bq::Member],
+                floors: &[u64],
                 o: DrainOutcome,
                 id: u64,
-            ) -> Result<(u64, Vec<(u64, Watermark, u64)>, u64)> {
+            ) -> Result<(u64, Vec<(u64, Option<Watermark>, u64)>, u64)> {
                 let mut per = Vec::with_capacity(members.len());
                 let end = o.id.end();
-                for (dt, q, sid) in members.iter() {
-                    per.push(apply_member_pending(t, dt, q, sid, &o, src).await?);
+                for (i, (dt, q, sid)) in members.iter().enumerate() {
+                    per.push(apply_member_pending(t, dt, q, sid, &o, src, floors[i]).await?);
                 }
                 Ok((id, per, end))
             }
             let depth = window_depth().max(2);
             let mut seq = 0u64;
             let mut expected = 0u64;
-            let mut done: std::collections::BTreeMap<u64, (Vec<(u64, Watermark, u64)>, u64)> =
+            let mut done: std::collections::BTreeMap<u64, (Vec<(u64, Option<Watermark>, u64)>, u64)> =
                 std::collections::BTreeMap::new();
             let mut inflight = futures::stream::FuturesUnordered::new();
             // The window this arm was entered with goes in FIRST: the old
@@ -2126,7 +2160,7 @@ async fn apply_windows(
                 if let Some(o) = seed.take() {
                     let id = seq;
                     seq += 1;
-                    inflight.push(apply_window(t, src.as_ref(), &members, o, id));
+                    inflight.push(apply_window(t, src.as_ref(), &members, &floors, o, id));
                 }
                 tokio::select! {
                     win = win_rx.recv(), if inflight.len() < depth && !barrier => {
@@ -2139,7 +2173,7 @@ async fn apply_windows(
                         }
                         let id = seq;
                         seq += 1;
-                        inflight.push(apply_window(t, src.as_ref(), &members, o, id));
+                        inflight.push(apply_window(t, src.as_ref(), &members, &floors, o, id));
                     }
                     Some(res) = inflight.next(), if !inflight.is_empty() => {
                         settle!(res);
@@ -2168,11 +2202,11 @@ async fn apply_windows(
             // references: a closure taking `&(..)` and returning an async
             // block trips higher-ranked lifetime inference ("FnOnce is not
             // general enough").
-            let (sref, oref, mref) = (src.as_ref(), &o, &members);
+            let (sref, oref, mref, fref) = (src.as_ref(), &o, &members, &floors);
             let fs: Vec<_> = (0..mref.len())
                 .map(|i| async move {
                     let (dt, q, sid) = &mref[i];
-                    let n = apply_member(t, dt, q, sid, oref, sref).await?;
+                    let n = apply_member(t, dt, q, sid, oref, sref, fref[i]).await?;
                     Ok::<_, Error>((i, n))
                 })
                 .collect();
@@ -2181,7 +2215,7 @@ async fn apply_windows(
             }
         } else {
             for (i, (dt, q, sid)) in members.iter().enumerate() {
-                rows_per[i] += apply_member(t, dt, q, sid, &o, src.as_ref()).await?;
+                rows_per[i] += apply_member(t, dt, q, sid, &o, src.as_ref(), floors[i]).await?;
             }
         }
         if std::env::var("APITAP_DEBUG").is_ok() {
@@ -2258,7 +2292,11 @@ async fn apply_member(
     source_id: &str,
     o: &DrainOutcome,
     src: Option<&PgPool>,
+    floor: u64,
 ) -> Result<u64> {
+    if o.id.end() <= floor {
+        return Ok(0);
+    }
     let dest = t.dest();
     let r = async {
         let mut h = t.open(&[dest_table]).await?;
@@ -2283,7 +2321,13 @@ async fn apply_member_pending(
     source_id: &str,
     o: &DrainOutcome,
     src: Option<&PgPool>,
-) -> Result<(u64, Watermark, u64)> {
+    floor: u64,
+) -> Result<(u64, Option<Watermark>, u64)> {
+    // Already past this window (M-55): nothing applied, no mark — its stored
+    // watermark stays where it is rather than moving back to this window's.
+    if o.id.end() <= floor {
+        return Ok((0, None, u64::MAX));
+    }
     let mut h = t.open(&[dest_table]).await?;
     let (n, m) = t.dest().apply(&mut h.unit, dest_table, qualified, source_id, o, src).await?;
     let e0 = match &h.unit {
@@ -2291,7 +2335,7 @@ async fn apply_member_pending(
         _ => 0,
     };
     t.close(h, Vec::new()).await?;
-    Ok((n, m, e0))
+    Ok((n, Some(m), e0))
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -2733,6 +2777,13 @@ mod tests {
 
     /// The window-depth knob: default 1 (the historical shape), zero/junk
     /// fall back, and the value clamps at 8 (design §14.18).
+    #[test]
+    fn member_cap_is_the_next_watermark_above_the_minimum() {
+        assert_eq!(super::member_cap(10, &[10, 10]), None);
+        assert_eq!(super::member_cap(10, &[10, 30, 20]), Some(20));
+        assert_eq!(super::member_cap(5, &[5]), None);
+    }
+
     #[test]
     fn window_depth_defaults_to_one_and_clamps_at_eight() {
         std::env::remove_var("APITAP_WINDOW_DEPTH");

@@ -187,6 +187,10 @@ pub(crate) async fn drain_windows(
     pool: &MySqlPool,
     ctxs: &[MyCtx],
     start: u64,
+    // Stop no later than this (the next member position above `start`,
+    // MASTER review M-55): no window straddles a member's position. A capped
+    // pass does not follow.
+    cap: Option<u64>,
     group_seed: &str,
     max_secs: u64,
     max_buf_bytes: usize,
@@ -195,12 +199,14 @@ pub(crate) async fn drain_windows(
 ) -> Result<u64> {
     mysource::precheck(pool).await?;
     let (live_file, live_pos) = master_position(pool).await?;
-    let mut stop_line = pack_pos(&live_file, live_pos);
+    let live = pack_pos(&live_file, live_pos);
+    let mut stop_line = cap.map_or(live, |c| c.min(live));
     // Follow mode (the MySQL twin of the Postgres lane's APITAP_FOLLOW_SECS):
     // the binlog drain kept a pass loop of its own — measured 196 passes in
     // 91 s at 20k/s — so the session/setup cost dominated exactly as it did on
     // the PG side before follow. One session, a rolling stop line.
     let follow = crate::logbased::run::follow_secs()
+        .filter(|_| cap.is_none())
         .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
     // A watermark AHEAD of the server's own position is not "up to date" — it
     // is impossible on a log that only grows. Either the binlog was reset or
@@ -209,7 +215,7 @@ pub(crate) async fn drain_windows(
     // the changes between the two positions are unreachable, and both used to
     // exit through the "nothing to do" path below: a silent hole, reported as
     // success with zero changes. Found by a release smoke doing exactly that.
-    if start > stop_line {
+    if start > live {
         let (want_idx, want_pos) = mysource::unpack(start);
         return Err(Error::InvalidInput(format!(
             "log_based: the stored position ({}, {want_pos}) is AHEAD of the \

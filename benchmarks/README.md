@@ -623,6 +623,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_url_planes --> `e2e_pg_url_planes.py` | read() and the walsender dial the server the URL resolves to |
 | <!-- claim: leg.e2e_parallel_apply_barrier --> `e2e_parallel_apply_barrier.py` | parallel apply treats truncate/masked windows as barriers |
 | <!-- claim: leg.e2e_ch_residue_crash --> `e2e_ch_residue_crash.py` | a CH residue op cut between DELETE and INSERT replays exact |
+| <!-- claim: leg.e2e_group_member_ahead --> `e2e_group_member_ahead.py` | a group member already past a window does not apply it again |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |
