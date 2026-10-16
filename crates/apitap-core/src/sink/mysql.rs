@@ -691,6 +691,35 @@ impl MySqlSink {
         }
     }
 
+    /// A replace parks the old table under a run name and drops it — and a
+    /// child table's FOREIGN KEY follows the RENAME. The DROP then fails after
+    /// the new table is live, the parked table can never go, every later run
+    /// is refused over it, and the child silently references the STALE rows
+    /// (reproduced, MASTER review M-62). Refused before anything is copied,
+    /// like the Postgres sink's dependent-view check.
+    async fn refuse_referencing_fks(&self) -> Result<()> {
+        let sql = format!(
+            "SELECT GROUP_CONCAT(CONCAT(TABLE_NAME, '.', CONSTRAINT_NAME) ORDER BY TABLE_NAME SEPARATOR ', ') \
+             FROM information_schema.REFERENTIAL_CONSTRAINTS \
+             WHERE UNIQUE_CONSTRAINT_SCHEMA = '{db}' AND REFERENCED_TABLE_NAME = '{t}' \
+               AND NOT (CONSTRAINT_SCHEMA = '{db}' AND TABLE_NAME = '{t}')",
+            db = sql_lit(&self.db),
+            t = sql_lit(&self.bare),
+        );
+        // NOT unwrap_or_default: "could not check" must not read as "nothing
+        // references it" — the failure this moves earlier would come back.
+        let Some(fks) = self.scalar(&sql).await? else {
+            return Ok(());
+        };
+        Err(Error::InvalidInput(format!(
+            "mode='replace' into {} cannot swap the table: foreign key(s) {fks} reference it, \
+             and a swap would leave them pointing at the OLD table (which could then never \
+             be dropped). Nothing has been copied yet. Drop the foreign key(s) around the \
+             transfer, or use mode='append', which never swaps the table.",
+            self.bare
+        )))
+    }
+
     async fn scalar(&self, sql: &str) -> Result<Option<String>> {
         let mut conn = self.deadline_conn().await?;
         let v: Option<Option<String>> = conn
@@ -741,11 +770,19 @@ impl MySqlSink {
     }
 
     async fn write_state(&self, watermark: &str, rows: u64) -> Result<()> {
-        let (Some(source_id), Some(cursor)) = (&self.source_id, &self.cursor_col) else {
+        let Some(sql) = self.state_upsert_sql(watermark, rows) else {
             return Ok(());
         };
         self.ensure_state_table().await?;
-        self.exec(&format!(
+        self.exec(&sql).await
+    }
+
+    /// The state-row upsert, or `None` when this run keeps no state.
+    fn state_upsert_sql(&self, watermark: &str, rows: u64) -> Option<String> {
+        let (Some(source_id), Some(cursor)) = (&self.source_id, &self.cursor_col) else {
+            return None;
+        };
+        Some(format!(
             "INSERT INTO {state} \
                (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
              VALUES ('{dt}','{sid}','{cur}','{wm}','{md}',{rows},UTC_TIMESTAMP(6)) \
@@ -759,7 +796,18 @@ impl MySqlSink {
             wm = sql_lit(watermark),
             md = self.mode_str,
         ))
-        .await
+    }
+
+    /// A drop AFTER the publish: the data is live and its state written, so
+    /// a failure (an FK naming the parked table, a lock) is a warning that
+    /// names the leftover, never a failed run (MASTER review M-62).
+    async fn drop_after_publish(&self, table: &str) {
+        if let Err(e) = self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(table))).await {
+            crate::progress::warn(&format!(
+                "mysql: published, but dropping {table} failed ({e}); the next run of this \
+                 table will name it — drop it by hand"
+            ));
+        }
     }
 }
 
@@ -849,6 +897,9 @@ impl crate::sink::Sink for MySqlSink {
         _durable: bool,
         mode: Mode,
     ) -> Result<()> {
+        if mode == Mode::Replace {
+            self.refuse_referencing_fks().await?;
+        }
         // Same-engine transfers mirror the source column types verbatim
         // (`native_ddl`) so a swap yields a table identical to the source's;
         // anything else maps the lane's deliveries — same rule as the Postgres
@@ -1312,8 +1363,6 @@ impl MySqlSink {
                         staging = self.fq(&self.staging),
                     ))
                     .await?;
-                    self.exec(&format!("DROP TABLE {}", self.fq(&self.old)))
-                        .await?;
                 } else {
                     self.exec(&format!(
                         "RENAME TABLE {} TO {}",
@@ -1333,20 +1382,44 @@ impl MySqlSink {
                 if let Some(wm) = &staged_wm {
                     self.write_state(wm, rows).await?;
                 }
+                // The parked old table goes after the state row: an FK on it
+                // (child FKs follow the RENAME) failed the DROP between the
+                // publish and the state write (M-62).
+                if exists {
+                    self.drop_after_publish(&self.old).await;
+                }
                 Ok(())
             }
             Mode::Append => {
-                self.exec(&format!(
+                // The rows and their watermark in ONE transaction: a DROP or a
+                // state write failing between them left the rows published
+                // with the watermark behind them (M-62). The state table is
+                // ensured first — its DDL would commit implicitly.
+                let state = staged_wm.as_ref().and_then(|wm| self.state_upsert_sql(wm, rows));
+                if state.is_some() {
+                    self.ensure_state_table().await?;
+                }
+                let mut conn = self.deadline_conn().await?;
+                let insert = format!(
                     "INSERT INTO {} SELECT * FROM {}",
                     self.fq(&self.bare),
                     self.fq(&self.staging)
-                ))
-                .await?;
-                self.exec(&format!("DROP TABLE {}", self.fq(&self.staging)))
-                    .await?;
-                if let Some(wm) = &staged_wm {
-                    self.write_state(wm, rows).await?;
+                );
+                let r = async {
+                    conn.query_drop("START TRANSACTION").await?;
+                    conn.query_drop(&insert).await?;
+                    if let Some(sql) = &state {
+                        conn.query_drop(sql).await?;
+                    }
+                    conn.query_drop("COMMIT").await
                 }
+                .await;
+                if let Err(e) = r {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    return Err(Error::Transfer(format!("mysql append publish: {e}")));
+                }
+                drop(conn);
+                self.drop_after_publish(&self.staging).await;
                 Ok(())
             }
             Mode::Merge => Err(Error::InvalidInput(
