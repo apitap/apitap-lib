@@ -1434,7 +1434,7 @@ defaults cannot see. None of them change what lands — only how it gets there.
 | variable | default | what it is for |
 |---|---|---|
 | `APITAP_CH_MAX_BODY` | unset (one request per pipe) | **ClickHouse behind a proxy.** Caps each HTTP request body; accepts bytes or a `K`/`M`/`G` suffix. |
-| `APITAP_PG_BINARY` | `0` | **Postgres CDC.** Asks the walsender for binary `pgoutput` and renders the text in apitap instead. |
+| `APITAP_PG_BINARY` | auto | **Postgres CDC.** Asks the walsender for binary `pgoutput` and renders the text in apitap instead. Unset: on for ClickHouse lanes when every tracked column type has a renderer, text otherwise. `1` forces on, `0` forces off. |
 | `APITAP_PROGRESS`, `APITAP_PROGRESS_INTERVAL` | auto | **Live reporting** — see [Progress while it runs](#progress-while-it-runs). |
 | `APITAP_SLOT_WAL_WARN` | `4G` | **CDC.** How much retained WAL on the source turns the `slot.wal` gauge's warning on. The gauge itself is emitted every run regardless. |
 | `APITAP_HTTP_CONNECT_TIMEOUT` | `15` (seconds) | How long a connection to an HTTP service (ClickHouse, BigQuery, GCS, S3, Iceberg, the GitHub/Sheets sources) may take to establish. |
@@ -1540,9 +1540,11 @@ table. Both refusals happen before any data moves.
 Postgres text-encodes every tuple *inside* the walsender — the process that is
 the per-slot ceiling. With this set, apitap asks for the binary form and renders
 the Postgres text itself, moving that work off the server: **−8.9% walsender CPU
-per million changes** measured on the same WAL drained twice. Off by default
-while the type coverage widens: arrays, `interval`, `inet` and enums are not
-decoded yet, and rather than guess, the connection falls back to text. Nothing
+per million changes** measured on the same WAL drained twice. On by default for
+ClickHouse lanes, but only when every tracked column's type has a binary
+renderer: arrays, enums, domains, `interval`, `inet` and the like are not decoded
+yet, so a group containing one streams text instead (a note says which type
+OIDs). `APITAP_PG_BINARY=0` forces text everywhere; `=1` forces binary. Nothing
 downstream changes either way; the digests matched 10/10 tables across 12.5M
 rows before this shipped.
 

@@ -20,6 +20,20 @@ use crate::error::{Error, Result};
 const PG_EPOCH_UNIX_DAYS: i64 = 10_957;
 const USECS_PER_DAY: i64 = 86_400_000_000;
 
+/// Every type OID [`render`] has a text renderer for. A lane may only ask
+/// the walsender for binary pgoutput when every tracked column's type is in
+/// here — anything else (arrays, enums, domains, interval, inet, ranges, …)
+/// would fail every window, so such a lane stays on text (MASTER review M-7).
+pub(crate) const RENDERED_OIDS: &[u32] = &[
+    16, 21, 23, 20, 26, 28, 29, 700, 701, 1700, 25, 1043, 1042, 19, 18, 114, 142, 705, 17,
+    3802, 2950, 1082, 1083, 1114, 1184, 1266,
+];
+
+/// Whether [`render`] can turn `oid`'s send format into its text form.
+pub(crate) fn renders(oid: u32) -> bool {
+    RENDERED_OIDS.contains(&oid)
+}
+
 /// Append the PG-text rendering of one binary `send`-format value.
 pub(crate) fn render(oid: u32, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
     match oid {
@@ -66,7 +80,7 @@ pub(crate) fn render(oid: u32, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
         other => {
             return Err(Error::Transfer(format!(
                 "pgoutput binary: no text renderer for type OID {other} yet — \
-                 unset APITAP_PG_BINARY to stream this table in text mode"
+                 set APITAP_PG_BINARY=0 to stream this table in text mode"
             )))
         }
     }
@@ -418,6 +432,18 @@ fn timetz(raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rendered_list_is_exactly_the_render_arms() {
+        // A listed OID must reach a real arm (any error but "no renderer");
+        // an unlisted one must hit the fallback. Keeps the M-7 gate honest.
+        for oid in 0..5000u32 {
+            let mut out = Vec::new();
+            let fell_through = matches!(render(oid, &[0u8; 32], &mut out),
+                Err(e) if e.to_string().contains("no text renderer"));
+            assert_eq!(renders(oid), !fell_through, "OID {oid}");
+        }
+    }
 
     fn r(oid: u32, raw: &[u8]) -> String {
         let mut out = Vec::new();

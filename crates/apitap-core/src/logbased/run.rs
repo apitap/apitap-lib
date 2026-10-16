@@ -1313,6 +1313,44 @@ async fn clear_group<'a>(tenure: &Tenure<Dest>, members: impl Iterator<Item = (&
 /// changelog history across the gap (system review 2026-10-07, P1). `legacy`
 /// is the pre-fix spelling: only a pipeline that already has state may adopt
 /// it, and no run ever drops a name it did not compute for itself.
+/// Whether every column of every tracked table has a type `pgbindec` can
+/// render from binary pgoutput. Any catalog error answers false — text is
+/// always correct, binary only faster.
+async fn binary_renderable(src: &PgPool, ctxs: &[TableCtx]) -> bool {
+    let (schemas, names): (Vec<String>, Vec<String>) = ctxs
+        .iter()
+        .filter_map(|c| c.qualified.split_once('.'))
+        .map(|(s, n)| (s.to_string(), n.to_string()))
+        .unzip();
+    if schemas.len() != ctxs.len() {
+        return false;
+    }
+    let oids: Vec<i64> = match sqlx::query_scalar(
+        "SELECT DISTINCT a.atttypid::int8 FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN unnest($1::text[], $2::text[]) AS t(s, r) ON n.nspname = t.s AND c.relname = t.r \
+         WHERE a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(&schemas)
+    .bind(&names)
+    .fetch_all(src)
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let unrendered: Vec<i64> =
+        oids.iter().copied().filter(|o| !u32::try_from(*o).is_ok_and(crate::wire::pgbindec::renders)).collect();
+    if !unrendered.is_empty() {
+        crate::progress::note(&format!(
+            "log_based: binary pgoutput off for this group — column type OIDs {unrendered:?} \
+             have no binary renderer, so the walsender streams text"
+        ));
+    }
+    !oids.is_empty() && unrendered.is_empty()
+}
+
 fn slot_names(ctxs: &[TableCtx], single: bool, dst_origin: &str) -> (String, String) {
     if single {
         let c = &ctxs[0];
@@ -1635,8 +1673,12 @@ async fn drain_group(
     // Binary pgoutput: the CH lane takes it by default (P4's RowBinary body
     // path, +15% measured); other lanes stay on text unless the env forces
     // it. The negotiation falls back to text on pre-14 servers either way.
-    let want_binary = crate::wire::walsender::pg_binary_setting()
-        .unwrap_or(matches!(tenure.dest(), Dest::Ch(_)));
+    // The default only applies when every tracked column has a renderer
+    // (M-7): one array/enum/domain column would fail every window.
+    let want_binary = match crate::wire::walsender::pg_binary_setting() {
+        Some(forced) => forced,
+        None => matches!(tenure.dest(), Dest::Ch(_)) && binary_renderable(src, ctxs).await,
+    };
     ws.start_replication(slot, wm, publication, want_binary).await?;
     // P4: the CH lane renders RowBinary bodies straight from send-format
     // cells when the session actually negotiated `binary 'true'`. Other

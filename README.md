@@ -485,7 +485,7 @@ is off.
 | `APITAP_HTTP_CONNECT_TIMEOUT` / `APITAP_HTTP_READ_TIMEOUT` | `15` s / off | connect deadline; the read timeout is a *total* request deadline and stays off because a long load sends nothing until it is done — TCP keepalive detects dead peers instead |
 | `APITAP_ALLOW_INSECURE_AUTH` | `0` | accept a cleartext/MD5 password request on an unverified Postgres channel |
 | `APITAP_SLOT_WAL_WARN` | `4G` | retained-WAL threshold for the warning |
-| `APITAP_PG_BINARY` | `0` | ask the walsender for binary `pgoutput` (measured neutral on the wall, −9% walsender CPU; opt-in) |
+| `APITAP_PG_BINARY` | auto | binary `pgoutput`: on by default for ClickHouse lanes whose every column type has a binary renderer (else text); `1` forces on, `0` forces off |
 | `APITAP_DEBUG` | off | per-phase timings on stderr |
 
 A/B escape hatches also exist (`APITAP_RAW_COPY=0`, `APITAP_MY_RAW=0`,
