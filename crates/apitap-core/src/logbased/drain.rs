@@ -158,7 +158,7 @@ fn cells_bytes(row: &Tuple) -> usize {
 fn op_bytes(op: &StreamOp) -> usize {
     match op {
         StreamOp::Insert(t) | StreamOp::Delete(t) => cells_bytes(t),
-        StreamOp::Update(old, new) => {
+        StreamOp::Update(old, new, _) => {
             cells_bytes(new) + old.as_ref().map_or(0, cells_bytes)
         }
         StreamOp::Truncate => 0,
@@ -172,7 +172,9 @@ type TxOps = Vec<(u16, StreamOp)>;
 /// Buffered op of a streamed (not-yet-committed) transaction.
 pub(crate) enum StreamOp {
     Insert(Tuple),
-    Update(Option<Tuple>, Tuple),
+    /// Old image (if any), new image, and whether the old image is FULL
+    /// (`O`, REPLICA IDENTITY FULL) rather than the key alone (`K`).
+    Update(Option<Tuple>, Tuple, bool),
     Delete(Tuple),
     Truncate,
 }
@@ -526,9 +528,10 @@ pub(crate) async fn drain(
                 PgoMessage::Update { rel_id, old, new } => {
                     if let Some(t) = tracked(sess, rel_id)? {
                         decoded += 1;
+                        let old_full = old.as_ref().is_some_and(|o| o.full);
                         let old = old.map(|o| o.tuple);
                         let n = cells_bytes(&new) + old.as_ref().map_or(0, cells_bytes);
-                        let op = StreamOp::Update(old, new);
+                        let op = StreamOp::Update(old, new, old_full);
                         match in_stream {
                             Some(x) => {
                                 sess.stream_bytes += n;
@@ -684,7 +687,7 @@ fn flush_ops(
             let c = changelogs[i].as_mut().expect("changelog just ensured");
             match op {
                 StreamOp::Insert(row) => c.insert(row),
-                StreamOp::Update(old, row) => c.update(old.as_ref(), row),
+                StreamOp::Update(old, row, _) => c.update(old.as_ref(), row),
                 StreamOp::Delete(old) => c.delete(old),
                 StreamOp::Truncate => c.truncate(),
             }
@@ -699,7 +702,7 @@ fn flush_ops(
         let c = collapsers[i].as_mut().expect("collapser just ensured");
         match op {
             StreamOp::Insert(row) => c.insert(row)?,
-            StreamOp::Update(old, row) => c.update(old.as_ref(), row)?,
+            StreamOp::Update(old, row, full) => c.update_image(old.as_ref(), full, row)?,
             StreamOp::Delete(old) => c.delete(&old)?,
             StreamOp::Truncate => c.truncate(),
         }

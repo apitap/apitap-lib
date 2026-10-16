@@ -261,6 +261,13 @@ impl Collapser {
     }
 
     pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple) -> Result<()> {
+        self.update_image(old, false, row)
+    }
+
+    /// `old_full`: the old image is the whole row (REPLICA IDENTITY FULL),
+    /// not the key alone — which lets a key-changing update tell WHICH row
+    /// left its old key (see the deferred-duplicate case below).
+    pub(crate) fn update_image(&mut self, old: Option<&Tuple>, old_full: bool, row: Tuple) -> Result<()> {
         self.events += 1;
         let new_key = self.key_of_row(&row)?;
         let toast = row.has_toast();
@@ -302,8 +309,32 @@ impl Collapser {
                     self.map.insert(new_key, Slot::Residue { del: d_new });
                     return Ok(());
                 }
-                // Identity changed: the old row must die.
-                self.put_delete(old_key);
+                // Identity changed: the old row must die — but WHICH row?
+                // Postgres checks a non-deferrable key per row, so the row at
+                // the old key is the one this window last wrote there (a chain:
+                // 1→2 then 2→3 nets to the upsert moving on). A DEFERRABLE key
+                // allows two rows at one key until the statement ends:
+                // `SET id = 3 - id` sends 1→2 then 2→1, and the second
+                // "old key 2" is the PRE-window row 2, not the r1 just moved
+                // there — nulling the upsert lost r1 (MASTER review M-56,
+                // reproduced). A deferrable key cannot be a replica identity,
+                // so such a table runs REPLICA IDENTITY FULL and its old image
+                // is the whole row: when it differs from the upsert, the
+                // upsert stays and the pre-window row is the one deleted.
+                let other_row = old_full
+                    && match self.map.get(&old_key) {
+                        Some(Slot::Upsert { seq, .. }) => self.upserts[*seq]
+                            .as_ref()
+                            .is_some_and(|up| !up.views().eq(old.views())),
+                        _ => false,
+                    };
+                if other_row {
+                    if let Some(Slot::Upsert { seq, .. }) = self.map.get(&old_key).copied() {
+                        self.map.insert(old_key, Slot::Upsert { seq, del: true });
+                    }
+                } else {
+                    self.put_delete(old_key);
+                }
             }
         }
         match self.map.entry(new_key) {
@@ -412,6 +443,36 @@ impl Collapser {
             events: self.events,
         }
     }
+}
+
+/// M-56: a deferred-key swap (`SET id = 3 - id`) under REPLICA IDENTITY FULL
+/// keeps both rows; the same key chain with key-only old images still nets
+/// to the moved row alone.
+#[test]
+fn a_deferred_key_swap_keeps_both_rows_and_a_chain_still_moves() {
+    let t = |s: &str| Cell::Text(bytes::Bytes::from(s.to_string()));
+    let row = |id: &str, v: &str| Tuple::from_cells(&[t(id), t(v)]);
+    let l = Layout::for_test(&["id", "v"], &[], &["id"]);
+
+    // Swap: pre-window 1:r1, 2:r2. WAL: (old 1:r1) → 2:r1, (old 2:r2) → 1:r2.
+    let mut c = Collapser::new(l.clone());
+    c.update_image(Some(&row("1", "r1")), true, row("2", "r1")).unwrap();
+    c.update_image(Some(&row("2", "r2")), true, row("1", "r2")).unwrap();
+    let w = c.finish();
+    let mut ups: Vec<String> = w.upserts.iter()
+        .map(|r| r.views().map(|v| format!("{v:?}")).collect::<Vec<_>>().join("|")).collect();
+    ups.sort();
+    assert_eq!(ups.len(), 2, "both rows survive the swap: {ups:?}");
+    assert_eq!(w.deletes.iter().count(), 2, "both pre-window rows are replaced");
+
+    // Chain with key-only old images (non-deferrable key): 1→2, 2→3 nets to
+    // the row at 3 alone.
+    let key_only = |id: &str| Tuple::from_cells(&[t(id), Cell::Null]);
+    let mut c = Collapser::new(l);
+    c.update_image(Some(&key_only("1")), false, row("2", "r1")).unwrap();
+    c.update_image(Some(&key_only("2")), false, row("3", "r1")).unwrap();
+    let w = c.finish();
+    assert_eq!(w.upserts.len(), 1, "the chain lands one row");
 }
 
 /// The single-int fast path (L3): canonical integer text parses; anything
