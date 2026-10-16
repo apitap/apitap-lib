@@ -1018,7 +1018,38 @@ enum QueryVerb {
 /// buffered rows to be cleared by the NEXT transaction's GTID event (MariaDB:
 /// silently lost) or held until the next XID (MySQL). See system review
 /// 2026-10-07, R1.
+/// Skip the whitespace and comments (`/* … */`, `-- …`, `# …`) a client may
+/// prepend: `/* DBeaver */ TRUNCATE t` classified as `Other`, so the
+/// TRUNCATE was silently dropped and a commented ALTER never cleared the
+/// schema cache (MASTER M-37). An unterminated comment leaves nothing to
+/// classify.
+fn strip_leading_noise(mut s: &str) -> &str {
+    loop {
+        let t = s.trim_start();
+        if let Some(rest) = t.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(i) => {
+                    s = &rest[i + 2..];
+                    continue;
+                }
+                None => return "",
+            }
+        }
+        if let Some(rest) = t.strip_prefix("--").or_else(|| t.strip_prefix('#')) {
+            match rest.find('\n') {
+                Some(i) => {
+                    s = &rest[i + 1..];
+                    continue;
+                }
+                None => return "",
+            }
+        }
+        return t;
+    }
+}
+
 fn query_verb(head: &str) -> QueryVerb {
+    let head = strip_leading_noise(head);
     if starts_with_word(head, "begin") {
         QueryVerb::Begin
     } else if starts_with_word(head, "commit") {
@@ -1081,6 +1112,11 @@ mod query_verbs_tests {
     /// no XID (system review 2026-10-07, R1).
     #[test]
     fn query_verbs_are_classified_by_word_not_by_fixed_slices() {
+        // MASTER M-37: leading comments/whitespace are skipped.
+        assert_eq!(query_verb("/* DBeaver */ TRUNCATE t"), QueryVerb::Ddl);
+        assert_eq!(query_verb("-- note\nBEGIN"), QueryVerb::Begin);
+        assert_eq!(query_verb("# c\nCOMMIT"), QueryVerb::Commit);
+        assert_eq!(query_verb("/* unterminated"), QueryVerb::Other);
         assert_eq!(query_verb("BEGIN"), QueryVerb::Begin);
         assert_eq!(query_verb("begin;"), QueryVerb::Begin);
         assert_eq!(query_verb("start transaction"), QueryVerb::Other);
@@ -1089,7 +1125,9 @@ mod query_verbs_tests {
         assert_eq!(query_verb("COMMITMENT"), QueryVerb::Other);
         assert_eq!(query_verb("TRUNCATE TABLE t"), QueryVerb::Ddl);
         assert_eq!(query_verb("create table t (id int)"), QueryVerb::Ddl);
-        assert_eq!(query_verb("/* leading */ TRUNCATE t"), QueryVerb::Other);
+        // The first cut pinned the bug here: a leading comment made the
+        // verb Other and the TRUNCATE was silently dropped (MASTER M-37).
+        assert_eq!(query_verb("/* leading */ TRUNCATE t"), QueryVerb::Ddl);
         // A byte at the old fixed-slice boundary that is not a char boundary:
         // the fixed-slice spellings panicked here; the classifier must not.
         assert_eq!(query_verb("12345é"), QueryVerb::Other);
