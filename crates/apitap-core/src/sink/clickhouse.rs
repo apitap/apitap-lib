@@ -956,6 +956,26 @@ impl ChSink {
         Ok(())
     }
 
+    /// A flipped bootstrap created the table this run publishes, so only THIS
+    /// source's state row can be stale; a sibling source's row is not this
+    /// run's to delete (M-11: the blanket DELETE wiped a peer's watermark).
+    async fn publish_state_flipped(&self, staged_wm: Option<&str>, rows: u64) -> Result<()> {
+        self.ensure_state_table().await?;
+        if let Some(sid) = &self.source_id {
+            self.ch
+                .exec(&format!(
+                    "DELETE FROM `_apitap_state` WHERE dest_table = '{}' AND source_id = '{}'",
+                    ch_str(&self.final_bare),
+                    ch_str(sid)
+                ))
+                .await?;
+        }
+        if let Some(wm) = staged_wm {
+            self.write_state(wm, rows).await?;
+        }
+        Ok(())
+    }
+
     async fn write_state(&self, watermark: &str, rows: u64) -> Result<()> {
         let (Some(cursor), Some(source_id)) = (&self.cursor_col, &self.source_id) else {
             return Ok(());
@@ -974,6 +994,16 @@ impl ChSink {
             .await?;
         Ok(())
     }
+}
+
+/// The error a flipped bootstrap returns when its atomic claim on the final
+/// name lost to a peer that published first.
+fn flipped_lost(table: &str, e: Error) -> Error {
+    Error::InvalidInput(format!(
+        "another run published {table} while this first run was loading it — the \
+         table now exists and this run would have replaced it ({e}). Re-run: the \
+         new state row makes this an incremental load."
+    ))
 }
 
 /// ClickHouse column type for a delivered value.
@@ -2014,7 +2044,8 @@ impl ChSink {
                 // is legal fan-in, replacing it is not. A true Replace carries
                 // a Swap token. A probe that fails counts as EXISTS (refuse
                 // rather than destroy on an unproven absence).
-                if crate::naming::flipped_bootstrap(self.run.kind(), mode) {
+                let flipped = crate::naming::flipped_bootstrap(self.run.kind(), mode);
+                if flipped {
                     let probed = self
                         .ch
                         .exec(&format!(
@@ -2053,6 +2084,21 @@ impl ChSink {
                     let eng = self.ddl.engine.as_deref().unwrap_or("ReplicatedMergeTree");
                     let create_cols = &self.plan_ddl;
                     let order_by = &self.staging_order_by;
+                    if flipped {
+                        // The probe above is check-then-act: a peer publishing
+                        // between it and an EXCHANGE would be swapped into
+                        // staging and dropped (MASTER review M-11). A RENAME
+                        // fails atomically where the target exists, on every
+                        // host (`throw` surfaces any host's failure).
+                        self.ch
+                            .exec_with(
+                                &format!("RENAME TABLE {} TO {}{oc}", self.staging_t, self.final_t),
+                                &[("distributed_ddl_output_mode", "throw")],
+                            )
+                            .await
+                            .map_err(|e| flipped_lost(&self.final_bare, e))?;
+                        return self.publish_state_flipped(staged_wm.as_deref(), rows).await;
+                    }
                     self.ch
                         .exec(&format!(
                             "CREATE TABLE IF NOT EXISTS {}{oc} ({create_cols}) \
@@ -2094,18 +2140,23 @@ impl ChSink {
                         .parse::<u64>()
                         .unwrap_or(0)
                         > 0;
-                    if !exists {
+                    if !exists || flipped {
                         // Bootstrap: the destination gets the (possibly explicit)
                         // ZooKeeper path directly — no shadow table needed.
                         // IF NOT EXISTS: a partially-applied earlier ON CLUSTER
-                        // create may have left the table on some hosts.
+                        // create may have left the table on some hosts. Not on a
+                        // flipped bootstrap: there the CREATE is the atomic claim
+                        // — if a peer created the table since the probe, it must
+                        // fail rather than ATTACH into the peer's table (M-11).
+                        let ine = if flipped { "" } else { "IF NOT EXISTS " };
                         self.ch
                             .exec(&format!(
-                                "CREATE TABLE IF NOT EXISTS {}{oc} ({create_cols}) \
+                                "CREATE TABLE {ine}{}{oc} ({create_cols}) \
                                  ENGINE = {engine} ORDER BY {order_by}",
                                 self.final_t
                             ))
-                            .await?;
+                            .await
+                            .map_err(|e| if flipped { flipped_lost(&self.final_bare, e) } else { e })?;
                         self.ch
                             .exec(&format!(
                                 "ALTER TABLE {} ATTACH PARTITION ID 'all' FROM {}",
@@ -2182,6 +2233,15 @@ impl ChSink {
                         // object rather than collecting it on a guess.
                         let _ = self.ch.exec(&format!("DROP TABLE {tmp}{oc}")).await;
                     }
+                } else if flipped {
+                    // Atomic claim (M-11): fails with TABLE_ALREADY_EXISTS when
+                    // a peer published since the probe, instead of swapping
+                    // the peer's table into staging and dropping it.
+                    self.ch
+                        .exec(&format!("RENAME TABLE {} TO {}", self.staging_t, self.final_t))
+                        .await
+                        .map_err(|e| flipped_lost(&self.final_bare, e))?;
+                    return self.publish_state_flipped(staged_wm.as_deref(), rows).await;
                 } else {
                     self.ch
                         .exec(&format!(
@@ -2201,6 +2261,9 @@ impl ChSink {
                 }
                 // Replace destroyed every source's rows — clear ALL stale state rows
                 // for this destination before the bootstrap (if any) re-inserts its own.
+                if flipped {
+                    return self.publish_state_flipped(staged_wm.as_deref(), rows).await;
+                }
                 self.ensure_state_table().await?;
                 self.ch
                     .exec(&format!(
