@@ -617,6 +617,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_http_deadline --> `e2e_http_deadline.py` | HTTP deadlines bound a stuck destination |
 | <!-- claim: leg.e2e_logbased_dests.ch --> `e2e_logbased_dests.py ch` | the same drain into ClickHouse |
 | <!-- claim: leg.e2e_logbased_dests.my --> `e2e_logbased_dests.py my` | the same drain into MySQL |
+| <!-- claim: leg.e2e_ch_insert_only --> `e2e_ch_insert_only.py` | a Replacing destination takes the tombstone path, FINAL exact |
 | <!-- claim: leg.e2e_pg_ch_binary_types --> `e2e_pg_ch_binary_types.py` | a PG→CH table binary pgoutput cannot render drains on text |
 | <!-- claim: leg.e2e_read_pg_types --> `e2e_read_pg_types.py` | read() of PG types without a send decoder equals the server's ::text |
 | <!-- claim: leg.e2e_pg_url_planes --> `e2e_pg_url_planes.py` | read() and the walsender dial the server the URL resolves to |
