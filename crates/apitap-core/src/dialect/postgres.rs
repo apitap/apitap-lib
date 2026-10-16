@@ -101,18 +101,23 @@ pub(crate) fn quote_ident_path(path: &str) -> String {
 }
 
 
+/// The PG*-reading tests (here and in `wire::walsender`) run in parallel
+/// with the ones that set those variables (cargo's default); without one
+/// crate-wide lock the setter's window leaks into the readers and the suite
+/// goes flaky.
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The PGSSLMODE-reading tests run in parallel with the one that sets it
-    /// (cargo's default); without a lock the setter's window leaks into the
-    /// readers and the suite goes flaky.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use super::env_guard;
 
     /// P0-3: remote + no sslmode gets verified TLS; explicit modes and
     /// loopback hosts are untouched (the false-positive and the

@@ -240,6 +240,7 @@ LEGS = [
     leg("e2e_ch_insert_only.py",   "a Replacing destination takes the tombstone path, FINAL exact"),
     leg("e2e_pg_ch_binary_types.py", "a PG→CH table binary pgoutput cannot render drains on text"),
     leg("e2e_read_pg_types.py",    "read() of PG types without a send decoder equals the server's ::text"),
+    leg("e2e_pg_url_planes.py",    "read() and the walsender dial the server the URL resolves to"),
 ]
 
 

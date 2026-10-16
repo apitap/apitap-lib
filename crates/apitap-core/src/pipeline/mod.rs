@@ -57,6 +57,23 @@ pub(crate) fn source_origin(src_url: &str) -> String {
             // elided default port must not silently fork the watermark.
             let scheme = norm(u.scheme());
             let host = u.host_str().unwrap_or("unknown");
+            // Postgres: the server sqlx actually dials (MASTER review M-6) —
+            // `?host=`/`port`/`dbname` and PG* override the authority, so two
+            // `?host=` servers no longer share one watermark row. The
+            // authority's own spelling is kept when it IS the effective host,
+            // so existing state rows keep their identity.
+            if scheme == "postgres" {
+                if let Ok(o) = <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(src_url) {
+                    let resolved = match o.get_socket() {
+                        Some(p) => p.display().to_string(),
+                        None => o.get_host().to_string(),
+                    };
+                    let decoded = crate::wire::walsender::percent_decode(host).unwrap_or_default();
+                    let host = if decoded == resolved { host.to_string() } else { resolved };
+                    let db = o.get_database().unwrap_or("");
+                    return format!("{scheme}://{host}:{}/{db}", o.get_port());
+                }
+            }
             let port = u.port().unwrap_or(match scheme {
                 "postgres" => crate::dialect::postgres::DEFAULT_PORT,
                 "mysql" => crate::dialect::mysql::DEFAULT_PORT,
@@ -997,6 +1014,24 @@ fn watermark_moved(read: &Option<String>, now: &Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// M-6: two `?host=` servers are two identities; a URL without overrides
+    /// keeps the exact identity it had before (existing state rows).
+    #[test]
+    fn the_source_origin_is_the_server_sqlx_dials() {
+        let _g = crate::dialect::postgres::env_guard();
+        for v in ["PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE"] {
+            std::env::remove_var(v);
+        }
+        let o = super::source_origin;
+        assert_eq!(o("postgres://u:p@h/db"), "postgres://h:5432/db");
+        assert_eq!(o("postgresql://u:p@h:5433/db?application_name=x"), "postgres://h:5433/db");
+        assert_eq!(o("postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db"),
+                   o("postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db?application_name=y"));
+        assert_ne!(o("postgres://u:p@lb/db?host=a"), o("postgres://u:p@lb/db?host=b"));
+        assert_eq!(o("postgres://u:p@lb:1/x?host=a&port=2&dbname=y"), "postgres://a:2/y");
+        assert_eq!(o("mysql://u:p@h/db"), "mysql://h:3306/db");
+    }
+
     /// R2-3: any change — moved watermark, a row appearing or vanishing — is
     /// a refusal, not a proceed.
     #[test]

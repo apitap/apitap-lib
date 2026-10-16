@@ -20,6 +20,7 @@
 //! module exists to preserve.
 
 use crate::error::{Error, Result};
+use std::str::FromStr;
 use crate::wire::pgoutput::lsn_to_string;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};
@@ -595,6 +596,9 @@ struct ConnInfo {
     /// anchors, which is libpq's meaning: naming a root replaces the store,
     /// it does not add to it.
     root_cert: Option<String>,
+    /// `options` (URL `?options=` / `PGOPTIONS`), sent in the startup packet
+    /// so `-csearch_path=…` means the same here as on the sqlx pool.
+    options: Option<String>,
 }
 
 /// Certificates out of a PEM file, without a parser crate.
@@ -679,62 +683,21 @@ fn connectable_host(h: &str) -> &str {
 fn parse_url(url: &str) -> Result<ConnInfo> {
     let u = reqwest::Url::parse(url)
         .map_err(|e| crate::urlerr::bad_url("postgres url", url, e))?;
-    let host = u
-        .host_str()
-        .map(connectable_host)
-        .ok_or_else(|| Error::InvalidInput("postgres url needs a host".into()))?
-        .to_string();
-    let mut ssl = SslMode::Prefer { explicit: false };
-    let mut root_cert = None;
+    // Mode spelling is validated here first, for the named refusals below
+    // (verify-ca, typos) — sqlx's own parse error says less.
+    let mut url_ssl: Option<SslMode> = None;
     for (k, v) in u.query_pairs() {
-        // (the default fix lives after the loop — round 2 §1.1)
-        if k == "sslrootcert" {
-            root_cert = Some(v.to_string());
-        }
         // BOTH spellings. libpq writes `sslmode`, sqlx accepts `sslmode` and
         // `ssl-mode`, and this project's own MySQL parser accepts both — so a
         // URL written with the hyphen encrypted its sqlx pool and silently
-        // ran the replication socket in cleartext, with the "you asked for
-        // TLS and did not get it" note suppressed because, as far as this
-        // parser could tell, nobody had asked.
+        // ran the replication socket in cleartext.
         if k == "sslmode" || k == "ssl-mode" {
-            ssl = match v.as_ref() {
-                "disable" => SslMode::Disable,
-                // libpq treats `allow` as "plaintext first, TLS only if that
-                // fails". Nobody deploys it deliberately and the distinction
-                // buys nothing here, so it maps to the same attempt order as
-                // `prefer` rather than to an unsupported-value error.
-                "prefer" | "allow" => SslMode::Prefer { explicit: true },
-                "require" => SslMode::Require,
-                "verify-full" => SslMode::VerifyFull,
-                // verify-ca means "check the chain but not the hostname".
-                // rustls's standard verifier does both together, and a
-                // chain-only verifier is a custom implementation with its own
-                // failure modes — so it is refused by name rather than
-                // silently upgraded to verify-full or downgraded to require.
-                "verify-ca" => {
-                    return Err(Error::InvalidInput(
-                        "sslmode=verify-ca is not implemented — it verifies the \
-                         certificate chain while skipping the hostname check, \
-                         which this client cannot express. Use verify-full (chain \
-                         AND hostname) or require (encrypt without verifying)."
-                            .into(),
-                    ))
-                }
-                other => {
-                    return Err(Error::InvalidInput(format!(
-                        "sslmode={other} is not a Postgres ssl mode — use disable, \
-                         prefer, require or verify-full"
-                    )))
-                }
-            };
+            url_ssl = Some(ssl_mode_named(&v)?);
         }
-    }
-    // Client certificates are a different feature (the server must also be
-    // configured for them), and silently dropping them means a confusing
-    // authentication failure later. Named now.
-    for (k, _) in u.query_pairs() {
-        if k == "sslcert" || k == "sslkey" {
+        // Client certificates are a different feature (the server must also
+        // be configured for them), and silently dropping them means a
+        // confusing authentication failure later. Named now.
+        if matches!(&*k, "sslcert" | "sslkey" | "ssl-cert" | "ssl-key") {
             return Err(Error::InvalidInput(format!(
                 "{k} is not supported on the replication connection — apitap does \
                  not do client-certificate authentication there yet. Remove it and \
@@ -743,27 +706,92 @@ fn parse_url(url: &str) -> Result<ConnInfo> {
             )));
         }
     }
-    // The pools' default, on the replication socket too (round 2 §1.1.5):
-    // a URL that says nothing about TLS to a non-local host gets verified
-    // TLS. Explicit values parsed above always win, and a local host keeps
-    // `prefer`. Unix sockets are not supported on this plane.
+    // WHICH server, database and role: exactly what the sqlx pool dials
+    // (MASTER review M-6). sqlx starts from the PG* environment, applies the
+    // authority, then every query key in order (`?host=`, `hostaddr`, `port`,
+    // `dbname`, `user`, `password`, `options` — last wins), then `.pgpass`.
+    // Reading the authority alone sent the raw COPY plane and the walsender
+    // to a different server than the pool that planned the read.
+    let o = sqlx::postgres::PgConnectOptions::from_str(url)
+        .map_err(|e| Error::InvalidInput(format!("postgres url: {e}")))?;
+    if o.get_socket().is_some() || o.get_host().starts_with('/') {
+        return Err(Error::InvalidInput(
+            "a Unix-socket Postgres URL is not supported on the replication / raw \
+             COPY connection — give a TCP host"
+                .into(),
+        ));
+    }
+    // The password sqlx settled on (URL, `?password=`, PGPASSWORD, then
+    // .pgpass) is only exposed through its canonical URL.
+    let canon = sqlx::ConnectOptions::to_url_lossy(&o);
+    let password = percent_decode(canon.password().unwrap_or(""))?;
+    let host = connectable_host(o.get_host()).to_string();
+    let mut ssl = match url_ssl {
+        Some(m) => m,
+        None => match std::env::var("PGSSLMODE") {
+            Ok(v) => ssl_mode_named(&v)?,
+            Err(_) => SslMode::Prefer { explicit: false },
+        },
+    };
+    // The pools' default, on the replication socket too (round 2 §1.1.5): a
+    // URL that says nothing about TLS to a non-local EFFECTIVE host gets
+    // verified TLS. Explicit values (URL or PGSSLMODE) always win.
     if matches!(ssl, SslMode::Prefer { explicit: false })
         && !crate::dialect::postgres::host_is_local(&host)
     {
         ssl = SslMode::VerifyFull;
     }
+    // sqlx's three spellings of the CA (M-21), then PGSSLROOTCERT.
+    let root_cert = u
+        .query_pairs()
+        .filter(|(k, _)| matches!(&**k, "sslrootcert" | "ssl-root-cert" | "ssl-ca"))
+        .map(|(_, v)| v.to_string())
+        .last()
+        .or_else(|| std::env::var("PGSSLROOTCERT").ok());
     Ok(ConnInfo {
         host,
-        port: u.port().unwrap_or(5432),
-        user: percent_decode(u.username())?,
-        password: percent_decode(u.password().unwrap_or(""))?,
-        db: u.path().trim_matches('/').to_string(),
+        port: o.get_port(),
+        user: o.get_username().to_string(),
+        password,
+        db: o.get_database().unwrap_or("").to_string(),
         ssl,
         root_cert,
+        options: o.get_options().map(str::to_string),
     })
 }
 
-fn percent_decode(s: &str) -> Result<String> {
+/// A Postgres `sslmode` value, or its refusal by name.
+fn ssl_mode_named(v: &str) -> Result<SslMode> {
+    Ok(match v {
+        "disable" => SslMode::Disable,
+        // libpq treats `allow` as "plaintext first, TLS only if that fails".
+        // Nobody deploys it deliberately and the distinction buys nothing
+        // here, so it maps to the same attempt order as `prefer`.
+        "prefer" | "allow" => SslMode::Prefer { explicit: true },
+        "require" => SslMode::Require,
+        "verify-full" => SslMode::VerifyFull,
+        // verify-ca means "check the chain but not the hostname". rustls's
+        // standard verifier does both together, so it is refused by name
+        // rather than silently upgraded or downgraded.
+        "verify-ca" => {
+            return Err(Error::InvalidInput(
+                "sslmode=verify-ca is not implemented — it verifies the \
+                 certificate chain while skipping the hostname check, \
+                 which this client cannot express. Use verify-full (chain \
+                 AND hostname) or require (encrypt without verifying)."
+                    .into(),
+            ))
+        }
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "sslmode={other} is not a Postgres ssl mode — use disable, \
+                 prefer, require or verify-full"
+            )))
+        }
+    })
+}
+
+pub(crate) fn percent_decode(s: &str) -> Result<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -1008,7 +1036,11 @@ impl Walsender {
         if replication {
             params.push(("replication", "database"));
         }
-        if let Some(o) = options {
+        let merged = match (ci.options.as_deref(), options) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (a, b) => a.or(b).map(str::to_string),
+        };
+        if let Some(o) = merged.as_deref() {
             params.push(("options", o));
         }
         for (k, v) in params {
@@ -2155,6 +2187,7 @@ mod tests {
 
     #[test]
     fn url_parse_reads_sslmode_and_decodes_credentials() {
+        let _g = crate::dialect::postgres::env_guard();
         let ci = parse_url("postgres://u%40x:p%3Aw@h:5433/db").unwrap();
         assert_eq!((ci.user.as_str(), ci.password.as_str()), ("u@x", "p:w"));
         assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
@@ -2197,6 +2230,54 @@ mod tests {
         // one of them would be weaker than asked for, the other stricter.
         assert!(parse_url("postgres://u:p@h/db?sslmode=verify-ca").is_err());
         assert!(parse_url("postgres://u:p@h/db?sslmode=yes-please").is_err());
+    }
+
+    /// M-6: the replication / raw COPY planes dial what the sqlx pool dials.
+    /// Every query override and PG* variable sqlx honours wins over the
+    /// authority here too, and `options` reaches the startup packet.
+    #[test]
+    fn the_url_resolves_like_the_sqlx_pool() {
+        let _g = crate::dialect::postgres::env_guard();
+        for v in ["PGHOST", "PGHOSTADDR", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE",
+                  "PGOPTIONS", "PGSSLMODE", "PGSSLROOTCERT"] {
+            std::env::remove_var(v);
+        }
+        let ci = parse_url(
+            "postgres://u:p@decoy:5433/wrong?host=real.example&port=5544&dbname=right\
+             &user=r&password=s%26t&options=-csearch_path%3Dsales",
+        )
+        .unwrap();
+        assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("real.example", 5544, "right"));
+        assert_eq!((ci.user.as_str(), ci.password.as_str()), ("r", "s&t"));
+        assert_eq!(ci.options.as_deref(), Some("-csearch_path=sales"));
+        // The TLS default follows the EFFECTIVE host, not the authority.
+        assert_eq!(parse_url("postgres://u:p@db.example/x?host=127.0.0.1").unwrap().ssl,
+                   SslMode::Prefer { explicit: false });
+        assert_eq!(parse_url("postgres://u:p@localhost/x?host=db.example").unwrap().ssl,
+                   SslMode::VerifyFull);
+        // hostaddr wins like host does.
+        assert_eq!(parse_url("postgres://u:p@decoy/x?hostaddr=10.1.2.3").unwrap().host, "10.1.2.3");
+        // sqlx's other CA spellings.
+        assert_eq!(parse_url("postgres://u:p@h/x?ssl-ca=/ca.pem").unwrap().root_cert.as_deref(),
+                   Some("/ca.pem"));
+
+        // The environment fills what the URL leaves out — and PGSSLMODE is
+        // the operator's explicit choice.
+        std::env::set_var("PGPORT", "6000");
+        std::env::set_var("PGDATABASE", "envdb");
+        std::env::set_var("PGPASSWORD", "envpw");
+        std::env::set_var("PGOPTIONS", "-cstatement_timeout=0");
+        std::env::set_var("PGSSLMODE", "require");
+        let ci = parse_url("postgres://u@h").unwrap();
+        assert_eq!((ci.port, ci.db.as_str(), ci.password.as_str()), (6000, "envdb", "envpw"));
+        assert_eq!(ci.options.as_deref(), Some("-cstatement_timeout=0"));
+        assert_eq!(ci.ssl, SslMode::Require);
+        for v in ["PGPORT", "PGDATABASE", "PGPASSWORD", "PGOPTIONS", "PGSSLMODE"] {
+            std::env::remove_var(v);
+        }
+        // A socket is refused on this plane (the raw COPY caller falls back
+        // to sqlx; the walsender says why).
+        assert!(parse_url("postgres://u:p@h/x?host=/var/run/postgresql").is_err());
     }
 
     /// LIVE smoke against a real Postgres (`wal_level=logical`):
