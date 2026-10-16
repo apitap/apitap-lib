@@ -1574,3 +1574,27 @@ untuk tuning TLS/remote) dengan test+RED; rig mem-forward-nya.
 **Batas akhir yang konsisten: ~6,9 µs/change, ~48 rb/s @0,33 core di rig ini
 — tiga serangan berturut-turut (coalescer lanjutan, pool, blocking reader)
 menghasilkan satu win (default 5 ms, −6%) dan dua netral/negatif.**
+
+### 14.17 Plafon PG slots=2 & MySQL grup (2026-10-12/13)
+
+Di luar 49k yang mengejar penuh, kedua jalur diuji pada offer 62–65k (pace ledger, mix murni
+update, kandang 0,5 core):
+
+| jalur | offered | hasil drain | CPU | veredict |
+|---|---|---|---|---|
+| PG slots=2 (2 tabel) | 61,4–62,6 rb/s | tuntas 171–174 s (jendela writer 120 s) → **tidak mengejar** | 0,42–0,43/0,5 (84–86%) | **MATCH** (digest eksak 2/2) |
+| MySQL grup 10-tabel | 62,7 rb/s | tuntas 411 s (jendela writer 120 s) → **tidak mengejar** | 0,28/0,5 (57%) | MATCH |
+
+Plafon "mengejar penuh" kedua jalur ada di antara **48–49 rb/s** dan **62 kb/s**. Di 49k kedua
+jalur mengejar penuh (validasi eksak); di 62k keduanya tertinggal.
+
+- PG slots=2 @62,6k: CPU 84% → mendekati plafon core (bukan CPU-tak-cukup, tapi laju apply).
+- MySQL grup @62,7k: CPU cuma 57% → tertinggal meski CPU menganggur → plafon ada di
+  jalur apply serial per grup (bukan CPU), konsisten dengan temuan single-table.
+- Catatan metodologi: `validate.sh` memanggil validator dengan konteks container yang salah
+  (query kosong → "MISMATCH" palsu). Digest benar lewat `bench-capped-pg-ch-validator.sh raw`;
+  kedua tabel PG65c MATCH eksak. Leg adjust: validator harus di-invoke dengan `PG_C/PG_DB/CH_C`
+  yang benar atau lewat `raw`.
+
+Target ">50k/s" tercapai sebagai **kelas 3 jt/menit** (48–49k mengejar penuh @0,5 core, MATCH);
+di atas itu perlu core tambahan + slot menyesuaikan (rezim C, `slots="auto"`).
