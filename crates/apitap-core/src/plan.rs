@@ -256,6 +256,12 @@ pub(crate) fn resolve_watermark(
     match own_state {
         Some(s) => Ok(Some(match arb {
             WmArbitration::StateAuthoritative => s,
+            // Sibling state rows mean FAN-IN, and the data max covers the
+            // other sources' rows too: source B at 40 reading max(40, 100)
+            // resumes at 100 and its 41..100 are never loaded — green
+            // (MASTER M-5). With siblings present the state row alone is the
+            // truth; the data max only arbitrates a single-source table.
+            WmArbitration::Greatest { .. } if sibling_state_rows => s,
             WmArbitration::Greatest { numeric } => match data_max {
                 Some(d) => wm_pick(numeric, s, d),
                 None => s,
@@ -286,6 +292,11 @@ mod wm_tests {
         assert_eq!(r(Some("5"), Some("9"), false, StateAuthoritative).unwrap(), Some("5".into()));
         // greatest: fresher of the two, garbage state loses
         assert_eq!(r(Some("5"), Some("9"), false, Greatest { numeric: true }).unwrap(), Some("9".into()));
+        // MASTER M-5: with sibling state rows the state row is authoritative
+        // — max(own, data) would adopt a more advanced sibling's cursor and
+        // skip this source's backlog.
+        assert_eq!(r(Some("40"), Some("100"), true, Greatest { numeric: true }).unwrap(), Some("40".into()));
+        assert_eq!(r(Some("40"), Some("100"), true, StateAuthoritative).unwrap(), Some("40".into()));
         assert_eq!(r(Some("garbage"), Some("9"), false, Greatest { numeric: true }).unwrap(), Some("9".into()));
         // fan-in: no own row + siblings = loud error
         assert!(r(None, Some("9"), true, Greatest { numeric: true }).is_err());
