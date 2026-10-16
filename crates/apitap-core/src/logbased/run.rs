@@ -1744,6 +1744,12 @@ async fn drain_loop(
     // stalling on their round trips (design §14.18).
     let mut pending: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     'windows: loop {
+        // A SIGTERM must end a follow loop NOW, not at the follow deadline —
+        // the SIGKILL a few seconds behind it would otherwise land mid-apply
+        // (MASTER M-58).
+        if crate::shutdown::requested() {
+            break;
+        }
         if let Some(deadline) = follow {
             if std::time::Instant::now() >= deadline {
                 break;
@@ -1789,7 +1795,7 @@ async fn drain_loop(
             // Follow mode: same session, rolling stop line. Ask the source
             // where its WAL ends now and drain the delta; a quiet source
             // parks briefly instead of spinning.
-            if std::time::Instant::now() >= deadline {
+            if crate::shutdown::requested() || std::time::Instant::now() >= deadline {
                 break;
             }
             let now: (String,) = sqlx::query_as("SELECT pg_current_wal_lsn()::text")

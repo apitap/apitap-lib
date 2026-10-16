@@ -290,7 +290,8 @@ pub(crate) async fn drain_windows(
             // not the end — roll the stop line and wait for the next change;
             // without follow it is exactly the old break.
             let Some(deadline) = follow else { break };
-            if std::time::Instant::now() >= deadline {
+            // SIGTERM ends the follow now (MASTER M-58).
+            if crate::shutdown::requested() || std::time::Instant::now() >= deadline {
                 break;
             }
             let (lf, lp) = master_position(pool).await?;
@@ -318,7 +319,7 @@ pub(crate) async fn drain_windows(
                 }
                 continue;
             };
-            if std::time::Instant::now() >= deadline {
+            if crate::shutdown::requested() || std::time::Instant::now() >= deadline {
                 break;
             }
             let (lf, lp) = master_position(pool).await?;
