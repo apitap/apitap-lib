@@ -1290,9 +1290,14 @@ pub(crate) const STATE_TABLE: &str = "_apitap_state";
 /// apitap's own bookkeeping as if a user had made it.
 pub(crate) const CDC_PENDING_TABLE: &str = "_apitap_cdc_pending";
 
+/// The ClickHouse residue journal (MASTER review M-12/M-13): the image each
+/// masked update / TOAST re-key computed, so a replay re-lands it instead of
+/// reading the destination's later state. Per-destination, like the above.
+pub(crate) const RESIDUE_JOURNAL_TABLE: &str = "_apitap_residue_journal";
+
 /// Every table apitap owns whose name is a whole word rather than a suffix.
 pub(crate) const OWN_TABLES: &[&str] =
-    &[STATE_TABLE, CDC_PENDING_TABLE, crate::lease::LEASE_TABLE];
+    &[STATE_TABLE, CDC_PENDING_TABLE, crate::lease::LEASE_TABLE, RESIDUE_JOURNAL_TABLE];
 
 /// What every SUPPORTED apitap writes beside a table and scans for — so a claim
 /// about another version is a compiled fact with a test, not an assumption.
@@ -1307,7 +1312,7 @@ pub(crate) mod compat {
     use super::{
         Artifact::{self, *},
         LandKind::{self, *},
-        CDC_PENDING_TABLE, STATE_TABLE,
+        CDC_PENDING_TABLE, RESIDUE_JOURNAL_TABLE, STATE_TABLE,
     };
 
     /// What a SHIPPED apitap writes beside a table and what it scans for.
@@ -1325,22 +1330,24 @@ pub(crate) mod compat {
         G1,
         G2,
         G3,
+        G4,
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     impl Generation {
-        pub(crate) const CURRENT: Generation = Generation::G3;
+        pub(crate) const CURRENT: Generation = Generation::G4;
         /// G0 (<0.55.0) writes the un-tokenized name, which is `Found::Legacy`
         /// and refused — never coexisted with. 0.55.0 is not a neighbour:
         /// the stability page says upgrade it to 0.55.1 first.
         pub(crate) const SUPPORTED: &'static [Generation] =
-            &[Generation::G1, Generation::G2, Generation::G3];
+            &[Generation::G1, Generation::G2, Generation::G3, Generation::G4];
         pub(crate) const fn versions(self) -> &'static str {
             match self {
                 Self::G0 => "<0.55.0",
                 Self::G1 => "0.55.1",
                 Self::G2 => "0.56.0",
-                Self::G3 => "0.57.0+",
+                Self::G3 => "0.57.0–0.61.x",
+                Self::G4 => "0.62.0+",
             }
         }
 
@@ -1355,7 +1362,7 @@ pub(crate) mod compat {
                 (Self::G1, _) => &[Staging],
                 (Self::G2, Cdc) => &[Lock],
                 // G3 Cdc: the lock plus an empty staging MARKER, for G1 readers
-                (Self::G2, _) | (Self::G3, _) => &[Lock, Staging],
+                (Self::G2, _) | (Self::G3, _) | (Self::G4, _) => &[Lock, Staging],
             }
         }
 
@@ -1363,7 +1370,7 @@ pub(crate) mod compat {
             match self {
                 Self::G0 => &[],
                 Self::G1 => &[Staging],
-                Self::G2 | Self::G3 => &[Lock, Staging],
+                Self::G2 | Self::G3 | Self::G4 => &[Lock, Staging],
             }
         }
 
@@ -1372,6 +1379,12 @@ pub(crate) mod compat {
             match self {
                 Self::G0 | Self::G1 => &[STATE_TABLE],
                 Self::G2 | Self::G3 => &[STATE_TABLE, CDC_PENDING_TABLE, crate::lease::LEASE_TABLE],
+                Self::G4 => &[
+                    STATE_TABLE,
+                    CDC_PENDING_TABLE,
+                    crate::lease::LEASE_TABLE,
+                    RESIDUE_JOURNAL_TABLE,
+                ],
             }
         }
     }
@@ -1385,7 +1398,11 @@ pub(crate) mod compat {
     /// the current bookkeeping tables it does not know to hide.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const ROLLBACK_LEAKS: &[(Generation, &[&str])] =
-        &[(Generation::G1, &[CDC_PENDING_TABLE, crate::lease::LEASE_TABLE])];
+        &[
+            (Generation::G1, &[CDC_PENDING_TABLE, crate::lease::LEASE_TABLE, RESIDUE_JOURNAL_TABLE]),
+            (Generation::G2, &[RESIDUE_JOURNAL_TABLE]),
+            (Generation::G3, &[RESIDUE_JOURNAL_TABLE]),
+        ];
 
     /// The ONLY place a marker set is chosen. `guard::announce` creates exactly
     /// these, empty. A bulk run's staging is not a marker: the sink's own
@@ -2226,12 +2243,13 @@ mod tests {
     }
 
     #[test]
-    fn own_tables_are_frozen_at_three_names() {
-        assert_eq!(OWN_TABLES, &["_apitap_state", "_apitap_cdc_pending", "_apitap_lease"],
+    fn own_tables_are_frozen_at_four_names() {
+        assert_eq!(OWN_TABLES, &["_apitap_state", "_apitap_cdc_pending", "_apitap_lease",
+                                 "_apitap_residue_journal"],
                    "every whole-word bookkeeping table is replicated as user data by every \
                     older generation on rollback; adding one updates ROLLBACK_LEAKS and \
                     failure-modes.md#upgrading-and-rolling-back in the same commit.");
-        assert_eq!(OWN_TABLES.len(), 3);
+        assert_eq!(OWN_TABLES.len(), 4);
     }
 
     /// A token says what it is, and a bulk constructor cannot say Cdc.

@@ -569,7 +569,11 @@ remains — Postgres `SELECT count(*) FROM _apitap_lease WHERE NOT collected AND
 MySQL the same with `UTC_TIMESTAMP(6)`, BigQuery with `CURRENT_TIMESTAMP()`,
 ClickHouse `SELECT count() FROM (SELECT token, argMax(collected, seq) c, argMax(expires_at, seq) e FROM _apitap_lease GROUP BY dest_key, token) WHERE c = 0 AND e > now64(6)` —
 then `DROP TABLE _apitap_lease` and `DROP TABLE _apitap_cdc_pending`, or list
-tables explicitly. Rolling back to 0.56.0 needs nothing, with one cost: a 0.57.0
+tables explicitly. A ClickHouse destination that ran a 0.62.0+ drain also
+holds `_apitap_residue_journal` (the replay journal for TOAST-masked updates and
+re-keys), which every release before 0.62.0 replicates the same way: before
+rolling back to any of them, drop it once every drain has stopped — it only
+matters to a window that has not committed. Rolling back to 0.56.0 needs nothing else, with one cost: a 0.57.0
 drain killed outright leaves a lock and a staging marker, and 0.56.0 collects the
 lock but refuses on the marker, naming it — drop it by hand, once.
 

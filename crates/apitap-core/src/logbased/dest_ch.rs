@@ -44,6 +44,18 @@ use crate::naming::STATE_CURSOR_LSN as STATE_CURSOR;
 /// The bare name lives in `naming` so table discovery excludes it along with
 /// `_apitap_state`; this is only its quoted spelling.
 const PENDING: &str = "`_apitap_cdc_pending`";
+/// The residue journal (MASTER review M-13): a masked update or re-key on
+/// ClickHouse is readback → DELETE → INSERT, three statements with no
+/// transaction. The patched row is journalled first, so a run that dies
+/// between the DELETE and the INSERT leaves the row recoverable: the replay
+/// finds the destination row gone and re-inserts the journalled image
+/// instead of wedging ("row missing… replay out of order?") or, for a
+/// re-key, silently skipping the move.
+const JOURNAL: &str = "`_apitap_residue_journal`";
+const _: () = assert!(matches!(
+    crate::naming::RESIDUE_JOURNAL_TABLE.as_bytes(),
+    b"_apitap_residue_journal"
+));
 const _: () = assert!(
     // A rename that forgot the other half would make apitap replicate its own
     // bookkeeping out of a ClickHouse source.
@@ -771,6 +783,21 @@ async fn apply_unit(
     // Residue tail: serial, ordered. Masked TOAST updates read the missing
     // columns back from the destination, then delete + reinsert the patched
     // row (ClickHouse has no cheap row UPDATE).
+    // Journal-first replay (MASTER review M-12/M-13): on a replay the
+    // destination already carries this window's later images, so a readback
+    // can return the WRONG row (`Rekey 1→2; Rekey 3→1` reads C at key 1) or
+    // nothing (a crash between DELETE and INSERT). The first attempt
+    // journalled every image it computed from the pre-window state; the
+    // replay reuses those. An op is identified by its key and its ordinal
+    // among this window's residue ops on that key — stable across attempts,
+    // which all start at the same watermark.
+    let replay = !c.residue.is_empty() && u.journal_live(dest_table, id.start()).await?;
+    let mut ordinal: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut jkey = |pred: &str| {
+        let n = ordinal.entry(pred.to_string()).or_insert(0);
+        *n += 1;
+        format!("{n}|{pred}")
+    };
     for op in &c.residue {
         match op {
             ResidueOp::MaskedUpdate { key, row } => {
@@ -782,6 +809,15 @@ async fn apply_unit(
                     .map(|(i, _)| i)
                     .collect();
                 let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
+                let jk = jkey(&pred);
+                if replay {
+                    if let Some(img) = u.journal_get(dest_table, &jk, id.start()).await? {
+                        u.delete_owned(dest_table, &pred).await?;
+                        let cols = if insert_only { insert_only_cols(wal_cols) } else { wal_cols.to_vec() };
+                        u.insert_owned(dest_table, &cols, img).await?;
+                        continue;
+                    }
+                }
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
                     // Insert-only tables need the LIVE row: without FINAL the
@@ -798,8 +834,8 @@ async fn apply_unit(
                     };
                     let Some(line) = body.lines().next() else {
                         return Err(Error::Transfer(
-                            "log_based: masked update for a row missing at the destination — \
-                             window replay out of order?"
+                            "log_based: masked update for a row missing at the destination \
+                             and not in the residue journal — window replay out of order?"
                                 .into(),
                         ));
                     };
@@ -816,11 +852,14 @@ async fn apply_unit(
                         };
                     }
                 }
-                u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
                 render_residue_row(&full, oids, &missing, binary, &mut buf)?;
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
+                }
+                u.journal_put(dest_table, &jk, &buf, id.end(), id.start()).await?;
+                u.delete_owned(dest_table, &pred).await?;
+                if insert_only {
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
                 } else {
                     u.insert_owned(dest_table, wal_cols, buf).await?;
@@ -861,6 +900,20 @@ async fn apply_unit(
                     .map(|(i, _)| i)
                     .collect();
                 let old_pred = key_pred(pk_cols, old_key, &pk_oids, binary)?;
+                let jk = jkey(&old_pred);
+                if replay && !missing.is_empty() {
+                    if let Some(img) = u.journal_get(dest_table, &jk, id.start()).await? {
+                        u.delete_owned(dest_table, &old_pred).await?;
+                        if insert_only {
+                            u.insert_owned(dest_table, &insert_only_cols(wal_cols), img).await?;
+                        } else {
+                            let new_pred = key_pred(pk_cols, new_key, &pk_oids, binary)?;
+                            u.delete_owned(dest_table, &new_pred).await?;
+                            u.insert_owned(dest_table, wal_cols, img).await?;
+                        }
+                        continue;
+                    }
+                }
                 if !missing.is_empty() {
                     let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
                     let body = if insert_only {
@@ -884,11 +937,20 @@ async fn apply_unit(
                                 };
                             }
                         }
-                        // The old key is not there. On a replayed window that is
-                        // the expected shape — the move already happened and the
-                        // row sits at the new key — so skip rather than fail.
+                        // The old key is not there and nothing was journalled
+                        // for this op: an attempt from before the journal
+                        // existed already moved the row. (A journalled op never
+                        // reaches here — the replay branch above took it.)
                         None => continue,
                     }
+                }
+                let mut buf = Vec::new();
+                render_residue_row(&full, oids, &missing, binary, &mut buf)?;
+                if insert_only {
+                    insert_only_suffix(&mut buf, id.end(), false);
+                }
+                if !missing.is_empty() {
+                    u.journal_put(dest_table, &jk, &buf, id.end(), id.start()).await?;
                 }
                 u.delete_owned(dest_table, &old_pred).await?;
                 // Replay-idempotent (review round 2 R2-4): a replayed window
@@ -904,10 +966,7 @@ async fn apply_unit(
                     let new_pred = key_pred(pk_cols, new_key, &pk_oids, binary)?;
                     u.delete_owned(dest_table, &new_pred).await?;
                 }
-                let mut buf = Vec::new();
-                render_residue_row(&full, oids, &missing, binary, &mut buf)?;
                 if insert_only {
-                    insert_only_suffix(&mut buf, id.end(), false);
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
                 } else {
                     u.insert_owned(dest_table, wal_cols, buf).await?;
@@ -1000,7 +1059,7 @@ fn insert_only_columns_ddl(table: &str) -> String {
 }
 
 mod store {
-    use super::{ch_engine_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, PENDING, STATE_CURSOR};
+    use super::{ch_engine_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, JOURNAL, PENDING, STATE_CURSOR};
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark};
@@ -1370,6 +1429,20 @@ mod store {
             };
             *self.patch.lock().unwrap() = Some(ok);
             ok
+        }
+
+        async fn ensure_journal_table(&self) -> Result<()> {
+            if !self.first_time("\u{1}journal") {
+                return Ok(());
+            }
+            self.ch
+                .exec(&format!(
+                    "CREATE TABLE IF NOT EXISTS {JOURNAL} (\
+                       dest_table String, k String, row String, ver UInt64) \
+                     ENGINE = ReplacingMergeTree(ver) ORDER BY (dest_table, k)"
+                ))
+                .await?;
+            Ok(())
         }
 
         async fn ensure_state_table(&self) -> Result<()> {
@@ -1758,6 +1831,61 @@ mod store {
             table: &str,
         ) -> Result<std::collections::HashMap<String, String>> {
             self.s.types(table).await
+        }
+
+        /// Journal the rendered row a residue op is about to write at `k`
+        /// (its key predicate) BEFORE the op deletes anything. `after` is the
+        /// window start: entries at or below it belong to committed windows
+        /// and are swept, once per table per run.
+        pub(crate) async fn journal_put(&mut self, table: &str, k: &str, row: &[u8], ver: u64, after: u64) -> Result<()> {
+            self.s.ensure_journal_table().await?;
+            if self.s.first_time(&format!("\u{1}jsweep\u{1}{table}")) {
+                let w = format!("dest_table = '{}' AND ver <= {after}", ch_str(table));
+                self.delete_where(JOURNAL.trim_matches('`'), &w).await?;
+            }
+            let mut body = Vec::with_capacity(row.len() * 2 + k.len() + 64);
+            for f in [table.as_bytes(), k.as_bytes()] {
+                crate::wire::mytsv::tsv_escape(f, &mut body);
+                body.push(b'\t');
+            }
+            body.extend_from_slice(hex::encode(row).as_bytes());
+            body.extend_from_slice(format!("\t{ver}\n").as_bytes());
+            let cols = ["dest_table", "k", "row", "ver"].map(String::from);
+            self.insert_owned(JOURNAL.trim_matches('`'), &cols, body).await
+        }
+
+        /// The newest journalled row for `k` written by an attempt at a window
+        /// that has not committed (`ver > after`), if any.
+        pub(crate) async fn journal_get(&mut self, table: &str, k: &str, after: u64) -> Result<Option<Vec<u8>>> {
+            self.s.ensure_journal_table().await?;
+            let body = self
+                .read(&format!(
+                    "SELECT row FROM {JOURNAL} FINAL WHERE dest_table = '{}' AND k = '{}' \
+                     AND ver > {after} FORMAT TabSeparated",
+                    ch_str(table),
+                    ch_str(k)
+                ))
+                .await?;
+            match body.lines().next() {
+                None => Ok(None),
+                Some(h) => hex::decode(h.trim())
+                    .map(Some)
+                    .map_err(|e| Error::Transfer(format!("log_based: residue journal row for {table} is corrupt: {e}"))),
+            }
+        }
+
+        /// Whether an attempt at this window already journalled anything for
+        /// `table` — i.e. this apply is a replay. Asked once per window, so a
+        /// first attempt pays one cheap read and no per-op lookups.
+        pub(crate) async fn journal_live(&mut self, table: &str, after: u64) -> Result<bool> {
+            self.s.ensure_journal_table().await?;
+            let body = self
+                .read(&format!(
+                    "SELECT count() FROM {JOURNAL} WHERE dest_table = '{}' AND ver > {after}",
+                    ch_str(table)
+                ))
+                .await?;
+            Ok(body.trim() != "0")
         }
 
         fn delete_mode(&self, table: &str) -> &'static str {

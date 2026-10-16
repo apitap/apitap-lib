@@ -242,6 +242,7 @@ LEGS = [
     leg("e2e_read_pg_types.py",    "read() of PG types without a send decoder equals the server's ::text"),
     leg("e2e_pg_url_planes.py",    "read() and the walsender dial the server the URL resolves to"),
     leg("e2e_parallel_apply_barrier.py", "parallel apply treats truncate/masked windows as barriers"),
+    leg("e2e_ch_residue_crash.py", "a CH residue op cut between DELETE and INSERT replays exact"),
 ]
 
 
