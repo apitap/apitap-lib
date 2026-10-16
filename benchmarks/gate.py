@@ -248,6 +248,7 @@ LEGS = [
     leg("e2e_ch_lb_504.py",        "an LB 504 after a forwarded EXCHANGE never republishes old data"),
     leg("e2e_ch_flipped_race.py",  "a CH first run that loses the race refuses; the peer keeps its table"),
     leg("e2e_ch_drop_after_publish.py", "a CH staging DROP refused after the publish never re-lands the delta"),
+    leg("e2e_refusal_leaves_nothing.py", "a run refused after its announcement leaves no staging behind"),
 ]
 
 

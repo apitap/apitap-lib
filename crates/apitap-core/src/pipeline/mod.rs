@@ -741,10 +741,21 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     // and the load would repeat (W, W2] on a keyless table, silently (review
     // round 2 R2-3; the residual window between this re-read and the
     // finalize's own write is what the PG-side CAS follow-up closes).
+    //
+    // Both exits below leave AFTER `prepare` created staging, which is this
+    // run's announcement from here on: they go through `discard`, or the
+    // leftover reads as a live peer and every later run of the table refuses
+    // (MASTER review M-33 — the refusal itself used to leave it).
     if let Some((cursor, wm_read)) = &incremental {
-        let st2 = sink.dest_state(&mut plan, mode, cursor, source_id).await?;
+        let st2 = match sink.dest_state(&mut plan, mode, cursor, source_id).await {
+            Ok(st) => st,
+            Err(e) => {
+                abandon_staging(&sink, table).await;
+                return Err(e);
+            }
+        };
         if watermark_moved(wm_read, &st2.watermark) {
-            sink.release_lock().await;
+            abandon_staging(&sink, table).await;
             return Err(Error::InvalidInput(
                 "another run committed this destination between this load's \
                  watermark read and its announcement — loading now would repeat \
@@ -810,6 +821,18 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         elapsed_ms: started.elapsed().as_millis() as u64,
         parallel: if rows == 0 { 0 } else { used },
     })
+}
+
+/// Take back what `prepare` created on an exit before the load: the staging
+/// object and the announcement. Best-effort; the caller returns its own error.
+async fn abandon_staging<S: Sink>(sink: &S, table: &str) {
+    if let Err(d) = sink.discard().await {
+        crate::progress::note(&format!(
+            "could not drop this run's staging ({d}); the next run of {table} will \
+             refuse until it is removed"
+        ));
+    }
+    sink.release_lock().await;
 }
 
 /// One table of a multi-table run: source name (as the user gave it / the catalog
