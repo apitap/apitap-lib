@@ -719,10 +719,13 @@ apitap.transfer(
   `<prefix>/<table>.csv.gz`, header row included. Workers stream their own
   staging parts and finalize COMPOSES them server-side, so the final object
   appears atomically (readers never see a partial file). `format=parquet`
-  writes the columnar convention instead: `<prefix>/<table>/part-NNNNN.parquet`
-  (ZSTD), one part per pipe — parts can't be concatenated, so the directory
-  swap is per-object (each file lands atomically; the set is not a
-  transaction).
+  writes the columnar convention instead: `<prefix>/<table>/part-<gen>-NNNNN.parquet`
+  (ZSTD), one part per pipe, each publish under a new `<gen>` — parts can't
+  be concatenated, so the directory swap is per-object (each file lands
+  atomically; the set is not a transaction). Read it as `part-*.parquet`.
+  A publish that fails midway removes the parts it added, so the previous
+  generation stays whole; if a previous part cannot be deleted after the new
+  ones land, the run fails naming it (readers would see both).
 - **Auth**: the same service-account flow as BigQuery (`?credentials=` or
   `GOOGLE_APPLICATION_CREDENTIALS`); the key needs `storage.objectAdmin` on
   the bucket.
@@ -763,11 +766,15 @@ apitap.transfer(
   env vars. `region=` defaults to `AWS_REGION`, then `us-east-1`. Requests are
   SigV4-signed; no AWS SDK involved.
 - **Layout**: workers stream S3 multipart uploads into
-  `{prefix}{table}__apitap_staging/part-NNNNN.parquet`, then finalize copies
-  parts to `{prefix}{table}/part-NNNNN.parquet` and sweeps staging plus any
-  stale apitap parts from a prior run (only `part-NNNNN.parquet` names are
-  ever deleted). Copies are per-object, not a transaction — readers can see a
-  mixed directory briefly.
+  `{prefix}{table}__apitap_staging/<run>/part-NNNNN.parquet`, then finalize
+  copies parts to `{prefix}{table}/part-<gen>-NNNNN.parquet` (a new `<gen>`
+  per publish; read the directory as `part-*.parquet`) and deletes the
+  previous generation (only apitap `part-…parquet` names are ever deleted).
+  The live names are never overwritten: a copy failing midway removes what
+  it added and the previous generation stays whole; a previous part that
+  will not delete fails the run, naming it. Readers see both generations
+  for the length of those deletes. A part over 5 GiB is copied in ranges
+  (UploadPartCopy).
 - **Format**: `format=parquet` only for now (ZSTD, same typed encoder as the
   BigQuery lane). `format=csv` returns when an S3-side concat lands.
 - **Modes**: `mode="replace"` only — objects have no upsert. For incremental,

@@ -582,15 +582,100 @@ impl S3Conn {
         Self::check(r, "delete").await.map(|_| ())
     }
 
-    /// Server-side copy (CopyObject, ≤ 5 GiB per object — a per-pipe staging
-    /// part stays well under that at any pipe count we ship).
+    /// Server-side copy. CopyObject takes ≤ 5 GiB; a bigger per-pipe part
+    /// (a large table on few pipes) failed at finalize after the whole load
+    /// (MASTER review M-32), so above the limit the copy is a multipart
+    /// UploadPartCopy in ranges of at most the limit.
     pub(crate) async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+        let limit = copy_part_bytes();
+        let size = self.head_size(src).await?;
+        if size <= limit {
+            return self.copy_one(src, dst).await;
+        }
+        let id = self.create_multipart(dst).await?;
+        let r = async {
+            let mut etags = Vec::new();
+            let (mut at, mut n) = (0u64, 1u32);
+            while at < size {
+                let end = (at + limit).min(size) - 1;
+                etags.push((n, self.upload_part_copy(src, dst, &id, n, at, end).await?));
+                at = end + 1;
+                n += 1;
+            }
+            self.complete_multipart(dst, &id, &etags).await
+        }
+        .await;
+        if r.is_err() {
+            let _ = self.abort_multipart(dst, &id).await;
+        }
+        r
+    }
+
+    /// One `UploadPartCopy` of `src[first..=last]`; returns the part's ETag.
+    async fn upload_part_copy(
+        &self,
+        src: &str,
+        dst: &str,
+        upload_id: &str,
+        part_number: u32,
+        first: u64,
+        last: u64,
+    ) -> Result<String> {
         let uri = self.uri_for(dst);
-        let source = format!(
+        let q = vec![
+            ("partNumber".to_string(), part_number.to_string()),
+            ("uploadId".to_string(), upload_id.to_string()),
+        ];
+        let r = self
+            .request(
+                reqwest::Method::PUT,
+                &uri,
+                &q,
+                Vec::new(),
+                &payload_hash(b""),
+                &[
+                    ("x-amz-copy-source", self.copy_source(src)),
+                    ("x-amz-copy-source-range", format!("bytes={first}-{last}")),
+                ],
+            )
+            .await?;
+        let body = Self::check(r, "upload part copy").await?;
+        if body.contains("<Error>") {
+            return Err(Error::Transfer(format!("s3 upload part copy: {body:.400}")));
+        }
+        xml_tag(&body, "ETag")
+            .map(|e| e.replace("&quot;", "").trim_matches('"').to_string())
+            .ok_or_else(|| Error::Transfer(format!("s3 upload part copy: no ETag in {body:.200}")))
+    }
+
+    /// An object's size, from HEAD.
+    async fn head_size(&self, object: &str) -> Result<u64> {
+        let uri = self.uri_for(object);
+        let r = self
+            .request(reqwest::Method::HEAD, &uri, &[], Vec::new(), &payload_hash(b""), &[])
+            .await?;
+        if !r.status().is_success() {
+            return Err(Error::Transfer(format!("s3 head {object}: {}", r.status())));
+        }
+        r.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| Error::Transfer(format!("s3 head {object}: no Content-Length")))
+    }
+
+    fn copy_source(&self, src: &str) -> String {
+        format!(
             "/{}/{}",
             self.bucket,
             src.split('/').map(enc_seg).collect::<Vec<_>>().join("/")
-        );
+        )
+    }
+
+    /// CopyObject, for objects within the single-copy limit.
+    async fn copy_one(&self, src: &str, dst: &str) -> Result<()> {
+        let uri = self.uri_for(dst);
+        let source = self.copy_source(src);
         let r = self
             .request(
                 reqwest::Method::PUT,
@@ -942,8 +1027,22 @@ impl crate::sink::Sink for S3Sink {
 
     async fn discard(&self) -> Result<()> {
         let mut first_err = None;
-        for p in self.conn.list(&self.staging).await? {
-            if let Err(e) = self.conn.delete(&p).await {
+        // A failed list must not skip the abort and the release below: the
+        // lock would outlive the run and refuse every later one (M-32).
+        match self.conn.list(&self.staging).await {
+            Ok(objs) => {
+                for p in objs {
+                    if let Err(e) = self.conn.delete(&p).await {
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
+            Err(e) => {
+                // This run's part names are its own counter's: delete them by
+                // name, or the staging left behind reads as a live peer.
+                for n in 0..self.next_part.load(Ordering::Relaxed) {
+                    let _ = self.conn.delete(&format!("{}part-{n:05}.parquet", self.staging)).await;
+                }
                 first_err.get_or_insert(e);
             }
         }
@@ -983,33 +1082,99 @@ impl S3Sink {
         }
         let dir = format!("{}{}/", self.conn.prefix, self.bare);
         let stale: Vec<String> = self.conn.list(&dir).await?;
-        let mut fresh = Vec::with_capacity(parts.len());
+        // A NEW generation of names (MASTER review M-32): copying over the
+        // live `part-NNNNN` names one by one left a mixed directory when a
+        // copy failed midway. Now a failed copy removes what it added and the
+        // previous generation stays whole.
+        let gen = part_generation();
+        let mut fresh: Vec<String> = Vec::with_capacity(parts.len());
         for (i, p) in parts.iter().enumerate() {
-            let dst = format!("{dir}part-{i:05}.parquet");
-            self.conn.copy(p, &dst).await?;
+            let dst = format!("{dir}part-{gen}-{i:05}.parquet");
+            if let Err(e) = self.conn.copy(p, &dst).await {
+                for f in &fresh {
+                    let _ = self.conn.delete(f).await;
+                }
+                return Err(e);
+            }
             fresh.push(dst);
         }
-        // Same non-transactional caveat as the GCS sink: readers can see a
-        // mixed directory until the sweep finishes; only OUR part files are
-        // ever deleted.
+        // The previous generation goes now. Readers see both for the length
+        // of these deletes (a directory is not a transaction); a delete that
+        // FAILS leaves duplicate rows for every reader, so it fails the run,
+        // naming them — the next successful run sweeps them too. Only OUR
+        // part files are ever deleted.
+        let mut left = Vec::new();
         for s in stale {
-            if !fresh.contains(&s) && is_part_object(&s) {
-                let _ = self.conn.delete(&s).await;
+            if !fresh.contains(&s) && is_part_object(&s) && self.conn.delete(&s).await.is_err() {
+                left.push(s);
             }
         }
         for p in &parts {
             let _ = self.conn.delete(p).await;
+        }
+        if !left.is_empty() {
+            return Err(stale_parts_left(&dir, &left));
         }
         Ok(())
     }
 }
 
 /// apitap's own part-file names — the ONLY things a stale-sweep may delete.
-fn is_part_object(name: &str) -> bool {
+pub(crate) fn is_part_object(name: &str) -> bool {
     let base = name.rsplit_once('/').map_or(name, |(_, b)| b);
-    base.strip_prefix("part-")
-        .and_then(|r| r.strip_suffix(".parquet"))
-        .is_some_and(|digits| digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit()))
+    let Some(r) = base.strip_prefix("part-").and_then(|r| r.strip_suffix(".parquet")) else {
+        return false;
+    };
+    // `part-NNNNN` (before 0.62) or `part-<generation>-NNNNN`.
+    let (gen, digits) = r.rsplit_once('-').unwrap_or(("", r));
+    digits.len() == 5
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && gen.len() <= 32
+        && gen.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// A new, sortable generation id for one publish's part names: milliseconds
+/// in base 36 plus random bits, so two publishes never share a name.
+pub(crate) fn part_generation() -> String {
+    let ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let rnd = uuid::Uuid::new_v4().as_u128() as u32;
+    format!("{}{}", base36(ms), base36(u64::from(rnd)))
+}
+
+fn base36(mut n: u64) -> String {
+    const D: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(D[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).expect("ascii")
+}
+
+/// The publish landed but some previous parts would not delete: readers see
+/// them beside the new ones, so the run reports it.
+pub(crate) fn stale_parts_left(dir: &str, left: &[String]) -> Error {
+    Error::Transfer(format!(
+        "the new parts are published in {dir}, but {} previous part file(s) could not be \
+         deleted and readers see their rows beside the new ones: {} — delete them by hand; \
+         the next successful run of this table also sweeps them",
+        left.len(),
+        left.join(", ")
+    ))
+}
+
+/// `APITAP_S3_COPY_PART_BYTES`: the single-copy limit (default 5 GiB, the S3
+/// maximum; min 5 MiB, the multipart minimum). Lower only to test the
+/// multipart copy path.
+fn copy_part_bytes() -> u64 {
+    std::env::var("APITAP_S3_COPY_PART_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(5 << 30, |n| n.clamp(5 << 20, 5 << 30))
 }
 
 /// One multipart upload, from create to complete/abort. S3Loader uses one;
@@ -1132,6 +1297,11 @@ mod tests {
     #[test]
     fn stale_sweep_only_touches_our_part_files() {
         assert!(is_part_object("lake/events/part-00003.parquet"));
+        // M-32: a publish writes a new generation of names.
+        let g = part_generation();
+        assert!(is_part_object(&format!("lake/events/part-{g}-00003.parquet")), "{g}");
+        assert_ne!(g, part_generation());
+        assert!(!is_part_object("lake/events/part-Upper-00003.parquet"));
         assert!(!is_part_object("lake/events/part-3.parquet"));
         assert!(!is_part_object("lake/events/users-notes.parquet"));
         assert!(!is_part_object("lake/events/README.md"));

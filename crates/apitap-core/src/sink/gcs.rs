@@ -754,8 +754,21 @@ impl crate::sink::Sink for GcsSink {
 
     async fn discard(&self) -> Result<()> {
         let mut first_err = None;
-        for p in self.conn.list(&self.staging).await? {
-            if let Err(e) = self.conn.delete(&p).await {
+        // A failed list must not skip the release below (M-32).
+        match self.conn.list(&self.staging).await {
+            Ok(objs) => {
+                for p in objs {
+                    if let Err(e) = self.conn.delete(&p).await {
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
+            Err(e) => {
+                // This run's part names are its own counter's: delete them by
+                // name, or the staging left behind reads as a live peer.
+                for n in 0..self.next_part.load(Ordering::Relaxed) {
+                    let _ = self.conn.delete(&format!("{}part-{n:05}.{}", self.staging, self.ext())).await;
+                }
                 first_err.get_or_insert(e);
             }
         }
@@ -811,24 +824,36 @@ impl GcsSink {
             GcsFormat::Parquet => {
                 let dir = format!("{}{}/", self.conn.prefix, self.bare);
                 let stale: Vec<String> = self.conn.list(&dir).await?;
-                let mut fresh = Vec::with_capacity(parts.len());
+                // A new generation of names (MASTER review M-32): a rewrite
+                // failing midway used to leave the live `part-NNNNN` names
+                // half new, half old. Now it removes what it added and the
+                // previous generation stays whole.
+                let gen = crate::sink::s3::part_generation();
+                let mut fresh: Vec<String> = Vec::with_capacity(parts.len());
                 for (i, p) in parts.iter().enumerate() {
-                    let dst = format!("{dir}part-{i:05}.parquet");
-                    self.conn.rewrite(p, &dst).await?;
+                    let dst = format!("{dir}part-{gen}-{i:05}.parquet");
+                    if let Err(e) = self.conn.rewrite(p, &dst).await {
+                        for f in &fresh {
+                            let _ = self.conn.delete(f).await;
+                        }
+                        return Err(e);
+                    }
                     fresh.push(dst);
                 }
-                // Per-object renames aren't a transaction: readers can see a
-                // mixed directory until this finishes (a failure here leaves
-                // the mix until the next successful run — documented). Only
-                // apitap's OWN part files are swept; anything else a user put
-                // in the directory is not ours to delete.
+                // The previous generation goes now; a delete that FAILS
+                // leaves duplicate rows for readers, so it fails the run,
+                // naming them. Only apitap's OWN part files are swept.
+                let mut left = Vec::new();
                 for s in stale {
-                    if !fresh.contains(&s) && is_part_object(&s) {
-                        let _ = self.conn.delete(&s).await;
+                    if !fresh.contains(&s) && is_part_object(&s) && self.conn.delete(&s).await.is_err() {
+                        left.push(s);
                     }
                 }
                 for p in &parts {
                     let _ = self.conn.delete(p).await;
+                }
+                if !left.is_empty() {
+                    return Err(crate::sink::s3::stale_parts_left(&dir, &left));
                 }
                 // A previous format=csv run of this table would otherwise stay
                 // live next to the new parts forever.
@@ -845,10 +870,7 @@ impl GcsSink {
 /// apitap's own part-file names (`part-NNNNN.parquet` under a table dir) —
 /// the ONLY things a stale-sweep may delete.
 fn is_part_object(name: &str) -> bool {
-    let base = name.rsplit_once('/').map_or(name, |(_, b)| b);
-    base.strip_prefix("part-")
-        .and_then(|r| r.strip_suffix(".parquet"))
-        .is_some_and(|digits| digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit()))
+    crate::sink::s3::is_part_object(name)
 }
 
 pub(crate) struct GcsLoader {
