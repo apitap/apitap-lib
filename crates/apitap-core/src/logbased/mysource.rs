@@ -523,7 +523,16 @@ pub(crate) async fn drain_binlog(
             // Wall-clock stop, or a SIGTERM. Either way the position this
             // window reports is the last COMPLETE transaction's, so the
             // window applies whole and the watermark that follows is true.
-            break;
+            //
+            // BETWEEN TRANSACTIONS ONLY (MASTER M-4): a mid-flight break
+            // dropped tx_buf while the stream kept flowing, and the next
+            // window read the transaction's tail without its BEGIN —
+            // committing it and advancing the watermark past the lost head
+            // (about once per 30 s window under steady writes). Mid-flight,
+            // the deadline and SIGTERM defer to the COMMIT.
+            if tx_buf.is_empty() {
+                break;
+            }
         }
         // A bound on the READ itself, not just between reads. The loop's
         // wall-clock deadline and the SIGTERM flag above are both checked

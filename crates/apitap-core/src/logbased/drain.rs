@@ -277,7 +277,16 @@ pub(crate) async fn drain(
             //
             // NOT ^C: SIGINT is left to the interpreter, so Ctrl-C behaves
             // exactly as it always did — see `crate::shutdown`.
-            break;
+            //
+            // BETWEEN TRANSACTIONS ONLY (MASTER M-4): a break mid-flight
+            // dropped tx_buf while the STREAM kept flowing, and the next
+            // window then read the transaction's tail without its BEGIN —
+            // committing it and advancing the watermark and slot past the
+            // lost head. Mid-flight, the deadline and SIGTERM defer to the
+            // commit; the loop top re-checks with tx_buf empty.
+            if tx_buf.is_empty() && in_stream.is_none() {
+                break;
+            }
         }
         // The scanner owns the read half and bounds its own refills with the
         // silence budget — one timer per ~1 MiB refill, not per event (L1b).
