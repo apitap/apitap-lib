@@ -603,8 +603,8 @@ fn cdc_window_budget() -> usize {
 
 /// The FULL per-window budget (no /2, no 24 MiB clamp). For the latency-bound
 /// lanes whose windows do not overlap: BigQuery (each window is a load + MERGE
-/// round-trip, measured to roughly halve wall time) and — since G1.3 — MySQL,
-/// whose apply loop never overlapped yet paid the halved PG budget.
+/// round-trip, measured to roughly halve wall time). MySQL had it too (G1.3)
+/// until its drain and apply began to overlap (MASTER M-61).
 fn cdc_full_window_budget() -> usize {
     env_window_override().unwrap_or_else(window_budget)
 }
@@ -1251,10 +1251,13 @@ async fn run_group_mysql(
             .map(|c| c.source_id.as_str())
             .collect::<Vec<_>>()
             .join("\x1e");
-        // G1.3: the MySQL lane never overlapped its drain and apply, yet it
-        // paid the /2 overlap budget — windows were half the size for no
-        // reason and the per-window costs doubled per change.
-        let budget = cdc_full_window_budget();
+        // The overlap budget. G1.3 gave this lane the FULL budget because its
+        // drain and apply did not overlap — they do now (`run_overlapped`
+        // below, with a window queued in `win_tx`), so a window draining, one
+        // queued and one applying are resident together, each ~3x its byte
+        // count: about 260 MB at the 256 MB cap's 29 MB full budget (MASTER
+        // M-61). The halved budget is what the overlapped Postgres lanes use.
+        let budget = cdc_window_budget();
 
         // Armed for the incremental drain only — the bootstrap branch above returns
         // before reaching here. See `crate::shutdown` and the note in `drain_group`.
