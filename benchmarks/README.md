@@ -645,6 +645,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_ch_profile_limits --> `e2e_ch_profile_limits.py` | a ClickHouse profile with limit/offset/max_result_rows=break cannot shorten a transfer, either direction |
 | <!-- claim: leg.e2e_ch_source_u64 --> `e2e_ch_source_u64.py` | a parallel ClickHouse read on a UInt64 cursor past i64::MAX reads every row |
 | <!-- claim: leg.e2e_my_binlog_format --> `e2e_my_binlog_format.py` | MySQL CDC is exact under binlog_checksum=NONE across a rotate and a TRUNCATE; a STATEMENT-format write to a tracked table is refused, not dropped |
+| <!-- claim: leg.e2e_pg_mixed_case_pk --> `e2e_pg_mixed_case_pk.py` | Postgres CDC of a mixed-case table (beside a lower-case twin) whose PRIMARY KEY has INCLUDE columns is exact |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

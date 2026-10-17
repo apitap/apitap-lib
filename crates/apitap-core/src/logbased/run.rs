@@ -2353,11 +2353,15 @@ fn db_err(e: sqlx::Error) -> Error {
 }
 
 async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String, bool)> {
+    // Quoted part by part — the spelling the bootstrap's bulk read uses
+    // (`quote_ident_path`). Raw, `public.MyTable` case-folded to
+    // `public.mytable`: the drain tracked a different table than the
+    // bootstrap copied, or failed (MASTER M-60).
     let row: (String, String, String) = sqlx::query_as(
         "SELECT n.nspname, c.relname, c.relkind::text FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1::regclass",
     )
-    .bind(table)
+    .bind(crate::dialect::postgres::quote_ident_path(table))
     .fetch_one(src)
     .await
     .map_err(|e| Error::InvalidInput(format!("log_based: table '{table}': {e}")))?;
@@ -2370,14 +2374,24 @@ async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String, boo
     Ok((row.0, row.1, row.2 == "p"))
 }
 
+/// The source table's primary-key columns, in key order.
+///
+/// `qualified` is the catalog's own `schema.relname`, unquoted: cast straight
+/// to regclass it case-folds, so `public.MyTable` failed or resolved to a
+/// different `public.mytable`. It is quoted part by part first. And only the
+/// KEY attributes count: `indkey` also lists a PRIMARY KEY's INCLUDE columns,
+/// which were read as key columns (MASTER M-60). `indkey` is an int2vector,
+/// subscripted from 0, so the key attributes are positions below
+/// `indnkeyatts`.
 async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT a.attname FROM pg_index i \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
          WHERE i.indrelid = $1::regclass AND i.indisprimary \
+           AND array_position(i.indkey, a.attnum) < i.indnkeyatts \
          ORDER BY array_position(i.indkey, a.attnum)",
     )
-    .bind(qualified)
+    .bind(quote_table(qualified))
     .fetch_all(src)
     .await
     .map_err(db_err)?;
