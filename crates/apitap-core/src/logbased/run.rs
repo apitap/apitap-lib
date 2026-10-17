@@ -633,6 +633,13 @@ pub(crate) async fn run_many(
     opts: &TransferOptions,
 ) -> Result<MultiReport> {
     let started = std::time::Instant::now();
+    if tables.is_empty() {
+        // An empty list reached slots= arithmetic (`div_ceil(0)`) and
+        // panicked instead of saying what was wrong.
+        return Err(Error::InvalidInput(
+            "log_based: the tables list is empty".into(),
+        ));
+    }
     if opts.dest_table.is_some() {
         return Err(Error::InvalidInput(
             "dest_table applies to single-table transfers — multi-table runs \
