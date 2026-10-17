@@ -246,6 +246,14 @@ mod tests {
     }
 
     #[test]
+    fn numeric_negative_ndigits_is_an_error_not_zero() {
+        // T5: ndigits=-1, weight 0, sign +, dscale 0 — and a digit group that
+        // a wrapped length check would never have looked at.
+        let f = [0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert!(numeric_to_scaled_i128_raw(&f).is_err());
+    }
+
+    #[test]
     fn numeric_fast_path_matches_general_path() {
         // Grid over every header field the fast path dispatches on, with digit
         // patterns covering 0, 1, and the max group 9999. Cases land on both sides
@@ -456,6 +464,11 @@ fn numeric_to_scaled_i128_raw_general(f: &[u8]) -> Result<(i128, i32)> {
         return Err(bad("numeric"));
     }
     let ndigits = i16::from_be_bytes(f[0..2].try_into().unwrap()) as i32;
+    if ndigits < 0 {
+        // Cast to usize it wrapped past the length check below, the digit
+        // loop ran zero times, and a damaged value decoded as 0 (T5).
+        return Err(bad("numeric negative ndigits"));
+    }
     let weight = i16::from_be_bytes(f[2..4].try_into().unwrap()) as i32;
     let sign = u16::from_be_bytes(f[4..6].try_into().unwrap());
     let dscale = u16::from_be_bytes(f[6..8].try_into().unwrap()) as i32;
