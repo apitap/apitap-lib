@@ -132,7 +132,9 @@ pub(crate) async fn control_pool(src_url: &str) -> Result<MySqlPool> {
         .max_connections(2)
         .connect(&url)
         .await
-        .map_err(|e| Error::Transfer(format!("log_based: mysql source connect: {e}")))
+        // Diagnosed against the user's URL, like the bulk lane's connect: the
+        // reserved-character and auth-plugin hints apply here too (M-42).
+        .map_err(|e| crate::urlerr::connect_err("log_based: mysql source connect", src_url, e))
 }
 
 /// First run: capture the coordinate, then full-load every member.

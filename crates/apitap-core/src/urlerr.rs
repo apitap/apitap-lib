@@ -153,7 +153,18 @@ pub(crate) fn bad_url(what: &str, url: &str, e: impl Display) -> Error {
 /// here too, and telling those users to check their percent-encoding would send
 /// them down a road with nothing at the end of it.
 pub(crate) fn connect_err(what: &str, url: &str, e: impl Display) -> Error {
-    let plain = format!("{what}: {e}");
+    let mut plain = format!("{what}: {e}");
+    // A MySQL user on an auth plugin neither apitap client speaks (MariaDB
+    // ed25519/parsec, sha256_password): the driver's "unknown authentication
+    // plugin" said what failed but not what to do (MASTER M-42).
+    if plain.contains("unknown authentication plugin") {
+        plain.push_str(
+            "\n  apitap's MySQL clients speak mysql_native_password and caching_sha2_password; \
+             give this user one of them, e.g. MariaDB: ALTER USER u IDENTIFIED VIA \
+             mysql_native_password USING PASSWORD('…'); MySQL: ALTER USER u IDENTIFIED WITH \
+             caching_sha2_password BY '…'",
+        );
+    }
     let Some((_, rest)) = url.split_once("://") else {
         return Error::Connect(plain);
     };

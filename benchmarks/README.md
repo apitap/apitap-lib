@@ -650,6 +650,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_ice_toast_refetch --> `e2e_ice_toast_refetch.py` | an Iceberg CDC drain refetches TOAST holes through the source's primary key: no sequential scan, every body intact |
 | <!-- claim: leg.e2e_my_require_pk --> `e2e_my_require_pk.py` | a MySQL destination with sql_require_primary_key=ON takes replace, append (keyed and key-less) and CDC |
 | <!-- claim: leg.e2e_pg_other_slots --> `e2e_pg_other_slots.py` | a run names every other inactive apitap slot that publishes its tables, with what it retains and the statement that drops it |
+| <!-- claim: leg.e2e_my_auth_plugin --> `e2e_my_auth_plugin.py` | a MySQL user on an auth plugin apitap does not speak (MariaDB ed25519) is told which plugins work and the ALTER USER that switches |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

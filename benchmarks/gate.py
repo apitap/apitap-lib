@@ -270,6 +270,7 @@ LEGS = [
     leg("e2e_ice_toast_refetch.py",   "an Iceberg CDC drain refetches TOAST holes through the primary key", {"iceberg"}),
     leg("e2e_my_require_pk.py",       "a MySQL destination with sql_require_primary_key=ON takes every lane"),
     leg("e2e_pg_other_slots.py",     "a run names the other inactive apitap slots holding WAL for its tables"),
+    leg("e2e_my_auth_plugin.py",     "a MySQL user on an unspoken auth plugin is told how to fix it", {"mariadb"}),
 ]
 
 
