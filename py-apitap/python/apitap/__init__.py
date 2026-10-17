@@ -215,14 +215,17 @@ class Reader:
                 "f32": pl.Float32, "f64": pl.Float64, "bool": pl.Boolean,
                 "date": pl.Date, "ts:utc": pl.Datetime("us", "UTC"),
                 "ts:naive": pl.Datetime("us"), "str": pl.String,
-                "bin": pl.Binary,
+                "text": pl.String, "bin": pl.Binary,
             }[tag]
 
         # Cheap schema-only probe — the engine starts LATER, inside the
         # collect, once polars has told us which columns the query needs.
-        schema = pl.Schema(
-            {name: dtype(tag) for name, tag, _ in _read_schema(src, table)}
-        )
+        probed = _read_schema(src, table)
+        schema = pl.Schema({name: dtype(tag) for name, tag, _ in probed})
+        # Strings the reader made out of non-text columns (json, arrays,
+        # time, …): the server would judge a pushed predicate on the native
+        # value, not on the string polars sees (MASTER M-46).
+        text_cols = {name for name, tag, _ in probed if tag == "text"}
 
         str_cols = {
             n for n, dt in schema.items() if dt in (pl.String, pl.Binary)
@@ -239,9 +242,19 @@ class Reader:
             n for n, dt in schema.items() if dt in (pl.Float32, pl.Float16)
         }
         bool_cols = {n for n, dt in schema.items() if dt == pl.Boolean}
+        # Arithmetic on these wraps in polars at the column's width and
+        # widens on the server: `i16_col + 1 < 0` keeps 32767 in polars, the
+        # server drops it (MASTER M-46). Int64 overflow is an error on both
+        # servers, which the fallback below absorbs.
+        narrow_cols = {
+            n for n, dt in schema.items()
+            if dt in (pl.Int8, pl.Int16, pl.Int32, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
+        }
         is_my = src.split("://", 1)[0].lower().startswith("mysql")
 
         def source(with_columns, predicate, n_rows, batch_size):
+            import itertools
+
             import pyarrow as pa
             cols = list(with_columns) if with_columns is not None else None
             # FILTER pushdown: a conservative subset of the predicate is
@@ -252,18 +265,35 @@ class Reader:
             where = (
                 _predicate_sql(
                     predicate, set(schema.names()), str_cols, float_cols,
-                    float32_cols, bool_cols, is_my
+                    float32_cols, bool_cols, is_my, text_cols, narrow_cols
                 )
                 if predicate is not None
                 else None
             )
-            native = _read(src, table, cursor=cursor, parallel=parallel,
-                           query=query, materialize=False, columns=cols,
-                           push_where=where)
+
+            def batches(push):
+                native = _read(src, table, cursor=cursor, parallel=parallel,
+                               query=query, materialize=False, columns=cols,
+                               push_where=push)
+                return iter(pa.RecordBatchReader.from_stream(native))
+
+            # A pushed predicate the server rejects (a type it will not
+            # compare, an overflow) used to fail the read; the pushdown is
+            # an optimization, so the read starts over without it. Only
+            # before the first batch — after one is out, a retry would
+            # repeat rows (MASTER M-46).
+            try:
+                it = batches(where)
+                first = next(it, None)
+            except Exception:
+                if where is None:
+                    raise
+                it = batches(None)
+                first = next(it, None)
             taken = 0
             # The engine emits exactly the requested columns in the
             # requested order — no per-batch select needed.
-            for batch in pa.RecordBatchReader.from_stream(native):
+            for batch in itertools.chain([first] if first is not None else [], it):
                 df = pl.from_arrow(batch)
                 if predicate is not None:
                     df = df.filter(predicate)
@@ -342,7 +372,8 @@ class Reader:
         return rows
 
 
-def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_cols, is_my):
+def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_cols, is_my,
+                   text_cols=frozenset(), narrow_cols=frozenset()):
     """Render a polars predicate as a SQL WHERE fragment, or None.
 
     Only a conservative subset crosses the wire: arithmetic (+ - * %) and
@@ -405,6 +436,10 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_
                 if isinstance(x, bool) or not isinstance(x, int):
                     raise ValueError("non-int payload")
                 return str(x), False, False, False
+            if t in ("Float32", "Float16"):
+                # polars compares at f32; the server widens the literal to
+                # double and compares there (MASTER M-46).
+                raise ValueError("float32 literal")
             if t in FLOAT_T:
                 if not isinstance(x, (int, float)) or isinstance(x, bool):
                     raise ValueError("non-float payload")
@@ -435,7 +470,7 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_
         raise ValueError(f"literal {v!r}")
 
     def walk(n):
-        # -> (sql, stringy, floaty, booly)
+        # -> (sql, stringy, floaty, booly, narrow)
         if not isinstance(n, dict) or len(n) != 1:
             raise ValueError(f"node {n!r}")
         (k, v), = n.items()
@@ -447,10 +482,14 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_
                 # Float32 columns compare at different precisions on the two
                 # sides (review R2-8): never push.
                 raise ValueError("float32 column")
+            if name in text_cols:
+                # json/arrays/time/… read as text: the server compares the
+                # native value, polars the string (MASTER M-46).
+                raise ValueError("column read as text")
             return (quote(name), name in str_cols, name in float_cols,
-                    name in bool_cols)
+                    name in bool_cols, name in narrow_cols)
         if k == "Literal":
-            return lit(v)
+            return lit(v) + (False,)
         if k == "Cast":
             # Elide ONLY the widening casts polars wraps around literals.
             # A cast over a column changes the values being compared —
@@ -461,6 +500,16 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_
             if not (isinstance(inner, dict) and set(inner) == {"Literal"}):
                 raise ValueError("cast over non-literal")
             dt = json.dumps(v.get("dtype", ""))
+            sql, stringy, floaty, booly = lit(inner["Literal"])
+            if booly:
+                # A cast of a Boolean literal to a number is 1/0 in polars
+                # and TRUE/FALSE on the server (MASTER M-46).
+                raise ValueError("cast over a boolean literal")
+            if floaty and "Float" not in dt and not float(sql).is_integer():
+                # polars casts 3.7 to an int as 3; eliding the cast
+                # compared against 3.7 and dropped the rows equal to 3
+                # (MASTER M-46).
+                raise ValueError("non-integral literal cast to an int")
             if "Float32" in dt or "Float16" in dt:
                 # A Float32 literal cast must NOT be elided: polars compares
                 # the literal widened, the server at the column's precision,
@@ -474,8 +523,8 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_
             op = v["op"]
             if not isinstance(op, str):
                 raise ValueError(f"op shape {op!r}")
-            left, ls, lf, lb = walk(v["left"])
-            right, rs, rf, rb = walk(v["right"])
+            left, ls, lf, lb, ln = walk(v["left"])
+            right, rs, rf, rb, rn = walk(v["right"])
             floaty = lf or rf
             if op in LOGIC:
                 # `&`/`|` on integers arrive as the same ops (review R2-8):
@@ -483,22 +532,24 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_
                 # type error on Postgres. Boolean operands only.
                 if not (lb and rb):
                     raise ValueError("logical op on non-boolean operands")
-                return f"({left} {LOGIC[op]} {right})", False, False, True
+                return f"({left} {LOGIC[op]} {right})", False, False, True, False
             if op in CMP:
                 if (ls or rs) and op not in STR_OK:
                     raise ValueError("string range comparison")
                 if op == "NotEq" and lf and rf:
                     raise ValueError("float != float (NaN semantics differ)")
-                return f"({left} {CMP[op]} {right})", False, False, True
+                return f"({left} {CMP[op]} {right})", False, False, True, False
             if op in ARITH:
                 if ls or rs:
                     raise ValueError("string arithmetic")
-                return f"({left} {ARITH[op]} {right})", False, floaty, False
+                if ln or rn:
+                    raise ValueError("arithmetic on a narrow int column")
+                return f"({left} {ARITH[op]} {right})", False, floaty, False, False
             raise ValueError(f"op {op!r}")
         raise ValueError(f"node kind {k!r}")
 
     try:
-        sql, stringy, _, _ = walk(ir)
+        sql, stringy, _, _, _ = walk(ir)
         return None if stringy else sql
     except Exception:
         return None

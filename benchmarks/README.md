@@ -652,6 +652,8 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_other_slots --> `e2e_pg_other_slots.py` | a run names every other inactive apitap slot that publishes its tables, with what it retains and the statement that drops it |
 | <!-- claim: leg.e2e_my_auth_plugin --> `e2e_my_auth_plugin.py` | a MySQL user on an auth plugin apitap does not speak (MariaDB ed25519) is told which plugins work and the ALTER USER that switches |
 | <!-- claim: leg.e2e_my_lower_case_names --> `e2e_my_lower_case_names.py` | MySQL CDC on a lower_case_table_names=1 server follows a table named in mixed case |
+| <!-- claim: leg.e2e_read_pushdown.pg --> `e2e_read_pushdown.py pg` | read().lazy() pushdown on Postgres returns exactly the rows polars keeps (narrow-int arithmetic, f32, casts, text-read columns, a server-rejected predicate) |
+| <!-- claim: leg.e2e_read_pushdown.my --> `e2e_read_pushdown.py my` | the same on MySQL (json read as text included) |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

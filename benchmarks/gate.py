@@ -272,6 +272,8 @@ LEGS = [
     leg("e2e_pg_other_slots.py",     "a run names the other inactive apitap slots holding WAL for its tables"),
     leg("e2e_my_auth_plugin.py",     "a MySQL user on an unspoken auth plugin is told how to fix it", {"mariadb"}),
     leg("e2e_my_lower_case_names.py", "MySQL CDC with lower_case_table_names=1 follows a mixed-case table"),
+    leg("e2e_read_pushdown.py",      "read().lazy() pushdown returns exactly the rows polars keeps, Postgres", argv=["pg"]),
+    leg("e2e_read_pushdown.py",      "read().lazy() pushdown returns exactly the rows polars keeps, MySQL", argv=["my"]),
 ]
 
 

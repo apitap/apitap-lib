@@ -444,8 +444,8 @@ fn read(
 }
 
 /// Schema-only probe: (name, dtype-tag, nullable) per column, no workers
-/// started. Tags: i16 i32 i64 f32 f64 bool date ts:utc ts:naive str bin
-/// decimal:<p>:<s> — the Python wrapper maps them onto polars dtypes for
+/// started. Tags: i16 i32 i64 f32 f64 bool date ts:utc ts:naive str text bin
+/// decimal:<p>:<s> (`text` = read as a string from a non-text column) — the Python wrapper maps them onto polars dtypes for
 /// the lazy plugin's up-front schema registration.
 #[pyfunction]
 fn read_schema(
@@ -473,6 +473,9 @@ fn read_schema(
                 K::Date32 => "date".to_string(),
                 K::TimestampUtc => "ts:utc".to_string(),
                 K::TimestampNaive => "ts:naive".to_string(),
+                // `text`: a string the reader made out of a non-text column
+                // (json, arrays, time, …) — polars String, never pushed down.
+                K::Utf8 if f.rewritten => "text".to_string(),
                 K::Utf8 => "str".to_string(),
                 K::Binary => "bin".to_string(),
             };

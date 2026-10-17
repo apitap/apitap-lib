@@ -67,25 +67,81 @@ fn read_dialect(src_url: &str) -> Result<ReadDialect> {
 /// The lazy plugin registers this schema up front, then starts the real
 /// read later with the query's projection pushed down.
 pub(crate) async fn schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>> {
-    match read_dialect(src_url)? {
-        ReadDialect::Pg => schema_with(PgSource::connect(src_url, 1).await?, table).await,
-        ReadDialect::My => schema_with(MySqlSource::connect(src_url, 1).await?, table).await,
+    let dialect = read_dialect(src_url)?;
+    match dialect {
+        ReadDialect::Pg => schema_with(PgSource::connect(src_url, 1).await?, table, dialect).await,
+        ReadDialect::My => {
+            schema_with(MySqlSource::connect(src_url, 1).await?, table, dialect).await
+        }
     }
 }
 
-async fn schema_with<S: Source>(src: S, table: &str) -> Result<Vec<ArrowField>> {
+/// The schema the read will deliver — decided by `column_kind`, the same
+/// rule `start` applies. This probe used to take `arrow_kind` alone, so a
+/// Postgres column the reader casts to text (time, an unconstrained
+/// NUMERIC, …) was announced as its native type to the lazy frame.
+async fn schema_with<S: Source>(
+    src: S,
+    table: &str,
+    dialect: ReadDialect,
+) -> Result<Vec<ArrowField>> {
     let plan = src.probe(table).await?;
     let lane = src.plan_lane(&plan, WireFormat::PgCopyBinary);
     Ok(lane
         .cols
         .iter()
         .zip(plan.cols.iter())
-        .map(|(lc, pc)| ArrowField {
-            name: pc.name.clone(),
-            kind: arrow_kind(&lc.delivered).unwrap_or(ArrowKind::Utf8),
-            nullable: pc.nullable,
+        .map(|(lc, pc)| {
+            let kind = column_kind(dialect, lc, pc);
+            ArrowField {
+                name: pc.name.clone(),
+                kind: kind.unwrap_or(ArrowKind::Utf8),
+                nullable: pc.nullable,
+                rewritten: read_as_text(kind, &pc.udt),
+            }
         })
         .collect())
+}
+
+/// The reader hands this column over as a string that is NOT the column's
+/// own value: cast to text (`kind` None), or a Utf8 column whose source type
+/// is not plain text (MySQL json arrives as UTF-8 bytes but compares as
+/// JSON). A pushed-down predicate on it would be judged by the server on the
+/// native value (MASTER M-46).
+fn read_as_text(kind: Option<ArrowKind>, udt: &str) -> bool {
+    match kind {
+        None => true,
+        Some(ArrowKind::Utf8) => !matches!(
+            udt.to_ascii_lowercase().as_str(),
+            "text"
+                | "varchar"
+                | "bpchar"
+                | "name"
+                | "char"
+                | "tinytext"
+                | "mediumtext"
+                | "longtext"
+        ),
+        Some(_) => false,
+    }
+}
+
+/// A column's Arrow kind, or `None` when the reader delivers it as text
+/// instead (the caller rewrites the SELECT or the udt). Postgres ships raw
+/// COPY BINARY, so only the udts the Arrow builder decodes from send format
+/// keep their kind; everything else (time, interval, inet, arrays, domains,
+/// enums, unconstrained NUMERIC, …) would put send-format bytes into a Utf8
+/// column (MASTER review M-8 / M-45).
+fn column_kind(
+    dialect: ReadDialect,
+    lc: &crate::plan::LaneCol,
+    pc: &crate::plan::ColumnPlan,
+) -> Option<ArrowKind> {
+    let native = match dialect {
+        ReadDialect::Pg => pg_send_decodable(&pc.udt, pc.precision),
+        ReadDialect::My => true,
+    };
+    arrow_kind(&lc.delivered).filter(|_| native)
 }
 
 pub(crate) async fn start(
@@ -232,16 +288,9 @@ async fn plan_read<S: Source>(
     let mut kinds = Vec::with_capacity(lane.cols.len());
     let mut schema = Vec::with_capacity(lane.cols.len());
     for (lc, pc) in lane.cols.iter_mut().zip(plan.cols.iter_mut()) {
-        // Postgres ships raw COPY BINARY: only the udts the Arrow builder
-        // decodes from send format may skip the cast. Everything else
-        // (time, interval, inet, arrays, domains, enums, unconstrained
-        // NUMERIC, …) would put send-format bytes into a Utf8 column
-        // (MASTER review M-8 / M-45).
-        let native = match dialect {
-            ReadDialect::Pg => pg_send_decodable(&pc.udt, pc.precision),
-            ReadDialect::My => true,
-        };
-        let kind = match arrow_kind(&lc.delivered).filter(|_| native) {
+        let native_kind = column_kind(dialect, lc, pc);
+        let rewritten = read_as_text(native_kind, &pc.udt);
+        let kind = match native_kind {
             Some(k) => k,
             None => {
                 match dialect {
@@ -259,7 +308,12 @@ async fn plan_read<S: Source>(
             }
         };
         kinds.push(kind);
-        schema.push(ArrowField { name: pc.name.clone(), kind, nullable: pc.nullable });
+        schema.push(ArrowField {
+            name: pc.name.clone(),
+            kind,
+            nullable: pc.nullable,
+            rewritten,
+        });
     }
 
     let want = if parallel > 1 { parallel * 6 } else { 1 };

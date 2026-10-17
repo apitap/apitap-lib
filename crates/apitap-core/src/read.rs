@@ -42,6 +42,11 @@ pub struct ArrowField {
     pub name: String,
     pub kind: ArrowKind,
     pub nullable: bool,
+    /// Read as TEXT although the source column is not text (json, arrays,
+    /// enums, time, unconstrained numeric, …): a predicate on it compares
+    /// the server's native value, not the string the reader sees, so the
+    /// lazy pushdown must not cross the wire with it (MASTER M-46).
+    pub rewritten: bool,
 }
 
 /// The running read: a schema and a pull side. `next_batch` blocks the
