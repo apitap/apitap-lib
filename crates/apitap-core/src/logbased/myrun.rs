@@ -86,7 +86,25 @@ pub(crate) async fn resolve(
             Some((d, b)) => (d.to_string(), b.to_string()),
             None => (default_db.to_string(), t.clone()),
         };
-        let qualified = format!("{db}.{bare}");
+        // The binlog's TABLE_MAP names a table as the SERVER spells it, and
+        // with lower_case_table_names=1 that is lower case: tracked as the
+        // user typed it (`bench.Orders`), the table never matched and the
+        // drain applied zero changes, forever (MASTER M-44). The catalog's
+        // own spelling is the one the binlog uses. The state identity
+        // (`source_id`) keeps the user's spelling, so nothing moves on disk.
+        let canonical: Option<(String, String)> = sqlx::query_as(
+            "SELECT CAST(table_schema AS CHAR), CAST(table_name AS CHAR) FROM information_schema.tables \
+             WHERE table_schema = ? AND table_name = ?",
+        )
+        .bind(&db)
+        .bind(&bare)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based: resolve {db}.{bare}: {e}")))?;
+        let qualified = match &canonical {
+            Some((d, b)) => format!("{d}.{b}"),
+            None => format!("{db}.{bare}"),
+        };
         let sc = fetch_schema(pool, &db, &bare).await?;
         let pk_cols: Vec<String> = sc
             .names
