@@ -485,6 +485,21 @@ impl PgSink {
             let parts = resolve_parts(&self.pool, &self.bare).await?;
             self.dest_key = parts.label();
             self.schema = parts.schema;
+            // The tables themselves go there too. Left unqualified they
+            // followed search_path while the guard, lease and state used the
+            // resolved schema: with search_path "$user", public and the table
+            // in public, staging was created in "$user", a replace dropped
+            // public.t, and the table moved schemas (MASTER M-19).
+            let staging_bare = crate::naming::artifact_ident_run(
+                &self.bare,
+                crate::naming::Artifact::Staging,
+                crate::naming::PG_IDENT_MAX,
+                &self.run,
+            );
+            let q = |t: &str| format!("{}.{}", quote_ident(&self.schema), quote_ident(t));
+            self.final_t = q(&self.bare);
+            self.staging_t = q(&staging_bare);
+            self.copy_in_sql = format!("COPY {} FROM STDIN (FORMAT binary)", self.staging_t);
         }
         self.resolved = true;
         Ok(())
@@ -937,11 +952,12 @@ impl crate::sink::Sink for PgSink {
             .iter()
             .find(|c| c.name == cursor)
             .map(|c| c.udt.clone());
-        let exists = self.final_exists().await?;
         // An unqualified dest name follows search_path — resolve the REAL schema so
-        // the state table and its keys land next to the actual data.
-        // The same resolution the CDC lane uses, and `prepare` asks for it too.
+        // the state table and its keys land next to the actual data, and ask
+        // whether the table exists THERE. The same resolution the CDC lane
+        // uses, and `prepare` asks for it too.
         self.resolve_schema().await?;
+        let exists = self.final_exists().await?;
         self.ensure_state_table().await?;
         if !exists {
             if mode == Mode::Merge {

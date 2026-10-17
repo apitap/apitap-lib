@@ -258,6 +258,7 @@ LEGS = [
     leg("e2e_my_partial_dates.py", "a MySQL/MariaDB partial date is refused by the bulk load", {"mariadb"}),
     leg("e2e_ch_alter_type.py",    "a column that changes number class mid-CDC never lands as reinterpreted bits"),
     leg("e2e_my_sink_warnings.py",    "a MySQL destination never publishes rows LOAD DATA dropped or changed"),
+    leg("e2e_pg_search_path.py",      "an unqualified Postgres destination stays in the schema it lives in"),
 ]
 
 
