@@ -536,27 +536,60 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             Ok(out)
         }
         MT_TIME2 => {
+            // The integer part and the fraction are ONE biased number, not
+            // two fields: MySQL's my_time_packed_from_binary. The integer
+            // part (hhhhhhhhhh mmmmmm ssssss) is biased by 0x800000; a
+            // negative value with a fraction borrows one second, its
+            // fraction being the complement (fsp 1-4); at fsp 5-6 all six
+            // bytes are one 48-bit number biased by 0x800000000000. Decoding
+            // the two halves separately turned -00:00:01.5 into
+            // "-00:00:02.D" and -00:00:00.000001 into bytes that are not
+            // even UTF-8 (P2-10, reproduced on MySQL 8). Before that, masking
+            // the sign bit away had turned -01:00:00 into 1023:00:00.
             let b = r.take(3)?;
-            let packed = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-            // TIME2 is stored biased by 0x800000: the top bit is the SIGN, and
-            // a negative value is the complement of its magnitude. Masking the
-            // bit away and stopping there turned -01:00:00 into 1023:00:00 and
-            // -00:00:01 into 1023:63:63 — values that are not even valid
-            // clock readings, which is how obvious the bug was once measured.
-            let negative = packed & 0x80_0000 == 0;
-            let v = if negative {
-                (0x80_0000u32.wrapping_sub(packed)) & 0x7F_FFFF
-            } else {
-                packed & 0x7F_FFFF
+            let int = (((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32) as i64;
+            let fsp = c.meta as u8;
+            let packed: i64 = match fsp {
+                0 => (int - 0x80_0000) << 24,
+                1 | 2 => {
+                    let (mut ip, mut fr) = (int - 0x80_0000, r.u8()? as i64);
+                    if ip < 0 && fr != 0 {
+                        ip += 1;
+                        fr -= 0x100;
+                    }
+                    (ip << 24) + fr * 10_000
+                }
+                3 | 4 => {
+                    let f = r.take(2)?;
+                    let (mut ip, mut fr) =
+                        (int - 0x80_0000, u16::from_be_bytes([f[0], f[1]]) as i64);
+                    if ip < 0 && fr != 0 {
+                        ip += 1;
+                        fr -= 0x1_0000;
+                    }
+                    (ip << 24) + fr * 100
+                }
+                _ => {
+                    let f = r.take(3)?;
+                    let whole =
+                        (int << 24) | ((f[0] as i64) << 16) | ((f[1] as i64) << 8) | f[2] as i64;
+                    whole - 0x8000_0000_0000
+                }
             };
+            let negative = packed < 0;
+            let a = packed.unsigned_abs();
+            let v = (a >> 24) as u32;
+            let frac = (a & 0xFF_FFFF) as u32;
+            if frac > 999_999 {
+                return Err(bad("TIME2 fraction out of range"));
+            }
             let h = (v >> 12) & 0x3FF;
             let mi = (v >> 6) & 0x3F;
             let sec = v & 0x3F;
-            let frac = read_frac(r, c.meta as u8)?;
             let mut out = Vec::with_capacity(18);
             // A TIME is a signed interval, not a clock time: MySQL's range is
             // -838:59:59 to 838:59:59, and the sign is part of the value.
-            if negative && (h | mi | sec | frac as u32) != 0 {
+            if negative && a != 0 {
                 out.push(b'-');
             }
             if h < 100 {

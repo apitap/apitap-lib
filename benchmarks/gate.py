@@ -274,6 +274,8 @@ LEGS = [
     leg("e2e_my_lower_case_names.py", "MySQL CDC with lower_case_table_names=1 follows a mixed-case table"),
     leg("e2e_read_pushdown.py",      "read().lazy() pushdown returns exactly the rows polars keeps, Postgres", argv=["pg"]),
     leg("e2e_read_pushdown.py",      "read().lazy() pushdown returns exactly the rows polars keeps, MySQL", argv=["my"]),
+    leg("e2e_my_time_fraction.py",   "MySQL CDC carries negative fractional TIME as the server holds it", argv=["my"]),
+    leg("e2e_my_time_fraction.py",   "MariaDB CDC carries negative fractional TIME as the server holds it", {"mariadb"}, ["maria"]),
 ]
 
 
