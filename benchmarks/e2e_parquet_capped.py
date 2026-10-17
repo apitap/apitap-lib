@@ -59,7 +59,9 @@ CELLS = [
     ("256m", "0.5", 2, None),
 ]
 PEAK_FRACTION = 0.90
-PART = re.compile(r"/part-\d{5}\.parquet$")
+# Since M-32 a publish writes generation-named parts (part-<gen>-00000.parquet)
+# so it never overwrites a live one; the old bare part-00000 name still counts.
+PART = re.compile(r"/part-(?:[a-z0-9]+-)?\d{5}\.parquet$")
 PLAN = re.compile(r"\[plan\] chunk=(\d+)KiB row_group=(\d+)MiB pipes=(\d+)")
 
 
