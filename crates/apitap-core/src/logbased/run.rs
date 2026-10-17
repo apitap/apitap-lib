@@ -1450,6 +1450,12 @@ async fn bootstrap_group(
             .map_err(db_err)?;
     }
 
+    // A bootstrap is where a slot under a NEW name is born — after a
+    // destination, group or slots= change — so this is where the one it
+    // replaces is most likely to be left behind (MASTER M-23).
+    let tracked: Vec<String> = ctxs.iter().map(|c| c.qualified.clone()).collect();
+    other_slots_report(src, slot, &tracked).await;
+
     let mut ws = Walsender::connect(src_url).await?;
     let rows = ws
         .simple_query(&format!(
@@ -1606,6 +1612,8 @@ async fn drain_group(
     // Refusing would be wrong: a big backlog is exactly when the drain MUST
     // run. Silence would also be wrong, which is what this used to be.
     slot_wal_report(src, slot).await;
+    let tracked: Vec<String> = ctxs.iter().map(|c| c.qualified.clone()).collect();
+    other_slots_report(src, slot, &tracked).await;
 
     // PG 13+ reports a slot's WAL retention state through `wal_status`; `lost`
     // means Postgres already removed the WAL the drain needed
@@ -2577,6 +2585,52 @@ fn window_max_secs() -> u64 {
         .unwrap_or(3600)
 }
 
+/// Inactive apitap slots OTHER than this run's that publish one of its tables.
+///
+/// A slot's name follows its identity — the destination, the group's
+/// membership, `slots=N`, and pre-0.59 releases spelled it differently — so
+/// a change of any of those starts a new slot and leaves the old one holding
+/// WAL until the source's disk fills, with nothing pointing at it (MASTER
+/// M-23). Such a slot is NOT dropped here: another destination of the same
+/// table owns a slot that looks exactly the same from the source. It is
+/// named, with what it retains and the statement that drops it, every run.
+async fn other_slots_report(src: &sqlx::PgPool, slot: &str, tracked: &[String]) {
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT s.slot_name, pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint \
+         FROM pg_replication_slots s \
+         WHERE s.slot_name LIKE 'apitap\\_%' AND s.slot_name <> $1 AND NOT s.active \
+           AND EXISTS (SELECT 1 FROM pg_publication_tables p \
+                       WHERE p.pubname = s.slot_name || '_pub' \
+                         AND p.schemaname || '.' || p.tablename = ANY($2)) \
+         ORDER BY 1",
+    )
+    .bind(slot)
+    .bind(tracked)
+    .fetch_all(src)
+    .await
+    .unwrap_or_default();
+    for (name, bytes) in rows {
+        let bytes = bytes.unwrap_or(0).max(0) as u64;
+        crate::progress::gauge(
+            "slot.other",
+            &[
+                ("slot", name.clone()),
+                ("retained_bytes", bytes.to_string()),
+                ("ours", slot.to_string()),
+            ],
+        );
+        crate::progress::note(&format!(
+            "slot {name} also publishes this run's tables and is inactive, retaining {} of \
+             WAL. If no other apitap destination of these tables uses it — it may be the \
+             one this run used before a destination, group or slots= change — drop it: \
+             SELECT pg_drop_replication_slot('{name}'); DROP PUBLICATION {name}_pub;",
+            human_bytes(bytes)
+        ));
+    }
+}
+
+/// How much WAL this run's slot is holding on the source, as a gauge every
+/// run and a warning past `APITAP_SLOT_WAL_WARN`. Best-effort: a source role
 /// without permission to read `pg_replication_slots` must not fail a transfer
 /// over a diagnostic.
 async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
