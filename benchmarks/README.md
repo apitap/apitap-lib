@@ -639,6 +639,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_ch_alter_type --> `e2e_ch_alter_type.py` | a source column that changes number class mid-CDC (int8 → float8) never lands in ClickHouse as reinterpreted bits |
 | <!-- claim: leg.e2e_my_sink_warnings --> `e2e_my_sink_warnings.py` | a MySQL destination never publishes rows LOAD DATA silently dropped or changed: case/accent-distinct text keys all land, a timestamptz 'infinity' is refused, never 0000-00-00 |
 | <!-- claim: leg.e2e_pg_search_path --> `e2e_pg_search_path.py` | an unqualified Postgres destination stays in the schema it lives in, under search_path "$user", public |
+| <!-- claim: leg.e2e_pg_parallel_snapshot --> `e2e_pg_parallel_snapshot.py` | a parallel Postgres read sees one table state: an UPDATE committing mid-read neither loses nor doubles a row |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

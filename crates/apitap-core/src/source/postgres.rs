@@ -508,16 +508,59 @@ impl Source for PgSource {
                     .collect(),
             ),
         };
-        pipes
+        // Several spans must read ONE table state. Each span is its own
+        // statement, so without a shared snapshot a non-HOT UPDATE committing
+        // mid-read moved its tuple from a span not yet read into one already
+        // read (lost) or the other way (twice), and a replace published that
+        // (MASTER M-18). The CDC bootstrap already pins its spans to the
+        // slot's snapshot; every other multi-span read exports one here, from
+        // a connection of its own held open until the last span is done.
+        let (snapshot, holder) = match &self.snapshot {
+            Some(s) => (Some(s.clone()), None),
+            None if stmts.len() > 1 => {
+                let (snap, conn) = export_snapshot(&self.pool).await?;
+                (Some(snap), Some(conn))
+            }
+            None => (None, None),
+        };
+        let rows = pipes
             .run(stmts, move |_| PgBody {
                 pool: self.pool.clone(),
                 url: self.url.clone(),
                 mode: mode.clone(),
                 chunk,
-                snapshot: self.snapshot.clone(),
+                snapshot: snapshot.clone(),
             })
-            .await
+            .await;
+        if let Some(conn) = holder {
+            use sqlx::Connection as _;
+            let _ = conn.close().await;
+        }
+        rows
     }
+}
+
+/// A snapshot every span of one read can pin itself to, and the connection
+/// that keeps it alive: an exported snapshot lives only as long as the
+/// transaction that exported it.
+async fn export_snapshot(pool: &PgPool) -> Result<(std::sync::Arc<str>, sqlx::PgConnection)> {
+    use sqlx::{Connection as _, Executor as _};
+    let err = |e: sqlx::Error| {
+        Error::Transfer(format!(
+            "export a read snapshot for the parallel spans: {e}"
+        ))
+    };
+    let mut conn = sqlx::PgConnection::connect_with(&pool.connect_options())
+        .await
+        .map_err(err)?;
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .map_err(err)?;
+    let snap: String = sqlx::query_scalar("SELECT pg_export_snapshot()")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(err)?;
+    Ok((std::sync::Arc::from(snap.as_str()), conn))
 }
 
 struct PgBody {
