@@ -423,7 +423,7 @@ async fn apply_unit(
 
 /// Everything that holds a connection. See the module doc.
 mod store {
-    use super::{db_err, upsert_state_tx};
+    use super::{db_err, delete_state, state_table_in, upsert_state_tx};
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, Fence, LeaseStore, Watermark};
@@ -459,7 +459,8 @@ mod store {
         /// `resolve_names` — the SAME rule the bulk lane uses, so the lock, the
         /// scan, the lease and the fence all agree under any `search_path`.
         parts: std::sync::Mutex<HashMap<String, PgParts>>,
-        state_ready: std::sync::atomic::AtomicBool,
+        /// Schemas whose `_apitap_state` this run has already ensured.
+        state_ready: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     /// One fenced transaction. Dropped without `close_unit`, it rolls back.
@@ -551,23 +552,43 @@ mod store {
             (PgGuard::new(self.pool.clone(), parts.schema), parts.bare)
         }
 
+        /// This destination's state table: `_apitap_state` in the schema the
+        /// table lives in, where the bulk lane keeps it too. The lane used to
+        /// write an UNQUALIFIED `_apitap_state` (whatever search_path chose):
+        /// `sales.orders` and `public.orders` fed from one source shared one
+        /// row, and a bulk replace of `sales.orders` — which clears
+        /// `sales._apitap_state` — left this lane's watermark behind, so the
+        /// next drain resumed a stale LSN on a replaced table (MASTER M-65).
+        pub(super) fn state_table(&self, dest_table: &str) -> String {
+            state_table_in(&self.parts_of(dest_table).schema)
+        }
+
         /// Created outside any unit: IF NOT EXISTS is not atomic, and the
         /// loser of a race raises inside whatever transaction it is in.
-        async fn ensure_state_table(&self) -> Result<()> {
-            if self.state_ready.load(std::sync::atomic::Ordering::Relaxed) {
+        async fn ensure_state_table(&self, schema: &str) -> Result<()> {
+            if self
+                .state_ready
+                .lock()
+                .expect("state_ready")
+                .contains(schema)
+            {
                 return Ok(());
             }
             self.pool
                 .execute(
-                    "CREATE TABLE IF NOT EXISTS _apitap_state (\
-                       dest_table  text NOT NULL, \
-                       source_id   text NOT NULL, \
-                       cursor_col  text NOT NULL, \
-                       watermark   text, \
-                       mode        text NOT NULL, \
-                       last_rows   bigint NOT NULL DEFAULT 0, \
-                       synced_at   timestamptz NOT NULL DEFAULT now(), \
-                       PRIMARY KEY (dest_table, source_id))",
+                    format!(
+                        "CREATE TABLE IF NOT EXISTS {} (\
+                           dest_table  text NOT NULL, \
+                           source_id   text NOT NULL, \
+                           cursor_col  text NOT NULL, \
+                           watermark   text, \
+                           mode        text NOT NULL, \
+                           last_rows   bigint NOT NULL DEFAULT 0, \
+                           synced_at   timestamptz NOT NULL DEFAULT now(), \
+                           PRIMARY KEY (dest_table, source_id))",
+                        state_table_in(schema)
+                    )
+                    .as_str(),
                 )
                 .await
                 .map(|_| ())
@@ -585,7 +606,10 @@ mod store {
                     }
                     _ => Err(db_err(e)),
                 })?;
-            self.state_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.state_ready
+                .lock()
+                .expect("state_ready")
+                .insert(schema.to_string());
             Ok(())
         }
 
@@ -605,12 +629,21 @@ mod store {
             // it was a fresh destination, and quietly ran a full bootstrap.
             // Read the row whatever wrote it; `naming::state_verdict` refuses
             // it if it is not ours, in both lanes.
+            //
+            // Only the schema's own table. The unqualified one older releases
+            // wrote is NOT read as a fallback: in `public` it is also the live
+            // table of every `public.*` destination, and a bare `orders` row
+            // there may be public.orders' watermark rather than sales.orders'.
+            // Where the two are one table (`public` on the default
+            // search_path) nothing changes; a destination elsewhere
+            // re-bootstraps once after the upgrade — a full copy, no loss.
             let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
-            let row: Option<(Option<String>, String, String)> = sqlx::query_as(
-                "SELECT watermark, cursor_col, mode FROM _apitap_state \
+            let row: Option<(Option<String>, String, String)> = sqlx::query_as(&format!(
+                "SELECT watermark, cursor_col, mode FROM {} \
                  WHERE dest_table IN ($1, $2) AND source_id = $3 \
                  ORDER BY (dest_table = $1) DESC LIMIT 1",
-            )
+                self.state_table(dest_table)
+            ))
             .bind(bare)
             .bind(qualified)
             .bind(source_id)
@@ -689,7 +722,9 @@ mod store {
         /// against" and wrote. Expiry is not part of it either — a lapse nobody
         /// claimed is still this run's, and the close renews it.
         async fn open_unit<'a>(&'a self, keys: &[String], token: &str) -> Result<PgUnit> {
-            self.ensure_state_table().await?;
+            for schema in by_schema(keys).keys() {
+                self.ensure_state_table(schema).await?;
+            }
             let mut tx = self.pool.begin().await.map_err(db_err)?;
             // Sorted, so two lanes never take two rows in opposite orders.
             let mut sorted: Vec<&String> = keys.iter().collect();
@@ -727,17 +762,12 @@ mod store {
             for m in &marks {
                 match m {
                     Watermark::Set { table, source_id, lsn, rows } => {
-                        upsert_state_tx(&mut u.tx, table, source_id, *lsn, *rows).await?
+                        let st = self.state_table(table);
+                        upsert_state_tx(&mut u.tx, &st, table, source_id, *lsn, *rows).await?
                     }
                     Watermark::Clear { table, source_id } => {
-                        let (bare, qualified) = crate::naming::pg_state_keys(table);
-                        sqlx::query("DELETE FROM _apitap_state WHERE dest_table IN ($1, $2) AND source_id = $3")
-                            .bind(bare)
-                            .bind(qualified)
-                            .bind(source_id)
-                            .execute(&mut *u.tx)
-                            .await
-                            .map_err(db_err)?;
+                        let st = self.state_table(table);
+                        delete_state(&mut u.tx, &st, table, source_id).await?
                     }
                 }
             }
@@ -847,8 +877,34 @@ fn key_pred_bound(
         .join(" AND ")
 }
 
+/// `_apitap_state` in `schema`, quoted.
+fn state_table_in(schema: &str) -> String {
+    format!("{}._apitap_state", quote_ident(schema))
+}
+
+/// Both spellings of this table's row for `source_id`, from `state_t`.
+async fn delete_state(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state_t: &str,
+    dest_table: &str,
+    source_id: &str,
+) -> Result<()> {
+    let (bare, qualified) = crate::naming::pg_state_keys(dest_table);
+    sqlx::query(&format!(
+        "DELETE FROM {state_t} WHERE dest_table IN ($1, $2) AND source_id = $3"
+    ))
+    .bind(bare)
+    .bind(qualified)
+    .bind(source_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 async fn upsert_state_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state_t: &str,
     dest_table: &str,
     source_id: &str,
     lsn: u64,
@@ -859,14 +915,14 @@ async fn upsert_state_tx(
     // dual-spelling READ above is what reaches the bulk lane's row; nothing
     // needs to move on disk for that to work.
     let (bare, _qualified) = crate::naming::pg_state_keys(dest_table);
-    sqlx::query(
-        "INSERT INTO _apitap_state \
+    sqlx::query(&format!(
+        "INSERT INTO {state_t} \
            (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
          VALUES ($1, $2, $3, $4, 'log_based', $5, now()) \
          ON CONFLICT (dest_table, source_id) DO UPDATE SET \
            cursor_col = EXCLUDED.cursor_col, watermark = EXCLUDED.watermark, \
-           mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()",
-    )
+           mode = EXCLUDED.mode, last_rows = EXCLUDED.last_rows, synced_at = now()"
+    ))
     .bind(bare)
     .bind(source_id)
     .bind(STATE_CURSOR)

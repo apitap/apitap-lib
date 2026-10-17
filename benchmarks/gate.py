@@ -266,6 +266,7 @@ LEGS = [
     leg("e2e_ch_source_u64.py",       "a parallel ClickHouse read on a UInt64 cursor past i64::MAX reads every row"),
     leg("e2e_my_binlog_format.py",    "MySQL CDC under binlog_checksum=NONE; a STATEMENT writer is refused"),
     leg("e2e_pg_mixed_case_pk.py",    "Postgres CDC of a mixed-case table keyed with INCLUDE columns"),
+    leg("e2e_pg_state_schema.py",     "Postgres CDC state lives in the destination's schema"),
 ]
 
 

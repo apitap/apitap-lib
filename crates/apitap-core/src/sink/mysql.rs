@@ -1421,12 +1421,18 @@ impl MySqlSink {
                     ))
                     .await?;
                 }
-                // Replace destroyed every source's rows — clear stale state.
+                // Replace destroyed every source's rows — clear stale state,
+                // under EVERY spelling: the CDC lane keys a table as the run
+                // named it (`public.orders`, `bench.orders`), this lane as
+                // `orders`, and only the bare one was cleared — the next
+                // drain resumed its old position on the replaced table
+                // (MASTER M-65). This state table belongs to one database, so
+                // any `<x>.orders` in it is this same table.
                 self.ensure_state_table().await?;
                 self.exec(&format!(
-                    "DELETE FROM {} WHERE dest_table='{}'",
+                    "DELETE FROM {} WHERE dest_table = '{b}' OR SUBSTRING_INDEX(dest_table, '.', -1) = '{b}'",
                     self.fq("_apitap_state"),
-                    sql_lit(&self.bare)
+                    b = sql_lit(&self.bare)
                 ))
                 .await?;
                 if let Some(wm) = &staged_wm {
