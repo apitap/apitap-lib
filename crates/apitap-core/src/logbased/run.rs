@@ -2470,7 +2470,22 @@ async fn ensure_publication(
         })?;
         return Ok(());
     }
-    if viaroot {
+    // Only when the publication does not have it yet: ALTER PUBLICATION
+    // needs ownership, and running it on EVERY drain (PG 13+, partitioned or
+    // not) made each run fatal for a role that may read the publication but
+    // does not own it (P2). It also wrote WAL after the last user commit on
+    // every run, which moved caught-up watermarks past it.
+    let has_viaroot: bool = if viaroot {
+        sqlx::query_scalar::<_, bool>("SELECT pubviaroot FROM pg_publication WHERE pubname = $1")
+            .bind(publication)
+            .fetch_optional(src)
+            .await
+            .map_err(db_err)?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if viaroot && !has_viaroot {
         // Heal a publication made before this option was set (or by an older
         // apitap): one idempotent catalog update, and the next drain's
         // Relation messages carry the ROOT's name. The changes a broken

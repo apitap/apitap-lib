@@ -441,6 +441,14 @@ def run_changelog_replay_ch():
         print("   -- the replay: from the group minimum, one RP update longer")
         src(f"UPDATE {RP} SET title = 'after' WHERE id = 2")
         q(f"ALTER TABLE `{RPB}` DROP CONSTRAINT leg_small")
+        # Two runs: the members are at different heights, so the first pass
+        # stops at RP's watermark (MASTER M-55) and lands only RPB's half of
+        # the attempt; the second drains the update past it. One run sufficed
+        # only while every drain wrote an ALTER PUBLICATION's WAL after the
+        # last commit, which pushed RP's watermark past the attempt and let
+        # one window straddle it.
+        r = drain()
+        case("the replay's capped pass succeeds", r.returncode == 0, (r.stdout + r.stderr).strip()[-300:])
         r = drain()
         case("the replay succeeds", r.returncode == 0, (r.stdout + r.stderr).strip()[-300:])
         want9, got9 = src(f"SELECT md5(body) || '/' || length(body) FROM {RP} WHERE id = 9"), body_at(9)
