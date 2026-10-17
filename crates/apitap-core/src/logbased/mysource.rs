@@ -455,6 +455,10 @@ pub(crate) struct MySession {
     /// run's keys; every body a window builds carries the one it was built
     /// with. Cleared in the same statement as the schemas, at every DDL.
     pub layouts: HashMap<String, Arc<Layout>>,
+    /// The current binlog file carries no event checksums
+    /// (binlog_checksum=NONE when it was written), as its FORMAT_DESCRIPTION
+    /// said. Per file, not per server: the setting can change between files.
+    pub no_checksum: bool,
 }
 
 /// The layout of tracked table `q`: cached, else from the schema cache, else
@@ -569,7 +573,19 @@ pub(crate) async fn drain_binlog(
         };
         // `raw` is an owned Bytes now — the old borrowed-slice shape forced a
         // full copy of every event here.
-        let (h, body) = bl::split_event(&raw, true)?;
+        // The checksum is the file's, and its FORMAT_DESCRIPTION says which:
+        // the algorithm byte sits 5 bytes from the end, and an FDE always
+        // keeps 4 trailing checksum bytes itself. Assuming CRC32 everywhere
+        // cut 4 real bytes off every event of a binlog_checksum=NONE file —
+        // a ROTATE's file name lost its tail and the watermark went
+        // BACKWARDS, a TRUNCATE's table name was cut (MASTER M-39).
+        let checksummed = if raw.get(4) == Some(&bl::TYPE_FDE) {
+            sess.no_checksum = raw.len() >= 5 && raw[raw.len() - 5] == 0;
+            true
+        } else {
+            !sess.no_checksum
+        };
+        let (h, body) = bl::split_event(&raw, checksummed)?;
 
         match h.event_type {
             bl::TYPE_ROTATE => {
@@ -727,6 +743,46 @@ pub(crate) async fn drain_binlog(
                     // Transaction opens: anything buffered from a torn
                     // previous attempt is stale.
                     tx_buf.clear();
+                } else if verb == QueryVerb::Rollback {
+                    // The transaction never happened. Left in the buffer, its
+                    // rows were applied by whatever drained next — a DDL's
+                    // implicit commit (MASTER M-39).
+                    tx_buf.clear();
+                } else if verb == QueryVerb::RollbackTo {
+                    // Which of the buffered rows the savepoint undid is not in
+                    // the event. Guessing either way is wrong data, so a
+                    // partial rollback over tracked changes stops the run.
+                    if !tx_buf.is_empty() {
+                        return Err(Error::Transfer(format!(
+                            "binlog: a transaction touching a tracked table rolled back \
+                             to a savepoint ({head:?}) at {}:{} — the binlog does not say \
+                             which of its rows the savepoint undid, so it cannot be \
+                             replicated faithfully. Re-bootstrap the table (clear its \
+                             _apitap_state row), and avoid ROLLBACK TO SAVEPOINT in \
+                             transactions that mix non-transactional tables",
+                            sess.file, h.log_pos
+                        )));
+                    }
+                } else if verb == QueryVerb::Dml {
+                    // A session with binlog_format=STATEMENT or MIXED writes
+                    // its DML as statement text: no rows event, no values.
+                    // Ignored, those rows vanished from the destination
+                    // (MASTER M-38). A statement naming a tracked table is
+                    // refused; one that names none is not ours.
+                    if let Some(t) = names_tracked(head, &db, &sess.tracked) {
+                        return Err(Error::Transfer(format!(
+                            "binlog: a change to the tracked table {t} was written as \
+                             statement text ({}) at {}:{}, not as row events — a \
+                             session ran with binlog_format=STATEMENT or MIXED. Its \
+                             rows cannot be read from the binlog. Make every writer \
+                             use ROW (SET GLOBAL binlog_format='ROW', and reconnect \
+                             the sessions), then re-bootstrap {t} (clear its \
+                             _apitap_state row)",
+                            crate::sink::char_excerpt(head, 120),
+                            sess.file,
+                            h.log_pos
+                        )));
+                    }
                 } else if verb == QueryVerb::Commit {
                     // A non-transactional engine (MyISAM, Aria, MEMORY) commits
                     // with an explicit `COMMIT` QUERY event and no XID: the
@@ -1009,6 +1065,13 @@ enum QueryVerb {
     Begin,
     Commit,
     Ddl,
+    /// `ROLLBACK` (the whole transaction).
+    Rollback,
+    /// `ROLLBACK TO [SAVEPOINT] x`.
+    RollbackTo,
+    /// INSERT/UPDATE/DELETE/REPLACE/LOAD DATA written as statement text — a
+    /// session running binlog_format=STATEMENT or MIXED.
+    Dml,
     Other,
 }
 
@@ -1054,11 +1117,51 @@ fn query_verb(head: &str) -> QueryVerb {
         QueryVerb::Begin
     } else if starts_with_word(head, "commit") {
         QueryVerb::Commit
+    } else if starts_with_word(head, "rollback") {
+        let rest = head["rollback".len()..].trim_start();
+        let rest = rest
+            .strip_prefix("work")
+            .map(str::trim_start)
+            .unwrap_or(rest);
+        if starts_with_word(rest, "to") {
+            QueryVerb::RollbackTo
+        } else {
+            QueryVerb::Rollback
+        }
+    } else if ["insert", "update", "delete", "replace", "load"]
+        .iter()
+        .any(|k| starts_with_word(head, k))
+    {
+        QueryVerb::Dml
     } else if is_ddl(head) {
         QueryVerb::Ddl
     } else {
         QueryVerb::Other
     }
+}
+
+/// The tracked table (`db.t`) a DML statement names, if any: its bare name
+/// as a word anywhere in the text (case-insensitive, with or without
+/// backticks or a schema). A false match only refuses a run that could have
+/// gone on; a missed one is silent loss, so this errs toward matching.
+fn names_tracked(
+    sql: &str,
+    default_db: &str,
+    tracked: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    tracked.keys().find_map(|q| {
+        let (db, t) = q.split_once('.')?;
+        let t = t.to_ascii_lowercase();
+        let named = words.iter().any(|w| *w == t);
+        let same_db =
+            db.eq_ignore_ascii_case(default_db) || lower.contains(&db.to_ascii_lowercase());
+        (named && same_db).then(|| q.clone())
+    })
 }
 
 fn is_ddl(sql: &str) -> bool {
@@ -1124,6 +1227,23 @@ mod query_verbs_tests {
         assert_eq!(query_verb("commit /*x*/"), QueryVerb::Commit);
         assert_eq!(query_verb("COMMITMENT"), QueryVerb::Other);
         assert_eq!(query_verb("TRUNCATE TABLE t"), QueryVerb::Ddl);
+        // MASTER M-38/M-39: statement-format DML and rollbacks.
+        assert_eq!(query_verb("INSERT INTO t VALUES (1)"), QueryVerb::Dml);
+        assert_eq!(query_verb("/* app */ update t set v = 1"), QueryVerb::Dml);
+        assert_eq!(query_verb("DELETE FROM t"), QueryVerb::Dml);
+        assert_eq!(query_verb("REPLACE INTO t VALUES (1)"), QueryVerb::Dml);
+        assert_eq!(
+            query_verb("LOAD DATA INFILE 'x' INTO TABLE t"),
+            QueryVerb::Dml
+        );
+        assert_eq!(query_verb("ROLLBACK"), QueryVerb::Rollback);
+        assert_eq!(query_verb("rollback work"), QueryVerb::Rollback);
+        assert_eq!(
+            query_verb("ROLLBACK TO SAVEPOINT s1"),
+            QueryVerb::RollbackTo
+        );
+        assert_eq!(query_verb("ROLLBACK TO `s1`"), QueryVerb::RollbackTo);
+        assert_eq!(query_verb("INSERTION"), QueryVerb::Other);
         assert_eq!(query_verb("create table t (id int)"), QueryVerb::Ddl);
         // The first cut pinned the bug here: a leading comment made the
         // verb Other and the TRUNCATE was silently dropped (MASTER M-37).

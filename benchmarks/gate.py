@@ -264,6 +264,7 @@ LEGS = [
     leg("e2e_ch_replace_lossy.py",    "a ClickHouse replace without engine= never strips the table it replaces"),
     leg("e2e_ch_profile_limits.py",   "a ClickHouse profile that shortens answers cannot shorten a transfer"),
     leg("e2e_ch_source_u64.py",       "a parallel ClickHouse read on a UInt64 cursor past i64::MAX reads every row"),
+    leg("e2e_my_binlog_format.py",    "MySQL CDC under binlog_checksum=NONE; a STATEMENT writer is refused"),
 ]
 
 

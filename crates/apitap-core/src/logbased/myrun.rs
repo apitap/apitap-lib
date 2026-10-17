@@ -267,7 +267,16 @@ pub(crate) async fn drain_windows(
     )
         .await?;
 
+    // The dump's first event is an artificial ROTATE, sent before any
+    // FORMAT_DESCRIPTION, with the checksum the session negotiated:
+    // @master_binlog_checksum = @@global.binlog_checksum (mywire). The FDEs
+    // that follow set it per file.
+    let global_checksum: String = sqlx::query_scalar("SELECT @@global.binlog_checksum")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("probe binlog_checksum: {e}")))?;
     let mut sess = MySession {
+        no_checksum: global_checksum.eq_ignore_ascii_case("NONE"),
         file: start_file,
         tracked: ctxs
             .iter()
