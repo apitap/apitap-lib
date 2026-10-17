@@ -277,6 +277,7 @@ LEGS = [
     leg("e2e_my_time_fraction.py",   "MySQL CDC carries negative fractional TIME as the server holds it", argv=["my"]),
     leg("e2e_my_time_fraction.py",   "MariaDB CDC carries negative fractional TIME as the server holds it", {"mariadb"}, ["maria"]),
     leg("e2e_ch_schema_listing.py",  "schema= on a ClickHouse source moves every user table"),
+    leg("e2e_pg_residue_typmod.py",  "a Postgres CDC residue write never truncates a value to fit the column"),
 ]
 
 

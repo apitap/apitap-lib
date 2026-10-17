@@ -202,12 +202,18 @@ async fn apply_unit(
     // is cast with it: `"id" = $3::integer`. The value still travels as a
     // bind; nothing embeds (this cast bug is the regression
     // e2e_logbased/e2e_toast_rekey caught).
+    //
+    // The type WITHOUT its typmod: an explicit cast to varchar(n), char(n)
+    // or bit(n) truncates silently, where the column's own assignment
+    // refuses a value that does not fit — and the bulk lane refuses it. So
+    // character types cast to text and bit types to bit varying (their bare
+    // names mean char(1) and bit(1)); the column then applies its length.
     let casts: std::collections::HashMap<String, String> = if c.residue.is_empty() && !raw_bytes {
         std::collections::HashMap::new()
     } else {
         let names: Vec<String> = wal_cols.to_vec();
         let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
-            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
+            "SELECT a.attname::text, format_type(a.atttypid, NULL) \
              FROM pg_attribute a \
              WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
                AND a.attname::text = ANY($2)",
@@ -217,7 +223,16 @@ async fn apply_unit(
         .fetch_all(&mut **tx)
         .await
         .map_err(db_err)?;
-        rows.into_iter().collect()
+        rows.into_iter()
+            .map(|(name, ty)| {
+                let ty = match ty.as_str() {
+                    "character" | "character varying" => "text".to_string(),
+                    "bit" => "bit varying".to_string(),
+                    _ => ty,
+                };
+                (name, ty)
+            })
+            .collect()
     };
     let hex_col = |name: &str| raw_bytes && casts.get(name).is_some_and(|t| t == "bytea");
     let hex: Vec<bool> = wal_cols.iter().map(|c| hex_col(c)).collect();
