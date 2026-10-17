@@ -463,6 +463,48 @@ impl ChConn {
     /// Common query params. `wait_end_of_query=1` buffers the response until the
     /// statement fully completed, so the HTTP status is trustworthy (otherwise an
     /// insert can fail after a 200 was already sent).
+    /// Settings pinned on EVERY request. A server profile may set any of
+    /// these, and each one shortens or alters an answer while ClickHouse
+    /// still says 200: `limit`/`offset` cut every SELECT (a count, a
+    /// watermark, the source stream), a `*_overflow_mode=break` stops a read
+    /// at a quota and returns what it had, `skip_unavailable_shards` drops a
+    /// shard, `additional_table_filters` hides rows, the query cache answers
+    /// from an old result, parallel replicas split a read across replicas.
+    /// The source's `count()` cross-check is gone, so nothing caught it
+    /// (MASTER M-30). Every overflow becomes an exception instead.
+    const PINNED: [(&'static str, &'static str); 19] = [
+        ("limit", "0"),
+        ("offset", "0"),
+        ("result_overflow_mode", "throw"),
+        ("read_overflow_mode", "throw"),
+        ("read_overflow_mode_leaf", "throw"),
+        ("timeout_overflow_mode", "throw"),
+        ("timeout_overflow_mode_leaf", "throw"),
+        ("transfer_overflow_mode", "throw"),
+        ("sort_overflow_mode", "throw"),
+        ("group_by_overflow_mode", "throw"),
+        ("set_overflow_mode", "throw"),
+        ("join_overflow_mode", "throw"),
+        ("distinct_overflow_mode", "throw"),
+        ("skip_unavailable_shards", "0"),
+        ("final", "0"),
+        ("use_query_cache", "0"),
+        ("max_parallel_replicas", "1"),
+        ("additional_table_filters", "{}"),
+        ("additional_result_filter", ""),
+    ];
+
+    /// Pinned on every INSERT: a profile's error allowance skips bad rows
+    /// with a 200, an async insert acknowledges before the data is written,
+    /// and deduplication drops a block identical to an earlier one — on a
+    /// Replicated staging table, a legitimately repeated block of rows.
+    const INSERT_PINNED: [(&'static str, &'static str); 4] = [
+        ("input_format_allow_errors_num", "0"),
+        ("input_format_allow_errors_ratio", "0"),
+        ("async_insert", "0"),
+        ("insert_deduplicate", "0"),
+    ];
+
     fn params<'a>(&'a self, extra: &'a str) -> [(&'a str, &'a str); 5] {
         [
             ("database", self.database.as_str()),
@@ -498,6 +540,7 @@ impl ChConn {
                 ("wait_end_of_query", "0"),
                 ("session_timezone", "UTC"),
             ])
+            .query(&Self::PINNED)
             .body(sql.to_string())
             .send()
             .await
@@ -564,6 +607,7 @@ impl ChConn {
                 .post(&self.base)
                 .basic_auth(&self.user, Some(&self.password))
                 .query(&self.params("")[..4])
+                .query(&Self::PINNED)
                 .query(settings)
                 .body(query.to_string())
                 .send()
@@ -691,6 +735,8 @@ impl ChConn {
             .post(&self.base)
             .basic_auth(&self.user, Some(&self.password))
             .query(&self.params(query))
+            .query(&Self::PINNED)
+            .query(&Self::INSERT_PINNED)
             .query(settings)
             .query(&[
                 ("min_insert_block_size_rows", "1048576"),
