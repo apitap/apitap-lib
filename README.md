@@ -54,7 +54,7 @@ df = apitap.read(src, table="public.orders").to_polars()                 # or .l
 | | |
 |---|---|
 | **Sources** | `postgres://` · `mysql://` (MySQL 8.x, MariaDB) · `clickhouse://` · `gsheets://` · `github://` (repo CSVs as tables) · `github+api://` (issues, PRs, commits… as typed tables) |
-| **Destinations** | `postgres://` · `mysql://` · `clickhouse://` · `bigquery://` · `gcs://` · `s3://` (AWS, MinIO, R2, any S3-compatible store) · `iceberg://` (any REST catalog) |
+| **Destinations** | `postgres://` · `mysql://` · `clickhouse://` · `bigquery://` · `gcs://` · `s3://` (AWS, MinIO, R2, any S3-compatible store) · `iceberg://` (REST catalogs with bearer auth) |
 | **Modes** | `replace` (default, atomic swap) · `append` · `merge` (Postgres, Iceberg) · `log_based` batch CDC from Postgres and MySQL/MariaDB into Postgres, ClickHouse, MySQL, BigQuery, Iceberg |
 | **DataFrames** | `apitap.read()` → polars, pyarrow, duckdb, pandas through the Arrow C stream protocol, zero-copy, no pyarrow dependency |
 | **Runtime** | CPython ≥ 3.9, one `abi3` wheel (`manylinux_x86_64`); the engine is Rust, nothing in the data path is Python |
@@ -172,7 +172,7 @@ keep running between runs.
 | BigQuery | `bigquery://project/dataset?credentials=/path/key.json[&location=EU]` | service-account key; `GOOGLE_APPLICATION_CREDENTIALS` is the fallback. Bulk modes use the free load/copy-job path and work on sandbox projects; CDC needs billing (row-level DML) |
 | GCS | `gcs://bucket[/prefix]?format=csv\|parquet[&credentials=…]` | `csv` = one composed `.csv.gz` per table (atomic visibility); `parquet` = a directory of ZSTD parts |
 | S3-compatible | `s3://bucket[/prefix]?format=parquet[&endpoint=…][&region=…][&access_key_id=…&secret_access_key=…][&session_token=…]` | `AWS_*` env vars are the fallback; an explicit `endpoint` means path-style (MinIO, R2, OVH/Scaleway/Hetzner); SigV4 signed by hand, no SDK |
-| Iceberg | `iceberg://catalog-host[:port]/namespace?warehouse=…[&base=…][&token=…][&tls=0\|1][&endpoint=…][&region=…][&access_key_id=…&secret_access_key=…]` | any REST catalog (Lakekeeper, Polaris, Nessie, Glue REST, R2 Data Catalog, S3 Tables); format-version 2, single-level namespace, data on `s3://` |
+| Iceberg | `iceberg://catalog-host[:port]/namespace?warehouse=…[&base=…][&token=…][&tls=0\|1][&endpoint=…][&region=…][&access_key_id=…&secret_access_key=…]` | a REST catalog that takes a bearer `token` or none (Lakekeeper, Polaris, Nessie, R2 Data Catalog); not AWS Glue REST or S3 Tables, which need SigV4-signed catalog calls; a token is static, so one that expires mid-run fails the run (nothing is committed); format-version 2, single-level namespace, data on `s3://` |
 | Google Sheets | `gsheets://<spreadsheet_id>?credentials=/path/key.json` | tabs are tables, row 1 the header, every column nullable text as displayed |
 | GitHub files | `github://owner/repo[/dir]?ref=main` | `.csv` files are tables (RFC 4180, streamed); `GITHUB_TOKEN`/`GH_TOKEN` for private repos and the 5,000/h rate limit |
 | GitHub API | `github+api://owner/repo` | `issues`, `pull_requests`, `commits`, `stargazers`, `releases`, `issue_comments`, `workflow_runs`, `branches`, `tags`, `labels` as typed tables plus a `raw` jsonb column; incremental where the API filters server-side |
