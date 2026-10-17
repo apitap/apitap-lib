@@ -1088,10 +1088,9 @@ fn rb_types_for(
     cols.iter()
         .enumerate()
         .map(|(i, c)| {
-            let (ch, nullable) = types
-                .get(c)
-                .and_then(|t| crate::wire::rowbinary::rb_type_from_ch(t))?;
-            let ty = crate::wire::rowbinary::rb_type_for_cdc(*oids.get(i)?, ch)?;
+            let name = types.get(c)?;
+            let (ch, nullable) = crate::wire::rowbinary::rb_type_from_ch(name)?;
+            let ty = crate::wire::rowbinary::rb_type_for_cdc(*oids.get(i)?, ch, name)?;
             Some((ty, nullable))
         })
         .collect()

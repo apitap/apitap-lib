@@ -132,14 +132,25 @@ pub(crate) fn rb_type_from_ch(ch: &str) -> Option<(RbType, bool)> {
 /// OID gives the CONVERSION — jsonb's version header must be stripped, bytea's
 /// binary form (raw bytes) does not match its `\x…` text shape in ClickHouse,
 /// and so on. `None` → the whole table stays on the TSV path.
-pub(crate) fn rb_type_for_cdc(oid: u32, ch: RbType) -> Option<RbType> {
+///
+/// `ch_name` is the column's ClickHouse type (`Nullable(...)` allowed). A
+/// byte-swap is only right between the SAME number class: `Swap(8)` is
+/// Int64, UInt64 and Float64 alike, and matching on width alone wrote a
+/// float8's IEEE bits into an Int64 column (an ALTER TYPE mid-CDC, or a
+/// pre-created table) and an int8's into a Float64, silently (MASTER M-28).
+/// Signed ints need the signed Int of their width and floats the Float of
+/// theirs; any other pairing takes the TSV path, where ClickHouse parses
+/// the text and a value that does not fit fails loudly.
+pub(crate) fn rb_type_for_cdc(oid: u32, ch: RbType, ch_name: &str) -> Option<RbType> {
+    let inner = ch_name.strip_prefix("Nullable(").and_then(|s| s.strip_suffix(')')).unwrap_or(ch_name);
+    let exact = |want: &str| if inner == want { Some(ch) } else { None };
     Some(match oid {
         16 => match ch { RbType::Bool => ch, _ => return None },                  // bool
-        20 => match ch { RbType::Swap(8) => ch, _ => return None },               // int8
-        21 => match ch { RbType::Swap(2) => ch, _ => return None },               // int2
-        23 => match ch { RbType::Swap(4) => ch, _ => return None },               // int4
-        700 => match ch { RbType::Swap(4) => ch, _ => return None },              // float4
-        701 => match ch { RbType::Swap(8) => ch, _ => return None },              // float8
+        20 => exact("Int64")?,                                                    // int8
+        21 => exact("Int16")?,                                                    // int2
+        23 => exact("Int32")?,                                                    // int4
+        700 => exact("Float32")?,                                                 // float4
+        701 => exact("Float64")?,                                                 // float8
         1082 => match ch { RbType::Date32 => ch, _ => return None },              // date
         1114 | 1184 => match ch { RbType::Ts64 => ch, _ => return None },         // ts/tstz
         1700 => match ch {                                                        // numeric
@@ -711,15 +722,22 @@ mod tests {
     /// column holds) and any unknown OID fall back to TSV.
     #[test]
     fn cdc_oid_rules_refine_the_ch_type() {
-        assert_eq!(rb_type_for_cdc(3802, RbType::String), Some(RbType::JsonB));
-        assert_eq!(rb_type_for_cdc(25, RbType::String), Some(RbType::String));
-        assert_eq!(rb_type_for_cdc(1043, RbType::String), Some(RbType::String));
-        assert_eq!(rb_type_for_cdc(114, RbType::String), Some(RbType::String));
-        assert_eq!(rb_type_for_cdc(23, RbType::Swap(4)), Some(RbType::Swap(4)));
-        assert_eq!(rb_type_for_cdc(23, RbType::Swap(8)), None); // width mismatch
-        assert_eq!(rb_type_for_cdc(1700, RbType::Decimal { width: 8, scale: 4 }), Some(RbType::Decimal { width: 8, scale: 4 }));
-        assert_eq!(rb_type_for_cdc(17, RbType::String), None); // bytea
-        assert_eq!(rb_type_for_cdc(1009, RbType::String), None); // text[]
-        assert_eq!(rb_type_for_cdc(1083, RbType::String), None); // time
+        assert_eq!(rb_type_for_cdc(3802, RbType::String, "String"), Some(RbType::JsonB));
+        assert_eq!(rb_type_for_cdc(25, RbType::String, "String"), Some(RbType::String));
+        assert_eq!(rb_type_for_cdc(1043, RbType::String, "String"), Some(RbType::String));
+        assert_eq!(rb_type_for_cdc(114, RbType::String, "String"), Some(RbType::String));
+        assert_eq!(rb_type_for_cdc(23, RbType::Swap(4), "Int32"), Some(RbType::Swap(4)));
+        assert_eq!(rb_type_for_cdc(23, RbType::Swap(8), "Int64"), None); // width mismatch
+        // Same width, wrong class (M-28): float bits into an int, and back.
+        assert_eq!(rb_type_for_cdc(701, RbType::Swap(8), "Int64"), None);
+        assert_eq!(rb_type_for_cdc(701, RbType::Swap(8), "UInt64"), None);
+        assert_eq!(rb_type_for_cdc(20, RbType::Swap(8), "Nullable(Float64)"), None);
+        assert_eq!(rb_type_for_cdc(23, RbType::Swap(4), "UInt32"), None);
+        assert_eq!(rb_type_for_cdc(701, RbType::Swap(8), "Nullable(Float64)"), Some(RbType::Swap(8)));
+        assert_eq!(rb_type_for_cdc(20, RbType::Swap(8), "Int64"), Some(RbType::Swap(8)));
+        assert_eq!(rb_type_for_cdc(1700, RbType::Decimal { width: 8, scale: 4 }, "Decimal(18, 4)"), Some(RbType::Decimal { width: 8, scale: 4 }));
+        assert_eq!(rb_type_for_cdc(17, RbType::String, "String"), None); // bytea
+        assert_eq!(rb_type_for_cdc(1009, RbType::String, "String"), None); // text[]
+        assert_eq!(rb_type_for_cdc(1083, RbType::String, "String"), None); // time
     }
 }
