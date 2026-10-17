@@ -907,6 +907,37 @@ impl MyWire {
         }
     }
 
+    /// The first column of the first row of a one-column SELECT, as text
+    /// (`None` for SQL NULL or no row). For the few control questions the
+    /// binlog connection must answer about ITSELF before it dumps.
+    pub(crate) async fn query_text(&mut self, sql: &str) -> Result<Option<String>> {
+        let (stmt, ncols) = self.prepare(sql).await?;
+        if ncols != 1 {
+            return Err(desync("query_text wants one column"));
+        }
+        self.execute(stmt).await?;
+        let mut out = None;
+        let mut first = true;
+        while let Some(row) = self.next_row().await? {
+            if !first {
+                continue;
+            }
+            first = false;
+            // [0x00][null bitmap: (1 + 7 + 2) / 8 = 1 byte][lenenc value]
+            let null = row.get(1).ok_or_else(|| desync("short text row"))? & 0b100 != 0;
+            if !null {
+                let body = row.get(2..).ok_or_else(|| desync("short text row"))?;
+                let (n, w) = lenenc(body)?;
+                let v = body
+                    .get(w..w + n as usize)
+                    .ok_or_else(|| desync("short text value"))?;
+                out = Some(String::from_utf8_lossy(v).into_owned());
+            }
+        }
+        self.stmt_close(stmt).await?;
+        Ok(out)
+    }
+
     /// COM_STMT_CLOSE — fire and forget (no server response).
     pub(crate) async fn stmt_close(&mut self, stmt_id: u32) -> Result<()> {
         self.seq = 0;

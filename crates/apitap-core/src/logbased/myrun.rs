@@ -275,6 +275,25 @@ pub(crate) async fn drain_windows(
     // own default is PREFERRED{explicit:false}, a silent downgrade.
     let mut w =
         MyWire::connect(&crate::dialect::mysql::secure_url(src_url)).await?;
+    // The binlog connection must be on the server the pool read the schema,
+    // the positions and the bootstrap from. Behind a load balancer or a
+    // Galera VIP each connection may land on a different node, whose binlog
+    // has other files at other positions: the dump would stream another
+    // server's history against this one's watermark (MASTER M-43).
+    const WHO: &str = "SELECT CONCAT(@@hostname, ':', @@port, ':', @@server_id)";
+    let pool_side: String = sqlx::query_scalar(WHO)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("probe server identity: {e}")))?;
+    let wire_side = w.query_text(WHO).await?.unwrap_or_default();
+    if wire_side != pool_side {
+        return Err(Error::InvalidInput(format!(
+            "log_based: the binlog connection reached a different server ({wire_side}) than \
+             the rest of this run ({pool_side}) — the source URL points at a load balancer or \
+             a VIP that spreads connections over several nodes. A binlog position means \
+             nothing on another node. Point log_based at one server directly"
+        )));
+    }
     // Same moment the Postgres lane reports its slot's WAL: once per run,
     // before the stream opens, so an unattended pipeline has a number to alert
     // on rather than only a failure to react to.
