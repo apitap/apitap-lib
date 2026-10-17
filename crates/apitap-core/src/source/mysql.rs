@@ -372,6 +372,18 @@ fn bin_date_days(b: &[u8]) -> Result<i64> {
     if b.len() < 5 || b[0] < 4 {
         return Err(Error::Transfer("malformed/zero binary DATE".into()));
     }
+    // A partial date ('2024-05-00', accepted under MariaDB's default
+    // sql_mode) has no calendar day: day 0 folded into the last day of the
+    // previous month, 2024-04-30, silently (MASTER M-41).
+    if b[3] == 0 || b[4] == 0 {
+        return Err(Error::Transfer(format!(
+            "partial binary DATE {:04}-{:02}-{:02} (month or day 0) has no calendar day — \
+             fix the source rows, or read the column as text (CAST(col AS CHAR))",
+            u16::from_le_bytes([b[1], b[2]]),
+            b[3],
+            b[4]
+        )));
+    }
     let y = u16::from_le_bytes([b[1], b[2]]) as i32;
     Ok(days_from_civil(y, b[3] as u32, b[4] as u32))
 }

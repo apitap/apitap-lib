@@ -255,6 +255,7 @@ LEGS = [
     leg("e2e_my_replace_fk.py",    "a MySQL replace into an FK-referenced table is refused before the load"),
     leg("e2e_my_cdc_dests.py",     "MySQL CDC bytes and instants land as the source holds them, into Postgres", argv=["pg"]),
     leg("e2e_my_cdc_dests.py",     "MySQL CDC spells a DECIMAL as the bulk load does, into ClickHouse", argv=["ch"]),
+    leg("e2e_my_partial_dates.py", "a MySQL/MariaDB partial date is refused by the bulk load", {"mariadb"}),
 ]
 
 
