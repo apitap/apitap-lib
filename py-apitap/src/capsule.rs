@@ -411,7 +411,9 @@ unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowAr
             0
         }
         Err(e) => {
-            st.last_error = CString::new(e.to_string()).ok();
+            // An interior NUL (a value quoted in the message) made CString::new
+            // fail, and the consumer got EIO with no message at all (P2).
+            st.last_error = CString::new(e.to_string().replace('\0', "\\0")).ok();
             5 // EIO
         }
     }

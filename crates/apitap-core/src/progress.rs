@@ -112,8 +112,12 @@ fn default_format() -> Format {
 fn interval(fmt: Format) -> Duration {
     if let Ok(v) = std::env::var("APITAP_PROGRESS_INTERVAL") {
         if let Ok(secs) = v.trim().parse::<f64>() {
+            // `inf` or a huge value panicked Duration::from_secs_f64 inside
+            // the reporter (P2); one day is already more than any run waits.
             if secs > 0.05 {
-                return Duration::from_secs_f64(secs);
+                if let Ok(d) = Duration::try_from_secs_f64(secs.min(86_400.0)) {
+                    return d;
+                }
             }
         }
     }
