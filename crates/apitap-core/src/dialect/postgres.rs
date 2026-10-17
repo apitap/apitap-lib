@@ -79,6 +79,26 @@ pub(crate) fn secure_url(url: &str) -> String {
     }
 }
 
+/// A Postgres connect failure, diagnosed against the URL the USER wrote.
+///
+/// Both pools dial `secure_url(url)`, which appends `sslmode=verify-full` to
+/// the raw string. Diagnosing that string instead of the user's lost the
+/// reserved-character hint for a password holding `?` (the appended
+/// parameter lands inside the "password"), and the TLS hint wrapped an
+/// already-prefixed error a second time ("connect: connect: …").
+pub(crate) fn connect_error(what: &str, user_url: &str, e: impl std::fmt::Display) -> crate::error::Error {
+    let base = crate::urlerr::connect_err(what, user_url, e);
+    if url_is_local(user_url) {
+        return base;
+    }
+    match base {
+        crate::error::Error::Connect(m) => {
+            crate::error::Error::Connect(format!("{m} — {}", tls_required_hint(user_url)))
+        }
+        other => other,
+    }
+}
+
 /// The error a plaintext-only (or private-CA) server gets once TLS is the
 /// default — names the opt-outs verbatim, same reasoning as
 /// `dialect::mysql::tls_required_hint` (review round 2 §1.1.4).

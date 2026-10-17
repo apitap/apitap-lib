@@ -39,6 +39,7 @@ use crate::dialect::postgres::{quote_ident, quote_ident_path};
 
 async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
     // TLS by default off-loopback (review P0-3); explicit modes honoured.
+    let user_url = url;
     let url = crate::dialect::postgres::secure_url(url);
     PgPoolOptions::new()
         .max_connections(max)
@@ -54,17 +55,7 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
         })
         .connect(&url)
         .await
-        .map_err(|e| {
-            let base = crate::urlerr::connect_err("postgres source", &url, e);
-            if crate::dialect::postgres::url_is_local(&url) {
-                base
-            } else {
-                crate::error::Error::Connect(format!(
-                    "{base} — {}",
-                    crate::dialect::postgres::tls_required_hint(&url)
-                ))
-            }
-        })
+        .map_err(|e| crate::dialect::postgres::connect_error("postgres source", user_url, e))
 }
 
 pub(crate) struct PgSource {
