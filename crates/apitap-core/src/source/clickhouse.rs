@@ -534,14 +534,23 @@ impl crate::source::Source for ChSource {
                     return Ok(vec![one("false".into())]);
                 }
                 if let Some((lo, hi)) = probe.split_once('\t') {
-                    let (lo, hi) = (
-                        lo.trim().parse::<i64>().map_err(|e| {
-                            Error::Transfer(format!("clickhouse: cursor min → {e}"))
-                        })?,
-                        hi.trim().parse::<i64>().map_err(|e| {
-                            Error::Transfer(format!("clickhouse: cursor max → {e}"))
-                        })?,
-                    );
+                    // A UInt64 cursor past i64::MAX does not fit the span
+                    // arithmetic, and refusing the parse failed every parallel
+                    // read of such a table (MASTER M-49). Not a number at all
+                    // is still an error; out of i64's range reads as ONE span.
+                    let num = |v: &str, what: &str| -> Result<Option<i64>> {
+                        let v = v.trim();
+                        match v.parse::<i64>() {
+                            Ok(n) => Ok(Some(n)),
+                            Err(_) if v.parse::<u64>().is_ok() => Ok(None),
+                            Err(e) => Err(Error::Transfer(format!(
+                                "clickhouse: cursor {what} {v:?} → {e}"
+                            ))),
+                        }
+                    };
+                    let (Some(lo), Some(hi)) = (num(lo, "min")?, num(hi, "max")?) else {
+                        return Ok(vec![one(format!("true{dpred}"))]);
+                    };
                     return Ok(spans(lo, hi, want)
                         .into_iter()
                         .map(|(rlo, rhi)| {
