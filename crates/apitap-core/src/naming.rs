@@ -471,7 +471,12 @@ pub(crate) fn parse_peer(name: &str, artifact: Artifact) -> Option<PeerRun> {
     if head.len() < RUN_TOKEN_LEN {
         return None;
     }
-    let tok = &head[head.len() - RUN_TOKEN_LEN..];
+    // `get`, not indexing: a non-ASCII object name (an S3 key `tablé…`) can
+    // put the cut inside a character, and the slice panicked the run (P2).
+    let tok = head.get(head.len() - RUN_TOKEN_LEN..)?;
+    if !tok.is_ascii() {
+        return None;
+    }
     let b = tok.as_bytes();
     if b[0] != b'_' {
         return None;
