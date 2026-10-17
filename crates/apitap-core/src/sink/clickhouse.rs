@@ -930,6 +930,61 @@ impl ChSink {
         }
     }
 
+    /// A replace without `engine=` rebuilds the table as plain MergeTree and
+    /// EXCHANGEs it in. Over an existing table that is anything else — another
+    /// engine, Replicated, Distributed, PARTITION BY, a TTL, column codecs —
+    /// that swap silently threw away its engine, replication, retention and
+    /// compression (MASTER M-29). Refused before anything is copied, naming
+    /// what would be lost; `engine=` (and the table rebuilt deliberately) or a
+    /// drop is the operator's call.
+    async fn refuse_lossy_replace(&self) -> Result<()> {
+        let lit = ch_str(&self.final_bare);
+        let row = self
+            .ch
+            .exec(&format!(
+                "SELECT engine, engine_full, partition_key, \
+                        (SELECT count() FROM system.columns WHERE database = currentDatabase() \
+                         AND table = '{lit}' AND compression_codec != '') \
+                 FROM system.tables WHERE database = currentDatabase() AND name = '{lit}' \
+                 FORMAT TabSeparatedRaw"
+            ))
+            .await?;
+        let row = row.trim_end_matches('\n');
+        if row.is_empty() {
+            return Ok(());
+        }
+        let mut f = row.split('\t');
+        let (engine, full, part, codecs) = (
+            f.next().unwrap_or(""),
+            f.next().unwrap_or(""),
+            f.next().unwrap_or(""),
+            f.next().unwrap_or("0"),
+        );
+        let mut lost = Vec::new();
+        if engine != "MergeTree" {
+            lost.push(format!("its engine {engine}"));
+        }
+        if !part.is_empty() {
+            lost.push(format!("PARTITION BY {part}"));
+        }
+        if full.contains(" TTL ") {
+            lost.push("its TTL".to_string());
+        }
+        if codecs.trim() != "0" {
+            lost.push(format!("the codecs on {} column(s)", codecs.trim()));
+        }
+        if lost.is_empty() {
+            return Ok(());
+        }
+        Err(Error::InvalidInput(format!(
+            "mode='replace' would rebuild {} as a plain MergeTree and drop {} \
+             (it is: {full}) — pass engine= to say what the new table should be, \
+             drop the table first, or use mode='append'",
+            self.final_t,
+            lost.join(", ")
+        )))
+    }
+
     async fn ensure_state_table(&self) -> Result<()> {
         // Cluster mode: the watermark must be one truth across every node a
         // balancer can answer from. A node-local state table would let run N
@@ -1426,6 +1481,9 @@ impl crate::sink::Sink for ChSink {
         _durable: bool,
         mode: Mode,
     ) -> Result<()> {
+        if mode == Mode::Replace && self.ddl.engine.is_none() {
+            self.refuse_lossy_replace().await?;
+        }
         let mut ddl_list = if self.dest_structure.is_empty() {
             plan.cols
                 .iter()

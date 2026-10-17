@@ -260,6 +260,7 @@ LEGS = [
     leg("e2e_my_sink_warnings.py",    "a MySQL destination never publishes rows LOAD DATA dropped or changed"),
     leg("e2e_pg_search_path.py",      "an unqualified Postgres destination stays in the schema it lives in"),
     leg("e2e_pg_parallel_snapshot.py", "a parallel Postgres read sees one table state"),
+    leg("e2e_ch_replace_lossy.py",    "a ClickHouse replace without engine= never strips the table it replaces"),
 ]
 
 
