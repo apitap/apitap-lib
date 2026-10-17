@@ -361,17 +361,31 @@ async fn read_base(
     plan: &ReplayPlan,
 ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
     let t = ch_ident(dest_table);
-    let sel = pk_cols
-        .iter()
-        .map(|c| ch_ident(c))
-        .chain(cols.iter().map(|&i| ch_ident(&wal_cols[i])))
-        .collect::<Vec<_>>()
-        .join(", ");
     let key_list = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
     let mut preds = Vec::with_capacity(keys.len());
     for k in keys {
         preds.push(format!("({})", key_pred(pk_cols, k, pk_oids, false)?));
     }
+    // Rows meet the requested keys by SLOT, never by text (as BigQuery's
+    // readback does): each answer carries the index of the predicate it
+    // matched, and the map is keyed by the REQUESTED key. Keyed by the key
+    // columns as ClickHouse renders them, a NUMERIC `1.50` (CH: `1.5`), a
+    // timestamptz or a bool key never met the WAL text it was asked for:
+    // the masked update was refused torn on every run and the lane stuck
+    // (MASTER M-27).
+    let slot = format!(
+        "multiIf({}, -1)",
+        preds
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{p}, {i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let sel = std::iter::once(slot)
+        .chain(cols.iter().map(|&i| ch_ident(&wal_cols[i])))
+        .collect::<Vec<_>>()
+        .join(", ");
     let pre = before_window(plan);
     let body = u
         .read(&format!(
@@ -391,16 +405,27 @@ async fn read_base(
             base = ch_str(CL_BASELINE),
         ))
         .await?;
-    let np = pk_cols.len();
     let mut out = std::collections::HashMap::with_capacity(keys.len());
     for line in body.lines().filter(|l| !l.is_empty()) {
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != np + cols.len() {
+        if f.len() != 1 + cols.len() {
             return Err(Error::Transfer("log_based changelog: masked readback column count mismatch".into()));
         }
-        let key: crate::logbased::changelog::CKey = f[..np].iter().map(|x| tsv_unescape(x).unwrap_or_default()).collect();
-        let vals = f[np..].iter().map(|x| tsv_unescape(x).map(bytes::Bytes::from)).collect();
-        out.insert(key, vals);
+        let key = f[0]
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| keys.get(i))
+            .ok_or_else(|| {
+                Error::Transfer(format!(
+                    "log_based changelog: masked readback slot '{}' matches no requested key",
+                    f[0]
+                ))
+            })?;
+        let vals = f[1..]
+            .iter()
+            .map(|x| tsv_unescape(x).map(bytes::Bytes::from))
+            .collect();
+        out.insert(key.clone(), vals);
     }
     Ok(out)
 }

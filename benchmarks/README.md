@@ -647,7 +647,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_ch_source --> `e2e_ch_source.py` | ClickHouse -> ClickHouse, RowBinary relayed |
 | <!-- claim: leg.e2e_ch_cluster --> `e2e_ch_cluster.py` | a replicated destination is refused, not scattered |
 | <!-- claim: leg.e2e_ch_body_cap --> `e2e_ch_body_cap.py` | APITAP_CH_MAX_BODY for proxied ClickHouse |
-| <!-- claim: leg.e2e_changelog_ch --> `e2e_changelog_ch.py` | changelog=True on ClickHouse |
+| <!-- claim: leg.e2e_changelog_ch --> `e2e_changelog_ch.py` | changelog=True on ClickHouse; a masked update under a NUMERIC + bool key resolves |
 | <!-- claim: leg.e2e_changelog_my --> `e2e_changelog_my.py` | changelog=True on MySQL |
 | <!-- claim: leg.e2e_tls --> `e2e_tls.py` | Postgres TLS, verified not just offered |
 | <!-- claim: leg.e2e_tls_mysql --> `e2e_tls_mysql.py` | MySQL TLS, same |

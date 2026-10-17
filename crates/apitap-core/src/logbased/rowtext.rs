@@ -382,6 +382,13 @@ pub(crate) fn ch_key_literal(v: &[u8], oid: u32) -> Result<String> {
         }
         return Ok(s.to_string());
     }
+    // The row renderer lands bool as 1/0 (UInt8, as the bulk lane does), so
+    // the key must say the same: `'t'` against a UInt8 key column fails
+    // TYPE_MISMATCH and the masked readback refused the window on every run
+    // (MASTER M-27).
+    if oid == BOOL_OID {
+        return Ok(if v == b"t" { "1" } else { "0" }.to_string());
+    }
     Ok(format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")))
 }
 
@@ -620,6 +627,8 @@ mod tests {
         let mut out = Vec::new();
         render_ch_row_rb(&row, &types, &mut out).unwrap();
         assert_eq!(out, vec![0, 42, 0, 0, 0, 1, 2, b'h', b'i']);
+        assert_eq!(ch_key_literal(b"t", BOOL_OID).unwrap(), "1");
+        assert_eq!(ch_key_literal(b"f", BOOL_OID).unwrap(), "0");
 
         // A NULL into a non-nullable column is refused by name (the NULL
         // cell is column 1, so THAT column carries the non-nullable type).

@@ -4,6 +4,11 @@ Proves the three things that make an append-only CDC destination trustworthy:
   1. EVERY operation is captured (a key updated 3x lands 3 rows, not 1),
   2. `<table>__current` equals the source table, and
   3. a REPLAYED window does not corrupt the current state (duplicates are inert).
+
+Plus the masked readback on keys ClickHouse spells differently from the WAL:
+a NUMERIC `1.50` key (CH renders `1.5`) and a bool key. The readback used to
+key its answer by CH's rendering, never met the WAL key, and refused the
+window as torn on every run (MASTER review M-27).
 """
 import subprocess, sys
 import apitap
@@ -58,6 +63,10 @@ ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{T}' SETTINGS mutations_
     "SELECT count() FROM system.tables WHERE name='_apitap_state'") != "0" else None
 
 pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v text, body text)")  # body TOASTs later
+# EXTERNAL: out of line and uncompressed. repeat('x', 40000) compresses to a
+# few hundred bytes, under the 2 KB TOAST threshold — stored inline, the WAL
+# resends it on every UPDATE and the masked path is never taken.
+pg(f"ALTER TABLE {T} ALTER body SET STORAGE EXTERNAL")
 pg(f"INSERT INTO {T} VALUES (1,'a'),(2,'b'),(3,'c')")
 
 print("== bootstrap (baseline rows get op B) ==")
@@ -109,6 +118,46 @@ newest = ch(f"SELECT length(ifNull(body,'')) FROM {T} WHERE id=1 AND _apitap_op=
 print(f"   …and the newest U record itself carries it: {newest}")
 ok &= newest == str(len(BIG))
 ok &= current_matches("after-toast")
+
+print("== unchanged-TOAST under a NUMERIC + bool key (M-27) ==")
+N = f"{T}_num"
+
+
+def drop_num():
+    # Slot names are hashes: find this table's through its publication.
+    for pub in set(pg(f"SELECT pubname FROM pg_publication_tables WHERE tablename = '{N}'").split()):
+        pg(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+           f"WHERE slot_name = '{pub.removesuffix('_pub')}' AND NOT active")
+        pg(f"DROP PUBLICATION IF EXISTS {pub}")
+    pg(f"DROP TABLE IF EXISTS {N} CASCADE")
+
+
+drop_num()
+for t in (N, f"{N}__apitap_cl"):
+    ch(f"DROP TABLE IF EXISTS {t}")
+ch(f"DROP VIEW IF EXISTS {N}__current")
+if ch("SELECT count() FROM system.tables WHERE name='_apitap_state'") != "0":
+    ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table='{N}' SETTINGS mutations_sync=1")
+pg(f"CREATE TABLE {N} (k numeric(6,2), f bool, v text, body text, PRIMARY KEY (k, f))")
+pg(f"ALTER TABLE {N} ALTER body SET STORAGE EXTERNAL")
+pg(f"INSERT INTO {N} VALUES (1.50, true, 'a', NULL), (2.00, false, 'b', NULL)")
+apitap.transfer(PG, CH, table=N, mode="log_based", changelog=True)
+pg(f"UPDATE {N} SET body = repeat('y', 40000)")
+apitap.transfer(PG, CH, table=N, mode="log_based", changelog=True)
+pg(f"UPDATE {N} SET v = v || '-probe'")                  # body NOT touched: masked
+try:
+    apitap.transfer(PG, CH, table=N, mode="log_based", changelog=True)
+    got = ch(f"SELECT groupArray(concat(toString(k), '|', toString(f), '|', v, '|', toString(length(body)))) "
+             f"FROM (SELECT * FROM {N}__current ORDER BY k)")
+    want = "['1.5|1|a-probe|40000','2|0|b-probe|40000']"   # bool lands as UInt8
+    print(f"   __current after a body-less UPDATE: {got}")
+    ok &= got == want
+except Exception as e:
+    print(f"   ✗ the masked window was refused: {str(e)[:200]}")
+    ok = False
+drop_num()
+ch(f"DROP VIEW IF EXISTS {N}__current")
+ch(f"DROP TABLE IF EXISTS {N}")
 
 print("== a REPLICA run onto a changelog table is refused ==")
 try:
