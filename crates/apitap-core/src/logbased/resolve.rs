@@ -240,11 +240,6 @@ impl Source<'_> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "SELECT {sel} FROM {} WHERE {}::text = $1",
-            quote_table(qualified_src),
-            quote_ident(pk)
-        );
         // One tx pins the session UTC so timestamptz::text matches the WAL's
         // +00-suffixed rendering (SET LOCAL dies with the tx).
         let mut tx = self.0.begin().await.map_err(db_err)?;
@@ -252,6 +247,25 @@ impl Source<'_> {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        // The key compares in its OWN type: `"pk"::text = $1` cannot use the
+        // primary-key index, so every masked key was a sequential scan of the
+        // source table — hours for a large table under Iceberg CDC (MASTER
+        // M-59). The WAL's key text casts back exactly (numeric, timestamptz
+        // with its +00, bool, bytea's \x-hex).
+        let ty: String = sqlx::query_scalar(
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attname = $2 AND NOT a.attisdropped",
+        )
+        .bind(quote_table(qualified_src))
+        .bind(pk)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let sql = format!(
+            "SELECT {sel} FROM {} WHERE {} = $1::{ty}",
+            quote_table(qualified_src),
+            quote_ident(pk)
+        );
         for (key, fin) in r.masked_mut() {
             let Fin::Masked { row: cells, .. } = fin else { continue };
             let ktext = String::from_utf8(key[0].clone())

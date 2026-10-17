@@ -647,6 +647,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_binlog_format --> `e2e_my_binlog_format.py` | MySQL CDC is exact under binlog_checksum=NONE across a rotate and a TRUNCATE; a STATEMENT-format write to a tracked table is refused, not dropped |
 | <!-- claim: leg.e2e_pg_mixed_case_pk --> `e2e_pg_mixed_case_pk.py` | Postgres CDC of a mixed-case table (beside a lower-case twin) whose PRIMARY KEY has INCLUDE columns is exact |
 | <!-- claim: leg.e2e_pg_state_schema --> `e2e_pg_state_schema.py` | Postgres CDC state lives in the destination schema's _apitap_state, where a bulk replace clears it |
+| <!-- claim: leg.e2e_ice_toast_refetch --> `e2e_ice_toast_refetch.py` | an Iceberg CDC drain refetches TOAST holes through the source's primary key: no sequential scan, every body intact |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |
