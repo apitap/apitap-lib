@@ -82,14 +82,27 @@ pub(crate) fn copy_escape(v: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// One bytea value as COPY text from its RAW bytes: `\\x` + hex, which COPY
+/// unescapes to the `\x…` input form. The MySQL lane ships BLOB/BINARY/BIT
+/// cells as their bytes, and copied as text those wedged the lane on 0x00 or
+/// invalid UTF-8 and re-decoded a `\101` payload as escape-format bytea
+/// (MASTER M-16).
+pub(crate) fn copy_bytea_hex(v: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(b"\\\\x");
+    out.extend_from_slice(hex::encode(v).as_bytes());
+}
+
 /// One full row, Postgres-dialect text (COPY text for a pg destination).
-pub(crate) fn render_copy_row(row: &Tuple, out: &mut Vec<u8>) -> Result<()> {
+/// `hex[i]` marks a column whose cells are raw bytes for a bytea column (the
+/// MySQL lane); empty means none (the WAL already renders `\x…`).
+pub(crate) fn render_copy_row(row: &Tuple, hex: &[bool], out: &mut Vec<u8>) -> Result<()> {
     for (i, cell) in row.views().enumerate() {
         if i > 0 {
             out.push(b'\t');
         }
         match cell {
             Cellv::Null => out.extend_from_slice(b"\\N"),
+            Cellv::Text(t) if hex.get(i).copied().unwrap_or(false) => copy_bytea_hex(t, out),
             Cellv::Text(t) => copy_escape(t, out),
             Cellv::UnchangedToast => {
                 return Err(Error::Transfer(

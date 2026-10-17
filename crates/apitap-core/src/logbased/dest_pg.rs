@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::lease::Watermark;
 use crate::logbased::collapse::{Collapsed, ResidueOp};
 use crate::logbased::replay::WindowId;
-use crate::logbased::rowtext::{copy_escape, render_copy_row, row_key_refs};
+use crate::logbased::rowtext::{copy_bytea_hex, copy_escape, render_copy_row, row_key_refs};
 use crate::logbased::window::TableWindow;
 use crate::wire::pgoutput::Cell;
 use sqlx::Executor;
@@ -184,6 +184,48 @@ async fn apply_unit(
     let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
     let tx = u.tx();
 
+    // The MySQL lane ships BLOB/BINARY/BIT cells as their raw bytes (its OIDs
+    // are all 0 — the value carries the type). Copied as text those wedged
+    // the lane on 0x00 or invalid UTF-8, and a `\101` payload re-decoded as
+    // escape-format bytea, silently (MASTER M-16). The destination's catalog
+    // says which columns are bytea; those cells go as hex.
+    let raw_bytes = !l.oids().is_empty() && l.oids().iter().all(|&o| o == 0);
+    // The residue binds every value as a $n — a cell's text is embedded
+    // nowhere, so no quoting rule (backslash, newline, a quote in the
+    // payload) can be got wrong, which the old cell-literal rendering did for
+    // anything but a lone apostrophe (system review 2026-10-07, dest_pg binds).
+    //
+    // A parameter arrives as `text`, and `text` has no `=` operator against
+    // an integer (or any non-text) column — the old literals were coerced by
+    // the server, a parameter is not. So each value also names the column's
+    // own type, read once from the destination's catalog, and the placeholder
+    // is cast with it: `"id" = $3::integer`. The value still travels as a
+    // bind; nothing embeds (this cast bug is the regression
+    // e2e_logbased/e2e_toast_rekey caught).
+    let casts: std::collections::HashMap<String, String> = if c.residue.is_empty() && !raw_bytes {
+        std::collections::HashMap::new()
+    } else {
+        let names: Vec<String> = wal_cols.to_vec();
+        let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
+             FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.attname::text = ANY($2)",
+        )
+        .bind(&ft)
+        .bind(&names)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().collect()
+    };
+    let hex_col = |name: &str| raw_bytes && casts.get(name).is_some_and(|t| t == "bytea");
+    let hex: Vec<bool> = wal_cols.iter().map(|c| hex_col(c)).collect();
+    let key_hex: Vec<bool> = pk_idx
+        .iter()
+        .map(|&i| hex.get(i).copied().unwrap_or(false))
+        .collect();
+
     if c.truncate {
         tx.execute(format!("TRUNCATE {ft}").as_str()).await.map_err(db_err)?;
     }
@@ -209,7 +251,7 @@ async fn apply_unit(
         let mut buf = Vec::with_capacity(4 << 20);
         for key in c.deletes.iter() {
             let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-            render_key_row(&refs, &mut buf);
+            render_key_row(&refs, &key_hex, &mut buf);
             if buf.len() > 4 << 20 {
                 // send(&buf) keeps the 4 MiB capacity — mem::take would
                 // regrow it from zero every chunk on the timed path.
@@ -218,7 +260,7 @@ async fn apply_unit(
             }
         }
         for row in &c.upserts {
-            render_key_row(&row_key_refs(row, pk_idx), &mut buf);
+            render_key_row(&row_key_refs(row, pk_idx), &key_hex, &mut buf);
             if buf.len() > 4 << 20 {
                 copy.send(&buf[..]).await.map_err(db_err)?;
                 buf.clear();
@@ -255,7 +297,7 @@ async fn apply_unit(
             .map_err(db_err)?;
         let mut buf = Vec::with_capacity(4 << 20);
         for row in &c.upserts {
-            render_copy_row(row, &mut buf)?;
+            render_copy_row(row, &hex, &mut buf)?;
             if buf.len() > 4 << 20 {
                 copy.send(&buf[..]).await.map_err(db_err)?;
                 buf.clear();
@@ -275,35 +317,8 @@ async fn apply_unit(
     }
 
     // Residue tail: serial, ordered (masked updates and their followers).
-    // Every value travels as a $n bind — a cell's text is embedded nowhere,
-    // so no quoting rule (backslash, newline, a quote in the payload) can be
-    // got wrong, which the old cell-literal rendering did for anything but a
-    // lone apostrophe (system review 2026-10-07, dest_pg binds).
-    //
-    // A parameter arrives as `text`, and `text` has no `=` operator against
-    // an integer (or any non-text) column — the old literals were coerced by
-    // the server, a parameter is not. So each value also names the column's
-    // own type, read once from the destination's catalog, and the placeholder
-    // is cast with it: `"id" = $3::integer`. The value still travels as a
-    // bind; nothing embeds (this cast bug is the regression
-    // e2e_logbased/e2e_toast_rekey caught).
-    let casts: std::collections::HashMap<String, String> = if c.residue.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        let names: Vec<String> = wal_cols.to_vec();
-        let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
-            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
-             FROM pg_attribute a \
-             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
-               AND a.attname::text = ANY($2)",
-        )
-        .bind(&ft)
-        .bind(&names)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(db_err)?;
-        rows.into_iter().collect()
-    };
+    // Every value travels as a $n bind, cast with the column's own type (see
+    // `casts` above).
     for op in &c.residue {
         let mut binds: Vec<Option<String>> = Vec::new();
         let sql = match op {
@@ -315,7 +330,7 @@ async fn apply_unit(
                         !matches!(cell, Cell::UnchangedToast) && !pk_cols.contains(cname)
                     })
                     .map(|(cname, cell)| {
-                        binds.push(bind_of(cell));
+                        binds.push(bind_of(cell, hex_col(cname)));
                         format!(
                             "{} = ${}::{}",
                             quote_ident(cname),
@@ -328,7 +343,7 @@ async fn apply_unit(
                 if sets.is_empty() {
                     continue;
                 }
-                let pred = key_pred_bound(pk_cols, key, &casts, &mut binds);
+                let pred = key_pred_bound(pk_cols, key, &casts, &key_hex, &mut binds);
                 format!("UPDATE {ft} SET {sets} WHERE {pred}")
             }
             ResidueOp::Upsert { row } => {
@@ -336,7 +351,7 @@ async fn apply_unit(
                     .iter()
                     .zip(row.iter())
                     .map(|(cname, cell)| {
-                        binds.push(bind_of(cell));
+                        binds.push(bind_of(cell, hex_col(cname)));
                         format!("${}::{}", binds.len(), cast_of(&casts, cname))
                     })
                     .collect::<Vec<_>>()
@@ -358,7 +373,7 @@ async fn apply_unit(
                 )
             }
             ResidueOp::Delete { key } => {
-                let pred = key_pred_bound(pk_cols, key, &casts, &mut binds);
+                let pred = key_pred_bound(pk_cols, key, &casts, &key_hex, &mut binds);
                 format!("DELETE FROM {ft} WHERE {pred}")
             }
             ResidueOp::Rekey { old_key, row, .. } => {
@@ -374,7 +389,7 @@ async fn apply_unit(
                     .zip(row.iter())
                     .filter(|(_, cell)| !matches!(cell, Cell::UnchangedToast))
                     .map(|(cname, cell)| {
-                        binds.push(bind_of(cell));
+                        binds.push(bind_of(cell, hex_col(cname)));
                         format!(
                             "{} = ${}::{}",
                             quote_ident(cname),
@@ -392,7 +407,7 @@ async fn apply_unit(
                 // Idempotent on replay by construction: once the move has
                 // been applied the old key is gone, so a re-applied window
                 // matches zero rows and changes nothing.
-                let pred = key_pred_bound(pk_cols, old_key, &casts, &mut binds);
+                let pred = key_pred_bound(pk_cols, old_key, &casts, &key_hex, &mut binds);
                 format!("UPDATE {ft} SET {sets} WHERE {pred}")
             }
         };
@@ -763,12 +778,16 @@ pub(crate) fn quote_table(t: &str) -> String {
     t.split('.').map(quote_ident).collect::<Vec<_>>().join(".")
 }
 
-fn render_key_row(key: &[&[u8]], out: &mut Vec<u8>) {
+fn render_key_row(key: &[&[u8]], hex: &[bool], out: &mut Vec<u8>) {
     for (i, k) in key.iter().enumerate() {
         if i > 0 {
             out.push(b'\t');
         }
-        copy_escape(k, out);
+        if hex.get(i).copied().unwrap_or(false) {
+            copy_bytea_hex(k, out);
+        } else {
+            copy_escape(k, out);
+        }
     }
     out.push(b'\n');
 }
@@ -779,10 +798,21 @@ fn render_key_row(key: &[&[u8]], out: &mut Vec<u8>) {
 /// source did not resend included — the literal path rendered it NULL too),
 /// `Some` is the cell's text as it arrived (system review 2026-10-07,
 /// dest_pg binds).
-fn bind_of(cell: &Cell) -> Option<String> {
+/// `hex`: the cell is raw bytes for a bytea column (the MySQL lane), bound as
+/// its `\x…` input form — lossy UTF-8 would replace every invalid byte with
+/// U+FFFD (MASTER M-16).
+fn bind_of(cell: &Cell, hex: bool) -> Option<String> {
     match cell {
         Cell::Null | Cell::UnchangedToast => None,
-        Cell::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
+        Cell::Text(t) => Some(bind_text(t, hex)),
+    }
+}
+
+fn bind_text(t: &[u8], hex: bool) -> String {
+    if hex {
+        format!("\\x{}", hex::encode(t))
+    } else {
+        String::from_utf8_lossy(t).into_owned()
     }
 }
 
@@ -802,13 +832,15 @@ fn key_pred_bound(
     pk_cols: &[String],
     key: &[Vec<u8>],
     casts: &std::collections::HashMap<String, String>,
+    key_hex: &[bool],
     binds: &mut Vec<Option<String>>,
 ) -> String {
     pk_cols
         .iter()
         .zip(key.iter())
-        .map(|(c, v)| {
-            binds.push(Some(String::from_utf8_lossy(v).into_owned()));
+        .enumerate()
+        .map(|(i, (c, v))| {
+            binds.push(Some(bind_text(v, key_hex.get(i).copied().unwrap_or(false))));
             format!("{} = ${}::{}", quote_ident(c), binds.len(), cast_of(casts, c))
         })
         .collect::<Vec<_>>()
@@ -895,13 +927,19 @@ mod tests {
         let mut casts = std::collections::HashMap::new();
         casts.insert("id".to_string(), "integer".to_string());
         let mut binds: Vec<Option<String>> = Vec::new();
-        let pred = key_pred_bound(&pk, &[b"x'; DROP TABLE t; --".to_vec()], &casts, &mut binds);
+        let pred = key_pred_bound(
+            &pk,
+            &[b"x'; DROP TABLE t; --".to_vec()],
+            &casts,
+            &[],
+            &mut binds,
+        );
         assert_eq!(pred, "\"id\" = $1::integer");
         assert_eq!(binds, vec![Some("x'; DROP TABLE t; --".to_string())]);
 
         let poison = Cell::Text(b"a'b\\c\n".as_slice().into());
-        assert_eq!(bind_of(&poison).as_deref(), Some("a'b\\c\n"));
-        assert_eq!(bind_of(&Cell::Null), None);
-        assert_eq!(bind_of(&Cell::UnchangedToast), None);
+        assert_eq!(bind_of(&poison, false).as_deref(), Some("a'b\\c\n"));
+        assert_eq!(bind_of(&Cell::Null, false), None);
+        assert_eq!(bind_of(&Cell::UnchangedToast, false), None);
     }
 }

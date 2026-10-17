@@ -633,6 +633,8 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_ice_late_commit --> `e2e_ice_late_commit.py` | a failure after an ambiguous Iceberg commit never sweeps what a late commit lands |
 | <!-- claim: leg.e2e_s3_publish_faults --> `e2e_s3_publish_faults.py` | an S3 publish fault leaves a readable table and no lock |
 | <!-- claim: leg.e2e_my_replace_fk --> `e2e_my_replace_fk.py` | a MySQL replace into an FK-referenced table is refused before the load |
+| <!-- claim: leg.e2e_my_cdc_dests.pg --> `e2e_my_cdc_dests.py pg` | MySQL CDC into Postgres: BLOB/BINARY/BIT bytes and TIMESTAMP instants land as the source holds them, under a non-UTC destination zone; a zero TIMESTAMP is refused, never 1970 |
+| <!-- claim: leg.e2e_my_cdc_dests.ch --> `e2e_my_cdc_dests.py ch` | MySQL CDC into ClickHouse: a DECIMAL is spelled one way whether the bulk load or the binlog wrote it |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

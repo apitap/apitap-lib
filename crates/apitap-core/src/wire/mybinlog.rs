@@ -488,8 +488,19 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             ))
         }
         MT_TIMESTAMP2 => {
-            let secs = i32::from_be_bytes(r.take(4)?.try_into().unwrap()) as i64;
+            // Unsigned: MariaDB stores TIMESTAMP up to 2106, and read as i32
+            // every value past 2038-01-19 went negative — a 1901 date
+            // (MASTER M-66).
+            let secs = u32::from_be_bytes(r.take(4)?.try_into().unwrap()) as i64;
             let frac = read_frac(r, c.meta as u8)?;
+            if secs == 0 && frac == 0 {
+                // Epoch 0 is not a TIMESTAMP value (the range starts one
+                // second later); it is the zero TIMESTAMP, '0000-00-00
+                // 00:00:00', which rendered as 1970-01-01 — a real instant
+                // the source never held. Relay the zero literal, as DATE and
+                // DATETIME do, and let the destination accept or refuse it.
+                return Ok(b"0000-00-00 00:00:00+00".to_vec());
+            }
             Ok(fmt_epoch(secs, frac))
         }
         MT_DATETIME2 => {
@@ -890,24 +901,29 @@ fn decode_decimal(r: &mut R<'_>, precision: u32, scale: u32) -> Result<Vec<u8>> 
         out.push(b'-');
     }
     let int_start = out.len();
-    // The leading group renders unpadded (its leading zeros are not data);
-    // every later group is a fixed 9-digit block. Byte-identical to the
-    // String version this replaced — including a literal "0" leading group,
-    // which stays a rendered zero exactly as `v.to_string()` produced.
+    // The first NON-ZERO group renders unpadded (its leading zeros are not
+    // data) and every later group is a fixed 9-digit block. Zero groups
+    // before it render nothing: a DECIMAL(65,30) holding 123.45 has a zero
+    // partial group and three zero full groups ahead of the 123, and
+    // rendering the zero group as "0" padded the rest into
+    // "0000000000000000000000000123.45" — while the bulk load wrote 123.45,
+    // two spellings of one value in a String destination (MASTER M-40).
     if int_rest > 0 {
         let n = BYTES_FOR[int_rest as usize];
         let mut v = 0u32;
         for byte in rd.take(n)? {
             v = (v << 8) | *byte as u32;
         }
-        out.extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
+        if v != 0 {
+            out.extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
+        }
     }
     for _ in 0..int_full {
         let v = u32::from_be_bytes(rd.take(4)?.try_into().unwrap());
-        if out.len() == int_start {
-            out.extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
-        } else {
+        if out.len() != int_start {
             push_padded(&mut out, v, 9);
+        } else if v != 0 {
+            out.extend_from_slice(itoa::Buffer::new().format(v).as_bytes());
         }
     }
     if out.len() == int_start {
