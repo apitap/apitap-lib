@@ -402,10 +402,22 @@ pub(crate) fn strip_utc_offset(v: &[u8]) -> Result<&[u8]> {
     if let Some(s) = v.strip_suffix(b"+00:00") {
         return Ok(s);
     }
+    // Postgres values this destination has no spelling for. They are
+    // refused, not guessed: 'infinity' has no DATETIME, and a BC date or a
+    // timetz's own non-UTC offset would land as a different value once the
+    // suffix is cut. Name the value, so the operator fixes the row instead
+    // of chasing a walsender bug (MASTER M-24).
+    let s = String::from_utf8_lossy(v);
+    if s == "infinity" || s == "-infinity" || s.ends_with(" BC") {
+        return Err(Error::Transfer(format!(
+            "log_based: the timestamp '{s}' has no value in this destination — \
+             update or delete that row at the source (or exclude the column) and re-run"
+        )));
+    }
     Err(Error::Transfer(format!(
-        "log_based: timestamptz '{}' does not carry a +00 offset — the \
-         replication session should be pinned to UTC (walsender bug?)",
-        String::from_utf8_lossy(v)
+        "log_based: the time value '{s}' does not carry a +00 offset — a timestamptz is \
+         always UTC on the replication session, so this is a timetz with its own offset, \
+         which this destination cannot hold as written; cast the column in a source view"
     )))
 }
 
@@ -591,12 +603,32 @@ mod tests {
         assert_eq!(out, b"1|0|\\\\x0102");
     }
 
+    /// The spellings the WAL sends for values a MySQL/BigQuery timestamp
+    /// cannot hold are refused by name (MASTER M-24); 'infinity' was
+    /// reported as a walsender bug.
+    #[test]
+    fn strip_utc_offset_names_what_it_refuses() {
+        assert_eq!(
+            strip_utc_offset(b"2024-01-01 00:00:00+00").unwrap(),
+            b"2024-01-01 00:00:00"
+        );
+        assert_eq!(strip_utc_offset(b"10:00:00+00:00").unwrap(), b"10:00:00");
+        for v in [&b"infinity"[..], b"-infinity", b"0044-03-15 00:00:00+00 BC"] {
+            let e = strip_utc_offset(v).unwrap_err().to_string();
+            assert!(e.contains("has no value in this destination"), "{e}");
+        }
+        let e = strip_utc_offset(b"10:00:00+02").unwrap_err().to_string();
+        assert!(e.contains("timetz with its own offset"), "{e}");
+    }
+
     #[test]
     fn ch_key_literal_types() {
         assert_eq!(ch_key_literal(b"123", 20).unwrap(), "123");
         assert_eq!(ch_key_literal(b"a'b", 25).unwrap(), "'a\\'b'");
         assert_eq!(ch_key_literal(b"\\x00", BYTEA_OID).unwrap(), "'\\\\x00'");
         assert!(ch_key_literal(b"1; DROP", 20).is_err());
+        assert_eq!(ch_key_literal(b"t", BOOL_OID).unwrap(), "1");
+        assert_eq!(ch_key_literal(b"f", BOOL_OID).unwrap(), "0");
     }
 
     #[test]
@@ -627,8 +659,6 @@ mod tests {
         let mut out = Vec::new();
         render_ch_row_rb(&row, &types, &mut out).unwrap();
         assert_eq!(out, vec![0, 42, 0, 0, 0, 1, 2, b'h', b'i']);
-        assert_eq!(ch_key_literal(b"t", BOOL_OID).unwrap(), "1");
-        assert_eq!(ch_key_literal(b"f", BOOL_OID).unwrap(), "0");
 
         // A NULL into a non-nullable column is refused by name (the NULL
         // cell is column 1, so THAT column carries the non-nullable type).
