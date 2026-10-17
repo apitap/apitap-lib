@@ -351,7 +351,17 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
                 // No grid bound to walk to: emptiness is the only end known.
                 break;
             }
-            for row in &page {
+            for (j, row) in page.iter().enumerate() {
+                if let Some(i) = beyond_header(row, ncols) {
+                    return Err(Error::InvalidInput(format!(
+                        "gsheets: row {} of tab '{tab}' has a value in column {} but the header row \
+                         ends at column {} — the cell would be dropped. Give that column a header \
+                         (or clear the cell)",
+                        start + j,
+                        column_letters(i),
+                        column_letters(ncols.saturating_sub(1)),
+                    )));
+                }
                 enc.row_start(ncols, &mut out);
                 for i in 0..ncols {
                     let cell = row.get(i).map(String::as_str).unwrap_or("");
@@ -374,6 +384,31 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
     }
 }
 
+/// The first non-empty cell past the header's width, if any. Sheets omits a
+/// trailing blank header, so a data cell in a column with no header used to
+/// be dropped without a word (MASTER M-48).
+fn beyond_header(row: &[String], ncols: usize) -> Option<usize> {
+    row.iter()
+        .enumerate()
+        .skip(ncols)
+        .find(|(_, c)| !c.is_empty())
+        .map(|(i, _)| i)
+}
+
+/// A 0-based column index in the sheet's own spelling: 0 → A, 26 → AA.
+fn column_letters(mut i: usize) -> String {
+    let mut s = Vec::new();
+    loop {
+        s.push(b'A' + (i % 26) as u8);
+        if i < 26 {
+            break;
+        }
+        i = i / 26 - 1;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap_or_default()
+}
+
 /// Where the row pump's next range starts, or `None` past the allocated grid
 /// (`grid_rows < 0` = unknown: walk until a page comes back empty). Emptiness
 /// alone is NOT end-of-data — the API omits trailing blanks per request
@@ -388,6 +423,23 @@ fn next_page_start(start: usize, grid_rows: i64) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// MASTER M-48: a value past the header's width is found and named;
+    /// trailing blanks (the API pads nothing, but a user's sheet may) are not.
+    #[test]
+    fn a_cell_beyond_the_header_is_found_and_named() {
+        let row = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::beyond_header(&row(&["a", "b"]), 2), None);
+        assert_eq!(super::beyond_header(&row(&["a", "b", ""]), 2), None);
+        assert_eq!(super::beyond_header(&row(&["a", "b", "", "x"]), 2), Some(3));
+        assert_eq!(super::beyond_header(&row(&["a"]), 2), None);
+        assert_eq!(super::column_letters(0), "A");
+        assert_eq!(super::column_letters(3), "D");
+        assert_eq!(super::column_letters(25), "Z");
+        assert_eq!(super::column_letters(26), "AA");
+        assert_eq!(super::column_letters(701), "ZZ");
+        assert_eq!(super::column_letters(702), "AAA");
+    }
+
     /// R2-9: the walk stops only past the allocated grid; an unknown grid
     /// walks on (the caller handles emptiness).
     #[test]
