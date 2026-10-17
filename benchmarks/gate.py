@@ -268,6 +268,7 @@ LEGS = [
     leg("e2e_pg_mixed_case_pk.py",    "Postgres CDC of a mixed-case table keyed with INCLUDE columns"),
     leg("e2e_pg_state_schema.py",     "Postgres CDC state lives in the destination's schema"),
     leg("e2e_ice_toast_refetch.py",   "an Iceberg CDC drain refetches TOAST holes through the primary key", {"iceberg"}),
+    leg("e2e_my_require_pk.py",       "a MySQL destination with sql_require_primary_key=ON takes every lane"),
 ]
 
 

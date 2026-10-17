@@ -146,7 +146,12 @@ async fn apply_unit(
             .collect::<Result<Vec<_>>>()?
             .join(", ");
         u.temp_ddl("DROP TEMPORARY TABLE IF EXISTS _ap_del").await?;
-        u.temp_ddl(&format!("CREATE TEMPORARY TABLE _ap_del ({ddl}) ENGINE=InnoDB")).await?;
+        // Keyed: sql_require_primary_key=ON refuses a temporary table without
+        // a primary key too (MASTER M-52). The rows are a key set, so the key
+        // costs nothing — LOAD DATA LOCAL skips a repeated key — and the join
+        // below probes it.
+        let pk = pk_cols.iter().map(|k| my_ident(k)).collect::<Vec<_>>().join(", ");
+        u.temp_ddl(&format!("CREATE TEMPORARY TABLE _ap_del ({ddl}, PRIMARY KEY ({pk})) ENGINE=InnoDB")).await?;
     }
     if !c.upserts.is_empty() {
         u.temp_ddl("DROP TEMPORARY TABLE IF EXISTS _ap_up").await?;

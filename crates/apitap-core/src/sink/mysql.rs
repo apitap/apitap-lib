@@ -359,11 +359,18 @@ impl crate::guard::GuardStore for MyGuard {
     }
 
     /// MySQL has no zero-column table, so a marker carries one it never reads.
-    /// MEMORY, because nothing in it needs to survive a restart.
+    /// MEMORY, because nothing in it needs to survive a restart. A PRIMARY KEY,
+    /// because sql_require_primary_key=ON (the DigitalOcean default) refuses
+    /// any table without one — and this marker is the first thing every run
+    /// creates, so every MySQL-destination run failed there (MASTER M-52).
     async fn create_marker(&self, raw: &str) -> Result<()> {
-        self.exec(&format!("CREATE TABLE IF NOT EXISTS {} (t TINYINT) ENGINE=MEMORY", self.fq(raw)))
-            .await
+        self.exec(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (t TINYINT NOT NULL PRIMARY KEY) ENGINE=MEMORY",
+            self.fq(raw)
+        ))
+        .await
     }
+
 
     async fn drop_object(&self, raw: &str) -> Result<()> {
         self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(raw))).await
@@ -720,6 +727,17 @@ impl MySqlSink {
         )))
     }
 
+    /// `sql_require_primary_key` is ON (MySQL 8.0.13+; MariaDB has no such
+    /// variable and answers nothing).
+    async fn requires_primary_key(&self) -> Result<bool> {
+        let mut conn = self.deadline_conn().await?;
+        let v: Option<(String, String)> = conn
+            .query_first("SHOW VARIABLES LIKE 'sql_require_primary_key'")
+            .await
+            .map_err(|e| Error::Transfer(format!("mysql sql_require_primary_key: {e}")))?;
+        Ok(v.is_some_and(|(_, v)| v.eq_ignore_ascii_case("ON") || v == "1"))
+    }
+
     async fn scalar(&self, sql: &str) -> Result<Option<String>> {
         let mut conn = self.deadline_conn().await?;
         let v: Option<Option<String>> = conn
@@ -990,7 +1008,8 @@ impl crate::sink::Sink for MySqlSink {
                 conn.query_map(
                     format!(
                         "SELECT column_name, column_type FROM information_schema.columns \
-                         WHERE table_schema='{}' AND table_name='{}' ORDER BY ordinal_position",
+                         WHERE table_schema='{}' AND table_name='{}' AND column_name != '{INVISIBLE_KEY}' \
+                         ORDER BY ordinal_position",
                         sql_lit(&self.db),
                         sql_lit(&self.bare)
                     ),
@@ -1022,6 +1041,15 @@ impl crate::sink::Sink for MySqlSink {
         if !plan.pk_cols.is_empty() {
             let pk: Vec<String> = plan.pk_cols.iter().map(|c| my_ident(c)).collect();
             ddl.push(format!("PRIMARY KEY ({})", pk.join(", ")));
+        } else if self.requires_primary_key().await? {
+            // A key-less source under sql_require_primary_key=ON: an
+            // INVISIBLE generated key (MySQL 8.0.23+, what the server's own
+            // sql_generate_invisible_primary_key does). LOAD DATA names its
+            // columns and `SELECT *` does not see it, so no row changes.
+            ddl.push(format!(
+                "{} BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY INVISIBLE",
+                my_ident(INVISIBLE_KEY)
+            ));
         }
         // No blind DROP any more, of staging or of the `__apitap_old` slot.
         // Those two statements WERE the defect: they destroyed whatever objects
@@ -1203,7 +1231,8 @@ impl crate::sink::Sink for MySqlSink {
             conn.query_map(
                 format!(
                     "SELECT column_name, column_type FROM information_schema.columns \
-                     WHERE table_schema='{}' AND table_name='{}' ORDER BY ordinal_position",
+                     WHERE table_schema='{}' AND table_name='{}' AND column_name != '{INVISIBLE_KEY}' \
+                     ORDER BY ordinal_position",
                     sql_lit(&self.db),
                     sql_lit(&self.bare)
                 ),
@@ -1511,6 +1540,10 @@ pub(crate) struct MySqlLoader {
 /// must never become a hang — the channel close is what stops the client's side,
 /// the KILL is what stops the server's, and one without the other is survivable.
 const KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The invisible key a key-less staging table gets under
+/// sql_require_primary_key=ON (MASTER M-52). Never part of a plan's columns.
+const INVISIBLE_KEY: &str = "_apitap_rowid";
 
 impl MySqlLoader {
     /// `KILL QUERY <this load's CONNECTION_ID()>` from another connection.
