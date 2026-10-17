@@ -1259,9 +1259,11 @@ impl PgSink {
                 // Parallel spans share no snapshot: a row UPDATEd mid-run can land
                 // in staging twice (old and new version) and ON CONFLICT refuses to
                 // touch the same row twice. Dedupe deterministically — keep the
-                // highest cursor value per key.
+                // highest cursor value per key. NULLS LAST: Postgres sorts NULL
+                // first under DESC, so a version with a NULL cursor beat the
+                // newest one (P2).
                 let order = match &self.cursor_col {
-                    Some(c) => format!("{keys}, {} DESC", quote_ident(c)),
+                    Some(c) => format!("{keys}, {} DESC NULLS LAST", quote_ident(c)),
                     None => keys.clone(),
                 };
                 let mut tx = self
