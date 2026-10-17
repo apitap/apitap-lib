@@ -122,16 +122,16 @@ impl ChDest {
     }
 
     /// After a replica bootstrap, inside the unit whose close writes the state
-    /// row: drop the scratch names older releases left untokenized, and — when
-    /// the destination is a Replacing-family table the user asked for — add
-    /// the tombstone bookkeeping columns so the drain can take the insert-only
-    /// path (design §14, slice 2). A classic MergeTree replica is untouched.
+    /// row: drop the scratch names older releases left untokenized.
+    ///
+    /// It no longer ALTERs anything. It used to add the tombstone pair to ANY
+    /// Replacing-family destination, and a user's own
+    /// `ReplacingMergeTree(updated_at)` then took the insert-only path, where
+    /// a delete is a tombstone row its engine never reads: deletes never
+    /// applied (MASTER M-26). A table whose engine names the pair got the
+    /// columns at CREATE already — the engine cannot reference them otherwise.
     pub(crate) async fn bootstrap_finish(&self, u: &mut ChUnit<'_>, dest_table: &str) -> Result<()> {
         u.drop_legacy_scratch(dest_table).await?;
-        let engine = self.store.engine_of(dest_table).await;
-        if engine.starts_with("ReplacingMergeTree") {
-            u.exec_owned(&insert_only_columns_ddl(dest_table)).await?;
-        }
         Ok(())
     }
 
@@ -993,10 +993,35 @@ async fn apply_unit(
 }
 
 /// Everything that reaches the server. See the module doc.
-/// Insert-only applies when the destination table's engine is a Replacing
-/// family engine and it carries both bookkeeping columns (design §14).
-fn is_insert_only_shape(engine: &str, has_ver: bool, has_deleted: bool) -> bool {
-    engine.starts_with("ReplacingMergeTree") && has_ver && has_deleted
+/// Insert-only applies when the destination's engine is a Replacing-family
+/// engine whose version and is_deleted arguments ARE the bookkeeping pair,
+/// `ReplacingMergeTree(_apitap_ver, _apitap_deleted)` (design §14), and both
+/// columns exist. `engine_full` is `system.tables.engine_full`, arguments and
+/// all: the bare `engine` column said "ReplacingMergeTree" for a user's
+/// `ReplacingMergeTree(updated_at)` too, whose merges never read a tombstone
+/// (MASTER M-26). A Replicated spelling's path arguments come first, so the
+/// pair is matched as the LAST two arguments.
+fn is_insert_only_shape(engine_full: &str, has_ver: bool, has_deleted: bool) -> bool {
+    let Some((family, rest)) = engine_full.split_once('(') else {
+        return false;
+    };
+    if !matches!(
+        family.trim(),
+        "ReplacingMergeTree" | "ReplicatedReplacingMergeTree"
+    ) {
+        return false;
+    }
+    let Some((args, _)) = rest.split_once(')') else {
+        return false;
+    };
+    let args: Vec<&str> = args
+        .split(',')
+        .map(|a| a.trim().trim_matches('`'))
+        .collect();
+    args.len() >= 2
+        && args[args.len() - 2..] == ["_apitap_ver", "_apitap_deleted"]
+        && has_ver
+        && has_deleted
 }
 
 /// The column list an insert-only row is written with: the source columns
@@ -1045,17 +1070,6 @@ fn rb_types_for(
             Some((ty, nullable))
         })
         .collect()
-}
-
-/// The ALTER that gives a Replacing-family destination its tombstone
-/// bookkeeping columns (design §14, slice 2). Idempotent on purpose: a
-/// re-bootstrap runs it again.
-fn insert_only_columns_ddl(table: &str) -> String {
-    format!(
-        "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS _apitap_ver UInt64 DEFAULT 0, \
-         ADD COLUMN IF NOT EXISTS _apitap_deleted UInt8 DEFAULT 0",
-        t = ch_ident(table)
-    )
 }
 
 mod store {
@@ -1321,22 +1335,6 @@ mod store {
             self.ops.lock().unwrap().push(_op);
         }
 
-        /// The destination table's engine, read once per bootstrap; a missing
-        /// table or an old server reads as empty (the caller's default).
-        pub(super) async fn engine_of(&self, table: &str) -> String {
-            let tbl = ch_str(table);
-            self.ch
-                .read(&format!(
-                    "SELECT engine FROM system.tables \
-                     WHERE database = currentDatabase() AND name = '{tbl}' LIMIT 1 \
-                     FORMAT TabSeparated"
-                ))
-                .await
-                .unwrap_or_default()
-                .trim()
-                .to_string()
-        }
-
         /// The store-level name for the per-table insert-only probe — the
         /// parallel-apply gate (review P0-7) needs it before any unit opens.
         pub(crate) async fn insert_only(&self, table: &str) -> bool {
@@ -1359,12 +1357,12 @@ mod store {
             let body = match self
                 .ch
                 .read(&format!(
-                    "SELECT t.engine, countIf(c.name = '_apitap_ver'), \
+                    "SELECT t.engine_full, countIf(c.name = '_apitap_ver'), \
                             countIf(c.name = '_apitap_deleted') \
                      FROM system.tables t \
                      LEFT JOIN system.columns c ON c.database = t.database AND c.table = t.name \
                      WHERE t.database = currentDatabase() AND t.name = '{tbl}' \
-                     GROUP BY t.engine LIMIT 1 FORMAT TabSeparated"
+                     GROUP BY t.engine_full LIMIT 1 FORMAT TabSeparated"
                 ))
                 .await
             {
@@ -2537,31 +2535,41 @@ fn render_residue_row(
 
 #[cfg(test)]
 mod tests {
-    /// The insert-only shape rule (design §14): Replacing family + both
-    /// bookkeeping columns; anything else stays on the classic replica path.
+    /// The insert-only shape rule (design §14, MASTER M-26): the engine's
+    /// version and is_deleted arguments must BE the bookkeeping pair. The
+    /// spellings are `system.tables.engine_full` as ClickHouse 24.8 renders
+    /// them (captured on the bench server).
     #[test]
-    fn insert_only_needs_a_replacing_engine_and_both_columns() {
-        assert!(super::is_insert_only_shape("ReplacingMergeTree", true, true));
+    fn insert_only_needs_the_engine_to_name_the_pair() {
+        let ours = "ReplacingMergeTree(_apitap_ver, _apitap_deleted) ORDER BY id SETTINGS index_granularity = 8192";
+        assert!(super::is_insert_only_shape(ours, true, true));
         assert!(super::is_insert_only_shape(
-            "ReplacingMergeTree(_apitap_ver, _apitap_deleted)",
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/t', '{replica}', _apitap_ver, _apitap_deleted) ORDER BY id",
             true,
             true
         ));
-        assert!(!super::is_insert_only_shape("MergeTree", true, true));
-        assert!(!super::is_insert_only_shape("ReplacingMergeTree", true, false));
-        assert!(!super::is_insert_only_shape("ReplacingMergeTree", false, true));
+        // A user's own Replacing table, even after an older bootstrap added
+        // the pair as plain columns: its merges never read a tombstone.
+        let theirs = "ReplacingMergeTree(updated_at) ORDER BY id SETTINGS index_granularity = 8192";
+        assert!(!super::is_insert_only_shape(theirs, true, true));
+        assert!(!super::is_insert_only_shape(
+            "ReplacingMergeTree ORDER BY id SETTINGS index_granularity = 8192",
+            true,
+            true
+        ));
+        assert!(!super::is_insert_only_shape(
+            "ReplacingMergeTree(_apitap_ver) ORDER BY id",
+            true,
+            true
+        ));
+        assert!(!super::is_insert_only_shape(
+            "MergeTree ORDER BY id SETTINGS index_granularity = 8192",
+            true,
+            true
+        ));
+        assert!(!super::is_insert_only_shape(ours, true, false));
+        assert!(!super::is_insert_only_shape(ours, false, true));
         assert!(!super::is_insert_only_shape("", true, true));
-    }
-
-    /// The bookkeeping DDL names both columns, is idempotent, and quotes the
-    /// table (design §14, slice 2).
-    #[test]
-    fn insert_only_columns_ddl_is_idempotent_and_complete() {
-        let ddl = super::insert_only_columns_ddl("prof_pg_m");
-        assert!(ddl.contains("`prof_pg_m`"), "{ddl}");
-        assert!(ddl.contains("_apitap_ver UInt64 DEFAULT 0"), "{ddl}");
-        assert!(ddl.contains("_apitap_deleted UInt8 DEFAULT 0"), "{ddl}");
-        assert_eq!(ddl.matches("IF NOT EXISTS").count(), 2, "{ddl}");
     }
 
     /// The insert-only row shape: columns end with the bookkeeping pair, and
