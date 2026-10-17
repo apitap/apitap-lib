@@ -656,6 +656,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_read_pushdown.my --> `e2e_read_pushdown.py my` | the same on MySQL (json read as text included) |
 | <!-- claim: leg.e2e_my_time_fraction.my --> `e2e_my_time_fraction.py my` | MySQL CDC carries a negative TIME with a fraction (every fsp) as the server holds it |
 | <!-- claim: leg.e2e_my_time_fraction.maria --> `e2e_my_time_fraction.py maria` | the same on MariaDB |
+| <!-- claim: leg.e2e_ch_schema_listing --> `e2e_ch_schema_listing.py` | schema= on a ClickHouse source moves every user table, including ones whose name merely resembles apitap's |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

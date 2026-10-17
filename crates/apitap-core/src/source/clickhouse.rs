@@ -386,7 +386,7 @@ impl crate::source::Source for ChSource {
             .exec(&format!(
                 "SELECT name, ifNull(toInt64(total_rows), -1) FROM system.tables \
                  WHERE database = {} AND engine LIKE '%MergeTree%' \
-                   AND name NOT LIKE '\\_apitap%' AND name NOT LIKE '__apitap%' \
+                   AND name NOT LIKE '\\_apitap%' AND name NOT LIKE '\\_\\_apitap%' \
                  ORDER BY name FORMAT TSV",
                 lit(&db)
             ))

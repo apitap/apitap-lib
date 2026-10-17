@@ -276,6 +276,7 @@ LEGS = [
     leg("e2e_read_pushdown.py",      "read().lazy() pushdown returns exactly the rows polars keeps, MySQL", argv=["my"]),
     leg("e2e_my_time_fraction.py",   "MySQL CDC carries negative fractional TIME as the server holds it", argv=["my"]),
     leg("e2e_my_time_fraction.py",   "MariaDB CDC carries negative fractional TIME as the server holds it", {"mariadb"}, ["maria"]),
+    leg("e2e_ch_schema_listing.py",  "schema= on a ClickHouse source moves every user table"),
 ]
 
 
