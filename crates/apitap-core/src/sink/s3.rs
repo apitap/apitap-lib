@@ -393,7 +393,14 @@ impl S3Conn {
 
     async fn check(r: reqwest::Response, what: &str) -> Result<String> {
         let status = r.status();
-        let body = r.text().await.unwrap_or_default();
+        // An unreadable body is not an empty one: a Complete/Copy answers 200
+        // with its <Error> IN the body, and "" passed every <Error> check
+        // (MASTER M-31).
+        let body = r.text().await.map_err(|e| {
+            Error::Transfer(format!(
+                "s3 {what}: {status}, the response body could not be read: {e}"
+            ))
+        })?;
         if !status.is_success() {
             let excerpt = super::char_excerpt(&body, 400);
             return Err(Error::Transfer(format!("s3 {what}: {status} {excerpt}")));

@@ -213,13 +213,16 @@ pub(crate) async fn lease_get(
         }
         Err(e) => return Err(e),
     };
+    // An aggregate: always exactly one row. A field that does not parse is
+    // a damaged answer, not "no lease" — read as 0 it made the drain's lock
+    // look Absent and a peer's guard blind (MASTER M-31).
     let mut f = body.trim().split('\t');
-    let expires_in: i64 = f.next().unwrap_or("").trim().parse().unwrap_or(0);
-    let collected: u8 = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
-    let n: u64 = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+    let n: u64 = parse_num(f.clone().nth(2).unwrap_or(""), "lease row count")?;
     if n == 0 {
         return Ok(None);
     }
+    let expires_in: i64 = parse_num(f.next().unwrap_or(""), "lease expiry")?;
+    let collected: u8 = parse_num(f.next().unwrap_or(""), "lease collected flag")?;
     Ok(Some(crate::lease::Lease { expires_in, collected: collected != 0 }))
 }
 
@@ -688,7 +691,16 @@ impl ChConn {
                     }
                 )));
             }
-            return Ok((body.to_string(), written));
+            // A 2xx whose body could not be read is not an empty answer. As
+            // "" it became 0 rows staged (and the staging dropped as
+            // "success"), an empty guard scan, an absent lease, an empty
+            // watermark (MASTER M-31).
+            let body = body_read.map_err(|e| {
+                Error::Transfer(format!(
+                    "clickhouse {status}: the response body could not be read: {e}"
+                ))
+            })?;
+            return Ok((body, written));
         }
     }
 
@@ -806,6 +818,19 @@ fn max_body_bytes() -> u64 {
         .ok()
         .map(|n| n.saturating_mul(mult))
         .unwrap_or(0)
+}
+
+/// One number from a ClickHouse answer. A body that is not a number is a
+/// damaged answer and fails the run; every count used to default to 0, and a
+/// 0 means "nothing staged", "no such table" or "no lease" (MASTER M-31).
+fn parse_num<T: std::str::FromStr>(body: &str, what: &str) -> Result<T> {
+    let t = body.trim();
+    t.parse().map_err(|_| {
+        Error::Transfer(format!(
+            "clickhouse: {what}: expected a number, got {:?}",
+            super::char_excerpt(t, 80)
+        ))
+    })
 }
 
 /// `` ` ``-quote a ClickHouse identifier.
@@ -1621,10 +1646,8 @@ impl crate::sink::Sink for ChSink {
                          WHERE cluster = '{}'",
                         ch_str(cl)
                     ))
-                    .await?
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
+                    .await
+                    .and_then(|b| parse_num(&b, "cluster shard count"))?;
                 if shards == 0 {
                     return Err(Error::InvalidInput(format!(
                         "cluster '{cl}' is not defined on this server — check \
@@ -1648,10 +1671,8 @@ impl crate::sink::Sink for ChSink {
                          database = currentDatabase() AND name = '{}'",
                         ch_str(&self.final_bare)
                     ))
-                    .await?
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
+                    .await
+                    .and_then(|b| parse_num(&b, "destination lookup"))?;
                 if exists > 0 {
                     return Err(Error::InvalidInput(format!(
                         "mode='replace' into the existing Replicated table {} \
@@ -1769,17 +1790,14 @@ impl crate::sink::Sink for ChSink {
         // only true once every replica is current (a run without this barrier
         // reported 913,341 of 1,000,000).
         self.sync_cluster_replicas().await?;
-        Ok(self
-            .ch
+        self.ch
             .exec(&format!(
                 "SELECT count() FROM {}{}",
                 self.staging_t,
                 self.consistent_read()
             ))
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(0))
+            .await
+            .and_then(|b| parse_num(&b, "staged row count"))
     }
 
     async fn dest_state(
@@ -2257,10 +2275,8 @@ impl ChSink {
                              database = currentDatabase() AND name = '{}'",
                             ch_str(&self.final_bare)
                         ))
-                        .await?
-                        .trim()
-                        .parse::<u64>()
-                        .unwrap_or(0)
+                        .await
+                        .and_then(|b| parse_num::<u64>(&b, "destination lookup"))?
                         > 0;
                     if !exists || flipped {
                         // Bootstrap: the destination gets the (possibly explicit)

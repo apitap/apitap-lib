@@ -640,6 +640,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_sink_warnings --> `e2e_my_sink_warnings.py` | a MySQL destination never publishes rows LOAD DATA silently dropped or changed: case/accent-distinct text keys all land, a timestamptz 'infinity' is refused, never 0000-00-00 |
 | <!-- claim: leg.e2e_pg_search_path --> `e2e_pg_search_path.py` | an unqualified Postgres destination stays in the schema it lives in, under search_path "$user", public |
 | <!-- claim: leg.e2e_pg_parallel_snapshot --> `e2e_pg_parallel_snapshot.py` | a parallel Postgres read sees one table state: an UPDATE committing mid-read neither loses nor doubles a row |
+| <!-- claim: leg.e2e_ch_body_cut --> `e2e_ch_body_cut.py` | a ClickHouse 200 whose body never arrives fails the run; it is never read as an empty answer |
 | <!-- claim: leg.e2e_ch_replace_lossy --> `e2e_ch_replace_lossy.py` | a ClickHouse replace without engine= never silently strips PARTITION BY, TTL, codecs or the engine of the table it replaces |
 | <!-- claim: leg.e2e_ch_profile_limits --> `e2e_ch_profile_limits.py` | a ClickHouse profile with limit/offset/max_result_rows=break cannot shorten a transfer, either direction |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
