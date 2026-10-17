@@ -159,17 +159,66 @@ pub(crate) struct DestState {
     pub watermark: Option<String>,
 }
 
+/// Compare two numeric watermark texts exactly: integers, decimals
+/// (`-12.50`), and — through f64 — exponent forms. `None` when either is not
+/// a number. Integers alone used to parse, so two DECIMAL cursors fell back
+/// to string order and "9.75" beat "12.5": the watermark stalled on the
+/// smaller value (P2, S7-16).
+pub(crate) fn cmp_numeric_text(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    fn parts(s: &str) -> Option<(bool, &str, &str)> {
+        let s = s.trim();
+        let (neg, s) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let (i, f) = s.split_once('.').unwrap_or((s, ""));
+        if (i.is_empty() && f.is_empty())
+            || !i.bytes().all(|c| c.is_ascii_digit())
+            || !f.bytes().all(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+        Some((neg, i.trim_start_matches('0'), f.trim_end_matches('0')))
+    }
+    use std::cmp::Ordering;
+    match (parts(a), parts(b)) {
+        (Some((an, ai, af)), Some((bn, bi, bf))) => {
+            let zero = |i: &str, f: &str| i.is_empty() && f.is_empty();
+            let (an, bn) = (an && !zero(ai, af), bn && !zero(bi, bf));
+            if an != bn {
+                return Some(if an {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                });
+            }
+            let mag = ai
+                .len()
+                .cmp(&bi.len())
+                .then_with(|| ai.cmp(bi))
+                .then_with(|| af.cmp(bf));
+            Some(if an { mag.reverse() } else { mag })
+        }
+        _ => {
+            let (x, y) = (a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?);
+            x.partial_cmp(&y)
+        }
+    }
+}
+
 /// The larger of two watermark texts — numeric cursors compare numerically,
 /// text cursors (timestamps in the source's own rendering) lexicographically.
 pub(crate) fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Option<String> {
     match (a, b) {
         (Some(x), Some(y)) => {
             let x_wins = if numeric {
-                match (x.parse::<i128>(), y.parse::<i128>()) {
-                    (Ok(xi), Ok(yi)) => xi >= yi,
-                    (Ok(_), Err(_)) => true,
-                    (Err(_), Ok(_)) => false,
-                    _ => x >= y,
+                match cmp_numeric_text(&x, &y) {
+                    Some(o) => o != std::cmp::Ordering::Less,
+                    None => match (cmp_numeric_text(&x, &x), cmp_numeric_text(&y, &y)) {
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        _ => x >= y,
+                    },
                 }
             } else {
                 x >= y
@@ -188,16 +237,11 @@ pub(crate) fn wm_max(a: Option<String>, b: Option<String>, numeric: bool) -> Opt
 /// semantics; per-sink clones of this drifted once already.)
 pub(crate) fn wm_pick(numeric: bool, state: String, data: String) -> String {
     if numeric {
-        match (state.parse::<i128>(), data.parse::<i128>()) {
-            (Ok(s), Ok(d)) => {
-                if s >= d {
-                    state
-                } else {
-                    data
-                }
-            }
-            (Ok(_), Err(_)) => state,
-            _ => data,
+        match cmp_numeric_text(&state, &data) {
+            Some(o) if o != std::cmp::Ordering::Less => state,
+            Some(_) => data,
+            None if cmp_numeric_text(&state, &state).is_some() => state,
+            None => data,
         }
     } else if state >= data {
         state
@@ -278,6 +322,26 @@ pub(crate) fn resolve_watermark(
 
 #[cfg(test)]
 mod wm_tests {
+    /// P2 (S7-16): DECIMAL watermarks compare as numbers, not text.
+    #[test]
+    fn decimal_watermarks_compare_numerically() {
+        use std::cmp::Ordering::*;
+        assert_eq!(super::cmp_numeric_text("12.5", "9.75"), Some(Greater));
+        assert_eq!(super::cmp_numeric_text("-12.5", "-9.75"), Some(Less));
+        assert_eq!(super::cmp_numeric_text("1.50", "1.5"), Some(Equal));
+        assert_eq!(super::cmp_numeric_text("-0.0", "0"), Some(Equal));
+        assert_eq!(super::cmp_numeric_text("100", "99.999"), Some(Greater));
+        assert_eq!(super::cmp_numeric_text("1e3", "999.5"), Some(Greater));
+        assert_eq!(super::cmp_numeric_text("abc", "1"), None);
+        assert_eq!(
+            super::wm_max(Some("9.75".into()), Some("12.5".into()), true).as_deref(),
+            Some("12.5")
+        );
+        assert_eq!(super::wm_pick(true, "9.75".into(), "12.5".into()), "12.5");
+        assert_eq!(super::wm_pick(true, "12.5".into(), "9.75".into()), "12.5");
+        assert_eq!(super::wm_pick(true, "junk".into(), "9.75".into()), "9.75");
+    }
+
     use super::*;
 
     #[test]
