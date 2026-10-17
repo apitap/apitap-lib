@@ -906,6 +906,24 @@ impl crate::sink::Sink for MySqlSink {
         // sink.
         let mut ddl = Vec::new();
         let mut types = Vec::with_capacity(plan.cols.len());
+        // A key from another engine keeps that engine's equality: Postgres
+        // text compares bytes, and under the server's default `_ci` collation
+        // 'abc'/'ABC' (or 'e'/'é') are ONE key — LOAD DATA LOCAL dropped the
+        // second row as a duplicate-key warning and the table published short
+        // (MASTER M-20). Binary AND no-pad: utf8mb4_bin pads, so 'a' and 'a '
+        // would collide instead. MySQL 8 names it utf8mb4_0900_bin, MariaDB
+        // utf8mb4_nopad_bin; a server with neither keeps utf8mb4_bin, and the
+        // loader's warnings check refuses whatever still collides.
+        let key_coll = if plan.engine != "mysql" && !plan.pk_cols.is_empty() {
+            self.scalar(
+                "SELECT COALESCE(MAX(collation_name), 'utf8mb4_bin') FROM information_schema.collations \
+                 WHERE collation_name IN ('utf8mb4_0900_bin', 'utf8mb4_nopad_bin')",
+            )
+            .await?
+            .unwrap_or_else(|| "utf8mb4_bin".to_string())
+        } else {
+            String::new()
+        };
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             let ty = match (&c.native_ddl, plan.engine) {
                 (Some(native), "mysql") => native.clone(),
@@ -952,7 +970,15 @@ impl crate::sink::Sink for MySqlSink {
             } else {
                 "NOT NULL"
             };
-            ddl.push(format!("{} {ty} {null}", my_ident(&c.name)));
+            let coll = if !key_coll.is_empty()
+                && plan.pk_cols.contains(&c.name)
+                && ty.starts_with("VARCHAR(")
+            {
+                format!(" COLLATE {key_coll}")
+            } else {
+                String::new()
+            };
+            ddl.push(format!("{} {ty}{coll} {null}", my_ident(&c.name)));
         }
         // Cross-vocabulary drift check for append: dest_state can only compare
         // COLUMN_TYPE same-engine, so for a non-mysql plan compare the dest
@@ -1097,7 +1123,31 @@ impl crate::sink::Sink for MySqlSink {
             conn.query_drop(&load_sql)
                 .await
                 .map_err(|e| Error::Transfer(format!("LOAD DATA: {e}")))?;
-            Ok(conn.affected_rows())
+            let loaded = conn.affected_rows();
+            // LOCAL implies IGNORE: a duplicate key (1062), a truncated or
+            // clipped value (1265/1264), a bad date (1292) — under the
+            // session's sql_mode='' an infinity timestamp becomes 0000-00-00 —
+            // are all WARNINGS, the row skipped or changed and the load
+            // "successful". Nothing read them, so the table published short or
+            // altered, silently (MASTER M-20, M-51). Every one fails the run.
+            let warnings = conn.get_warnings();
+            if warnings > 0 {
+                let info = conn.info().into_owned();
+                let shown: Vec<(String, u32, String)> = conn
+                    .query("SHOW WARNINGS LIMIT 5")
+                    .await
+                    .unwrap_or_default();
+                let shown = shown
+                    .iter()
+                    .map(|(l, c, m)| format!("{l} {c}: {m}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(Error::Transfer(format!(
+                    "LOAD DATA: MySQL raised {warnings} warning(s) ({info}) — rows were dropped \
+                     or changed on the way in, so the run is refused: {shown}"
+                )));
+            }
+            Ok(loaded)
         }));
         Ok(MySqlLoader {
             tx,
