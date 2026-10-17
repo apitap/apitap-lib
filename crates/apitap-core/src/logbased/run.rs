@@ -771,9 +771,15 @@ async fn run_sloted(
             )),
         });
     }
-    for h in handles {
-        let _ = h.join();
-    }
+    // Off the async worker: each thread has reported, but joining it waits
+    // for its own runtime's shutdown, and a blocking join on this executor
+    // stalls every task scheduled beside it meanwhile (P2).
+    let _ = tokio::task::spawn_blocking(move || {
+        for h in handles {
+            let _ = h.join();
+        }
+    })
+    .await;
     let elapsed_all = started.elapsed().as_millis() as u64;
 
     // A failed group fails ITS tables, each named in the report, and nothing
