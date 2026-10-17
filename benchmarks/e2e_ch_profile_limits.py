@@ -12,7 +12,8 @@ Proof, on a throwaway ClickHouse 24.8:
      Postgres: every row, every time;
   2. default profile max_result_rows=5, result_overflow_mode='break' — the
      overflow mode is pinned to throw, so the read is either every row or a
-     refusal naming the limit; never a short table.
+     refusal naming the limit; never a short table;
+  3. default profile readonly=1 — refused, naming readonly=2 (MASTER M-53).
 """
 import os
 import subprocess
@@ -125,6 +126,17 @@ def main():
             assert bench(f"SELECT count() FROM system.tables WHERE database = 'default' AND name = '{T}'") == "0", \
                 "nothing may be published from a capped read"
             print("  max_result_rows=5 with break: refused naming the limit, nothing published")
+
+        # A readonly=1 user can take no per-query setting at all, and every
+        # request carries some: it must be told what to change (M-53).
+        start("<readonly>1</readonly>")
+        try:
+            apitap.transfer(CH, DST, table=T, mode="replace")
+            m = None
+        except Exception as e:  # noqa: BLE001 — any refusal, judged by its text
+            m = str(e)
+        assert m and "readonly=2" in m, f"a readonly=1 user must be told to use readonly=2: {m}"
+        print("  readonly=1 profile: refused, naming readonly=2")
     finally:
         sh(["docker", "rm", "-f", NAME])
         psql("apitap-bench-pg-src", "apitap_bench_src", f"DROP TABLE IF EXISTS {T}")

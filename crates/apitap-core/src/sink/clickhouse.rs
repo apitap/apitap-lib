@@ -552,8 +552,9 @@ impl ChConn {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Transfer(format!(
-                "clickhouse {status}: {}",
-                body.trim()
+                "clickhouse {status}: {}{}",
+                body.trim(),
+                readonly_hint(&body)
             )));
         }
         Ok(resp)
@@ -674,8 +675,9 @@ impl ChConn {
                 let from_proxy =
                     status.is_server_error() && !body.contains("DB::Exception");
                 return Err(Error::Transfer(format!(
-                    "clickhouse {status}: {}{}",
+                    "clickhouse {status}: {}{}{}",
                     body.trim(),
+                    readonly_hint(body),
                     if outcome_unknown {
                         " — a proxy or load balancer in front of ClickHouse forwarded \
                          this statement and lost the answer, so whether it ran is \
@@ -818,6 +820,20 @@ fn max_body_bytes() -> u64 {
         .ok()
         .map(|n| n.saturating_mul(mult))
         .unwrap_or(0)
+}
+
+/// A `readonly=1` user cannot take ANY per-query setting, and every request
+/// apitap sends carries some (session_timezone, the pinned limits): every
+/// transfer failed at its first statement with "Cannot modify 'x' setting in
+/// readonly mode" and nothing said what to change (MASTER M-53).
+fn readonly_hint(body: &str) -> &'static str {
+    if body.contains("in readonly mode") {
+        " — this ClickHouse user has readonly=1, which forbids the per-query settings \
+         apitap sends with every request. Give it readonly=2 (reads only, settings \
+         allowed: ALTER USER u SETTINGS readonly = 2), or readonly=0 for a destination"
+    } else {
+        ""
+    }
 }
 
 /// One number from a ClickHouse answer. A body that is not a number is a
