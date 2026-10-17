@@ -1164,7 +1164,7 @@ impl crate::sink::Sink for IcebergSink {
                 // cdc_bind applies, moved up front where it costs nothing.
                 if !m.default_partition_spec().fields().is_empty() {
                     return Err(Error::InvalidInput(format!(
-                        "iceberg table '{}' is partitioned — apitap writes                          unpartitioned tables only; land into an unpartitioned                          table, or export and partition it on the warehouse side",
+                        "iceberg table '{}' is partitioned — apitap writes unpartitioned tables only; land into an unpartitioned table, or export and partition it on the warehouse side",
                         self.table
                     )));
                 }

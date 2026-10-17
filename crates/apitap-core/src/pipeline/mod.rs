@@ -809,7 +809,7 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
             // difference between "re-run" and "drop this object first".
             if let Err(d) = sink.discard().await {
                 crate::progress::note(&format!(
-                    "could not drop this run's staging after the error below                      ({d}); the next run of {table} will refuse until it is                      removed"
+                    "could not drop this run's staging after the error below ({d}); the next run of {table} will refuse until it is removed"
                 ));
             }
             return Err(e);

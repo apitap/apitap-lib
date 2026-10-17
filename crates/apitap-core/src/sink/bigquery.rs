@@ -1500,7 +1500,7 @@ impl BqLoader {
                 Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
                     attempt += 1;
                     crate::progress::note(&format!(
-                        "bigquery throttled the load-job start, retry {attempt}/5                          in {}ms",
+                        "bigquery throttled the load-job start, retry {attempt}/5 in {}ms",
                         400u64 << attempt
                     ));
                     tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))

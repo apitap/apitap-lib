@@ -1425,7 +1425,7 @@ impl MySqlSink {
                     // table this run never created out of the way and drop
                     // it. Refuse; the re-run reads the new state row.
                     return Err(Error::InvalidInput(format!(
-                        "another run published {} while this first run was                          loading it — the table now exists and this run would                          have replaced it. Re-run: the new state row makes                          this an incremental load.",
+                        "another run published {} while this first run was loading it — the table now exists and this run would have replaced it. Re-run: the new state row makes this an incremental load.",
                         self.bare
                     )));
                 }

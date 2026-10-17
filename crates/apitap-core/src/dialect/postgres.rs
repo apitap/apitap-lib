@@ -108,7 +108,7 @@ pub(crate) fn tls_required_hint(url: &str) -> String {
         .and_then(|u| effective_host(&u))
         .unwrap_or_else(|| "the server".into());
     format!(
-        "apitap requires TLS for Postgres connections to non-loopback hosts by          default, and {host} is not local. A server without TLS needs          sslmode=require (or sslmode=disable) in the URL; a private CA needs          sslrootcert=/path/to/ca.crt."
+        "apitap requires TLS for Postgres connections to non-loopback hosts by default, and {host} is not local. A server without TLS needs sslmode=require (or sslmode=disable) in the URL; a private CA needs sslrootcert=/path/to/ca.crt."
     )
 }
 

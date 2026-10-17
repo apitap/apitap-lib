@@ -1810,7 +1810,7 @@ fn io_err(e: std::io::Error) -> Error {
     // settings that had nothing to do with it.
     if e.kind() == std::io::ErrorKind::UnexpectedEof {
         return Error::Transfer(
-            "postgres closed the connection mid-stream — a server restart, a              pg_terminate_backend, an idle/statement timeout, or a dropped              network path. Nothing was committed at the destination (bulk loads              swap only at the end, and a CDC watermark advances only with its              data), so re-running is safe and is the recovery."
+            "postgres closed the connection mid-stream — a server restart, a pg_terminate_backend, an idle/statement timeout, or a dropped network path. Nothing was committed at the destination (bulk loads swap only at the end, and a CDC watermark advances only with its data), so re-running is safe and is the recovery."
                 .into(),
         );
     }

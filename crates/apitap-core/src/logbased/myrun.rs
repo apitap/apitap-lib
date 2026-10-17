@@ -267,7 +267,7 @@ pub(crate) async fn drain_windows(
     // MySQL's error 1236.
     if start > 0 && !mysource::binlog_file_present(pool, &start_file).await? {
         return Err(Error::InvalidInput(format!(
-            "log_based: the binlog this run must resume from ({start_file},              position {start_pos}) is no longer on the server — it was purged              by the server's own retention (binlog_expire_logs_seconds /              expire_logs_days / PURGE BINARY LOGS) while this table was not              being drained. Every change between that position and now is gone              from the log, so resuming would skip them silently. Recovery is a              fresh bootstrap: clear this table's apitap state on the              destination and re-run. To prevent it, keep binlog retention              longer than the longest gap between runs."
+            "log_based: the binlog this run must resume from ({start_file}, position {start_pos}) is no longer on the server — it was purged by the server's own retention (binlog_expire_logs_seconds / expire_logs_days / PURGE BINARY LOGS) while this table was not being drained. Every change between that position and now is gone from the log, so resuming would skip them silently. Recovery is a fresh bootstrap: clear this table's apitap state on the destination and re-run. To prevent it, keep binlog retention longer than the longest gap between runs."
         )));
     }
 
