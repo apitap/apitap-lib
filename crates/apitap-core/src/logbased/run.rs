@@ -1686,7 +1686,7 @@ async fn drain_group(
         }
     }
 
-    let stop_line: (String,) = sqlx::query_as("SELECT pg_current_wal_lsn()::text")
+    let stop_line: (String,) = sqlx::query_as(&format!("SELECT {WAL_END}::text"))
         .fetch_one(src)
         .await
         .map_err(db_err)?;
@@ -1886,7 +1886,7 @@ async fn drain_loop(
             if crate::shutdown::requested() || std::time::Instant::now() >= deadline {
                 break;
             }
-            let now: (String,) = sqlx::query_as("SELECT pg_current_wal_lsn()::text")
+            let now: (String,) = sqlx::query_as(&format!("SELECT {WAL_END}::text"))
                 .fetch_one(src)
                 .await
                 .map_err(db_err)?;
@@ -2364,6 +2364,12 @@ async fn apply_member_pending(
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+/// Where the source's WAL ends, in SQL. `pg_current_wal_lsn()` errors on a
+/// hot standby ("recovery is in progress"), and Postgres 16 decodes logically
+/// from one; there the replayed end is the end (P2).
+pub(crate) const WAL_END: &str =
+    "(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END)";
+
 fn scheme(url: &str) -> &str {
     url.split("://").next().unwrap_or("")
 }
@@ -2623,15 +2629,15 @@ fn window_max_secs() -> u64 {
 /// table owns a slot that looks exactly the same from the source. It is
 /// named, with what it retains and the statement that drops it, every run.
 async fn other_slots_report(src: &sqlx::PgPool, slot: &str, tracked: &[String]) {
-    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT s.slot_name, pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint \
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(&format!(
+        "SELECT s.slot_name, pg_wal_lsn_diff({WAL_END}, s.restart_lsn)::bigint \
          FROM pg_replication_slots s \
          WHERE s.slot_name LIKE 'apitap\\_%' AND s.slot_name <> $1 AND NOT s.active \
            AND EXISTS (SELECT 1 FROM pg_publication_tables p \
                        WHERE p.pubname = s.slot_name || '_pub' \
                          AND p.schemaname || '.' || p.tablename = ANY($2)) \
-         ORDER BY 1",
-    )
+         ORDER BY 1"
+    ))
     .bind(slot)
     .bind(tracked)
     .fetch_all(src)
@@ -2662,10 +2668,10 @@ async fn other_slots_report(src: &sqlx::PgPool, slot: &str, tracked: &[String]) 
 /// without permission to read `pg_replication_slots` must not fail a transfer
 /// over a diagnostic.
 async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
-    let row: Option<(Option<i64>, bool)> = sqlx::query_as(
-        "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, active \
-         FROM pg_replication_slots WHERE slot_name = $1",
-    )
+    let row: Option<(Option<i64>, bool)> = sqlx::query_as(&format!(
+        "SELECT pg_wal_lsn_diff({WAL_END}, restart_lsn)::bigint, active \
+         FROM pg_replication_slots WHERE slot_name = $1"
+    ))
     .bind(slot)
     .fetch_optional(src)
     .await

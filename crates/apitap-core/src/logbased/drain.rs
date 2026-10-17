@@ -318,7 +318,7 @@ pub(crate) async fn drain(
                         let buffered = buf_bytes + sess.stream_bytes;
                         if buffered < floor && std::time::Instant::now() < deadline {
                             let now: (String,) =
-                                sqlx::query_as("SELECT pg_current_wal_lsn()::text")
+                                sqlx::query_as(&format!("SELECT {}::text", crate::logbased::run::WAL_END))
                                     .fetch_one(src)
                                     .await
                                     .map_err(|e| {
