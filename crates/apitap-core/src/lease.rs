@@ -373,11 +373,23 @@ impl<F: Fence> Tenure<F> {
         let mut held: Vec<(String, crate::guard::Announced)> = Vec::new();
         // A refusal gives back what it holds, the run's own objects included:
         // a refused BigQuery drain would otherwise leave its fence table.
-        for t in tables {
+        for (i, t) in tables.iter().enumerate() {
             let (g, bare) = dest.guard(t);
             match crate::guard::announce(&*g, &bare, &run).await {
                 Ok(a) => held.push((t.clone(), a)),
                 Err(e) => {
+                    // `lease_open` wrote a row for EVERY table; give_back
+                    // closes only the announced ones, so this table's row
+                    // and every later one's stayed until their TTL (P2).
+                    // None of them carries a marker of ours.
+                    for rest in &tables[i..] {
+                        let (g, bare) = dest.guard(rest);
+                        g.lease_close(crate::guard::never_announced(
+                            g.dest_label(&bare),
+                            run.token().to_string(),
+                        ))
+                        .await;
+                    }
                     give_back_run(&*dest, held, run.token()).await;
                     return Err(e);
                 }
@@ -576,7 +588,10 @@ mod tests {
         async fn list(&self, _b: &str, _k: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
             Ok(Vec::new())
         }
-        async fn create_marker(&self, _raw: &str) -> Result<()> {
+        async fn create_marker(&self, raw: &str) -> Result<()> {
+            if raw.contains("boom") {
+                return Err(Error::Transfer("marker: injected".into()));
+            }
             Ok(())
         }
         async fn drop_object(&self, _raw: &str) -> Result<()> {
@@ -689,6 +704,29 @@ mod tests {
         Tenure::acquire_every(f, &["a".to_string(), "b".to_string()], RunId::mint_drain("s"), every)
             .await
             .unwrap()
+    }
+
+    /// P2: an announce failing on the 2nd of 3 tables closes ALL three
+    /// lease rows `lease_open` wrote — the announced one through its proof,
+    /// the failed one and the never-reached one without markers to drop.
+    #[test]
+    fn a_failed_announce_closes_every_lease_row() {
+        rt().block_on(async {
+            let f = Arc::new(FakeFence::default());
+            let tables = ["a".to_string(), "boom".to_string(), "c".to_string()];
+            let r = Tenure::acquire_every(f.clone(), &tables, RunId::mint_drain("s"), SLOW).await;
+            assert!(
+                r.is_err(),
+                "the injected marker failure must refuse the tenure"
+            );
+            let closes = f.events().iter().filter(|e| *e == "lease_close").count();
+            assert_eq!(
+                closes,
+                3,
+                "every lease row lease_open wrote must close: {:?}",
+                f.events()
+            );
+        });
     }
 
     #[test]

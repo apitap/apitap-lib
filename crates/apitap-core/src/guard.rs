@@ -259,6 +259,19 @@ pub(crate) async fn release(
     Ok(Released { key: a.key.clone(), token: a.token.clone(), _priv: () })
 }
 
+/// The proof for a table this run never put a marker on — its announce
+/// failed before it (which drops its own partial markers) or never ran.
+/// There is nothing of ours to remove first, so its lease row may close.
+/// Not for any table whose announce succeeded: that one closes through
+/// [`release`].
+pub(crate) fn never_announced(key: String, token: String) -> Released {
+    Released {
+        key,
+        token,
+        _priv: (),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
