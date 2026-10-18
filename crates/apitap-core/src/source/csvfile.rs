@@ -125,11 +125,15 @@ impl CsvPump {
     }
 }
 
-/// A record's fields as UTF-8 strings (header parsing).
+/// A record's fields as UTF-8 strings (header parsing). A UTF-8 byte-order
+/// mark leading the first field is dropped: `trim` keeps U+FEFF (it is not
+/// White_Space), so an Excel export's first column was named "\u{feff}id" (P2).
 pub(crate) fn row_strings(row: &CsvRow<'_>) -> Result<Vec<String>> {
     (0..row.len())
         .map(|i| {
-            String::from_utf8(row.field(i).to_vec())
+            let f = row.field(i);
+            let f = if i == 0 { f.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(f) } else { f };
+            String::from_utf8(f.to_vec())
                 .map_err(|e| Error::InvalidInput(format!("csv header is not UTF-8: {e}")))
         })
         .collect()
@@ -483,4 +487,27 @@ mod tests {
         assert_eq!(p.cols[2].name, "Note");
         assert!(text_plan("github", "x.csv", &["a".into(), "A".into()]).is_err());
     }
+
+    fn first_row_strings(input: &[u8]) -> Vec<String> {
+        let mut pump = CsvPump::new();
+        pump.feed(input);
+        let row = pump.next_record(true).unwrap();
+        row_strings(&row).unwrap()
+    }
+
+    /// P2: an Excel byte-order mark is not part of the first column's name,
+    /// also when the first chunk splits it (csv-core strips a BOM only when
+    /// its first read holds all three bytes).
+    #[test]
+    fn a_utf8_bom_is_not_part_of_the_first_header() {
+        let h = first_row_strings(b"\xEF\xBB\xBFid,name\n1,a\n");
+        assert_eq!(text_plan("github", "x.csv", &h).unwrap().cols[0].name, "id");
+        let mut pump = CsvPump::new();
+        pump.feed(b"\xEF");
+        assert!(pump.next_record(false).is_none());
+        pump.feed(b"\xBB\xBFid,name\n");
+        let h = row_strings(&pump.next_record(false).unwrap()).unwrap();
+        assert_eq!(text_plan("github", "x.csv", &h).unwrap().cols[0].name, "id");
+    }
+
 }
