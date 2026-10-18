@@ -102,7 +102,8 @@ pub(crate) fn tls_required_hint(url: &str) -> String {
          0.55.1, and {host} is not loopback. If this server genuinely has no \
          TLS, add ?ssl-mode=disabled to the URL to send credentials and data in \
          clear on purpose; ?ssl-mode=required encrypts without verifying the \
-         certificate, and verify_ca / verify_identity check it."
+         certificate, and verify_identity checks it (verify_ca is refused: use \
+         verify_identity or required)."
     )
 }
 
@@ -141,6 +142,13 @@ mod tls_default_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2/R3-16: the hint never offers a mode every entry point refuses.
+    #[test]
+    fn the_tls_hint_does_not_offer_verify_ca() {
+        let h = super::tls_required_hint("mysql://u@db.example/x");
+        assert!(h.contains("verify_ca is refused") && !h.contains("verify_ca /"), "{h}");
+    }
 
     /// P0-4: the CDC lanes now share this mapping with the bulk lanes —
     /// remote + no mode gets verified TLS, explicit modes and loopback are

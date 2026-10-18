@@ -5,8 +5,9 @@
 //! hands each row's payload to the direct-Arrow decoders in place.
 //!
 //! Production coverage: plain TCP and TLS (`ssl-mode=preferred/required`,
-//! MySQL semantics — encrypt without certificate verification; `verify_ca`
-//! and `verify_identity` ride the sqlx lane, which verifies). Auth =
+//! MySQL semantics — encrypt without certificate verification;
+//! `verify_identity` verifies the chain and the name; `verify_ca` is
+//! refused, since rustls checks no chain without the name). Auth =
 //! caching_sha2_password (fast path everywhere; FULL auth over TLS sends
 //! the password on the encrypted channel) and mysql_native_password, with
 //! AuthSwitch both ways. Anything else fails the canary connect and the
@@ -162,7 +163,7 @@ pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
                 other => {
                     return Err(Error::InvalidInput(format!(
                         "ssl-mode={other} is not a MySQL ssl mode — use disabled, \
-                         preferred, required, verify_ca or verify_identity"
+                         preferred, required or verify_identity (verify_ca is refused)"
                     )))
                 }
             };
@@ -357,7 +358,7 @@ fn parse_handshake(p: &[u8]) -> Result<Handshake> {
 /// Accept-anything verifier: MySQL `ssl-mode=required` semantics — the
 /// channel is encrypted, the certificate is NOT verified (server certs are
 /// auto-generated self-signed in the default install). Users who want
-/// verification say `verify_ca`/`verify_identity` and get the sqlx lane.
+/// verification say `verify_identity`.
 #[derive(Debug)]
 struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
 
