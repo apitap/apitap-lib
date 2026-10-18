@@ -97,16 +97,30 @@ pub(crate) struct PgToMyTsv {
     pos: usize,
     header_done: bool,
     finished: bool,
+    /// The largest field this process buffers: half its memory limit, or
+    /// Postgres's own 1 GB varlena ceiling. A partial tuple is carried in
+    /// `buf` until it completes, so a field's claimed length was buffered
+    /// without bound and a big bytea OOM-killed the lane (P2).
+    max_field: usize,
 }
 
 impl PgToMyTsv {
     pub(crate) fn new(cols: Vec<(MyType, String)>) -> Self {
+        let max_field = crate::pipeline::mem_limit_bytes()
+            .map(|m| (m / 2) as usize)
+            .unwrap_or(usize::MAX)
+            .min(1 << 30);
+        Self::with_max_field(cols, max_field)
+    }
+
+    fn with_max_field(cols: Vec<(MyType, String)>, max_field: usize) -> Self {
         Self {
             cols,
             buf: Vec::with_capacity(1 << 20),
             pos: 0,
             header_done: false,
             finished: false,
+            max_field,
         }
     }
 
@@ -139,6 +153,13 @@ impl PgToMyTsv {
                 let ext =
                     u32::from_be_bytes(self.buf[self.pos + 15..self.pos + 19].try_into().unwrap())
                         as usize;
+                // Postgres writes no header extension; a large one is a
+                // damaged stream, not something to buffer.
+                if ext > 1 << 20 {
+                    return Err(Error::Transfer(format!(
+                        "pg binary COPY: header extension of {ext} bytes"
+                    )));
+                }
                 if self.buf.len() - self.pos < 19 + ext {
                     continue;
                 }
@@ -146,7 +167,7 @@ impl PgToMyTsv {
                 self.header_done = true;
             }
             while !self.finished {
-                match try_tuple_at(&self.cols, &self.buf[self.pos..], out)? {
+                match try_tuple_at(&self.cols, self.max_field, &self.buf[self.pos..], out)? {
                     Some((consumed, finished)) => {
                         self.pos += consumed;
                         self.finished = finished;
@@ -171,7 +192,7 @@ impl PgToMyTsv {
         // the bulk of each coalesced piece on the raw plane).
         let mut off = 0usize;
         while !self.finished {
-            match try_tuple_at(&self.cols, &inp[off..], out)? {
+            match try_tuple_at(&self.cols, self.max_field, &inp[off..], out)? {
                 Some((consumed, finished)) => {
                     off += consumed;
                     self.finished = finished;
@@ -195,6 +216,7 @@ impl PgToMyTsv {
 /// (`out` is left untouched in that case).
 fn try_tuple_at(
     cols: &[(MyType, String)],
+    max_field: usize,
     b: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<Option<(usize, bool)>> {
@@ -234,6 +256,14 @@ fn try_tuple_at(
             )));
         }
         let len = len as usize;
+        if len > max_field {
+            out.truncate(out_start);
+            return Err(Error::Transfer(format!(
+                "pg binary COPY: field {name} is {len} bytes, above the {} MiB this process \
+                 can buffer (half its memory limit; APITAP_MEM_BUDGET sets it)",
+                max_field >> 20
+            )));
+        }
         if b.len() < off + len {
             out.truncate(out_start);
             return Ok(None);
@@ -529,6 +559,29 @@ mod tests {
         let f = [0xFF, 0xFF, 0, 0, 0, 0, 0, 0];
         assert!(render_field(MyType::Numeric, "c", &f, &mut out).is_err());
         assert!(render_field(MyType::NumericDouble, "c", &f, &mut out).is_err());
+    }
+
+    /// P2: a field claiming more than the cap is refused on the chunk that
+    /// shows its length, and the carry never holds more than that chunk.
+    #[test]
+    fn a_field_past_the_cap_is_refused_before_it_is_buffered() {
+        let mut t = PgToMyTsv::with_max_field(vec![(MyType::Bytea, "b".to_string())], 64 << 10);
+        let mut input = b"PGCOPY\n\xff\r\n\0".to_vec();
+        input.extend(0u32.to_be_bytes());
+        input.extend(0u32.to_be_bytes());
+        input.extend(1i16.to_be_bytes());
+        input.extend(0x7FFF_FFFFi32.to_be_bytes());
+        input.extend([0u8; 1024]);
+        let mut out = Vec::new();
+        let e = t.push(&input, &mut out).unwrap_err().to_string();
+        assert!(e.contains("field b") && e.contains("APITAP_MEM_BUDGET"), "{e}");
+        assert!(t.buf.len() < 64 << 10);
+
+        let mut t = PgToMyTsv::with_max_field(vec![(MyType::Bytea, "b".to_string())], 64 << 10);
+        let mut input = b"PGCOPY\n\xff\r\n\0".to_vec();
+        input.extend(0u32.to_be_bytes());
+        input.extend((1u32 << 30).to_be_bytes());
+        assert!(t.push(&input, &mut Vec::new()).is_err(), "a 1 GiB header extension");
     }
 
     fn render(ty: MyType, f: &[u8]) -> String {
