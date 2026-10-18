@@ -671,6 +671,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_hardening.nullcursor --> `e2e_pg_hardening.py nullcursor` | a parallel Postgres read over an integer cursor copies the rows whose cursor is NULL |
 | <!-- claim: leg.e2e_pg_hardening.negscale --> `e2e_pg_hardening.py negscale` | PG15+ numeric(5,-2) / numeric(2,5) land as Decimal(7,0) / Decimal(5,5), values exact |
 | <!-- claim: leg.e2e_pg_hardening.longname --> `e2e_pg_hardening.py longname` | a Postgres destination name past 63 bytes is refused, not silently cut |
+| <!-- claim: leg.e2e_pg_hardening.fkref --> `e2e_pg_hardening.py fkref` | a Postgres `replace` into a table another table references is refused before anything is copied |
 | <!-- claim: leg.e2e_pg_hardening.keepalive --> `e2e_pg_hardening.py keepalive` | every Postgres pool socket carries a TCP keepalive timer (`ss -o`), so a half-open COPY errors instead of hanging |
 | <!-- claim: leg.e2e_pg_cdc_hardening.toastpk --> `e2e_pg_cdc_hardening.py toastpk` | an UPDATE beside a 2400-character out-of-line key drains: the key comes from the old image |
 | <!-- claim: leg.e2e_pg_cdc_hardening.openstream --> `e2e_pg_cdc_hardening.py openstream` | a streamed transaction left open on the source does not hold a one-shot drain; after its commit every row lands once |

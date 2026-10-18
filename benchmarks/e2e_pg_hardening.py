@@ -14,7 +14,11 @@ Four P2 findings (docs/review/2026-10-18-p2-triage.md), PG16 :5544 / :5545 / CH 
             Decimal(5, 0) in ClickHouse: out of its own precision.
   longname  a 64-byte destination name was cut to 63 by Postgres: every run
             looked for the full name, never found it, and re-bootstrapped.
-Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale|longname
+  fkref     a replace into a table another table references failed at the
+            swap's DROP, after the whole load was staged.
+  keepalive pool sockets had no TCP keepalive: a half-open one parked a COPY
+            read forever. `ss -o` shows the timer on apitap's connections.
+Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale|longname|fkref|keepalive
 """
 import os
 import subprocess
@@ -156,6 +160,27 @@ def longname():
         dst_state_wipe(long)
 
 
+def fkref():
+    p, c = "pg_fk_parent", "pg_fk_child"
+    src(f"DROP TABLE IF EXISTS {p}")
+    dst(f"DROP TABLE IF EXISTS {c}; DROP TABLE IF EXISTS {p}")
+    try:
+        src(f"CREATE TABLE {p} (id int PRIMARY KEY); INSERT INTO {p} SELECT generate_series(1, 10)")
+        dst(f"CREATE TABLE {p} (id int PRIMARY KEY); CREATE TABLE {c} (pid int REFERENCES {p})")
+        try:
+            apitap.transfer(PG, DST, table=p, mode="replace")
+            m = None
+        except Exception as e:  # noqa: BLE001
+            m = str(e)
+        staged = dst("SELECT count(*) FROM pg_class WHERE relname LIKE '%apitap_staging%'")
+        assert m and "Nothing has been copied" in m and c in m, f"refused before the load, naming {c}: {m!r}"
+        assert staged == "0", f"no staging table may exist: {staged}"
+        print(f"  replace into a referenced table: refused up front ({m[:70]}...)")
+    finally:
+        src(f"DROP TABLE IF EXISTS {p}")
+        dst(f"DROP TABLE IF EXISTS {c}; DROP TABLE IF EXISTS {p}")
+
+
 def keepalive():
     import threading
     t = "pg_keepalive_v"
@@ -193,7 +218,7 @@ def _try(f, err):
 
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"notnull": notnull, "pub": pub, "nullcursor": nullcursor, "negscale": negscale, "longname": longname}
+    cases = {"notnull": notnull, "pub": pub, "nullcursor": nullcursor, "negscale": negscale, "longname": longname, "fkref": fkref, "keepalive": keepalive}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_pg_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ Postgres hardening: {which[0]}")

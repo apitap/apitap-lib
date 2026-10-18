@@ -655,6 +655,33 @@ impl PgSink {
         )))
     }
 
+    /// A foreign key from another table into the destination fails the swap
+    /// the same way a view does — `DROP TABLE` without CASCADE refuses — and
+    /// only after the whole load was staged (P2). Checked with the views.
+    async fn refuse_incoming_fks(&self) -> Result<()> {
+        let refs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT conrelid::regclass::text, conname::text FROM pg_constraint \
+             WHERE contype = 'f' AND confrelid = to_regclass($1::text) \
+               AND conrelid <> confrelid ORDER BY 1, 2",
+        )
+        .bind(&self.final_t)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("probe incoming foreign keys: {e}")))?;
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = refs.into_iter().map(|(t, c)| format!("{t} ({c})")).collect();
+        Err(Error::InvalidInput(format!(
+            "mode='replace' into {} cannot swap the table: foreign key(s) from {} reference \
+             it, and Postgres refuses to drop a referenced table. Nothing has been copied \
+             yet. Drop and recreate the foreign key(s) around the transfer, or use \
+             mode='append'/'merge', which never drop the table.",
+            self.final_t,
+            names.join(", ")
+        )))
+    }
+
 
     fn state_table(&self) -> String {
         format!("{}.\"_apitap_state\"", quote_ident(&self.schema))
@@ -819,6 +846,7 @@ impl crate::sink::Sink for PgSink {
             // this check, except dest_state only runs for the incremental
             // modes — replace never reaches it.
             self.refuse_dependent_views().await?;
+            self.refuse_incoming_fks().await?;
             // Resolve the table's ACTUAL namespace — an unqualified dest name follows
             // search_path everywhere else; hardcoding 'public' here would silently
             // skip the index/grant capture for such tables.

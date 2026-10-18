@@ -291,6 +291,7 @@ LEGS = [
     leg("e2e_pg_hardening.py",       "a parallel Postgres read copies NULL-cursor rows", argv=["nullcursor"]),
     leg("e2e_pg_hardening.py",       "numeric with a negative or oversized scale lands in a Decimal that holds it", argv=["negscale"]),
     leg("e2e_pg_hardening.py",       "a Postgres destination name past 63 bytes is refused", argv=["longname"]),
+    leg("e2e_pg_hardening.py",      "a Postgres replace into a referenced table is refused before the load", argv=["fkref"]),
     leg("e2e_pg_hardening.py",      "every Postgres pool socket carries TCP keepalive", argv=["keepalive"]),
     leg("e2e_pg_cdc_hardening.py",  "Postgres CDC takes an unchanged out-of-line key from the old image", argv=["toastpk"]),
     leg("e2e_pg_cdc_hardening.py",  "an open streamed transaction does not hold a Postgres CDC one-shot", argv=["openstream"]),
