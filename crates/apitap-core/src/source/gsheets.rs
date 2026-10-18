@@ -101,6 +101,7 @@ impl GsheetsSource {
             .get(url)
             .query(query)
             .bearer_auth(&self.token)
+            .timeout(crate::http::control_timeout())
             .send()
             .await
             .map_err(|e| Error::Transfer(format!("gsheets request: {e}")))?;

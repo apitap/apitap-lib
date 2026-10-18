@@ -45,6 +45,7 @@ async fn exchange(client: &reqwest::Client, uri: &str, assertion: &str) -> Resul
         }
         let sent = client
             .post(uri)
+            .timeout(crate::http::control_timeout())
             .form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", assertion)])
             .send()
             .await;
@@ -127,6 +128,31 @@ pub(crate) fn read_credentials(path: Option<String>, what: &str) -> Result<Strin
 
 #[cfg(test)]
 mod exchange_tests {
+    /// P2: a server that accepts and never answers is a timeout, not a hang.
+    #[test]
+    fn a_silent_token_server_times_out() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((c, _)) = l.accept().await {
+                    held.push(c);
+                }
+            });
+            std::env::set_var("APITAP_HTTP_REQUEST_TIMEOUT", "1");
+            let c = reqwest::Client::new();
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                super::exchange(&c, &format!("http://127.0.0.1:{port}/token"), "a"),
+            )
+            .await;
+            std::env::remove_var("APITAP_HTTP_REQUEST_TIMEOUT");
+            assert!(r.expect("the exchange must give up by itself").is_err());
+        });
+    }
+
     /// P2: the token is back-dated, and a 503 is retried; a 400 is not.
     #[test]
     fn the_token_exchange_retries_a_transient_failure() {

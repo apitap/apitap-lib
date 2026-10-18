@@ -402,7 +402,8 @@ impl GithubApiSource {
                 .client
                 .get(&url)
                 .header("user-agent", "apitap")
-                .header("accept", accept.unwrap_or("application/vnd.github+json"));
+                .header("accept", accept.unwrap_or("application/vnd.github+json"))
+                .timeout(crate::http::control_timeout());
             if let Some(t) = &self.token {
                 r = r.bearer_auth(t);
             }

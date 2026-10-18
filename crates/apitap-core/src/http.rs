@@ -152,6 +152,15 @@ mod tests {
     }
 }
 
+/// The deadline for one small control-plane request (a metadata or listing
+/// page, a token exchange): `APITAP_HTTP_REQUEST_TIMEOUT` seconds, default
+/// 120. The client has no read timeout by default (long uploads need that), so
+/// a live peer that accepted the request and never answered hung the run
+/// forever; keepalive only finds dead ones (P2). Never on a body that streams.
+pub(crate) fn control_timeout() -> Duration {
+    env_secs("APITAP_HTTP_REQUEST_TIMEOUT", 120)
+}
+
 /// Attempts an object-store call gets (S3, GCS).
 pub(crate) const STORE_ATTEMPTS: u32 = 6;
 
