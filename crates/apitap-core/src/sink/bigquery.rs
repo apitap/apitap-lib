@@ -942,6 +942,12 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
         .unwrap_or_default()
 }
 
+/// A failed chunk PUT, without the session URI: its upload_id authorises the
+/// upload, and reqwest's Display prints the URL (P2).
+fn upload_err(e: reqwest::Error) -> Error {
+    Error::Transfer(format!("bigquery upload chunk: {}", e.without_url()))
+}
+
 /// Whether an `api()` error is HTTP `code`: its message starts
 /// "bigquery <code> " (the status, then "on <url>"). The checks used
 /// `contains("409")`, and the URL holds the project and dataset: a 403
@@ -1627,7 +1633,7 @@ impl BqLoader {
                 Err(e) if attempt < 4 => {
                     let _ = e; // transient; retried below
                 }
-                Err(e) => return Err(Error::Transfer(format!("bigquery upload chunk: {e}"))),
+                Err(e) => return Err(upload_err(e)),
             }
             tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
         }
