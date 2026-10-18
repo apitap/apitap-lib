@@ -1209,35 +1209,49 @@ impl crate::sink::Sink for MySqlSink {
             .map_err(|e| Error::Transfer(format!("mysql loader connection id: {e}")))?
             .ok_or_else(|| Error::Transfer("mysql loader got no CONNECTION_ID()".into()))?;
 
+        // The task keeps its connection until finish/abort RELEASES it. It
+        // went back to the pool the moment the LOAD DATA ended, so an abort
+        // that raced the end could KILL QUERY an id a sibling loader of the
+        // same pool was already running its own load on (P2). `true` returns
+        // the connection to the pool; `false` (an abort) closes it, so a KILL
+        // that landed on it idle cannot reach whoever would take it next.
+        let (release, released) = tokio::sync::oneshot::channel::<bool>();
         let join = pipe::JoinOnce::new(tokio::spawn(async move {
-            conn.query_drop(&load_sql)
-                .await
-                .map_err(|e| Error::Transfer(format!("LOAD DATA: {e}")))?;
-            let loaded = conn.affected_rows();
-            // LOCAL implies IGNORE: a duplicate key (1062), a truncated or
-            // clipped value (1265/1264), a bad date (1292) — under the
-            // session's sql_mode='' an infinity timestamp becomes 0000-00-00 —
-            // are all WARNINGS, the row skipped or changed and the load
-            // "successful". Nothing read them, so the table published short or
-            // altered, silently (MASTER M-20, M-51). Every one fails the run.
-            let warnings = conn.get_warnings();
-            if warnings > 0 {
-                let info = conn.info().into_owned();
-                let shown: Vec<(String, u32, String)> = conn
-                    .query("SHOW WARNINGS LIMIT 5")
+            let r: Result<u64> = async {
+                conn.query_drop(&load_sql)
                     .await
-                    .unwrap_or_default();
-                let shown = shown
-                    .iter()
-                    .map(|(l, c, m)| format!("{l} {c}: {m}"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(Error::Transfer(format!(
-                    "LOAD DATA: MySQL raised {warnings} warning(s) ({info}) — rows were dropped \
-                     or changed on the way in, so the run is refused: {shown}"
-                )));
+                    .map_err(|e| Error::Transfer(format!("LOAD DATA: {e}")))?;
+                let loaded = conn.affected_rows();
+                // LOCAL implies IGNORE: a duplicate key (1062), a truncated or
+                // clipped value (1265/1264), a bad date (1292) — under the
+                // session's sql_mode='' an infinity timestamp becomes 0000-00-00 —
+                // are all WARNINGS, the row skipped or changed and the load
+                // "successful". Nothing read them, so the table published short or
+                // altered, silently (MASTER M-20, M-51). Every one fails the run.
+                let warnings = conn.get_warnings();
+                if warnings > 0 {
+                    let info = conn.info().into_owned();
+                    let shown: Vec<(String, u32, String)> = conn
+                        .query("SHOW WARNINGS LIMIT 5")
+                        .await
+                        .unwrap_or_default();
+                    let shown = shown
+                        .iter()
+                        .map(|(l, c, m)| format!("{l} {c}: {m}"))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(Error::Transfer(format!(
+                        "LOAD DATA: MySQL raised {warnings} warning(s) ({info}) — rows were dropped \
+                         or changed on the way in, so the run is refused: {shown}"
+                    )));
+                }
+                Ok(loaded)
             }
-            Ok(loaded)
+            .await;
+            if !released.await.unwrap_or(false) {
+                let _ = conn.disconnect().await;
+            }
+            r
         }));
         Ok(MySqlLoader {
             tx,
@@ -1246,6 +1260,7 @@ impl crate::sink::Sink for MySqlSink {
             registry: self.registry.clone(),
             conn_id,
             pool: self.pool.clone(),
+            release: Some(release),
         })
     }
 
@@ -1583,6 +1598,9 @@ pub(crate) struct MySqlLoader {
     /// Where the KILL is issued from: this loader's connection is busy
     /// streaming the file, so it cannot be the one to kill it.
     pool: Pool,
+    /// Lets the load task drop its connection: `true` back to the pool,
+    /// `false` closed (see `loader`). Until then `conn_id` is ours.
+    release: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
 /// How long `abort` waits to have a pooled connection issue the KILL. An abort
@@ -1634,6 +1652,9 @@ impl Loader for MySqlLoader {
             .await
             .map_err(|_| Error::Transfer("mysql LOAD DATA stream closed early".into()))?;
         self.tx.close_channel();
+        if let Some(r) = self.release.take() {
+            let _ = r.send(true);
+        }
         match self.join.join().await {
             Some(r) => r.map_err(|e| Error::Transfer(format!("mysql loader join: {e}")))?,
             None => Err(Error::Transfer("mysql LOAD DATA task had already ended".into())),
@@ -1661,9 +1682,9 @@ impl Loader for MySqlLoader {
         // bytes only reach the server after it asked for them, i.e. while the
         // statement is running and the KILL lands.
         //
-        // Only while the loader still holds its connection: once its task has
-        // ended the connection is back in the pool, and `CONNECTION_ID()` could
-        // by then name somebody else's statement.
+        // The task holds its connection until released below, so the id is
+        // ours whether the load is still running or just ended; an ended
+        // task (it errored on its own) needs no KILL.
         let killed = if self.join.is_finished() {
             "the load had already ended".to_string()
         } else {
@@ -1673,6 +1694,9 @@ impl Loader for MySqlLoader {
             }
         };
         self.tx.close_channel();
+        if let Some(r) = self.release.take() {
+            let _ = r.send(false); // closed, not pooled: a KILL may have landed on it
+        }
         self.registry
             .lock()
             .expect("infile registry")
@@ -1767,6 +1791,13 @@ mod abort_tests {
 
         let open = fn_body(src, "async fn loader(&self) -> Result<MySqlLoader> {");
         assert!(open.contains("SELECT CONNECTION_ID()"), "the id is taken at open: {open}");
+        // P2: the id stays ours until the loader says so — the task holds its
+        // connection until released, and an abort closes it instead of pooling it.
+        assert!(open.contains("released.await"), "the task waits to be released: {open}");
+        assert!(open.contains("conn.disconnect()"), "an unpooled close after an abort: {open}");
+        let fin = fn_body(src, "async fn finish(mut self) -> Result<u64> {");
+        assert!(fin.contains("send(true)"), "finish pools the connection: {fin}");
+        assert!(abort.contains("send(false)"), "abort closes it: {abort}");
     }
 }
 
