@@ -2709,8 +2709,6 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         out
     }
 
-    /// Every batch is one BigQuery transaction, so a changelog table's INSERT
-    /// and its own watermark row must land in the SAME one. Split across two, a
     /// R2-7: more than 95 table groups never share one transaction, whatever
     /// the bytes say — BigQuery's 100-table cap would fail the script
     /// non-retryably on every rerun.
@@ -2723,6 +2721,8 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         assert_eq!(batches[1].len(), 25);
     }
 
+    /// Every batch is one BigQuery transaction, so a changelog table's INSERT
+    /// and its own watermark row must land in the SAME one. Split across two, a
     /// failure in between commits the log rows without the watermark and the
     /// next run replays the whole window into an append-only table.
     #[test]
