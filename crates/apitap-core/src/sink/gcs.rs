@@ -206,7 +206,9 @@ impl GcsConn {
                     tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
                         .await;
                 }
-                Err(e) => return Err(Error::Transfer(format!("gcs {what}: {e}"))),
+                // without_url: a resumable session URI authorises its
+                // upload, and reqwest's Display prints the URL (P2).
+                Err(e) => return Err(Error::Transfer(format!("gcs {what}: {}", e.without_url()))),
             }
         }
     }
