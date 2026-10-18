@@ -870,6 +870,16 @@ async fn run_group(
     let src_pool_url = crate::dialect::postgres::secure_url(src_url);
     let src = PgPoolOptions::new()
         .max_connections(2)
+        // Every control statement on this pool gives up behind a lock after
+        // 30 s. The startup's publication check (pg_publication_tables opens
+        // the table) queued forever behind an ACCESS EXCLUSIVE lock (a VACUUM
+        // FULL, an ALTER), and so did the TOAST refetch (P2, T19).
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, "SET lock_timeout = '30s'").await?;
+                Ok(())
+            })
+        })
         .connect(&src_pool_url)
         .await
         .map_err(|e| {
@@ -1882,11 +1892,8 @@ async fn drain_loop(
             if crate::shutdown::requested() || std::time::Instant::now() >= deadline {
                 break;
             }
-            let now: (String,) = sqlx::query_as(&format!("SELECT {WAL_END}::text"))
-                .fetch_one(src)
-                .await
-                .map_err(db_err)?;
-            let now = lsn_from_string(&now.0)?;
+            let now = wal_end_now(src).await?;
+            let now = lsn_from_string(&now)?;
             if now > stop_line {
                 stop_line = now;
             } else {
@@ -2363,6 +2370,18 @@ async fn apply_member_pending(
 /// Where the source's WAL ends, in SQL. `pg_current_wal_lsn()` errors on a
 /// hot standby ("recovery is in progress"), and Postgres 16 decodes logically
 /// from one; there the replayed end is the end (P2).
+/// The source's WAL end now, for the follow loops. Bounded: a server that
+/// accepted the query and then stalled parked the follow forever, with no
+/// slot confirmations sent meanwhile (P2, T19).
+pub(crate) async fn wal_end_now(src: &sqlx::PgPool) -> Result<String> {
+    let q = format!("SELECT {WAL_END}::text");
+    match tokio::time::timeout(std::time::Duration::from_secs(60), sqlx::query_as::<_, (String,)>(&q).fetch_one(src)).await {
+        Ok(Ok((s,))) => Ok(s),
+        Ok(Err(e)) => Err(Error::Transfer(format!("log_based: follow lsn read: {e}"))),
+        Err(_) => Err(Error::Transfer("log_based: follow lsn read: no answer in 60 s".into())),
+    }
+}
+
 pub(crate) const WAL_END: &str =
     "(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END)";
 

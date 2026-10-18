@@ -673,6 +673,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_hardening.longname --> `e2e_pg_hardening.py longname` | a Postgres destination name past 63 bytes is refused, not silently cut |
 | <!-- claim: leg.e2e_pg_cdc_hardening.toastpk --> `e2e_pg_cdc_hardening.py toastpk` | an UPDATE beside a 2400-character out-of-line key drains: the key comes from the old image |
 | <!-- claim: leg.e2e_pg_cdc_hardening.openstream --> `e2e_pg_cdc_hardening.py openstream` | a streamed transaction left open on the source does not hold a one-shot drain; after its commit every row lands once |
+| <!-- claim: leg.e2e_pg_cdc_hardening.lockwait --> `e2e_pg_cdc_hardening.py lockwait` | a TOAST refetch behind an ACCESS EXCLUSIVE lock gives up (lock_timeout) and the rerun lands |
 | <!-- claim: leg.e2e_s3_hardening.amp --> `e2e_s3_hardening.py amp` | an S3 prefix holding `&` (XML-escaped in listings) publishes, and a second replace leaves only the live parts |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |

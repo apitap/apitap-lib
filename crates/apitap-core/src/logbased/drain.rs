@@ -354,16 +354,8 @@ pub(crate) async fn drain(
                     if let Some((src, floor, deadline)) = follow {
                         let buffered = buf_bytes + sess.stream_bytes;
                         if buffered < floor && std::time::Instant::now() < deadline {
-                            let now: (String,) =
-                                sqlx::query_as(&format!("SELECT {}::text", crate::logbased::run::WAL_END))
-                                    .fetch_one(src)
-                                    .await
-                                    .map_err(|e| {
-                                        Error::Transfer(format!(
-                                            "log_based: follow lsn read: {e}"
-                                        ))
-                                    })?;
-                            let now = crate::wire::pgoutput::lsn_from_string(&now.0)?;
+                            let now = crate::logbased::run::wal_end_now(src).await?;
+                            let now = crate::wire::pgoutput::lsn_from_string(&now)?;
                             if now > stop_line {
                                 stop_line = now;
                             } else {

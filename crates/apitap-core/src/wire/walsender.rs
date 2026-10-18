@@ -263,6 +263,14 @@ fn read_coalesce_us() -> u64 {
 /// design §14.26).
 const RECV_BUF_BYTES: usize = 4 << 20;
 
+fn connect_timeout_secs() -> u64 {
+    std::env::var("APITAP_PG_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(30)
+}
+
 fn recv_buffer_bytes() -> usize {
     match std::env::var("APITAP_RECV_BUF_BYTES") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
@@ -899,7 +907,27 @@ impl Walsender {
         Self::connect_with(url, None, false).await
     }
 
+    /// Connect, TLS and startup (auth included) under one deadline. None of
+    /// them had one: a server that accepted the socket and then stalled (a
+    /// pooler queue, an auth hook) parked the run forever — keepalive only
+    /// finds dead peers, not quiet live ones (P2, T19).
+    /// `APITAP_PG_CONNECT_TIMEOUT_SECS`, default 30.
     async fn connect_with(url: &str, options: Option<&str>, replication: bool) -> Result<Self> {
+        let secs = connect_timeout_secs();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(secs),
+            Self::connect_inner(url, options, replication),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(Error::Transfer(format!(
+                "walsender connect: no startup answer in {secs} s (APITAP_PG_CONNECT_TIMEOUT_SECS)"
+            ))),
+        }
+    }
+
+    async fn connect_inner(url: &str, options: Option<&str>, replication: bool) -> Result<Self> {
         let ci = parse_url(url)?;
         let stream = TcpStream::connect((ci.host.as_str(), ci.port))
             .await
@@ -2016,6 +2044,27 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// P2/T19: a server that accepts the socket and never answers startup
+    /// is a named error within the deadline, not a hang.
+    #[test]
+    fn a_silent_server_is_a_connect_timeout() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (_held, _) = l.accept().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
+            std::env::set_var("APITAP_PG_CONNECT_TIMEOUT_SECS", "2");
+            let url = format!("postgres://u@127.0.0.1:{port}/d?sslmode=disable");
+            let r = tokio::time::timeout(std::time::Duration::from_secs(10), super::Walsender::connect_sql(&url)).await;
+            std::env::remove_var("APITAP_PG_CONNECT_TIMEOUT_SECS");
+            let e = r.expect("the connect must give up by itself").err().expect("no server answered");
+            assert!(e.to_string().contains("APITAP_PG_CONNECT_TIMEOUT_SECS"), "{e}");
+        });
+    }
+
     /// The decode-work-memory policy: unset follows the server, an explicit
     /// value is honored up to 256 MiB, anything larger or unparseable is a
     /// loud refusal — never a silent 1 GiB raise on the user's source

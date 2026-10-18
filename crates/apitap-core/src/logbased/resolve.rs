@@ -30,10 +30,12 @@ use std::collections::HashMap;
 /// time zone was pinned: an `ALTER ROLE .. SET IntervalStyle = 'iso_8601'`
 /// made a refetched interval[] read `{P1D}` where the WAL ships `{"1 day"}`
 /// (P2). Startup parameters override role settings on the walsender; here
-/// only these do.
+/// only these do. And a bound: a refetch behind an ACCESS EXCLUSIVE lock
+/// (VACUUM FULL, ALTER) waited forever, with the apply parked (P2, T19).
 const REFETCH_PINS: &str = "SELECT set_config('TimeZone', 'UTC', true), \
      set_config('DateStyle', 'ISO', true), set_config('IntervalStyle', 'postgres', true), \
-     set_config('extra_float_digits', '3', true)";
+     set_config('extra_float_digits', '3', true), \
+     set_config('lock_timeout', '30s', true), set_config('statement_timeout', '60s', true)";
 
 /// One key's final state after replaying the residue tail over the set-phase
 /// upserts (insertion order preserved — collapse.rs's map+vec move).
