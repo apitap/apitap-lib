@@ -323,6 +323,9 @@ impl IcebergConn {
             "properties": {
                 "write.parquet.compression-codec": "zstd",
                 "created-by": "apitap",
+                // Never the catalog's default: apitap writes v2 manifests and
+                // snapshots, which a v3 table would reject or mis-take (P2).
+                "format-version": "2",
             },
         });
         let r = self
@@ -841,12 +844,15 @@ fn cur_prop_for(source_id: &str) -> String {
 
 /// (S3 client, table location, '/'-terminated key prefix) from catalog metadata.
 fn storage_for(conn: &IcebergConn, meta: &TableMetadata) -> Result<(S3Conn, String, String)> {
-    if meta.format_version() == FormatVersion::V1 {
-        return Err(Error::InvalidInput(
-            "iceberg: this is a format-version 1 table — apitap writes v2 \
-             tables only (v1 is legacy; recreate the table as v2)"
-                .into(),
-        ));
+    // v2 only: a v3 table passed the old v1-only check and got v2 manifest
+    // lists and snapshots without row lineage — a rejected commit or a
+    // spec-violating table, depending on the catalog (P2, R2-25).
+    if meta.format_version() != FormatVersion::V2 {
+        return Err(Error::InvalidInput(format!(
+            "iceberg: this is a format-version {} table — apitap writes v2 tables \
+             only (recreate the table as v2)",
+            meta.format_version() as u8
+        )));
     }
     let location = meta.location().trim_end_matches('/').to_string();
     let (bucket, key) = split_s3_uri(&location)?;
