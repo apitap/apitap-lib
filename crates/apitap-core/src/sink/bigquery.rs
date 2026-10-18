@@ -771,6 +771,13 @@ impl BqConn {
     /// lease collected, which no retry can change, and "aborted" in the same
     /// message must not make it look transient.
     pub(crate) async fn cdc_script(&self, sql: &str) -> Result<()> {
+        self.cdc_script_outcome(sql).await.map_err(|(e, _)| e)
+    }
+
+    /// `cdc_script`, saying whether a failure is DEFINITE: the job finished
+    /// with an error (`true`), or its fate is unknown — a transport failure
+    /// or a deadline, after which the script may still run (`false`).
+    pub(crate) async fn cdc_script_outcome(&self, sql: &str) -> std::result::Result<(), (Error, bool)> {
         let mut id = fresh_job_id();
         let mut attempt = 0u32;
         loop {
@@ -779,7 +786,7 @@ impl BqConn {
                 Err(e) => e,
             };
             if script_error_class(e.message()) == ErrClass::Lost {
-                return Err(crate::lease::no_longer_holds(&[]));
+                return Err((crate::lease::no_longer_holds(&[]), true));
             }
             match next_try(&e, attempt) {
                 Some(retry) => {
@@ -790,7 +797,10 @@ impl BqConn {
                     let ms = 200u64 << attempt; // 400, 800, 1600, 3200, 6400
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
-                None => return Err(e.into_error()),
+                None => {
+                    let definite = matches!(e, ScriptErr::Failed(_));
+                    return Err((e.into_error(), definite));
+                }
             }
         }
     }
@@ -2373,8 +2383,16 @@ pub(crate) async fn lease_open(conn: &BqConn, keys: &[String], token: &str) -> R
         t = conn.fq(crate::lease::LEASE_TABLE),
         tok = sql_str(token),
     );
-    if let Err(e) = conn.cdc_script(&sql).await {
-        let _ = conn.table_delete(&crate::naming::fence_ident(token)).await;
+    // The fence is dropped only after a DEFINITE failure. After an unknown
+    // one the script may still run and re-create it after the drop, with
+    // lease rows beside it, and the drop only looked like cleanup (P2). An
+    // unknown outcome leaves both as they are; the lease rows expire, and
+    // the fence (empty) is the documented leak of a start that never
+    // announced (R2-26 L4).
+    if let Err((e, definite)) = conn.cdc_script_outcome(&sql).await {
+        if definite {
+            let _ = conn.table_delete(&crate::naming::fence_ident(token)).await;
+        }
         return Err(e);
     }
     Ok(())
