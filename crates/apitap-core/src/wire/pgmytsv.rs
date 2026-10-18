@@ -361,7 +361,14 @@ fn render_numeric(name: &str, f: &[u8], out: &mut Vec<u8>) -> Result<()> {
     if f.len() < 8 {
         return Err(bad(name, "numeric header"));
     }
-    let ndigits = i16::from_be_bytes(f[0..2].try_into().unwrap()) as usize;
+    // Negative ndigits wrapped to usize::MAX, the length check overflowed
+    // past, and the digit loop indexed out of bounds (P2, T4; pgcopy's twin
+    // is 4aed35c).
+    let ndigits = i16::from_be_bytes(f[0..2].try_into().unwrap());
+    if ndigits < 0 {
+        return Err(bad(name, "numeric ndigits"));
+    }
+    let ndigits = ndigits as usize;
     let weight = i16::from_be_bytes(f[2..4].try_into().unwrap()) as i32;
     let sign = u16::from_be_bytes(f[4..6].try_into().unwrap());
     let dscale = u16::from_be_bytes(f[6..8].try_into().unwrap()) as usize;
@@ -513,6 +520,15 @@ mod tests {
             v.extend(d.to_be_bytes());
         }
         v
+    }
+
+    /// P2/T4: a negative ndigits is an error, not a wrapped length.
+    #[test]
+    fn negative_numeric_ndigits_is_an_error() {
+        let mut out = Vec::new();
+        let f = [0xFF, 0xFF, 0, 0, 0, 0, 0, 0];
+        assert!(render_field(MyType::Numeric, "c", &f, &mut out).is_err());
+        assert!(render_field(MyType::NumericDouble, "c", &f, &mut out).is_err());
     }
 
     fn render(ty: MyType, f: &[u8]) -> String {
