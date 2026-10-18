@@ -56,19 +56,33 @@ fn to_py(e: apitap_core::Error) -> PyErr {
 fn rt() -> std::sync::Arc<Runtime> {
     static RT: std::sync::Mutex<Option<(u32, std::sync::Arc<Runtime>)>> =
         std::sync::Mutex::new(None);
-    let mut g = RT.lock().unwrap_or_else(|e| e.into_inner());
     let pid = std::process::id();
+    {
+        let g = RT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((p, rt)) = &*g {
+            if *p == pid {
+                return rt.clone();
+            }
+        }
+    }
+    // Built OUTSIDE the lock. Building it spawns every worker thread, which
+    // takes milliseconds; a fork() from another thread inside that window
+    // gave the child a locked mutex whose owner does not exist there, and
+    // its first apitap call blocked forever (P2). The lock now covers only
+    // the check and the swap; a builder that lost a race leaks its runtime.
+    let built = std::sync::Arc::new(Runtime::new().expect("tokio runtime"));
+    let mut g = RT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((p, rt)) = &*g {
         if *p == pid {
+            std::mem::forget(built);
             return rt.clone();
         }
     }
-    let rt = std::sync::Arc::new(Runtime::new().expect("tokio runtime"));
     // The old runtime is leaked on purpose: its threads died with the fork,
     // and dropping it would try to join them.
     std::mem::forget(g.take());
-    *g = Some((pid, rt.clone()));
-    rt
+    *g = Some((pid, built.clone()));
+    built
 }
 
 /// log_based's runtime is chosen by the quota, per the scale law
