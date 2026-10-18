@@ -410,10 +410,22 @@ impl Source for PgSource {
                     ))
                 })?;
                 if let (Some(lo), Some(hi)) = (lo, hi) {
-                    for (rlo, rhi) in spans(lo, hi, want) {
+                    // The probe runs before the workers' snapshot: the edge
+                    // spans stay open, so a row committed in between with a
+                    // cursor past min/max is still read, and NULL cursors
+                    // (no span matched them) ride the last one (P2).
+                    let ranges = spans(lo, hi, want);
+                    let last = ranges.len() - 1;
+                    for (k, (rlo, rhi)) in ranges.into_iter().enumerate() {
+                        let range = match (k == 0, k == last) {
+                            (true, true) => "true".to_string(),
+                            (true, false) => format!("{qcol} <= {rhi}"),
+                            (false, true) => format!("({qcol} >= {rlo} OR {qcol} IS NULL)"),
+                            (false, false) => format!("{qcol} >= {rlo} AND {qcol} <= {rhi}"),
+                        };
                         stmts.push(format!(
                             "COPY (SELECT {select_list} FROM {src_t} \
-                             WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}) \
+                             WHERE {range}{dpred}) \
                              TO STDOUT ({copy_opts})"
                         ));
                     }
@@ -431,19 +443,27 @@ impl Source for PgSource {
             if stmts.is_empty() {
                 let (ver, npages): (i32, i64) = sqlx::query_as(
                     "SELECT current_setting('server_version_num')::int4, \
-                            (pg_relation_size($1::regclass) / 8192)::int8",
+                            (pg_relation_size($1::regclass) / current_setting('block_size')::int8)::int8",
                 )
                 .bind(&src_t)
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| Error::InvalidInput(format!("sizing {table}: {e}")))?;
                 if ver >= 140_000 && npages > 0 {
-                    for (plo, phi) in spans(0, npages - 1, want) {
+                    // The last span is open: pages added between this sizing
+                    // and the workers' snapshot hold visible rows (P2).
+                    let ranges = spans(0, npages - 1, want);
+                    let last = ranges.len() - 1;
+                    for (k, (plo, phi)) in ranges.into_iter().enumerate() {
+                        let upper = if k == last {
+                            String::new()
+                        } else {
+                            format!(" AND ctid < '({},0)'::tid", phi + 1)
+                        };
                         stmts.push(format!(
                             "COPY (SELECT {select_list} FROM {src_t} \
-                             WHERE ctid >= '({plo},0)'::tid AND ctid < '({},0)'::tid{dpred}) \
-                             TO STDOUT ({copy_opts})",
-                            phi + 1
+                             WHERE ctid >= '({plo},0)'::tid{upper}{dpred}) \
+                             TO STDOUT ({copy_opts})"
                         ));
                     }
                 }

@@ -665,6 +665,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_cdc_hardening.state --> `e2e_my_cdc_hardening.py state` | MySQL `_apitap_state` keys are binary-collated: tables differing only in case keep separate watermarks |
 | <!-- claim: leg.e2e_ch_hardening.dt64 --> `e2e_ch_hardening.py dt64` | a ClickHouse DateTime64(9) column travels as exact text: its nanoseconds survive CH → CH |
 | <!-- claim: leg.e2e_ch_hardening.cursor --> `e2e_ch_hardening.py cursor` | a String cursor holding a backslash is stored as the value itself, and the next append takes each row exactly once |
+| <!-- claim: leg.e2e_pg_hardening.nullcursor --> `e2e_pg_hardening.py nullcursor` | a parallel Postgres read over an integer cursor copies the rows whose cursor is NULL |
 | <!-- claim: leg.e2e_pg_hardening.negscale --> `e2e_pg_hardening.py negscale` | PG15+ numeric(5,-2) / numeric(2,5) land as Decimal(7,0) / Decimal(5,5), values exact |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
