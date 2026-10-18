@@ -379,7 +379,7 @@ pub(crate) type Rows = Vec<Vec<Option<String>>>;
 // TLS, which is most of them.
 
 /// Read half of either transport.
-pub(super) enum PgRead {
+pub(crate) enum PgRead {
     Tcp(OwnedReadHalf),
     Tls(tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>),
 }
