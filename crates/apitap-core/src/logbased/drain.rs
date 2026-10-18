@@ -509,9 +509,7 @@ pub(crate) async fn drain(
                                 if sess.stream_bytes > tx_limit {
                                     return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
                                 }
-                                sess.streams
-                                    .get_mut(&x)
-                                    .expect("stream open")
+                                open_stream(sess, x)?
                                     .push((t, op, sub.unwrap_or(x)));
                             }
                             None => {
@@ -538,9 +536,7 @@ pub(crate) async fn drain(
                                 if sess.stream_bytes > tx_limit {
                                     return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
                                 }
-                                sess.streams
-                                    .get_mut(&x)
-                                    .expect("stream open")
+                                open_stream(sess, x)?
                                     .push((t, op, sub.unwrap_or(x)));
                             }
                             None => {
@@ -565,9 +561,7 @@ pub(crate) async fn drain(
                                 if sess.stream_bytes > tx_limit {
                                     return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
                                 }
-                                sess.streams
-                                    .get_mut(&x)
-                                    .expect("stream open")
+                                open_stream(sess, x)?
                                     .push((t, op, sub.unwrap_or(x)));
                             }
                             None => {
@@ -586,11 +580,7 @@ pub(crate) async fn drain(
                         if let Some(t) = tracked(sess, rid)? {
                             let op = StreamOp::Truncate;
                             match in_stream {
-                                Some(x) => sess.streams.get_mut(&x).expect("stream open").push((
-                                    t,
-                                    op,
-                                    sub.unwrap_or(x),
-                                )),
+                                Some(x) => open_stream(sess, x)?.push((t, op, sub.unwrap_or(x))),
                                 None => tx_buf.push((t, op)),
                             }
                         }
@@ -732,8 +722,30 @@ fn tracked(sess: &mut DrainSession, rel_id: u32) -> Result<Option<u16>> {
     Ok(sess.slots[usize::from(slot)].tracked.then_some(slot))
 }
 
+/// The open stream block a row change belongs to. StreamCommit and a whole
+/// StreamAbort remove the entry but leave the block marker: a change after
+/// one inside the same block (a protocol deviation) hit `expect` and killed
+/// the process instead of failing the window (P2, T11).
+fn open_stream(sess: &mut DrainSession, x: u32) -> Result<&mut Vec<(u16, StreamOp, u32)>> {
+    sess.streams.get_mut(&x).ok_or_else(|| {
+        Error::Transfer(format!(
+            "log_based: row change for stream {x} after its commit or abort — pgoutput protocol desync"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    /// P2/T11: a change for a stream that is not open is an error.
+    #[test]
+    fn a_change_for_a_closed_stream_is_an_error() {
+        let mut s = DrainSession::default();
+        let e = open_stream(&mut s, 7).err().expect("no stream 7 is open").to_string();
+        assert!(e.contains("desync"), "{e}");
+        s.streams.insert(7, Vec::new());
+        assert!(open_stream(&mut s, 7).is_ok());
+    }
+
     use super::*;
 
     /// L4 (§4.2): relations resolve to dense slots — a repeat resolution
