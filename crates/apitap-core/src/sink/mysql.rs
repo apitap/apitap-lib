@@ -100,6 +100,48 @@ pub(crate) struct MySqlShared {
     tls_hint: Option<Arc<str>>,
 }
 
+/// The `_apitap_state` DDL both MySQL lanes create. `dest_table` and
+/// `source_id` are BINARY-collated: under the server's default `_ci`
+/// collation `Orders` and `orders` — two tables where lower_case_table_names
+/// is 0 — shared one state row, and one resumed from the other's watermark
+/// (P2, MySQL state collation).
+pub(crate) fn state_table_ddl(fq: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {fq} (\
+            dest_table VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+            source_id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+            cursor_col VARCHAR(255), \
+            watermark VARCHAR(255), \
+            mode VARCHAR(16), \
+            last_rows BIGINT, \
+            synced_at DATETIME(6), \
+            PRIMARY KEY (dest_table, source_id)\
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+}
+
+/// How many of a state table's key columns are not binary-collated yet (a
+/// table an older release created).
+pub(crate) fn state_collation_probe(db: &str) -> String {
+    format!(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = '{}' \
+         AND table_name = '_apitap_state' AND column_name IN ('dest_table', 'source_id') \
+         AND collation_name <> 'utf8mb4_bin'",
+        sql_lit(db)
+    )
+}
+
+/// The one-time conversion of such a table. Safe on existing rows: the old
+/// `_ci` primary key already forbade two rows equal under it, so none can
+/// collide under the binary collation.
+pub(crate) fn state_collation_fix(fq: &str) -> String {
+    format!(
+        "ALTER TABLE {fq} \
+         MODIFY dest_table VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+         MODIFY source_id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL"
+    )
+}
+
 /// The lease store, shared by both lanes — see `crate::lease`.
 ///
 /// InnoDB, not `ENGINE=MEMORY` like the lock: a MEMORY table is emptied by a
@@ -771,20 +813,17 @@ impl MySqlSink {
     }
 
     async fn ensure_state_table(&self) -> Result<()> {
-        self.exec(&format!(
-            "CREATE TABLE IF NOT EXISTS {} (\
-                dest_table VARCHAR(255) NOT NULL, \
-                source_id VARCHAR(512) NOT NULL, \
-                cursor_col VARCHAR(255), \
-                watermark VARCHAR(255), \
-                mode VARCHAR(16), \
-                last_rows BIGINT, \
-                synced_at DATETIME(6), \
-                PRIMARY KEY (dest_table, source_id)\
-             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-            self.fq("_apitap_state")
-        ))
-        .await
+        let fq = self.fq("_apitap_state");
+        self.exec(&state_table_ddl(&fq)).await?;
+        let stale = self
+            .scalar(&state_collation_probe(&self.db))
+            .await?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if stale > 0 {
+            self.exec(&state_collation_fix(&fq)).await?;
+        }
+        Ok(())
     }
 
     async fn write_state(&self, watermark: &str, rows: u64) -> Result<()> {

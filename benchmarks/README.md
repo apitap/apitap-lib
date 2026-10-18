@@ -662,6 +662,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_cdc_hardening.tagged --> `e2e_my_cdc_hardening.py tagged` | MySQL 8.4 transactions with a tagged GTID (event 42) drain instead of wedging the lane |
 | <!-- claim: leg.e2e_my_cdc_hardening.truncate --> `e2e_my_cdc_hardening.py truncate` | a MySQL TRUNCATE written with a leading comment reaches the destination |
 | <!-- claim: leg.e2e_my_cdc_hardening.txcap --> `e2e_my_cdc_hardening.py txcap` | one MySQL transaction past APITAP_TX_BUF_BYTES is refused naming the table, watermark untouched |
+| <!-- claim: leg.e2e_my_cdc_hardening.state --> `e2e_my_cdc_hardening.py state` | MySQL `_apitap_state` keys are binary-collated: tables differing only in case keep separate watermarks |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

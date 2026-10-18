@@ -595,21 +595,16 @@ mod store {
             if self.state_ready.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(());
             }
-            conn.query_drop(format!(
-                "CREATE TABLE IF NOT EXISTS {} (\
-                    dest_table VARCHAR(255) NOT NULL, \
-                    source_id VARCHAR(512) NOT NULL, \
-                    cursor_col VARCHAR(255), \
-                    watermark VARCHAR(255), \
-                    mode VARCHAR(16), \
-                    last_rows BIGINT, \
-                    synced_at DATETIME(6), \
-                    PRIMARY KEY (dest_table, source_id)\
-                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-                self.fq("_apitap_state")
-            ))
-            .await
-            .map_err(|e| Error::Transfer(format!("log_based: mysql state ddl: {e}")))?;
+            let fq = self.fq("_apitap_state");
+            let ddl_err = |e: mysql_async::Error| Error::Transfer(format!("log_based: mysql state ddl: {e}"));
+            conn.query_drop(crate::sink::mysql::state_table_ddl(&fq)).await.map_err(ddl_err)?;
+            let stale: Option<u64> = conn
+                .query_first(crate::sink::mysql::state_collation_probe(self.shared.db()))
+                .await
+                .map_err(ddl_err)?;
+            if stale.unwrap_or(0) > 0 {
+                conn.query_drop(crate::sink::mysql::state_collation_fix(&fq)).await.map_err(ddl_err)?;
+            }
             self.state_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
