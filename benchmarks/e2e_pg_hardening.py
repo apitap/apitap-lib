@@ -12,7 +12,9 @@ Four P2 findings (docs/review/2026-10-18-p2-triage.md), PG16 :5544 / :5545 / CH 
             never copied.
   negscale  numeric(5,-2) (PG15+, values up to 9999900) was declared
             Decimal(5, 0) in ClickHouse: out of its own precision.
-Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale
+  longname  a 64-byte destination name was cut to 63 by Postgres: every run
+            looked for the full name, never found it, and re-bootstrapped.
+Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale|longname
 """
 import subprocess
 import sys
@@ -131,9 +133,30 @@ def negscale():
         ch(f"DROP TABLE IF EXISTS {t}")
 
 
+def longname():
+    t, long = "pg_long_dest_src", "x" * 64
+    src(f"DROP TABLE IF EXISTS {t}")
+    dst(f"DROP TABLE IF EXISTS {long[:63]}")
+    try:
+        src(f"CREATE TABLE {t} (id int PRIMARY KEY); INSERT INTO {t} SELECT generate_series(1, 10)")
+        try:
+            apitap.transfer(PG, DST, table=t, dest_table=long, mode="append", cursor="id")
+            m = None
+        except Exception as e:  # noqa: BLE001
+            m = str(e)
+        made = dst(f"SELECT count(*) FROM pg_class WHERE relname = '{long[:63]}'")
+        assert m and "64 bytes" in m, f"a 64-byte destination must be refused, got {m!r} (cut table exists: {made})"
+        assert made == "0", "nothing may be created under the cut name"
+        print(f"  dest_table of 64 bytes: refused ({m[:70]}...)")
+    finally:
+        src(f"DROP TABLE IF EXISTS {t}")
+        dst(f"DROP TABLE IF EXISTS {long[:63]}")
+        dst_state_wipe(long)
+
+
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"notnull": notnull, "pub": pub, "nullcursor": nullcursor, "negscale": negscale}
+    cases = {"notnull": notnull, "pub": pub, "nullcursor": nullcursor, "negscale": negscale, "longname": longname}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_pg_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ Postgres hardening: {which[0]}")

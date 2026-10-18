@@ -444,12 +444,12 @@ impl PgSink {
         overlap_send: bool,
         run: &crate::naming::RunId,
     ) -> Result<Self> {
-        Ok(Self::bind(
+        Self::bind(
             Self::shared_pool(url, max_conns).await?,
             dest_table,
             overlap_send,
             run,
-        ))
+        )
     }
 
     /// The sink-side pool alone — a multi-table run builds it once and binds one
@@ -522,12 +522,13 @@ impl PgSink {
         dest_table: &str,
         overlap_send: bool,
         run: &crate::naming::RunId,
-    ) -> Self {
+    ) -> Result<Self> {
         let qualified = dest_table.contains('.');
         let (schema_pfx, bare) = match dest_table.rsplit_once('.') {
             Some((s, t)) => (format!("{s}."), t.to_string()),
             None => (String::new(), dest_table.to_string()),
         };
+        check_ident_len(schema_pfx.trim_end_matches('.'), &bare)?;
         // The run's token is IN the name, which is what makes it impossible for
         // one run to publish another's work: finalize renames a name only this
         // run could have minted. Before this, two runs shared one staging
@@ -547,7 +548,7 @@ impl PgSink {
         } else {
             schema
         };
-        Self {
+        Ok(Self {
             pool,
             final_t: quote_ident_path(dest_table),
             copy_in_sql: format!("COPY {staging_t} FROM STDIN (FORMAT binary)"),
@@ -567,8 +568,26 @@ impl PgSink {
             col_names: Vec::new(),
             overlap_send,
             run: run.clone(),
+        })
+    }
+}
+
+/// Postgres cuts an identifier past 63 bytes silently. The staging name is
+/// minted to fit; the destination's was not: two names sharing their first
+/// 63 bytes were one table under two guard and state keys, and one long name
+/// never matched its stored, cut spelling, so every run re-bootstrapped (P2).
+fn check_ident_len(schema: &str, table: &str) -> Result<()> {
+    for (what, name) in [("schema", schema), ("table", table)] {
+        if name.len() > crate::naming::PG_IDENT_MAX {
+            return Err(Error::InvalidInput(format!(
+                "destination {what} name '{name}' is {} bytes; Postgres keeps only the first {} \
+                 and would silently cut it. Use a shorter dest_table",
+                name.len(),
+                crate::naming::PG_IDENT_MAX
+            )));
         }
     }
+    Ok(())
 }
 
 impl PgSink {
@@ -1502,6 +1521,15 @@ impl Loader for PgCopyLoader {
 
 #[cfg(test)]
 mod tests {
+    /// P2: a 64-byte destination name is refused, not cut; 63 bytes fits.
+    #[test]
+    fn identifiers_past_63_bytes_are_refused() {
+        assert!(super::check_ident_len("public", &"x".repeat(63)).is_ok());
+        let e = super::check_ident_len("public", &"x".repeat(64)).unwrap_err().to_string();
+        assert!(e.contains("64 bytes"), "{e}");
+        assert!(super::check_ident_len(&"s".repeat(64), "t").is_err());
+    }
+
     use super::*;
 
     #[test]

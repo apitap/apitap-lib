@@ -247,7 +247,7 @@ impl DstScheme for PgTo {
         PgSink::shared_pool(url, cfg.shape.pipes + 8).await
     }
     fn bind(shared: sqlx::PgPool, table: &str, cfg: &SinkCfg) -> Result<PgSink> {
-        Ok(PgSink::bind(shared, table, cfg.pg_overlap, &cfg.run))
+        PgSink::bind(shared, table, cfg.pg_overlap, &cfg.run)
     }
 }
 struct ChTo;
