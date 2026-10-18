@@ -47,6 +47,12 @@ static WINDOW: AtomicU64 = AtomicU64::new(0);
 static ON: AtomicBool = AtomicBool::new(false);
 /// True while a reporter thread is alive; cleared to stop it.
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// The live reporter's generation. A transfer started within a reporter's
+/// 200 ms sleep set RUNNING again before the old thread looked, so two
+/// threads ran and the old one's rate went negative (P2); each thread now
+/// exits once its generation is not the current one.
+static GEN: AtomicU64 = AtomicU64::new(0);
+
 /// One gauge field. A value that parses as a FINITE number is written as
 /// one; "NaN" and "inf" parse as f64 too, and unquoted they are not JSON.
 fn json_field(k: &str, v: &str) -> String {
@@ -328,6 +334,7 @@ impl Reporter {
         }
         let started = Instant::now();
         RUNNING.store(true, Relaxed);
+        let my = GEN.fetch_add(1, Relaxed) + 1;
         let tick = interval(fmt);
         std::thread::spawn(move || {
             let mut last = (0u64, 0u64, Instant::now());
@@ -335,7 +342,7 @@ impl Reporter {
             // on the cadence: a killed pod should not wait 30 s to exit.
             let step = Duration::from_millis(200);
             let mut waited = Duration::ZERO;
-            while RUNNING.load(Relaxed) {
+            while RUNNING.load(Relaxed) && GEN.load(Relaxed) == my {
                 std::thread::sleep(step);
                 waited += step;
                 if waited < tick {
@@ -352,8 +359,8 @@ impl Reporter {
                     started.elapsed(),
                     rows,
                     bytes,
-                    ((rows - last.0) as f64 / secs) as u64,
-                    ((bytes - last.1) as f64 / secs) as u64,
+                    (rows.saturating_sub(last.0) as f64 / secs) as u64,
+                    (bytes.saturating_sub(last.1) as f64 / secs) as u64,
                     false,
                 );
                 emit(fmt, &line);
