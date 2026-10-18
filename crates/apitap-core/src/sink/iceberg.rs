@@ -842,6 +842,14 @@ fn cur_prop_for(source_id: &str) -> String {
     format!("apitap.watermark-cursor.{source_id}")
 }
 
+/// A new snapshot's timestamp: now, but never before the table's last update.
+/// Iceberg-Java catalogs refuse a snapshot log that goes back more than a
+/// minute, so a writer whose clock ran behind the previous one had every
+/// commit rejected until its clock was fixed (P2).
+fn snapshot_ts(meta: &TableMetadata) -> i64 {
+    chrono::Utc::now().timestamp_millis().max(meta.last_updated_ms() + 1)
+}
+
 /// (S3 client, table location, '/'-terminated key prefix) from catalog metadata.
 fn storage_for(conn: &IcebergConn, meta: &TableMetadata) -> Result<(S3Conn, String, String)> {
     // v2 only: a v3 table passed the old v1-only check and got v2 manifest
@@ -1516,7 +1524,7 @@ impl IcebergSink {
                 .with_sequence_number(seq)
                 .with_summary(Summary { operation, additional_properties: props })
                 .with_schema_id(meta.current_schema_id())
-                .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+                .with_timestamp_ms(snapshot_ts(&meta))
                 .build();
 
             let mut updates = vec![
@@ -2219,7 +2227,7 @@ impl CdcBound {
                     additional_properties: props,
                 })
                 .with_schema_id(meta.current_schema_id())
-                .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+                .with_timestamp_ms(snapshot_ts(&meta))
                 .build();
 
             let updates = vec![
