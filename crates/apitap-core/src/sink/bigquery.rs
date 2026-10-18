@@ -1459,7 +1459,7 @@ pub(crate) struct BqLoader {
     /// stream — each resolves to its committed row count. `await_jobs` empties
     /// it one handle at a time and `quiesce` drains what is left, so no handle
     /// is ever dropped while its job can still run.
-    pending_jobs: Vec<PendingJob>,
+    pending_jobs: std::collections::VecDeque<PendingJob>,
     last_seal: std::time::Instant,
     /// APITAP_DEBUG=1: cumulative per-phase wall time, reported at finish.
     t_transcode: std::time::Duration,
@@ -1514,7 +1514,7 @@ impl BqLoader {
             local_wm: None,
             shared_wm,
             file_rows: 0,
-            pending_jobs: Vec::new(),
+            pending_jobs: std::collections::VecDeque::new(),
             last_seal: std::time::Instant::now(),
             t_transcode: Default::default(),
             t_gzip: Default::default(),
@@ -1779,7 +1779,7 @@ impl BqLoader {
                 Ok(out_rows)
             })),
         };
-        self.pending_jobs.push(pending);
+        self.pending_jobs.push_back(pending);
         // Fresh file: new resumable session, offsets from zero.
         self.session_uri = None;
         self.offset = 0;
@@ -1811,10 +1811,10 @@ impl BqLoader {
     /// `pipeline::run`'s error arm runs `discard()` underneath it, and a job
     /// still PENDING re-creates the staging table it dropped (CREATE_IF_NEEDED,
     /// `bq_job_config`) — the next run then refuses it with `locked:`.
-    async fn await_jobs(jobs: &mut Vec<PendingJob>) -> Result<u64> {
+    async fn await_jobs(jobs: &mut std::collections::VecDeque<PendingJob>) -> Result<u64> {
         let mut committed = 0u64;
-        while !jobs.is_empty() {
-            let mut p = jobs.remove(0);
+        // pop_front, not remove(0): each removal shifted the rest (P-e).
+        while let Some(mut p) = jobs.pop_front() {
             // `JoinOnce`, so a handle can never be polled twice: `quiesce`
             // reaches the same field on the error path.
             committed += p
@@ -3081,11 +3081,12 @@ mod tests {
     /// rest and proved nothing.
     #[tokio::test]
     async fn an_error_mid_commit_leaves_every_later_job_owned() {
-        let mut jobs = vec![
+        let mut jobs: std::collections::VecDeque<_> = vec![
             job("first", Ok(10)),
             job("second", Err(Error::Transfer("job second failed".into()))),
             job("third", Ok(30)),
-        ];
+        ]
+        .into();
 
         let err = BqLoader::await_jobs(&mut jobs)
             .await
@@ -3107,7 +3108,7 @@ mod tests {
     /// The clean path still adds up every job's committed rows.
     #[tokio::test]
     async fn commit_adds_up_every_jobs_rows() {
-        let mut jobs = vec![job("a", Ok(7)), job("b", Ok(5))];
+        let mut jobs: std::collections::VecDeque<_> = vec![job("a", Ok(7)), job("b", Ok(5))].into();
         assert_eq!(BqLoader::await_jobs(&mut jobs).await.expect("all done"), 12);
         assert!(jobs.is_empty(), "nothing is left to quiesce");
     }
