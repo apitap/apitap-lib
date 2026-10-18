@@ -1165,6 +1165,10 @@ pub(crate) fn skippable(t: u8) -> bool {
         EV_HEARTBEAT
             | EV_HEARTBEAT_V2
             | 33 | 34 | 35 // MySQL GTID / ANONYMOUS_GTID / PREVIOUS_GTIDS
+            // GTID_TAGGED_LOG_EVENT (MySQL 8.3+, `gtid_next='AUTOMATIC:<tag>'`):
+            // a GTID marker like 33, no rows. Refused, it wedged the lane on
+            // the first tagged transaction, every rerun (P2).
+            | 42
             | 3 | 5 | 9    // STOP / INTVAR / APPEND_BLOCK
             | 1            // START_EVENT_V3
             | 13 | 14      // RAND / USER_VAR (statement-based context)
@@ -1633,6 +1637,8 @@ mod tests {
         }
         assert!(is_tx_start(EV_MA_GTID));
         assert!(!skippable(EV_MA_GTID));
+        // MySQL 8.3+ tagged GTID: a marker like 33, no rows (P2).
+        assert!(skippable(42), "a tagged GTID event carries no rows");
         // Events that can carry data (or announce loss) are never skippable —
         // the reader refuses on them instead.
         for t in [39u8, 26, 166, 0, 200] {
