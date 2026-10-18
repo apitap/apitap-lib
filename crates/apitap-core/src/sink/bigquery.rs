@@ -660,7 +660,7 @@ impl BqConn {
         }
         match self.table_create(STATE_TABLE, &state_schema_fields()).await {
             Ok(()) => Ok(()),
-            Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
+            Err(Error::Transfer(m)) if is_conflict(&m) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -940,6 +940,20 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether an `api()` error is HTTP `code`: its message starts
+/// "bigquery <code> " (the status, then "on <url>"). The checks used
+/// `contains("409")`, and the URL holds the project and dataset: a 403
+/// against project `acme-409123` read as "already exists", so a marker
+/// that was never created counted as held (P2).
+fn is_status(m: &str, code: u16) -> bool {
+    m.starts_with(&format!("bigquery {code} "))
+}
+
+/// A create that lost a race, or found the object already there.
+fn is_conflict(m: &str) -> bool {
+    is_status(m, 409)
 }
 
 pub(crate) fn sql_str(s: &str) -> String {
@@ -2048,7 +2062,7 @@ impl BqSink {
         match self.conn.table_create(STATE_TABLE, &state_schema_fields()).await {
             Ok(()) => Ok(()),
             // Two first-runs can race the CREATE; whoever loses appends fine.
-            Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
+            Err(Error::Transfer(m)) if is_conflict(&m) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -2233,7 +2247,7 @@ pub(crate) async fn ensure_lease_table(conn: &BqConn) -> Result<()> {
     {
         Ok(()) => Ok(()),
         // Two first-runs race the CREATE; whoever loses is fine.
-        Err(Error::Transfer(m)) if m.contains("409") || m.contains("Already Exists") => Ok(()),
+        Err(Error::Transfer(m)) if is_conflict(&m) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -2324,7 +2338,7 @@ pub(crate) async fn lease_get(conn: &BqConn, key: &str, token: &str)
         Ok(r) => r,
         // No lease store = nothing is leased, never an error.
         Err(Error::Transfer(m))
-            if m.contains("404") || m.contains("Not found") || m.contains("was not found") =>
+            if is_status(&m, 404) || m.contains("Not found") || m.contains("was not found") =>
         {
             return Ok(None)
         }
@@ -2466,13 +2480,13 @@ impl crate::guard::GuardStore for BqGuard {
 
     /// BigQuery has no zero-column table; nothing ever reads this one.
     async fn create_marker(&self, raw: &str) -> Result<()> {
-        let exists = |m: &str| m.contains("409") || m.contains("Already Exists");
+        let exists = |m: &str| is_conflict(m);
         match self.conn.table_create(raw, &lock_schema_fields()).await {
             Ok(()) => Ok(()),
             // Idempotent, like the SQL engines' IF NOT EXISTS.
             Err(Error::Transfer(m)) if exists(&m) => Ok(()),
             // A first run into a dataset that does not exist yet.
-            Err(Error::Transfer(m)) if m.contains("404") => {
+            Err(Error::Transfer(m)) if is_status(&m, 404) => {
                 self.conn.ensure_dataset().await?;
                 match self.conn.table_create(raw, &lock_schema_fields()).await {
                     Err(Error::Transfer(m)) if exists(&m) => Ok(()),
@@ -2917,6 +2931,15 @@ impl BqSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2: a status is read from the message's head, never from the URL.
+    #[test]
+    fn statuses_are_read_from_the_head_not_the_url() {
+        let forbidden = "bigquery 403 Forbidden on https://bigquery.googleapis.com/bigquery/v2/projects/acme-409123/datasets/sales_2404/tables: rateLimitExceeded";
+        assert!(!super::is_conflict(forbidden) && !super::is_status(forbidden, 404));
+        assert!(super::is_conflict("bigquery 409 Conflict on .../tables: Already Exists: Table p:d.t"));
+        assert!(super::is_status("bigquery 404 Not Found on .../d", 404));
+    }
 
     /// A job task that resolves to `rows`, for the ownership tests below.
     fn job(id: &str, r: Result<u64>) -> PendingJob {
