@@ -307,6 +307,7 @@ LEGS = [
     leg("e2e_s3_hardening.py",      "numeric(2,4) lands exact in S3 parquet", argv=["numeric"]),
     leg("e2e_ice_hardening.py",     "an Iceberg table of format-version 3 is refused", argv=["v3"]),
     leg("e2e_ice_hardening.py",     "numeric(2,4) lands exact in Iceberg", argv=["numeric"]),
+    leg("e2e_ice_hardening.py",  "an Iceberg commit refuses a schema evolved during the load", argv=["schema"]),
 ]
 
 

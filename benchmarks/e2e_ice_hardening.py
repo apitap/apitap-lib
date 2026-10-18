@@ -5,7 +5,10 @@ P2 findings (docs/review/2026-10-18-p2-triage.md):
             and snapshots without row lineage. Now anything but v2 is refused.
   numeric   numeric(2,4) (PG15+, values like 0.0012) became decimal(2,2):
             0.0012 landed as 0.00.
-Usage: e2e_ice_hardening.py v3|numeric
+  schema    a commit required only the snapshot ref: a schema evolved by
+            another writer during the load passed, and the files (written
+            with the old field ids) were committed against the new schema.
+Usage: e2e_ice_hardening.py v3|numeric|schema
 """
 import json
 import subprocess
@@ -104,9 +107,53 @@ def numeric():
         drop(t)
 
 
+def schema():
+    import threading
+    import time
+    base, v = "ice_schema_src", "ice_schema_v"
+    pg(f"DROP VIEW IF EXISTS {v}; DROP TABLE IF EXISTS {base}")
+    drop(v)
+    try:
+        pg(f"CREATE TABLE {base} (id bigint PRIMARY KEY); INSERT INTO {base} SELECT generate_series(1, 10); "
+           f"CREATE VIEW {v} AS SELECT id FROM {base} WHERE (SELECT true FROM pg_sleep(0.004 + id * 0))")
+        apitap.transfer(PG, ICE, table=v, mode="append", cursor="id")
+        pg(f"INSERT INTO {base} SELECT generate_series(11, 1500)")    # ~6 s to read
+        out = {}
+        th = threading.Thread(target=lambda: out.update(r=_try(lambda: apitap.transfer(
+            PG, ICE, table=v, mode="append", cursor="id", parallel=1))))
+        th.start()
+        time.sleep(2)
+        meta = rest("GET", f"/namespaces/{NS}/tables/{v}")["metadata"]
+        cur = next(x for x in meta["schemas"] if x["schema-id"] == meta["current-schema-id"])
+        new_id = meta["last-column-id"] + 1
+        fields = cur["fields"] + [{"id": new_id, "name": "extra", "required": False, "type": "string"}]
+        rest("POST", f"/namespaces/{NS}/tables/{v}", {"requirements": [], "updates": [
+            {"action": "add-schema", "schema": {"type": "struct", "schema-id": max(x["schema-id"] for x in meta["schemas"]) + 1,
+                                                 "fields": fields}, "last-column-id": new_id},
+            {"action": "set-current-schema", "schema-id": -1}]})
+        th.join()
+        err = out["r"]
+        assert err and "schema or partition spec changed" in err, \
+            f"a schema change during the load must refuse the commit, got {err!r}"
+        n = ice_rows(v, "SELECT count(*) FROM {T}")[0][0]
+        assert n == 10, f"nothing from the refused load may be committed: {n} rows"
+        print(f"  schema evolved mid-load: commit refused ({err[:60]}...), table still {n} rows")
+    finally:
+        pg(f"DROP VIEW IF EXISTS {v}; DROP TABLE IF EXISTS {base}")
+        drop(v)
+
+
+def _try(f):
+    try:
+        f()
+        return None
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+
+
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"v3": v3, "numeric": numeric}
+    cases = {"v3": v3, "numeric": numeric, "schema": schema}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_ice_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ Iceberg hardening: {which[0]}")

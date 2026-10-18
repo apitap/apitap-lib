@@ -1402,6 +1402,7 @@ impl IcebergSink {
             .fold(None, |acc, f| wm_max(acc, f.wm.clone(), numeric));
 
         // -- optimistic-concurrency commit loop
+        let (schema_id0, spec_id0) = (meta0.current_schema_id(), meta0.default_partition_spec_id());
         let mut meta = meta0;
         // Every attempt's snapshot id: a late-landing 504 from an earlier
         // attempt must be visible to every later reload, or the next attempt
@@ -1412,6 +1413,26 @@ impl IcebergSink {
         // stays Unknown so the sweep never touches its files (round-2 §1.2).
         // The flag is the caller's, so a `?` exit is judged by it too (M-14).
         for attempt in 0..3u32 {
+            // The files were written with the schema and spec the load began
+            // with; another writer that evolved either since (a drop and a
+            // re-add gives the column a new field id) would have readers see
+            // NULL where these files hold values. Only the snapshot ref was
+            // required before, so a schema-only change passed (P2).
+            if meta.current_schema_id() != schema_id0 || meta.default_partition_spec_id() != spec_id0 {
+                let e = Error::Transfer(format!(
+                    "iceberg: the table's schema or partition spec changed during this load \
+                     (schema {} -> {}, spec {} -> {}); its files were written for the old one, \
+                     so nothing is committed. Re-run against the new schema.",
+                    schema_id0,
+                    meta.current_schema_id(),
+                    spec_id0,
+                    meta.default_partition_spec_id()
+                ));
+                if *ambiguous {
+                    return Ok(CommitEnd::Unknown(e));
+                }
+                return Err(e);
+            }
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
             tried.push(snapshot_id);
@@ -1593,6 +1614,8 @@ impl IcebergSink {
             }
             let requirements = vec![
                 TableRequirement::UuidMatch { uuid: meta.uuid() },
+                TableRequirement::CurrentSchemaIdMatch { current_schema_id: schema_id0 },
+                TableRequirement::DefaultSpecIdMatch { default_spec_id: spec_id0 },
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
                     snapshot_id: parent,
@@ -2156,6 +2179,7 @@ impl CdcBound {
 
         let schema = self.meta.current_schema().clone();
         let pspec = self.meta.default_partition_spec().as_ref().clone();
+        let (schema_id0, spec_id0) = (self.meta.current_schema_id(), self.meta.default_partition_spec_id());
         let mut meta = self.meta.clone();
         // See `commit`: every attempt's id is remembered for the later
         // reloads (review P0-5c).
@@ -2165,6 +2189,26 @@ impl CdcBound {
         // stays Unknown so the sweep never touches its files (round-2 §1.2).
         // The flag is the caller's, so a `?` exit is judged by it too (M-14).
         for attempt in 0..3u32 {
+            // The files were written with the schema and spec the load began
+            // with; another writer that evolved either since (a drop and a
+            // re-add gives the column a new field id) would have readers see
+            // NULL where these files hold values. Only the snapshot ref was
+            // required before, so a schema-only change passed (P2).
+            if meta.current_schema_id() != schema_id0 || meta.default_partition_spec_id() != spec_id0 {
+                let e = Error::Transfer(format!(
+                    "iceberg: the table's schema or partition spec changed during this load \
+                     (schema {} -> {}, spec {} -> {}); its files were written for the old one, \
+                     so nothing is committed. Re-run against the new schema.",
+                    schema_id0,
+                    meta.current_schema_id(),
+                    spec_id0,
+                    meta.default_partition_spec_id()
+                ));
+                if *ambiguous {
+                    return Ok(CommitEnd::Unknown(e));
+                }
+                return Err(e);
+            }
             let io = FileIO::new_with_memory();
             let snapshot_id = fresh_snapshot_id(&meta);
             tried.push(snapshot_id);
@@ -2271,6 +2315,8 @@ impl CdcBound {
             ];
             let requirements = vec![
                 TableRequirement::UuidMatch { uuid: meta.uuid() },
+                TableRequirement::CurrentSchemaIdMatch { current_schema_id: schema_id0 },
+                TableRequirement::DefaultSpecIdMatch { default_spec_id: spec_id0 },
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
                     snapshot_id: parent,
