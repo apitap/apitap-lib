@@ -300,7 +300,9 @@ impl ColBuf {
                             .into(),
                     ));
                 }
-                v.push(us + PG_EPOCH_MICROS);
+                // Checked: a timestamp past ~294 246 AD wrapped to a huge
+                // negative and was stored silently (P2-10).
+                v.push(us.checked_add(PG_EPOCH_MICROS).ok_or_else(|| bad("timestamp out of range"))?);
                 8
             }
             ColBuf::Bytes(v) => match d {
@@ -947,6 +949,16 @@ mod tests {
         }
         s.extend_from_slice(&(-1i16).to_be_bytes());
         s
+    }
+
+    /// P2-10: a timestamp too large to move to the Unix epoch is an error.
+    #[test]
+    fn a_timestamp_past_the_unix_range_is_an_error() {
+        let names = vec!["ts".into()];
+        let delivered = vec![Delivered::DateTime { utc: true }];
+        let mut enc = ParquetEncoder::new(names, delivered, None, RowGroup::Mib24).unwrap();
+        let stream = copy_stream(&[vec![Some((i64::MAX - 1).to_be_bytes().to_vec())]]);
+        assert!(enc.push(&stream).is_err());
     }
 
     /// P2: a tuple after the trailer is an error, not a silently dropped row.
