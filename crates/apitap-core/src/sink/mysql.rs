@@ -142,6 +142,16 @@ pub(crate) fn state_collation_fix(fq: &str) -> String {
     )
 }
 
+/// A COUNT(*) answer as a number. Each was `.parse().ok().unwrap_or(0)`, so
+/// a damaged answer read as 0: "no state table", "no sibling" — the fan-in
+/// refusal bypassed (P2, T8). An answer that is not a number fails the run.
+fn count_of(v: Option<String>) -> Result<u64> {
+    let v = v.ok_or_else(|| Error::Transfer("mysql: COUNT(*) returned no row".into()))?;
+    v.trim()
+        .parse::<u64>()
+        .map_err(|e| Error::Transfer(format!("mysql: COUNT(*) answered {v:?}: {e}")))
+}
+
 /// The lease store, shared by both lanes — see `crate::lease`.
 ///
 /// InnoDB, not `ENGINE=MEMORY` like the lock: a MEMORY table is emptied by a
@@ -817,9 +827,8 @@ impl MySqlSink {
         self.exec(&state_table_ddl(&fq)).await?;
         let stale = self
             .scalar(&state_collation_probe(&self.db))
-            .await?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+            .await
+            .and_then(count_of)?;
         if stale > 0 {
             self.exec(&state_collation_fix(&fq)).await?;
         }
@@ -1253,9 +1262,8 @@ impl crate::sink::Sink for MySqlSink {
                 sql_lit(&self.db),
                 sql_lit(&self.bare)
             ))
-            .await?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
+            .await
+            .and_then(count_of)?
             > 0;
         if !exists {
             return Ok(DestState {
@@ -1329,9 +1337,8 @@ impl crate::sink::Sink for MySqlSink {
                  WHERE table_schema = '{}' AND table_name = '_apitap_state'",
                 sql_lit(&self.db)
             ))
-            .await?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
+            .await
+            .and_then(count_of)?
             > 0;
         // The state row BEFORE the emptiness check, and its whole vocabulary:
         // `naming::cursor_watermark` refuses a drain's row (an LSN is not a
@@ -1349,9 +1356,8 @@ impl crate::sink::Sink for MySqlSink {
         // Empty table carries no watermark (TRUNCATE-to-resync must work).
         let n = self
             .scalar(&format!("SELECT COUNT(*) FROM {}", self.fq(&self.bare)))
-            .await?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+            .await
+            .and_then(count_of)?;
         if n == 0 {
             return Ok(DestState {
                 exists: true,
@@ -1371,9 +1377,8 @@ impl crate::sink::Sink for MySqlSink {
                 self.fq("_apitap_state"),
                 sql_lit(&self.bare)
             ))
-            .await?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
+            .await
+            .and_then(count_of)?
                 > 0
         } else {
             false
@@ -1448,9 +1453,8 @@ impl MySqlSink {
                         sql_lit(&self.db),
                         sql_lit(&self.bare)
                     ))
-                    .await?
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
+                    .await
+                    .and_then(count_of)?
                     > 0;
                 if exists && crate::naming::flipped_bootstrap(self.run.kind(), mode) {
                     // (R2-2) The destination appeared while this bootstrap
@@ -1675,6 +1679,14 @@ impl Loader for MySqlLoader {
 #[cfg(test)]
 mod abort_tests {
     use super::*;
+
+    /// P2/T8: a COUNT answer that is not a number fails, it is not 0.
+    #[test]
+    fn a_count_answer_must_be_a_number() {
+        assert_eq!(super::count_of(Some("3".into())).unwrap(), 3);
+        assert!(super::count_of(Some("x".into())).is_err());
+        assert!(super::count_of(None).is_err());
+    }
 
     /// The body of `fn <header>`, brace matched with strings stepped over.
     fn fn_body<'a>(src: &'a str, header: &str) -> &'a str {
