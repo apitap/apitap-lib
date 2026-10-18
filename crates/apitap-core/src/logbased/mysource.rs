@@ -46,6 +46,17 @@ pub(crate) fn file_name(prefix: &str, idx: u64) -> String {
     format!("{prefix}.{idx:06}")
 }
 
+/// A rows event's 6-byte table id. The event split guarantees only the
+/// header, so a body under 6 bytes indexed out of bounds (P2, T1).
+fn rows_table_id(body: &[u8]) -> Result<u64> {
+    let head = body
+        .get(..6)
+        .ok_or_else(|| Error::Transfer("mysql binlog: rows event shorter than its table id".into()))?;
+    let mut b = [0u8; 8];
+    b[..6].copy_from_slice(head);
+    Ok(u64::from_le_bytes(b))
+}
+
 /// Current coordinates + the binlog file prefix, from the control pool.
 pub(crate) async fn master_position(
     pool: &sqlx::MySqlPool,
@@ -703,11 +714,7 @@ pub(crate) async fn drain_binlog(
             t if bl::is_rows(t) => {
                 // Cheap skip for untracked tables: the TABLE_MAP was never
                 // registered, so there is nothing to decode against.
-                let table_id = {
-                    let mut b = [0u8; 8];
-                    b[..6].copy_from_slice(&body[..6]);
-                    u64::from_le_bytes(b)
-                };
+                let table_id = rows_table_id(body)?;
                 let Some(map) = sess.st.maps.get(&table_id).cloned() else {
                     continue;
                 };
@@ -1388,6 +1395,13 @@ mod truncate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2/T1: a rows body under its 6-byte table id is an error, not a panic.
+    #[test]
+    fn a_short_rows_body_is_refused() {
+        assert!(rows_table_id(&[1, 2, 3]).is_err());
+        assert_eq!(rows_table_id(&[7, 0, 0, 0, 0, 0, 0xAA]).unwrap(), 7);
+    }
 
     #[test]
     fn watermarks_pack_monotonically_across_files() {
