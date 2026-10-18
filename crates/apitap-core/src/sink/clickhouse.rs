@@ -2546,7 +2546,7 @@ impl ChLoader {
 
     /// Close the in-flight request cleanly (ClickHouse commits what it received)
     /// and open a fresh one for the rest of the stream. Only reached when
-    /// `APITAP_CH_MAX_BODY_MB` is set — see [`max_body_bytes`]. The split is
+    /// `APITAP_CH_MAX_BODY` is set — see [`max_body_bytes`]. The split is
     /// invisible downstream: bulk loads stream into a staging table that is
     /// swapped in atomically, and a CDC window re-deletes its keys before
     /// re-inserting, so a failure between requests replays cleanly.
