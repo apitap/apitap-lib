@@ -51,6 +51,21 @@ pub(crate) fn tx_buf_limit() -> usize {
         .unwrap_or(TX_BUF_LIMIT)
 }
 
+/// The streamed-transaction cap is the sum over every open stream (the
+/// honest memory bound), so its refusal says so: it named one table and "one
+/// transaction" for the combined size of several (P2).
+fn streams_too_big(open: usize, bytes: usize, limit: usize) -> Error {
+    Error::Transfer(format!(
+        "log_based: {open} streamed transaction(s) in flight on the source hold {} MiB of \
+         changes together (APITAP_TX_BUF_BYTES = {} MiB) — each stays buffered until it \
+         commits, and continuing would OOM. Commit or split the long transactions on the \
+         source, or raise APITAP_TX_BUF_BYTES (bytes, or a K/M/G suffix) if this process \
+         really has that much memory. The watermark is untouched: the next run re-reads them.",
+        bytes >> 20,
+        limit >> 20
+    ))
+}
+
 pub(crate) fn tx_too_big(table: &str, bytes: usize, limit: usize) -> Error {
     Error::Transfer(format!(
         "log_based: one transaction's changes for {table} have buffered {} MiB \
@@ -512,7 +527,7 @@ pub(crate) async fn drain(
                             Some(x) => {
                                 sess.stream_bytes += n;
                                 if sess.stream_bytes > tx_limit {
-                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
+                                    return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, tx_limit));
                                 }
                                 open_stream(sess, x)?
                                     .push((t, op, sub.unwrap_or(x)));
@@ -539,7 +554,7 @@ pub(crate) async fn drain(
                             Some(x) => {
                                 sess.stream_bytes += n;
                                 if sess.stream_bytes > tx_limit {
-                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
+                                    return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, tx_limit));
                                 }
                                 open_stream(sess, x)?
                                     .push((t, op, sub.unwrap_or(x)));
@@ -564,7 +579,7 @@ pub(crate) async fn drain(
                             Some(x) => {
                                 sess.stream_bytes += n;
                                 if sess.stream_bytes > tx_limit {
-                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, sess.stream_bytes, tx_limit));
+                                    return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, tx_limit));
                                 }
                                 open_stream(sess, x)?
                                     .push((t, op, sub.unwrap_or(x)));
@@ -776,6 +791,13 @@ mod tests {
         // Recreated table: new oid, same name, same slot.
         assert_eq!(sess.rel_slot("public.t", true).unwrap(), 0);
         assert_eq!(sess.slots.len(), 2);
+    }
+
+    /// P2: the streamed cap names how many transactions share it.
+    #[test]
+    fn the_stream_cap_names_every_open_stream() {
+        let e = streams_too_big(2, 300 << 20, 256 << 20).to_string();
+        assert!(e.contains("2 streamed transaction(s)") && !e.contains("one transaction"), "{e}");
     }
 
     /// The knob may shorten the wait, but never removes it: zero and junk
