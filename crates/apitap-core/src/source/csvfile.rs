@@ -44,10 +44,22 @@ pub(crate) struct CsvPump {
     /// Per-call relative ends, translated into `ends` after every call.
     scratch: Vec<usize>,
     row_ready: bool,
+    /// The largest record this process assembles: a quarter of its memory
+    /// limit (the buffer doubles), or 1 GiB. An unbalanced quote makes the
+    /// rest of the file one field, and `out` doubled until the OOM kill (P2).
+    max_record: usize,
 }
 
 impl CsvPump {
     pub(crate) fn new() -> Self {
+        let max_record = crate::pipeline::mem_limit_bytes()
+            .map(|m| (m / 4) as usize)
+            .unwrap_or(usize::MAX)
+            .min(1 << 30);
+        Self::with_max_record(max_record)
+    }
+
+    fn with_max_record(max_record: usize) -> Self {
         Self {
             rdr: csv_core::Reader::new(),
             input: Vec::with_capacity(256 * 1024),
@@ -57,6 +69,7 @@ impl CsvPump {
             ends: Vec::with_capacity(256),
             scratch: vec![0; 512],
             row_ready: false,
+            max_record,
         }
     }
 
@@ -73,7 +86,7 @@ impl CsvPump {
     /// `eof=true`, when the stream is exhausted). Empty input is exactly
     /// csv-core's end-of-data signal (it flushes a final unterminated record) —
     /// which is why the parser must never see an empty slice BEFORE eof.
-    pub(crate) fn next_record(&mut self, eof: bool) -> Option<CsvRow<'_>> {
+    pub(crate) fn next_record(&mut self, eof: bool) -> Result<Option<CsvRow<'_>>> {
         if self.row_ready {
             self.outlen = 0;
             self.ends.clear();
@@ -82,7 +95,7 @@ impl CsvPump {
         loop {
             let input = &self.input[self.consumed..];
             if input.is_empty() && !eof {
-                return None;
+                return Ok(None);
             }
             let (res, nin, nout, nend) =
                 self.rdr
@@ -101,19 +114,26 @@ impl CsvPump {
                     // single empty (= NULL) cell, and every other CSV reader
                     // returns it too.
                     self.row_ready = true;
-                    return Some(CsvRow {
+                    return Ok(Some(CsvRow {
                         out: &self.out[..self.outlen],
                         ends: &self.ends,
-                    });
+                    }));
                 }
-                csv_core::ReadRecordResult::End => return None,
+                csv_core::ReadRecordResult::End => return Ok(None),
                 csv_core::ReadRecordResult::InputEmpty => {
                     if !eof {
-                        return None;
+                        return Ok(None);
                     }
                 }
                 csv_core::ReadRecordResult::OutputFull => {
                     let len = self.out.len();
+                    if len * 2 > self.max_record {
+                        return Err(Error::InvalidInput(format!(
+                            "csv: one record is past {} MiB (a quarter of this process's memory \
+                             limit; APITAP_MEM_BUDGET sets it) — an unbalanced quote?",
+                            self.max_record >> 20
+                        )));
+                    }
                     self.out.resize(len * 2, 0);
                 }
                 csv_core::ReadRecordResult::OutputEndsFull => {
@@ -323,7 +343,7 @@ where
             Some(Err(e)) => return Err(Error::Transfer(format!("read '{label}': {e}"))),
             None => eof = true,
         }
-        while let Some(row) = pump.next_record(eof) {
+        while let Some(row) = pump.next_record(eof)? {
             if !header_skipped {
                 header_skipped = true;
                 check_header(plan, label, &row)?;
@@ -369,7 +389,7 @@ mod tests {
         let mut pump = CsvPump::new();
         pump.feed(input);
         let mut out = Vec::new();
-        while let Some(r) = pump.next_record(true) {
+        while let Some(r) = pump.next_record(true).unwrap() {
             out.push(
                 (0..r.len())
                     .map(|i| String::from_utf8(r.field(i).to_vec()).unwrap())
@@ -402,7 +422,7 @@ mod tests {
             let mut pump = CsvPump::new();
             pump.feed(&data[..split]);
             let mut got: Vec<Vec<String>> = Vec::new();
-            while let Some(r) = pump.next_record(false) {
+            while let Some(r) = pump.next_record(false).unwrap() {
                 got.push(
                     (0..r.len())
                         .map(|i| String::from_utf8(r.field(i).to_vec()).unwrap())
@@ -410,7 +430,7 @@ mod tests {
                 );
             }
             pump.feed(&data[split..]);
-            while let Some(r) = pump.next_record(true) {
+            while let Some(r) = pump.next_record(true).unwrap() {
                 got.push(
                     (0..r.len())
                         .map(|i| String::from_utf8(r.field(i).to_vec()).unwrap())
@@ -511,8 +531,31 @@ mod tests {
     fn first_row_strings(input: &[u8]) -> Vec<String> {
         let mut pump = CsvPump::new();
         pump.feed(input);
-        let row = pump.next_record(true).unwrap();
+        let row = pump.next_record(true).unwrap().unwrap();
         row_strings(&row).unwrap()
+    }
+
+    /// P2: an unbalanced quote is refused at the cap, not assembled until OOM.
+    #[test]
+    fn an_unbalanced_quote_is_refused_at_the_record_cap() {
+        let mut pump = CsvPump::with_max_record(1 << 20);
+        pump.feed(b"id\n\"abc");
+        assert!(pump.next_record(false).unwrap().is_some()); // the header
+        let chunk = vec![b'x'; 64 << 10];
+        let mut err = None;
+        for _ in 0..64 {
+            pump.feed(&chunk);
+            match pump.next_record(false) {
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let e = err.expect("a 4 MiB field under a 1 MiB cap must be refused");
+        assert!(e.contains("unbalanced quote"), "{e}");
+        assert!(pump.out.len() <= 1 << 20);
     }
 
     /// P2: an Excel byte-order mark is not part of the first column's name,
@@ -524,9 +567,9 @@ mod tests {
         assert_eq!(text_plan("github", "x.csv", &h).unwrap().cols[0].name, "id");
         let mut pump = CsvPump::new();
         pump.feed(b"\xEF");
-        assert!(pump.next_record(false).is_none());
+        assert!(pump.next_record(false).unwrap().is_none());
         pump.feed(b"\xBB\xBFid,name\n");
-        let h = row_strings(&pump.next_record(false).unwrap()).unwrap();
+        let h = row_strings(&pump.next_record(false).unwrap().unwrap()).unwrap();
         assert_eq!(text_plan("github", "x.csv", &h).unwrap().cols[0].name, "id");
     }
 
@@ -536,10 +579,10 @@ mod tests {
         let plan = text_plan("github", "x.csv", &["a".into(), "b".into()]).unwrap();
         let mut pump = CsvPump::new();
         pump.feed(b"a,b\n");
-        assert!(check_header(&plan, "x.csv", &pump.next_record(true).unwrap()).is_ok());
+        assert!(check_header(&plan, "x.csv", &pump.next_record(true).unwrap().unwrap()).is_ok());
         let mut pump = CsvPump::new();
         pump.feed(b"b,a\n");
-        let e = check_header(&plan, "x.csv", &pump.next_record(true).unwrap()).unwrap_err().to_string();
+        let e = check_header(&plan, "x.csv", &pump.next_record(true).unwrap().unwrap()).unwrap_err().to_string();
         assert!(e.contains("header changed"), "{e}");
     }
 }

@@ -328,7 +328,7 @@ impl Source for GithubSource {
         let mut pump = csvfile::CsvPump::new();
         let mut fed = 0usize;
         let headers: Vec<String> = loop {
-            if let Some(row) = pump.next_record(false) {
+            if let Some(row) = pump.next_record(false)? {
                 break csvfile::row_strings(&row)?;
             }
             if fed > PROBE_BYTES {
@@ -344,7 +344,7 @@ impl Source for GithubSource {
                 Some(Err(e)) => {
                     return Err(Error::Transfer(format!("github probe '{key}': {e}")))
                 }
-                None => match pump.next_record(true) {
+                None => match pump.next_record(true)? {
                     Some(row) => break csvfile::row_strings(&row)?,
                     None => {
                         return Err(Error::InvalidInput(format!(
