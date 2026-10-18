@@ -14,7 +14,10 @@ server:
   state    `_apitap_state` keys compared under the server's _ci collation:
            Postgres tables "Orders" and "orders" appended into one MySQL
            database shared one state row.
-Usage: e2e_my_cdc_hardening.py tagged|truncate|txcap|state
+  enum     COLUMN_TYPE writes an enum label's backslash, LF and NUL escaped
+           with a backslash; the CDC label table kept them escaped, so a CDC
+           row carried two backslashes where the bulk load wrote one.
+Usage: e2e_my_cdc_hardening.py tagged|truncate|txcap|state|enum
 """
 import os
 import subprocess
@@ -168,9 +171,28 @@ def state():
         wipe()
 
 
+def enum():
+    t = "my_enum_escapes"
+    mysql("apitap-bench-my", f"DROP TABLE IF EXISTS {t}")
+    ch_wipe(t)
+    try:
+        mysql("apitap-bench-my", f"CREATE TABLE {t} (id int PRIMARY KEY, e enum('a\\\\b', 'n\\nl', 'plain')); "
+              f"INSERT INTO {t} VALUES (1, 1), (2, 2)")
+        apitap.transfer(MY, CH, table=t, mode="log_based")
+        mysql("apitap-bench-my", f"INSERT INTO {t} VALUES (11, 1), (12, 2)")
+        apitap.transfer(MY, CH, table=t, mode="log_based")
+        src = mysql("apitap-bench-my", f"SELECT GROUP_CONCAT(HEX(e) ORDER BY id) FROM {t}")
+        got = ch(f"SELECT arrayStringConcat(groupArray(hex(toString(e))), ',') FROM (SELECT e FROM {t} ORDER BY id)")
+        assert got == src, f"bulk rows 1,2 and CDC rows 11,12 must carry the source's bytes: source {src}, destination {got}"
+        print(f"  ENUM labels a\\b and n<LF>l, bulk and CDC: {got}")
+    finally:
+        mysql("apitap-bench-my", f"DROP TABLE IF EXISTS {t}")
+        ch_wipe(t)
+
+
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"tagged": tagged, "truncate": truncate, "txcap": txcap, "state": state}
+    cases = {"tagged": tagged, "truncate": truncate, "txcap": txcap, "state": state, "enum": enum}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_my_cdc_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ MySQL CDC hardening: {which[0]}")

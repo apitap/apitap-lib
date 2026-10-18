@@ -435,7 +435,10 @@ pub(crate) async fn fetch_schema(
 /// Pull the member list out of a catalog COLUMN_TYPE like
 /// `enum('new','paid','shipped')` or `set('read','write')`. MySQL escapes an
 /// embedded quote by doubling it, and the labels may contain commas, so this
-/// walks the string rather than splitting on punctuation.
+/// walks the string rather than splitting on punctuation. It also writes a
+/// label's `\` as `\\`, LF as `\n`, CR as `\r`, NUL as `\0` and 0x1A as `\Z`
+/// (probed on MySQL 8.0 and MariaDB 10.6; a tab stays raw): kept as written,
+/// a CDC row carried `a\\b` where the bulk load wrote `a\b` (P2).
 fn enum_set_labels(column_type: &str) -> Option<std::sync::Arc<Vec<String>>> {
     let lower = column_type.trim_start().to_ascii_lowercase();
     if !(lower.starts_with("enum(") || lower.starts_with("set(")) {
@@ -460,6 +463,14 @@ fn enum_set_labels(column_type: &str) -> Option<std::sync::Arc<Vec<String>>> {
                 }
                 in_quote = !in_quote;
             }
+            '\\' if in_quote => match chars.next() {
+                Some('0') => cur.push('\0'),
+                Some('n') => cur.push('\n'),
+                Some('r') => cur.push('\r'),
+                Some('Z') => cur.push('\x1a'),
+                Some(c) => cur.push(c),
+                None => cur.push('\\'),
+            },
             c if in_quote => cur.push(c),
             _ => {}
         }
@@ -1425,6 +1436,15 @@ mod tests {
     fn a_short_rows_body_is_refused() {
         assert!(rows_table_id(&[1, 2, 3]).is_err());
         assert_eq!(rows_table_id(&[7, 0, 0, 0, 0, 0, 0xAA]).unwrap(), 7);
+    }
+
+    /// P2: COLUMN_TYPE as MySQL 8.0 / MariaDB 10.6 write it for labels
+    /// a\b, x'y, n<LF>l, z<NUL>z (captured live).
+    #[test]
+    fn enum_labels_are_unescaped_the_way_the_server_escaped_them() {
+        let got = enum_set_labels("enum('a\\\\b','x''y','n\\nl','z\\0z')").unwrap();
+        assert_eq!(*got, vec!["a\\b", "x'y", "n\nl", "z\0z"]);
+        assert_eq!(*enum_set_labels("set('t\tab')").unwrap(), vec!["t\tab"]);
     }
 
     #[test]
