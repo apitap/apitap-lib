@@ -1004,6 +1004,7 @@ impl Source for MySqlSource {
             cols,
             cursor: None,
             pk_cols,
+            cursor_col: None,
         })
     }
 
@@ -1095,9 +1096,7 @@ impl Source for MySqlSource {
         // Integer cursors range-split; timestamp cursors (valid for incremental
         // watermarks) fall through to a single filtered stream.
         let int_cursor = plan.cursor.as_deref().and_then(|c| {
-            plan.cols
-                .iter()
-                .find(|pc| pc.name == c)
+            plan.cursor_plan()
                 .filter(|pc| {
                     matches!(
                         pc.udt.as_str(),

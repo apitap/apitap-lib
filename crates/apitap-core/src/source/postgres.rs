@@ -250,6 +250,7 @@ impl Source for PgSource {
             cols,
             cursor: None,
             pk_cols,
+            cursor_col: None,
         })
     }
 
@@ -388,9 +389,7 @@ impl Source for PgSource {
         // ranges (TID Range Scan, PG 14+ — no index needed, so PK-LESS tables and
         // timestamp-cursor deltas still get full parallelism), then a single stream.
         let int_cursor = plan.cursor.as_deref().and_then(|c| {
-            plan.cols
-                .iter()
-                .find(|pc| pc.name == c)
+            plan.cursor_plan()
                 .filter(|pc| matches!(pc.udt.as_str(), "int2" | "int4" | "int8"))
                 .map(|_| c.to_string())
         });

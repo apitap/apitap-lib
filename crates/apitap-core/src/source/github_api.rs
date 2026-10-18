@@ -762,6 +762,7 @@ impl Source for GithubApiSource {
                 .filter(|c| c.pk)
                 .map(|c| c.name.to_string())
                 .collect(),
+            cursor_col: None,
         })
     }
 

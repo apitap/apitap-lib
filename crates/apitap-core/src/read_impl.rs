@@ -274,6 +274,7 @@ async fn plan_read<S: Source>(
             })
             .collect::<Result<_>>()?;
         lane.cols = idx.iter().map(|&i| lane.cols[i].clone()).collect();
+        plan.cursor_col = plan.cursor_plan().cloned();
         plan.cols = idx.iter().map(|&i| plan.cols[i].clone()).collect();
     }
 

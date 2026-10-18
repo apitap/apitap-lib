@@ -206,6 +206,7 @@ impl Source for GsheetsSource {
             cols,
             cursor: None,
             pk_cols: Vec::new(),
+            cursor_col: None,
         })
     }
 

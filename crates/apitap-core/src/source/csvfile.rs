@@ -210,6 +210,7 @@ pub(crate) fn text_plan(engine: &'static str, label: &str, headers: &[String]) -
         cols,
         cursor: None,
         pk_cols: Vec::new(),
+        cursor_col: None,
     })
 }
 

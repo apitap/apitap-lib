@@ -67,9 +67,20 @@ pub(crate) struct TablePlan {
     /// a merge-mode bootstrap recreates it on the destination so the NEXT run can
     /// upsert against it.
     pub pk_cols: Vec<String>,
+    /// The cursor column, kept when a read() projection drops it from
+    /// `cols`: span planning finds the cursor's type there, and a projection
+    /// without it fell back to ONE statement on MySQL — `read(columns=..,
+    /// parallel=8)` ran single-stream, silently (P2).
+    pub cursor_col: Option<ColumnPlan>,
 }
 
 impl TablePlan {
+    /// The cursor's column plan: in `cols`, or kept aside by a projection.
+    pub(crate) fn cursor_plan(&self) -> Option<&ColumnPlan> {
+        let c = self.cursor.as_deref()?;
+        self.cols.iter().find(|pc| pc.name == c).or(self.cursor_col.as_ref().filter(|pc| pc.name == c))
+    }
+
     /// The auto-detect rule: exactly one integer-PK column.
     pub(crate) fn single_int_pk(&self) -> Option<String> {
         let mut it = self.cols.iter().filter(|c| c.int_pk);
@@ -355,6 +366,33 @@ pub(crate) fn resolve_watermark(
 
 #[cfg(test)]
 mod wm_tests {
+    /// P2: a projection that drops the cursor keeps it for span planning.
+    #[test]
+    fn a_projection_without_the_cursor_still_knows_it() {
+        let col = |n: &str, udt: &str| super::ColumnPlan {
+            name: n.into(),
+            nullable: false,
+            int_pk: n == "id",
+            native_ddl: None,
+            udt: udt.into(),
+            precision: None,
+            scale: None,
+        };
+        let mut plan = super::TablePlan {
+            engine: "mysql",
+            cols: vec![col("id", "int"), col("name", "varchar")],
+            cursor: Some("id".into()),
+            pk_cols: vec!["id".into()],
+            cursor_col: None,
+        };
+        // As read_impl narrows a projection to ["name"].
+        plan.cursor_col = plan.cursor_plan().cloned();
+        plan.cols.retain(|c| c.name == "name");
+        assert_eq!(plan.cursor_plan().map(|c| c.udt.as_str()), Some("int"));
+        plan.cursor = Some("other".into());
+        assert!(plan.cursor_plan().is_none(), "a different cursor is not the kept one");
+    }
+
     /// P2: numeric(5,-2) needs 7 integer digits; numeric(2,5) needs p >= s.
     #[test]
     fn decimal_shape_widens_negative_and_oversized_scales() {

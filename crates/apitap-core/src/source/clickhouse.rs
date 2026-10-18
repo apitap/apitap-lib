@@ -377,6 +377,7 @@ impl crate::source::Source for ChSource {
             cols,
             cursor,
             pk_cols,
+            cursor_col: None,
         })
     }
 
