@@ -52,19 +52,23 @@ pub(crate) fn rb_type(udt: &str, precision: Option<i32>, scale: Option<i32>) -> 
         "date" => RbType::Date32,
         "timestamp" | "timestamptz" => RbType::Ts64,
         "numeric" => match (precision, scale) {
+            (Some(p), Some(s)) if crate::plan::decimal_shape(p, s).0 <= 38 => {
+                let (p, s) = crate::plan::decimal_shape(p, s);
+                RbType::Decimal {
+                    width: if p <= 9 {
+                        4
+                    } else if p <= 18 {
+                        8
+                    } else {
+                        16
+                    },
+                    scale: s as u32,
+                }
+            }
+            (Some(p), Some(s)) if crate::plan::decimal_shape(p, s).0 > 38 => return None,
             // p ≤ 38 covers Decimal32/64/128; p > 38 would be Decimal256 (32-byte
             // little-endian) which this transcoder doesn't emit → whole-table TSV
             // fallback keeps it correct.
-            (Some(p), Some(s)) if p <= 38 => RbType::Decimal {
-                width: if p <= 9 {
-                    4
-                } else if p <= 18 {
-                    8
-                } else {
-                    16
-                },
-                scale: s.max(0) as u32,
-            },
             (Some(p), _) if p > 38 => return None,
             _ => RbType::NumericF64,
         },
@@ -458,6 +462,15 @@ fn bad(what: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// numeric(9,-3) holds 12 integer digits: Decimal64, scale 0, not the
+    /// Decimal32 its declared p picked; numeric(2,5) is Decimal(5,5) (P2).
+    #[test]
+    fn negative_and_oversized_numeric_scales_widen() {
+        assert!(matches!(rb_type("numeric", Some(9), Some(-3)), Some(RbType::Decimal { width: 8, scale: 0 })));
+        assert!(matches!(rb_type("numeric", Some(2), Some(5)), Some(RbType::Decimal { width: 4, scale: 5 })));
+        assert!(rb_type("numeric", Some(37), Some(-2)).is_none());
+    }
+
     /// P1-10: Decimal(P>38) is Decimal256 on the wire — mapping it to the
     /// 16-byte width misaligned every later column. Refuse (TSV fallback).
     #[test]

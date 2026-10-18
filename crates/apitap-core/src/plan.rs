@@ -183,6 +183,15 @@ pub(crate) fn is_numeric_udt(udt: &str) -> bool {
     )
 }
 
+/// A Postgres numeric(p, s) as a destination decimal can hold it. PG15+
+/// accepts a negative scale (numeric(5,-2) holds 9999900: p - s integer
+/// digits) and a scale past the precision (numeric(2,5) holds 0.00012):
+/// declared as-is they became Decimal(5,0), which stores 9999900 out of its
+/// precision, and Decimal(2,5), which ClickHouse refuses (P2).
+pub(crate) fn decimal_shape(p: i32, s: i32) -> (i32, i32) {
+    if s < 0 { (p - s, 0) } else { (p.max(s), s) }
+}
+
 /// Compare two numeric watermark texts exactly: integers, decimals
 /// (`-12.50`), and — through f64 — exponent forms. `None` when either is not
 /// a number. Integers alone used to parse, so two DECIMAL cursors fell back
@@ -346,6 +355,14 @@ pub(crate) fn resolve_watermark(
 
 #[cfg(test)]
 mod wm_tests {
+    /// P2: numeric(5,-2) needs 7 integer digits; numeric(2,5) needs p >= s.
+    #[test]
+    fn decimal_shape_widens_negative_and_oversized_scales() {
+        assert_eq!(super::decimal_shape(5, -2), (7, 0));
+        assert_eq!(super::decimal_shape(2, 5), (5, 5));
+        assert_eq!(super::decimal_shape(10, 2), (10, 2));
+    }
+
     /// P2: only number types arbitrate numerically.
     #[test]
     fn numeric_cursor_types_are_a_positive_list() {

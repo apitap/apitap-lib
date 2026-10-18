@@ -600,10 +600,10 @@ fn delivered_of_udt(c: &ColumnPlan) -> Delivered {
         // a Decimal256-capable text parser accepts; the binary lane's own p ≤ 38 gate
         // lives in `rb_type`.
         "numeric" => match (c.precision, c.scale) {
-            (Some(p), Some(s)) if p <= 76 => Delivered::Decimal {
-                p: p as u16,
-                s: s.max(0) as u16,
-            },
+            (Some(p), Some(s)) if crate::plan::decimal_shape(p, s).0 <= 76 => {
+                let (p, s) = crate::plan::decimal_shape(p, s);
+                Delivered::Decimal { p: p as u16, s: s as u16 }
+            }
             _ => Delivered::Float64,
         },
         "bool" => Delivered::Bool,
