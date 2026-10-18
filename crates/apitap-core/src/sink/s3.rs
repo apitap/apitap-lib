@@ -88,12 +88,59 @@ fn decode_component(s: &str) -> Result<String> {
 
 /// Minimal XML tag extraction — S3's response surface here is flat elements
 /// with no attributes or nesting ambiguity, and the tree has no XML crate.
+/// Element text is entity-decoded: AWS escapes `& < >` in a `<Key>` and MinIO
+/// also `' "` and control characters, so a key under a prefix holding `&` came
+/// back as `&amp;`, and every copy, delete and peer check on it missed (P2).
 fn xml_tag(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body.find(&open)? + open.len();
     let end = body[start..].find(&close)? + start;
-    Some(body[start..end].to_string())
+    Some(xml_unescape(&body[start..end]))
+}
+
+/// The five named entities and decimal/hex character references. An
+/// unknown or malformed reference is kept as written.
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').and_then(|j| {
+            let ent = &rest[1..j];
+            let ch = match ent {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => ent
+                    .strip_prefix("#x")
+                    .or_else(|| ent.strip_prefix("#X"))
+                    .map(|h| u32::from_str_radix(h, 16))
+                    .or_else(|| ent.strip_prefix('#').map(|d| d.parse::<u32>()))
+                    .and_then(|r| r.ok())
+                    .and_then(char::from_u32),
+            }?;
+            Some((ch, j + 1))
+        });
+        match decoded {
+            Some((ch, n)) => {
+                out.push(ch);
+                rest = &rest[n..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn xml_tags(body: &str, tag: &str) -> Vec<String> {
@@ -104,7 +151,7 @@ fn xml_tags(body: &str, tag: &str) -> Vec<String> {
     while let Some(i) = rest.find(&open) {
         let start = i + open.len();
         let Some(j) = rest[start..].find(&close) else { break };
-        out.push(rest[start..start + j].to_string());
+        out.push(xml_unescape(&rest[start..start + j]));
         rest = &rest[start + j + close.len()..];
     }
     out
@@ -1299,6 +1346,10 @@ mod tests {
             vec!["a/part-00000.parquet", "a/part-00001.parquet"]
         );
         assert!(xml_tag(listing, "NextContinuationToken").is_none());
+        // P2: entity-decoded, as AWS and MinIO escape keys.
+        assert_eq!(xml_tags("<Key>a&amp;b&#39;c&#x9;&lt;d&gt;</Key>", "Key"), vec!["a&b'c\t<d>"]);
+        assert_eq!(xml_tag("<ETag>&quot;e1&quot;</ETag>", "ETag").as_deref(), Some("\"e1\""));
+        assert_eq!(xml_unescape("a & b &bogus; &#xZZ;"), "a & b &bogus; &#xZZ;");
     }
 
     #[test]

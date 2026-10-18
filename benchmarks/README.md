@@ -670,6 +670,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_hardening.pub --> `e2e_pg_hardening.py pub` | a Postgres replace keeps the destination in its FOR TABLE publication, column list and row filter included |
 | <!-- claim: leg.e2e_pg_hardening.nullcursor --> `e2e_pg_hardening.py nullcursor` | a parallel Postgres read over an integer cursor copies the rows whose cursor is NULL |
 | <!-- claim: leg.e2e_pg_hardening.negscale --> `e2e_pg_hardening.py negscale` | PG15+ numeric(5,-2) / numeric(2,5) land as Decimal(7,0) / Decimal(5,5), values exact |
+| <!-- claim: leg.e2e_s3_hardening.amp --> `e2e_s3_hardening.py amp` | an S3 prefix holding `&` (XML-escaped in listings) publishes, and a second replace leaves only the live parts |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |
