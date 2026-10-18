@@ -776,7 +776,7 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     // subsequent run of that table into `locked: another apitap run is already
     // loading this table — it started 4s ago` about a run that had died. The
     // e2e rig hid it by dropping the destination between cases.
-    let staged: Result<(u64, usize)> = async {
+    let staged = async {
         let want = if parallel > 1 {
             parallel * profile.span_mult
         } else {
@@ -797,8 +797,14 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         let rows = sink.rows_staged(loaded).await?;
         sink.finalize(rows, mode).await?;
         Ok((rows, used))
-    }
-    .await;
+    };
+    // A panic in span planning, rows_staged or finalize (outside the workers'
+    // own catch) skipped the discard below: the staging and its announcement
+    // stayed, and every later run of the table refused as `locked` (P2-12).
+    // It now takes the error arm like any other failure.
+    let staged: Result<(u64, usize)> = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(staged))
+        .await
+        .unwrap_or_else(|p| Err(Error::Transfer(format!("panicked: {}", crate::pipe::panic_text(&*p)))));
 
     let (rows, used) = match staged {
         Ok(v) => v,
