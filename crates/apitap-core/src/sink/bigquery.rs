@@ -318,13 +318,16 @@ impl BqConn {
         // and a missed leftover would get appended into by the next run.
         let mut out = Vec::new();
         let mut token: Option<String> = None;
-        loop {
+        // Bounded, and a token that repeats is refused: an endpoint (or a
+        // proxy) that always answered a token looped forever. The token is
+        // percent-encoded; it went into the query raw (P2, T16).
+        for _page in 0..100_000u32 {
             let mut url = format!(
                 "{BQ_BASE}/projects/{}/datasets/{}/tables?maxResults=1000",
                 self.project, self.dataset
             );
             if let Some(t) = &token {
-                url.push_str(&format!("&pageToken={t}"));
+                url.push_str(&format!("&pageToken={}", crate::sink::s3::enc_seg(t)));
             }
             let v = self.api(reqwest::Method::GET, url, None).await?;
             if let Some(ts) = v["tables"].as_array() {
@@ -336,10 +339,16 @@ impl BqConn {
                 );
             }
             match v["nextPageToken"].as_str() {
+                Some(t) if token.as_deref() == Some(t) => {
+                    return Err(Error::Transfer(format!(
+                        "bigquery table listing: the next page token repeats ({t})"
+                    )))
+                }
                 Some(t) => token = Some(t.to_string()),
                 None => return Ok(out),
             }
         }
+        Err(Error::Transfer("bigquery table listing: still paging after 100000 pages".into()))
     }
 
     pub(crate) async fn ensure_dataset(&self) -> Result<()> {

@@ -41,7 +41,7 @@ pub(crate) struct S3Conn {
 
 /// RFC 3986 percent-encode one path SEGMENT (no '/' — segments are joined by
 /// the caller so the canonical URI keeps its separators).
-fn enc_seg(s: &str) -> String {
+pub(crate) fn enc_seg(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
