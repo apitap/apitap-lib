@@ -813,6 +813,26 @@ impl crate::sink::Sink for PgSink {
             .await
             .map_err(|e| Error::Transfer(format!("resolve schema: {e}")))?;
             let mut ddl: Vec<String> = Vec::new();
+            // NOT NULL is attnotnull, not a pg_constraint row (contype 'n'
+            // from PG18, outside the list below): the swap made every such
+            // column nullable but the key's (P2). Columns the new table still
+            // has get it back.
+            let notnull: Vec<String> = sqlx::query_scalar(
+                "SELECT attname::text FROM pg_attribute \
+                 WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped AND attnotnull \
+                 ORDER BY attnum",
+            )
+            .bind(&self.final_t)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("capture NOT NULL: {e}")))?;
+            for col in notnull.iter().filter(|n| plan.cols.iter().any(|c| &c.name == *n)) {
+                ddl.push(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
+                    self.final_t,
+                    quote_ident(col)
+                ));
+            }
             let cons: Vec<(String, String)> = sqlx::query_as(
                 "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
                  WHERE conrelid = $1::regclass AND contype IN ('p','u','f','c','x') \

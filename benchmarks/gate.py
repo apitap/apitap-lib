@@ -285,6 +285,7 @@ LEGS = [
     leg("e2e_my_cdc_hardening.py",   "MySQL state keys are case-sensitive", argv=["state"]),
     leg("e2e_ch_hardening.py",       "a ClickHouse DateTime64(9) keeps its nanoseconds", argv=["dt64"]),
     leg("e2e_ch_hardening.py",       "a ClickHouse String cursor watermark is stored raw", argv=["cursor"]),
+    leg("e2e_pg_hardening.py",       "a Postgres replace keeps NOT NULL columns", argv=["notnull"]),
     leg("e2e_pg_hardening.py",       "a parallel Postgres read copies NULL-cursor rows", argv=["nullcursor"]),
     leg("e2e_pg_hardening.py",       "numeric with a negative or oversized scale lands in a Decimal that holds it", argv=["negscale"]),
 ]
