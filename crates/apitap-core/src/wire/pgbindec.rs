@@ -25,7 +25,7 @@ const USECS_PER_DAY: i64 = 86_400_000_000;
 /// here — anything else (arrays, enums, domains, interval, inet, ranges, …)
 /// would fail every window, so such a lane stays on text (MASTER review M-7).
 pub(crate) const RENDERED_OIDS: &[u32] = &[
-    16, 21, 23, 20, 26, 28, 29, 700, 701, 1700, 25, 1043, 1042, 19, 18, 114, 142, 705, 17,
+    16, 21, 23, 20, 26, 28, 29, 700, 701, 1700, 25, 1043, 1042, 19, 114, 142, 705, 17,
     3802, 2950, 1082, 1083, 1114, 1184, 1266,
 ];
 
@@ -52,7 +52,7 @@ pub(crate) fn render(oid: u32, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
         701 => push_float(f64::from_be_bytes(fixed(raw, oid)?), false, out),
         1700 => numeric(raw, out)?,
         // Text-shaped types: `send` format IS the text bytes.
-        25 | 1043 | 1042 | 19 | 18 | 114 | 142 | 705 => out.extend_from_slice(raw),
+        25 | 1043 | 1042 | 19 | 114 | 142 | 705 => out.extend_from_slice(raw),
         // bytea: the WAL text plane always renders \x hex (bytea_output does
         // not apply to logical decoding) — match it.
         17 => {
@@ -445,6 +445,14 @@ mod tests {
                 Err(e) if e.to_string().contains("no text renderer"));
             assert_eq!(renders(oid), !fell_through, "OID {oid}");
         }
+    }
+
+    /// "char" (18) is not rendered: charsend ships the raw byte, charout
+    /// prints `\ooo` for bytes >= 0x80 and '' for NUL (PG15+), so binary
+    /// "char" columns stay on the text plane (P2).
+    #[test]
+    fn quoted_char_stays_on_the_text_plane() {
+        assert!(!renders(18));
     }
 
     fn r(oid: u32, raw: &[u8]) -> String {
