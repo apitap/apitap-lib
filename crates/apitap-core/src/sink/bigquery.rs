@@ -956,8 +956,24 @@ fn is_conflict(m: &str) -> bool {
     is_status(m, 409)
 }
 
+/// A string's body for a single-quoted BigQuery literal. Backslash and quote
+/// were escaped, control characters were not: a raw newline is "Unclosed
+/// string literal", so a text key holding one made the readback / MERGE
+/// script fail on every replay of the window (P2, R2-26 L1).
 pub(crate) fn sql_str(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '\'' => o.push_str("\\'"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
 }
 
 /// The state compaction: every row of `state` older than the newest row of
@@ -2939,6 +2955,15 @@ mod tests {
         assert!(!super::is_conflict(forbidden) && !super::is_status(forbidden, 404));
         assert!(super::is_conflict("bigquery 409 Conflict on .../tables: Already Exists: Table p:d.t"));
         assert!(super::is_status("bigquery 404 Not Found on .../d", 404));
+    }
+
+    /// P2/R2-26: control characters never reach a literal raw.
+    #[test]
+    fn literals_escape_control_characters() {
+        assert_eq!(super::sql_str("a\nb\r\tc"), "a\\nb\\r\\tc");
+        assert_eq!(super::sql_str("o'k\\"), "o\\'k\\\\");
+        assert_eq!(super::sql_str("x\u{1}"), "x\\u0001");
+        assert!(!super::sql_str("a\nb").contains('\n'));
     }
 
     /// A job task that resolves to `rows`, for the ownership tests below.
