@@ -820,8 +820,13 @@ pub(crate) async fn drain_binlog(
                     // — it is DDL, it auto-commits, and it is its own commit
                     // boundary. Apply it here or it is lost, which is exactly
                     // what happened until 0.56.0.
-                    if starts_with_word(head, "truncate") {
-                        match truncate_target(head, &db) {
+                    // Past the leading comments, as `query_verb` reads it: a
+                    // `/* app */ TRUNCATE t` was classed DDL and then not
+                    // recognised as a truncate here — skipped silently, the
+                    // destination kept the rows (P2).
+                    let stmt = strip_leading_noise(head);
+                    if starts_with_word(stmt, "truncate") {
+                        match truncate_target(stmt, &db) {
                             // `sess.tracked` is the authority on what this run
                             // follows. The first draft asked `collapsers` instead
                             // — and those are populated lazily, by the first ROWS
@@ -1025,8 +1030,10 @@ fn truncate_target(sql: &str, db: &str) -> Option<String> {
     let rest = s.get(..8).filter(|h| h.eq_ignore_ascii_case("truncate"))?;
     let _ = rest;
     let mut rest = s[8..].trim_start();
-    // The TABLE keyword is optional in MySQL.
-    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("table") {
+    // The TABLE keyword is optional in MySQL. As a WORD: a fixed 5-byte
+    // slice panicked inside a multi-byte name (`TRUNCATE 表名`) and read
+    // `TRUNCATE tablex` as table `x` (P2, T2).
+    if starts_with_word(rest, "table") {
         rest = rest[5..].trim_start();
     }
     // `db`.`t`, db.t, `t`, t — stop at whitespace or a statement terminator.
@@ -1263,6 +1270,19 @@ mod query_verbs_tests {
 mod truncate_tests {
     use super::*;
     use crate::wire::pgoutput::Cell;
+
+    /// P2/T2: a multi-byte name never panics, `tablex` is a table name, and a
+    /// leading comment is skipped the way query_verb skips it.
+    #[test]
+    fn a_truncate_target_survives_multibyte_names_and_comments() {
+        assert_eq!(truncate_target("TRUNCATE 表名", "bench").as_deref(), Some("bench.表名"));
+        assert_eq!(truncate_target("TRUNCATE tablex", "b").as_deref(), Some("b.tablex"));
+        assert_eq!(truncate_target("TRUNCATE TABLE tablex", "b").as_deref(), Some("b.tablex"));
+        assert_eq!(
+            truncate_target(strip_leading_noise("/* app */ TRUNCATE t"), "b").as_deref(),
+            Some("b.t")
+        );
+    }
 
     /// MySQL writes TRUNCATE as a QUERY event, so the table name has to come out
     /// of the statement text. These are the spellings a server actually emits —

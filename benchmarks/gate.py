@@ -280,6 +280,7 @@ LEGS = [
     leg("e2e_pg_residue_typmod.py",  "a Postgres CDC residue write never truncates a value to fit the column"),
     leg("e2e_pg_nonowner_drain.py",  "a Postgres CDC drain runs as a role that does not own the publication"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
+    leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),
 ]
 
 
