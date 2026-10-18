@@ -677,7 +677,9 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_cdc_hardening.openstream --> `e2e_pg_cdc_hardening.py openstream` | a streamed transaction left open on the source does not hold a one-shot drain; after its commit every row lands once |
 | <!-- claim: leg.e2e_pg_cdc_hardening.lockwait --> `e2e_pg_cdc_hardening.py lockwait` | a TOAST refetch behind an ACCESS EXCLUSIVE lock gives up (lock_timeout) and the rerun lands |
 | <!-- claim: leg.e2e_s3_hardening.amp --> `e2e_s3_hardening.py amp` | an S3 prefix holding `&` (XML-escaped in listings) publishes, and a second replace leaves only the live parts |
+| <!-- claim: leg.e2e_s3_hardening.numeric --> `e2e_s3_hardening.py numeric` | a PG15+ numeric(2,4) value (0.0012) lands exact in S3 parquet, not clamped to scale 2 |
 | <!-- claim: leg.e2e_ice_hardening.v3 --> `e2e_ice_hardening.py v3` | an Iceberg table of format-version 3 is refused before anything is written |
+| <!-- claim: leg.e2e_ice_hardening.numeric --> `e2e_ice_hardening.py numeric` | a PG15+ numeric(2,4) value lands exact in Iceberg (decimal(4,4)) |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

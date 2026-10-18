@@ -7,7 +7,9 @@ exist and the stale sweep deleted nothing. Keys are entity-decoded now.
 
 Proof: Postgres -> s3://apitap-bench/p2-a&b/, mode=replace twice. Both runs
 succeed, the prefix holds only the live part files, and they hold the table.
-Usage: e2e_s3_hardening.py amp
+  numeric  numeric(2,4) (PG15+) clamped its scale to the precision in parquet:
+           0.0012 was written as 0.00.
+Usage: e2e_s3_hardening.py amp|numeric
 """
 import html
 import re
@@ -75,9 +77,40 @@ def amp():
         wipe()
 
 
+NUM_PREFIX = "p2-num"
+NUM_URL = URL.replace(f"/{PREFIX}?", f"/{NUM_PREFIX}?")
+
+
+def num_keys():
+    return [html.unescape(k) for k in _rig.s3_list(f"{NUM_PREFIX}/")]
+
+
+def numeric():
+    t = "s3_numeric_24"
+    for k in num_keys():
+        _rig.s3_delete(k)
+    try:
+        pg(f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id int PRIMARY KEY, n numeric(2,4)); "
+           f"INSERT INTO {t} VALUES (1, 0.0012), (2, -0.0099)")
+        apitap.transfer(PG, NUM_URL, table=t, mode="replace")
+        import duckdb
+        d = duckdb.connect()
+        d.execute("SET s3_endpoint='127.0.0.1:9100'; SET s3_use_ssl=false; SET s3_url_style='path'; "
+                  "SET s3_access_key_id='bench'; SET s3_secret_access_key='benchbench'; SET s3_region='us-east-1';")
+        files = [f"s3://apitap-bench/{k}" for k in num_keys() if f"/{t}/" in k]
+        from decimal import Decimal
+        got = [Decimal(r[0]) for r in d.execute("SELECT CAST(n AS VARCHAR) FROM read_parquet(?) ORDER BY id", [files]).fetchall()]
+        assert got == [Decimal("0.0012"), Decimal("-0.0099")], f"numeric(2,4) values exact in parquet, got {got}"
+        print(f"  numeric(2,4) into S3 parquet: {got}")
+    finally:
+        pg(f"DROP TABLE IF EXISTS {t}")
+        for k in num_keys():
+            _rig.s3_delete(k)
+
+
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"amp": amp}
+    cases = {"amp": amp, "numeric": numeric}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_s3_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ S3 hardening: {which[0]}")

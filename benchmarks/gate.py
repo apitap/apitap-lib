@@ -297,7 +297,9 @@ LEGS = [
     leg("e2e_pg_cdc_hardening.py",  "an open streamed transaction does not hold a Postgres CDC one-shot", argv=["openstream"]),
     leg("e2e_pg_cdc_hardening.py",  "a TOAST refetch behind a lock gives up instead of waiting", argv=["lockwait"]),
     leg("e2e_s3_hardening.py",       "an S3 prefix holding & publishes and sweeps", argv=["amp"]),
+    leg("e2e_s3_hardening.py",      "numeric(2,4) lands exact in S3 parquet", argv=["numeric"]),
     leg("e2e_ice_hardening.py",     "an Iceberg table of format-version 3 is refused", argv=["v3"]),
+    leg("e2e_ice_hardening.py",     "numeric(2,4) lands exact in Iceberg", argv=["numeric"]),
 ]
 
 
