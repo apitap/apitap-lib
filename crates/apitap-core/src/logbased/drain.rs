@@ -136,6 +136,23 @@ pub(crate) struct DrainSession {
 }
 
 impl DrainSession {
+    /// Map a relation oid to its slot. A dropped-and-recreated table keeps
+    /// its slot under a new oid; the old oid's entries were never removed, so
+    /// DROP/CREATE churn grew both maps for the whole follow session (P2).
+    fn register_rel(&mut self, rel_id: u32, slot: u16) {
+        let stale: Vec<u32> = self
+            .rels
+            .iter()
+            .filter(|&(&o, &s)| s == slot && o != rel_id)
+            .map(|(&o, _)| o)
+            .collect();
+        for o in stale {
+            self.rels.remove(&o);
+            self.rel_oids.remove(&o);
+        }
+        self.rels.insert(rel_id, slot);
+    }
+
     /// Dense slot (L4, §4.2) for a table name. A recreated table announces a
     /// new oid under the same name and must land in the slot its window
     /// state (collapsers, changelogs) already lives in.
@@ -515,7 +532,7 @@ pub(crate) async fn drain(
                             sess.layouts.insert(table.clone(), Arc::new(new));
                         }
                     }
-                    sess.rels.insert(r.rel_id, slot);
+                    sess.register_rel(r.rel_id, slot);
                     sess.last_rel = Some((r.rel_id, slot));
                 }
                 PgoMessage::Insert { rel_id, new } => {
@@ -791,6 +808,22 @@ mod tests {
         // Recreated table: new oid, same name, same slot.
         assert_eq!(sess.rel_slot("public.t", true).unwrap(), 0);
         assert_eq!(sess.slots.len(), 2);
+    }
+
+    /// P2: a recreated table's new oid replaces the old one in both maps.
+    #[test]
+    fn a_recreated_relation_drops_its_old_oid() {
+        let mut sess = DrainSession::default();
+        let slot = sess.rel_slot("public.t", true).unwrap();
+        sess.rel_oids.insert(100, Arc::new(vec![23]));
+        sess.register_rel(100, slot);
+        let other = sess.rel_slot("public.u", true).unwrap();
+        sess.register_rel(200, other);
+        sess.rel_oids.insert(101, Arc::new(vec![23]));
+        sess.register_rel(101, slot);
+        assert!(!sess.rels.contains_key(&100) && !sess.rel_oids.contains_key(&100));
+        assert_eq!(sess.rels.get(&101), Some(&slot));
+        assert_eq!(sess.rels.get(&200), Some(&other), "another table's oid stays");
     }
 
     /// P2: the streamed cap names how many transactions share it.
