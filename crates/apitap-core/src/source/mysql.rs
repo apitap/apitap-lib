@@ -289,7 +289,7 @@ fn le<const N: usize>(b: &[u8]) -> Result<[u8; N]> {
 fn ar_cell<'a>(b: &'a [u8], enc: MyAr) -> Result<CellVal<'a>> {
     Ok(match enc {
         MyAr::I8 => CellVal::I16(i8::from_le_bytes(le::<1>(b)?) as i16),
-        MyAr::U8 => CellVal::I16(b[0] as i16),
+        MyAr::U8 => CellVal::I16(le::<1>(b)?[0] as i16),
         MyAr::I16 => CellVal::I16(i16::from_le_bytes(le::<2>(b)?)),
         MyAr::U16 => CellVal::I32(u16::from_le_bytes(le::<2>(b)?) as i32),
         MyAr::I32 => CellVal::I32(i32::from_le_bytes(le::<4>(b)?)),
@@ -634,10 +634,18 @@ fn tsv_write(enc: MyTsv, b: &[u8], out: &mut Vec<u8>) -> Result<()> {
         MyTsv::Int { bytes, unsigned } => {
             let mut buf = itoa::Buffer::new();
             let s = match (bytes, unsigned) {
-                (1, false) => buf.format(i8::from_le_bytes([b[0]]) as i64),
-                (1, true) => buf.format(b[0] as u64),
-                (2, false) => buf.format(i16::from_le_bytes([b[0], b[1]]) as i64),
-                (2, true) => buf.format(u16::from_le_bytes([b[0], b[1]]) as u64),
+                // Every width checked, not indexed: an empty or short cell is
+                // an error, not a panic (P2).
+                (1, false) => {
+                    buf.format(i8::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as i64)
+                }
+                (1, true) => buf.format(u8::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as u64),
+                (2, false) => {
+                    buf.format(i16::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as i64)
+                }
+                (2, true) => {
+                    buf.format(u16::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as u64)
+                }
                 (4, false) => {
                     buf.format(i32::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as i64)
                 }
@@ -716,7 +724,9 @@ fn write_datetime(b: &[u8], out: &mut Vec<u8>) -> Result<()> {
         out.extend_from_slice(b"0000-00-00 00:00:00");
         return Ok(());
     }
-    if b.is_empty() || b[0] < 4 {
+    // The claimed length must be there: fields past it were indexed on the
+    // claim alone (P2, T10).
+    if b.is_empty() || b[0] < 4 || b.len() < 1 + b[0] as usize {
         return Err(Error::Transfer("malformed binary DATETIME".into()));
     }
     write_date(b, out)?;
@@ -1799,6 +1809,20 @@ async fn arrow_row_worker(
 
 #[cfg(test)]
 mod tests {
+    /// P2: a short cell is an error at every width, and a binary DATETIME
+    /// claiming more bytes than it has is refused, not indexed.
+    #[test]
+    fn short_cells_and_datetimes_are_errors_not_panics() {
+        assert!(super::ar_cell(&[], super::MyAr::U8).is_err());
+        let mut v = Vec::new();
+        for (bytes, unsigned) in [(1, false), (1, true), (2, false), (2, true)] {
+            let enc = super::MyTsv::Int { bytes, unsigned };
+            assert!(super::tsv_write(enc, &[], &mut v).is_err(), "{bytes} {unsigned}");
+        }
+        assert!(super::tsv_write(super::MyTsv::Int { bytes: 2, unsigned: true }, &[1], &mut v).is_err());
+        assert!(super::write_datetime(&[11, 0xE8, 0x07, 1, 1], &mut v).is_err());
+    }
+
     /// P1-5: unsigned bounds arrive as text; the helper parses them and, on a
     /// BIGINT UNSIGNED tail beyond i64, refuses so the caller reads fully
     /// instead of wrapping to a negative span.
