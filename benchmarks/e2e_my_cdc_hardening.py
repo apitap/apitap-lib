@@ -17,7 +17,9 @@ server:
   enum     COLUMN_TYPE writes an enum label's backslash, LF and NUL escaped
            with a backslash; the CDC label table kept them escaped, so a CDC
            row carried two backslashes where the bulk load wrote one.
-Usage: e2e_my_cdc_hardening.py tagged|truncate|txcap|state|enum
+  dropped  writes to a table, then DROP TABLE, drained after the drop: the
+           drain died on "bench.t not found" every rerun, with no recovery.
+Usage: e2e_my_cdc_hardening.py tagged|truncate|txcap|state|enum|dropped
 """
 import os
 import subprocess
@@ -199,9 +201,30 @@ def enum():
         ch_wipe(t)
 
 
+def dropped():
+    t = "my_dropped_mid"
+    mysql("apitap-bench-my", f"DROP TABLE IF EXISTS {t}")
+    ch_wipe(t)
+    try:
+        mysql("apitap-bench-my", f"CREATE TABLE {t} (id int PRIMARY KEY); INSERT INTO {t} VALUES (1)")
+        apitap.transfer(MY, CH, table=t, mode="log_based")
+        before = state_rows(t)
+        mysql("apitap-bench-my", f"INSERT INTO {t} SELECT 1 + n FROM (SELECT 1 n UNION SELECT 2 UNION SELECT 3) x; "
+              f"DROP TABLE {t}")
+        code = f"import apitap\napitap.transfer({MY!r}, {CH!r}, table={t!r}, mode='log_based')\n"
+        r = sh([sys.executable, "-c", code])
+        assert r.returncode != 0 and "dropped or renamed" in r.stderr, \
+            f"a table dropped after its writes must be named, with the recovery (exit {r.returncode}):\n{r.stderr[-600:]}"
+        assert state_rows(t) == before, "the watermark must stay"
+        print("  writes then DROP TABLE, drained after: refused naming the drop and the recovery")
+    finally:
+        mysql("apitap-bench-my", f"DROP TABLE IF EXISTS {t}")
+        ch_wipe(t)
+
+
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"tagged": tagged, "truncate": truncate, "txcap": txcap, "state": state, "enum": enum}
+    cases = {"tagged": tagged, "truncate": truncate, "txcap": txcap, "state": state, "enum": enum, "dropped": dropped}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_my_cdc_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ MySQL CDC hardening: {which[0]}")

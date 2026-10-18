@@ -284,6 +284,7 @@ LEGS = [
     leg("e2e_my_cdc_hardening.py",   "a MySQL transaction past APITAP_TX_BUF_BYTES is refused, watermark kept", argv=["txcap"]),
     leg("e2e_my_cdc_hardening.py",   "MySQL state keys are case-sensitive", argv=["state"]),
     leg("e2e_my_cdc_hardening.py",   "MySQL CDC enum labels carry the source bytes", argv=["enum"]),
+    leg("e2e_my_cdc_hardening.py",  "a MySQL table dropped after its writes names the recovery", argv=["dropped"]),
     leg("e2e_ch_hardening.py",       "a ClickHouse DateTime64(9) keeps its nanoseconds", argv=["dt64"]),
     leg("e2e_ch_hardening.py",       "a ClickHouse String cursor watermark is stored raw", argv=["cursor"]),
     leg("e2e_pg_hardening.py",       "a Postgres replace keeps NOT NULL columns", argv=["notnull"]),

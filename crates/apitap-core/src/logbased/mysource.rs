@@ -347,6 +347,20 @@ pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
 
 /// Column names, PK membership and signedness for one table — the facts
 /// `binlog_row_metadata=MINIMAL` leaves out.
+/// A tracked table missing from the source catalog. Usually it was dropped
+/// (or renamed) after changes the binlog still holds — "db.t not found"
+/// stopped every rerun with no word on recovery (P2) — or the name is wrong.
+fn dropped_mid_backlog(db: &str, table: &str) -> Error {
+    Error::InvalidInput(format!(
+        "log_based: {db}.{table} is not in the source catalog. If this pipeline \
+         tracked it and it was dropped or renamed since, the binlog still holds \
+         changes written to it, and their columns can only be matched by position \
+         against a table that exists — re-running stops here again. Recovery: drop \
+         {db}.{table} from tables= (or track its new name) and clear its apitap \
+         state on the destination. Otherwise check the table name."
+    ))
+}
+
 pub(crate) async fn fetch_schema(
     pool: &sqlx::MySqlPool,
     db: &str,
@@ -365,7 +379,7 @@ pub(crate) async fn fetch_schema(
     .await
     .map_err(|e| Error::Transfer(format!("schema of {db}.{table}: {e}")))?;
     if rows.is_empty() {
-        return Err(Error::InvalidInput(format!("{db}.{table} not found")));
+        return Err(dropped_mid_backlog(db, table));
     }
     // MySQL stores JSON as a BINARY envelope and the binlog ships that
     // envelope verbatim, while a bootstrap SELECT returns the document as
@@ -1422,6 +1436,13 @@ mod truncate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2: a table dropped after its changes names the drop and the recovery.
+    #[test]
+    fn a_dropped_table_says_how_to_recover() {
+        let m = dropped_mid_backlog("bench", "t").to_string();
+        assert!(m.contains("dropped or renamed") && m.contains("tables="), "{m}");
+    }
 
     /// P2: a position past 4 GiB is refused, not wrapped.
     #[test]

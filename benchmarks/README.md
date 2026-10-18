@@ -664,6 +664,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_cdc_hardening.txcap --> `e2e_my_cdc_hardening.py txcap` | one MySQL transaction past APITAP_TX_BUF_BYTES is refused naming the table, watermark untouched |
 | <!-- claim: leg.e2e_my_cdc_hardening.state --> `e2e_my_cdc_hardening.py state` | MySQL `_apitap_state` keys are binary-collated: tables differing only in case keep separate watermarks |
 | <!-- claim: leg.e2e_my_cdc_hardening.enum --> `e2e_my_cdc_hardening.py enum` | a MySQL ENUM label holding a backslash or a newline lands from CDC with the bytes the bulk load wrote |
+| <!-- claim: leg.e2e_my_cdc_hardening.dropped --> `e2e_my_cdc_hardening.py dropped` | writes then DROP TABLE, drained after the drop: refused naming the drop and the recovery, watermark kept |
 | <!-- claim: leg.e2e_ch_hardening.dt64 --> `e2e_ch_hardening.py dt64` | a ClickHouse DateTime64(9) column travels as exact text: its nanoseconds survive CH → CH |
 | <!-- claim: leg.e2e_ch_hardening.cursor --> `e2e_ch_hardening.py cursor` | a String cursor holding a backslash is stored as the value itself, and the next append takes each row exactly once |
 | <!-- claim: leg.e2e_pg_hardening.notnull --> `e2e_pg_hardening.py notnull` | a Postgres `mode="replace"` keeps the destination's NOT NULL columns (attnotnull is no constraint row) |
