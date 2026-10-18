@@ -314,6 +314,49 @@ impl From<BulkKind> for LandKind {
 /// Total token width, including its leading `_`.
 pub(crate) const RUN_TOKEN_LEN: usize = 16;
 
+/// The next nonce of THIS process (see the minting comment in `RunId`).
+fn process_nonce() -> u64 {
+    static STATE: NonceState = NonceState::new();
+    STATE.next(std::process::id())
+}
+
+/// A nonce sequence bound to the pid it was derived for.
+struct NonceState {
+    pid: std::sync::atomic::AtomicU32,
+    base: std::sync::atomic::AtomicU64,
+    next: std::sync::atomic::AtomicU64,
+    derive: std::sync::Mutex<()>,
+}
+
+impl NonceState {
+    const fn new() -> Self {
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        Self {
+            pid: AtomicU32::new(0),
+            base: AtomicU64::new(0),
+            next: AtomicU64::new(0),
+            derive: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn next(&self, pid: u32) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.pid.load(SeqCst) != pid {
+            let _g = self.derive.lock().unwrap_or_else(|e| e.into_inner());
+            if self.pid.load(SeqCst) != pid {
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64)
+                    .unwrap_or(0);
+                self.base.store(ns.wrapping_mul(0x9E37_79B9).wrapping_add(pid as u64), SeqCst);
+                self.next.store(0, SeqCst);
+                self.pid.store(pid, SeqCst);
+            }
+        }
+        self.base.load(SeqCst).wrapping_add(self.next.fetch_add(1, SeqCst))
+    }
+}
+
 fn base36(mut n: u64, width: usize) -> String {
     const D: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut out = vec![b'0'; width];
@@ -371,16 +414,15 @@ impl RunId {
         // process would start at 0 and two of them would mint the same
         // sequence. It is derived once from the clock and the pid, which is
         // enough entropy for a name and needs no RNG dependency.
-        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let base = *BASE.get_or_init(|| {
-            let ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as u64)
-                .unwrap_or(0);
-            ns.wrapping_mul(0x9E37_79B9).wrapping_add(std::process::id() as u64)
-        });
-        let nonce = base.wrapping_add(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        //
+        // Per PROCESS, not per first minter: a parent that minted before it
+        // forked (a Celery prefork warm-up, multiprocessing after a first
+        // transfer) handed every child the same base and counter, and two
+        // children minting in the same second got the SAME token — one
+        // staging object, both passing is_self (P2). The base is re-derived,
+        // and the counter restarted, whenever the pid is not the one it was
+        // derived for.
+        let nonce = process_nonce();
         RunId {
             token: format!(
                 "_{}{}{}{}",
@@ -449,6 +491,21 @@ pub(crate) fn flipped_bootstrap(kind: LandKind, mode: crate::Mode) -> bool {
 #[cfg(test)]
 mod flipped_tests {
     use super::*;
+
+    /// P2: a new pid (a forked child) derives its own base and restarts the
+    /// counter, instead of continuing the parent's sequence.
+    #[test]
+    fn a_new_process_derives_its_own_nonce_base() {
+        let st = NonceState::new();
+        let a1 = st.next(4_000_001);
+        let a2 = st.next(4_000_001);
+        assert_eq!(a2, a1.wrapping_add(1), "one process counts up");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b1 = st.next(4_000_002);
+        assert_ne!(b1, a2.wrapping_add(1), "a child does not continue the parent's count");
+        assert_eq!(st.next(4_000_002), b1.wrapping_add(1));
+    }
+
     /// P2: the lost-first-run advice names both cases, and never offers
     /// replace for fan-in.
     #[test]
