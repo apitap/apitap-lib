@@ -120,6 +120,8 @@ impl GithubSource {
                 "github url needs a repo: github://<owner>/<repo>[/dir]?ref=main".into(),
             ));
         }
+        check_name("owner", &owner)?;
+        check_name("repo", &repo)?;
         let mut prefix = segs
             .next()
             .unwrap_or("")
@@ -490,6 +492,23 @@ impl<L: Loader> PipeBody<L> for GhBody<'_> {
     }
 }
 
+/// GitHub's own owner and repo charset. The decoded name went into the API,
+/// trees and raw URLs as-is, so `x%2F..%2F..%2Fuser` walked to other
+/// api.github.com endpoints with the user's token (P2).
+fn check_name(what: &str, name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "github url: {what} '{name}' is not a GitHub name (letters, digits, '-', '_', '.')"
+        )))
+    }
+}
+
 /// Whether a probed "header" is a Git LFS pointer's first line: the raw host
 /// serves the ~130-byte pointer for an LFS-tracked file, and its lines landed
 /// as a two-row table, reported as success (P2).
@@ -499,6 +518,15 @@ fn is_lfs_pointer(headers: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// P2: an owner or repo that is not a GitHub name is refused.
+    #[test]
+    fn owner_and_repo_must_be_github_names() {
+        assert!(super::check_name("repo", "apitap-lib").is_ok());
+        assert!(super::check_name("repo", "x/../y").is_err());
+        assert!(super::check_name("repo", "..").is_err());
+        assert!(super::check_name("owner", "a b").is_err());
+    }
+
     /// P2: an LFS pointer is recognised; a real header is not.
     #[test]
     fn an_lfs_pointer_is_not_a_header() {
