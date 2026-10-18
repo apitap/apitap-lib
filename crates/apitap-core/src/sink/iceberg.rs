@@ -2374,7 +2374,19 @@ impl crate::sink::Loader for IcebergLoader {
     }
 
     async fn finish(mut self) -> Result<u64> {
-        let key_rows = self.pq.finish_file()?;
+        // A failed footer left both multipart uploads open, billed until
+        // discard's belt found them: finish consumes the loader, so nothing
+        // else can abort them (P2).
+        let key_rows = match self.pq.finish_file() {
+            Ok(k) => k,
+            Err(e) => {
+                self.data.abort(&self.s3).await;
+                if let Some((d, _)) = &self.del {
+                    d.abort(&self.s3).await;
+                }
+                return Err(e);
+            }
+        };
         let data_tail = self.pq.out.take_all();
         let key_tail = self.pq.key_file.as_ref().map(|k| k.out.take_all());
         // A 0-row worker still produced parquet header+footer bytes — don't

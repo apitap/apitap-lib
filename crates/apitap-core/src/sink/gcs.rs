@@ -955,21 +955,26 @@ impl crate::sink::Loader for GcsLoader {
     }
 
     async fn finish(mut self) -> Result<u64> {
-        let mut pending = match (self.pq.take(), self.gz.take()) {
-            (Some(mut pq), _) => {
-                pq.finish_file()?;
-                pq.out.take_all()
+        // Any failure cancels the session, as abort does: finish consumes the
+        // loader, so nothing else could, and the partial part object stayed
+        // until the session expired (P2).
+        let tail = match (self.pq.take(), self.gz.take()) {
+            (Some(mut pq), _) => pq.finish_file().map(|_| pq.out.take_all()),
+            (None, Some(gz)) => gz.finish().map_err(|e| Error::Transfer(format!("gcs gzip finish: {e}"))),
+            (None, None) => Ok(Vec::new()),
+        };
+        let pending = match tail {
+            Ok(p) => p,
+            Err(e) => {
+                self.conn.cancel(&self.session).await;
+                return Err(e);
             }
-            (None, Some(gz)) => gz
-                .finish()
-                .map_err(|e| Error::Transfer(format!("gcs gzip finish: {e}")))?,
-            (None, None) => Vec::new(),
         };
         let total = self.offset + pending.len() as u64;
-        let chunk = std::mem::take(&mut pending);
-        self.conn
-            .put_chunk(&self.session, self.offset, chunk, Some(total))
-            .await?;
+        if let Err(e) = self.conn.put_chunk(&self.session, self.offset, pending, Some(total)).await {
+            self.conn.cancel(&self.session).await;
+            return Err(e);
+        }
         Ok(self.rows)
     }
 

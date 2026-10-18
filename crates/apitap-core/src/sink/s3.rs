@@ -1351,7 +1351,13 @@ impl crate::sink::Loader for S3Loader {
     }
 
     async fn finish(mut self) -> Result<u64> {
-        self.pq.finish_file()?;
+        // finish consumes the loader, so the pipe cannot abort it after a
+        // failed footer: the open multipart upload's parts were billed until
+        // discard's belt found them (P2). Abort here.
+        if let Err(e) = self.pq.finish_file() {
+            self.mp.abort(&self.conn).await;
+            return Err(e);
+        }
         let pending = self.pq.out.take_all();
         if self.mp.part_no == 0 && pending.is_empty() {
             // Nothing was ever produced (0-row worker): abort the upload so no
