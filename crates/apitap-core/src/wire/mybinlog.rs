@@ -221,10 +221,10 @@ impl<'a> R<'a> {
         Ok(v)
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let s = self
-            .b
-            .get(self.p..self.p + n)
-            .ok_or_else(|| bad("truncated slice"))?;
+        // Checked: a lenenc length near u64::MAX overflowed `p + n` (a
+        // panic under overflow checks) (P2, T17).
+        let end = self.p.checked_add(n).ok_or_else(|| bad("truncated slice"))?;
+        let s = self.b.get(self.p..end).ok_or_else(|| bad("truncated slice"))?;
         self.p += n;
         Ok(s)
     }
@@ -1254,6 +1254,14 @@ mod tests {
         body.extend_from_slice(&[1, b'd', 0, 1, b't', 0, 2, MT_DECIMAL, MT_VARCHAR, 2, 0x10, 0x00, 0]);
         let tm = parse_table_map(&body).unwrap();
         assert_eq!(tm.cols[1].meta, 16, "VARCHAR's metadata, not shifted");
+    }
+
+    /// P2/T17: a length near usize::MAX is a clean error, not an overflow.
+    #[test]
+    fn a_huge_take_is_an_error() {
+        let mut r = R::new(&[1, 2, 3]);
+        r.take(1).unwrap();
+        assert!(r.take(usize::MAX).is_err());
     }
 
     /// P2-10: NEWDECIMAL metadata no server writes (scale past precision,

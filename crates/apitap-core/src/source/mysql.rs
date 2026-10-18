@@ -1616,7 +1616,9 @@ where
 {
     #[inline]
     fn take<'a>(p: &'a [u8], pos: usize, n: usize) -> Result<&'a [u8]> {
-        p.get(pos..pos + n)
+        // Checked: a lenenc length near u64::MAX overflowed (P2, T17).
+        pos.checked_add(n)
+            .and_then(|end| p.get(pos..end))
             .ok_or_else(|| Error::Transfer("mysql wire: truncated row".into()))
     }
     let n = encs.len();
