@@ -1880,9 +1880,14 @@ pub(crate) async fn cdc_clear_watermark(
         return Ok(());
     }
     let requirements = vec![TableRequirement::UuidMatch { uuid: meta.uuid() }];
-    conn.commit_table(table, &requirements, &[TableUpdate::RemoveProperties { removals }])
-        .await
-        .map(|_| ())
+    // Every outcome, not `.map(|_| ())`: an Unknown (a 5xx, a lost answer)
+    // read as cleared, leaving a failed bootstrap's watermark with no error
+    // anywhere (P2). A Conflict is the table replaced — its properties went
+    // with it.
+    match conn.commit_table(table, &requirements, &[TableUpdate::RemoveProperties { removals }]).await? {
+        CommitTry::Done | CommitTry::Conflict => Ok(()),
+        CommitTry::Unknown(e) => Err(e),
+    }
 }
 
 pub(crate) async fn cdc_set_watermark(
