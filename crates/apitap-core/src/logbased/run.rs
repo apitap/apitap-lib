@@ -2182,6 +2182,11 @@ async fn apply_windows(
                         close_prefix_window(t, dest, &members, per, &mut rows_per, &applied_tx, end).await?;
                         expected += 1;
                     }
+                    // Per settled window, not once after the arm: the row
+                    // counter sat frozen for a whole parallel follow (P2).
+                    let total: u64 = rows_per.iter().sum();
+                    crate::progress::add_rows(total - reported_rows);
+                    reported_rows = total;
                 }};
             }
             loop {
