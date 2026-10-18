@@ -99,6 +99,23 @@ fn xml_tag(body: &str, tag: &str) -> Option<String> {
     Some(xml_unescape(&body[start..end]))
 }
 
+/// Whether a listing has another page. A server that says
+/// `<IsTruncated>false</IsTruncated>` is done even if it also sends a marker
+/// (one wasted request per listing before); a server that omits the flag is
+/// paged on its marker alone. And a listing has an end: 10 000 pages (10 M
+/// keys) is an answer that never stops, refused rather than followed (P2).
+fn more_pages(body: &str, marker: bool, pages: u32, prefix: &str) -> Result<bool> {
+    if !marker || xml_tag(body, "IsTruncated").as_deref() == Some("false") {
+        return Ok(false);
+    }
+    if pages >= 10_000 {
+        return Err(Error::Transfer(format!(
+            "s3 listing of '{prefix}' still truncated after {pages} pages; refusing to page on"
+        )));
+    }
+    Ok(true)
+}
+
 /// A part upload's integrity header. The body is sent UNSIGNED_PAYLOAD, so on
 /// a plain-http endpoint nothing caught a part corrupted in flight; with
 /// Content-MD5 the server refuses a mismatch (400 BadDigest) (P2).
@@ -570,6 +587,7 @@ impl S3Conn {
         };
         let mut out = Vec::new();
         let mut token: Option<String> = None;
+        let mut pages = 0u32;
         loop {
             let mut q = vec![
                 ("list-type".to_string(), "2".to_string()),
@@ -587,7 +605,8 @@ impl S3Conn {
             // `<NextContinuationToken></NextContinuationToken>` rather than
             // omitting it; `Some("")` means "no more pages", not "page again".
             token = xml_tag(&body, "NextContinuationToken").filter(|t| !t.is_empty());
-            if token.is_none() {
+            pages += 1;
+            if !more_pages(&body, token.is_some(), pages, prefix)? {
                 break;
             }
         }
@@ -607,6 +626,7 @@ impl S3Conn {
         let mut out = Vec::new();
         let mut key_marker: Option<String> = None;
         let mut id_marker: Option<String> = None;
+        let mut pages = 0u32;
         loop {
             let mut q = vec![
                 ("uploads".to_string(), String::new()),
@@ -631,7 +651,8 @@ impl S3Conn {
             // prevent (measured: a failed pg→s3 run never returned).
             key_marker = xml_tag(&body, "NextKeyMarker").filter(|m| !m.is_empty());
             id_marker = xml_tag(&body, "NextUploadIdMarker").filter(|m| !m.is_empty());
-            if key_marker.is_none() {
+            pages += 1;
+            if !more_pages(&body, key_marker.is_some(), pages, prefix)? {
                 break;
             }
         }
@@ -1357,6 +1378,14 @@ mod tests {
             vec!["a/part-00000.parquet", "a/part-00001.parquet"]
         );
         assert!(xml_tag(listing, "NextContinuationToken").is_none());
+        // P2: a listing stops on IsTruncated=false even with a marker, pages
+        // on the marker when the flag is absent, and has a page cap.
+        let done = "<IsTruncated>false</IsTruncated><NextKeyMarker>k</NextKeyMarker>";
+        assert!(!more_pages(done, true, 1, "p").unwrap());
+        assert!(more_pages("<NextKeyMarker>k</NextKeyMarker>", true, 1, "p").unwrap());
+        assert!(more_pages("<IsTruncated>true</IsTruncated>", true, 1, "p").unwrap());
+        assert!(!more_pages("<IsTruncated>true</IsTruncated>", false, 1, "p").unwrap());
+        assert!(more_pages("<IsTruncated>true</IsTruncated>", true, 10_000, "p").is_err());
         // P2: a part carries its Content-MD5 (RFC 1864 vectors).
         assert_eq!(part_headers(b"")[0].1, "1B2M2Y8AsgTpgAmY7PhCfg==");
         assert_eq!(part_headers(b"abc")[0], ("content-md5", "kAFQmDzST7DWlj99KOF/cg==".to_string()));
