@@ -1001,7 +1001,13 @@ mod tests {
         rt().block_on(async {
             let f = Arc::new(FakeFence::default());
             let t = tenure(f.clone(), Duration::from_millis(10)).await;
-            tokio::time::sleep(Duration::from_millis(45)).await;
+            // Up to 2 s for three renewals, not a fixed 45 ms: under a busy
+            // parallel test run the keeper got only two in that window, and
+            // the test failed about once in fifteen runs.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while f.renews.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             let n = f.renews.load(Ordering::SeqCst);
             t.release().await;
             crate::shutdown::clear();
