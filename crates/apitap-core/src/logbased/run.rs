@@ -1999,6 +1999,7 @@ async fn apply_windows(
     // The Postgres lane never reported progress: only the MySQL lane called
     // `add_rows` (system review 2026-10-07, G0.9), so an operator watching a
     // pg drain saw a frozen counter and could not tell stuck from slow.
+    let mut warned_parallel = false;
     let mut reported_rows = 0u64;
     while let Some(o) = win_rx.recv().await {
         let t_apply = std::time::Instant::now();
@@ -2027,9 +2028,9 @@ async fn apply_windows(
         };
         // "Say so loudly" (round 2): the flag is not silently inert.
         if parallel_apply() && !parallel_ok {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // Once per RUN: a process-global flag told only the first run of
+            // a long-lived process (P2).
+            if !std::mem::replace(&mut warned_parallel, true) {
                 eprintln!(
                     "[log_based] APITAP_PARALLEL_APPLY ignored: the destination is \
                      not proven insert-only, or this window carries residue/truncate; \
