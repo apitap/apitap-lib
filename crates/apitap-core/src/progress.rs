@@ -47,6 +47,34 @@ static WINDOW: AtomicU64 = AtomicU64::new(0);
 static ON: AtomicBool = AtomicBool::new(false);
 /// True while a reporter thread is alive; cleared to stop it.
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// One gauge field. A value that parses as a FINITE number is written as
+/// one; "NaN" and "inf" parse as f64 too, and unquoted they are not JSON.
+fn json_field(k: &str, v: &str) -> String {
+    if v.parse::<f64>().is_ok_and(f64::is_finite) {
+        format!("\"{k}\":{v}")
+    } else {
+        format!("\"{k}\":\"{}\"", json_esc(v))
+    }
+}
+
+/// A JSON string's content: `\`, `"` and every control character escaped.
+/// Quotes were swapped for apostrophes and the rest passed raw, so a
+/// multi-line error note or a name holding `\` broke the JSON line (P2).
+fn json_esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
 /// Set by `add_rows` itself: a lane that reports rows is, by definition, a
 /// lane that decodes them. Nothing claims exactness on a lane's behalf, so a
 /// relay that never counts shows bytes instead of a misleading zero — the
@@ -178,15 +206,7 @@ pub(crate) fn gauge(event: &str, fields: &[(&str, String)]) {
         Format::Json => {
             let body: Vec<String> = fields
                 .iter()
-                .map(|(k, v)| {
-                    // A value that parses as a number is written as one; only
-                    // the rest are quoted.
-                    if v.parse::<f64>().is_ok() {
-                        format!("\"{k}\":{v}")
-                    } else {
-                        format!("\"{k}\":\"{}\"", v.replace('"', "'"))
-                    }
-                })
+                .map(|(k, v)| json_field(k, v))
                 .collect();
             writeln!(
                 err,
@@ -239,7 +259,7 @@ fn warn_or_note(msg: &str, always: bool) {
             err,
             "{{\"ts\":\"{}\",\"event\":\"transfer.note\",\"note\":\"{}\"}}",
             stamp(),
-            msg.replace('"', "'")
+            json_esc(msg)
         ),
         Format::Plain => writeln!(err, "{} apitap note={msg}", stamp()),
         // \r first so the note does not land on top of a half-written live line.
@@ -421,7 +441,7 @@ fn render(
                  \"elapsed_s\":{:.1}",
                 stamp(),
                 if done { "transfer.done" } else { "transfer.progress" },
-                name.replace('"', "'"),
+                json_esc(&name),
                 unit.word(),
                 rows,
                 exact || done,
@@ -614,6 +634,17 @@ mod tests {
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
         L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// P2: every JSON line stays JSON — escapes, non-finite numbers.
+    #[test]
+    fn progress_json_is_always_json() {
+        let line = format!("{{{}}}", json_field("note", "a\\b\n\"c\"\u{1}"));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["note"], "a\\b\n\"c\"\u{1}");
+        let nan: serde_json::Value = serde_json::from_str(&format!("{{{}}}", json_field("r", "NaN"))).unwrap();
+        assert_eq!(nan["r"], "NaN");
+        assert_eq!(json_field("r", "12.5"), "\"r\":12.5");
     }
 
     #[test]
