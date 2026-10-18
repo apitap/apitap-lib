@@ -836,6 +836,15 @@ fn readonly_hint(body: &str) -> &'static str {
     }
 }
 
+/// One scalar from a `FORMAT TabSeparatedRaw` answer: the value as stored,
+/// minus the row's newline. The watermark reads ran with the default
+/// (escaped) TabSeparated and `.trim()`: a String cursor holding `\` or a
+/// tab came back escaped, was stored escaped, and became the next delta's
+/// literal; leading/trailing spaces were cut (P2).
+fn raw_scalar(body: &str) -> String {
+    body.strip_suffix('\n').unwrap_or(body).to_string()
+}
+
 /// One number from a ClickHouse answer. A body that is not a number is a
 /// damaged answer and fails the run; every count used to default to 0, and a
 /// 0 means "nothing staged", "no such table" or "no lease" (MASTER M-31).
@@ -2067,13 +2076,12 @@ impl crate::sink::Sink for ChSink {
             Some(
                 self.ch
                     .exec(&format!(
-                        "SELECT toString(max({})) FROM {}",
+                        "SELECT toString(max({})) FROM {} FORMAT TabSeparatedRaw",
                         ch_ident(cursor),
                         self.final_t
                     ))
-                    .await?
-                    .trim()
-                    .to_string(),
+                    .await
+                    .map(|b| raw_scalar(&b))?,
             )
         };
         // ClickHouse can't update the state row atomically with the ATTACH, so a
@@ -2177,14 +2185,13 @@ impl ChSink {
             Some(c) => Some(
                 self.ch
                     .exec(&format!(
-                        "SELECT toString(max({})) FROM {}{}",
+                        "SELECT toString(max({})) FROM {}{} FORMAT TabSeparatedRaw",
                         ch_ident(c),
                         self.staging_t,
                         self.consistent_read()
                     ))
-                    .await?
-                    .trim()
-                    .to_string(),
+                    .await
+                    .map(|b| raw_scalar(&b))?,
             ),
             None => None,
         };
@@ -2623,6 +2630,14 @@ impl Loader for ChLoader {
 
 #[cfg(test)]
 mod tests {
+    /// P2: a raw-TSV scalar is the stored value, minus the row newline only.
+    #[test]
+    fn raw_scalar_keeps_backslashes_and_spaces() {
+        assert_eq!(super::raw_scalar("a\\b\n"), "a\\b");
+        assert_eq!(super::raw_scalar(" x \n"), " x ");
+        assert_eq!(super::raw_scalar(""), "");
+    }
+
     /// P0-1: the backslash is escaped BEFORE the backtick — the REPRO shape
     /// stays inside one quoted identifier instead of rendering `42 AS
     /// injected_col` as statement text.
