@@ -139,6 +139,25 @@ pub(crate) fn row_strings(row: &CsvRow<'_>) -> Result<Vec<String>> {
         .collect()
 }
 
+/// The streamed header must be the one the plan was built from. Each fetch
+/// re-reads the file, which can change in between (a push to the branch):
+/// a reordered header put values under the wrong columns silently (P2).
+pub(crate) fn check_header(plan: &TablePlan, label: &str, row: &CsvRow<'_>) -> Result<()> {
+    let now = text_plan(plan.engine, label, &row_strings(row)?)?;
+    let same = now.cols.len() == plan.cols.len()
+        && now.cols.iter().zip(&plan.cols).all(|(a, b)| a.name == b.name);
+    if same {
+        return Ok(());
+    }
+    let names = |p: &TablePlan| p.cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(",");
+    Err(Error::InvalidInput(format!(
+        "'{label}' header changed while it was read: planned [{}], streamed [{}] — the file \
+         changed under the run; run it again",
+        names(plan),
+        names(&now)
+    )))
+}
+
 /// Build the all-text plan from a header row: names trimmed, blanks become
 /// `col_N`, duplicates fail loudly (case-insensitive).
 pub(crate) fn text_plan(engine: &'static str, label: &str, headers: &[String]) -> Result<TablePlan> {
@@ -307,6 +326,7 @@ where
         while let Some(row) = pump.next_record(eof) {
             if !header_skipped {
                 header_skipped = true;
+                check_header(plan, label, &row)?;
                 continue;
             }
             if row.len() > ncols {
@@ -510,4 +530,16 @@ mod tests {
         assert_eq!(text_plan("github", "x.csv", &h).unwrap().cols[0].name, "id");
     }
 
+    /// P2: a streamed header that differs from the plan's is refused.
+    #[test]
+    fn a_changed_header_is_refused() {
+        let plan = text_plan("github", "x.csv", &["a".into(), "b".into()]).unwrap();
+        let mut pump = CsvPump::new();
+        pump.feed(b"a,b\n");
+        assert!(check_header(&plan, "x.csv", &pump.next_record(true).unwrap()).is_ok());
+        let mut pump = CsvPump::new();
+        pump.feed(b"b,a\n");
+        let e = check_header(&plan, "x.csv", &pump.next_record(true).unwrap()).unwrap_err().to_string();
+        assert!(e.contains("header changed"), "{e}");
+    }
 }
