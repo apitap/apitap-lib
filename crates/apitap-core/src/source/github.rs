@@ -355,6 +355,13 @@ impl Source for GithubSource {
             }
         };
         drop(stream);
+        if is_lfs_pointer(&headers) {
+            return Err(Error::InvalidInput(format!(
+                "'{key}' is a Git LFS pointer, not the file: raw.githubusercontent.com serves \
+                 the pointer for LFS-tracked files. Fetch it from \
+                 media.githubusercontent.com/media/<owner>/<repo>/<ref>/<path> instead"
+            )));
+        }
         csvfile::text_plan("github", &key, &headers)
     }
 
@@ -483,8 +490,22 @@ impl<L: Loader> PipeBody<L> for GhBody<'_> {
     }
 }
 
+/// Whether a probed "header" is a Git LFS pointer's first line: the raw host
+/// serves the ~130-byte pointer for an LFS-tracked file, and its lines landed
+/// as a two-row table, reported as success (P2).
+fn is_lfs_pointer(headers: &[String]) -> bool {
+    headers.first().is_some_and(|h| h.starts_with("version https://git-lfs.github.com/spec/"))
+}
+
 #[cfg(test)]
 mod tests {
+    /// P2: an LFS pointer is recognised; a real header is not.
+    #[test]
+    fn an_lfs_pointer_is_not_a_header() {
+        assert!(super::is_lfs_pointer(&["version https://git-lfs.github.com/spec/v1".into()]));
+        assert!(!super::is_lfs_pointer(&["id".into(), "version".into()]));
+    }
+
     use super::*;
 
     #[test]
