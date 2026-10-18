@@ -882,14 +882,21 @@ impl Walsender {
     /// `APITAP_DECODE_WORKMEM` when (and only when) the operator set one, so a
     /// big transaction's ReorderBuffer can stay off pg_replslot spill files.
     /// By default nothing is raised: the server's own value applies. If the
-    /// server rejects the options for any reason, retry plain rather than fail
-    /// a connection that worked fine before this optimization.
+    /// server rejects the PARAMETER, retry plain (and say so) rather than fail
+    /// a connection that worked fine before this optimization. Any other
+    /// error is the answer: every error used to fall through, so a wrong
+    /// password cost two failed logins, and the operator's setting was
+    /// dropped without a word (P2).
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         if let Some(workmem) = decode_workmem_override()? {
             let opts = format!("-c logical_decoding_work_mem={workmem}");
             match Self::connect_with(url, Some(&opts), true).await {
                 Ok(ws) => return Ok(ws),
-                Err(_) => {} // fall through to a plain startup
+                Err(e) if is_guc_rejection(&e) => crate::progress::warn(&format!(
+                    "APITAP_DECODE_WORKMEM={workmem} was refused by the server ({e}); \
+                     decoding with the server's own logical_decoding_work_mem"
+                )),
+                Err(e) => return Err(e),
             }
         }
         Self::connect_with(url, None, true).await
@@ -1870,6 +1877,16 @@ fn parse_error(msg: &[u8]) -> Error {
     Error::Transfer(format!("walsender: server error {code}: {text}"))
 }
 
+/// A startup refusal of a `-c` parameter: invalid_parameter_value (22023),
+/// undefined_object (42704), or insufficient_privilege (42501, a SUSET GUC
+/// for a non-superuser) — the codes `parse_error` puts in its text.
+fn is_guc_rejection(e: &Error) -> bool {
+    let m = e.to_string();
+    ["22023", "42704", "42501"]
+        .iter()
+        .any(|c| m.contains(&format!("walsender: server error {c}:")))
+}
+
 fn md5_password(user: &str, password: &str, salt: [u8; 4]) -> String {
     use md5::Md5;
     let inner = hex::encode(Md5::digest(format!("{password}{user}")));
@@ -2047,6 +2064,21 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// P2: only a parameter refusal falls back to a plain startup.
+    #[test]
+    fn only_a_parameter_refusal_retries_without_it() {
+        let frame = |code: &str| {
+            let mut m = vec![b'C'];
+            m.extend_from_slice(code.as_bytes());
+            m.extend_from_slice(b"\0Mx\0\0");
+            super::parse_error(&m)
+        };
+        assert!(super::is_guc_rejection(&frame("22023")));
+        assert!(super::is_guc_rejection(&frame("42501")));
+        assert!(!super::is_guc_rejection(&frame("28P01")), "a wrong password is the answer");
+        assert!(!super::is_guc_rejection(&crate::error::Error::Transfer("walsender connect: refused".into())));
+    }
+
     /// P2/T19: a server that accepts the socket and never answers startup
     /// is a named error within the deadline, not a hang.
     #[test]
