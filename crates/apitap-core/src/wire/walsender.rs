@@ -616,7 +616,7 @@ struct ConnInfo {
 /// file that contains something else (a key, a mangled block) yields no
 /// certificates and the caller refuses, rather than quietly verifying against
 /// an empty store — which would accept everything.
-fn pem_certs(pem: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+pub(crate) fn pem_certs(pem: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
     let mut out = Vec::new();

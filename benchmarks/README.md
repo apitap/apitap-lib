@@ -675,6 +675,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_hardening.fkref --> `e2e_pg_hardening.py fkref` | a Postgres `replace` into a table another table references is refused before anything is copied |
 | <!-- claim: leg.e2e_pg_hardening.keepalive --> `e2e_pg_hardening.py keepalive` | every Postgres pool socket carries a TCP keepalive timer (`ss -o`), so a half-open COPY errors instead of hanging |
 | <!-- claim: leg.e2e_pg_hardening.multigroup --> `e2e_pg_hardening.py multigroup` | a per-table mode map whose later group fails keeps the report of the group that landed |
+| <!-- claim: leg.e2e_my_tls_ca --> `e2e_my_tls_ca.py` | the binlog drain verifies a private CA given as `ssl-ca=` under `verify_identity`; without it the connection is refused |
 | <!-- claim: leg.e2e_pg_cdc_hardening.toastpk --> `e2e_pg_cdc_hardening.py toastpk` | an UPDATE beside a 2400-character out-of-line key drains: the key comes from the old image |
 | <!-- claim: leg.e2e_pg_cdc_hardening.openstream --> `e2e_pg_cdc_hardening.py openstream` | a streamed transaction left open on the source does not hold a one-shot drain; after its commit every row lands once |
 | <!-- claim: leg.e2e_pg_cdc_hardening.lockwait --> `e2e_pg_cdc_hardening.py lockwait` | a TOAST refetch behind an ACCESS EXCLUSIVE lock gives up (lock_timeout) and the rerun lands |

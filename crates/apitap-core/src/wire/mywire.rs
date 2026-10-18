@@ -95,6 +95,13 @@ pub(crate) struct MyConnInfo {
     pub password: String,
     pub db: String,
     ssl: SslPref,
+    /// `ssl-ca=` (alias `sslrootcert=`): the private CA to verify against,
+    /// INSTEAD of the bundled public roots. Ignored here before, while sqlx
+    /// (the control pool) honoured it on the same URL: on RDS, Cloud SQL or
+    /// any private CA the raw plane failed UnknownIssuer under the
+    /// verify_identity default, and `required` (no verification) was the
+    /// only way through (P2-9).
+    ssl_ca: Option<String>,
 }
 
 /// Reject an ssl mode this client cannot honour, before any socket is opened.
@@ -137,7 +144,11 @@ pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
         .ok_or_else(|| Error::InvalidInput("mysql url needs a host".into()))?
         .to_string();
     let mut ssl = SslPref::Preferred { explicit: false };
+    let mut ssl_ca = None;
     for (k, v) in u.query_pairs() {
+        if k == "ssl-ca" || k == "ssl_ca" || k == "sslrootcert" {
+            ssl_ca = Some(v.to_string());
+        }
         if k == "ssl-mode" || k == "sslmode" {
             ssl = match v.to_lowercase().replace('-', "_").as_str() {
                 "disabled" => SslPref::Disabled,
@@ -175,6 +186,7 @@ pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
         password: pct(u.password().unwrap_or(""))?,
         db: u.path().trim_matches('/').to_string(),
         ssl,
+        ssl_ca,
     })
 }
 
@@ -393,14 +405,32 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
-async fn tls_upgrade(tcp: TcpStream, host: &str, ssl: SslPref) -> Result<IoBox> {
+async fn tls_upgrade(tcp: TcpStream, host: &str, ssl: SslPref, ssl_ca: Option<&str>) -> Result<IoBox> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Transfer(format!("mysql tls: {e}")))?;
     let cfg = if ssl.verifies() {
         let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        match ssl_ca {
+            Some(path) => {
+                let pem = std::fs::read_to_string(path)
+                    .map_err(|e| Error::InvalidInput(format!("mysql ssl-ca {path}: {e}")))?;
+                let certs = crate::wire::walsender::pem_certs(&pem);
+                if certs.is_empty() {
+                    return Err(Error::InvalidInput(format!(
+                        "mysql ssl-ca {path} holds no CERTIFICATE block — an empty trust \
+                         store would verify nothing, so this is refused"
+                    )));
+                }
+                for c in certs {
+                    roots
+                        .add(c)
+                        .map_err(|e| Error::InvalidInput(format!("mysql ssl-ca {path}: {e}")))?;
+                }
+            }
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
         builder.with_root_certificates(roots).with_no_client_auth()
     } else {
         // MySQL's `required` means encrypt, do not verify — the same as
@@ -567,7 +597,7 @@ impl MyWire {
             req.push(CHARSET_UTF8MB4);
             req.extend_from_slice(&[0u8; 23]);
             tcp.write_all(&req).await.map_err(io_err)?;
-            tls_upgrade(tcp, &info.host, info.ssl).await?
+            tls_upgrade(tcp, &info.host, info.ssl, info.ssl_ca.as_deref()).await?
         } else {
             Box::new(tcp)
         };
@@ -1217,6 +1247,11 @@ mod tests {
         // verify_ca checks the chain but NOT the hostname, which rustls cannot
         // express — refused by name rather than silently moved either way.
         assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=verify_ca").is_err());
+        // P2-9: ssl-ca (and its aliases) reaches the raw plane.
+        let ci = parse_my_url("mysql://u:p@h/db?ssl-mode=verify_identity&ssl-ca=/etc/ca.pem").unwrap();
+        assert_eq!(ci.ssl_ca.as_deref(), Some("/etc/ca.pem"));
+        let ci = parse_my_url("mysql://u:p@h/db?sslrootcert=/x.pem").unwrap();
+        assert_eq!(ci.ssl_ca.as_deref(), Some("/x.pem"));
         assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=whatever").is_err());
     }
 
