@@ -152,6 +152,26 @@ fn count_of(v: Option<String>) -> Result<u64> {
         .map_err(|e| Error::Transfer(format!("mysql: COUNT(*) answered {v:?}: {e}")))
 }
 
+/// Whether a key column's DDL type is one MySQL cannot index whole: a TEXT
+/// or BLOB (any size) or JSON part, or a VARCHAR past 768 characters (the
+/// utf8mb4 3072-byte cap). Case-insensitive: a mysql -> mysql type is the
+/// source's own lowercase `varchar(1000)`, which the uppercase-only check
+/// never matched, so the staging DDL failed with the raw 1170/1071 error
+/// instead of this remedy (P2).
+fn pk_unindexable(ty: &str) -> bool {
+    let up = ty.trim().to_ascii_uppercase();
+    let head = up.split(|c: char| c == '(' || c == ' ').next().unwrap_or("");
+    let varchar_w: Option<u32> = up
+        .strip_prefix("VARCHAR(")
+        .and_then(|r| r.split(')').next())
+        .and_then(|n| n.trim().parse().ok());
+    matches!(
+        head,
+        "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB"
+            | "LONGBLOB" | "JSON"
+    ) || varchar_w.is_some_and(|n| n > 768)
+}
+
 /// The lease store, shared by both lanes — see `crate::lease`.
 ///
 /// InnoDB, not `ENGINE=MEMORY` like the lock: a MEMORY table is emptied by a
@@ -1013,13 +1033,7 @@ impl crate::sink::Sink for MySqlSink {
             // utf8mb4 3072-byte index cap — refuse with the remedy instead of
             // surfacing the raw DDL error.
             if plan.pk_cols.contains(&c.name) {
-                let varchar_w: Option<u32> = ty
-                    .strip_prefix("VARCHAR(")
-                    .and_then(|r| r.strip_suffix(')'))
-                    .and_then(|n| n.parse().ok());
-                if matches!(ty.as_str(), "LONGTEXT" | "MEDIUMTEXT" | "JSON" | "LONGBLOB")
-                    || varchar_w.is_some_and(|n| n > 768)
-                {
+                if pk_unindexable(&ty) {
                     return Err(Error::InvalidInput(format!(
                         "primary-key column {} maps to {ty}, which MySQL cannot \
                          index — cast it to a bounded type in a source view \
@@ -1679,6 +1693,17 @@ impl Loader for MySqlLoader {
 #[cfg(test)]
 mod abort_tests {
     use super::*;
+
+    /// P2: TEXT/BLOB keys and wide VARCHARs are caught whatever their case.
+    #[test]
+    fn unindexable_key_types_are_caught_in_any_case() {
+        for t in ["varchar(1000)", "VARCHAR(769)", "longtext", "text", "TINYTEXT", "blob", "json"] {
+            assert!(super::pk_unindexable(t), "{t}");
+        }
+        for t in ["varchar(255)", "VARCHAR(768)", "int", "bigint unsigned", "char(36)"] {
+            assert!(!super::pk_unindexable(t), "{t}");
+        }
+    }
 
     /// P2/T8: a COUNT answer that is not a number fails, it is not 0.
     #[test]
