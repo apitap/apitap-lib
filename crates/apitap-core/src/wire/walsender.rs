@@ -1135,7 +1135,7 @@ impl Walsender {
                         }
                         10 => {
                             // SASL: mechanisms as cstr list. We speak
-                            // SCRAM-SHA-256 (no channel binding on plain TCP).
+                            // SCRAM-SHA-256, without channel binding.
                             let mechs = msg
                                 .get(4..)
                                 .and_then(|b| std::str::from_utf8(b).ok())
@@ -1184,11 +1184,13 @@ impl Walsender {
                     // reaching here is not authentication. AuthenticationOk
                     // and ReadyForQuery are words ANY peer can say; the
                     // server-final v= signature is the one artifact that
-                    // requires the stored key to produce, and with
-                    // sslmode=require the certificate is unverified, so this
-                    // gate is the only server authentication there is. A
-                    // peer that skipped AuthenticationSASLFinal is refused
-                    // here rather than trusted.
+                    // requires the stored key to produce. It proves the far
+                    // end holds the verifier — a fake server is caught — but
+                    // not that nothing relays the exchange: without channel
+                    // binding, only a verified certificate (verify-full)
+                    // rules a relay out. A peer that skipped
+                    // AuthenticationSASLFinal is refused here rather than
+                    // trusted.
                     if let Some(st) = scram.as_ref() {
                         st.require_verified()?;
                     }
@@ -1966,17 +1968,18 @@ impl ScramState {
     /// The server-authentication half of SCRAM. The v= signature is
     /// HMAC(ServerKey, auth-message), and ServerKey comes out of the same
     /// salted password as our own proof — so a valid v= can only be produced
-    /// by a peer that actually holds this user's stored credentials. It is
-    /// the ONE artifact a man-in-the-middle relaying the exchange, or a
-    /// server with a different password store, cannot fake, which is why the
-    /// startup loop refuses to finish until this has passed.
+    /// by a peer that actually holds this user's stored credentials: a fake
+    /// server, or one with a different password store, cannot produce it,
+    /// which is why the startup loop refuses to finish until this has
+    /// passed. It does NOT detect a man-in-the-middle that relays the real
+    /// server's answer unchanged — apitap sends no channel binding, so only
+    /// a verified certificate (sslmode=verify-full) rules that out.
     fn verify_server(&self, server_final: &str) -> Result<()> {
         let v = server_final.strip_prefix("v=").ok_or_else(|| {
             Error::Transfer(
                 "walsender: SCRAM server-final carries no v= signature — the \
-                 peer never proved it knows the password. A man-in-the-middle \
-                 relaying the exchange, or a wrong server, looks exactly like \
-                 this; refusing to treat the connection as authenticated."
+                 peer never proved it knows the password, as a fake server would \
+                 not; refusing to treat the connection as authenticated."
                     .into(),
             )
         })?
@@ -2016,8 +2019,8 @@ impl ScramState {
         Err(Error::Transfer(
             "walsender: the server completed SCRAM without ever sending its \
              v= signature (AuthenticationSASLFinal) — it never proved it \
-             knows the password. A man-in-the-middle relaying the exchange \
-             looks exactly like this; refusing the connection."
+             knows the password, as a fake server would not; refusing the \
+             connection."
                 .into(),
         ))
     }
