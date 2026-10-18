@@ -225,22 +225,19 @@ fn count_rows(buf: &[u8], cols: &[Skip]) -> (u64, usize) {
                     None => break 'outer,
                 }
             }
-            match c.width {
-                Some(w) => {
-                    if pos + w > buf.len() {
-                        break 'outer;
-                    }
-                    pos += w;
-                }
+            // Checked sums: a 10-byte varint length near usize::MAX wrapped
+            // `pos + used + len` back under buf.len(), pos stayed put, and
+            // the loop counted rows forever on a broken body (P2).
+            let end = match c.width {
+                Some(w) => pos.checked_add(w),
                 None => match read_varint(buf, pos) {
-                    Some((len, used)) => {
-                        if pos + used + len > buf.len() {
-                            break 'outer;
-                        }
-                        pos += used + len;
-                    }
+                    Some((len, used)) => pos.checked_add(used).and_then(|p| p.checked_add(len)),
                     None => break 'outer,
                 },
+            };
+            match end {
+                Some(end) if end <= buf.len() => pos = end,
+                _ => break 'outer,
             }
         }
         rows += 1;
@@ -714,6 +711,25 @@ fn glued_exception(tail: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// P2: a varint length near usize::MAX is a truncated row, not a wrapped
+    /// sum that counts forever.
+    #[test]
+    fn a_huge_varint_length_stops_the_count() {
+        let mut buf = Vec::new();
+        let mut v = (usize::MAX - 9) as u64;
+        while v >= 0x80 {
+            buf.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        buf.push(v as u8);
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        let cols = [super::Skip { nullable: false, width: None }];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(super::count_rows(&buf, &cols)).unwrap());
+        let got = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("count_rows must return");
+        assert_eq!(got, (0, 0));
+    }
+
     /// P2: DateTime64 past microseconds travels as text, and its precision is
     /// read from the spelling.
     #[test]
