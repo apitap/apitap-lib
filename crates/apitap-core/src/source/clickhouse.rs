@@ -87,6 +87,16 @@ fn peel(ty: &str) -> (String, bool) {
 /// Inner ClickHouse type → this engine's delivery vocabulary. Anything outside
 /// it (Array, Map, Tuple, Enum, IPv4/6, Int128+, …) rides as text: every table
 /// transfers, exotic columns land as String.
+/// The precision of a `DateTime64(p[, tz])` spelling (3 when absent, as
+/// ClickHouse defaults).
+fn datetime64_precision(inner: &str) -> u32 {
+    inner
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split(|c| c == ',' || c == ')').next())
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(3)
+}
+
 fn delivered_of(inner: &str) -> Delivered {
     let head = inner.split('(').next().unwrap_or(inner).trim();
     match head {
@@ -112,6 +122,11 @@ fn delivered_of(inner: &str) -> Delivered {
             }
         }
         "Date" | "Date32" => Delivered::Date,
+        // DateTime64(7..9) does not fit the microsecond lanes: cast to
+        // DateTime64(6) it lost its sub-microsecond digits silently, and an
+        // append with such a cursor re-sent every row past the truncated max
+        // (P2). It travels as its exact text instead.
+        "DateTime64" if datetime64_precision(inner) > 6 => Delivered::Text,
         "DateTime" | "DateTime64" => Delivered::DateTime { utc: true },
         "UUID" => Delivered::Uuid,
         "String" | "FixedString" => Delivered::Text,
@@ -433,6 +448,10 @@ impl crate::source::Source for ChSource {
             "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" => {
                 Ok(false)
             }
+            "DateTime64" if datetime64_precision(&inner) > 6 => Err(Error::InvalidInput(format!(
+                "clickhouse: {inner} is not usable as an incremental cursor — its sub-microsecond \
+                 digits do not survive the watermark; cast it to DateTime64(6) in a view"
+            ))),
             "Date" | "Date32" | "DateTime" | "DateTime64" | "String" => Ok(true),
             other => Err(Error::InvalidInput(format!(
                 "clickhouse: {other} is not usable as an incremental cursor"
@@ -695,6 +714,17 @@ fn glued_exception(tail: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// P2: DateTime64 past microseconds travels as text, and its precision is
+    /// read from the spelling.
+    #[test]
+    fn datetime64_beyond_micros_is_text() {
+        assert_eq!(super::datetime64_precision("DateTime64(9, 'UTC')"), 9);
+        assert_eq!(super::datetime64_precision("DateTime64(6)"), 6);
+        assert_eq!(super::datetime64_precision("DateTime64"), 3);
+        assert!(matches!(super::delivered_of("DateTime64(9, 'UTC')"), super::Delivered::Text));
+        assert!(matches!(super::delivered_of("DateTime64(6, 'UTC')"), super::Delivered::DateTime { .. }));
+    }
+
     /// P1-12: the in-band glued-exception detector.
     #[test]
     fn a_glued_exception_tail_is_detected() {

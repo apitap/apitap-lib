@@ -283,6 +283,7 @@ LEGS = [
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),
     leg("e2e_my_cdc_hardening.py",   "a MySQL transaction past APITAP_TX_BUF_BYTES is refused, watermark kept", argv=["txcap"]),
     leg("e2e_my_cdc_hardening.py",   "MySQL state keys are case-sensitive", argv=["state"]),
+    leg("e2e_ch_hardening.py",       "a ClickHouse DateTime64(9) keeps its nanoseconds", argv=["dt64"]),
 ]
 
 
