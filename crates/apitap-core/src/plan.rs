@@ -159,6 +159,30 @@ pub(crate) struct DestState {
     pub watermark: Option<String>,
 }
 
+/// Whether a cursor column's source type compares as a NUMBER: a positive
+/// list, case-insensitive, over the Postgres, MySQL and ClickHouse spellings.
+/// The sinks asked "not a date/timestamp?", so text/varchar/String and
+/// ClickHouse DateTime64/Date32 cursors were treated as numeric, both
+/// watermarks failed to parse, and the arbitration silently took the
+/// destination's max — a regressed max re-landed rows (P2).
+pub(crate) fn is_numeric_udt(udt: &str) -> bool {
+    let lower = udt.trim().to_ascii_lowercase();
+    let inner = lower
+        .strip_prefix("nullable(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(&lower);
+    let head = inner.split(|c: char| c == '(' || c == ' ').next().unwrap_or(inner);
+    matches!(
+        head,
+        "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "tinyint" | "mediumint" | "int"
+            | "numeric" | "decimal" | "float4" | "float8" | "real" | "double" | "float"
+            | "int16" | "int32" | "int64" | "int128" | "int256"
+            | "uint8" | "uint16" | "uint32" | "uint64" | "uint128" | "uint256"
+            | "float32" | "float64" | "decimal32" | "decimal64" | "decimal128" | "decimal256"
+            | "oid"
+    )
+}
+
 /// Compare two numeric watermark texts exactly: integers, decimals
 /// (`-12.50`), and — through f64 — exponent forms. `None` when either is not
 /// a number. Integers alone used to parse, so two DECIMAL cursors fell back
@@ -322,6 +346,17 @@ pub(crate) fn resolve_watermark(
 
 #[cfg(test)]
 mod wm_tests {
+    /// P2: only number types arbitrate numerically.
+    #[test]
+    fn numeric_cursor_types_are_a_positive_list() {
+        for t in ["int8", "INT", "bigint", "numeric", "decimal(10,2)", "UInt64", "Nullable(Int32)", "Float64", "double"] {
+            assert!(super::is_numeric_udt(t), "{t}");
+        }
+        for t in ["text", "varchar", "String", "DateTime64(3)", "Date32", "timestamptz", "date", "uuid", "bool"] {
+            assert!(!super::is_numeric_udt(t), "{t}");
+        }
+    }
+
     /// P2 (S7-16): DECIMAL watermarks compare as numbers, not text.
     #[test]
     fn decimal_watermarks_compare_numerically() {

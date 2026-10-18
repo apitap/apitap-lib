@@ -1851,12 +1851,7 @@ impl crate::sink::Sink for ChSink {
             .cols
             .iter()
             .find(|c| c.name == cursor)
-            .map(|c| {
-                !matches!(
-                    c.udt.as_str(),
-                    "date" | "timestamp" | "timestamptz" | "datetime"
-                )
-            })
+            .map(|c| crate::plan::is_numeric_udt(&c.udt))
             .unwrap_or(false);
         self.ensure_state_table().await?;
         let lit = self.final_bare.replace('\\', "\\\\").replace('\'', "\\'");

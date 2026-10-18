@@ -1387,12 +1387,7 @@ impl crate::sink::Sink for MySqlSink {
             .cols
             .iter()
             .find(|c| c.name == cursor)
-            .map(|c| {
-                !matches!(
-                    c.udt.as_str(),
-                    "date" | "timestamp" | "timestamptz" | "datetime"
-                )
-            })
+            .map(|c| crate::plan::is_numeric_udt(&c.udt))
             .unwrap_or(false);
         let watermark = crate::plan::resolve_watermark(
             state_wm,
