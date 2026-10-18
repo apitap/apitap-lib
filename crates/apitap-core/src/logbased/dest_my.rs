@@ -93,6 +93,16 @@ impl MyDest {
     }
 }
 
+/// One key column of the delete twin: the destination column's type, with
+/// its character set and collation when it has them.
+fn twin_col_ddl(name: &str, ty: &str, cs: Option<&str>, coll: Option<&str>) -> String {
+    let mut d = format!("{} {ty}", my_ident(name));
+    if let (Some(cs), Some(co)) = (cs, coll) {
+        d.push_str(&format!(" CHARACTER SET {cs} COLLATE {co}"));
+    }
+    d
+}
+
 /// Apply one collapsed window for one table through the unit, and name the
 /// watermark its close writes. A window with no traffic for this table writes
 /// nothing but that mark. Columns, types and keys are the window's own layout.
@@ -126,22 +136,29 @@ async fn apply_unit(
 
     let clear = !c.deletes.is_empty() || !c.upserts.is_empty();
     if clear {
-        // Key twin with the destination's own column types.
-        let col_types: Vec<(String, String)> = u
+        // Key twin with the destination's own column types AND collations.
+        // column_type carries no COLLATE, so a text key took the database
+        // default (_ci) while apitap creates it binary: 'abc' and 'ABC' in one
+        // window collided in the twin's primary key, the key load warned
+        // 1062, and the window was refused on every rerun (P2-3).
+        let col_types: Vec<(String, String, Option<String>, Option<String>)> = u
             .catalog(
-                "SELECT column_name, column_type FROM information_schema.columns \
-                 WHERE table_schema = ? AND table_name = ?",
+                "SELECT column_name, column_type, character_set_name, collation_name \
+                 FROM information_schema.columns WHERE table_schema = ? AND table_name = ?",
                 table,
             )
             .await?;
-        let type_of: HashMap<&str, &str> = col_types.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        let type_of: HashMap<&str, (&str, Option<&str>, Option<&str>)> = col_types
+            .iter()
+            .map(|(n, t, cs, co)| (n.as_str(), (t.as_str(), cs.as_deref(), co.as_deref())))
+            .collect();
         let ddl = pk_cols
             .iter()
             .map(|k| {
-                let ty = type_of.get(k.as_str()).ok_or_else(|| {
+                let (ty, cs, co) = type_of.get(k.as_str()).ok_or_else(|| {
                     Error::Transfer(format!("log_based: PK column '{k}' missing at the MySQL destination"))
                 })?;
-                Ok(format!("{} {ty}", my_ident(k)))
+                Ok(twin_col_ddl(k, ty, *cs, *co))
             })
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -865,6 +882,16 @@ fn key_pred(pk_cols: &[String], key: &[Vec<u8>], pk_oids: &[u32]) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-3: the twin's key column keeps the destination's collation.
+    #[test]
+    fn the_twin_key_keeps_the_destination_collation() {
+        assert_eq!(
+            twin_col_ddl("k", "varchar(10)", Some("utf8mb4"), Some("utf8mb4_0900_bin")),
+            "`k` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin"
+        );
+        assert_eq!(twin_col_ddl("id", "int", None, None), "`id` int");
+    }
     use crate::guard::GuardStore;
 
     /// The drain's lease key and the guard's refusal name are ONE string, or a

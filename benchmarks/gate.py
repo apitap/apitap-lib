@@ -298,6 +298,7 @@ LEGS = [
     leg("e2e_pg_cdc_hardening.py",  "a TOAST refetch behind a lock gives up instead of waiting", argv=["lockwait"]),
     leg("e2e_pg_cdc_hardening.py",  "a masked update of a row missing at a Postgres destination is refused", argv=["missingpg"]),
     leg("e2e_pg_cdc_hardening.py",  "a masked update of a row missing at a MySQL destination is refused", argv=["missingmy"]),
+    leg("e2e_pg_cdc_hardening.py",  "MySQL CDC keys differing only in case both land", argv=["twinkey"]),
     leg("e2e_s3_hardening.py",       "an S3 prefix holding & publishes and sweeps", argv=["amp"]),
     leg("e2e_s3_hardening.py",      "numeric(2,4) lands exact in S3 parquet", argv=["numeric"]),
     leg("e2e_ice_hardening.py",     "an Iceberg table of format-version 3 is refused", argv=["v3"]),

@@ -12,7 +12,10 @@ Three P2 findings (docs/review/2026-10-18-p2-triage.md), PG16 :5544 -> :5545 / I
              a masked update (TOAST body untouched) of a row missing at the
              destination matched nothing and the window committed: the row
              stayed gone. Postgres and MySQL destinations now refuse it.
-Usage: e2e_pg_cdc_hardening.py toastpk|openstream|lockwait|missingpg|missingmy
+  twinkey    a MySQL destination's binary text key met a delete twin keyed
+             under the database's _ci collation: 'abc' and 'ABC' in one
+             window collided there and the window was refused every rerun.
+Usage: e2e_pg_cdc_hardening.py toastpk|openstream|lockwait|missingpg|missingmy|twinkey
 """
 import json
 import os
@@ -211,9 +214,29 @@ def missing(dest):
             my_dst(f"DELETE FROM _apitap_state WHERE dest_table = '{t}'")
 
 
+def twinkey():
+    t = "pg_cdc_twinkey"
+    wipe(t)
+    my_dst(f"DROP TABLE IF EXISTS {t}")
+    my_dst(f"DELETE FROM _apitap_state WHERE dest_table = '{t}'")
+    try:
+        src(f"CREATE TABLE {t} (k varchar(20) PRIMARY KEY, v int); INSERT INTO {t} VALUES ('seed', 0)")
+        apitap.transfer(SRC, MY_DST, table=t, mode="log_based")
+        src(f"BEGIN; INSERT INTO {t} VALUES ('abc', 1), ('ABC', 2); COMMIT")
+        r, _ = run(SRC, MY_DST, t)
+        assert r.returncode == 0, f"keys differing only in case must both land:\n{r.stderr[-600:]}"
+        got = my_dst(f"SELECT GROUP_CONCAT(k ORDER BY k COLLATE utf8mb4_bin) FROM {t}")
+        assert got == "ABC,abc,seed", f"three rows, both cases kept: {got}"
+        print(f"  'abc' and 'ABC' in one window into a MySQL destination: {got}")
+    finally:
+        wipe(t)
+        my_dst(f"DROP TABLE IF EXISTS {t}")
+        my_dst(f"DELETE FROM _apitap_state WHERE dest_table = '{t}'")
+
+
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"toastpk": toastpk, "openstream": openstream, "lockwait": lockwait, "missingpg": lambda: missing("pg"), "missingmy": lambda: missing("my")}
+    cases = {"toastpk": toastpk, "openstream": openstream, "lockwait": lockwait, "missingpg": lambda: missing("pg"), "missingmy": lambda: missing("my"), "twinkey": twinkey}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_pg_cdc_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ Postgres CDC hardening: {which[0]}")

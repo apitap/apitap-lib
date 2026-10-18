@@ -678,6 +678,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_cdc_hardening.lockwait --> `e2e_pg_cdc_hardening.py lockwait` | a TOAST refetch behind an ACCESS EXCLUSIVE lock gives up (lock_timeout) and the rerun lands |
 | <!-- claim: leg.e2e_pg_cdc_hardening.missingpg --> `e2e_pg_cdc_hardening.py missingpg` | a masked UPDATE (TOAST untouched) of a row missing at a Postgres destination is refused, not committed as a no-op |
 | <!-- claim: leg.e2e_pg_cdc_hardening.missingmy --> `e2e_pg_cdc_hardening.py missingmy` | the same refusal at a MySQL destination |
+| <!-- claim: leg.e2e_pg_cdc_hardening.twinkey --> `e2e_pg_cdc_hardening.py twinkey` | keys `abc` and `ABC` in one window both land in a MySQL destination (the delete twin keeps the key's binary collation) |
 | <!-- claim: leg.e2e_s3_hardening.amp --> `e2e_s3_hardening.py amp` | an S3 prefix holding `&` (XML-escaped in listings) publishes, and a second replace leaves only the live parts |
 | <!-- claim: leg.e2e_s3_hardening.numeric --> `e2e_s3_hardening.py numeric` | a PG15+ numeric(2,4) value (0.0012) lands exact in S3 parquet, not clamped to scale 2 |
 | <!-- claim: leg.e2e_ice_hardening.v3 --> `e2e_ice_hardening.py v3` | an Iceberg table of format-version 3 is refused before anything is written |
