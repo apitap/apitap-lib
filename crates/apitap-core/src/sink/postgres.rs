@@ -882,6 +882,39 @@ impl crate::sink::Sink for PgSink {
                 };
                 ddl.push(format!("GRANT {privs} ON {} TO {who}", self.final_t));
             }
+            // FOR TABLE publication membership belongs to the dropped OID: a
+            // subscriber of the destination silently stopped receiving the
+            // table (P2). PG15+ carries a column list and a row filter, which
+            // come back with it, or the replicated set would widen.
+            let ver: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int4")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Transfer(format!("capture publications: {e}")))?;
+            let pubs: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(if ver >= 150_000 {
+                "SELECT p.pubname::text, \
+                        (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum) \
+                         FROM pg_attribute a WHERE a.attrelid = pr.prrelid AND a.attnum = ANY(pr.prattrs)), \
+                        pg_get_expr(pr.prqual, pr.prrelid) \
+                 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid \
+                 WHERE pr.prrelid = $1::regclass ORDER BY 1"
+            } else {
+                "SELECT p.pubname::text, NULL::text, NULL::text \
+                 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid \
+                 WHERE pr.prrelid = $1::regclass ORDER BY 1"
+            })
+            .bind(&self.final_t)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("capture publications: {e}")))?;
+            for (pubname, cols, qual) in &pubs {
+                let cols = cols.as_ref().map(|c| format!(" ({c})")).unwrap_or_default();
+                let qual = qual.as_ref().map(|q| format!(" WHERE ({q})")).unwrap_or_default();
+                ddl.push(format!(
+                    "ALTER PUBLICATION {} ADD TABLE {}{cols}{qual}",
+                    quote_ident(pubname),
+                    self.final_t
+                ));
+            }
             self.restore_ddl = ddl;
         }
         if self.bootstrap_pk {
