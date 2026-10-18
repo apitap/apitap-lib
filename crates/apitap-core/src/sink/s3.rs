@@ -99,6 +99,16 @@ fn xml_tag(body: &str, tag: &str) -> Option<String> {
     Some(xml_unescape(&body[start..end]))
 }
 
+/// A part upload's integrity header. The body is sent UNSIGNED_PAYLOAD, so on
+/// a plain-http endpoint nothing caught a part corrupted in flight; with
+/// Content-MD5 the server refuses a mismatch (400 BadDigest) (P2).
+fn part_headers(body: &[u8]) -> [(&'static str, String); 1] {
+    use base64::Engine as _;
+    use md5::Digest as _;
+    let digest = md5::Md5::digest(body);
+    [("content-md5", base64::engine::general_purpose::STANDARD.encode(digest))]
+}
+
 /// The five named entities and decimal/hex character references. An
 /// unknown or malformed reference is kept as written.
 fn xml_unescape(s: &str) -> String {
@@ -479,8 +489,9 @@ impl S3Conn {
             ("partNumber".to_string(), part_number.to_string()),
             ("uploadId".to_string(), upload_id.to_string()),
         ];
+        let md5 = part_headers(&bytes);
         let r = self
-            .request(reqwest::Method::PUT, &uri, &q, bytes, UNSIGNED_PAYLOAD, &[])
+            .request(reqwest::Method::PUT, &uri, &q, bytes, UNSIGNED_PAYLOAD, &md5)
             .await?;
         let etag = r
             .headers()
@@ -1346,6 +1357,9 @@ mod tests {
             vec!["a/part-00000.parquet", "a/part-00001.parquet"]
         );
         assert!(xml_tag(listing, "NextContinuationToken").is_none());
+        // P2: a part carries its Content-MD5 (RFC 1864 vectors).
+        assert_eq!(part_headers(b"")[0].1, "1B2M2Y8AsgTpgAmY7PhCfg==");
+        assert_eq!(part_headers(b"abc")[0], ("content-md5", "kAFQmDzST7DWlj99KOF/cg==".to_string()));
         // P2: entity-decoded, as AWS and MinIO escape keys.
         assert_eq!(xml_tags("<Key>a&amp;b&#39;c&#x9;&lt;d&gt;</Key>", "Key"), vec!["a&b'c\t<d>"]);
         assert_eq!(xml_tag("<ETag>&quot;e1&quot;</ETag>", "ETag").as_deref(), Some("\"e1\""));
