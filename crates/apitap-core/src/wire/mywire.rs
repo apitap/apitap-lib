@@ -68,14 +68,13 @@ enum SslPref {
     /// walsender's note for the same reasoning.
     Preferred { explicit: bool },
     Required,
-    VerifyCa,
     VerifyIdentity,
 }
 
 impl SslPref {
     /// Does this mode check the certificate at all?
     fn verifies(self) -> bool {
-        matches!(self, SslPref::VerifyCa | SslPref::VerifyIdentity)
+        matches!(self, SslPref::VerifyIdentity)
     }
 }
 
@@ -527,7 +526,7 @@ impl MyWire {
                 }
                 up
             }
-            SslPref::Required | SslPref::VerifyCa | SslPref::VerifyIdentity => {
+            SslPref::Required | SslPref::VerifyIdentity => {
                 if hs.caps & CLIENT_SSL == 0 {
                     return Err(Error::Connect(
                         "mysql wire: ssl-mode requires TLS but the server offers none \
