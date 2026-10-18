@@ -509,6 +509,42 @@ impl GithubApiSource {
 /// this (the URL carries an `after=` cursor; a manufactured `page=11` answers
 /// HTTP 422) — and cursor pagination also anchors the crawl position, so items
 /// updated mid-crawl can't shift rows across page boundaries.
+/// Pages one entity may take: `APITAP_GITHUB_MAX_PAGES`, default 100 000
+/// (10 M items at 100 a page).
+fn max_pages() -> u64 {
+    std::env::var("APITAP_GITHUB_MAX_PAGES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(100_000)
+}
+
+/// The URL to fetch after page `pages`, or `None` at the end. The loop
+/// followed rel="next" without bound: a proxy or API that kept minting a
+/// next link (or the same one) looped and accumulated forever (P2).
+fn next_page(
+    entity: &str,
+    cur: &str,
+    next: Option<String>,
+    empty: bool,
+    pages: u64,
+    cap: u64,
+) -> Result<Option<String>> {
+    let Some(n) = next.filter(|_| !empty) else { return Ok(None) };
+    if n == cur {
+        return Err(Error::Transfer(format!(
+            "github+api {entity}: the next page link points at the page just read ({cur})"
+        )));
+    }
+    if pages >= cap {
+        return Err(Error::Transfer(format!(
+            "github+api {entity}: still paging after {pages} pages (APITAP_GITHUB_MAX_PAGES); \
+             refusing to follow the API without end"
+        )));
+    }
+    Ok(Some(n))
+}
+
 fn link_next(link: &str) -> Option<String> {
     link.split(',').find_map(|part| {
         let (url, rest) = part.split_once(';')?;
@@ -915,7 +951,9 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
         let mut out: Vec<u8> = Vec::with_capacity(self.chunk + 64 * 1024);
         let mut rows: u64 = 0;
         let mut url = self.src.first_page_url(e, since.as_deref());
+        let mut pages = 0u64;
         loop {
+            pages += 1;
             let resp = self.src.send(url.clone(), e.accept, e.name).await?;
             let next = resp
                 .headers()
@@ -970,9 +1008,9 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
                     }
                 }
             }
-            match next {
-                Some(n) if !items.is_empty() => url = n,
-                _ => break,
+            match next_page(e.name, &url, next, items.is_empty(), pages, max_pages())? {
+                Some(n) => url = n,
+                None => break,
             }
         }
         if !tsv_lane {
@@ -997,6 +1035,18 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// P2: paging stops at the cap and at a link back to the same page.
+    #[test]
+    fn paging_has_an_end() {
+        let n = |u: &str| Some(u.to_string());
+        assert_eq!(super::next_page("issues", "a", n("b"), false, 1, 5).unwrap(), n("b"));
+        assert_eq!(super::next_page("issues", "a", n("b"), true, 1, 5).unwrap(), None);
+        assert_eq!(super::next_page("issues", "a", None, false, 1, 5).unwrap(), None);
+        assert!(super::next_page("issues", "a", n("a"), false, 1, 5).is_err());
+        let e = super::next_page("issues", "a", n("b"), false, 5, 5).unwrap_err().to_string();
+        assert!(e.contains("APITAP_GITHUB_MAX_PAGES"), "{e}");
+    }
+
     /// R2-11: the commits entity must stay replace-only — a cursor over
     /// client-set committer dates silently freezes or skips.
     #[test]
