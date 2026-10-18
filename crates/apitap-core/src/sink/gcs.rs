@@ -185,7 +185,8 @@ impl GcsConn {
         Ok(fresh)
     }
 
-    /// Send with up to 3 attempts: transport errors and 5xx retry with backoff
+    /// Send with up to STORE_ATTEMPTS: transport errors, 5xx, 408 and 429
+    /// retry with growing backoff
     /// (every call here is idempotent — range re-PUTs included, per the
     /// resumable protocol). 4xx and success return immediately.
     async fn send_retry(
@@ -197,14 +198,15 @@ impl GcsConn {
         loop {
             attempt += 1;
             match build().send().await {
-                Ok(resp) if resp.status().is_server_error() && attempt < 3 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                        .await;
+                Ok(resp)
+                    if crate::http::store_retryable(resp.status()) && attempt < crate::http::STORE_ATTEMPTS =>
+                {
+                    let wait = crate::http::store_backoff(attempt, resp.headers().get(reqwest::header::RETRY_AFTER));
+                    tokio::time::sleep(wait).await;
                 }
                 Ok(resp) => return Ok(resp),
-                Err(_) if attempt < 3 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                        .await;
+                Err(_) if attempt < crate::http::STORE_ATTEMPTS => {
+                    tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
                 }
                 // without_url: a resumable session URI authorises its
                 // upload, and reqwest's Display prints the URL (P2).

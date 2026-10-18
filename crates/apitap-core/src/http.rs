@@ -151,3 +151,52 @@ mod tests {
         let _ = client();
     }
 }
+
+/// Attempts an object-store call gets (S3, GCS).
+pub(crate) const STORE_ATTEMPTS: u32 = 6;
+
+/// Whether an object-store answer is worth another attempt: a 5xx, a 408,
+/// or a 429. 429 was not retried at all (GCS rateLimitExceeded, S3-compatible
+/// stores that throttle), and the 1.5 s total backoff was far below what a
+/// throttle asks for, so a brief one failed a whole load at finalize (P2).
+pub(crate) fn store_retryable(s: reqwest::StatusCode) -> bool {
+    s.is_server_error() || s.as_u16() == 408 || s.as_u16() == 429
+}
+
+/// The wait before attempt `attempt + 1` (1-based): 0.5, 1, 2, 4, 8 s plus up
+/// to a quarter of jitter, or the server's `Retry-After` seconds (capped at
+/// 60 s) when it sent one.
+pub(crate) fn store_backoff(attempt: u32, retry_after: Option<&reqwest::header::HeaderValue>) -> Duration {
+    if let Some(secs) = retry_after
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_secs(secs.min(60));
+    }
+    let base = 500u64 << attempt.saturating_sub(1).min(4);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_millis(base + nanos % (base / 4 + 1))
+}
+
+#[cfg(test)]
+mod store_retry_tests {
+    use super::*;
+
+    /// P2: 429 and 408 retry like a 5xx; the backoff grows, and a
+    /// Retry-After wins.
+    #[test]
+    fn throttles_are_retried_with_growing_backoff() {
+        use reqwest::StatusCode as S;
+        assert!(store_retryable(S::TOO_MANY_REQUESTS) && store_retryable(S::REQUEST_TIMEOUT));
+        assert!(store_retryable(S::SERVICE_UNAVAILABLE) && !store_retryable(S::FORBIDDEN));
+        let d1 = store_backoff(1, None);
+        let d5 = store_backoff(5, None);
+        assert!(d1 >= Duration::from_millis(500) && d1 < Duration::from_millis(700), "{d1:?}");
+        assert!(d5 >= Duration::from_secs(8), "{d5:?}");
+        let ra = reqwest::header::HeaderValue::from_static("3");
+        assert_eq!(store_backoff(1, Some(&ra)), Duration::from_secs(3));
+    }
+}

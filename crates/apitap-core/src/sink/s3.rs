@@ -359,7 +359,7 @@ impl S3Conn {
         let uri = self.uri_for(object);
         let range = format!("bytes={start}-{}", start + len - 1);
         let mut last = None;
-        for attempt in 1..=3u32 {
+        for attempt in 1..=crate::http::STORE_ATTEMPTS {
             let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
             // `range` is a signed header here — it changes the response bytes.
             let headers = sigv4_headers(
@@ -386,16 +386,19 @@ impl S3Conn {
                         .map(|b| b.to_vec())
                         .map_err(|e| Error::Transfer(format!("s3 range get: {e}")));
                 }
-                Ok(r) if r.status().is_server_error() && attempt < 3 => {
+                Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
                     last = Some(Error::Transfer(format!("s3 range get: {}", r.status())));
+                    tokio::time::sleep(crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER))).await;
                 }
                 Ok(r) => {
                     return Err(Error::Transfer(format!("s3 range get {object}: {}", r.status())))
                 }
-                Err(e) if attempt < 3 => last = Some(Error::Transfer(format!("s3 range get: {e}"))),
+                Err(e) if attempt < crate::http::STORE_ATTEMPTS => {
+                    last = Some(Error::Transfer(format!("s3 range get: {e}")));
+                    tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
+                }
                 Err(e) => return Err(Error::Transfer(format!("s3 range get: {e}"))),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
         }
         Err(last.unwrap_or_else(|| Error::Transfer("s3 range get: retries exhausted".into())))
     }
@@ -422,7 +425,7 @@ impl S3Conn {
         extra_amz: &[(&str, String)],
     ) -> Result<reqwest::Response> {
         let mut last = None;
-        for attempt in 1..=3u32 {
+        for attempt in 1..=crate::http::STORE_ATTEMPTS {
             let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
             let headers = sigv4_headers(
                 &self.creds,
@@ -452,15 +455,19 @@ impl S3Conn {
             for (k, v) in &headers {
                 req = req.header(k.as_str(), v);
             }
-            match req.body(body.clone()).send().await {
-                Ok(r) if r.status().is_server_error() && attempt < 3 => {
+            let wait = match req.body(body.clone()).send().await {
+                Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
                     last = Some(Error::Transfer(format!("s3 {method} {object_uri}: {}", r.status())));
+                    crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER))
                 }
                 Ok(r) => return Ok(r),
-                Err(e) if attempt < 3 => last = Some(Error::Transfer(format!("s3 send: {e}"))),
+                Err(e) if attempt < crate::http::STORE_ATTEMPTS => {
+                    last = Some(Error::Transfer(format!("s3 send: {e}")));
+                    crate::http::store_backoff(attempt, None)
+                }
                 Err(e) => return Err(Error::Transfer(format!("s3 send: {e}"))),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            };
+            tokio::time::sleep(wait).await;
         }
         Err(last.unwrap_or_else(|| Error::Transfer("s3: retries exhausted".into())))
     }
