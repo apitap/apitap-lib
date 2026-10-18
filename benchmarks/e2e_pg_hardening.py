@@ -18,7 +18,9 @@ Four P2 findings (docs/review/2026-10-18-p2-triage.md), PG16 :5544 / :5545 / CH 
             swap's DROP, after the whole load was staged.
   keepalive pool sockets had no TCP keepalive: a half-open one parked a COPY
             read forever. `ss -o` shows the timer on apitap's connections.
-Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale|longname|fkref|keepalive
+  multigroup a per-table mode map whose later group failed to start raised
+            one error and dropped the report of the group that had landed.
+Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale|longname|fkref|keepalive|multigroup
 """
 import os
 import subprocess
@@ -209,6 +211,28 @@ def keepalive():
         dst(f"DROP TABLE IF EXISTS {t}")
 
 
+def multigroup():
+    ok, missing = "pg_multi_ok", "pg_multi_no_such_table"
+    src(f"DROP TABLE IF EXISTS {ok}")
+    dst(f"DROP TABLE IF EXISTS {ok}")
+    try:
+        src(f"CREATE TABLE {ok} (id int PRIMARY KEY); INSERT INTO {ok} SELECT generate_series(1, 7)")
+        try:
+            apitap.transfer(PG, DST, tables={ok: "replace", missing: "append"})
+            raise AssertionError("a missing table must fail its group")
+        except apitap.MultiTransferError as e:
+            by = {t.table: t for t in e.report.tables}
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(f"the landed group must be reported, got a bare {type(e).__name__}: {e}")
+        assert by[ok].error is None and by[ok].rows == 7, f"{ok} landed and says so: {by[ok]}"
+        assert by[missing].error, f"{missing} carries its group's error: {by[missing]}"
+        assert dst(f"SELECT count(*) FROM {ok}") == "7"
+        print(f"  replace + a failing append group: {ok} reported 7 rows, {missing} its error")
+    finally:
+        src(f"DROP TABLE IF EXISTS {ok}")
+        dst(f"DROP TABLE IF EXISTS {ok}")
+
+
 def _try(f, err):
     try:
         f()
@@ -218,7 +242,7 @@ def _try(f, err):
 
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"notnull": notnull, "pub": pub, "nullcursor": nullcursor, "negscale": negscale, "longname": longname, "fkref": fkref, "keepalive": keepalive}
+    cases = {"notnull": notnull, "pub": pub, "nullcursor": nullcursor, "negscale": negscale, "longname": longname, "fkref": fkref, "keepalive": keepalive, "multigroup": multigroup}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_pg_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ Postgres hardening: {which[0]}")

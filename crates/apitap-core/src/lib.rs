@@ -536,7 +536,7 @@ pub async fn transfer_tables(
         let mut o = opts.clone();
         o.mode = mode;
         let r = if mode == Mode::LogBased {
-            logbased::run::run_many(src_url, dst_url, &tables, &o).await?
+            logbased::run::run_many(src_url, dst_url, &tables, &o).await
         } else {
             pipeline::dispatch::multi(
                 src_url,
@@ -544,10 +544,28 @@ pub async fn transfer_tables(
                 pipeline::dispatch::TableSel::List(&tables),
                 &o,
             )
-            .await?
+            .await
         };
-        budget = budget.max(r.budget);
-        results.extend(r.tables);
+        match r {
+            Ok(r) => {
+                budget = budget.max(r.budget);
+                results.extend(r.tables);
+            }
+            // A group that failed to start is its tables' error, not the
+            // call's: returning it with `?` dropped the report of groups that
+            // had already landed (a replace swapped, an append committed), so
+            // the caller could not tell which tables changed (P2).
+            Err(e) => {
+                let msg = e.to_string();
+                results.extend(tables.into_iter().map(|table| TableResult {
+                    table,
+                    rows: 0,
+                    elapsed_ms: 0,
+                    parallel: 0,
+                    error: Some(msg.clone()),
+                }));
+            }
+        }
     }
     Ok(MultiReport {
         rows: results.iter().filter(|t| t.error.is_none()).map(|t| t.rows).sum(),
