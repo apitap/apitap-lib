@@ -373,7 +373,19 @@ unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowAr
     // A panic inside the read pipeline must NOT unwind across the FFI
     // boundary: since Rust 1.81 that aborts the whole Python process
     // (review round 2 R2-10). It becomes EIO + `last_error` instead.
-    let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st.handle.next_batch()));
+    //
+    // The export runs inside the catch too: it indexes validity bitmaps and
+    // grows vectors, and a panic there unwound across the boundary and
+    // aborted Python (P2). `out` is written only on success.
+    let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match st.handle.next_batch() {
+        Ok(Some(batch)) => {
+            // SAFETY: `out` is writable, uninitialised array storage.
+            unsafe { export_batch(batch, out) };
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => Err(e),
+    }));
     let next = match pulled {
         Ok(r) => r,
         Err(_) => {
@@ -382,12 +394,8 @@ unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowAr
         }
     };
     match next {
-        Ok(Some(batch)) => {
-            // SAFETY: `out` is writable, uninitialised array storage.
-            unsafe { export_batch(batch, out) };
-            0
-        }
-        Ok(None) => {
+        Ok(true) => 0,
+        Ok(false) => {
             // End of stream: a released (empty) array.
             // SAFETY: `out` is writable storage; `write` does not read the
             // old value, which is what uninitialised memory requires.
