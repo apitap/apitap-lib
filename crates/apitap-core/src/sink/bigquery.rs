@@ -556,10 +556,7 @@ impl BqConn {
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        Err(ScriptErr::transport(Error::Transfer(format!(
-            "bigquery job {job_id} exceeded 30 minutes and did not settle after a cancel              request — its fate is unknown; the window must not be treated as \
-             committed-nothing"
-        ))))
+        Err(ScriptErr::transport(Error::Transfer(deadline_msg(&job_id))))
     }
 
     /// The location every job of this connection is submitted under. A job
@@ -944,6 +941,16 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
         .unwrap_or_default()
 }
 
+/// The poll deadline's refusal, shared with its test so the test pins the
+/// message poll() actually produces (it pinned a shape 54a29fd retired).
+fn deadline_msg(job_id: &str) -> String {
+    format!(
+        "bigquery job {job_id} exceeded 30 minutes and did not settle after a cancel \
+         request — its fate is unknown; the window must not be treated as \
+         committed-nothing"
+    )
+}
+
 /// Bytes a resumable session has persisted, from a 308's `Range: bytes=0-N`
 /// (N + 1). No Range header means nothing persisted yet.
 fn persisted_from(range: Option<&str>) -> u64 {
@@ -1303,7 +1310,7 @@ mod retry_tests {
         assert_eq!(t("bigquery 400 Bad Request on https://x/jobs: Syntax error"), None);
         assert_eq!(f("bigquery job j failed: Transaction is aborted due to concurrent update"), Some(Retry::NewId));
         assert_eq!(f("bigquery job j failed: Syntax error: Unexpected identifier"), None);
-        assert_eq!(f("bigquery job j still running after 30 minutes"), None, "it may still commit");
+        assert_eq!(t(&super::deadline_msg("j")), None, "a deadline is unknown fate: it may still commit");
         assert_eq!(f("bigquery job id j belongs to another query"), None);
         assert_eq!(next_try(&ScriptErr::Transport("503 ".into()), 5), None, "bounded");
         assert_eq!(next_try(&ScriptErr::Transport("503 ".into()), 4), Some(Retry::SameId));
