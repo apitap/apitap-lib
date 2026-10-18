@@ -572,6 +572,15 @@ impl PgSink {
     }
 }
 
+/// The loser of two concurrent `CREATE TABLE IF NOT EXISTS`: 42P07
+/// duplicate_table or 23505 unique_violation (pg_type), whatever the
+/// server's message language; the English text stays as a fallback.
+fn is_create_race(code: Option<&str>, msg: &str) -> bool {
+    matches!(code, Some("42P07") | Some("23505"))
+        || msg.contains("already exists")
+        || msg.contains("duplicate key")
+}
+
 /// Postgres cuts an identifier past 63 bytes silently. The staging name is
 /// minted to fit; the destination's was not: two names sharing their first
 /// 63 bytes were one table under two guard and state keys, and one long name
@@ -718,9 +727,11 @@ impl PgSink {
         .map(|_| ())
         .or_else(|e| {
             // Two concurrent first-runs can both pass IF NOT EXISTS — the loser's
-            // error is harmless, the table exists either way.
-            let msg = e.to_string();
-            if msg.contains("already exists") || msg.contains("duplicate key") {
+            // error is harmless, the table exists either way. By SQLSTATE: the
+            // English text alone failed the loser on a server whose
+            // lc_messages is not English ("existiert bereits") (P2).
+            let code = e.as_database_error().and_then(|d| d.code().map(|c| c.into_owned()));
+            if is_create_race(code.as_deref(), &e.to_string()) {
                 Ok(())
             } else {
                 Err(Error::Transfer(format!("state table: {e}")))
@@ -1549,6 +1560,15 @@ impl Loader for PgCopyLoader {
 
 #[cfg(test)]
 mod tests {
+    /// P2: the state-table create race is recognised by SQLSTATE in any language.
+    #[test]
+    fn a_create_race_is_recognised_by_sqlstate() {
+        assert!(super::is_create_race(Some("42P07"), "Relation »_apitap_state« existiert bereits"));
+        assert!(super::is_create_race(Some("23505"), "doppelter Schlüsselwert"));
+        assert!(super::is_create_race(None, "relation \"x\" already exists"));
+        assert!(!super::is_create_race(Some("42501"), "permission denied"));
+    }
+
     /// P2: a 64-byte destination name is refused, not cut; 63 bytes fits.
     #[test]
     fn identifiers_past_63_bytes_are_refused() {
