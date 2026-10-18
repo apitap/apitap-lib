@@ -245,7 +245,7 @@ impl BqConn {
             .await
             .map_err(|e| Error::Transfer(format!("bigquery {method} {url}: {e}")))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = body_text(resp, &format!("{method} {url}")).await?;
         if !status.is_success() {
             return Err(Error::Transfer(format!(
                 "bigquery {status} on {url}: {}",
@@ -473,7 +473,7 @@ impl BqConn {
             .await
             .map_err(|e| Error::Transfer(format!("bigquery state load: {e}")))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = body_text(resp, "state load").await?;
         if !status.is_success() {
             return Err(Error::Transfer(format!(
                 "bigquery state load {status}: {}",
@@ -883,7 +883,9 @@ impl BqConn {
             .await
             .map_err(|e| ScriptErr::Transport(format!("bigquery cdc staging load: {e}")))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = body_text(resp, "cdc staging load")
+            .await
+            .map_err(|e| ScriptErr::Transport(e.to_string()))?;
         if status == reqwest::StatusCode::CONFLICT {
             // The id already names a job: this load's earlier POST landed.
             // Adopted only if it loads this very table.
@@ -946,6 +948,16 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
 /// upload, and reqwest's Display prints the URL (P2).
 fn upload_err(e: reqwest::Error) -> Error {
     Error::Transfer(format!("bigquery upload chunk: {}", e.without_url()))
+}
+
+/// A response body that must be read whole. `text().unwrap_or_default()`
+/// turned a 200 whose body read failed (reset mid-body) into an empty answer
+/// — `Value::Null`, which table_get reads as "exists" (P2, T7). Read errors
+/// print without the URL (a session URI holds its upload_id).
+async fn body_text(resp: reqwest::Response, what: &str) -> Result<String> {
+    resp.text()
+        .await
+        .map_err(|e| Error::Transfer(format!("bigquery {what}: body read: {}", e.without_url())))
 }
 
 /// Whether an `api()` error is HTTP `code`: its message starts
@@ -1647,7 +1659,7 @@ impl BqLoader {
                 Ok(None)
             }
             (200 | 201, Some(_)) => {
-                let body = resp.text().await.unwrap_or_default();
+                let body = body_text(resp, "upload chunk").await?;
                 let v: Value = serde_json::from_str(&body)
                     .map_err(|e| Error::Transfer(format!("bigquery job response: {e}")))?;
                 Ok(Some(v))
@@ -2970,6 +2982,30 @@ mod tests {
         assert_eq!(super::sql_str("o'k\\"), "o\\'k\\\\");
         assert_eq!(super::sql_str("x\u{1}"), "x\\u0001");
         assert!(!super::sql_str("a\nb").contains('\n'));
+    }
+
+    /// P2: an upload error never carries the session URI; a truncated 200
+    /// body is an error, not an empty answer (T7).
+    #[test]
+    fn upload_errors_hide_the_session_and_bodies_are_read_whole() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let e = reqwest::Client::new().get("http://127.0.0.1:1/x?upload_id=SECRET").send().await.unwrap_err();
+            let m = super::upload_err(e).to_string();
+            assert!(!m.contains("SECRET"), "{m}");
+
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut c, _) = l.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = c.read(&mut buf).await;
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"a\"").await;
+            });
+            let resp = reqwest::get(format!("http://127.0.0.1:{port}/")).await.unwrap();
+            assert!(super::body_text(resp, "probe").await.is_err(), "a body cut short is an error");
+        });
     }
 
     /// A job task that resolves to `rows`, for the ownership tests below.
