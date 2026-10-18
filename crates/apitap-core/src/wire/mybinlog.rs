@@ -302,8 +302,10 @@ pub(crate) fn parse_table_map(body: &[u8]) -> Result<TableMap> {
                 u16::from_le_bytes([s[0], s[1]])
             }
             // STRING/ENUM/SET/NEWDECIMAL: two bytes, but big-endian-ish
-            // packing (real type in the high byte for STRING).
-            MT_STRING | MT_ENUM | MT_SET | MT_NEWDECIMAL | MT_DECIMAL | MT_BIT => {
+            // packing (real type in the high byte for STRING). Not the
+            // pre-5.0 DECIMAL (0x00): the server writes no metadata for it,
+            // and reading two shifted every later column's (P2).
+            MT_STRING | MT_ENUM | MT_SET | MT_NEWDECIMAL | MT_BIT => {
                 let s = metablob
                     .get(mp..mp + 2)
                     .ok_or_else(|| bad("meta underflow"))?;
@@ -1243,6 +1245,17 @@ pub(crate) const TYPE_TX_PAYLOAD: u8 = EV_TRANSACTION_PAYLOAD;
 
 #[cfg(test)]
 mod tests {
+    /// P2: the pre-5.0 DECIMAL carries no metadata; the next column's is
+    /// read where it is.
+    #[test]
+    fn legacy_decimal_carries_no_metadata() {
+        // table id 6B, flags 2B, db "d", table "t", ncols 2, kinds, meta 2B (VARCHAR's), null bitmap
+        let mut body = vec![1, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&[1, b'd', 0, 1, b't', 0, 2, MT_DECIMAL, MT_VARCHAR, 2, 0x10, 0x00, 0]);
+        let tm = parse_table_map(&body).unwrap();
+        assert_eq!(tm.cols[1].meta, 16, "VARCHAR's metadata, not shifted");
+    }
+
     /// P2-10: NEWDECIMAL metadata no server writes (scale past precision,
     /// precision 0) is refused, not an underflow or an empty-value index.
     #[test]
