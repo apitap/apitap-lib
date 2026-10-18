@@ -46,6 +46,19 @@ pub(crate) fn file_name(prefix: &str, idx: u64) -> String {
     format!("{prefix}.{idx:06}")
 }
 
+/// A binlog position as the v4 protocol carries it. A file passes 4 GiB when
+/// one transaction outgrows max_binlog_size; `as u32` wrapped the position
+/// and the next run resumed mid-event (P2).
+fn pos_u32(file: &str, pos: u64) -> Result<u32> {
+    u32::try_from(pos).map_err(|_| {
+        Error::Transfer(format!(
+            "binlog file {file} is past 4 GiB (position {pos}): the binlog v4 position \
+             field cannot address it. Rotate the binlog (FLUSH BINARY LOGS), keep \
+             transactions under max_binlog_size, and re-bootstrap the table."
+        ))
+    })
+}
+
 /// A rows event's 6-byte table id. The event split guarantees only the
 /// header, so a body under 6 bytes indexed out of bounds (P2, T1).
 fn rows_table_id(body: &[u8]) -> Result<u64> {
@@ -72,7 +85,10 @@ pub(crate) async fn master_position(
             .fetch_one(pool)
             .await
         {
-            Ok(r) => return Ok((r.0, r.1 as u32)),
+            Ok(r) => {
+                let pos = pos_u32(&r.0, r.1)?;
+                return Ok((r.0, pos));
+            }
             Err(e) => {
                 let msg = e.to_string();
                 if !msg.contains("You have an error in your SQL syntax") {
@@ -1395,6 +1411,14 @@ mod truncate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2: a position past 4 GiB is refused, not wrapped.
+    #[test]
+    fn a_position_past_u32_is_refused() {
+        assert_eq!(pos_u32("binlog.000001", 5).unwrap(), 5);
+        let e = pos_u32("binlog.000001", (1 << 32) | 5).unwrap_err().to_string();
+        assert!(e.contains("4 GiB") && e.contains("binlog.000001"), "{e}");
+    }
 
     /// P2/T1: a rows body under its 6-byte table id is an error, not a panic.
     #[test]
