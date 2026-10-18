@@ -836,6 +836,24 @@ fn readonly_hint(body: &str) -> &'static str {
     }
 }
 
+/// How long `SYSTEM SYNC REPLICA ON CLUSTER` may wait, in seconds. An ON
+/// CLUSTER statement gives up at `distributed_ddl_task_timeout` (180 s by
+/// default) and SYNC REPLICA at `receive_timeout`: a staging table whose
+/// replicas needed longer to fetch failed the finalize on every run (P2).
+/// `APITAP_CH_SYNC_TIMEOUT_S`, default 3600.
+fn sync_timeout_s() -> String {
+    std::env::var("APITAP_CH_SYNC_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3600)
+        .to_string()
+}
+
+fn sync_replica_settings(secs: &str) -> [(&'static str, &str); 2] {
+    [("distributed_ddl_task_timeout", secs), ("receive_timeout", secs)]
+}
+
 /// One scalar from a `FORMAT TabSeparatedRaw` answer: the value as stored,
 /// minus the row's newline. The watermark reads ran with the default
 /// (escaped) TabSeparated and `.trim()`: a String cursor holding `\` or a
@@ -997,13 +1015,20 @@ impl ChSink {
     /// depend on that being true. No-op off a cluster.
     async fn sync_cluster_replicas(&self) -> Result<()> {
         if let Some(cl) = &self.ddl.on_cluster {
+            let secs = sync_timeout_s();
+            let settings = sync_replica_settings(&secs);
             self.ch
-                .exec(&format!(
-                    "SYSTEM SYNC REPLICA ON CLUSTER {} {}",
-                    ch_ident(cl),
-                    self.staging_t
-                ))
-                .await?;
+                .exec_with(
+                    &format!("SYSTEM SYNC REPLICA ON CLUSTER {} {}", ch_ident(cl), self.staging_t),
+                    &settings,
+                )
+                .await
+                .map_err(|e| {
+                    Error::Transfer(format!(
+                        "{e} (replicas get {secs} s to fetch the staging parts; \
+                         APITAP_CH_SYNC_TIMEOUT_S raises it)"
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -2625,6 +2650,15 @@ impl Loader for ChLoader {
 
 #[cfg(test)]
 mod tests {
+    /// P2: the cluster-wide replica sync waits as long as the knob says.
+    #[test]
+    fn replica_sync_waits_past_the_ddl_default() {
+        let s = super::sync_replica_settings("3600");
+        assert!(s.contains(&("distributed_ddl_task_timeout", "3600")));
+        assert!(s.contains(&("receive_timeout", "3600")));
+        assert_eq!(super::sync_timeout_s(), "3600");
+    }
+
     /// P2: a raw-TSV scalar is the stored value, minus the row newline only.
     #[test]
     fn raw_scalar_keeps_backslashes_and_spaces() {
