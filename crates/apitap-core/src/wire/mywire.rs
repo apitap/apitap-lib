@@ -860,6 +860,14 @@ impl MyWire {
     /// and then immediately overwritten), and the limit guarantees we can
     /// never consume bytes of the next packet's header.
     async fn read_packet_owned(&mut self) -> Result<bytes::Bytes> {
+        // One event is also bounded by the transaction cap: 1 GiB is far
+        // past what a 256 MB process survives, so a large LONGBLOB row was
+        // an OOM kill, not the refusal below (P2).
+        self.read_packet_capped(MAX_PAYLOAD.min(crate::logbased::drain::tx_buf_limit()))
+            .await
+    }
+
+    async fn read_packet_capped(&mut self, cap: usize) -> Result<bytes::Bytes> {
         use bytes::BufMut;
         let mut out = bytes::BytesMut::new();
         loop {
@@ -871,8 +879,14 @@ impl MyWire {
             }
             self.seq = self.seq.wrapping_add(1);
             let need = out.len() + len;
-            if need > MAX_PAYLOAD {
-                return Err(desync("payload past max_allowed_packet"));
+            if need > cap {
+                return Err(Error::Transfer(format!(
+                    "mysql binlog: one event is past {} MiB (APITAP_TX_BUF_BYTES, at most \
+                     max_allowed_packet's 1 GiB) and this process would run out of memory \
+                     holding it. Shrink the row on the source, or raise APITAP_TX_BUF_BYTES \
+                     if the process has that much memory. The watermark is untouched.",
+                    cap >> 20
+                )));
             }
             out.reserve(len);
             while out.len() < need {
@@ -957,6 +971,36 @@ impl MyWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn over(io: tokio::io::DuplexStream) -> MyWire {
+        let (r, w) = tokio::io::split(Box::new(io) as IoBox);
+        MyWire {
+            rd: BufReader::new(r),
+            wr: BufWriter::new(w),
+            seq: 0,
+            buf: Vec::new(),
+            deprecate_eof: true,
+        }
+    }
+
+    /// P2: a binlog payload past the cap is refused at the header that
+    /// crosses it, before its body is buffered; one under it assembles.
+    #[tokio::test]
+    async fn a_binlog_payload_past_the_cap_is_refused_before_it_is_buffered() {
+        use tokio::io::AsyncWriteExt;
+        let (mut peer, ours) = tokio::io::duplex(1 << 16);
+        let mut w = over(ours);
+        // A 16 MB continuation header: nothing behind it is ever read.
+        peer.write_all(&[0xFF, 0xFF, 0xFF, 0]).await.unwrap();
+        drop(peer); // an uncapped reader would fail on EOF, not hang
+        let e = w.read_packet_capped(1 << 20).await.unwrap_err().to_string();
+        assert!(e.contains("APITAP_TX_BUF_BYTES"), "{e}");
+
+        let (mut peer, ours) = tokio::io::duplex(1 << 16);
+        let mut w = over(ours);
+        peer.write_all(&[3, 0, 0, 0, b'a', b'b', b'c']).await.unwrap();
+        assert_eq!(&w.read_packet_capped(1 << 20).await.unwrap()[..], b"abc");
+    }
 
     /// Live binlog-protocol probe — the layout questions the manuals leave
     /// fuzzy (checksum on the FDE and on artificial events, heartbeat
