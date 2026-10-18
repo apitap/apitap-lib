@@ -481,7 +481,13 @@ fn set_keepalive(tcp: &TcpStream) {
         let idle: libc::c_int = 30;
         let intvl: libc::c_int = 10;
         let cnt: libc::c_int = 3;
-        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle);
+        // macOS names the idle option TCP_KEEPALIVE; TCP_KEEPIDLE does not
+        // exist there and the crate did not compile on a Mac (P2).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const KEEPIDLE: libc::c_int = libc::TCP_KEEPALIVE;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        const KEEPIDLE: libc::c_int = libc::TCP_KEEPIDLE;
+        set(libc::IPPROTO_TCP, KEEPIDLE, &idle);
         set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &intvl);
         set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, &cnt);
     }
