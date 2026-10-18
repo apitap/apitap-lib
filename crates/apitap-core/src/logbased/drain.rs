@@ -42,7 +42,7 @@ pub(crate) fn silence_budget() -> std::time::Duration {
 /// 2026-10-07, G0.1). `APITAP_TX_BUF_BYTES` raises or lowers it.
 const TX_BUF_LIMIT: usize = 256 << 20;
 
-fn tx_buf_limit() -> usize {
+pub(crate) fn tx_buf_limit() -> usize {
     std::env::var("APITAP_TX_BUF_BYTES")
         .ok()
         .and_then(|v| crate::logbased::run::parse_size(&v))
@@ -51,10 +51,10 @@ fn tx_buf_limit() -> usize {
         .unwrap_or(TX_BUF_LIMIT)
 }
 
-fn tx_too_big(table: &str, bytes: usize, limit: usize) -> Error {
+pub(crate) fn tx_too_big(table: &str, bytes: usize, limit: usize) -> Error {
     Error::Transfer(format!(
         "log_based: one transaction's changes for {table} have buffered {} MiB \
-         (APITAP_TX_BUF_BYTES = {} MiB) — Postgres ships a transaction whole, so it \
+         (APITAP_TX_BUF_BYTES = {} MiB) — the source ships a transaction whole, so it \
          cannot land in parts, and continuing would OOM. Split the write on the \
          source, or raise APITAP_TX_BUF_BYTES (bytes, or a K/M/G suffix) if this \
          process really has that much memory. The watermark is untouched: the next run re-reads the transaction.",

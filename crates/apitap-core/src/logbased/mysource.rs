@@ -520,6 +520,13 @@ pub(crate) async fn drain_binlog(
     let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
     let mut end_mark = start;
     let mut buf_bytes = 0usize;
+    // The open transaction's bytes, capped like the Postgres lane's
+    // (APITAP_TX_BUF_BYTES): the window budget is only checked at a commit,
+    // so one big transaction buffered without bound and a 2 GB UPDATE was
+    // OOM-killed, re-run from the same watermark, and killed again (P1-3).
+    // It restarts whenever tx_buf is empty — every clear and drain empties it.
+    let tx_limit = crate::logbased::drain::tx_buf_limit();
+    let mut tx_bytes = 0usize;
     let mut hit_budget = false;
 
     loop {
@@ -706,6 +713,10 @@ pub(crate) async fn drain_binlog(
                 };
                 let q = format!("{}.{}", map.db, map.table);
                 let ev = bl::parse_rows(body, t, &map)?;
+                if tx_buf.is_empty() {
+                    tx_bytes = 0;
+                }
+                let before = buf_bytes;
                 for msg in bl::to_messages(&mut sess.st, t, ev)? {
                     match msg {
                         // The layout came from the TABLE_MAP; bodies are built
@@ -733,6 +744,10 @@ pub(crate) async fn drain_binlog(
                         }
                         _ => {}
                     }
+                }
+                tx_bytes += buf_bytes - before;
+                if tx_bytes > tx_limit {
+                    return Err(crate::logbased::drain::tx_too_big(&q, tx_bytes, tx_limit));
                 }
             }
             bl::TYPE_QUERY => {
