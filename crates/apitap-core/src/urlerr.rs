@@ -61,14 +61,18 @@ pub(crate) fn sanitized(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (s, r),
         // No `://` at all — the shape is wrong long before the password is.
+        // Shown only up to the first `:@/?#` (and 12 characters): twelve
+        // characters of `alice:hunter2@db/app` printed half the password
+        // into the logs (P2).
         None => {
-            let end = url
+            let head = url.split([':', '@', '/', '?', '#']).next().unwrap_or("");
+            let end = head
                 .char_indices()
                 .map(|(i, c)| i + c.len_utf8())
                 .take(12)
                 .last()
                 .unwrap_or(0);
-            return format!("{}…", &url[..end]);
+            return format!("{}… (no scheme://)", &head[..end]);
         }
     };
     let (userinfo, hostport) = split_authority(rest);
@@ -254,6 +258,14 @@ mod tests {
     fn a_colon_in_the_password_is_not_blamed() {
         let m = err("mysql://u:a:b@c@h/db");
         assert!(m.contains("'@'") && !m.contains("':'"), "{m}");
+    }
+
+    /// P2: a URL without a scheme shows no part of its password.
+    #[test]
+    fn a_schemeless_url_shows_no_password() {
+        let s = sanitized("alice:hunter2@db:5432/app");
+        assert!(!s.contains("hunt"), "{s}");
+        assert_eq!(s, "alice… (no scheme://)");
     }
 
     /// …and it names the character that did it.
