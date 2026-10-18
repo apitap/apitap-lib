@@ -873,11 +873,7 @@ async fn run_group(
         .connect(&src_pool_url)
         .await
         .map_err(|e| {
-            let hint = if crate::dialect::postgres::url_is_local(&src_pool_url) {
-                String::new()
-            } else {
-                format!(" — {}", crate::dialect::postgres::tls_required_hint(&src_pool_url))
-            };
+            let hint = crate::dialect::postgres::tls_hint_for(src_url).unwrap_or_default();
             Error::Transfer(format!("log_based: source connect: {e}{hint}"))
         })?;
 

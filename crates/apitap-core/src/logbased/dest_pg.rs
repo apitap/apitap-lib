@@ -504,22 +504,16 @@ mod store {
         pub(crate) async fn connect(url: &str) -> Result<Self> {
             // TLS by default off-loopback (review P0-3); explicit modes
             // honoured. The closure runs twice, so the String clones per call.
+            let hint = crate::dialect::postgres::tls_hint_for(url).unwrap_or_default();
             let url = crate::dialect::postgres::secure_url(url);
             let connect = |n: u32| {
-                let url = url.clone();
+                let (url, hint) = (url.clone(), hint.clone());
                 async move {
                     PgPoolOptions::new()
                         .max_connections(n)
                         .connect(&url)
                         .await
-                        .map_err(|e| {
-                            let hint = if crate::dialect::postgres::url_is_local(&url) {
-                                String::new()
-                            } else {
-                                format!(" — {}", crate::dialect::postgres::tls_required_hint(&url))
-                            };
-                            Error::Transfer(format!("log_based: dest connect: {e}{hint}"))
-                        })
+                        .map_err(|e| Error::Transfer(format!("log_based: dest connect: {e}{hint}")))
                 }
             };
             Ok(Self {

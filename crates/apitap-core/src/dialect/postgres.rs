@@ -88,15 +88,19 @@ pub(crate) fn secure_url(url: &str) -> String {
 /// already-prefixed error a second time ("connect: connect: …").
 pub(crate) fn connect_error(what: &str, user_url: &str, e: impl std::fmt::Display) -> crate::error::Error {
     let base = crate::urlerr::connect_err(what, user_url, e);
-    if url_is_local(user_url) {
-        return base;
+    match (base, tls_hint_for(user_url)) {
+        (crate::error::Error::Connect(m), Some(h)) => crate::error::Error::Connect(format!("{m}{h}")),
+        (other, _) => other,
     }
-    match base {
-        crate::error::Error::Connect(m) => {
-            crate::error::Error::Connect(format!("{m} — {}", tls_required_hint(user_url)))
-        }
-        other => other,
-    }
+}
+
+/// The TLS hint, only when apitap DEFAULTED the TLS mode on the URL the user
+/// wrote. It was added to every connect error off loopback: a URL that said
+/// `sslmode=disable` and got a wrong password was told it needs
+/// sslmode=disable (P2). `secure_url` leaves an explicit mode and a set
+/// PGSSLMODE alone, so "it changed the URL" is exactly "TLS was defaulted".
+pub(crate) fn tls_hint_for(user_url: &str) -> Option<String> {
+    (secure_url(user_url) != user_url).then(|| format!(" — {}", tls_required_hint(user_url)))
 }
 
 /// The error a plaintext-only (or private-CA) server gets once TLS is the
@@ -136,6 +140,18 @@ pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2: the TLS hint only when apitap chose the TLS mode itself.
+    #[test]
+    fn the_tls_hint_is_only_for_a_defaulted_mode() {
+        let _g = env_guard();
+        std::env::remove_var("PGSSLMODE");
+        let explicit = connect_error("x", "postgres://u:p@prod.example/db?sslmode=disable", "password authentication failed");
+        assert!(!explicit.to_string().contains("requires TLS"), "{explicit}");
+        let defaulted = connect_error("x", "postgres://u:p@prod.example/db", "tls handshake eof");
+        assert!(defaulted.to_string().contains("requires TLS"), "{defaulted}");
+        assert!(tls_hint_for("postgres://u@127.0.0.1/db").is_none());
+    }
 
     use super::env_guard;
 
