@@ -989,7 +989,11 @@ where
             let started = std::time::Instant::now();
             let source_id = source_identity(src_url, &job.table);
             crate::progress::set_label(&job.table);
-            let out = async {
+            // Caught per table: a panic in one table's probe or prepare
+            // unwound through run_many and DROPPED every sibling mid-flight,
+            // so their discard never ran and their staging stayed, `locked`
+            // for every later run. It is now that table's error (P2).
+            let out = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
                 let sink = make_sink(job.table.clone()).await?;
                 run(
                     src,
@@ -1004,8 +1008,9 @@ where
                     &source_id,
                 )
                 .await
-            }
-            .await;
+            }))
+            .await
+            .unwrap_or_else(|p| Err(Error::Transfer(format!("panicked: {}", crate::pipe::panic_text(&*p)))));
 
             crate::progress::table_done();
             match out {
