@@ -631,9 +631,6 @@ async fn apply_unit(
     // line per window. Off by default; a couple of `Instant::now()` when on.
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let t0 = std::time::Instant::now();
-    let mut t_trunc = std::time::Duration::ZERO;
-    let mut t_clear = std::time::Duration::ZERO;
-    let mut t_ins = std::time::Duration::ZERO;
     // Before the window's first DDL: a table that turned Replicated mid-run.
     u.refuse_clustered(dest_table).await?;
     let Some(w) = w else {
@@ -665,7 +662,7 @@ async fn apply_unit(
     if c.truncate {
         u.clear_owned(dest_table).await?;
     }
-    t_trunc = t0.elapsed();
+    let t_trunc = t0.elapsed();
 
     // Clear the delete-set ∪ every upsert key first, so the insert phase is a
     // plain bulk INSERT (same move as the pg apply). The keys go through a
@@ -710,7 +707,7 @@ async fn apply_unit(
         };
         u.delete_owned(dest_table, &pred).await?;
     }
-    t_clear = t0.elapsed();
+    let t_clear = t0.elapsed();
 
     if insert_only {
         let ver = id.end();
@@ -803,7 +800,7 @@ async fn apply_unit(
             }
         }
     }
-    t_ins = t0.elapsed();
+    let t_ins = t0.elapsed();
 
     // Residue tail: serial, ordered. Masked TOAST updates read the missing
     // columns back from the destination, then delete + reinsert the patched
