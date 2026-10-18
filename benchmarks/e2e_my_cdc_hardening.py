@@ -55,6 +55,13 @@ def ch_wipe(t):
         ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table = '{t}' SETTINGS mutations_sync = 1")
 
 
+def state_rows(t):
+    # Every state row of the table, sorted: there is more than one, and an
+    # unordered first row made the comparison flip between runs.
+    return ch(f"SELECT arrayStringConcat(arraySort(groupArray(concat(mode, '=', watermark))), ',') "
+              f"FROM _apitap_state FINAL WHERE dest_table = '{t}'")
+
+
 def tagged():
     name, port = "apitap-qa-my84-gtid", 18312
     url = f"mysql://root:bench@127.0.0.1:{port}/bench"
@@ -113,13 +120,15 @@ def txcap():
               f"INSERT INTO {t} WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 1000) "
               f"SELECT x, REPEAT('a', 200) FROM g")
         apitap.transfer(MY, CH, table=t, mode="log_based")
-        before = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table = '{t}'")
+        before = state_rows(t)
         mysql("apitap-bench-my", f"UPDATE {t} SET v = REPEAT('b', 200)")       # ~800 KB in one transaction
         code = f"import apitap\napitap.transfer({MY!r}, {CH!r}, table={t!r}, mode='log_based')\n"
         r = sh([sys.executable, "-c", code], env=dict(os.environ, APITAP_TX_BUF_BYTES="256K"))
         assert r.returncode != 0 and "one transaction" in r.stderr and t in r.stderr, \
-            f"a transaction past the cap must be refused naming the table:\n{r.stderr[-500:]}"
-        after = ch(f"SELECT watermark FROM _apitap_state FINAL WHERE dest_table = '{t}'")
+            (f"a transaction past the cap must be refused naming the table (exit {r.returncode}, "
+             f"watermark before {before}, now {state_rows(t)}):"
+             f"\n{r.stderr[-1500:]}")
+        after = state_rows(t)
         assert after == before, f"the watermark must stay: {before} -> {after}"
         r = sh([sys.executable, "-c", code])
         assert r.returncode == 0, r.stderr[-500:]
