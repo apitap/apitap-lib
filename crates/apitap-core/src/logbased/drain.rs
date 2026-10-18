@@ -308,7 +308,12 @@ pub(crate) async fn drain(
                     // window may still be in flight — start_lsn would lie).
                     ws.standby_status(*applied.borrow(), false).await?;
                 }
-                if wal_end >= stop_line && tx_buf.is_empty() && sess.streams.is_empty() {
+                // Between stream blocks, not "no stream open": a streamed
+                // transaction left open on the source (a batch job, an idle
+                // session) kept `streams` non-empty, and the one-shot idled
+                // to the window deadline (an hour by default). Postgres
+                // re-streams it whole once it commits (P2).
+                if wal_end >= stop_line && tx_buf.is_empty() && in_stream.is_none() {
                     // Follow floor (design §14.2): the per-window DELETE cost
                     // is ~constant, so sealing every caught-up delta kept
                     // windows at ~4k changes and follow at 36k/s. Keep THIS
