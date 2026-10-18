@@ -108,6 +108,60 @@ fn push_hex(raw: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// ryu's output (sign stripped) as its significant digits — trailing zeros
+/// trimmed, "0" for zero — written into `buf`, and the decimal exponent of
+/// the FIRST digit. On bytes, into a stack buffer: the String version cost
+/// one to three heap allocations per float cell on the binary CDC path (P2,
+/// P-j). ryu writes at most 24 characters; its scientific mantissa is d[.ddd].
+fn normalize(s: &str, buf: &mut [u8; 32]) -> (usize, i32) {
+    let b = s.as_bytes();
+    let mut n = 0usize;
+    let mut push = |c: u8, n: &mut usize| {
+        if *n < buf.len() {
+            buf[*n] = c;
+            *n += 1;
+        }
+    };
+    let (mant, exp) = match b.iter().position(|&c| c == b'e' || c == b'E') {
+        Some(i) => (&b[..i], Some(s[i + 1..].parse::<i32>().unwrap_or(0))),
+        None => (b, None),
+    };
+    let dot = mant.iter().position(|&c| c == b'.');
+    let (int, frac) = match dot {
+        Some(i) => (&mant[..i], &mant[i + 1..]),
+        None => (mant, &mant[mant.len()..]),
+    };
+    let exp10 = match exp {
+        Some(e) => {
+            for &c in int.iter().chain(frac) {
+                push(c, &mut n);
+            }
+            e
+        }
+        None if int == b"0" => {
+            let lead = frac.iter().take_while(|&&c| c == b'0').count();
+            for &c in &frac[lead..] {
+                push(c, &mut n);
+            }
+            if n == 0 { 0 } else { -(lead as i32) - 1 }
+        }
+        None => {
+            for &c in int.iter().chain(frac) {
+                push(c, &mut n);
+            }
+            int.len() as i32 - 1
+        }
+    };
+    while n > 0 && buf[n - 1] == b'0' {
+        n -= 1;
+    }
+    if n == 0 {
+        buf[0] = b'0';
+        return (1, if exp.is_some() { exp10 } else { 0 });
+    }
+    (n, exp10)
+}
+
 /// float4/float8 the way PG's shortest_dec.c prints them: shortest
 /// round-trip digits (Ryu — the same algorithm PG ports), then PG's OWN
 /// notation rule, probed against a live 16.x server: scientific iff the
@@ -132,36 +186,9 @@ fn push_float(v: f64, single: bool, out: &mut Vec<u8>) {
         Some(r) => (true, r),
         None => (false, s),
     };
-    // Normalize ryu's output to (significant digits, decimal exponent of the
-    // FIRST digit). ryu scientific mantissa is always d[.ddd].
-    let (digits, exp10): (String, i32) = match s.split_once(['e', 'E']) {
-        Some((m, e)) => {
-            let exp: i32 = e.parse().unwrap_or(0);
-            (m.replace('.', ""), exp)
-        }
-        None => match s.split_once('.') {
-            Some((int, frac)) => {
-                if int == "0" {
-                    let lead = frac.len() - frac.trim_start_matches('0').len();
-                    let sig = frac.trim_start_matches('0');
-                    if sig.is_empty() {
-                        ("0".into(), 0) // 0.0
-                    } else {
-                        (sig.to_string(), -(lead as i32) - 1)
-                    }
-                } else {
-                    (format!("{int}{frac}"), int.len() as i32 - 1)
-                }
-            }
-            None => (s.to_string(), s.len() as i32 - 1),
-        },
-    };
-    let digits = {
-        // Shortest form has no significant trailing zeros; anything trailing
-        // here is positional (e.g. "100.0" → "100") and re-derivable.
-        let t = digits.trim_end_matches('0');
-        if t.is_empty() { "0" } else { t }
-    };
+    let mut buf = [0u8; 32];
+    let (n, exp10) = normalize(s, &mut buf);
+    let digits = std::str::from_utf8(&buf[..n]).unwrap_or("0");
     if neg {
         out.push(b'-'); // PG prints "-0" for negative zero
     }
@@ -469,6 +496,69 @@ mod tests {
         assert_eq!(r(23, &123456i32.to_be_bytes()), "123456");
         assert_eq!(r(20, &i64::MIN.to_be_bytes()), "-9223372036854775808");
         assert_eq!(r(26, &4000000000u32.to_be_bytes()), "4000000000");
+    }
+
+    /// The String normalization `normalize` replaced, kept as the reference.
+    fn normalize_ref(s: &str) -> (String, i32) {
+        let (digits, exp10): (String, i32) = match s.split_once(['e', 'E']) {
+            Some((m, e)) => {
+                let exp: i32 = e.parse().unwrap_or(0);
+                (m.replace('.', ""), exp)
+            }
+            None => match s.split_once('.') {
+                Some((int, frac)) => {
+                    if int == "0" {
+                        let lead = frac.len() - frac.trim_start_matches('0').len();
+                        let sig = frac.trim_start_matches('0');
+                        if sig.is_empty() {
+                            ("0".into(), 0) // 0.0
+                        } else {
+                            (sig.to_string(), -(lead as i32) - 1)
+                        }
+                    } else {
+                        (format!("{int}{frac}"), int.len() as i32 - 1)
+                    }
+                }
+                None => (s.to_string(), s.len() as i32 - 1),
+            },
+        };
+        let digits = {
+            // Shortest form has no significant trailing zeros; anything trailing
+            // here is positional (e.g. "100.0" → "100") and re-derivable.
+            let t = digits.trim_end_matches('0');
+            if t.is_empty() { "0" } else { t }
+        };
+        (digits.to_string(), exp10)
+    }
+
+    /// P2/P-j: the byte normalization equals the String one it replaced, over
+    /// 20 000 random float bit patterns and the edge values.
+    #[test]
+    fn float_normalization_matches_the_string_version() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut check = |s: &str| {
+            let mut buf = [0u8; 32];
+            let (n, e) = super::normalize(s, &mut buf);
+            let (want, we) = normalize_ref(s);
+            assert_eq!((std::str::from_utf8(&buf[..n]).unwrap(), e), (want.as_str(), we), "{s}");
+        };
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let d = f64::from_bits(x);
+            let f = f32::from_bits(x as u32);
+            let mut b = ryu::Buffer::new();
+            if d.is_finite() {
+                check(b.format_finite(d.abs()));
+            }
+            if f.is_finite() {
+                check(b.format_finite(f.abs()));
+            }
+        }
+        for v in [0.0f64, 1.0, 100.0, 1e14, 1e15, 0.0001, 1e-5, 5e-324, 1.79e308, 123.456] {
+            check(ryu::Buffer::new().format_finite(v));
+        }
     }
 
     #[test]
