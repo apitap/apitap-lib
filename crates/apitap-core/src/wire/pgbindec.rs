@@ -111,8 +111,9 @@ fn push_hex(raw: &[u8], out: &mut Vec<u8>) {
 /// float4/float8 the way PG's shortest_dec.c prints them: shortest
 /// round-trip digits (Ryu — the same algorithm PG ports), then PG's OWN
 /// notation rule, probed against a live 16.x server: scientific iff the
-/// decimal exponent is >= 15 or < -4 (`1e14` prints fixed, `1e+15` and
-/// `1e-05` scientific, `0.0001` fixed), exponent always signed with two
+/// decimal exponent is >= 15 (float4: >= 6) or < -4 (`1e14` prints fixed,
+/// `1e+15` and `1e-05` scientific, `0.0001` fixed; float4 `100000` fixed,
+/// `1e+06` scientific), exponent always signed with two
 /// digits minimum, no trailing `.0` on whole values. Ryu-the-crate has its
 /// own (different) fixed range, so its output is renormalized from digits +
 /// exponent rather than trusted.
@@ -168,7 +169,8 @@ fn push_float(v: f64, single: bool, out: &mut Vec<u8>) {
         out.push(b'0');
         return;
     }
-    if (-4..15).contains(&exp10) {
+    // float4out goes scientific from 1e6, float8out from 1e15.
+    if (-4..if single { 6 } else { 15 }).contains(&exp10) {
         // Fixed notation.
         if exp10 < 0 {
             out.extend_from_slice(b"0.");
@@ -471,6 +473,12 @@ mod tests {
         assert_eq!(r(701, &f64::NAN.to_be_bytes()), "NaN");
         assert_eq!(r(701, &f64::INFINITY.to_be_bytes()), "Infinity");
         assert_eq!(r(700, &1.25f32.to_be_bytes()), "1.25");
+        // float4out switches at 1e6, not 1e15 (probed: 100000, 1e+06).
+        assert_eq!(r(700, &100000f32.to_be_bytes()), "100000");
+        assert_eq!(r(700, &99999.99f32.to_be_bytes()), "99999.99");
+        assert_eq!(r(700, &1e6f32.to_be_bytes()), "1e+06");
+        assert_eq!(r(700, &1234567f32.to_be_bytes()), "1.234567e+06");
+        assert_eq!(r(700, &1e-5f32.to_be_bytes()), "1e-05");
         // The notation boundary, probed on a live PG 16: fixed through 1e14
         // and 0.0001, scientific from 1e+15 and 1e-05.
         assert_eq!(r(701, &1e14f64.to_be_bytes()), "100000000000000");
