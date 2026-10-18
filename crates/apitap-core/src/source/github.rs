@@ -175,12 +175,26 @@ impl GithubSource {
         r
     }
 
+    /// One GET, retrying a transport error, a 5xx or a 429 (honouring
+    /// Retry-After), as the github+api source and the object stores do. It
+    /// was one attempt: a transient raw.githubusercontent 503 failed the run
+    /// (P2). Every request here is a GET, so a retry repeats nothing.
     async fn send(&self, url: String, what: &str) -> Result<reqwest::Response> {
-        let resp = self
-            .req(url)
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("github {what}: {e}")))?;
+        let mut attempt = 0u32;
+        let resp = loop {
+            attempt += 1;
+            match self.req(url.clone()).send().await {
+                Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
+                    let wait = crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER));
+                    tokio::time::sleep(wait).await;
+                }
+                Ok(r) => break r,
+                Err(_) if attempt < crate::http::STORE_ATTEMPTS => {
+                    tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
+                }
+                Err(e) => return Err(Error::Transfer(format!("github {what}: {e}"))),
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             let hint = match (status.as_u16(), self.token.is_some()) {
