@@ -637,6 +637,15 @@ impl ParquetEncoder {
         }
         self.buf = buf;
         res?;
+        // Bytes past the trailer were appended and never parsed: rows after
+        // a stray mid-stream trailer vanished, and the row count agreed with
+        // the loss (P2). No producer sends them; refuse if one ever does.
+        if self.finished && self.pos < self.buf.len() {
+            return Err(Error::Transfer(format!(
+                "pg binary COPY: {} bytes after the trailer",
+                self.buf.len() - self.pos
+            )));
+        }
         Ok(rows)
     }
 
@@ -938,6 +947,20 @@ mod tests {
         }
         s.extend_from_slice(&(-1i16).to_be_bytes());
         s
+    }
+
+    /// P2: a tuple after the trailer is an error, not a silently dropped row.
+    #[test]
+    fn bytes_after_the_trailer_are_refused() {
+        let names = vec!["id".into()];
+        let delivered = vec![Delivered::Int { bytes: 8, unsigned: false }];
+        let mut enc = ParquetEncoder::new(names, delivered, None, RowGroup::Mib24).unwrap();
+        let row = |v: i64| vec![Some(v.to_be_bytes().to_vec())];
+        let mut stream = copy_stream(&[row(1), row(2)]);
+        stream.extend_from_slice(&1i16.to_be_bytes());
+        stream.extend_from_slice(&field(&3i64.to_be_bytes()));
+        let e = enc.push(&stream).unwrap_err().to_string();
+        assert!(e.contains("after the trailer"), "{e}");
     }
 
     #[test]
