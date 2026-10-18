@@ -433,6 +433,31 @@ fn summary_written_rows(h: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// Plain HTTP to a host that is not loopback: every statement carries the
+/// password in cleartext (basic auth), and nothing said so — Postgres and
+/// MySQL default to TLS off loopback (P2). A warning, not a refusal: plain
+/// HTTP behind a cluster's load balancer is a working deployment today.
+fn plaintext_remote(url: &str, https: bool) -> bool {
+    !https && !crate::dialect::mysql::host_is_loopback(url)
+}
+
+fn warn_plaintext_once(host: &str) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let fresh = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut s| s.insert(host.to_string()))
+        .unwrap_or(false);
+    if fresh {
+        crate::progress::warn(&format!(
+            "clickhouse: {host} is reached over plain HTTP, so the password and every row \
+             travel unencrypted — use clickhouse+https:// (port 8443) unless this network \
+             is trusted"
+        ));
+    }
+}
+
 impl ChConn {
     pub(crate) fn parse(url: &str) -> Result<Self> {
         let u = reqwest::Url::parse(url)
@@ -443,6 +468,9 @@ impl ChConn {
             .ok_or_else(|| Error::InvalidInput("clickhouse url: missing host".into()))?;
         let port = u.port().unwrap_or(if https { 8443 } else { 8123 });
         let database = u.path().trim_start_matches('/').to_string();
+        if plaintext_remote(url, https) {
+            warn_plaintext_once(host);
+        }
         Ok(Self {
             base: format!("{}://{host}:{port}/", if https { "https" } else { "http" }),
             user: if u.username().is_empty() {
@@ -2657,6 +2685,15 @@ mod tests {
         assert!(s.contains(&("distributed_ddl_task_timeout", "3600")));
         assert!(s.contains(&("receive_timeout", "3600")));
         assert_eq!(super::sync_timeout_s(), "3600");
+    }
+
+    /// P2: plain HTTP off loopback is flagged; loopback and https are not.
+    #[test]
+    fn plaintext_to_a_remote_host_is_flagged() {
+        assert!(super::plaintext_remote("clickhouse://u:p@10.0.0.5:8123/d", false));
+        assert!(!super::plaintext_remote("clickhouse://u:p@127.0.0.1:8123/d", false));
+        assert!(!super::plaintext_remote("clickhouse://u:p@localhost:8123/d", false));
+        assert!(!super::plaintext_remote("clickhouse+https://u:p@10.0.0.5:8443/d", true));
     }
 
     /// P2: a raw-TSV scalar is the stored value, minus the row newline only.
