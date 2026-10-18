@@ -165,8 +165,12 @@ impl ChDest {
     ) -> Result<()> {
         self.memo.forget(dest_table, source_id);
         // The rebuild below EXCHANGEs the destination table itself — on a
-        // cluster that would swap it on ONE node. Refused first.
+        // cluster that would swap it on ONE node. Refused first, and strictly:
+        // APITAP_CH_CDC_ALLOW_REPLICATED lets the APPLY ride a fixed node, but
+        // the rebuild would still swap the user's Replicated table for a
+        // node-local MergeTree there (P2).
         u.refuse_clustered(dest_table).await?;
+        u.refuse_replicated_rebuild(dest_table).await?;
         u.drop_legacy_scratch(dest_table).await?;
         // Already a changelog (a re-bootstrap of a table we own)? Leave it.
         //
@@ -1094,7 +1098,7 @@ fn rb_types_for(
 }
 
 mod store {
-    use super::{ch_engine_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, JOURNAL, PENDING, STATE_CURSOR};
+    use super::{ch_engine_ok, ch_rebuild_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, JOURNAL, PENDING, STATE_CURSOR};
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark};
@@ -1531,6 +1535,19 @@ mod store {
         /// table diverges exactly the same way with no options passed at all.
         /// Memoized per table once the table has been SEEN: a table that does
         /// not exist yet passes, and is asked again by the first state write.
+        /// The changelog rebuild's own check: a Replicated destination is
+        /// refused whatever APITAP_CH_CDC_ALLOW_REPLICATED says.
+        pub(super) async fn refuse_replicated_rebuild(&self, dest_table: &str) -> Result<()> {
+            let eng = self
+                .ch
+                .read(&format!(
+                    "SELECT engine FROM system.tables WHERE database = currentDatabase() AND name = '{t}'",
+                    t = ch_str(dest_table),
+                ))
+                .await?;
+            ch_rebuild_ok(dest_table, eng.trim())
+        }
+
         pub(super) async fn refuse_clustered(&self, dest_table: &str) -> Result<()> {
             let key = format!("\u{1}cluster\u{1}{dest_table}");
             if self.ensured.lock().unwrap().contains(&key) {
@@ -1810,6 +1827,10 @@ mod store {
 
         pub(crate) async fn refuse_clustered(&self, dest_table: &str) -> Result<()> {
             self.s.refuse_clustered(dest_table).await
+        }
+
+        pub(crate) async fn refuse_replicated_rebuild(&self, dest_table: &str) -> Result<()> {
+            self.s.refuse_replicated_rebuild(dest_table).await
         }
 
         pub(crate) async fn columns(&self, table: &str) -> Result<Vec<(String, String)>> {
@@ -2366,6 +2387,22 @@ fn ch_partition_expr(spec: Option<&str>) -> String {
 /// An empty string — the table does not exist yet — passes. So does
 /// ClickHouse Cloud's `Shared*` family: there the whole service shares one
 /// catalog, so a node-local CREATE is visible from every node.
+/// The changelog rebuild (CREATE .. AS SELECT, then EXCHANGE) on a
+/// Replicated table would swap it, on the dialled node only, for a
+/// node-local MergeTree — refused with no escape hatch.
+fn ch_rebuild_ok(dest_table: &str, engine: &str) -> Result<()> {
+    if engine.starts_with("Replicated") {
+        return Err(Error::InvalidInput(format!(
+            "log_based: changelog=True into ClickHouse {dest_table} ({engine}): the changelog \
+             bootstrap rebuilds the table and EXCHANGEs it, which on a cluster swaps it on ONE \
+             node for a node-local MergeTree. Not allowed for a Replicated table, \
+             APITAP_CH_CDC_ALLOW_REPLICATED or not: write the changelog to a plain \
+             MergeTree destination"
+        )));
+    }
+    Ok(())
+}
+
 fn ch_engine_ok(dest_table: &str, engine: &str) -> Result<()> {
     if !engine.starts_with("Replicated") {
         return Ok(());
@@ -2608,7 +2645,7 @@ mod tests {
         assert_eq!(String::from_utf8(buf).unwrap(), "a\tb\t4242\t1\n");
     }
 
-    use super::{ch_engine_ok, ch_partition_expr, cl_nullable};
+    use super::{ch_engine_ok, ch_partition_expr, ch_rebuild_ok, cl_nullable};
     use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, reuse_cached, structure};
     use super::*;
     use crate::lease::{owned_margin_secs, ttl_secs, Fence, LeaseStore};
@@ -3117,6 +3154,17 @@ mod tests {
         assert!(ch_engine_ok("orders", "SharedMergeTree").is_ok());
         // No table yet: nothing to diverge from, the bootstrap decides.
         assert!(ch_engine_ok("orders", "").is_ok());
+    }
+
+    /// P2: the changelog rebuild never runs on a Replicated table, whatever
+    /// the escape hatch says.
+    #[test]
+    fn a_changelog_rebuild_refuses_replicated_even_with_the_escape_hatch() {
+        // ch_rebuild_ok reads no environment: the hatch cannot reach it.
+        let e = ch_rebuild_ok("orders", "ReplicatedMergeTree").unwrap_err().to_string();
+        assert!(e.contains("EXCHANGE") && e.contains("APITAP_CH_CDC_ALLOW_REPLICATED"), "{e}");
+        assert!(ch_rebuild_ok("orders", "MergeTree").is_ok());
+        assert!(ch_rebuild_ok("orders", "").is_ok());
     }
 
     #[test]
