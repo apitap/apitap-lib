@@ -184,6 +184,14 @@ impl<S: Socket + ?Sized> Socket for Box<S> {
     }
 }
 
+#[cfg(feature = "_rt-tokio")]
+fn set_keepalive(stream: &tokio::net::TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&ka);
+}
+
 pub async fn connect_tcp<Ws: WithSocket>(
     host: &str,
     port: u16,
@@ -198,6 +206,11 @@ pub async fn connect_tcp<Ws: WithSocket>(
 
         let stream = TcpStream::connect((host, port)).await?;
         stream.set_nodelay(true)?;
+        // apitap: a half-open pool socket (NAT rebind, a silent middlebox)
+        // parked a COPY read forever — a bulk run that never finished and
+        // never failed. Keepalive probes after 60 s, every 10 s, as the
+        // walsender's and the MySQL raw plane's sockets do (P2-13).
+        set_keepalive(&stream);
 
         return Ok(with_socket.with_socket(stream).await);
     }

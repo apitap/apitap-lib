@@ -16,7 +16,9 @@ Four P2 findings (docs/review/2026-10-18-p2-triage.md), PG16 :5544 / :5545 / CH 
             looked for the full name, never found it, and re-bootstrapped.
 Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale|longname
 """
+import os
 import subprocess
+import time
 import sys
 
 import apitap
@@ -152,6 +154,41 @@ def longname():
         src(f"DROP TABLE IF EXISTS {t}")
         dst(f"DROP TABLE IF EXISTS {long[:63]}")
         dst_state_wipe(long)
+
+
+def keepalive():
+    import threading
+    t = "pg_keepalive_v"
+    src(f"DROP VIEW IF EXISTS {t}")
+    dst(f"DROP TABLE IF EXISTS {t}")
+    try:
+        # A slow source (about 8 s): the connections stay open while we look.
+        src(f"CREATE VIEW {t} AS SELECT g AS id, (SELECT 1 FROM pg_sleep(0.002 + g * 0)) AS s FROM generate_series(1, 4000) g")
+        err = []
+        th = threading.Thread(target=lambda: _try(lambda: apitap.transfer(PG, DST, table=t, mode="replace"), err))
+        th.start()
+        time.sleep(3)
+        me = os.getpid()
+        ss = sh(["ss", "-tnoip", "state", "established"]).stdout
+        ours = [line for line in ss.splitlines()
+                if f"pid={me}," in line and (":5544 " in line or ":5545 " in line)]
+        th.join()
+        assert not err, err
+        assert ours, f"no connection of this process to Postgres found:\n{ss[:600]}"
+        timed = [line for line in ours if "timer:(keepalive" in line]
+        assert len(timed) == len(ours), \
+            f"every pool socket must carry a keepalive timer ({len(timed)} of {len(ours)}):\n" + "\n".join(ours[:4])
+        print(f"  {len(ours)} pool socket(s) mid-run, each with timer:(keepalive,...)")
+    finally:
+        src(f"DROP VIEW IF EXISTS {t}")
+        dst(f"DROP TABLE IF EXISTS {t}")
+
+
+def _try(f, err):
+    try:
+        f()
+    except Exception as e:  # noqa: BLE001
+        err.append(str(e))
 
 
 if __name__ == "__main__":
