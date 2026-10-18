@@ -913,6 +913,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 fn decode_decimal(r: &mut R<'_>, precision: u32, scale: u32) -> Result<Vec<u8>> {
     const DIG_PER: u32 = 9;
     const BYTES_FOR: [usize; 10] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
+    // Metadata a server writes has 1 <= precision <= 65, scale <= 30 and
+    // scale <= precision; anything else (corrupt or misaligned metadata)
+    // underflowed here or indexed an empty value below (P2-10).
+    if precision == 0 || precision > 65 || scale > 30 || scale > precision {
+        return Err(bad(&format!("NEWDECIMAL({precision},{scale}) metadata")));
+    }
     let int_digits = precision - scale;
     let (int_full, int_rest) = (int_digits / DIG_PER, int_digits % DIG_PER);
     let (frac_full, frac_rest) = (scale / DIG_PER, scale % DIG_PER);
@@ -1237,6 +1243,16 @@ pub(crate) const TYPE_TX_PAYLOAD: u8 = EV_TRANSACTION_PAYLOAD;
 
 #[cfg(test)]
 mod tests {
+    /// P2-10: NEWDECIMAL metadata no server writes (scale past precision,
+    /// precision 0) is refused, not an underflow or an empty-value index.
+    #[test]
+    fn impossible_decimal_metadata_is_refused() {
+        assert!(super::decode_decimal(&mut super::R::new(&[0x80]), 2, 5).is_err());
+        assert!(super::decode_decimal(&mut super::R::new(&[]), 0, 0).is_err());
+        assert!(super::decode_decimal(&mut super::R::new(&[0x80; 40]), 66, 0).is_err());
+        assert_eq!(super::decode_decimal(&mut super::R::new(&[0x81]), 1, 0).unwrap(), b"1");
+    }
+
     /// MASTER M-3 + M-36: stripped BINARY values are re-padded to the
     /// declared length (a CHAR with the same bytes is not), and the legacy
     /// TIMESTAMP encoding is refused with the rebuild hint.
