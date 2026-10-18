@@ -220,7 +220,7 @@ impl Source for PgSource {
         .bind(&t)
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| Error::InvalidInput(format!("probing primary key of {table}: {e}")))?;
         let pk_cols: Vec<String> = pk.iter().map(|r| r.get::<String, _>("name")).collect();
         let int_pk_name: Option<String> = if pk.len() == 1 {
             let name: String = pk[0].get("name");
