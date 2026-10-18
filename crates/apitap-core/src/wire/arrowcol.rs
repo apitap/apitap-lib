@@ -1017,8 +1017,27 @@ impl BatchBuilder {
         Ok(())
     }
 
+    /// Arrow `utf8` must be valid UTF-8, and nothing on the way checked it: a
+    /// SQL_ASCII database's text (or binary carried as text) reached pyarrow
+    /// and polars, which assume validity (P2). Once per sealed buffer.
+    fn check_utf8(&self) -> Result<()> {
+        for (i, c) in self.cols.iter().enumerate() {
+            if let ColB::Utf8 { d, .. } = c {
+                if let Err(e) = std::str::from_utf8(d) {
+                    return Err(Error::Transfer(format!(
+                        "column {} (0-based) holds text that is not valid UTF-8 ({e}); Arrow \
+                         text must be — cast it to bytea on the source, or fix the encoding",
+                        i
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn seal(&mut self) -> Result<ArrowBatch> {
         self.check_offsets()?;
+        self.check_utf8()?;
         let rows = self.rows;
         self.rows = 0;
         self.rows_sealed += rows as u64;
@@ -1608,6 +1627,20 @@ mod tests {
     fn a_staging_offset_past_u32_is_refused() {
         assert_eq!(super::stage_off(7).unwrap(), 7);
         assert!(super::stage_off(1 << 32).is_err());
+    }
+
+    /// P2: invalid UTF-8 in a text column is refused at seal.
+    #[test]
+    fn invalid_utf8_text_is_refused() {
+        let mut b = BatchBuilder::new(vec![ArrowKind::Utf8], usize::MAX >> 1);
+        b.append_cell(0, CellVal::Str(&[0xff, 0xfe]));
+        b.row_done();
+        let e = b.finish().expect_err("must reject").to_string();
+        assert!(e.contains("not valid UTF-8"), "{e}");
+        let mut b = BatchBuilder::new(vec![ArrowKind::Utf8], usize::MAX >> 1);
+        b.append_cell(0, CellVal::Str("añ".as_bytes()));
+        b.row_done();
+        assert!(b.finish().unwrap().is_some());
     }
 
     /// A varlen column past i32 offsets must ERROR, never seal. The
