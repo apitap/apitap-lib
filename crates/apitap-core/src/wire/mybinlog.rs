@@ -330,9 +330,6 @@ fn bit(bm: &[u8], i: usize) -> bool {
     bm.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0)
 }
 
-/// One row image: `present` says which columns the image carries; absent
-/// columns become `UnchangedToast` (the arm every apply path already
-/// treats as "do not touch"), matching MINIMAL/NOBLOB row images.
 /// The catalog's `DATA_TYPE` mapped to the binlog TABLE_MAP type byte —
 /// `(type byte, real type when the byte is folded 0xFE)` — or `None` for a
 /// type without a reliable mapping, which the schema-position check skips
@@ -388,6 +385,9 @@ pub(crate) fn event_real_type(c: &ColDef) -> u8 {
     }
 }
 
+/// One row image: `present` says which columns the image carries; absent
+/// columns become `UnchangedToast` (the arm every apply path already
+/// treats as "do not touch"), matching MINIMAL/NOBLOB row images.
 fn read_row(r: &mut R<'_>, cols: &[ColDef], present: &[u8], ncols: usize) -> Result<Tuple> {
     let n_present = (0..ncols).filter(|&i| bit(present, i)).count();
     let nullbm = r.take((n_present + 7) / 8)?.to_vec();

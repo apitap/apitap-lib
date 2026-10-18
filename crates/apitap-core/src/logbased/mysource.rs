@@ -523,12 +523,6 @@ async fn layout_for(sess: &mut MySession, pool: &sqlx::MySqlPool, q: &str) -> Re
     Ok(l)
 }
 
-/// One drain window off a live binlog stream.
-///
-/// Mirrors `logbased::drain::drain`: buffer a transaction's ops, flush them
-/// into per-table collapsers at XID (the commit boundary), stop only at a
-/// commit — at the stop-line, the byte budget, or the wall clock.
-#[allow(clippy::too_many_arguments)]
 /// How often the stream asks the server for a heartbeat. Mirrored into
 /// `binlog_dump`'s argument by `myrun`, and used here to reason about silence.
 pub(crate) const HEARTBEAT_SECS: u64 = 5;
@@ -539,6 +533,12 @@ pub(crate) const HEARTBEAT_SECS: u64 = 5;
 /// in seconds instead of hanging until someone notices.
 const EVENT_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(HEARTBEAT_SECS * 6);
 
+/// One drain window off a live binlog stream.
+///
+/// Mirrors `logbased::drain::drain`: buffer a transaction's ops, flush them
+/// into per-table collapsers at XID (the commit boundary), stop only at a
+/// commit — at the stop-line, the byte budget, or the wall clock.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn drain_binlog(
     w: &mut MyWire,
     pool: &sqlx::MySqlPool,
@@ -990,19 +990,6 @@ fn cells_bytes(row: &Tuple) -> usize {
         + 48
 }
 
-/// Apply one transaction's buffered ops to whichever accumulator this run uses.
-///
-/// Extracted so the XID commit boundary and the TRUNCATE one cannot drift: a
-/// `TRUNCATE` is DDL and auto-commits, so it is its own boundary and never
-/// reaches an XID event. The first draft of the truncate fix pushed onto
-/// `tx_buf` and relied on XID to drain it, which meant the record sat in the
-/// buffer until the NEXT ordinary transaction committed — or was cleared by the
-/// next `BEGIN`, losing it again.
-///
-/// A table's first op of the window builds its body with the table's layout,
-/// whatever the op is. Until 0.57.0 the replica body was built by the first
-/// ROWS event, so an op arriving before one — a TRUNCATE — found no body and
-/// was skipped (`continue`), or was parked and wiped at the window's end into
 /// Charsets whose bytes are UTF-8 (or a strict subset), so a binlog string can
 /// be stored as text as-is. `utf8` is utf8mb3's alias.
 fn charset_is_utf8_compatible(cs: &str) -> bool {
@@ -1024,6 +1011,19 @@ fn non_utf8_string_columns<'a>(
     .collect()
 }
 
+/// Apply one transaction's buffered ops to whichever accumulator this run uses.
+///
+/// Extracted so the XID commit boundary and the TRUNCATE one cannot drift: a
+/// `TRUNCATE` is DDL and auto-commits, so it is its own boundary and never
+/// reaches an XID event. The first draft of the truncate fix pushed onto
+/// `tx_buf` and relied on XID to drain it, which meant the record sat in the
+/// buffer until the NEXT ordinary transaction committed — or was cleared by the
+/// next `BEGIN`, losing it again.
+///
+/// A table's first op of the window builds its body with the table's layout,
+/// whatever the op is. Until 0.57.0 the replica body was built by the first
+/// ROWS event, so an op arriving before one — a TRUNCATE — found no body and
+/// was skipped (`continue`), or was parked and wiped at the window's end into
 /// a body with no layout that every apply refused. An op with no layout at all
 /// is a broken decoder invariant (a map is registered only with its layout,
 /// and the TRUNCATE arm resolves one first), and is an error, never a skip.
