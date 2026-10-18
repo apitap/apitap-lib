@@ -90,8 +90,10 @@ pub(crate) fn sanitized(url: &str) -> String {
 }
 
 /// Characters that end or redirect the authority when they are not
-/// percent-encoded. A password holding any of them is the usual cause.
-const RESERVED: [char; 7] = [':', '/', '?', '#', '[', ']', '@'];
+/// percent-encoded. A password holding any of them is the usual cause. Not
+/// `:` — userinfo allows it after the user/password separator (RFC 3986),
+/// and blaming it pointed away from the real offender (P2).
+const RESERVED: [char; 6] = ['/', '?', '#', '[', ']', '@'];
 
 /// Build the error for a URL apitap could not parse.
 ///
@@ -245,6 +247,13 @@ mod tests {
             sanitized("mysql://root:p@ssw0rd@db.internal:3307/bench"),
             "mysql://root:<8 chars, hidden>@db.internal:3307"
         );
+    }
+
+    /// P2: a password's `:` is not blamed; the real offender still is.
+    #[test]
+    fn a_colon_in_the_password_is_not_blamed() {
+        let m = err("mysql://u:a:b@c@h/db");
+        assert!(m.contains("'@'") && !m.contains("':'"), "{m}");
     }
 
     /// …and it names the character that did it.
