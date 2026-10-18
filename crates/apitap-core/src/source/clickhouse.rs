@@ -27,9 +27,6 @@ use crate::source::spans;
 
 pub(crate) struct ChSource {
     conn: ChConn,
-    /// Engine of the table probed last — the span planner needs it (see the
-    /// module note on non-plain MergeTree engines).
-    engine: std::sync::Mutex<String>,
 }
 
 /// Quote an identifier the ClickHouse way. Inside backtick-quoting the
@@ -298,7 +295,6 @@ impl ChSource {
         conn.exec("SELECT 1").await?;
         Ok(Self {
             conn,
-            engine: std::sync::Mutex::new(String::new()),
         })
     }
 
@@ -360,9 +356,8 @@ impl crate::source::Source for ChSource {
             ))
             .await?;
         let mut mf = meta.trim().split('\t');
-        let engine = mf.next().unwrap_or_default().to_string();
+        let _engine = mf.next();
         let sorting_key = mf.next().unwrap_or_default().to_string();
-        *self.engine.lock().unwrap() = engine;
 
         // Cursor = the first sorting-key column when it is a non-nullable
         // integer. That is the only split that prunes granules; see span_stmts.
@@ -522,7 +517,22 @@ impl crate::source::Source for ChSource {
             format!("SELECT {select_list} FROM {src} WHERE {pred} FORMAT RowBinary")
         };
 
-        let engine = self.engine.lock().unwrap().clone();
+        // This table's own engine, asked here. It was the engine of the table
+        // probed LAST, kept on the shared source: a multi-table run plans
+        // tables concurrently, so a ReplacingMergeTree could read a
+        // neighbour's "MergeTree" and be split into spans that are not one
+        // snapshot — rows duplicated or lost under a merge (P2).
+        let (db, name, _) = qualify(&self.database(), table);
+        let engine = self
+            .conn
+            .exec(&format!(
+                "SELECT engine FROM system.tables WHERE database = {} AND name = {} FORMAT TSV",
+                lit(&db),
+                lit(&name)
+            ))
+            .await?
+            .trim()
+            .to_string();
         // Only a plain MergeTree gives every span the same row multiset. On the
         // collapsing family a merge between two span requests rewrites rows, so
         // N snapshots disagree — one span, one snapshot.
