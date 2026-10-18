@@ -842,6 +842,20 @@ fn cur_prop_for(source_id: &str) -> String {
     format!("apitap.watermark-cursor.{source_id}")
 }
 
+/// A parquet footer of `flen` bytes (+ 8 for its length and magic) must fit
+/// in `have` bytes: the manifest's file size, then the bytes actually read.
+/// Both come from outside (a manifest, a remote footer); a mismatch wrapped
+/// `size - flen - 8` or underflowed the slice and panicked (P2, T3).
+fn footer_fits(path: &str, have: u64, flen: u64) -> Result<()> {
+    if flen.checked_add(8).is_some_and(|need| need <= have) {
+        Ok(())
+    } else {
+        Err(Error::Transfer(format!(
+            "iceberg: {path}: parquet footer of {flen} bytes past the {have} bytes there"
+        )))
+    }
+}
+
 /// A new snapshot's timestamp: now, but never before the table's last update.
 /// Iceberg-Java catalogs refuse a snapshot log that goes back more than a
 /// minute, so a writer whose clock ran behind the previous one had every
@@ -951,9 +965,11 @@ impl IcebergSink {
         }
         let flen =
             u32::from_le_bytes(tail[tail.len() - 8..tail.len() - 4].try_into().unwrap()) as u64;
+        footer_fits(path, size, flen)?;
         if flen + 8 > tail_len {
             tail = s3.get_range(&key, size - flen - 8, flen + 8).await?;
         }
+        footer_fits(path, tail.len() as u64, flen)?;
         let meta_slice = &tail[tail.len() - 8 - flen as usize..tail.len() - 8];
         let md = ParquetMetaDataReader::decode_metadata(meta_slice)
             .map_err(|e| Error::Transfer(format!("iceberg: {path} footer: {e}")))?;
@@ -2432,6 +2448,15 @@ impl crate::sink::Loader for IcebergLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2/T3: a footer that claims more than is there is an error.
+    #[test]
+    fn a_footer_past_the_file_is_an_error() {
+        assert!(super::footer_fits("f", 100, 50).is_ok());
+        assert!(super::footer_fits("f", 100, 200).is_err());
+        assert!(super::footer_fits("f", 50, 60).is_err());
+        assert!(super::footer_fits("f", 100, u64::MAX).is_err());
+    }
 
     /// A 5xx/408/429 commit answer is AMBIGUOUS, not a failure: the request
     /// may have landed, and the caller's failure path sweeps the run's data
