@@ -1114,12 +1114,7 @@ async fn run_group_mysql(
         ));
     }
     let pool = myrun::control_pool(src_url).await?;
-    let default_db = src_url
-        .rsplit('/')
-        .next()
-        .and_then(|s| s.split('?').next())
-        .unwrap_or("")
-        .to_string();
+    let default_db = url_database(src_url);
     let single = tables.len() == 1;
     let ctxs = myrun::resolve(&pool, &default_db, tables, single, opts).await?;
 
@@ -2376,6 +2371,16 @@ async fn apply_member_pending(
 /// Where the source's WAL ends, in SQL. `pg_current_wal_lsn()` errors on a
 /// hot standby ("recovery is in progress"), and Postgres 16 decodes logically
 /// from one; there the replayed end is the end (P2).
+/// The database a mysql:// URL names: its path, as parse_my_url reads it.
+/// It was the text after the URL's LAST '/', so a query value holding a path
+/// (`?ssl-ca=/etc/ssl/ca.pem`) made the default database "ca.pem" and every
+/// unqualified table "ca.pem.t ... not found".
+fn url_database(src_url: &str) -> String {
+    reqwest::Url::parse(src_url)
+        .map(|u| u.path().trim_matches('/').to_string())
+        .unwrap_or_default()
+}
+
 /// The source's WAL end now, for the follow loops. Bounded: a server that
 /// accepted the query and then stalled parked the follow forever, with no
 /// slot confirmations sent meanwhile (P2, T19).
@@ -2787,6 +2792,14 @@ fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A query value holding a path is not the database.
+    #[test]
+    fn the_url_database_is_its_path() {
+        assert_eq!(super::url_database("mysql://u:p@h:3306/bench?ssl-ca=/etc/ssl/ca.pem"), "bench");
+        assert_eq!(super::url_database("mysql://u:p@h/bench"), "bench");
+        assert_eq!(super::url_database("mysql://u:p@h"), "");
+    }
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
