@@ -53,6 +53,12 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// exits once its generation is not the current one.
 static GEN: AtomicU64 = AtomicU64::new(0);
 
+/// Reporters alive. The CDC bootstrap runs a reported transfer INSIDE a
+/// reported log_based run; the inner one reset the counters and its end
+/// stopped the outer's reporter — no live progress after the first
+/// bootstrap (P2). Only the outermost reporter starts and stops.
+static DEPTH: AtomicU64 = AtomicU64::new(0);
+
 /// One gauge field. A value that parses as a FINITE number is written as
 /// one; "NaN" and "inf" parse as f64 too, and unquoted they are not JSON.
 fn json_field(k: &str, v: &str) -> String {
@@ -319,6 +325,10 @@ impl Reporter {
     /// Begin reporting. `tables` is 0 for a single-table run.
     pub(crate) fn start(table: &str, unit: Unit, est_rows: i64, tables: usize) -> Option<Self> {
         let fmt = env_choice()?;
+        if DEPTH.load(Relaxed) > 0 {
+            return None; // nested inside a reported run: the outer one reports
+        }
+        DEPTH.fetch_add(1, Relaxed);
         // A second transfer in the same process starts from zero.
         ROWS.store(0, Relaxed);
         BYTES.store(0, Relaxed);
@@ -403,10 +413,12 @@ impl Reporter {
 
 impl Drop for Reporter {
     fn drop(&mut self) {
-        // finish() consumes self, so reaching Drop means the transfer unwound
-        // early. Stop the thread; the error itself is the caller's to report.
+        // Every reporter ends here (finish() consumes self, then drops it); a
+        // drop without finish means the transfer unwound early. Stop the
+        // thread; the error itself is the caller's to report.
         RUNNING.store(false, Relaxed);
         ON.store(false, Relaxed);
+        DEPTH.fetch_sub(1, Relaxed);
     }
 }
 
@@ -652,6 +664,22 @@ mod tests {
         let nan: serde_json::Value = serde_json::from_str(&format!("{{{}}}", json_field("r", "NaN"))).unwrap();
         assert_eq!(nan["r"], "NaN");
         assert_eq!(json_field("r", "12.5"), "\"r\":12.5");
+    }
+
+    /// P2: a reporter inside a reported run leaves the outer one running.
+    #[test]
+    fn a_nested_reporter_leaves_the_outer_running() {
+        let _g = exclusive();
+        std::env::set_var("APITAP_PROGRESS", "json");
+        let outer = Reporter::start("t", Unit::Rows, -1, 0).expect("outer");
+        assert!(Reporter::start("t", Unit::Rows, -1, 0).is_none(), "the inner does not start");
+        assert!(is_on());
+        drop(outer);
+        assert!(!is_on());
+        let again = Reporter::start("t", Unit::Rows, -1, 0);
+        assert!(again.is_some(), "a later run reports again");
+        drop(again);
+        std::env::remove_var("APITAP_PROGRESS");
     }
 
     #[test]
