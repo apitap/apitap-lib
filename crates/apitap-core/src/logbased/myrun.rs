@@ -152,7 +152,22 @@ pub(crate) async fn control_pool(src_url: &str) -> Result<MySqlPool> {
         .await
         // Diagnosed against the user's URL, like the bulk lane's connect: the
         // reserved-character and auth-plugin hints apply here too (M-42).
-        .map_err(|e| crate::urlerr::connect_err("log_based: mysql source connect", src_url, e))
+        .map_err(|e| with_tls_hint(crate::urlerr::connect_err("log_based: mysql source connect", src_url, e), src_url))
+}
+
+/// The TLS-default hint the bulk lanes give, when apitap chose the TLS mode
+/// itself: the log_based connects said only "server offers none", without
+/// naming the ssl-mode=disabled opt-out (P2, R3-16).
+fn with_tls_hint(e: Error, src_url: &str) -> Error {
+    if crate::dialect::mysql::secure_url(src_url) == src_url {
+        return e;
+    }
+    let hint = crate::dialect::mysql::tls_required_hint(src_url);
+    match e {
+        Error::Connect(m) => Error::Connect(format!("{m} — {hint}")),
+        Error::Transfer(m) => Error::Transfer(format!("{m} — {hint}")),
+        other => other,
+    }
 }
 
 /// First run: capture the coordinate, then full-load every member.
@@ -273,8 +288,9 @@ pub(crate) async fn drain_windows(
 
     // The raw binlog plane gets the same default (review P0-4): mywire's
     // own default is PREFERRED{explicit:false}, a silent downgrade.
-    let mut w =
-        MyWire::connect(&crate::dialect::mysql::secure_url(src_url)).await?;
+    let mut w = MyWire::connect(&crate::dialect::mysql::secure_url(src_url))
+        .await
+        .map_err(|e| with_tls_hint(e, src_url))?;
     // The binlog connection must be on the server the pool read the schema,
     // the positions and the bootstrap from. Behind a load balancer or a
     // Galera VIP each connection may land on a different node, whose binlog
@@ -392,6 +408,17 @@ pub(crate) async fn drain_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2/R3-16: a defaulted TLS mode's failure names the opt-out; an
+    /// explicit mode's does not get the hint.
+    #[test]
+    fn a_defaulted_tls_failure_names_the_opt_out() {
+        let e = || Error::Connect("mysql wire: ssl-mode requires TLS but the server offers none".into());
+        let m = with_tls_hint(e(), "mysql://u:p@db.example/x").to_string();
+        assert!(m.contains("ssl-mode=disabled"), "{m}");
+        let m = with_tls_hint(e(), "mysql://u:p@db.example/x?ssl-mode=required").to_string();
+        assert!(!m.contains("ssl-mode=disabled"), "{m}");
+    }
 
     #[test]
     fn replica_ids_are_unique_grouped_and_high() {
