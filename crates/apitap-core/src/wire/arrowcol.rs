@@ -97,6 +97,14 @@ fn bad(what: &str) -> Error {
     Error::Transfer(format!("pg binary COPY: unexpected {what}"))
 }
 
+/// A field's offset in the staging window, as the u32 the stage keeps. `as`
+/// wrapped past 4 GiB to a smaller, still in-bounds offset: the wrong bytes,
+/// decoded silently (P2).
+#[inline]
+fn stage_off(o: usize) -> Result<u32> {
+    u32::try_from(o).map_err(|_| bad("staging window past 4 GiB"))
+}
+
 /// Append the bit for `row` (LSB-first). Rows arrive in order, so a fresh
 /// byte is needed exactly when `row % 8 == 0`.
 fn push_bit(bm: &mut Vec<u8>, row: usize, on: bool) {
@@ -666,7 +674,7 @@ impl BatchBuilder {
                     if data.len() - o < len as usize {
                         return Ok((pos, StageStop::Incomplete));
                     }
-                    self.st_off[c * ST_K + k] = o as u32;
+                    self.st_off[c * ST_K + k] = stage_off(o)?;
                     self.st_len[c * ST_K + k] = len;
                     o += len as usize;
                 }
@@ -748,7 +756,7 @@ impl BatchBuilder {
                             StageStopF::Straddle
                         }));
                     }
-                    self.st_off[c * ST_K + k] = o as u32;
+                    self.st_off[c * ST_K + k] = stage_off(o)?;
                     self.st_len[c * ST_K + k] = len;
                     o += len as usize;
                 }
@@ -1593,6 +1601,13 @@ mod tests {
                 _ => panic!("layout"),
             }
         }
+    }
+
+    /// P2: a staging offset past u32 is refused, not wrapped.
+    #[test]
+    fn a_staging_offset_past_u32_is_refused() {
+        assert_eq!(super::stage_off(7).unwrap(), 7);
+        assert!(super::stage_off(1 << 32).is_err());
     }
 
     /// A varlen column past i32 offsets must ERROR, never seal. The
