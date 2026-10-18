@@ -25,6 +25,16 @@ use crate::wire::pgoutput::{Cell, Tuple};
 use sqlx::Row as _;
 use std::collections::HashMap;
 
+/// The refetch transaction's session, as the walsender pins its own at
+/// startup (TimeZone, DateStyle, IntervalStyle, extra_float_digits). Only the
+/// time zone was pinned: an `ALTER ROLE .. SET IntervalStyle = 'iso_8601'`
+/// made a refetched interval[] read `{P1D}` where the WAL ships `{"1 day"}`
+/// (P2). Startup parameters override role settings on the walsender; here
+/// only these do.
+const REFETCH_PINS: &str = "SELECT set_config('TimeZone', 'UTC', true), \
+     set_config('DateStyle', 'ISO', true), set_config('IntervalStyle', 'postgres', true), \
+     set_config('extra_float_digits', '3', true)";
+
 /// One key's final state after replaying the residue tail over the set-phase
 /// upserts (insertion order preserved — collapse.rs's map+vec move).
 #[derive(Debug)]
@@ -240,10 +250,11 @@ impl Source<'_> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        // One tx pins the session UTC so timestamptz::text matches the WAL's
-        // +00-suffixed rendering (SET LOCAL dies with the tx).
+        // One tx pins the session the way the walsender's startup pins its
+        // own, so each refetched ::text matches what the WAL would have
+        // shipped (set_config(.., true) dies with the tx).
         let mut tx = self.0.begin().await.map_err(db_err)?;
-        sqlx::query("SET LOCAL TimeZone = 'UTC'")
+        sqlx::query(REFETCH_PINS)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
