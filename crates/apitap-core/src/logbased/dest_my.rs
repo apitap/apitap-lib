@@ -192,6 +192,9 @@ async fn apply_unit(
 
     // Residue tail: serial, ordered.
     for op in &c.residue {
+        // The row a zero-match must not hide (P2): affected rows on MySQL
+        // count CHANGED rows, so the check is a probe, not the count.
+        let mut must_find: Option<(&'static str, &crate::logbased::collapse::Key)> = None;
         let sql = match op {
             ResidueOp::MaskedUpdate { key, row } => {
                 let sets = wal_cols
@@ -208,6 +211,7 @@ async fn apply_unit(
                 if sets.is_empty() {
                     continue;
                 }
+                must_find = Some(("masked", key));
                 format!(
                     "UPDATE {ft} SET {sets} WHERE {}",
                     key_pred(pk_cols, key, &pk_oids)?
@@ -240,7 +244,8 @@ async fn apply_unit(
             ResidueOp::Delete { key } => {
                 format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key, &pk_oids)?)
             }
-            ResidueOp::Rekey { old_key, row, .. } => {
+            ResidueOp::Rekey { old_key, new_key, row } => {
+                must_find = Some(("move", new_key));
                 // Move the row rather than delete-and-reinsert: the columns
                 // this UPDATE does not name keep their values, and the
                 // TOASTed cell the source did not resend is one of them.
@@ -269,6 +274,12 @@ async fn apply_unit(
             }
         };
         u.exec(&sql, "residue").await?;
+        if let Some((kind, key)) = must_find {
+            let probe = format!("SELECT 1 FROM {ft} WHERE {} LIMIT 1", key_pred(pk_cols, key, &pk_oids)?);
+            if !u.exists(&probe, "residue probe").await? {
+                return Err(crate::logbased::dest_pg::missing_row(dest_table, kind, key));
+            }
+        }
     }
 
     Ok((c.events, set(c.events)))
@@ -439,6 +450,13 @@ mod store {
         pub(crate) async fn exec(&mut self, sql: &str, what: &'static str) -> Result<()> {
             self.begin().await?;
             self.conn().query_drop(sql).await.map_err(my_err(what))
+        }
+
+        /// Whether `sql` (a `SELECT 1 .. LIMIT 1`) finds a row, in the
+        /// fenced transaction.
+        pub(crate) async fn exists(&mut self, sql: &str, what: &'static str) -> Result<bool> {
+            self.begin().await?;
+            self.conn().query_first::<u8, _>(sql).await.map(|r| r.is_some()).map_err(my_err(what))
         }
 
         /// LOAD DATA LOCAL of `body` inside the fenced transaction; `sql_of`

@@ -336,6 +336,9 @@ async fn apply_unit(
     // `casts` above).
     for op in &c.residue {
         let mut binds: Vec<Option<String>> = Vec::new();
+        // What a zero-row answer means for this op: a masked update must
+        // find its row, a move must find its new key (P2, below).
+        let mut must_match: Option<(&'static str, &crate::logbased::collapse::Key)> = None;
         let sql = match op {
             ResidueOp::MaskedUpdate { key, row } => {
                 let sets = wal_cols
@@ -359,6 +362,7 @@ async fn apply_unit(
                     continue;
                 }
                 let pred = key_pred_bound(pk_cols, key, &casts, &key_hex, &mut binds);
+                must_match = Some(("masked", key));
                 format!("UPDATE {ft} SET {sets} WHERE {pred}")
             }
             ResidueOp::Upsert { row } => {
@@ -391,7 +395,8 @@ async fn apply_unit(
                 let pred = key_pred_bound(pk_cols, key, &casts, &key_hex, &mut binds);
                 format!("DELETE FROM {ft} WHERE {pred}")
             }
-            ResidueOp::Rekey { old_key, row, .. } => {
+            ResidueOp::Rekey { old_key, new_key, row } => {
+                must_match = Some(("move", new_key));
                 // Move the row rather than delete-and-reinsert. The columns
                 // this UPDATE does not name keep their values, and the one
                 // that matters here — the TOASTed cell the source did not
@@ -430,10 +435,42 @@ async fn apply_unit(
         for b in &binds {
             q = q.bind(b.as_deref());
         }
-        q.execute(&mut **tx).await.map_err(db_err)?;
+        let n = q.execute(&mut **tx).await.map_err(db_err)?.rows_affected();
+        // A masked update or a TOAST-carrying move that matched nothing left
+        // the destination without the row — and nothing can rebuild its
+        // unsent TOAST value — while the window committed (P2). CH and BQ
+        // refuse it; so does this lane now. A move that matches nothing on a
+        // REPLAY is fine: its new key is already there.
+        if let (0, Some((kind, key))) = (n, must_match) {
+            let mut kb: Vec<Option<String>> = Vec::new();
+            let pred = key_pred_bound(pk_cols, key, &casts, &key_hex, &mut kb);
+            let found = if kind == "move" {
+                let probe_sql = format!("SELECT 1 FROM {ft} WHERE {pred}");
+                let mut probe = sqlx::query(&probe_sql);
+                for b in &kb {
+                    probe = probe.bind(b.as_deref());
+                }
+                probe.fetch_optional(&mut **tx).await.map_err(db_err)?.is_some()
+            } else {
+                false
+            };
+            if !found {
+                return Err(missing_row(dest_table, kind, key));
+            }
+        }
     }
 
     Ok((c.events, set(c.events)))
+}
+
+/// A residue op whose row is not at the destination: refused, naming it.
+pub(crate) fn missing_row(dest_table: &str, kind: &str, key: &crate::logbased::collapse::Key) -> Error {
+    let k = key.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>().join(", ");
+    Error::Transfer(format!(
+        "log_based: the {kind} update of {dest_table} key ({k}) found no row at the \
+         destination — it was deleted or never arrived there, and its unchanged TOAST \
+         value cannot be rebuilt from the WAL. Re-bootstrap the table (or restore the row)"
+    ))
 }
 
 /// Everything that holds a connection. See the module doc.
