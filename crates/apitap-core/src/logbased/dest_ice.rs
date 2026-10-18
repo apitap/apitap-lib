@@ -341,7 +341,17 @@ mod store {
         /// are still unclaimed and stops the run over any it does not hear back,
         /// so an unguarded store answers with every one — never with nothing.
         opened: std::sync::Mutex<HashMap<String, Vec<String>>>,
+        /// When each (table, source) last had its watermark stamped while it
+        /// had no traffic — see `close_unit`.
+        idle_stamped: std::sync::Mutex<HashMap<(String, String), std::time::Instant>>,
     }
+
+    /// How often an idle member's watermark property is re-stamped. Every
+    /// window wrote one before: a catalog commit (a new metadata.json and two
+    /// round trips) per idle table per window, growing its metadata log for
+    /// nothing (P2, R2-24b). A skipped stamp is safe: a window that carried no
+    /// change for the table replays nothing for it on resume.
+    const IDLE_STAMP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// A table conformed against a window's column layout: what the apply body
     /// encodes with. Only the unit can commit to it.
@@ -432,7 +442,7 @@ mod store {
 
     impl IceStore {
         pub(crate) async fn connect(url: &str) -> Result<Self> {
-            Ok(Self { conn: IcebergConn::parse(url).await?, opened: Default::default() })
+            Ok(Self { conn: IcebergConn::parse(url).await?, opened: Default::default(), idle_stamped: Default::default() })
         }
 
         pub(crate) async fn read_state(
@@ -504,8 +514,24 @@ mod store {
                         // destination's: the body only rendered the window.
                         bound.cdc_commit(&source_id, pk_idx, CdcWindow { end_lsn: lsn, ..window }).await?
                     }
-                    Watermark::Set { table, source_id, lsn, .. } => {
-                        cdc_set_watermark(&self.conn, bare(&table), &source_id, lsn).await?
+                    Watermark::Set { table, source_id, lsn, rows } => {
+                        let key = (table.clone(), source_id.clone());
+                        let due = rows > 0
+                            || self
+                                .idle_stamped
+                                .lock()
+                                .expect("idle stamps")
+                                .get(&key)
+                                .is_none_or(|at| at.elapsed() >= IDLE_STAMP_EVERY);
+                        if due {
+                            cdc_set_watermark(&self.conn, bare(&table), &source_id, lsn).await?;
+                            let mut stamped = self.idle_stamped.lock().expect("idle stamps");
+                            if rows > 0 {
+                                stamped.remove(&key);
+                            } else {
+                                stamped.insert(key, std::time::Instant::now());
+                            }
+                        }
                     }
                     Watermark::Clear { table, source_id } => {
                         cdc_clear_watermark(&self.conn, bare(&table), &source_id).await?
