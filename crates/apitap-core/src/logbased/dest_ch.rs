@@ -1381,8 +1381,8 @@ mod store {
             let body = match self
                 .ch
                 .read(&format!(
-                    "SELECT t.engine_full, countIf(c.name = '_apitap_ver'), \
-                            countIf(c.name = '_apitap_deleted') \
+                    "SELECT t.engine_full, countIf(c.name = '_apitap_ver' AND c.type = 'UInt64'), \
+                            countIf(c.name = '_apitap_deleted' AND c.type = 'UInt8') \
                      FROM system.tables t \
                      LEFT JOIN system.columns c ON c.database = t.database AND c.table = t.name \
                      WHERE t.database = currentDatabase() AND t.name = '{tbl}' \
