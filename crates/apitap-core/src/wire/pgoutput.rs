@@ -209,7 +209,6 @@ impl Tuple {
     }
 
     /// Build from owned cells by concatenation — test rigs and slow paths.
-    #[allow(dead_code)]
     pub(crate) fn from_cells(cells: &[Cell]) -> Self {
         let mut frame = Vec::new();
         let mut rs = Vec::with_capacity(cells.len());

@@ -224,6 +224,25 @@ impl Collapser {
             .map(K::V)
     }
 
+    /// A new image whose key column arrived as unchanged-TOAST (a wide key
+    /// stored out of line, left as it was) takes the key from the OLD image,
+    /// which Postgres logs whenever the key is external. The key was refused
+    /// as an "unsupported layout" on every rerun, wedging the lane (P2). The
+    /// rare path rebuilds the tuple; the common one returns it untouched.
+    fn key_from_old(&self, old: &Tuple, row: Tuple) -> Tuple {
+        let idx = self.layout.key_idx();
+        if !idx.iter().any(|&i| matches!(row.get(i), Some(Cellv::UnchangedToast))) {
+            return row;
+        }
+        let mut cells = row.to_cells();
+        for &i in idx {
+            if let (Some(Cell::UnchangedToast), Some(Cellv::Text(t))) = (cells.get(i), old.get(i)) {
+                cells[i] = Cell::Text(bytes::Bytes::copy_from_slice(t));
+            }
+        }
+        Tuple::from_cells(&cells)
+    }
+
     /// Key of an OLD image. `K` images carry ONLY key columns as Text, with
     /// non-key columns Null; `O` (FULL) images carry everything — either
     /// way the key columns are at the same indices.
@@ -269,6 +288,10 @@ impl Collapser {
     /// left its old key (see the deferred-duplicate case below).
     pub(crate) fn update_image(&mut self, old: Option<&Tuple>, old_full: bool, row: Tuple) -> Result<()> {
         self.events += 1;
+        let row = match old {
+            Some(o) => self.key_from_old(o, row),
+            None => row,
+        };
         let new_key = self.key_of_row(&row)?;
         let toast = row.has_toast();
         if let Some(old) = old {
@@ -743,6 +766,20 @@ mod tests {
         let out = cl.finish();
         assert_eq!(out.deletes.sorted(), vec![key(&["1"])]);
         assert_eq!(cells_of(&out.upserts), vec![vec![t("9"), t("a")]]);
+    }
+
+    /// P2: a wide key left unchanged arrives as unchanged-TOAST in the new
+    /// image; the old image (logged because the key is external) supplies it.
+    #[test]
+    fn an_unchanged_toast_key_is_taken_from_the_old_image() {
+        let mut cl = c();
+        cl.update(Some(&row(&[t("k"), Cell::Null])), row(&[Cell::UnchangedToast, t("a")]))
+            .unwrap();
+        let out = cl.finish();
+        assert_eq!(cells_of(&out.upserts), vec![vec![t("k"), t("a")]]);
+        // No old image: still refused, there is nothing to take the key from.
+        let mut cl = c();
+        assert!(cl.update(None, row(&[Cell::UnchangedToast, t("a")])).is_err());
     }
 
     #[test]
