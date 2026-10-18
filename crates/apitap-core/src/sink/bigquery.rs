@@ -944,6 +944,15 @@ fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {
         .unwrap_or_default()
 }
 
+/// Bytes a resumable session has persisted, from a 308's `Range: bytes=0-N`
+/// (N + 1). No Range header means nothing persisted yet.
+fn persisted_from(range: Option<&str>) -> u64 {
+    range
+        .and_then(|r| r.trim().strip_prefix("bytes=0-"))
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .map_or(0, |n| n + 1)
+}
+
 /// A failed chunk PUT, without the session URI: its upload_id authorises the
 /// upload, and reqwest's Display prints the URL (P2).
 fn upload_err(e: reqwest::Error) -> Error {
@@ -1608,68 +1617,91 @@ impl BqLoader {
     }
 
     /// PUT `chunk` at the current offset. `total` = Some(len) marks the final chunk.
-    async fn put_chunk(&mut self, chunk: Vec<u8>, total: Option<u64>) -> Result<Option<Value>> {
+    async fn put_chunk(&mut self, mut chunk: Vec<u8>, total: Option<u64>) -> Result<Option<Value>> {
         if self.session_uri.is_none() {
             self.begin_session().await?;
         }
         let uri = self.session_uri.clone().expect("session begun above");
-        let end = self.offset + chunk.len() as u64;
-        let range = match total {
-            Some(t) if chunk.is_empty() => format!("bytes */{t}"),
-            Some(t) => format!("bytes {}-{}/{t}", self.offset, end - 1),
-            None => format!("bytes {}-{}/*", self.offset, end - 1),
-        };
-        // Re-PUTting a byte range is idempotent in the resumable protocol, so
-        // transient network errors, 5xx AND throttles get paced retries. The
-        // throttle case matters as much as the 5xx one and does not look like
-        // it: BigQuery says 403 `rateLimitExceeded` or 429, both of which
-        // `is_server_error()` reads as success-to-fail-on.
-        let mut resp = None;
-        for attempt in 0..5u32 {
-            let r = self
-                .conn
-                .client
-                .put(&uri)
-                .bearer_auth(self.conn.bearer().await?)
-                .header("Content-Range", range.clone())
-                .header("Content-Length", chunk.len().to_string())
-                .body(chunk.clone())
-                .send()
-                .await;
-            match r {
-                Ok(r) if attempt < 4 && throttled_or_transient(&r) => {}
-                Ok(r) => {
-                    resp = Some(r);
-                    break;
+        let mut stalls = 0u32;
+        loop {
+            let end = self.offset + chunk.len() as u64;
+            let range = match total {
+                Some(t) if chunk.is_empty() => format!("bytes */{t}"),
+                Some(t) => format!("bytes {}-{}/{t}", self.offset, end - 1),
+                None => format!("bytes {}-{}/*", self.offset, end - 1),
+            };
+            // Re-PUTting a byte range is idempotent in the resumable protocol, so
+            // transient network errors, 5xx AND throttles get paced retries. The
+            // throttle case matters as much as the 5xx one and does not look like
+            // it: BigQuery says 403 `rateLimitExceeded` or 429, both of which
+            // `is_server_error()` reads as success-to-fail-on.
+            let mut resp = None;
+            for attempt in 0..5u32 {
+                let r = self
+                    .conn
+                    .client
+                    .put(&uri)
+                    .bearer_auth(self.conn.bearer().await?)
+                    .header("Content-Range", range.clone())
+                    .header("Content-Length", chunk.len().to_string())
+                    .body(chunk.clone())
+                    .send()
+                    .await;
+                match r {
+                    Ok(r) if attempt < 4 && throttled_or_transient(&r) => {}
+                    Ok(r) => {
+                        resp = Some(r);
+                        break;
+                    }
+                    Err(e) if attempt < 4 => {
+                        let _ = e; // transient; retried below
+                    }
+                    // without_url: the session URI's upload_id authorises the
+                    // upload, and reqwest's Display prints the URL (P2).
+                    Err(e) => return Err(upload_err(e)),
                 }
-                Err(e) if attempt < 4 => {
-                    let _ = e; // transient; retried below
+                tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
+            }
+            let resp =
+                resp.ok_or_else(|| Error::Transfer("bigquery upload chunk: retries exhausted".into()))?;
+            let status = resp.status().as_u16();
+            match (status, total) {
+                // 308 = upload incomplete; its Range says how much the server
+                // PERSISTED, which the protocol allows to be less than was sent.
+                // The offset jumped to the chunk's end regardless, the next chunk
+                // went to a gap, and the final PUT failed as "unexpected status
+                // 308" — a whole load lost on a recoverable answer (P2, R2-26 L2).
+                (308, None) => {
+                    let persisted = persisted_from(resp.headers().get("range").and_then(|v| v.to_str().ok()));
+                    if persisted >= end {
+                        self.offset = end;
+                        return Ok(None);
+                    }
+                    if persisted < self.offset || stalls >= 3 {
+                        return Err(Error::Transfer(format!(
+                            "bigquery upload chunk: the session persisted {persisted} bytes of \
+                             {end} after {} re-sends — resumable session out of sync",
+                            stalls
+                        )));
+                    }
+                    stalls += 1;
+                    chunk.drain(..(persisted - self.offset) as usize);
+                    self.offset = persisted;
+                    continue;
                 }
-                Err(e) => return Err(upload_err(e)),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
-        }
-        let resp =
-            resp.ok_or_else(|| Error::Transfer("bigquery upload chunk: retries exhausted".into()))?;
-        let status = resp.status().as_u16();
-        match (status, total) {
-            // 308 = chunk accepted, upload incomplete.
-            (308, None) => {
-                self.offset = end;
-                Ok(None)
-            }
-            (200 | 201, Some(_)) => {
-                let body = body_text(resp, "upload chunk").await?;
-                let v: Value = serde_json::from_str(&body)
-                    .map_err(|e| Error::Transfer(format!("bigquery job response: {e}")))?;
-                Ok(Some(v))
-            }
-            _ => {
-                let body = resp.text().await.unwrap_or_default();
-                Err(Error::Transfer(format!(
-                    "bigquery upload chunk unexpected status {status}: {}",
-                    body.trim()
-                )))
+                (200 | 201, Some(_)) => {
+                    let body = body_text(resp, "upload chunk").await?;
+                    let v: Value = serde_json::from_str(&body)
+                        .map_err(|e| Error::Transfer(format!("bigquery job response: {e}")))?;
+                    return Ok(Some(v));
+                }
+                _ => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(Error::Transfer(format!(
+                        "bigquery upload chunk unexpected status {status}: {}",
+                        body.trim()
+                    )));
+                }
             }
         }
     }
@@ -2965,6 +2997,14 @@ impl BqSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2/R2-26 L2: a 308's Range is what the session kept.
+    #[test]
+    fn a_308_range_says_what_was_persisted() {
+        assert_eq!(super::persisted_from(Some("bytes=0-1048575")), 1_048_576);
+        assert_eq!(super::persisted_from(None), 0);
+        assert_eq!(super::persisted_from(Some("junk")), 0);
+    }
 
     /// P2: a status is read from the message's head, never from the URL.
     #[test]
