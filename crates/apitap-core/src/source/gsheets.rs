@@ -119,19 +119,15 @@ impl GsheetsSource {
     /// omitted by the API; callers pad against the header width.
     /// The sheet's ALLOCATED grid rows (`rowCount`) — what the row pump
     /// walks to. The values API omits TRAILING empty rows per request, so a
-    /// short or empty page is not end-of-data (review R2-9).
-    async fn grid_rows(&self, tab: &str) -> i64 {
-        self.get_json("", &[("fields", "sheets(properties(title,gridProperties(rowCount)))")])
-            .await
-            .ok()
-            .and_then(|meta| {
-                meta["sheets"].as_array().and_then(|arr| {
-                    arr.iter()
-                        .find(|s| s["properties"]["title"].as_str() == Some(tab))
-                        .and_then(|s| s["properties"]["gridProperties"]["rowCount"].as_i64())
-                })
-            })
-            .unwrap_or(-1)
+    /// short or empty page is not end-of-data (review R2-9). A failed request
+    /// or an unmatched title used to read as "unknown" (-1), which fell back
+    /// to stopping at the first empty page: rows after a blank gap were lost
+    /// and the run succeeded (P2). Both are errors now.
+    async fn grid_rows(&self, tab: &str) -> Result<i64> {
+        let meta = self
+            .get_json("", &[("fields", "sheets(properties(title,gridProperties(rowCount)))")])
+            .await?;
+        grid_rows_of(&meta, tab)
     }
 
     async fn values(&self, range: &str) -> Result<Vec<Vec<String>>> {
@@ -339,7 +335,7 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
         // even empty page is NOT end-of-data, and a blank row at a page edge
         // used to end the read and silently drop everything after it
         // (review R2-9). The sheet's allocated row count bounds the walk.
-        let grid_rows = self.src.grid_rows(&tab).await;
+        let grid_rows = self.src.grid_rows(&tab).await?;
         let mut start = 2usize; // row 1 is the header
         let mut rows_sent: u64 = 0;
         loop {
@@ -409,6 +405,22 @@ fn column_letters(mut i: usize) -> String {
     String::from_utf8(s).unwrap_or_default()
 }
 
+/// A tab's allocated rows from the spreadsheet metadata. Titles match
+/// case-insensitively, as the values API resolves a range's sheet name.
+fn grid_rows_of(meta: &serde_json::Value, tab: &str) -> Result<i64> {
+    meta["sheets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["properties"]["title"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(tab)))
+        .and_then(|s| s["properties"]["gridProperties"]["rowCount"].as_i64())
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "gsheets: no tab '{tab}' with a row count in the spreadsheet's metadata"
+            ))
+        })
+}
+
 /// Where the row pump's next range starts, or `None` past the allocated grid
 /// (`grid_rows < 0` = unknown: walk until a page comes back empty). Emptiness
 /// alone is NOT end-of-data — the API omits trailing blanks per request
@@ -423,6 +435,19 @@ fn next_page_start(start: usize, grid_rows: i64) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// P2: the row count comes from the tab the values API would read
+    /// (case-insensitive); an unmatched tab is an error, not "unknown".
+    #[test]
+    fn grid_rows_match_the_tab_or_fail() {
+        let meta = serde_json::json!({"sheets": [
+            {"properties": {"title": "Other", "gridProperties": {"rowCount": 5}}},
+            {"properties": {"title": "Sheet1", "gridProperties": {"rowCount": 1000}}}
+        ]});
+        assert_eq!(super::grid_rows_of(&meta, "Sheet1").unwrap(), 1000);
+        assert_eq!(super::grid_rows_of(&meta, "sheet1").unwrap(), 1000);
+        assert!(super::grid_rows_of(&meta, "Missing").is_err());
+    }
+
     /// MASTER M-48: a value past the header's width is found and named;
     /// trailing blanks (the API pads nothing, but a user's sheet may) are not.
     #[test]
