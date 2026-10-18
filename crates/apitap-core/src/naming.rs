@@ -427,6 +427,21 @@ impl RunId {
 /// another source is LEGAL fan-in by peer rules (different source hashes),
 /// but replacing it is not (review round 2 R2-2). The sinks use this to pick
 /// a non-destructive publish or to refuse.
+/// The refusal of a first run that lost its table to a peer. "Re-run: the
+/// new state row makes this an incremental load" held only when the peer
+/// loaded the SAME source; a different one (fan-in) leaves no state row for
+/// this source, the re-run is refused again, and its advice — replace —
+/// would erase the other source's rows (P2). Both cases, spelled out.
+pub(crate) fn lost_first_run(table: &str, detail: &str) -> String {
+    format!(
+        "another run published {table} while this first run was loading it — the table now \
+         exists and this run would have replaced it{detail}. If the other run loaded the SAME \
+         source, re-run: it resumes incrementally from that run's state. If it was a \
+         DIFFERENT source writing into this table, seed this source's _apitap_state row \
+         first; do not use mode='replace', which drops the other source's rows."
+    )
+}
+
 pub(crate) fn flipped_bootstrap(kind: LandKind, mode: crate::Mode) -> bool {
     mode == crate::Mode::Replace && kind == LandKind::Incremental
 }
@@ -434,6 +449,14 @@ pub(crate) fn flipped_bootstrap(kind: LandKind, mode: crate::Mode) -> bool {
 #[cfg(test)]
 mod flipped_tests {
     use super::*;
+    /// P2: the lost-first-run advice names both cases, and never offers
+    /// replace for fan-in.
+    #[test]
+    fn a_lost_first_run_explains_both_cases() {
+        let m = lost_first_run("orders", "");
+        assert!(!m.contains("Re-run: the new state row makes this an incremental load"), "{m}");
+        assert!(m.contains("SAME") && m.contains("DIFFERENT") && m.contains("do not use mode='replace'"), "{m}");
+    }
 
     /// R2-2: only an Incremental token landing as Replace is a flipped
     /// bootstrap. A true replace keeps its destructive swap; append/merge

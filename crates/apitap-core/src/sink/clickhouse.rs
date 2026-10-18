@@ -1218,11 +1218,7 @@ impl ChSink {
 /// The error a flipped bootstrap returns when its atomic claim on the final
 /// name lost to a peer that published first.
 fn flipped_lost(table: &str, e: Error) -> Error {
-    Error::InvalidInput(format!(
-        "another run published {table} while this first run was loading it — the \
-         table now exists and this run would have replaced it ({e}). Re-run: the \
-         new state row makes this an incremental load."
-    ))
+    Error::InvalidInput(crate::naming::lost_first_run(table, &format!(" ({e})")))
 }
 
 /// ClickHouse column type for a delivered value.
