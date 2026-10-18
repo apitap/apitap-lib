@@ -2249,12 +2249,6 @@ mod store {
                     // deadline that passed un-renewed refuses the open.
                     Some(p) => self.pin(&keys, &token, Some(p)).await?,
                 };
-                // Slice 1 of the insert-only plan (design §14): detect and
-                // cache per table; the apply path still runs today's shape
-                // until the staged rollout reaches it. Groups are slice 3.
-                if keys.len() == 1 {
-                    self.detect_insert_only(&keys[0]).await;
-                }
                 Ok(ChUnit { s: self, keys, token, pin, owed: false })
             }
         }
