@@ -667,6 +667,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_cdc_hardening.dropped --> `e2e_my_cdc_hardening.py dropped` | writes then DROP TABLE, drained after the drop: refused naming the drop and the recovery, watermark kept |
 | <!-- claim: leg.e2e_ch_hardening.dt64 --> `e2e_ch_hardening.py dt64` | a ClickHouse DateTime64(9) column travels as exact text: its nanoseconds survive CH → CH |
 | <!-- claim: leg.e2e_ch_hardening.cursor --> `e2e_ch_hardening.py cursor` | a String cursor holding a backslash is stored as the value itself, and the next append takes each row exactly once |
+| <!-- claim: leg.e2e_ch_hardening.clock --> `e2e_ch_hardening.py clock` | a drain's newer watermark wins over a `_apitap_state` row stamped by a clock running an hour ahead |
 | <!-- claim: leg.e2e_pg_hardening.notnull --> `e2e_pg_hardening.py notnull` | a Postgres `mode="replace"` keeps the destination's NOT NULL columns (attnotnull is no constraint row) |
 | <!-- claim: leg.e2e_pg_hardening.pub --> `e2e_pg_hardening.py pub` | a Postgres replace keeps the destination in its FOR TABLE publication, column list and row filter included |
 | <!-- claim: leg.e2e_pg_hardening.nullcursor --> `e2e_pg_hardening.py nullcursor` | a parallel Postgres read over an integer cursor copies the rows whose cursor is NULL |

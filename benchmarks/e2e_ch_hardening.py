@@ -7,7 +7,10 @@ Two P2 findings (docs/review/2026-10-18-p2-triage.md), each on CH 24.8:
            String cursor (ClickHouse source) holding a backslash was stored
            escaped, and the next append compared against the escaped literal.
            Raw TSV now.
-Usage: e2e_ch_hardening.py dt64|cursor
+  clock    _apitap_state is ReplacingMergeTree(synced_at), and synced_at
+           defaulted to the server's now: a row stamped by a clock running
+           ahead outranked every newer watermark until real time caught up.
+Usage: e2e_ch_hardening.py dt64|cursor|clock
 """
 import subprocess
 import sys
@@ -91,9 +94,44 @@ def cursor():
             state_wipe(q, t)
 
 
+def clock():
+    t = "ch_clock_step"
+    pg(f"DROP TABLE IF EXISTS {t}")
+    ch(f"DROP TABLE IF EXISTS {t}")
+    state_wipe(ch, t)
+    for pub in set(pg(f"SELECT pubname FROM pg_publication_tables WHERE tablename = '{t}'").split()):
+        pg(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+           f"WHERE slot_name = '{pub.removesuffix('_pub')}' AND NOT active")
+        pg(f"DROP PUBLICATION IF EXISTS {pub}")
+    try:
+        pg(f"CREATE TABLE {t} (id int PRIMARY KEY, v int); INSERT INTO {t} VALUES (1, 1)")
+        apitap.transfer(PG, CH, table=t, mode="log_based")
+        q = (f"SELECT argMax(watermark, synced_at) FROM _apitap_state "
+             f"WHERE dest_table = '{t}' AND mode = 'log_based' FORMAT TabSeparatedRaw")
+        sid, cur, wm = ch(f"SELECT any(source_id), any(cursor_col), argMax(watermark, synced_at) FROM _apitap_state "
+                          f"WHERE dest_table = '{t}' AND mode = 'log_based' FORMAT TSV").split("\t")
+        # The current watermark, re-stamped as a writer whose clock ran an
+        # hour ahead would have left it: a newer watermark must still win.
+        ch(f"INSERT INTO _apitap_state (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) "
+           f"VALUES ('{t}', '{sid}', '{cur}', '{wm}', 'log_based', 0, now64(6) + INTERVAL 1 HOUR)")
+        pg(f"INSERT INTO {t} VALUES (2, 2)")
+        apitap.transfer(PG, CH, table=t, mode="log_based")
+        got = ch(q)
+        assert int(got) > int(wm), f"the drain's newer watermark must win over the future-stamped {wm}, read back {got}"
+        print(f"  watermark {wm} stamped an hour ahead, then a drain: {got} wins")
+    finally:
+        for pub in set(pg(f"SELECT pubname FROM pg_publication_tables WHERE tablename = '{t}'").split()):
+            pg(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+               f"WHERE slot_name = '{pub.removesuffix('_pub')}' AND NOT active")
+            pg(f"DROP PUBLICATION IF EXISTS {pub}")
+        pg(f"DROP TABLE IF EXISTS {t}")
+        ch(f"DROP TABLE IF EXISTS {t}")
+        state_wipe(ch, t)
+
+
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"dt64": dt64, "cursor": cursor}
+    cases = {"dt64": dt64, "cursor": cursor, "clock": clock}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_ch_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ ClickHouse hardening: {which[0]}")

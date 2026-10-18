@@ -1303,10 +1303,16 @@ mod store {
     /// still owns the table and its proof is continuous. The count the server
     /// reports must equal the number of marks, or the window refuses and
     /// replays (`written_rows` semantics: partial = not owner).
-    pub(super) fn state_batch_sql(token: &str, margin: u64, e0: u64, margin_us: u64) -> String {
+    pub(super) fn state_batch_sql(
+        token: &str,
+        margin: u64,
+        e0: u64,
+        margin_us: u64,
+        keys: &[(&str, &str)],
+    ) -> String {
         format!(
-            "INSERT INTO `_apitap_state` (dest_table, source_id, cursor_col, watermark, mode, last_rows) \
-             SELECT dest_table, source_id, '{cursor}', toString(lsn), 'log_based', rows \
+            "INSERT INTO `_apitap_state` (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
+             SELECT dest_table, source_id, '{cursor}', toString(lsn), 'log_based', rows, {version} \
              FROM input('{structure}') \
              WHERE dest_key IN (SELECT dest_key FROM `{lease}` WHERE token = '{tok}' GROUP BY dest_key \
                    HAVING count() > 0 AND argMax(collected, seq) = 0 AND \
@@ -1317,6 +1323,7 @@ mod store {
             lease = crate::lease::LEASE_TABLE,
             tok = ch_str(token),
             pinned = pinned_pred(e0, margin_us),
+            version = crate::sink::clickhouse::state_version_expr(keys),
         )
     }
 
@@ -2281,7 +2288,14 @@ mod store {
                         render_state_batch_row(&self.lease_key(table), table, source_id, *lsn, *rows, &mut body);
                     }
                 }
-                let sql = state_batch_sql(&u.token, owned_margin_secs(), u.pin.e0, margin_us());
+                let keys: Vec<(&str, &str)> = marks
+                    .iter()
+                    .filter_map(|m| match m {
+                        Watermark::Set { table, source_id, .. } => Some((table.as_str(), source_id.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                let sql = state_batch_sql(&u.token, owned_margin_secs(), u.pin.e0, margin_us(), &keys);
                 match u.insert_state_batch(&sql, body).await? {
                     Some(n) if n as usize == marks.len() => return Ok(()),
                     Some(_) => return Err(no_longer_holds(&u.keys)),
@@ -2298,10 +2312,11 @@ mod store {
                         self.note("state");
                         let sql = format!(
                             "INSERT INTO `_apitap_state` \
-                             (dest_table, source_id, cursor_col, watermark, mode, last_rows) \
-                             SELECT '{dt}', '{sid}', '{STATE_CURSOR}', '{lsn}', 'log_based', {rows} WHERE {p}",
+                             (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
+                             SELECT '{dt}', '{sid}', '{STATE_CURSOR}', '{lsn}', 'log_based', {rows}, {v} WHERE {p}",
                             dt = ch_str(table),
                             sid = ch_str(source_id),
+                            v = crate::sink::clickhouse::state_version_expr(&[(table.as_str(), source_id.as_str())]),
                             p = u.pred(),
                         );
                         match u.written_owned(&sql).await? {

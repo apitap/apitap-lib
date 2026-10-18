@@ -1202,17 +1202,39 @@ impl ChSink {
         self.ch
             .exec(&format!(
                 "INSERT INTO `_apitap_state` \
-                 (dest_table, source_id, cursor_col, watermark, mode, last_rows) \
-                 VALUES ('{}', '{}', '{}', '{}', '{}', {rows})",
+                 (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
+                 SELECT '{}', '{}', '{}', '{}', '{}', {rows}, {}",
                 ch_str(&self.final_bare),
                 ch_str(source_id),
                 ch_str(cursor),
                 ch_str(watermark),
                 self.mode_str,
+                state_version_expr(&[(self.final_bare.as_str(), source_id.as_str())]),
             ))
             .await?;
         Ok(())
     }
+}
+
+/// The `synced_at` a state row is written with: the server's now, but never
+/// at or before the newest row already there for these keys. The state table
+/// is `ReplacingMergeTree(synced_at)` and every read takes the newest
+/// version, and the column defaulted to now64(6): after a backward clock step
+/// (NTP, a VM restore) or across the nodes of a balanced fleet, a NEWER
+/// watermark got an OLDER stamp, FINAL / argMax kept returning the old one,
+/// and the next run resumed behind — re-landing rows (P2). One uncorrelated
+/// scalar subquery (24.8 refuses correlated ones); an empty table's max is
+/// the epoch, so a first write is simply now.
+pub(crate) fn state_version_expr(keys: &[(&str, &str)]) -> String {
+    let pred = keys
+        .iter()
+        .map(|(t, s)| format!("(dest_table = '{}' AND source_id = '{}')", ch_str(t), ch_str(s)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let pred = if pred.is_empty() { "0".to_string() } else { pred };
+    format!(
+        "greatest(now64(6), (SELECT max(synced_at) FROM `_apitap_state` WHERE {pred}) + toIntervalMicrosecond(1))"
+    )
 }
 
 /// The error a flipped bootstrap returns when its atomic claim on the final
@@ -2681,6 +2703,15 @@ mod tests {
         assert!(s.contains(&("distributed_ddl_task_timeout", "3600")));
         assert!(s.contains(&("receive_timeout", "3600")));
         assert_eq!(super::sync_timeout_s(), "3600");
+    }
+
+    /// P2: a state row's version outranks every row already there for its keys.
+    #[test]
+    fn a_state_version_is_above_the_newest_row() {
+        let v = super::state_version_expr(&[("t", "s"), ("u'x", "s")]);
+        assert!(v.starts_with("greatest(now64(6), (SELECT max(synced_at) FROM `_apitap_state` WHERE "), "{v}");
+        assert!(v.contains("(dest_table = 't' AND source_id = 's') OR (dest_table = 'u\\'x'"), "{v}");
+        assert!(v.ends_with("+ toIntervalMicrosecond(1))"), "{v}");
     }
 
     /// P2: plain HTTP off loopback is flagged; loopback and https are not.
