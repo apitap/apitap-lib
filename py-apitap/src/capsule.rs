@@ -122,22 +122,28 @@ fn static_format(kind: ArrowKind) -> Option<&'static std::ffi::CStr> {
 /// is overwritten without being read, so uninitialised memory is fine and a
 /// live schema is not — it would be leaked, not released.
 pub unsafe fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
-    let mut strings: Vec<CString> = Vec::new();
+    let strings: Vec<CString> = Vec::new();
     let mut child_ptrs: Vec<*mut ArrowSchema> = Vec::with_capacity(fields.len());
     for f in fields {
+        // Each child owns its strings: the C Data Interface lets a consumer
+        // MOVE a child out and release it after the parent, and the child's
+        // format/name pointed into the parent's strings — freed with the
+        // parent, a use-after-free (P2).
+        let mut own: Vec<CString> = Vec::new();
         let format_ptr: *const c_char = match static_format(f.kind) {
             Some(cs) => cs.as_ptr(),
             None => {
                 let ArrowKind::Decimal { p, s } = f.kind else { unreachable!() };
                 let cs = CString::new(format!("d:{p},{s}")).expect("no NUL");
                 let p = cs.as_ptr();
-                strings.push(cs);
+                own.push(cs);
                 p
             }
         };
         let name = CString::new(f.name.as_str()).unwrap_or_default();
         let name_ptr = name.as_ptr();
-        strings.push(name);
+        own.push(name);
+        let child_priv = Box::into_raw(Box::new(own)) as *mut c_void;
         let child = Box::new(ArrowSchema {
             format: format_ptr,
             name: name_ptr,
@@ -146,11 +152,10 @@ pub unsafe fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
             n_children: 0,
             children: null_mut(),
             dictionary: null_mut(),
-            // Children are released (recursively) by the PARENT's release;
-            // marking them released-by-parent with a no-op keeps consumers
-            // that probe `release != None` happy.
-            release: Some(release_schema_child_noop),
-            private_data: null_mut(),
+            // Released by the parent's release, or on its own if a consumer
+            // moved it out (the parent then skips it: release is None).
+            release: Some(release_schema_child),
+            private_data: child_priv,
         });
         child_ptrs.push(Box::into_raw(child));
     }
@@ -170,15 +175,20 @@ pub unsafe fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
 }
 
 /// # Safety
-/// `s` is null or a child schema exported by this module. Owns nothing of its
-/// own — the parent's release frees the whole tree — so this only marks it
-/// released.
-unsafe extern "C" fn release_schema_child_noop(s: *mut ArrowSchema) {
-    // SAFETY: null-checked; the pointer is a child of a live exported schema.
+/// `s` is null or a child schema exported by this module (or a bitwise move
+/// of one). Frees the strings it owns and marks it released; a second call
+/// is a no-op.
+unsafe extern "C" fn release_schema_child(s: *mut ArrowSchema) {
+    // SAFETY: null-checked; private_data is the Vec<CString> boxed at export.
     unsafe {
-        if !s.is_null() {
-            (*s).release = None;
+        if s.is_null() || (*s).release.is_none() {
+            return;
         }
+        if !(*s).private_data.is_null() {
+            drop(Box::from_raw((*s).private_data as *mut Vec<CString>));
+            (*s).private_data = null_mut();
+        }
+        (*s).release = None;
     }
 }
 
