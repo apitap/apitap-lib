@@ -1288,6 +1288,18 @@ impl ChSink {
     }
 }
 
+/// The `mode` a cursor run's state row records. Merge is refused above, so a
+/// non-append run here is an append bootstrapping as a full replace. It was
+/// labelled "merge" — a mode this destination cannot run, which then showed
+/// up in the cross-lane refusal ("managed by mode='merge'"). Every other
+/// destination writes "replace" for the bootstrap.
+fn state_mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Append => "append",
+        _ => "replace",
+    }
+}
+
 /// The `synced_at` a state row is written with: the server's now, but never
 /// at or before the newest row already there for these keys. The state table
 /// is `ReplacingMergeTree(synced_at)` and every read takes the newest
@@ -2002,11 +2014,7 @@ impl crate::sink::Sink for ChSink {
         }
         self.source_id = Some(source_id.to_string());
         self.cursor_col = Some(cursor.to_string());
-        self.mode_str = if mode == Mode::Append {
-            "append"
-        } else {
-            "merge"
-        };
+        self.mode_str = state_mode_label(mode);
         // Numeric vs temporal comparison for greatest(state, data) below.
         let numeric_cursor = plan
             .cols
@@ -3420,5 +3428,18 @@ mod tests {
         assert_eq!(ch_type_of(&Delivered::Date), "Date32");
         assert_eq!(ch_type_of(&Delivered::Uuid), "UUID");
         assert_eq!(ch_type_of(&Delivered::Json), "String");
+    }
+}
+
+#[cfg(test)]
+mod state_mode_tests {
+    use super::*;
+
+    /// A bootstrapped append is recorded as the replace it ran as, never as
+    /// a merge ClickHouse refuses to run.
+    #[test]
+    fn a_bootstrap_is_recorded_as_replace_not_merge() {
+        assert_eq!(state_mode_label(Mode::Append), "append");
+        assert_eq!(state_mode_label(Mode::Replace), "replace");
     }
 }
