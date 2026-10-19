@@ -101,6 +101,106 @@ pub(crate) fn client_idle(idle: Duration) -> reqwest::Client {
     b.build().unwrap_or_default()
 }
 
+/// A reqwest error that says WHY. reqwest's Display stops at "error sending
+/// request for url (...)": the cause (timed out, connection refused, reset by
+/// peer, a certificate refused) lives in the source chain, which nothing
+/// printed, so a 5-second deadline and a dead server read the same. The URL
+/// is left out: every caller already names the endpoint, the ClickHouse one
+/// is 600 characters of settings, and some URLs carry a credential (a
+/// resumable session URI's upload_id).
+pub(crate) fn why(e: reqwest::Error) -> String {
+    why_in(e, std::env::var("APITAP_HTTP_READ_TIMEOUT").ok())
+}
+
+/// `why` with the read-timeout setting passed in, so a test never races
+/// another one over the process environment.
+fn why_in(e: reqwest::Error, read_timeout: Option<String>) -> String {
+    let (timeout, connect) = (e.is_timeout(), e.is_connect());
+    let e = e.without_url();
+    let mut out = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        let m = s.to_string();
+        if !out.contains(&m) {
+            out.push_str(": ");
+            out.push_str(&m);
+        }
+        src = s.source();
+    }
+    if timeout {
+        if !out.contains("timed out") {
+            out.push_str(": timed out");
+        }
+        out.push_str(&if connect {
+            format!(
+                " (no connection within APITAP_HTTP_CONNECT_TIMEOUT={}s)",
+                env_secs("APITAP_HTTP_CONNECT_TIMEOUT", CONNECT_SECS).as_secs()
+            )
+        } else {
+            match read_timeout {
+                Some(v) if v.trim().parse::<u64>().is_ok_and(|v| v > 0) => format!(
+                    " (APITAP_HTTP_READ_TIMEOUT={}s is a total deadline per request — \
+                     unset it to let a long load finish)",
+                    v.trim()
+                ),
+                _ => format!(
+                    " (a control request gets APITAP_HTTP_REQUEST_TIMEOUT={}s)",
+                    control_timeout().as_secs()
+                ),
+            }
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod why_tests {
+    /// A peer that accepts and never answers, behind a deadline: the error
+    /// has to say it timed out and which knob set the deadline. reqwest's own
+    /// Display said "error sending request for url (...)" and nothing else.
+    #[tokio::test]
+    async fn a_timeout_says_it_timed_out_and_names_the_knob() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(s);
+        });
+        // The deadline client_idle builds from APITAP_HTTP_READ_TIMEOUT=1.
+        let c = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let e = c
+            .post(format!("http://{addr}/?password=SECRET"))
+            .body("x")
+            .send()
+            .await
+            .unwrap_err();
+        let m = super::why_in(e, Some("1".into()));
+        hold.abort();
+        assert!(m.contains("timed out"), "{m}");
+        assert!(m.contains("APITAP_HTTP_READ_TIMEOUT=1s"), "{m}");
+        assert!(!m.contains("SECRET"), "the URL leaked: {m}");
+    }
+
+    /// A refused connection names the refusal, not just "error sending".
+    #[tokio::test]
+    async fn a_refused_connection_says_refused() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        let e = super::client()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        let m = super::why(e);
+        assert!(m.to_lowercase().contains("refused"), "{m}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The pool-idle knob: unset = 5000 ms, 0 disables reuse, junk falls

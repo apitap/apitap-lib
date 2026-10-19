@@ -212,9 +212,14 @@ impl GcsConn {
                 Err(_) if attempt < crate::http::STORE_ATTEMPTS => {
                     tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
                 }
-                // without_url: a resumable session URI authorises its
-                // upload, and reqwest's Display prints the URL (P2).
-                Err(e) => return Err(Error::Transfer(format!("gcs {what}: {}", e.without_url()))),
+                // http::why leaves the URL out: a resumable session URI
+                // authorises its upload (P2).
+                Err(e) => {
+                    return Err(Error::Transfer(format!(
+                        "gcs {what}: {}",
+                        crate::http::why(e)
+                    )))
+                }
             }
         }
     }

@@ -60,13 +60,17 @@ async fn sheets_get(
                 tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
                 continue;
             }
-            Err(e) => return Err(Error::Transfer(format!("gsheets request: {e}"))),
+            Err(e) => {
+                return Err(Error::Transfer(format!(
+                    "gsheets request: {}",
+                    crate::http::why(e)
+                )))
+            }
         };
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| Error::Transfer(format!("gsheets response read: {e}")))?;
+        let body = resp.text().await.map_err(|e| {
+            Error::Transfer(format!("gsheets response read: {}", crate::http::why(e)))
+        })?;
         if !status.is_success() {
             return Err(Error::Transfer(format!(
                 "gsheets api ({status}): {}",

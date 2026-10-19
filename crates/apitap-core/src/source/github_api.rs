@@ -508,7 +508,12 @@ impl GithubApiSource {
                     tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
                         .await;
                 }
-                Err(e) => return Err(Error::Transfer(format!("github+api {what}: {e}"))),
+                Err(e) => {
+                    return Err(Error::Transfer(format!(
+                        "github+api {what}: {}",
+                        crate::http::why(e)
+                    )))
+                }
             }
         }
     }

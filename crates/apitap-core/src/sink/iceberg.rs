@@ -265,7 +265,9 @@ impl IcebergConn {
             .req(reqwest::Method::GET, url)
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("iceberg catalog config: {e}")))?;
+            .map_err(|e| {
+                Error::Transfer(format!("iceberg catalog config: {}", crate::http::why(e)))
+            })?;
         let v = Self::body_ok(r, "config").await?;
         self.prefix = v["overrides"]["prefix"]
             .as_str()
@@ -284,7 +286,7 @@ impl IcebergConn {
             )
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("iceberg catalog: {e}")))?;
+            .map_err(|e| Error::Transfer(format!("iceberg catalog: {}", crate::http::why(e))))?;
         if get.status().is_success() {
             return Ok(());
         }
@@ -293,7 +295,7 @@ impl IcebergConn {
             .json(&serde_json::json!({"namespace": [self.namespace], "properties": {}}))
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("iceberg catalog: {e}")))?;
+            .map_err(|e| Error::Transfer(format!("iceberg catalog: {}", crate::http::why(e))))?;
         // 409 = raced another creator; that is success for "ensure".
         if r.status().is_success() || r.status().as_u16() == 409 {
             Ok(())
@@ -315,7 +317,7 @@ impl IcebergConn {
             )
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("iceberg catalog: {e}")))?;
+            .map_err(|e| Error::Transfer(format!("iceberg catalog: {}", crate::http::why(e))))?;
         if r.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -347,7 +349,7 @@ impl IcebergConn {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("iceberg catalog: {e}")))?;
+            .map_err(|e| Error::Transfer(format!("iceberg catalog: {}", crate::http::why(e))))?;
         if r.status().as_u16() == 409 {
             // Raced another creator — load what won.
             return self.load_table(table).await?.ok_or_else(|| {

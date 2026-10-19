@@ -241,10 +241,9 @@ impl BqConn {
         if let Some(b) = body {
             req = req.json(b);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("bigquery {method} {url}: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            Error::Transfer(format!("bigquery {method} {url}: {}", crate::http::why(e)))
+        })?;
         let status = resp.status();
         let text = body_text(resp, &format!("{method} {url}")).await?;
         if !status.is_success() {
@@ -482,7 +481,9 @@ impl BqConn {
             .body(body)
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("bigquery state load: {e}")))?;
+            .map_err(|e| {
+                Error::Transfer(format!("bigquery state load: {}", crate::http::why(e)))
+            })?;
         let status = resp.status();
         let text = body_text(resp, "state load").await?;
         if !status.is_success() {
@@ -912,7 +913,12 @@ impl BqConn {
             .body(body)
             .send()
             .await
-            .map_err(|e| ScriptErr::Transport(format!("bigquery cdc staging load: {e}")))?;
+            .map_err(|e| {
+                ScriptErr::Transport(format!(
+                    "bigquery cdc staging load: {}",
+                    crate::http::why(e)
+                ))
+            })?;
         let status = resp.status();
         let text = body_text(resp, "cdc staging load")
             .await
@@ -982,7 +988,7 @@ fn persisted_from(range: Option<&str>) -> u64 {
 /// A failed chunk PUT, without the session URI: its upload_id authorises the
 /// upload, and reqwest's Display prints the URL (P2).
 fn upload_err(e: reqwest::Error) -> Error {
-    Error::Transfer(format!("bigquery upload chunk: {}", e.without_url()))
+    Error::Transfer(format!("bigquery upload chunk: {}", crate::http::why(e)))
 }
 
 /// A response body that must be read whole. `text().unwrap_or_default()`
@@ -990,9 +996,12 @@ fn upload_err(e: reqwest::Error) -> Error {
 /// — `Value::Null`, which table_get reads as "exists" (P2, T7). Read errors
 /// print without the URL (a session URI holds its upload_id).
 async fn body_text(resp: reqwest::Response, what: &str) -> Result<String> {
-    resp.text()
-        .await
-        .map_err(|e| Error::Transfer(format!("bigquery {what}: body read: {}", e.without_url())))
+    resp.text().await.map_err(|e| {
+        Error::Transfer(format!(
+            "bigquery {what}: body read: {}",
+            crate::http::why(e)
+        ))
+    })
 }
 
 /// Whether an `api()` error is HTTP `code`: its message starts
@@ -1659,7 +1668,9 @@ impl BqLoader {
             .json(&self.job_config)
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("bigquery resumable begin: {e}")))?;
+            .map_err(|e| {
+                Error::Transfer(format!("bigquery resumable begin: {}", crate::http::why(e)))
+            })?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1720,8 +1731,8 @@ impl BqLoader {
                     Err(e) if attempt < 4 => {
                         let _ = e; // transient; retried below
                     }
-                    // without_url: the session URI's upload_id authorises the
-                    // upload, and reqwest's Display prints the URL (P2).
+                    // http::why leaves the URL out: the session URI's
+                    // upload_id authorises the upload (P2).
                     Err(e) => return Err(upload_err(e)),
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;

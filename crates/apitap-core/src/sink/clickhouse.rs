@@ -624,7 +624,7 @@ impl ChConn {
             .body(sql.to_string())
             .send()
             .await
-            .map_err(|e| Error::Connect(format!("clickhouse: {e}")))?;
+            .map_err(|e| Error::Connect(format!("clickhouse: {}", crate::http::why(e))))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -714,7 +714,8 @@ impl ChConn {
                 attempt += 1;
                 continue;
             }
-            let resp = sent.map_err(|e| Error::Connect(format!("clickhouse: {e}")))?;
+            let resp =
+                sent.map_err(|e| Error::Connect(format!("clickhouse: {}", crate::http::why(e))))?;
             let status = resp.status();
             // A body that could not be READ is not a body without an
             // exception in it. Defaulting to "" made an unreadable 5xx score
@@ -781,7 +782,8 @@ impl ChConn {
             // watermark (MASTER M-31).
             let body = body_read.map_err(|e| {
                 Error::Transfer(format!(
-                    "clickhouse {status}: the response body could not be read: {e}"
+                    "clickhouse {status}: the response body could not be read: {}",
+                    crate::http::why(e)
                 ))
             })?;
             return Ok((body, written));
@@ -846,7 +848,7 @@ impl ChConn {
             .body(body)
             .send()
             .await
-            .map_err(|e| Error::Transfer(format!("clickhouse insert: {e}")))?;
+            .map_err(|e| Error::Transfer(format!("clickhouse insert: {}", crate::http::why(e))))?;
         let status = resp.status();
         // Before the body: `text()` consumes the response, headers and all.
         let written = resp

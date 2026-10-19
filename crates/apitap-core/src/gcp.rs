@@ -55,7 +55,7 @@ async fn exchange(client: &reqwest::Client, uri: &str, assertion: &str) -> Resul
         let resp = match sent {
             Ok(r) => r,
             Err(e) => {
-                last = format!("google token exchange: {}", e.without_url());
+                last = format!("google token exchange: {}", crate::http::why(e));
                 continue;
             }
         };
@@ -63,7 +63,7 @@ async fn exchange(client: &reqwest::Client, uri: &str, assertion: &str) -> Resul
         let body = resp.text().await.map_err(|e| {
             Error::Transfer(format!(
                 "google token exchange: body read: {}",
-                e.without_url()
+                crate::http::why(e)
             ))
         })?;
         if status.is_success() {

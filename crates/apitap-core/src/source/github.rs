@@ -201,7 +201,12 @@ impl GithubSource {
                 Err(_) if attempt < crate::http::STORE_ATTEMPTS => {
                     tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
                 }
-                Err(e) => return Err(Error::Transfer(format!("github {what}: {e}"))),
+                Err(e) => {
+                    return Err(Error::Transfer(format!(
+                        "github {what}: {}",
+                        crate::http::why(e)
+                    )))
+                }
             }
         };
         let status = resp.status();
@@ -394,7 +399,12 @@ impl Source for GithubSource {
                     fed += b.len();
                     pump.feed(&b);
                 }
-                Some(Err(e)) => return Err(Error::Transfer(format!("github probe '{key}': {e}"))),
+                Some(Err(e)) => {
+                    return Err(Error::Transfer(format!(
+                        "github probe '{key}': {}",
+                        crate::http::why(e)
+                    )))
+                }
                 None => match pump.next_record(true)? {
                     Some(row) => break csvfile::row_strings(&row)?,
                     None => {

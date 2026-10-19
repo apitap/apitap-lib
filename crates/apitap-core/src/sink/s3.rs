@@ -365,7 +365,7 @@ impl S3Conn {
         r.bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| Error::Transfer(format!("s3 get {object}: {e}")))
+            .map_err(|e| Error::Transfer(format!("s3 get {object}: {}", crate::http::why(e))))
     }
 
     /// Ranged GET — the Iceberg sink reads parquet FOOTERS of committed data
@@ -395,11 +395,9 @@ impl S3Conn {
             }
             match req.send().await {
                 Ok(r) if r.status().is_success() => {
-                    return r
-                        .bytes()
-                        .await
-                        .map(|b| b.to_vec())
-                        .map_err(|e| Error::Transfer(format!("s3 range get: {e}")));
+                    return r.bytes().await.map(|b| b.to_vec()).map_err(|e| {
+                        Error::Transfer(format!("s3 range get: {}", crate::http::why(e)))
+                    });
                 }
                 Ok(r)
                     if crate::http::store_retryable(r.status())
@@ -419,10 +417,18 @@ impl S3Conn {
                     )))
                 }
                 Err(e) if attempt < crate::http::STORE_ATTEMPTS => {
-                    last = Some(Error::Transfer(format!("s3 range get: {e}")));
+                    last = Some(Error::Transfer(format!(
+                        "s3 range get: {}",
+                        crate::http::why(e)
+                    )));
                     tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
                 }
-                Err(e) => return Err(Error::Transfer(format!("s3 range get: {e}"))),
+                Err(e) => {
+                    return Err(Error::Transfer(format!(
+                        "s3 range get: {}",
+                        crate::http::why(e)
+                    )))
+                }
             }
         }
         Err(last.unwrap_or_else(|| Error::Transfer("s3 range get: retries exhausted".into())))
@@ -496,10 +502,10 @@ impl S3Conn {
                 }
                 Ok(r) => return Ok(r),
                 Err(e) if attempt < crate::http::STORE_ATTEMPTS => {
-                    last = Some(Error::Transfer(format!("s3 send: {e}")));
+                    last = Some(Error::Transfer(format!("s3 send: {}", crate::http::why(e))));
                     crate::http::store_backoff(attempt, None)
                 }
-                Err(e) => return Err(Error::Transfer(format!("s3 send: {e}"))),
+                Err(e) => return Err(Error::Transfer(format!("s3 send: {}", crate::http::why(e)))),
             };
             tokio::time::sleep(wait).await;
         }
@@ -513,7 +519,8 @@ impl S3Conn {
         // (MASTER M-31).
         let body = r.text().await.map_err(|e| {
             Error::Transfer(format!(
-                "s3 {what}: {status}, the response body could not be read: {e}"
+                "s3 {what}: {status}, the response body could not be read: {}",
+                crate::http::why(e)
             ))
         })?;
         if !status.is_success() {

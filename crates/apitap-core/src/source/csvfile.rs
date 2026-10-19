@@ -359,7 +359,12 @@ where
     while !eof {
         match stream.next().await {
             Some(Ok(bytes)) => pump.feed(&bytes),
-            Some(Err(e)) => return Err(Error::Transfer(format!("read '{label}': {e}"))),
+            Some(Err(e)) => {
+                return Err(Error::Transfer(format!(
+                    "read '{label}': {}",
+                    crate::http::why(e)
+                )))
+            }
             None => eof = true,
         }
         while let Some(row) = pump.next_record(eof)? {

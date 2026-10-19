@@ -88,6 +88,10 @@ else:
     timed_out = el2 >= 4.5 and "clickhouse insert" in p2.stderr
     case(f"a 5-second total deadline stops this transfer ({el2:.1f}s)", timed_out,
          tail[:120])
+    # And it says so. reqwest's Display stopped at "error sending request
+    # for url (...)", so a deadline and a dead server read the same.
+    case("the error says it timed out, and which knob set the deadline",
+         "timed out" in tail and "APITAP_HTTP_READ_TIMEOUT=5s" in tail, tail[-200:])
 
 drop_ch(ch, T)
 print("\n" + ("HTTP DEADLINE E2E: ALL GREEN" if ok else "HTTP DEADLINE E2E: FAILED"))
