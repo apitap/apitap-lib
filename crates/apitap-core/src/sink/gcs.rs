@@ -283,6 +283,7 @@ impl GcsConn {
         start: u64,
         bytes: Vec<u8>,
         total: Option<u64>,
+        crc32c: Option<&str>,
     ) -> Result<()> {
         let end = start + bytes.len() as u64;
         let range = match (bytes.is_empty(), total) {
@@ -294,10 +295,15 @@ impl GcsConn {
         let resp = self
             .send_retry(
                 || {
-                    self.client
+                    let r = self
+                        .client
                         .put(session)
-                        .header("content-range", range.clone())
-                        .body(bytes.clone())
+                        .header("content-range", range.clone());
+                    let r = match crc32c {
+                        Some(c) => r.header("x-goog-hash", format!("crc32c={c}")),
+                        None => r,
+                    };
+                    r.body(bytes.clone())
                 },
                 "chunk upload",
             )
@@ -738,6 +744,7 @@ impl crate::sink::Sink for GcsSink {
             scratch: Vec::new(),
             wm: None,
             offset: 0,
+            crc: CRC32C.digest(),
             rows: 0,
         })
     }
@@ -890,6 +897,16 @@ pub(crate) struct GcsLoader {
     wm: Option<String>,
     offset: u64,
     rows: u64,
+    /// CRC32C of every byte sent so far (see `finish`).
+    crc: crc::Digest<'static, u32>,
+}
+
+static CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+
+/// A CRC32C as `x-goog-hash` spells it: base64 of the big-endian bytes.
+fn crc32c_b64(v: u32) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(v.to_be_bytes())
 }
 
 impl GcsLoader {
@@ -900,8 +917,9 @@ impl GcsLoader {
             return Ok(());
         }
         let chunk: Vec<u8> = pending.drain(..take).collect();
+        self.crc.update(&chunk);
         self.conn
-            .put_chunk(&self.session, self.offset, chunk, None)
+            .put_chunk(&self.session, self.offset, chunk, None, None)
             .await?;
         self.offset += take as u64;
         Ok(())
@@ -971,7 +989,13 @@ impl crate::sink::Loader for GcsLoader {
             }
         };
         let total = self.offset + pending.len() as u64;
-        if let Err(e) = self.conn.put_chunk(&self.session, self.offset, pending, Some(total)).await {
+        // The whole object's CRC32C rides the final chunk: the server checks it
+        // and refuses a mismatch. Nothing checked the bytes before, so on a
+        // plain-http path a chunk corrupted in flight was accepted (P2).
+        let mut crc = std::mem::replace(&mut self.crc, CRC32C.digest());
+        crc.update(&pending);
+        let sum = crc32c_b64(crc.finalize());
+        if let Err(e) = self.conn.put_chunk(&self.session, self.offset, pending, Some(total), Some(&sum)).await {
             self.conn.cancel(&self.session).await;
             return Err(e);
         }
@@ -988,6 +1012,18 @@ impl crate::sink::Loader for GcsLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2: the object checksum is CRC32C, spelled as x-goog-hash wants it
+    /// (the RFC 3720 check value, and an incremental digest equals one pass).
+    #[test]
+    fn the_object_checksum_is_crc32c_in_base64() {
+        assert_eq!(CRC32C.checksum(b"123456789"), 0xE306_9283);
+        assert_eq!(crc32c_b64(0xE306_9283), "4waSgw==");
+        let mut d = CRC32C.digest();
+        d.update(b"1234");
+        d.update(b"56789");
+        assert_eq!(d.finalize(), 0xE306_9283);
+    }
 
     #[test]
     fn enc_and_decode_component_roundtrip() {
