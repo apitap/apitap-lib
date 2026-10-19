@@ -212,28 +212,42 @@ impl GithubSource {
         Ok(resp)
     }
 
-    /// The ref to read: `?ref=` verbatim, else the repo's default branch.
+    /// The COMMIT to read: `?ref=` (else the repo's default branch), resolved
+    /// once to its SHA. The ref name went into every tree and raw URL, so
+    /// GitHub re-resolved the branch on each request: a push between the probe
+    /// and the stream read the header at one commit and the rows at another,
+    /// and a multi-file run mixed commits (P2). Every request of this source
+    /// now names the same commit.
     async fn r#ref(&self) -> Result<&String> {
         self.resolved_ref
             .get_or_try_init(|| async {
-                if let Some(r) = &self.want_ref {
-                    return Ok(r.clone());
-                }
+                let name = match &self.want_ref {
+                    Some(r) => r.clone(),
+                    None => {
+                        let v: serde_json::Value = self
+                            .send(format!("{API}/repos/{}/{}", self.owner, self.repo), "repo lookup")
+                            .await?
+                            .json()
+                            .await
+                            .map_err(|e| Error::Transfer(format!("github repo response: {e}")))?;
+                        v["default_branch"].as_str().map(str::to_string).ok_or_else(|| {
+                            Error::Transfer("github repo response missing default_branch".into())
+                        })?
+                    }
+                };
                 let v: serde_json::Value = self
                     .send(
-                        format!("{API}/repos/{}/{}", self.owner, self.repo),
-                        "repo lookup",
+                        format!("{API}/repos/{}/{}/commits/{}", self.owner, self.repo, encode_segment(&name)),
+                        "ref lookup",
                     )
                     .await?
                     .json()
                     .await
-                    .map_err(|e| Error::Transfer(format!("github repo response: {e}")))?;
-                v["default_branch"]
+                    .map_err(|e| Error::Transfer(format!("github commit response: {e}")))?;
+                v["sha"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| {
-                        Error::Transfer("github repo response missing default_branch".into())
-                    })
+                    .ok_or_else(|| Error::Transfer(format!("github: ref '{name}' resolved to no commit sha")))
             })
             .await
     }
