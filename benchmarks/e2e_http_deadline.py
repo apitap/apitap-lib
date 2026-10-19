@@ -24,7 +24,7 @@ import time
 
 PG = os.environ.get("PG_URL", "postgres://postgres:bench@127.0.0.1:5544/apitap_bench_src")
 CH = os.environ.get("CH_URL", "clickhouse://default:bench@127.0.0.1:8124/default")
-SRC = os.environ.get("SLOW_TABLE", "bench_data_10m")
+SRC = os.environ.get("SLOW_TABLE", "bench_data_10m_cap")
 T = "http_deadline_probe"
 
 from _artifacts import drop_ch          # noqa: E402 — after T, used below
@@ -82,8 +82,11 @@ if p2.returncode == 0:
     case("a 5-second total deadline stops this transfer", False,
          f"it finished in {el2:.0f}s — the knob does nothing")
 else:
+    # Any failure is not proof: a missing table fails in 0.1s too. The
+    # deadline has to be what stopped it: after the 5 seconds, in the insert.
     tail = [l for l in p2.stderr.strip().splitlines() if l.strip()][-1]
-    case(f"a 5-second total deadline stops this transfer ({el2:.1f}s)", True,
+    timed_out = el2 >= 4.5 and "clickhouse insert" in p2.stderr
+    case(f"a 5-second total deadline stops this transfer ({el2:.1f}s)", timed_out,
          tail[:120])
 
 drop_ch(ch, T)
