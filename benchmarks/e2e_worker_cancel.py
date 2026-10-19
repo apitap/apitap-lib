@@ -73,7 +73,9 @@ MYD_C = os.environ.get("MYD_CONTAINER", "apitap-bench-my-dst")
 S3_BUCKET = "apitap-e2e"
 S3 = (f"s3://{S3_BUCKET}/wc?format=parquet&endpoint=http://127.0.0.1:9100"
       "&access_key_id=bench&secret_access_key=benchbench")
-BQ = _rig.bq_url()
+# Only the bq cell needs credentials; reading BQ_SA unconditionally failed
+# the pg/ch/s3/my cells with a KeyError before they ran.
+BQ = _rig.bq_url() if ENGINE == "bq" else None
 TABLE = "wc_src"
 N = 4_000_000
 PARALLEL = 4
