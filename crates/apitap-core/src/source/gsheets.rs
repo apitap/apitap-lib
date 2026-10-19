@@ -23,6 +23,50 @@ use serde_json::Value;
 
 const SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets.readonly";
 const API: &str = "https://sheets.googleapis.com/v4/spreadsheets";
+
+/// One Sheets GET, retrying a 5xx, a 408 or a 429 (honouring Retry-After) and
+/// a transport error. It was one attempt, so a quota 429 — Sheets answers it
+/// for per-minute read limits — failed a long sheet's pump halfway (P2).
+async fn sheets_get(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    query: &[(&str, &str)],
+    token: &str,
+) -> Result<Value> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let sent = client
+            .get(url.clone())
+            .query(query)
+            .bearer_auth(token)
+            .timeout(crate::http::control_timeout())
+            .send()
+            .await;
+        let resp = match sent {
+            Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
+                let wait = crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER));
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            Ok(r) => r,
+            Err(_) if attempt < crate::http::STORE_ATTEMPTS => {
+                tokio::time::sleep(crate::http::store_backoff(attempt, None)).await;
+                continue;
+            }
+            Err(e) => return Err(Error::Transfer(format!("gsheets request: {e}"))),
+        };
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| Error::Transfer(format!("gsheets response read: {e}")))?;
+        if !status.is_success() {
+            return Err(Error::Transfer(format!("gsheets api ({status}): {}", body.trim())));
+        }
+        return serde_json::from_str(&body).map_err(|e| Error::Transfer(format!("gsheets response: {e}")));
+    }
+}
 /// Rows per HTTP fetch: large enough to amortize the round-trip, small enough
 /// that a page is a few MB at spreadsheet-typical row widths. Overridable via
 /// `APITAP_GSHEETS_PAGE_ROWS` for API-limit tuning (and to exercise paging in
@@ -96,24 +140,7 @@ impl GsheetsSource {
                 .push("values")
                 .push(path_segment);
         }
-        let resp = self
-            .client
-            .get(url)
-            .query(query)
-            .bearer_auth(&self.token)
-            .timeout(crate::http::control_timeout())
-            .send()
-            .await
-            .map_err(|e| Error::Transfer(format!("gsheets request: {e}")))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Error::Transfer(format!(
-                "gsheets api ({status}): {}",
-                body.trim()
-            )));
-        }
-        serde_json::from_str(&body).map_err(|e| Error::Transfer(format!("gsheets response: {e}")))
+        sheets_get(&self.client, url, query, &self.token).await
     }
 
     /// Fetch a range as rows of display strings. Trailing blank cells are
@@ -437,6 +464,41 @@ fn next_page_start(start: usize, grid_rows: i64) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// P2: a 429 is retried (with its Retry-After), a 403 is the answer.
+    #[test]
+    fn a_throttled_sheets_get_is_retried() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let serve = |answers: Vec<&'static str>| async move {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = l.local_addr().unwrap().port();
+                let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let h = hits.clone();
+                tokio::spawn(async move {
+                    for a in answers {
+                        let (mut c, _) = l.accept().await.unwrap();
+                        let mut b = [0u8; 4096];
+                        let _ = c.read(&mut b).await;
+                        h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = c.write_all(a.as_bytes()).await;
+                    }
+                });
+                (reqwest::Url::parse(&format!("http://127.0.0.1:{port}/s")).unwrap(), hits)
+            };
+            let busy = "HTTP/1.1 429 Too Many\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let ok = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"a\":1}";
+            let denied = "HTTP/1.1 403 No\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno";
+            let c = reqwest::Client::new();
+            let (url, hits) = serve(vec![busy, ok]).await;
+            assert_eq!(super::sheets_get(&c, url, &[], "t").await.unwrap()["a"], 1);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let (url, hits) = serve(vec![denied, ok]).await;
+            assert!(super::sheets_get(&c, url, &[], "t").await.is_err());
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "a 403 is the answer");
+        });
+    }
+
     /// P2: the row count comes from the tab the values API would read
     /// (case-insensitive); an unmatched tab is an error, not "unknown".
     #[test]
