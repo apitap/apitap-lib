@@ -3,14 +3,14 @@
 //! `ON CONFLICT` upsert (merge). Captures indexes, constraints and grants so a
 //! replace re-applies what the swap would destroy.
 
-use crate::sink::{FinishMarked, Loader, Msg};
+use crate::dialect::postgres::{quote_ident, quote_ident_path};
 use crate::error::{Error, Result};
 use crate::pipe;
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
+use crate::sink::{FinishMarked, Loader, Msg};
 use crate::Mode;
 use sqlx::postgres::{PgPoolCopyExt, PgPoolOptions};
 use sqlx::PgPool;
-use crate::dialect::postgres::{quote_ident, quote_ident_path};
 
 /// A Postgres destination table, split into the schema it LIVES in and its
 /// bare name — the one answer both lanes use for where the lock goes, where the
@@ -42,9 +42,10 @@ impl PgParts {
 
     /// A qualified name split as written; `None` for a bare one.
     pub(crate) fn split(dest_table: &str) -> Option<PgParts> {
-        dest_table
-            .rsplit_once('.')
-            .map(|(s, t)| PgParts { schema: s.to_string(), bare: t.to_string() })
+        dest_table.rsplit_once('.').map(|(s, t)| PgParts {
+            schema: s.to_string(),
+            bare: t.to_string(),
+        })
     }
 }
 
@@ -78,7 +79,10 @@ pub(crate) async fn resolve_parts(pool: &PgPool, dest_table: &str) -> Result<PgP
                 Error::InvalidInput(format!("no schema on search_path resolves {dest_table}"))
             })?,
     };
-    Ok(PgParts { schema, bare: dest_table.to_string() })
+    Ok(PgParts {
+        schema,
+        bare: dest_table.to_string(),
+    })
 }
 
 /// The guard's view of a Postgres destination: one schema, spelled.
@@ -93,7 +97,10 @@ pub(crate) struct PgGuard {
 
 impl PgGuard {
     pub(crate) fn new(pool: PgPool, schema: impl Into<String>) -> Self {
-        PgGuard { pool, schema: schema.into() }
+        PgGuard {
+            pool,
+            schema: schema.into(),
+        }
     }
 
     fn fq(&self, raw: &str) -> String {
@@ -108,15 +115,28 @@ impl crate::guard::GuardStore for PgGuard {
     }
 
     fn dest_label(&self, bare: &str) -> String {
-        PgParts { schema: self.schema.clone(), bare: bare.to_string() }.label()
+        PgParts {
+            schema: self.schema.clone(),
+            bare: bare.to_string(),
+        }
+        .label()
     }
 
-    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+    async fn list(
+        &self,
+        bare: &str,
+        kinds: &[crate::naming::Artifact],
+    ) -> Result<Vec<crate::guard::Listed>> {
         // `_` and `%` are LIKE wildcards and both appear in these names.
-        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+        let esc = |v: &str| {
+            v.replace('\\', "\\\\")
+                .replace('_', "\\_")
+                .replace('%', "\\%")
+        };
         let mut found = Vec::new();
         for &a in kinds {
-            let (head, suffix) = crate::naming::artifact_match(bare, a, crate::naming::PG_IDENT_MAX);
+            let (head, suffix) =
+                crate::naming::artifact_match(bare, a, crate::naming::PG_IDENT_MAX);
             let rows: Vec<String> = sqlx::query_scalar(
                 "SELECT c.relname::text FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -137,11 +157,14 @@ impl crate::guard::GuardStore for PgGuard {
     /// never needs to survive a crash — a marker that outlives its process is
     /// the operational cost this protocol trades for, not a feature.
     async fn create_marker(&self, raw: &str) -> Result<()> {
-        sqlx::query(&format!("CREATE UNLOGGED TABLE IF NOT EXISTS {} ()", self.fq(raw)))
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Transfer(format!("announce run: {e}")))
+        sqlx::query(&format!(
+            "CREATE UNLOGGED TABLE IF NOT EXISTS {} ()",
+            self.fq(raw)
+        ))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| Error::Transfer(format!("announce run: {e}")))
     }
 
     async fn drop_object(&self, raw: &str) -> Result<()> {
@@ -186,7 +209,9 @@ impl crate::guard::GuardStore for PgGuard {
 /// instead of a typed `LockedError`. It showed up only in the one leg that
 /// reaches a lease read before any drain has created the table.
 fn no_lease_table(e: &sqlx::Error) -> bool {
-    e.as_database_error().and_then(|d| d.code()).is_some_and(|c| c == "42P01")
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|c| c == "42P01")
         || e.to_string().contains("does not exist")
 }
 
@@ -211,7 +236,9 @@ pub(crate) async fn ensure_lease_table(pool: &PgPool, schema: &str) -> Result<()
         // Two first-runs race the CREATE; whoever loses is fine. Same tolerance
         // the state table already carries.
         Err(e) => {
-            let code = e.as_database_error().and_then(|d| d.code().map(|c| c.to_string()));
+            let code = e
+                .as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()));
             let m = e.to_string();
             if matches!(code.as_deref(), Some("42P07") | Some("23505"))
                 || m.contains("already exists")
@@ -308,7 +335,10 @@ pub(crate) async fn lease_get(
         Err(e) if no_lease_table(&e) => None,
         Err(e) => return Err(Error::Transfer(format!("lease read: {e}"))),
     };
-    Ok(row.map(|(expires_in, collected)| crate::lease::Lease { expires_in, collected }))
+    Ok(row.map(|(expires_in, collected)| crate::lease::Lease {
+        expires_in,
+        collected,
+    }))
 }
 
 /// Take a lapsed lease, so its lock may be dropped.
@@ -353,15 +383,24 @@ pub(crate) async fn lease_claim(
             Some(_) => Claim::Refused,
         }),
         // 55P03 lock_not_available: the owner holds it. Alive; refuse.
-        Err(e) if e.as_database_error().and_then(|d| d.code())
-                    .is_some_and(|c| c == "55P03") => Ok(Claim::Refused),
+        Err(e)
+            if e.as_database_error()
+                .and_then(|d| d.code())
+                .is_some_and(|c| c == "55P03") =>
+        {
+            Ok(Claim::Refused)
+        }
         Err(e) if no_lease_table(&e) => Ok(Claim::Absent),
         Err(e) => Err(Error::Transfer(format!("lease claim: {e}"))),
     }
 }
 
 /// This run's keys whose row exists and is not collected. Expiry ignored.
-pub(crate) async fn lease_unclaimed(pool: &PgPool, schema: &str, token: &str) -> Result<Vec<String>> {
+pub(crate) async fn lease_unclaimed(
+    pool: &PgPool,
+    schema: &str,
+    token: &str,
+) -> Result<Vec<String>> {
     sqlx::query_scalar(&format!(
         "SELECT dest_key FROM {} WHERE token = $1 AND NOT collected",
         lease_table(schema)
@@ -462,7 +501,9 @@ impl PgSink {
             .max_connections(max_conns as u32)
             .connect(&url)
             .await
-            .map_err(|e| crate::dialect::postgres::connect_error("postgres destination", user_url, e))
+            .map_err(|e| {
+                crate::dialect::postgres::connect_error("postgres destination", user_url, e)
+            })
     }
 
     /// Where an unqualified destination really lives, by the rule the CDC lane
@@ -680,7 +721,10 @@ impl PgSink {
         if refs.is_empty() {
             return Ok(());
         }
-        let names: Vec<String> = refs.into_iter().map(|(t, c)| format!("{t} ({c})")).collect();
+        let names: Vec<String> = refs
+            .into_iter()
+            .map(|(t, c)| format!("{t} ({c})"))
+            .collect();
         Err(Error::InvalidInput(format!(
             "mode='replace' into {} cannot swap the table: foreign key(s) from {} reference \
              it, and Postgres refuses to drop a referenced table. Nothing has been copied \
@@ -690,7 +734,6 @@ impl PgSink {
             names.join(", ")
         )))
     }
-
 
     fn state_table(&self) -> String {
         format!("{}.\"_apitap_state\"", quote_ident(&self.schema))
@@ -730,7 +773,9 @@ impl PgSink {
             // error is harmless, the table exists either way. By SQLSTATE: the
             // English text alone failed the loser on a server whose
             // lc_messages is not English ("existiert bereits") (P2).
-            let code = e.as_database_error().and_then(|d| d.code().map(|c| c.into_owned()));
+            let code = e
+                .as_database_error()
+                .and_then(|d| d.code().map(|c| c.into_owned()));
             if is_create_race(code.as_deref(), &e.to_string()) {
                 Ok(())
             } else {
@@ -884,7 +929,10 @@ impl crate::sink::Sink for PgSink {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Error::Transfer(format!("capture NOT NULL: {e}")))?;
-            for col in notnull.iter().filter(|n| plan.cols.iter().any(|c| &c.name == *n)) {
+            for col in notnull
+                .iter()
+                .filter(|n| plan.cols.iter().any(|c| &c.name == *n))
+            {
                 ddl.push(format!(
                     "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
                     self.final_t,
@@ -966,7 +1014,10 @@ impl crate::sink::Sink for PgSink {
             .map_err(|e| Error::Transfer(format!("capture publications: {e}")))?;
             for (pubname, cols, qual) in &pubs {
                 let cols = cols.as_ref().map(|c| format!(" ({c})")).unwrap_or_default();
-                let qual = qual.as_ref().map(|q| format!(" WHERE ({q})")).unwrap_or_default();
+                let qual = qual
+                    .as_ref()
+                    .map(|q| format!(" WHERE ({q})"))
+                    .unwrap_or_default();
                 ddl.push(format!(
                     "ALTER PUBLICATION {} ADD TABLE {}{cols}{qual}",
                     quote_ident(pubname),
@@ -1018,8 +1069,13 @@ impl crate::sink::Sink for PgSink {
         // announcement again if anything here fails; see `announce`.
         let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
         *self.announced.lock().expect("announcement") = Some(a);
-        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::DeleteLeftovers)
-            .await?;
+        crate::guard::check_peers(
+            &self.guard(),
+            &self.bare,
+            &self.run,
+            crate::guard::Mine::DeleteLeftovers,
+        )
+        .await?;
         // Incremental staging never becomes the final table — always skip its WAL.
         let unlogged = if durable && mode == Mode::Replace {
             ""
@@ -1271,11 +1327,12 @@ impl PgSink {
                 // Replace destroyed every source's rows — stale state rows would
                 // make the next incremental run skip data. Clear them all; the
                 // bootstrap (if any) re-inserts its own row below.
-                let has_state: bool = sqlx::query_scalar("SELECT to_regclass($1::text) IS NOT NULL")
-                    .bind(self.state_table())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| Error::Transfer(format!("state lookup: {e}")))?;
+                let has_state: bool =
+                    sqlx::query_scalar("SELECT to_regclass($1::text) IS NOT NULL")
+                        .bind(self.state_table())
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Transfer(format!("state lookup: {e}")))?;
                 if has_state {
                     // Both spellings: the CDC lane historically keyed rows by
                     // the bare name, and a replace that deletes only its own
@@ -1471,7 +1528,11 @@ impl PgCopyLoader {
                 .await
                 .map_err(|e| Error::Transfer(format!("pg finish: {e}")))
         });
-        Ok(Self::Overlap { tx, back, join: pipe::JoinOnce::new(join) })
+        Ok(Self::Overlap {
+            tx,
+            back,
+            join: pipe::JoinOnce::new(join),
+        })
     }
 }
 
@@ -1501,7 +1562,9 @@ impl Loader for PgCopyLoader {
                         Some(Ok(Ok(_))) => Error::Transfer("pg copy closed early".into()),
                         Some(Ok(Err(e))) => e,
                         Some(Err(e)) => Error::Transfer(format!("join: {e}")),
-                        None => Error::Transfer("pg copy closed early: the sender task had already ended".into()),
+                        None => Error::Transfer(
+                            "pg copy closed early: the sender task had already ended".into(),
+                        ),
                     });
                 }
                 Ok(())
@@ -1515,7 +1578,9 @@ impl Loader for PgCopyLoader {
                 .finish()
                 .await
                 .map_err(|e| Error::Transfer(format!("pg finish: {e}"))),
-            Self::Overlap { mut tx, mut join, .. } => {
+            Self::Overlap {
+                mut tx, mut join, ..
+            } => {
                 use futures::SinkExt;
                 if tx.send(Msg::Finish).await.is_err() {
                     // Sender died before it could be told this is a finish —
@@ -1524,7 +1589,9 @@ impl Loader for PgCopyLoader {
                         Some(Ok(Ok(_))) => Error::Transfer("pg copy closed early".into()),
                         Some(Ok(Err(e))) => e,
                         Some(Err(e)) => Error::Transfer(format!("join: {e}")),
-                        None => Error::Transfer("pg copy closed early: the sender task had already ended".into()),
+                        None => Error::Transfer(
+                            "pg copy closed early: the sender task had already ended".into(),
+                        ),
                     });
                 }
                 drop(tx); // close the channel; the sender task then finishes the COPY
@@ -1563,8 +1630,14 @@ mod tests {
     /// P2: the state-table create race is recognised by SQLSTATE in any language.
     #[test]
     fn a_create_race_is_recognised_by_sqlstate() {
-        assert!(super::is_create_race(Some("42P07"), "Relation »_apitap_state« existiert bereits"));
-        assert!(super::is_create_race(Some("23505"), "doppelter Schlüsselwert"));
+        assert!(super::is_create_race(
+            Some("42P07"),
+            "Relation »_apitap_state« existiert bereits"
+        ));
+        assert!(super::is_create_race(
+            Some("23505"),
+            "doppelter Schlüsselwert"
+        ));
         assert!(super::is_create_race(None, "relation \"x\" already exists"));
         assert!(!super::is_create_race(Some("42501"), "permission denied"));
     }
@@ -1573,7 +1646,9 @@ mod tests {
     #[test]
     fn identifiers_past_63_bytes_are_refused() {
         assert!(super::check_ident_len("public", &"x".repeat(63)).is_ok());
-        let e = super::check_ident_len("public", &"x".repeat(64)).unwrap_err().to_string();
+        let e = super::check_ident_len("public", &"x".repeat(64))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("64 bytes"), "{e}");
         assert!(super::check_ident_len(&"s".repeat(64), "t").is_err());
     }

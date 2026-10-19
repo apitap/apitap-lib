@@ -97,17 +97,44 @@ fn datetime64_precision(inner: &str) -> u32 {
 fn delivered_of(inner: &str) -> Delivered {
     let head = inner.split('(').next().unwrap_or(inner).trim();
     match head {
-        "Int8" => Delivered::Int { bytes: 1, unsigned: false },
-        "Int16" => Delivered::Int { bytes: 2, unsigned: false },
-        "Int32" => Delivered::Int { bytes: 4, unsigned: false },
-        "Int64" => Delivered::Int { bytes: 8, unsigned: false },
-        "UInt8" => Delivered::Int { bytes: 1, unsigned: true },
-        "UInt16" => Delivered::Int { bytes: 2, unsigned: true },
-        "UInt32" => Delivered::Int { bytes: 4, unsigned: true },
-        "UInt64" => Delivered::Int { bytes: 8, unsigned: true },
+        "Int8" => Delivered::Int {
+            bytes: 1,
+            unsigned: false,
+        },
+        "Int16" => Delivered::Int {
+            bytes: 2,
+            unsigned: false,
+        },
+        "Int32" => Delivered::Int {
+            bytes: 4,
+            unsigned: false,
+        },
+        "Int64" => Delivered::Int {
+            bytes: 8,
+            unsigned: false,
+        },
+        "UInt8" => Delivered::Int {
+            bytes: 1,
+            unsigned: true,
+        },
+        "UInt16" => Delivered::Int {
+            bytes: 2,
+            unsigned: true,
+        },
+        "UInt32" => Delivered::Int {
+            bytes: 4,
+            unsigned: true,
+        },
+        "UInt64" => Delivered::Int {
+            bytes: 8,
+            unsigned: true,
+        },
         // ClickHouse's Bool is a UInt8 alias; keeping it Int8-unsigned means the
         // destination declares UInt8 and the byte passes through unchanged.
-        "Bool" => Delivered::Int { bytes: 1, unsigned: true },
+        "Bool" => Delivered::Int {
+            bytes: 1,
+            unsigned: true,
+        },
         "Float32" => Delivered::Float32,
         "Float64" => Delivered::Float64,
         "Decimal" | "Decimal32" | "Decimal64" | "Decimal128" => {
@@ -185,8 +212,8 @@ fn wire_width(d: &Delivered) -> Option<usize> {
         Delivered::Decimal { p, .. } if *p <= 9 => 4,
         Delivered::Decimal { p, .. } if *p <= 18 => 8,
         Delivered::Decimal { .. } => 16,
-        Delivered::Date => 4,             // Date32
-        Delivered::DateTime { .. } => 8,  // DateTime64(6)
+        Delivered::Date => 4,            // Date32
+        Delivered::DateTime { .. } => 8, // DateTime64(6)
         Delivered::Uuid => 16,
         Delivered::Json | Delivered::Text | Delivered::Bytes => return None,
     })
@@ -293,9 +320,7 @@ impl ChSource {
         let conn = ChConn::parse(url)?;
         // Fail fast on a bad URL/credentials, like every other source's connect.
         conn.exec("SELECT 1").await?;
-        Ok(Self {
-            conn,
-        })
+        Ok(Self { conn })
     }
 
     fn database(&self) -> String {
@@ -368,9 +393,17 @@ impl crate::source::Source for ChSource {
             .unwrap_or_default();
         let cursor = cols
             .iter()
-            .find(|c| c.name == first_key && matches!(delivered_of(&c.udt), Delivered::Int { .. }) && !c.nullable)
+            .find(|c| {
+                c.name == first_key
+                    && matches!(delivered_of(&c.udt), Delivered::Int { .. })
+                    && !c.nullable
+            })
             .map(|c| c.name.clone());
-        let pk_cols: Vec<String> = cols.iter().filter(|c| c.int_pk).map(|c| c.name.clone()).collect();
+        let pk_cols: Vec<String> = cols
+            .iter()
+            .filter(|c| c.int_pk)
+            .map(|c| c.name.clone())
+            .collect();
 
         Ok(TablePlan {
             engine: "clickhouse",
@@ -386,7 +419,9 @@ impl crate::source::Source for ChSource {
         schema: Option<&str>,
         tables: Option<&[String]>,
     ) -> Result<Vec<(String, i64)>> {
-        let db = schema.map(|s| s.to_string()).unwrap_or_else(|| self.database());
+        let db = schema
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.database());
         // total_rows is Nullable(UInt64): cast BEFORE ifNull or ClickHouse refuses
         // with NO_COMMON_TYPE (Int8 vs UInt64).
         let rows = self
@@ -485,7 +520,10 @@ impl crate::source::Source for ChSource {
                     };
                     format!("CAST({col} AS {full})")
                 };
-                LaneCol { delivered: d, select }
+                LaneCol {
+                    delivered: d,
+                    select,
+                }
             })
             .collect();
         Lane {
@@ -514,9 +552,8 @@ impl crate::source::Source for ChSource {
         let dpred = delta
             .map(|d| format!(" AND {} {} {}", q(&d.col), d.op, d.literal))
             .unwrap_or_default();
-        let one = |pred: String| {
-            format!("SELECT {select_list} FROM {src} WHERE {pred} FORMAT RowBinary")
-        };
+        let one =
+            |pred: String| format!("SELECT {select_list} FROM {src} WHERE {pred} FORMAT RowBinary");
 
         // This table's own engine, asked here. It was the engine of the table
         // probed LAST, kept on the shared source: a multi-table run plans
@@ -659,9 +696,7 @@ async fn worker<L: Loader>(
             let piece = match resp.chunk().await {
                 Ok(Some(b)) => b,
                 Ok(None) => break,
-                Err(e) => {
-                    return Err(Error::Transfer(format!("clickhouse read: {e}")))
-                }
+                Err(e) => return Err(Error::Transfer(format!("clickhouse read: {e}"))),
             };
             // A rolling window of the RAW stream: ClickHouse answers 200 for
             // a mid-stream failure and glues the exception onto the body —
@@ -734,10 +769,15 @@ mod tests {
         }
         buf.push(v as u8);
         buf.extend_from_slice(&[1, 2, 3, 4]);
-        let cols = [super::Skip { nullable: false, width: None }];
+        let cols = [super::Skip {
+            nullable: false,
+            width: None,
+        }];
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(super::count_rows(&buf, &cols)).unwrap());
-        let got = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("count_rows must return");
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("count_rows must return");
         assert_eq!(got, (0, 0));
     }
 
@@ -748,8 +788,14 @@ mod tests {
         assert_eq!(super::datetime64_precision("DateTime64(9, 'UTC')"), 9);
         assert_eq!(super::datetime64_precision("DateTime64(6)"), 6);
         assert_eq!(super::datetime64_precision("DateTime64"), 3);
-        assert!(matches!(super::delivered_of("DateTime64(9, 'UTC')"), super::Delivered::Text));
-        assert!(matches!(super::delivered_of("DateTime64(6, 'UTC')"), super::Delivered::DateTime { .. }));
+        assert!(matches!(
+            super::delivered_of("DateTime64(9, 'UTC')"),
+            super::Delivered::Text
+        ));
+        assert!(matches!(
+            super::delivered_of("DateTime64(6, 'UTC')"),
+            super::Delivered::DateTime { .. }
+        ));
     }
 
     /// P1-12: the in-band glued-exception detector.
@@ -802,8 +848,14 @@ mod tests {
     #[test]
     fn counts_rows_including_the_null_no_payload_rule() {
         let cols = [
-            Skip { nullable: false, width: Some(4) },  // Int32
-            Skip { nullable: true, width: None },      // Nullable(String)
+            Skip {
+                nullable: false,
+                width: Some(4),
+            }, // Int32
+            Skip {
+                nullable: true,
+                width: None,
+            }, // Nullable(String)
         ];
         // row 1: 1, "hi"   row 2: 2, NULL
         let mut buf = vec![1, 0, 0, 0, 0, 2, b'h', b'i'];

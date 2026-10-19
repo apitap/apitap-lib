@@ -14,7 +14,9 @@
 //! value.
 
 use crate::error::{Error, Result};
-use crate::wire::pgcopy::{numeric_to_scaled_i128, numeric_to_scaled_i128_raw, PG_EPOCH_DAYS, PG_EPOCH_MICROS};
+use crate::wire::pgcopy::{
+    numeric_to_scaled_i128, numeric_to_scaled_i128_raw, PG_EPOCH_DAYS, PG_EPOCH_MICROS,
+};
 
 /// How to transcode one column. Field order mirrors the SELECT / DDL order.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,7 +88,10 @@ pub(crate) fn rb_type(udt: &str, precision: Option<i32>, scale: Option<i32>) -> 
 /// knows it. Anything unrecognised returns `None` and the whole table falls
 /// back to the TSV path — correctness first.
 pub(crate) fn rb_type_from_ch(ch: &str) -> Option<(RbType, bool)> {
-    let (inner, nullable) = match ch.strip_prefix("Nullable(").and_then(|s| s.strip_suffix(')')) {
+    let (inner, nullable) = match ch
+        .strip_prefix("Nullable(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         Some(i) => (i, true),
         None => (ch, false),
     };
@@ -146,27 +151,47 @@ pub(crate) fn rb_type_from_ch(ch: &str) -> Option<(RbType, bool)> {
 /// theirs; any other pairing takes the TSV path, where ClickHouse parses
 /// the text and a value that does not fit fails loudly.
 pub(crate) fn rb_type_for_cdc(oid: u32, ch: RbType, ch_name: &str) -> Option<RbType> {
-    let inner = ch_name.strip_prefix("Nullable(").and_then(|s| s.strip_suffix(')')).unwrap_or(ch_name);
+    let inner = ch_name
+        .strip_prefix("Nullable(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(ch_name);
     let exact = |want: &str| if inner == want { Some(ch) } else { None };
     Some(match oid {
-        16 => match ch { RbType::Bool => ch, _ => return None },                  // bool
-        20 => exact("Int64")?,                                                    // int8
-        21 => exact("Int16")?,                                                    // int2
-        23 => exact("Int32")?,                                                    // int4
-        700 => exact("Float32")?,                                                 // float4
-        701 => exact("Float64")?,                                                 // float8
-        1082 => match ch { RbType::Date32 => ch, _ => return None },              // date
-        1114 | 1184 => match ch { RbType::Ts64 => ch, _ => return None },         // ts/tstz
-        1700 => match ch {                                                        // numeric
+        16 => match ch {
+            RbType::Bool => ch,
+            _ => return None,
+        }, // bool
+        20 => exact("Int64")?,    // int8
+        21 => exact("Int16")?,    // int2
+        23 => exact("Int32")?,    // int4
+        700 => exact("Float32")?, // float4
+        701 => exact("Float64")?, // float8
+        1082 => match ch {
+            RbType::Date32 => ch,
+            _ => return None,
+        }, // date
+        1114 | 1184 => match ch {
+            RbType::Ts64 => ch,
+            _ => return None,
+        }, // ts/tstz
+        1700 => match ch {
+            // numeric
             RbType::Decimal { .. } | RbType::NumericF64 => ch,
             _ => return None,
         },
-        2950 => match ch { RbType::Uuid => ch, _ => return None },                // uuid
-        25 | 1043 | 1042 | 19 | 114 => match ch {                                 // text-ish
+        2950 => match ch {
+            RbType::Uuid => ch,
+            _ => return None,
+        }, // uuid
+        25 | 1043 | 1042 | 19 | 114 => match ch {
+            // text-ish
             RbType::String => ch,
             _ => return None,
         },
-        3802 => match ch { RbType::String => RbType::JsonB, _ => return None },   // jsonb: strip version
+        3802 => match ch {
+            RbType::String => RbType::JsonB,
+            _ => return None,
+        }, // jsonb: strip version
         _ => return None, // bytea, arrays, oid/time/char, unknown — TSV fallback
     })
 }
@@ -227,7 +252,10 @@ impl Transcoder {
 
     #[cfg(test)]
     fn with_max_field(cols: Vec<(RbType, bool)>, max_field: usize) -> Self {
-        Self { max_field, ..Self::new(cols) }
+        Self {
+            max_field,
+            ..Self::new(cols)
+        }
     }
 
     /// Feed input; append transcoded RowBinary to `out`.
@@ -448,7 +476,9 @@ pub(crate) fn transcode_field(ty: RbType, f: &[u8], out: &mut Vec<u8>) -> Result
                         .into(),
                 ));
             }
-            let unix = t.checked_add(PG_EPOCH_MICROS).ok_or_else(|| bad("timestamp"))?;
+            let unix = t
+                .checked_add(PG_EPOCH_MICROS)
+                .ok_or_else(|| bad("timestamp"))?;
             out.extend(unix.to_le_bytes());
         }
         RbType::Decimal { width, scale } => {
@@ -514,8 +544,14 @@ mod tests {
     /// Decimal32 its declared p picked; numeric(2,5) is Decimal(5,5) (P2).
     #[test]
     fn negative_and_oversized_numeric_scales_widen() {
-        assert!(matches!(rb_type("numeric", Some(9), Some(-3)), Some(RbType::Decimal { width: 8, scale: 0 })));
-        assert!(matches!(rb_type("numeric", Some(2), Some(5)), Some(RbType::Decimal { width: 4, scale: 5 })));
+        assert!(matches!(
+            rb_type("numeric", Some(9), Some(-3)),
+            Some(RbType::Decimal { width: 8, scale: 0 })
+        ));
+        assert!(matches!(
+            rb_type("numeric", Some(2), Some(5)),
+            Some(RbType::Decimal { width: 4, scale: 5 })
+        ));
         assert!(rb_type("numeric", Some(37), Some(-2)).is_none());
     }
 
@@ -538,15 +574,9 @@ mod tests {
         let mut wire = Vec::new();
         crate::wire::pgcopy::numeric_field_from_str("99999999999", &mut wire).unwrap();
         let mut out = Vec::new();
-        assert!(transcode_field(
-            RbType::Decimal {
-                width: 4,
-                scale: 0
-            },
-            &wire[4..],
-            &mut out
-        )
-        .is_err());
+        assert!(
+            transcode_field(RbType::Decimal { width: 4, scale: 0 }, &wire[4..], &mut out).is_err()
+        );
     }
     use super::*;
 
@@ -757,20 +787,47 @@ mod tests {
     /// fallback, not a guess.
     #[test]
     fn ch_column_types_map_to_rowbinary() {
-        assert_eq!(rb_type_from_ch("Nullable(String)"), Some((RbType::String, true)));
+        assert_eq!(
+            rb_type_from_ch("Nullable(String)"),
+            Some((RbType::String, true))
+        );
         assert_eq!(rb_type_from_ch("Int32"), Some((RbType::Swap(4), false)));
-        assert_eq!(rb_type_from_ch("Nullable(Int16)"), Some((RbType::Swap(2), true)));
-        assert_eq!(rb_type_from_ch("Nullable(Int64)"), Some((RbType::Swap(8), true)));
-        assert_eq!(rb_type_from_ch("Nullable(Float64)"), Some((RbType::Swap(8), true)));
-        assert_eq!(rb_type_from_ch("Nullable(UInt8)"), Some((RbType::Bool, true)));
-        assert_eq!(rb_type_from_ch("Nullable(Date32)"), Some((RbType::Date32, true)));
-        assert_eq!(rb_type_from_ch("Nullable(DateTime64(6))"), Some((RbType::Ts64, true)));
-        assert_eq!(rb_type_from_ch("DateTime64(6, 'UTC')"), Some((RbType::Ts64, false)));
+        assert_eq!(
+            rb_type_from_ch("Nullable(Int16)"),
+            Some((RbType::Swap(2), true))
+        );
+        assert_eq!(
+            rb_type_from_ch("Nullable(Int64)"),
+            Some((RbType::Swap(8), true))
+        );
+        assert_eq!(
+            rb_type_from_ch("Nullable(Float64)"),
+            Some((RbType::Swap(8), true))
+        );
+        assert_eq!(
+            rb_type_from_ch("Nullable(UInt8)"),
+            Some((RbType::Bool, true))
+        );
+        assert_eq!(
+            rb_type_from_ch("Nullable(Date32)"),
+            Some((RbType::Date32, true))
+        );
+        assert_eq!(
+            rb_type_from_ch("Nullable(DateTime64(6))"),
+            Some((RbType::Ts64, true))
+        );
+        assert_eq!(
+            rb_type_from_ch("DateTime64(6, 'UTC')"),
+            Some((RbType::Ts64, false))
+        );
         assert_eq!(
             rb_type_from_ch("Nullable(Decimal(18, 4))"),
             Some((RbType::Decimal { width: 8, scale: 4 }, true))
         );
-        assert_eq!(rb_type_from_ch("Nullable(UUID)"), Some((RbType::Uuid, true)));
+        assert_eq!(
+            rb_type_from_ch("Nullable(UUID)"),
+            Some((RbType::Uuid, true))
+        );
         // Outside the covered set: TSV fallback, never a mis-scaled write.
         assert_eq!(rb_type_from_ch("DateTime"), None);
         assert_eq!(rb_type_from_ch("DateTime64(3)"), None);
@@ -783,20 +840,51 @@ mod tests {
     /// column holds) and any unknown OID fall back to TSV.
     #[test]
     fn cdc_oid_rules_refine_the_ch_type() {
-        assert_eq!(rb_type_for_cdc(3802, RbType::String, "String"), Some(RbType::JsonB));
-        assert_eq!(rb_type_for_cdc(25, RbType::String, "String"), Some(RbType::String));
-        assert_eq!(rb_type_for_cdc(1043, RbType::String, "String"), Some(RbType::String));
-        assert_eq!(rb_type_for_cdc(114, RbType::String, "String"), Some(RbType::String));
-        assert_eq!(rb_type_for_cdc(23, RbType::Swap(4), "Int32"), Some(RbType::Swap(4)));
+        assert_eq!(
+            rb_type_for_cdc(3802, RbType::String, "String"),
+            Some(RbType::JsonB)
+        );
+        assert_eq!(
+            rb_type_for_cdc(25, RbType::String, "String"),
+            Some(RbType::String)
+        );
+        assert_eq!(
+            rb_type_for_cdc(1043, RbType::String, "String"),
+            Some(RbType::String)
+        );
+        assert_eq!(
+            rb_type_for_cdc(114, RbType::String, "String"),
+            Some(RbType::String)
+        );
+        assert_eq!(
+            rb_type_for_cdc(23, RbType::Swap(4), "Int32"),
+            Some(RbType::Swap(4))
+        );
         assert_eq!(rb_type_for_cdc(23, RbType::Swap(8), "Int64"), None); // width mismatch
-        // Same width, wrong class (M-28): float bits into an int, and back.
+                                                                         // Same width, wrong class (M-28): float bits into an int, and back.
         assert_eq!(rb_type_for_cdc(701, RbType::Swap(8), "Int64"), None);
         assert_eq!(rb_type_for_cdc(701, RbType::Swap(8), "UInt64"), None);
-        assert_eq!(rb_type_for_cdc(20, RbType::Swap(8), "Nullable(Float64)"), None);
+        assert_eq!(
+            rb_type_for_cdc(20, RbType::Swap(8), "Nullable(Float64)"),
+            None
+        );
         assert_eq!(rb_type_for_cdc(23, RbType::Swap(4), "UInt32"), None);
-        assert_eq!(rb_type_for_cdc(701, RbType::Swap(8), "Nullable(Float64)"), Some(RbType::Swap(8)));
-        assert_eq!(rb_type_for_cdc(20, RbType::Swap(8), "Int64"), Some(RbType::Swap(8)));
-        assert_eq!(rb_type_for_cdc(1700, RbType::Decimal { width: 8, scale: 4 }, "Decimal(18, 4)"), Some(RbType::Decimal { width: 8, scale: 4 }));
+        assert_eq!(
+            rb_type_for_cdc(701, RbType::Swap(8), "Nullable(Float64)"),
+            Some(RbType::Swap(8))
+        );
+        assert_eq!(
+            rb_type_for_cdc(20, RbType::Swap(8), "Int64"),
+            Some(RbType::Swap(8))
+        );
+        assert_eq!(
+            rb_type_for_cdc(
+                1700,
+                RbType::Decimal { width: 8, scale: 4 },
+                "Decimal(18, 4)"
+            ),
+            Some(RbType::Decimal { width: 8, scale: 4 })
+        );
         assert_eq!(rb_type_for_cdc(17, RbType::String, "String"), None); // bytea
         assert_eq!(rb_type_for_cdc(1009, RbType::String, "String"), None); // text[]
         assert_eq!(rb_type_for_cdc(1083, RbType::String, "String"), None); // time

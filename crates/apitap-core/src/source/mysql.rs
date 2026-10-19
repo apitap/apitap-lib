@@ -6,17 +6,17 @@
 //! intermediate text, no Arrow.
 
 use super::spans;
+use crate::dialect::mysql::{is_binary_udt, my_ident, my_ident_path};
+use crate::error::{Error, Result};
 use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
+use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::Source;
-use crate::error::{Error, Result};
 use crate::wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, CellVal};
+use crate::wire::mytsv::tsv_escape;
 use crate::wire::mywire::{self, MyWire};
 use crate::wire::pgcopy as pgc;
-use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::wire::rowbinary::varint;
-use crate::dialect::mysql::{is_binary_udt, my_ident, my_ident_path};
-use crate::wire::mytsv::tsv_escape;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::Row;
 
@@ -202,7 +202,9 @@ enum MyAr {
     F64,
     /// NEWDECIMAL ASCII text → scaled i128, ONE conversion (the COPY lane
     /// pays text → pg-numeric groups → i128).
-    Dec { scale: u32 },
+    Dec {
+        scale: u32,
+    },
     Date,
     /// DATETIME and TIMESTAMP decode identically (session is UTC-pinned);
     /// only the delivered tag differs.
@@ -639,7 +641,9 @@ fn tsv_write(enc: MyTsv, b: &[u8], out: &mut Vec<u8>) -> Result<()> {
                 (1, false) => {
                     buf.format(i8::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as i64)
                 }
-                (1, true) => buf.format(u8::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as u64),
+                (1, true) => {
+                    buf.format(u8::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as u64)
+                }
                 (2, false) => {
                     buf.format(i16::from_le_bytes(b.try_into().map_err(|_| bad_int())?) as i64)
                 }
@@ -758,9 +762,6 @@ fn write_datetime(b: &[u8], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-
-
-
 // ---------------------------------------------------------------------------------
 // Source
 // ---------------------------------------------------------------------------------
@@ -806,7 +807,10 @@ impl MySqlSource {
                     ))
                 }
             })?;
-        Ok(Self { pool, url: url.into() })
+        Ok(Self {
+            pool,
+            url: url.into(),
+        })
     }
 }
 
@@ -1048,7 +1052,9 @@ impl Source for MySqlSource {
                     // connection-charset text (round-trips exactly on reload),
                     // HEX for binary so bytes survive the charset. delivered is a
                     // marker — the sink mirrors native_ddl for its DDL, not this.
-                    WireFormat::TabSeparated => unreachable!("can_produce refuses the PG text dialect for the MySQL source"),
+                    WireFormat::TabSeparated => {
+                        unreachable!("can_produce refuses the PG text dialect for the MySQL source")
+                    }
                     WireFormat::MyTsv => {
                         // Read BINARY and format client-side (measured ~3x cheaper
                         // than CAST-to-text on the wire). Only TIME is CAST — its
@@ -1064,7 +1070,12 @@ impl Source for MySqlSource {
                 LaneCol { delivered, select }
             })
             .collect();
-        Lane { format, cols, raw_frames: false, push_where: None }
+        Lane {
+            format,
+            cols,
+            raw_frames: false,
+            push_where: None,
+        }
     }
 
     async fn span_stmts(
@@ -1176,7 +1187,9 @@ impl Source for MySqlSource {
                     .collect(),
             ),
             WireFormat::MyTsv => MyEnc::Tsv(plan.cols.iter().map(my_tsv).collect()),
-            WireFormat::TabSeparated => unreachable!("can_produce refuses the PG text dialect for the MySQL source"),
+            WireFormat::TabSeparated => {
+                unreachable!("can_produce refuses the PG text dialect for the MySQL source")
+            }
         };
         // Raw-plane canary, same dance as the Arrow lane: one probe connect
         // decides, refused dialects (TLS-verify, exotic auth) ride sqlx, and
@@ -1241,9 +1254,12 @@ impl<L: Loader> PipeBody<L> for MyBody {
     async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
         match self {
             MyBody::Row { pool, enc, chunk } => row_worker(pool, spans, enc, pipe, chunk).await,
-            MyBody::Raw { url, enc, wire, chunk } => {
-                raw_transfer_worker(url, spans, enc, wire, pipe, chunk).await
-            }
+            MyBody::Raw {
+                url,
+                enc,
+                wire,
+                chunk,
+            } => raw_transfer_worker(url, spans, enc, wire, pipe, chunk).await,
         }
     }
 }
@@ -1285,9 +1301,7 @@ async fn row_worker<L: Loader>(
             let row = match rows.try_next().await {
                 Ok(Some(r)) => r,
                 Ok(None) => break,
-                Err(e) => {
-                    return Err(Error::Transfer(format!("mysql read: {e}")))
-                }
+                Err(e) => return Err(Error::Transfer(format!("mysql read: {e}"))),
             };
             if let Some(tf) = tf {
                 t_fetch += tf.elapsed();
@@ -1424,9 +1438,9 @@ async fn raw_transfer_worker<L: Loader>(
         };
         if ncols != wire.len() {
             return Err(Error::Transfer(format!(
-                    "mysql wire: span returned {ncols} columns, planned {}",
-                    wire.len()
-                )));
+                "mysql wire: span returned {ncols} columns, planned {}",
+                wire.len()
+            )));
         }
         w.execute(sid).await?;
         loop {
@@ -1818,9 +1832,20 @@ mod tests {
         let mut v = Vec::new();
         for (bytes, unsigned) in [(1, false), (1, true), (2, false), (2, true)] {
             let enc = super::MyTsv::Int { bytes, unsigned };
-            assert!(super::tsv_write(enc, &[], &mut v).is_err(), "{bytes} {unsigned}");
+            assert!(
+                super::tsv_write(enc, &[], &mut v).is_err(),
+                "{bytes} {unsigned}"
+            );
         }
-        assert!(super::tsv_write(super::MyTsv::Int { bytes: 2, unsigned: true }, &[1], &mut v).is_err());
+        assert!(super::tsv_write(
+            super::MyTsv::Int {
+                bytes: 2,
+                unsigned: true
+            },
+            &[1],
+            &mut v
+        )
+        .is_err());
         assert!(super::write_datetime(&[11, 0xE8, 0x07, 1, 1], &mut v).is_err());
     }
 
@@ -1831,7 +1856,10 @@ mod tests {
     fn cursor_bounds_parse_unsigned_text_and_refuse_beyond_i64() {
         assert_eq!(cursor_bounds(Some("5"), Some("10")), Some((5, 10)));
         assert_eq!(cursor_bounds(Some("-3"), Some("-1")), Some((-3, -1)));
-        assert_eq!(cursor_bounds(Some("0"), Some("4294967295")), Some((0, 4294967295)));
+        assert_eq!(
+            cursor_bounds(Some("0"), Some("4294967295")),
+            Some((0, 4294967295))
+        );
         assert_eq!(
             cursor_bounds(Some("0"), Some("18446744073709551615")),
             None,
@@ -1934,10 +1962,34 @@ mod tests {
         };
         let mut cases: Vec<ColumnPlan> = Vec::new();
         for udt in [
-            "tinyint", "smallint", "mediumint", "int", "bigint", "float", "double", "date",
-            "datetime", "timestamp", "year", "char", "varchar", "tinytext", "text",
-            "mediumtext", "longtext", "enum", "set", "time", "json", "binary", "varbinary",
-            "tinyblob", "blob", "mediumblob", "longblob", "bit",
+            "tinyint",
+            "smallint",
+            "mediumint",
+            "int",
+            "bigint",
+            "float",
+            "double",
+            "date",
+            "datetime",
+            "timestamp",
+            "year",
+            "char",
+            "varchar",
+            "tinytext",
+            "text",
+            "mediumtext",
+            "longtext",
+            "enum",
+            "set",
+            "time",
+            "json",
+            "binary",
+            "varbinary",
+            "tinyblob",
+            "blob",
+            "mediumblob",
+            "longblob",
+            "bit",
         ] {
             cases.push(col(udt, None, None, None));
             cases.push(col(udt, Some(&format!("{udt} unsigned")), None, None));

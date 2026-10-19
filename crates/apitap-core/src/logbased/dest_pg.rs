@@ -27,7 +27,9 @@ pub(crate) struct PgDest {
 
 impl PgDest {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: PgStore::connect(url).await? })
+        Ok(Self {
+            store: PgStore::connect(url).await?,
+        })
     }
 
     /// The store: the lease, the guard and the units a run's tenure takes.
@@ -93,13 +95,21 @@ impl PgDest {
         dest_table: &str,
         source_id: &str,
     ) -> Result<Option<crate::naming::CdcWatermark>> {
-        crate::naming::cdc_watermark(dest_table, self.store.read_state(dest_table, source_id).await?)
+        crate::naming::cdc_watermark(
+            dest_table,
+            self.store.read_state(dest_table, source_id).await?,
+        )
     }
 
     /// The bootstrap's full load lands data without constraints; the drain's
     /// apply needs the identity — add it, inside the unit whose close writes
     /// the state row.
-    pub(crate) async fn bootstrap_finish(&self, u: &mut PgUnit, dest_table: &str, pk_cols: &[String]) -> Result<()> {
+    pub(crate) async fn bootstrap_finish(
+        &self,
+        u: &mut PgUnit,
+        dest_table: &str,
+        pk_cols: &[String],
+    ) -> Result<()> {
         add_primary_key(u, dest_table, pk_cols).await
     }
 
@@ -139,8 +149,15 @@ async fn add_primary_key(u: &mut PgUnit, dest_table: &str, pk_cols: &[String]) -
     .await
     .map_err(db_err)?;
     if existing.is_empty() {
-        let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-        u.tx().execute(format!("ALTER TABLE {ft} ADD PRIMARY KEY ({pklist})").as_str()).await.map_err(db_err)?;
+        let pklist = pk_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        u.tx()
+            .execute(format!("ALTER TABLE {ft} ADD PRIMARY KEY ({pklist})").as_str())
+            .await
+            .map_err(db_err)?;
     } else if existing != pk_cols {
         return Err(Error::InvalidInput(format!(
             "log_based: {dest_table} already has PRIMARY KEY ({}) but the \
@@ -180,8 +197,16 @@ async fn apply_unit(
     let (wal_cols, pk_cols, pk_idx) = (l.cols(), l.key_cols(), l.key_idx());
 
     let ft = u.table(0).qualified();
-    let collist = wal_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-    let pklist = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+    let collist = wal_cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pklist = pk_cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let tx = u.tx();
 
     // The MySQL lane ships BLOB/BINARY/BIT cells as their raw bytes (its OIDs
@@ -242,7 +267,9 @@ async fn apply_unit(
         .collect();
 
     if c.truncate {
-        tx.execute(format!("TRUNCATE {ft}").as_str()).await.map_err(db_err)?;
+        tx.execute(format!("TRUNCATE {ft}").as_str())
+            .await
+            .map_err(db_err)?;
     }
 
     // Delete phase covers the delete-set UNION every upsert's key: clearing
@@ -324,11 +351,9 @@ async fn apply_unit(
         copy.finish().await.map_err(db_err)?;
         // No ON CONFLICT: the delete phase already removed every one of
         // these keys, so this is a straight bulk insert.
-        tx.execute(
-            format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up").as_str(),
-        )
-        .await
-        .map_err(db_err)?;
+        tx.execute(format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up").as_str())
+            .await
+            .map_err(db_err)?;
     }
 
     // Residue tail: serial, ordered (masked updates and their followers).
@@ -395,7 +420,11 @@ async fn apply_unit(
                 let pred = key_pred_bound(pk_cols, key, &casts, &key_hex, &mut binds);
                 format!("DELETE FROM {ft} WHERE {pred}")
             }
-            ResidueOp::Rekey { old_key, new_key, row } => {
+            ResidueOp::Rekey {
+                old_key,
+                new_key,
+                row,
+            } => {
                 must_match = Some(("move", new_key));
                 // Move the row rather than delete-and-reinsert. The columns
                 // this UPDATE does not name keep their values, and the one
@@ -450,7 +479,11 @@ async fn apply_unit(
                 for b in &kb {
                     probe = probe.bind(b.as_deref());
                 }
-                probe.fetch_optional(&mut **tx).await.map_err(db_err)?.is_some()
+                probe
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(db_err)?
+                    .is_some()
             } else {
                 false
             };
@@ -464,8 +497,16 @@ async fn apply_unit(
 }
 
 /// A residue op whose row is not at the destination: refused, naming it.
-pub(crate) fn missing_row(dest_table: &str, kind: &str, key: &crate::logbased::collapse::Key) -> Error {
-    let k = key.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>().join(", ");
+pub(crate) fn missing_row(
+    dest_table: &str,
+    kind: &str,
+    key: &crate::logbased::collapse::Key,
+) -> Error {
+    let k = key
+        .iter()
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
     Error::Transfer(format!(
         "log_based: the {kind} update of {dest_table} key ({k}) found no row at the \
          destination — it was deleted or never arrived there, and its unchanged TOAST \
@@ -487,7 +528,9 @@ mod store {
     /// The schema half of a lease key. Keys are `PgParts::label()`, always
     /// qualified, so this never guesses.
     fn key_schema(key: &str) -> String {
-        PgParts::split(key).map(|p| p.schema).unwrap_or_else(|| "public".into())
+        PgParts::split(key)
+            .map(|p| p.schema)
+            .unwrap_or_else(|| "public".into())
     }
 
     /// Every key in a group shares a schema in practice, but not by
@@ -564,12 +607,20 @@ mod store {
         #[cfg(test)]
         pub(crate) fn lazy(url: &str) -> Self {
             let lazy = || PgPoolOptions::new().connect_lazy(url).unwrap();
-            Self { pool: lazy(), keeper_pool: lazy(), parts: Default::default(), state_ready: Default::default() }
+            Self {
+                pool: lazy(),
+                keeper_pool: lazy(),
+                parts: Default::default(),
+                state_ready: Default::default(),
+            }
         }
 
         #[cfg(test)]
         pub(crate) fn pin(&self, table: &str, p: PgParts) {
-            self.parts.lock().expect("parts").insert(table.to_string(), p);
+            self.parts
+                .lock()
+                .expect("parts")
+                .insert(table.to_string(), p);
         }
 
         pub(crate) async fn resolve_names(&self, tables: &[String]) -> Result<()> {
@@ -588,9 +639,14 @@ mod store {
             if let Some(p) = self.parts.lock().expect("parts").get(dest_table) {
                 return p.clone();
             }
-            debug_assert!(dest_table.contains('.'), "{dest_table}: lease key before resolve_names");
-            PgParts::split(dest_table)
-                .unwrap_or_else(|| PgParts { schema: "public".into(), bare: dest_table.into() })
+            debug_assert!(
+                dest_table.contains('.'),
+                "{dest_table}: lease key before resolve_names"
+            );
+            PgParts::split(dest_table).unwrap_or_else(|| PgParts {
+                schema: "public".into(),
+                bare: dest_table.into(),
+            })
         }
 
         pub(crate) fn pg_guard(&self, dest_table: &str) -> (PgGuard, String) {
@@ -700,13 +756,20 @@ mod store {
                 sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(None),
                 _ => Err(db_err(e)),
             })?;
-            Ok(row.map(|(wm, cursor, mode)| crate::naming::StateRow::new(wm, Some(cursor), Some(mode))))
+            Ok(row.map(|(wm, cursor, mode)| {
+                crate::naming::StateRow::new(wm, Some(cursor), Some(mode))
+            }))
         }
 
         /// The schemas this run's keys can live in.
         fn schemas(&self) -> Vec<String> {
-            let mut v: Vec<String> =
-                self.parts.lock().expect("parts").values().map(|p| p.schema.clone()).collect();
+            let mut v: Vec<String> = self
+                .parts
+                .lock()
+                .expect("parts")
+                .values()
+                .map(|p| p.schema.clone())
+                .collect();
             v.sort();
             v.dedup();
             v
@@ -728,7 +791,8 @@ mod store {
         async fn lease_renew(&self, keys: &[String], token: &str) -> Result<u64> {
             let mut n = 0;
             for (schema, ks) in by_schema(keys) {
-                n += crate::sink::postgres::lease_renew(&self.keeper_pool, &schema, &ks, token).await?;
+                n += crate::sink::postgres::lease_renew(&self.keeper_pool, &schema, &ks, token)
+                    .await?;
             }
             Ok(n)
         }
@@ -736,7 +800,10 @@ mod store {
         async fn lease_unclaimed(&self, token: &str) -> Result<Vec<String>> {
             let mut out = Vec::new();
             for schema in self.schemas() {
-                out.extend(crate::sink::postgres::lease_unclaimed(&self.keeper_pool, &schema, token).await?);
+                out.extend(
+                    crate::sink::postgres::lease_unclaimed(&self.keeper_pool, &schema, token)
+                        .await?,
+                );
             }
             Ok(out)
         }
@@ -795,7 +862,12 @@ mod store {
             }
             let parts = keys
                 .iter()
-                .map(|k| PgParts::split(k).unwrap_or_else(|| PgParts { schema: "public".into(), bare: k.clone() }))
+                .map(|k| {
+                    PgParts::split(k).unwrap_or_else(|| PgParts {
+                        schema: "public".into(),
+                        bare: k.clone(),
+                    })
+                })
                 .collect();
             Ok(PgUnit { tx, parts })
         }
@@ -804,10 +876,20 @@ mod store {
         /// which is the transaction's START and would hand a long apply a
         /// lease that expires the moment it commits — then COMMIT. A renewal
         /// that touches no row means the claim is gone: roll back.
-        async fn close_unit<'a>(&'a self, mut u: PgUnit, token: &str, marks: Vec<Watermark>) -> Result<()> {
+        async fn close_unit<'a>(
+            &'a self,
+            mut u: PgUnit,
+            token: &str,
+            marks: Vec<Watermark>,
+        ) -> Result<()> {
             for m in &marks {
                 match m {
-                    Watermark::Set { table, source_id, lsn, rows } => {
+                    Watermark::Set {
+                        table,
+                        source_id,
+                        lsn,
+                        rows,
+                    } => {
                         let st = self.state_table(table);
                         upsert_state_tx(&mut u.tx, &st, table, source_id, *lsn, *rows).await?
                     }
@@ -917,7 +999,12 @@ fn key_pred_bound(
         .enumerate()
         .map(|(i, (c, v))| {
             binds.push(Some(bind_text(v, key_hex.get(i).copied().unwrap_or(false))));
-            format!("{} = ${}::{}", quote_ident(c), binds.len(), cast_of(casts, c))
+            format!(
+                "{} = ${}::{}",
+                quote_ident(c),
+                binds.len(),
+                cast_of(casts, c)
+            )
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -994,29 +1081,61 @@ mod tests {
     /// resolved the real schema.
     #[test]
     fn lease_key_is_dest_label() {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let url = "postgres://u@127.0.0.1:1/db";
-            let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy(url).unwrap();
-            let d = PgStore::lazy(url);
-            let cases = [
-                ("orders", PgParts { schema: "cdcdest".into(), bare: "orders".into() }),
-                ("events", PgParts { schema: "public".into(), bare: "events".into() }),
-                ("Mixed Case", PgParts { schema: "postgres".into(), bare: "Mixed Case".into() }),
-            ];
-            for (t, p) in &cases {
-                d.pin(t, p.clone());
-                assert_eq!(d.lease_key(t), PgGuard::new(pool.clone(), p.schema.clone()).dest_label(&p.bare),
-                           "{t}");
-            }
-            // A qualified name nobody resolved is taken as written, on both sides.
-            assert_eq!(d.lease_key("sales.orders"),
-                       PgGuard::new(pool.clone(), "sales").dest_label("orders"));
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let url = "postgres://u@127.0.0.1:1/db";
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy(url)
+                    .unwrap();
+                let d = PgStore::lazy(url);
+                let cases = [
+                    (
+                        "orders",
+                        PgParts {
+                            schema: "cdcdest".into(),
+                            bare: "orders".into(),
+                        },
+                    ),
+                    (
+                        "events",
+                        PgParts {
+                            schema: "public".into(),
+                            bare: "events".into(),
+                        },
+                    ),
+                    (
+                        "Mixed Case",
+                        PgParts {
+                            schema: "postgres".into(),
+                            bare: "Mixed Case".into(),
+                        },
+                    ),
+                ];
+                for (t, p) in &cases {
+                    d.pin(t, p.clone());
+                    assert_eq!(
+                        d.lease_key(t),
+                        PgGuard::new(pool.clone(), p.schema.clone()).dest_label(&p.bare),
+                        "{t}"
+                    );
+                }
+                // A qualified name nobody resolved is taken as written, on both sides.
+                assert_eq!(
+                    d.lease_key("sales.orders"),
+                    PgGuard::new(pool.clone(), "sales").dest_label("orders")
+                );
+            });
     }
 
     #[test]
     fn qualified_quotes_each_half() {
-        let p = PgParts { schema: "my.schema".into(), bare: "a\"b".into() };
+        let p = PgParts {
+            schema: "my.schema".into(),
+            bare: "a\"b".into(),
+        };
         assert_eq!(p.qualified(), "\"my.schema\".\"a\"\"b\"");
     }
     /// Residue values bind, never embed: a payload carrying a quote, a

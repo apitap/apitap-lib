@@ -25,8 +25,8 @@ const USECS_PER_DAY: i64 = 86_400_000_000;
 /// here — anything else (arrays, enums, domains, interval, inet, ranges, …)
 /// would fail every window, so such a lane stays on text (MASTER review M-7).
 pub(crate) const RENDERED_OIDS: &[u32] = &[
-    16, 21, 23, 20, 26, 28, 29, 700, 701, 1700, 25, 1043, 1042, 19, 114, 142, 705, 17,
-    3802, 2950, 1082, 1083, 1114, 1184, 1266,
+    16, 21, 23, 20, 26, 28, 29, 700, 701, 1700, 25, 1043, 1042, 19, 114, 142, 705, 17, 3802, 2950,
+    1082, 1083, 1114, 1184, 1266,
 ];
 
 /// Whether [`render`] can turn `oid`'s send format into its text form.
@@ -88,7 +88,9 @@ pub(crate) fn render(oid: u32, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
 }
 
 fn short(oid: u32) -> Error {
-    Error::Transfer(format!("pgoutput binary: truncated value for type OID {oid}"))
+    Error::Transfer(format!(
+        "pgoutput binary: truncated value for type OID {oid}"
+    ))
 }
 
 fn fixed<const N: usize>(raw: &[u8], oid: u32) -> Result<[u8; N]> {
@@ -143,7 +145,11 @@ fn normalize(s: &str, buf: &mut [u8; 32]) -> (usize, i32) {
             for &c in &frac[lead..] {
                 push(c, &mut n);
             }
-            if n == 0 { 0 } else { -(lead as i32) - 1 }
+            if n == 0 {
+                0
+            } else {
+                -(lead as i32) - 1
+            }
         }
         None => {
             for &c in int.iter().chain(frac) {
@@ -181,7 +187,11 @@ fn push_float(v: f64, single: bool, out: &mut Vec<u8>) {
         return;
     }
     let mut b = ryu::Buffer::new();
-    let s = if single { b.format_finite(v as f32) } else { b.format_finite(v) };
+    let s = if single {
+        b.format_finite(v as f32)
+    } else {
+        b.format_finite(v)
+    };
     let (neg, s) = match s.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s),
@@ -313,9 +323,15 @@ fn uuid(raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
     if raw.len() != 16 {
         return Err(short(2950));
     }
-    for (i, chunk) in [&raw[0..4], &raw[4..6], &raw[6..8], &raw[8..10], &raw[10..16]]
-        .iter()
-        .enumerate()
+    for (i, chunk) in [
+        &raw[0..4],
+        &raw[4..6],
+        &raw[6..8],
+        &raw[8..10],
+        &raw[10..16],
+    ]
+    .iter()
+    .enumerate()
     {
         if i > 0 {
             out.push(b'-');
@@ -526,7 +542,11 @@ mod tests {
             // Shortest form has no significant trailing zeros; anything trailing
             // here is positional (e.g. "100.0" → "100") and re-derivable.
             let t = digits.trim_end_matches('0');
-            if t.is_empty() { "0" } else { t }
+            if t.is_empty() {
+                "0"
+            } else {
+                t
+            }
         };
         (digits.to_string(), exp10)
     }
@@ -540,7 +560,11 @@ mod tests {
             let mut buf = [0u8; 32];
             let (n, e) = super::normalize(s, &mut buf);
             let (want, we) = normalize_ref(s);
-            assert_eq!((std::str::from_utf8(&buf[..n]).unwrap(), e), (want.as_str(), we), "{s}");
+            assert_eq!(
+                (std::str::from_utf8(&buf[..n]).unwrap(), e),
+                (want.as_str(), we),
+                "{s}"
+            );
         };
         for _ in 0..10_000 {
             x ^= x << 13;
@@ -556,7 +580,9 @@ mod tests {
                 check(b.format_finite(f.abs()));
             }
         }
-        for v in [0.0f64, 1.0, 100.0, 1e14, 1e15, 0.0001, 1e-5, 5e-324, 1.79e308, 123.456] {
+        for v in [
+            0.0f64, 1.0, 100.0, 1e14, 1e15, 0.0001, 1e-5, 5e-324, 1.79e308, 123.456,
+        ] {
             check(ryu::Buffer::new().format_finite(v));
         }
     }
@@ -583,7 +609,10 @@ mod tests {
         assert_eq!(r(701, &1e15f64.to_be_bytes()), "1e+15");
         assert_eq!(r(701, &0.0001f64.to_be_bytes()), "0.0001");
         assert_eq!(r(701, &0.00015f64.to_be_bytes()), "0.00015");
-        assert_eq!(r(701, &123456789012345.6f64.to_be_bytes()), "123456789012345.6");
+        assert_eq!(
+            r(701, &123456789012345.6f64.to_be_bytes()),
+            "123456789012345.6"
+        );
         assert_eq!(r(701, &1.79e308f64.to_be_bytes()), "1.79e+308");
         assert_eq!(r(701, &5e-324f64.to_be_bytes()), "5e-324");
         assert_eq!(r(701, &1234.5678f64.to_be_bytes()), "1234.5678");
@@ -635,7 +664,10 @@ mod tests {
         let us3 = us - 500_000 + 102_030;
         assert_eq!(r(1184, &us3.to_be_bytes()), "2026-08-16 12:34:56.10203+00");
         // Pre-2000 (negative µs): 1999-12-31 23:59:59.
-        assert_eq!(r(1114, &(-1_000_000i64).to_be_bytes()), "1999-12-31 23:59:59");
+        assert_eq!(
+            r(1114, &(-1_000_000i64).to_be_bytes()),
+            "1999-12-31 23:59:59"
+        );
         assert_eq!(r(1082, &i32::MAX.to_be_bytes()), "infinity");
         assert_eq!(r(1184, &i64::MIN.to_be_bytes()), "-infinity");
         // 0001-01-01 BC is ISO year 0: 719528 days before 1970-01-01, so
@@ -651,8 +683,13 @@ mod tests {
         assert_eq!(r(3802, b"\x01{\"a\": 1}"), "{\"a\": 1}");
         assert_eq!(r(17, &[0xde, 0xad, 0x00]), "\\xdead00");
         assert_eq!(
-            r(2950, &[0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
-                      0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00]),
+            r(
+                2950,
+                &[
+                    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
+                    0x44, 0x00, 0x00
+                ]
+            ),
             "550e8400-e29b-41d4-a716-446655440000"
         );
     }

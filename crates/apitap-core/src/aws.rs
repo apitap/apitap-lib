@@ -36,7 +36,9 @@ pub(crate) fn read_credentials(
         })?;
     let secret_access_key = secret
         .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
-        .ok_or_else(|| Error::InvalidInput("s3: access_key_id set but secret_access_key missing".into()))?;
+        .ok_or_else(|| {
+            Error::InvalidInput("s3: access_key_id set but secret_access_key missing".into())
+        })?;
     let session_token = token.or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
     Ok(AwsCreds {
         access_key_id,
@@ -95,10 +97,7 @@ pub(crate) fn sigv4_headers(
         }
         out
     }
-    let mut q: Vec<(String, String)> = query
-        .iter()
-        .map(|(k, v)| (enc_q(k), enc_q(v)))
-        .collect();
+    let mut q: Vec<(String, String)> = query.iter().map(|(k, v)| (enc_q(k), enc_q(v))).collect();
     q.sort();
     let canonical_query = q
         .iter()
@@ -138,7 +137,10 @@ pub(crate) fn sigv4_headers(
         sha256_hex(canonical_request.as_bytes())
     );
 
-    let k_date = hmac(format!("AWS4{}", creds.secret_access_key).as_bytes(), date.as_bytes());
+    let k_date = hmac(
+        format!("AWS4{}", creds.secret_access_key).as_bytes(),
+        date.as_bytes(),
+    );
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, b"s3");
     let k_signing = hmac(&k_service, b"aws4_request");
@@ -152,7 +154,10 @@ pub(crate) fn sigv4_headers(
     let mut out = vec![
         ("authorization".to_string(), authorization),
         ("x-amz-date".to_string(), amz_date.to_string()),
-        ("x-amz-content-sha256".to_string(), content_sha256.to_string()),
+        (
+            "x-amz-content-sha256".to_string(),
+            content_sha256.to_string(),
+        ),
     ];
     if let Some(t) = &creds.session_token {
         out.push(("x-amz-security-token".to_string(), t.clone()));
@@ -200,7 +205,10 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"
         ));
         assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
-        assert_eq!(hdrs[1], ("x-amz-date".to_string(), "20130524T000000Z".to_string()));
+        assert_eq!(
+            hdrs[1],
+            ("x-amz-date".to_string(), "20130524T000000Z".to_string())
+        );
     }
 
     /// Full known-answer: AWS documentation's exact example WITHOUT extra
@@ -219,7 +227,10 @@ mod tests {
             "PUT",
             "127.0.0.1:9100",
             "/apitap-bench/t/part-00000.parquet",
-            &[("partNumber".into(), "1".into()), ("uploadId".into(), "abc+/=".into())],
+            &[
+                ("partNumber".into(), "1".into()),
+                ("uploadId".into(), "abc+/=".into()),
+            ],
             "us-east-1",
             "20260801T000000Z",
             UNSIGNED_PAYLOAD,

@@ -56,7 +56,9 @@ fn single_pk(pk_cols: &[String]) -> Result<&str> {
 
 impl IceDest {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: IceStore::connect(url).await? })
+        Ok(Self {
+            store: IceStore::connect(url).await?,
+        })
     }
 
     /// The store: the one `Unguarded` one — see the module doc.
@@ -71,7 +73,10 @@ impl IceDest {
         dest_table: &str,
         source_id: &str,
     ) -> Result<Option<crate::naming::CdcWatermark>> {
-        crate::naming::cdc_watermark(bare(dest_table), self.store.read_state(dest_table, source_id).await?)
+        crate::naming::cdc_watermark(
+            bare(dest_table),
+            self.store.read_state(dest_table, source_id).await?,
+        )
     }
 
     /// The bootstrap's replace just created the table (and cleared every
@@ -143,7 +148,8 @@ async fn apply_unit(
     // Replay the residue tail over the set-phase upserts into one entry per
     // key; unresolved TOAST holes go back to the source.
     let mut r = resolve_window(w);
-    src.refetch_masked(&mut r, qualified_src, pk, wal_cols, oids).await?;
+    src.refetch_masked(&mut r, qualified_src, pk, wal_cols, oids)
+        .await?;
 
     // Delete-set: every touched key (deleted or re-landed), each once. A
     // TRUNCATE window starts from an empty manifest list — nothing old to
@@ -163,7 +169,10 @@ async fn apply_unit(
         }
     }
 
-    let n_rows = r.rows().filter(|(_, image)| !matches!(image, Image::Delete)).count() as u64;
+    let n_rows = r
+        .rows()
+        .filter(|(_, image)| !matches!(image, Image::Delete))
+        .count() as u64;
     let data = if n_rows > 0 {
         let mut enc = ParquetEncoder::new_ext(
             wal_cols.to_vec(),
@@ -296,8 +305,7 @@ fn encode_cell(t: &[u8], d: &Delivered, out: &mut Vec<u8>) -> Result<()> {
 }
 
 fn text(t: &[u8]) -> Result<&str> {
-    std::str::from_utf8(t)
-        .map_err(|_| Error::Transfer("log_based: non-UTF8 text cell".into()))
+    std::str::from_utf8(t).map_err(|_| Error::Transfer("log_based: non-UTF8 text cell".into()))
 }
 
 fn bad_cell(t: &[u8], what: &str) -> Error {
@@ -383,20 +391,38 @@ mod store {
 
     impl IceUnit<'_> {
         /// Load the table and conform it to the window's columns (a read).
-        pub(crate) async fn bind(&self, dest_table: &str, wal_cols: &[String], oids: &[u32]) -> Result<Bound> {
-            cdc_bind(&self.s.conn, bare(dest_table), wal_cols, oids).await.map(Bound)
+        pub(crate) async fn bind(
+            &self,
+            dest_table: &str,
+            wal_cols: &[String],
+            oids: &[u32],
+        ) -> Result<Bound> {
+            cdc_bind(&self.s.conn, bare(dest_table), wal_cols, oids)
+                .await
+                .map(Bound)
         }
 
         /// Hold a rendered window for the close, which commits it and its
         /// watermark as one snapshot.
-        pub(crate) fn stage(&mut self, dest_table: &str, b: Bound, pk_idx: usize, window: CdcWindow) -> Result<()> {
+        pub(crate) fn stage(
+            &mut self,
+            dest_table: &str,
+            b: Bound,
+            pk_idx: usize,
+            window: CdcWindow,
+        ) -> Result<()> {
             if let Some(s) = &self.staged {
                 return Err(Error::Transfer(format!(
                     "internal: {dest_table}: a second window staged in one unit (it holds {})",
                     s.table
                 )));
             }
-            self.staged = Some(Staged { table: dest_table.to_string(), bound: b.0, pk_idx, window });
+            self.staged = Some(Staged {
+                table: dest_table.to_string(),
+                bound: b.0,
+                pk_idx,
+                window,
+            });
             Ok(())
         }
     }
@@ -404,7 +430,9 @@ mod store {
     /// The mark a staged window commits with: the `Set` naming its table. A
     /// `Clear`, or another table's `Set`, never carries it.
     pub(super) fn carrier(staged: &str, marks: &[Watermark]) -> Option<usize> {
-        marks.iter().position(|m| matches!(m, Watermark::Set { table, .. } if bare(table) == bare(staged)))
+        marks
+            .iter()
+            .position(|m| matches!(m, Watermark::Set { table, .. } if bare(table) == bare(staged)))
     }
 
     /// The guard of a destination that has none: announces nothing, sees
@@ -422,7 +450,11 @@ mod store {
         fn dest_label(&self, bare: &str) -> String {
             bare.to_string()
         }
-        async fn list(&self, _bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        async fn list(
+            &self,
+            _bare: &str,
+            _kinds: &[crate::naming::Artifact],
+        ) -> Result<Vec<crate::guard::Listed>> {
             Ok(Vec::new())
         }
         async fn create_marker(&self, _raw: &str) -> Result<()> {
@@ -442,7 +474,11 @@ mod store {
 
     impl IceStore {
         pub(crate) async fn connect(url: &str) -> Result<Self> {
-            Ok(Self { conn: IcebergConn::parse(url).await?, opened: Default::default(), idle_stamped: Default::default() })
+            Ok(Self {
+                conn: IcebergConn::parse(url).await?,
+                opened: Default::default(),
+                idle_stamped: Default::default(),
+            })
         }
 
         pub(crate) async fn read_state(
@@ -460,7 +496,10 @@ mod store {
         }
 
         async fn lease_open(&self, keys: &[String], token: &str) -> Result<()> {
-            self.opened.lock().expect("opened").insert(token.to_string(), keys.to_vec());
+            self.opened
+                .lock()
+                .expect("opened")
+                .insert(token.to_string(), keys.to_vec());
             Ok(())
         }
 
@@ -469,7 +508,13 @@ mod store {
         }
 
         async fn lease_unclaimed(&self, token: &str) -> Result<Vec<String>> {
-            Ok(self.opened.lock().expect("opened").get(token).cloned().unwrap_or_default())
+            Ok(self
+                .opened
+                .lock()
+                .expect("opened")
+                .get(token)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn close_run(&self, token: &str) -> Result<()> {
@@ -487,7 +532,10 @@ mod store {
 
         /// No I/O and no fence: there is no lease row to hold.
         async fn open_unit<'a>(&'a self, _keys: &[String], _token: &str) -> Result<IceUnit<'a>> {
-            Ok(IceUnit { s: self, staged: None })
+            Ok(IceUnit {
+                s: self,
+                staged: None,
+            })
         }
 
         /// Each mark in order. The `Set` for the staged table commits the
@@ -495,7 +543,12 @@ mod store {
         /// any other `Set` stamps a watermark alone, and a `Clear` removes one.
         /// A staged window that no `Set` names is refused before anything is
         /// committed: dropping it would report a window applied that never was.
-        async fn close_unit<'a>(&'a self, u: IceUnit<'a>, _token: &str, marks: Vec<Watermark>) -> Result<()> {
+        async fn close_unit<'a>(
+            &'a self,
+            u: IceUnit<'a>,
+            _token: &str,
+            marks: Vec<Watermark>,
+        ) -> Result<()> {
             let IceUnit { mut staged, .. } = u;
             let at = match &staged {
                 Some(s) => Some(carrier(&s.table, &marks).ok_or_else(|| {
@@ -509,12 +562,31 @@ mod store {
             for (i, m) in marks.into_iter().enumerate() {
                 match m {
                     Watermark::Set { source_id, lsn, .. } if Some(i) == at => {
-                        let Staged { bound, pk_idx, window, .. } = staged.take().expect("the carried window");
+                        let Staged {
+                            bound,
+                            pk_idx,
+                            window,
+                            ..
+                        } = staged.take().expect("the carried window");
                         // The watermark is the mark's, like every other
                         // destination's: the body only rendered the window.
-                        bound.cdc_commit(&source_id, pk_idx, CdcWindow { end_lsn: lsn, ..window }).await?
+                        bound
+                            .cdc_commit(
+                                &source_id,
+                                pk_idx,
+                                CdcWindow {
+                                    end_lsn: lsn,
+                                    ..window
+                                },
+                            )
+                            .await?
                     }
-                    Watermark::Set { table, source_id, lsn, rows } => {
+                    Watermark::Set {
+                        table,
+                        source_id,
+                        lsn,
+                        rows,
+                    } => {
                         let key = (table.clone(), source_id.clone());
                         let due = rows > 0
                             || self
@@ -554,10 +626,14 @@ mod tests {
 
     #[test]
     fn wal_cells_roundtrip_through_parquet() {
-        let names: Vec<String> =
-            ["id", "name", "ok", "ts", "day", "uid", "amt"].map(String::from).to_vec();
+        let names: Vec<String> = ["id", "name", "ok", "ts", "day", "uid", "amt"]
+            .map(String::from)
+            .to_vec();
         let delivered = vec![
-            Delivered::Int { bytes: 8, unsigned: false },
+            Delivered::Int {
+                bytes: 8,
+                unsigned: false,
+            },
             Delivered::Text,
             Delivered::Bool,
             Delivered::DateTime { utc: true },
@@ -596,7 +672,13 @@ mod tests {
 
         let bytes = enc.out.0.lock().unwrap().clone();
         let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
-        let r = reader.get_row_iter(None).unwrap().next().unwrap().unwrap().to_string();
+        let r = reader
+            .get_row_iter(None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .to_string();
         assert!(r.contains("id: 42"), "{r}");
         assert!(r.contains("héllo"), "{r}");
         assert!(r.contains("ok: true"), "{r}");
@@ -612,10 +694,20 @@ mod tests {
         let mut out = Vec::new();
         encode_cell(b"true", &Delivered::Bool, &mut out).unwrap();
         encode_cell(b"f", &Delivered::Bool, &mut out).unwrap();
-        assert_eq!(out, [&1i32.to_be_bytes()[..], &[1], &1i32.to_be_bytes(), &[0]].concat());
+        assert_eq!(
+            out,
+            [&1i32.to_be_bytes()[..], &[1], &1i32.to_be_bytes(), &[0]].concat()
+        );
         assert!(encode_cell(b"yes", &Delivered::Bool, &mut Vec::new()).is_err());
-        assert!(encode_cell(b"abc", &Delivered::Int { bytes: 8, unsigned: false }, &mut Vec::new())
-            .is_err());
+        assert!(encode_cell(
+            b"abc",
+            &Delivered::Int {
+                bytes: 8,
+                unsigned: false
+            },
+            &mut Vec::new()
+        )
+        .is_err());
         // bytea rides \x-hex from both the WAL and the forced refetch form.
         let mut b = Vec::new();
         encode_cell(b"\\x4869", &Delivered::Bytes, &mut b).unwrap();
@@ -628,8 +720,16 @@ mod tests {
     /// was qualified), never with a `Clear` or another table's watermark.
     #[test]
     fn a_staged_window_rides_its_own_set() {
-        let set = |t: &str| Watermark::Set { table: t.into(), source_id: "s".into(), lsn: 7, rows: 0 };
-        let clear = |t: &str| Watermark::Clear { table: t.into(), source_id: "s".into() };
+        let set = |t: &str| Watermark::Set {
+            table: t.into(),
+            source_id: "s".into(),
+            lsn: 7,
+            rows: 0,
+        };
+        let clear = |t: &str| Watermark::Clear {
+            table: t.into(),
+            source_id: "s".into(),
+        };
         assert_eq!(store::carrier("t", &[set("u"), set("t")]), Some(1));
         assert_eq!(store::carrier("ns.t", &[set("t")]), Some(0));
         assert_eq!(store::carrier("t", &[clear("t"), set("u")]), None);
@@ -665,17 +765,29 @@ mod tests {
     #[test]
     fn an_unguarded_tenure_is_never_evicted() {
         use std::time::Duration;
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let store = std::sync::Arc::new(IceStore::connect(&catalog().await).await.unwrap());
-            let tables = ["a".to_string(), "b".to_string()];
-            let run = crate::naming::RunId::mint_drain("s");
-            let t = crate::lease::Tenure::acquire_every(store, &tables, run, Duration::from_millis(10))
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = std::sync::Arc::new(IceStore::connect(&catalog().await).await.unwrap());
+                let tables = ["a".to_string(), "b".to_string()];
+                let run = crate::naming::RunId::mint_drain("s");
+                let t = crate::lease::Tenure::acquire_every(
+                    store,
+                    &tables,
+                    run,
+                    Duration::from_millis(10),
+                )
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            let h = t.open(&["a"]).await.expect("a keeper tick evicted an unguarded run");
-            t.close(h, vec![]).await.unwrap();
-            t.release().await;
-        });
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                let h = t
+                    .open(&["a"])
+                    .await
+                    .expect("a keeper tick evicted an unguarded run");
+                t.close(h, vec![]).await.unwrap();
+                t.release().await;
+            });
     }
 }

@@ -62,18 +62,16 @@ fn pos_u32(file: &str, pos: u64) -> Result<u32> {
 /// A rows event's 6-byte table id. The event split guarantees only the
 /// header, so a body under 6 bytes indexed out of bounds (P2, T1).
 fn rows_table_id(body: &[u8]) -> Result<u64> {
-    let head = body
-        .get(..6)
-        .ok_or_else(|| Error::Transfer("mysql binlog: rows event shorter than its table id".into()))?;
+    let head = body.get(..6).ok_or_else(|| {
+        Error::Transfer("mysql binlog: rows event shorter than its table id".into())
+    })?;
     let mut b = [0u8; 8];
     b[..6].copy_from_slice(head);
     Ok(u64::from_le_bytes(b))
 }
 
 /// Current coordinates + the binlog file prefix, from the control pool.
-pub(crate) async fn master_position(
-    pool: &sqlx::MySqlPool,
-) -> Result<(String, u32)> {
+pub(crate) async fn master_position(pool: &sqlx::MySqlPool) -> Result<(String, u32)> {
     // 8.4 renamed the statement; try the modern spelling first so the
     // 8.4 path never hits the removed one (see the known-hang note).
     for sql in ["SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"] {
@@ -98,7 +96,8 @@ pub(crate) async fn master_position(
         }
     }
     Err(Error::Transfer(
-        "cannot read binlog coordinates (tried SHOW BINARY LOG STATUS and SHOW MASTER STATUS)".into(),
+        "cannot read binlog coordinates (tried SHOW BINARY LOG STATUS and SHOW MASTER STATUS)"
+            .into(),
     ))
 }
 
@@ -269,11 +268,10 @@ pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
         // ANNOTATE_ROWS frames) is decoded by the same reader — but its
         // event compression is a separate binlog encoding we do not speak,
         // and it is a MariaDB-only variable, so probe it here.
-        if let Ok((_, v)) = sqlx::query_as::<_, (String, String)>(
-            "SHOW VARIABLES LIKE 'log_bin_compress'",
-        )
-        .fetch_one(pool)
-        .await
+        if let Ok((_, v)) =
+            sqlx::query_as::<_, (String, String)>("SHOW VARIABLES LIKE 'log_bin_compress'")
+                .fetch_one(pool)
+                .await
         {
             if v.eq_ignore_ascii_case("ON") {
                 return Err(Error::InvalidInput(
@@ -302,11 +300,10 @@ pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
         ),
     ];
     for (var, expect, hint) in want {
-        let (_, val): (String, String) =
-            sqlx::query_as(&format!("SHOW VARIABLES LIKE '{var}'"))
-                .fetch_one(pool)
-                .await
-                .map_err(|e| Error::Transfer(format!("probe {var}: {e}")))?;
+        let (_, val): (String, String) = sqlx::query_as(&format!("SHOW VARIABLES LIKE '{var}'"))
+            .fetch_one(pool)
+            .await
+            .map_err(|e| Error::Transfer(format!("probe {var}: {e}")))?;
         if !val.eq_ignore_ascii_case(expect) {
             return Err(Error::InvalidInput(format!(
                 "log_based: {var}={val} — {hint}"
@@ -316,11 +313,10 @@ pub(crate) async fn precheck(pool: &sqlx::MySqlPool) -> Result<()> {
     // Row images must carry the key columns; MINIMAL only ships the PK for
     // before-images, which the collapse layer handles, but NOBLOB/PARTIAL
     // JSON diffs would arrive unreadable.
-    if let Ok((_, v)) = sqlx::query_as::<_, (String, String)>(
-        "SHOW VARIABLES LIKE 'binlog_row_value_options'",
-    )
-    .fetch_one(pool)
-    .await
+    if let Ok((_, v)) =
+        sqlx::query_as::<_, (String, String)>("SHOW VARIABLES LIKE 'binlog_row_value_options'")
+            .fetch_one(pool)
+            .await
     {
         if !v.is_empty() {
             return Err(Error::InvalidInput(format!(
@@ -396,7 +392,8 @@ pub(crate) async fn fetch_schema(
     // with no error (system review 2026-10-07, R2). Refuse and name the
     // columns; the fix is a source-side conversion.
     let bad_charset = non_utf8_string_columns(
-        rows.iter().map(|r| (r.0.as_str(), r.3.as_str(), r.4.as_deref())),
+        rows.iter()
+            .map(|r| (r.0.as_str(), r.3.as_str(), r.4.as_deref())),
     );
     if !bad_charset.is_empty() {
         return Err(Error::InvalidInput(format!(
@@ -432,8 +429,14 @@ pub(crate) async fn fetch_schema(
     // COLUMN_KEY='PRI' marks primary-key members.
     Ok(TableSchema {
         names: rows.iter().map(|r| r.0.clone()).collect(),
-        kinds: rows.iter().map(|r| crate::wire::mybinlog::catalog_kind(&r.3)).collect(),
-        binaries: rows.iter().map(|r| r.3.eq_ignore_ascii_case("binary")).collect(),
+        kinds: rows
+            .iter()
+            .map(|r| crate::wire::mybinlog::catalog_kind(&r.3))
+            .collect(),
+        binaries: rows
+            .iter()
+            .map(|r| r.3.eq_ignore_ascii_case("binary"))
+            .collect(),
         key: rows.iter().map(|r| r.1 == "PRI").collect(),
         unsigned: rows
             .iter()
@@ -854,7 +857,13 @@ pub(crate) async fn drain_binlog(
                     // next GTID event cleared the buffer before it was drained
                     // (the rows vanished silently) and MySQL held them until the
                     // next XID (system review 2026-10-07, R1).
-                    drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
+                    drain_tx(
+                        &mut tx_buf,
+                        changelog,
+                        &sess.layouts,
+                        &mut changelogs,
+                        &mut collapsers,
+                    )?;
                     end_mark = pack_pos(&sess.file, h.log_pos);
                     if end_mark >= stop_line {
                         break;
@@ -867,7 +876,13 @@ pub(crate) async fn drain_binlog(
                     // Anything already buffered belongs to the transaction this
                     // DDL implicitly committed, so it lands FIRST, under the
                     // layouts it was decoded against.
-                    drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
+                    drain_tx(
+                        &mut tx_buf,
+                        changelog,
+                        &sess.layouts,
+                        &mut changelogs,
+                        &mut collapsers,
+                    )?;
                     // A DDL may change any table's columns, and the QUERY
                     // event's `db` is the session's default database, not
                     // necessarily the altered table's (`ALTER TABLE other.t`),
@@ -906,7 +921,13 @@ pub(crate) async fn drain_binlog(
                                 // window failed for want of a column list.
                                 layout_for(sess, pool, &t).await?;
                                 tx_buf.push((Arc::from(t.as_str()), TxOp::Truncate));
-                                drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
+                                drain_tx(
+                                    &mut tx_buf,
+                                    changelog,
+                                    &sess.layouts,
+                                    &mut changelogs,
+                                    &mut collapsers,
+                                )?;
                             }
                             // A truncate of a table this run does not track is
                             // none of our business.
@@ -942,7 +963,13 @@ pub(crate) async fn drain_binlog(
             bl::TYPE_XID => {
                 // Commit boundary: the buffered ops become real, and the
                 // watermark advances to the position AFTER this event.
-                drain_tx(&mut tx_buf, changelog, &sess.layouts, &mut changelogs, &mut collapsers)?;
+                drain_tx(
+                    &mut tx_buf,
+                    changelog,
+                    &sess.layouts,
+                    &mut changelogs,
+                    &mut collapsers,
+                )?;
                 end_mark = pack_pos(&sess.file, h.log_pos);
                 if end_mark >= stop_line {
                     break;
@@ -999,15 +1026,16 @@ enum TxOp {
 }
 
 fn cells_bytes(row: &Tuple) -> usize {
-    std::iter::once(row.frame.len() + row.cells.len() * 12)
-        .sum::<usize>()
-        + 48
+    std::iter::once(row.frame.len() + row.cells.len() * 12).sum::<usize>() + 48
 }
 
 /// Charsets whose bytes are UTF-8 (or a strict subset), so a binlog string can
 /// be stored as text as-is. `utf8` is utf8mb3's alias.
 fn charset_is_utf8_compatible(cs: &str) -> bool {
-    matches!(cs.to_ascii_lowercase().as_str(), "utf8" | "utf8mb3" | "utf8mb4" | "ascii")
+    matches!(
+        cs.to_ascii_lowercase().as_str(),
+        "utf8" | "utf8mb3" | "utf8mb4" | "ascii"
+    )
 }
 
 /// String-typed columns whose charset is not UTF-8-compatible, in catalog
@@ -1015,8 +1043,16 @@ fn charset_is_utf8_compatible(cs: &str) -> bool {
 fn non_utf8_string_columns<'a>(
     rows: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
 ) -> Vec<(String, String)> {
-    const STRING_TYPES: &[&str] =
-        &["char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set"];
+    const STRING_TYPES: &[&str] = &[
+        "char",
+        "varchar",
+        "tinytext",
+        "text",
+        "mediumtext",
+        "longtext",
+        "enum",
+        "set",
+    ];
     rows.filter(|(_, dt, cs)| {
         STRING_TYPES.iter().any(|t| dt.eq_ignore_ascii_case(t))
             && cs.is_some_and(|c| !charset_is_utf8_compatible(c))
@@ -1050,7 +1086,9 @@ fn drain_tx(
 ) -> Result<()> {
     let layout_of = |t: &str| {
         layouts.get(t).cloned().ok_or_else(|| {
-            Error::Transfer(format!("log_based: no column layout for {t} — decoder invariant broken"))
+            Error::Transfer(format!(
+                "log_based: no column layout for {t} — decoder invariant broken"
+            ))
         })
     };
     for (table, op) in tx_buf.drain(..) {
@@ -1058,7 +1096,9 @@ fn drain_tx(
             if !changelogs.contains_key(table.as_ref()) {
                 changelogs.insert(table.to_string(), Changes::new(layout_of(&table)?));
             }
-            let c = changelogs.get_mut(table.as_ref()).expect("changelog just ensured");
+            let c = changelogs
+                .get_mut(table.as_ref())
+                .expect("changelog just ensured");
             match op {
                 TxOp::Insert(row) => c.insert(row),
                 TxOp::Update(old, row) => c.update(old.as_ref(), row),
@@ -1070,7 +1110,9 @@ fn drain_tx(
         if !collapsers.contains_key(table.as_ref()) {
             collapsers.insert(table.to_string(), Collapser::new(layout_of(&table)?));
         }
-        let c = collapsers.get_mut(table.as_ref()).expect("collapser just ensured");
+        let c = collapsers
+            .get_mut(table.as_ref())
+            .expect("collapser just ensured");
         match op {
             TxOp::Insert(row) => c.insert(row)?,
             TxOp::Update(old, row) => c.update(old.as_ref(), row)?,
@@ -1268,7 +1310,10 @@ mod charset_tests {
         let bad = non_utf8_string_columns(rows.into_iter());
         assert_eq!(
             bad,
-            vec![("a".to_string(), "latin1".to_string()), ("d".to_string(), "latin1".to_string())]
+            vec![
+                ("a".to_string(), "latin1".to_string()),
+                ("d".to_string(), "latin1".to_string())
+            ]
         );
     }
 }
@@ -1338,9 +1383,18 @@ mod truncate_tests {
     /// leading comment is skipped the way query_verb skips it.
     #[test]
     fn a_truncate_target_survives_multibyte_names_and_comments() {
-        assert_eq!(truncate_target("TRUNCATE 表名", "bench").as_deref(), Some("bench.表名"));
-        assert_eq!(truncate_target("TRUNCATE tablex", "b").as_deref(), Some("b.tablex"));
-        assert_eq!(truncate_target("TRUNCATE TABLE tablex", "b").as_deref(), Some("b.tablex"));
+        assert_eq!(
+            truncate_target("TRUNCATE 表名", "bench").as_deref(),
+            Some("bench.表名")
+        );
+        assert_eq!(
+            truncate_target("TRUNCATE tablex", "b").as_deref(),
+            Some("b.tablex")
+        );
+        assert_eq!(
+            truncate_target("TRUNCATE TABLE tablex", "b").as_deref(),
+            Some("b.tablex")
+        );
         assert_eq!(
             truncate_target(strip_leading_noise("/* app */ TRUNCATE t"), "b").as_deref(),
             Some("b.t")
@@ -1361,10 +1415,18 @@ mod truncate_tests {
             ("TRUNCATE TABLE other.t", "other.t"),
             ("  TRUNCATE   TABLE   t ;", "bench.t"),
         ] {
-            assert_eq!(truncate_target(sql, "bench").as_deref(), Some(want), "{sql}");
+            assert_eq!(
+                truncate_target(sql, "bench").as_deref(),
+                Some(want),
+                "{sql}"
+            );
         }
         // Not a truncate at all.
-        for sql in ["DROP TABLE t", "ALTER TABLE t ADD c INT", "INSERT INTO t VALUES (1)"] {
+        for sql in [
+            "DROP TABLE t",
+            "ALTER TABLE t ADD c INT",
+            "INSERT INTO t VALUES (1)",
+        ] {
             assert_eq!(truncate_target(sql, "bench"), None, "{sql}");
         }
         // A truncate whose target cannot be read returns None — the caller turns
@@ -1383,22 +1445,48 @@ mod truncate_tests {
     fn drain_tx_truncate_only_builds_window() {
         use std::collections::HashMap;
         let l = Layout::for_test(&["id", "v"], &[], &["id"]);
-        let layouts: HashMap<String, Arc<Layout>> = [("bench.t".to_string(), l.clone())].into_iter().collect();
+        let layouts: HashMap<String, Arc<Layout>> =
+            [("bench.t".to_string(), l.clone())].into_iter().collect();
         let key: Arc<str> = Arc::from("bench.t");
 
         // replica lane: no body yet, only the truncate
         let mut collapsers: HashMap<String, Collapser> = HashMap::new();
         let mut buf = vec![(key.clone(), TxOp::Truncate)];
-        drain_tx(&mut buf, false, &layouts, &mut HashMap::new(), &mut collapsers).expect("drain");
-        let w = collapsers.remove("bench.t").expect("the truncate built the table's body").seal("bench.t").unwrap();
-        assert!(w.body().truncate, "the replica window must carry the truncate");
+        drain_tx(
+            &mut buf,
+            false,
+            &layouts,
+            &mut HashMap::new(),
+            &mut collapsers,
+        )
+        .expect("drain");
+        let w = collapsers
+            .remove("bench.t")
+            .expect("the truncate built the table's body")
+            .seal("bench.t")
+            .unwrap();
+        assert!(
+            w.body().truncate,
+            "the replica window must carry the truncate"
+        );
         assert_eq!(w.layout(), &*l, "…and the table's layout");
 
         // changelog lane: one T record, and the layout
         let mut changelogs: HashMap<String, Changes> = HashMap::new();
         let mut buf = vec![(key.clone(), TxOp::Truncate)];
-        drain_tx(&mut buf, true, &layouts, &mut changelogs, &mut HashMap::new()).expect("drain");
-        let w = changelogs.remove("bench.t").expect("the truncate built the table's body").seal("bench.t").unwrap();
+        drain_tx(
+            &mut buf,
+            true,
+            &layouts,
+            &mut changelogs,
+            &mut HashMap::new(),
+        )
+        .expect("drain");
+        let w = changelogs
+            .remove("bench.t")
+            .expect("the truncate built the table's body")
+            .seal("bench.t")
+            .unwrap();
         let ops: Vec<_> = w.body().events.iter().map(|e| e.op).collect();
         assert_eq!(ops, [crate::logbased::changelog::ChangeOp::Truncate]);
         assert_eq!(w.layout(), &*l);
@@ -1407,9 +1495,18 @@ mod truncate_tests {
         // 0.56.0 dropped it without a word.
         for changelog in [false, true] {
             let cell = |s: &str| Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()));
-            let mut buf = vec![(Arc::from("bench.other"), TxOp::Insert(Tuple::from_cells(&[cell("1"), cell("x")])))];
-            let e = drain_tx(&mut buf, changelog, &layouts, &mut HashMap::new(), &mut HashMap::new())
-                .expect_err("an op with no layout");
+            let mut buf = vec![(
+                Arc::from("bench.other"),
+                TxOp::Insert(Tuple::from_cells(&[cell("1"), cell("x")])),
+            )];
+            let e = drain_tx(
+                &mut buf,
+                changelog,
+                &layouts,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+            )
+            .expect_err("an op with no layout");
             assert!(e.to_string().contains("bench.other"), "{e}");
         }
     }
@@ -1422,14 +1519,37 @@ mod truncate_tests {
         let cell = |s: &str| Cell::Text(bytes::Bytes::copy_from_slice(s.as_bytes()));
         let ins = |k: &str| TxOp::Insert(Tuple::from_cells(&[cell(k), cell("x")]));
         let l = Layout::for_test(&["id", "v"], &[], &["id"]);
-        let layouts: HashMap<String, Arc<Layout>> = [("bench.t".to_string(), l)].into_iter().collect();
+        let layouts: HashMap<String, Arc<Layout>> =
+            [("bench.t".to_string(), l)].into_iter().collect();
         let key: Arc<str> = Arc::from("bench.t");
         let mut collapsers: HashMap<String, Collapser> = HashMap::new();
-        let mut buf = vec![(key.clone(), ins("1")), (key.clone(), TxOp::Truncate), (key, ins("2"))];
-        drain_tx(&mut buf, false, &layouts, &mut HashMap::new(), &mut collapsers).expect("drain");
-        let w = collapsers.remove("bench.t").unwrap().seal("bench.t").unwrap();
+        let mut buf = vec![
+            (key.clone(), ins("1")),
+            (key.clone(), TxOp::Truncate),
+            (key, ins("2")),
+        ];
+        drain_tx(
+            &mut buf,
+            false,
+            &layouts,
+            &mut HashMap::new(),
+            &mut collapsers,
+        )
+        .expect("drain");
+        let w = collapsers
+            .remove("bench.t")
+            .unwrap()
+            .seal("bench.t")
+            .unwrap();
         assert!(w.body().truncate);
-        assert_eq!(w.body().upserts.iter().map(|t| t.to_cells()[0].clone()).collect::<Vec<_>>(), [cell("2")]);
+        assert_eq!(
+            w.body()
+                .upserts
+                .iter()
+                .map(|t| t.to_cells()[0].clone())
+                .collect::<Vec<_>>(),
+            [cell("2")]
+        );
     }
 }
 
@@ -1441,14 +1561,19 @@ mod tests {
     #[test]
     fn a_dropped_table_says_how_to_recover() {
         let m = dropped_mid_backlog("bench", "t").to_string();
-        assert!(m.contains("dropped or renamed") && m.contains("tables="), "{m}");
+        assert!(
+            m.contains("dropped or renamed") && m.contains("tables="),
+            "{m}"
+        );
     }
 
     /// P2: a position past 4 GiB is refused, not wrapped.
     #[test]
     fn a_position_past_u32_is_refused() {
         assert_eq!(pos_u32("binlog.000001", 5).unwrap(), 5);
-        let e = pos_u32("binlog.000001", (1 << 32) | 5).unwrap_err().to_string();
+        let e = pos_u32("binlog.000001", (1 << 32) | 5)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("4 GiB") && e.contains("binlog.000001"), "{e}");
     }
 
@@ -1484,7 +1609,12 @@ mod tests {
 
     #[test]
     fn ddl_is_recognised_but_dml_and_begin_are_not() {
-        for s in ["ALTER TABLE t ADD c INT", "create table x(i int)", "  DROP TABLE t", "TRUNCATE t"] {
+        for s in [
+            "ALTER TABLE t ADD c INT",
+            "create table x(i int)",
+            "  DROP TABLE t",
+            "TRUNCATE t",
+        ] {
             assert!(is_ddl(s), "{s}");
         }
         for s in ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT", "SAVEPOINT s"] {

@@ -45,7 +45,9 @@ use crate::plan::{
     resolve_watermark, wm_max, Delivered, DestState, Lane, TablePlan, WireFormat, WmArbitration,
 };
 use crate::sink::s3::{Multipart, S3Conn};
-use crate::wire::bqparquet::{merge_key_ok, parquet_col_ok, parquet_field, ParquetEncoder, RowGroup};
+use crate::wire::bqparquet::{
+    merge_key_ok, parquet_col_ok, parquet_field, ParquetEncoder, RowGroup,
+};
 use crate::Mode;
 use iceberg::io::{FileIO, FileWrite};
 use iceberg::spec::{
@@ -136,8 +138,8 @@ fn dec(s: &str) -> Result<String> {
 
 impl IcebergConn {
     pub(crate) async fn parse(url: &str) -> Result<Self> {
-        let u = reqwest::Url::parse(url)
-            .map_err(|e| crate::urlerr::bad_url("iceberg url", url, e))?;
+        let u =
+            reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("iceberg url", url, e))?;
         let host = u
             .host_str()
             .filter(|s| !s.is_empty())
@@ -244,7 +246,9 @@ impl IcebergConn {
         let text = r.text().await.unwrap_or_default();
         if !status.is_success() {
             let excerpt = super::char_excerpt(&text, 500);
-            return Err(Error::Transfer(format!("iceberg catalog {what}: {status} {excerpt}")));
+            return Err(Error::Transfer(format!(
+                "iceberg catalog {what}: {status} {excerpt}"
+            )));
         }
         serde_json::from_str(&text)
             .map_err(|e| Error::Transfer(format!("iceberg catalog {what}: bad JSON: {e}")))
@@ -274,7 +278,10 @@ impl IcebergConn {
 
     async fn ensure_namespace(&self) -> Result<()> {
         let get = self
-            .req(reqwest::Method::GET, self.v1(&format!("namespaces/{}", enc_q(&self.namespace))))
+            .req(
+                reqwest::Method::GET,
+                self.v1(&format!("namespaces/{}", enc_q(&self.namespace))),
+            )
             .send()
             .await
             .map_err(|e| Error::Transfer(format!("iceberg catalog: {e}")))?;
@@ -300,7 +307,11 @@ impl IcebergConn {
         let r = self
             .req(
                 reqwest::Method::GET,
-                self.v1(&format!("namespaces/{}/tables/{}", enc_q(&self.namespace), enc_q(table))),
+                self.v1(&format!(
+                    "namespaces/{}/tables/{}",
+                    enc_q(&self.namespace),
+                    enc_q(table)
+                )),
             )
             .send()
             .await
@@ -368,7 +379,11 @@ impl IcebergConn {
         let r = match self
             .req(
                 reqwest::Method::POST,
-                self.v1(&format!("namespaces/{}/tables/{}", enc_q(&self.namespace), enc_q(table))),
+                self.v1(&format!(
+                    "namespaces/{}/tables/{}",
+                    enc_q(&self.namespace),
+                    enc_q(table)
+                )),
             )
             .json(&body)
             .send()
@@ -379,7 +394,9 @@ impl IcebergConn {
             // case: the request may have been applied. The caller settles it
             // against the table's own metadata, never by assuming failure.
             Err(e) => {
-                return Ok(CommitTry::Unknown(Error::Transfer(format!("iceberg commit: {e}"))))
+                return Ok(CommitTry::Unknown(Error::Transfer(format!(
+                    "iceberg commit: {e}"
+                ))))
             }
         };
         match commit_status_class(r.status().as_u16()) {
@@ -388,7 +405,9 @@ impl IcebergConn {
             // failure the sweep then acts on (review P0-5).
             CommitClass::Done => Ok(CommitTry::Done),
             CommitClass::Conflict => Ok(CommitTry::Conflict),
-            CommitClass::Unknown => Ok(CommitTry::Unknown(Self::body_ok(r, "commit").await.unwrap_err())),
+            CommitClass::Unknown => Ok(CommitTry::Unknown(
+                Self::body_ok(r, "commit").await.unwrap_err(),
+            )),
             CommitClass::Failed => {
                 Self::body_ok(r, "commit").await?;
                 Ok(CommitTry::Done)
@@ -508,7 +527,11 @@ fn build_schema(names: &[String], delivered: &[Delivered]) -> Result<Schema> {
 /// Existing table: verify it matches what we deliver and return the table's
 /// own field id for each of OUR columns, in our column order — parquet field
 /// ids must be the TABLE's ids, whoever created it.
-fn conform_ids(meta: &TableMetadata, names: &[String], delivered: &[Delivered]) -> Result<Vec<i32>> {
+fn conform_ids(
+    meta: &TableMetadata,
+    names: &[String],
+    delivered: &[Delivered],
+) -> Result<Vec<i32>> {
     let schema = meta.current_schema();
     let theirs = schema.as_struct().fields();
     if theirs.len() != names.len() {
@@ -668,7 +691,11 @@ impl crate::guard::GuardStore for IceGuard {
         }
     }
 
-    async fn list(&self, _bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+    async fn list(
+        &self,
+        _bare: &str,
+        _kinds: &[crate::naming::Artifact],
+    ) -> Result<Vec<crate::guard::Listed>> {
         Ok(self
             .s3
             .list(&self.prefix)
@@ -697,7 +724,11 @@ impl crate::guard::GuardStore for IceGuard {
     }
 
     async fn drop_object(&self, raw: &str) -> Result<()> {
-        let key = if raw.starts_with(&self.prefix) { raw.to_string() } else { format!("{}{raw}", self.prefix) };
+        let key = if raw.starts_with(&self.prefix) {
+            raw.to_string()
+        } else {
+            format!("{}{raw}", self.prefix)
+        };
         self.s3.delete(&key).await
     }
 
@@ -861,7 +892,9 @@ fn footer_fits(path: &str, have: u64, flen: u64) -> Result<()> {
 /// minute, so a writer whose clock ran behind the previous one had every
 /// commit rejected until its clock was fixed (P2).
 fn snapshot_ts(meta: &TableMetadata) -> i64 {
-    chrono::Utc::now().timestamp_millis().max(meta.last_updated_ms() + 1)
+    chrono::Utc::now()
+        .timestamp_millis()
+        .max(meta.last_updated_ms() + 1)
 }
 
 /// (S3 client, table location, '/'-terminated key prefix) from catalog metadata.
@@ -878,7 +911,11 @@ fn storage_for(conn: &IcebergConn, meta: &TableMetadata) -> Result<(S3Conn, Stri
     }
     let location = meta.location().trim_end_matches('/').to_string();
     let (bucket, key) = split_s3_uri(&location)?;
-    let key_prefix = if key.is_empty() { String::new() } else { format!("{key}/") };
+    let key_prefix = if key.is_empty() {
+        String::new()
+    } else {
+        format!("{key}/")
+    };
     let s3 = S3Conn::from_parts(
         bucket,
         conn.s3_endpoint.clone(),
@@ -895,8 +932,8 @@ fn uri_key(uri: &str) -> Result<String> {
 /// Micros-since-epoch xor'd with fresh randomness, masked positive — unique
 /// against the metadata's snapshot list.
 fn fresh_snapshot_id(meta: &TableMetadata) -> i64 {
-    let mut id = (uuid::Uuid::new_v4().as_u128() as i64 ^ chrono::Utc::now().timestamp_micros())
-        & i64::MAX;
+    let mut id =
+        (uuid::Uuid::new_v4().as_u128() as i64 ^ chrono::Utc::now().timestamp_micros()) & i64::MAX;
     while meta.snapshots().any(|s| s.snapshot_id() == id) {
         id = (id + 1) & i64::MAX;
     }
@@ -911,8 +948,12 @@ impl IcebergSink {
     async fn dest_data_max(&self, meta: &TableMetadata, cursor: &str) -> Result<Option<String>> {
         use iceberg::spec::{DataContentType as DC, Manifest};
         let s3 = self.s3.clone().expect("storage bound");
-        let Some(snap) = meta.current_snapshot() else { return Ok(None) };
-        let list_bytes = s3.get_object(&self.uri_to_key(snap.manifest_list())?).await?;
+        let Some(snap) = meta.current_snapshot() else {
+            return Ok(None);
+        };
+        let list_bytes = s3
+            .get_object(&self.uri_to_key(snap.manifest_list())?)
+            .await?;
         let list = ManifestList::parse_with_version(&list_bytes, meta.format_version())
             .map_err(|e| Error::Transfer(format!("iceberg: manifest list didn't parse: {e}")))?;
         let mut acc: Option<String> = None;
@@ -1012,7 +1053,11 @@ impl IcebergSink {
                     if b.is_empty() || b.len() > 16 {
                         return Err(no_stats());
                     }
-                    let mut buf = if b[0] & 0x80 != 0 { [0xffu8; 16] } else { [0u8; 16] };
+                    let mut buf = if b[0] & 0x80 != 0 {
+                        [0xffu8; 16]
+                    } else {
+                        [0u8; 16]
+                    };
                     buf[16 - b.len()..].copy_from_slice(b);
                     let m = i128::from_be_bytes(buf);
                     max_d = Some(max_d.map_or(m, |a| a.max(m)));
@@ -1032,7 +1077,15 @@ impl IcebergSink {
             }
         }
         match (col.physical_type(), col.logical_type(), max_i, max_s) {
-            (PhysicalType::INT64, Some(LogicalType::Timestamp { is_adjusted_to_u_t_c, unit }), Some(m), _) => {
+            (
+                PhysicalType::INT64,
+                Some(LogicalType::Timestamp {
+                    is_adjusted_to_u_t_c,
+                    unit,
+                }),
+                Some(m),
+                _,
+            ) => {
                 if !matches!(unit, TimeUnit::MICROS(_)) {
                     return Err(Error::InvalidInput(format!(
                         "iceberg bootstrap: '{cursor}' uses a non-microsecond \
@@ -1047,22 +1100,31 @@ impl IcebergSink {
             (PhysicalType::INT32, Some(LogicalType::Date), Some(m), _) => {
                 Ok(Some((crate::wire::bqparquet::render_date_days(m)?, false)))
             }
-            (PhysicalType::INT64 | PhysicalType::INT32, None | Some(LogicalType::Integer { .. }), Some(m), _) => {
-                Ok(Some((m.to_string(), true)))
-            }
+            (
+                PhysicalType::INT64 | PhysicalType::INT32,
+                None | Some(LogicalType::Integer { .. }),
+                Some(m),
+                _,
+            ) => Ok(Some((m.to_string(), true))),
             // A whole-number decimal is an integer cursor (an UNSIGNED BIGINT,
             // or a NUMERIC(p,0)): the run-1 bootstrap writes it so, and run 2
             // used to refuse to read it back (MASTER review M-34). A scaled
             // decimal is refused as a cursor upstream and stays refused here.
-            (PhysicalType::INT64 | PhysicalType::INT32, Some(LogicalType::Decimal { scale: 0, .. }), Some(m), _) => {
-                Ok(Some((m.to_string(), true)))
-            }
-            (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Decimal { scale: 0, .. }), _, _) => {
-                match max_d {
-                    Some(m) => Ok(Some((m.to_string(), true))),
-                    None => Err(no_stats()),
-                }
-            }
+            (
+                PhysicalType::INT64 | PhysicalType::INT32,
+                Some(LogicalType::Decimal { scale: 0, .. }),
+                Some(m),
+                _,
+            ) => Ok(Some((m.to_string(), true))),
+            (
+                PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                Some(LogicalType::Decimal { scale: 0, .. }),
+                _,
+                _,
+            ) => match max_d {
+                Some(m) => Ok(Some((m.to_string(), true))),
+                None => Err(no_stats()),
+            },
             (PhysicalType::BYTE_ARRAY, _, _, Some(m)) => Ok(Some((m, false))),
             _ => Err(no_stats()),
         }
@@ -1108,7 +1170,10 @@ impl crate::sink::Sink for IcebergSink {
         }
         self.conn.ensure_namespace().await?;
         let Some(meta) = self.conn.load_table(&self.table).await? else {
-            return Ok(DestState { exists: false, watermark: None });
+            return Ok(DestState {
+                exists: false,
+                watermark: None,
+            });
         };
         // Name-level drift check now (types conform in prepare, where the
         // lane's delivered types exist): a mis-append must fail before bytes move.
@@ -1135,7 +1200,8 @@ impl crate::sink::Sink for IcebergSink {
         // and another cursor's are both refused. A cursor switch used to
         // re-bootstrap quietly from the data instead, appending whatever the
         // new column's max let through.
-        let own = crate::naming::cursor_watermark(&self.table, cursor, state_row_of(props, source_id))?;
+        let own =
+            crate::naming::cursor_watermark(&self.table, cursor, state_row_of(props, source_id))?;
         let sibling = props
             .keys()
             .any(|k| k.starts_with("apitap.watermark.") && *k != self.wm_prop());
@@ -1160,7 +1226,10 @@ impl crate::sink::Sink for IcebergSink {
             "iceberg",
             source_id,
         )?;
-        Ok(DestState { exists: true, watermark })
+        Ok(DestState {
+            exists: true,
+            watermark,
+        })
     }
 
     async fn prepare(
@@ -1211,13 +1280,20 @@ impl crate::sink::Sink for IcebergSink {
                 // A whole-number decimal (a MySQL BIGINT UNSIGNED arrives as
                 // decimal(20,0)) compares as a number: as a string, "99" beat
                 // "100" and the stored watermark went BACK (M-34, measured).
-                (i, matches!(delivered[i], Delivered::Int { .. } | Delivered::Decimal { s: 0, .. }))
+                (
+                    i,
+                    matches!(
+                        delivered[i],
+                        Delivered::Int { .. } | Delivered::Decimal { s: 0, .. }
+                    ),
+                )
             })
         });
         if mode == Mode::Merge {
-            let key = plan.pk_cols.first().cloned().ok_or_else(|| {
-                Error::InvalidInput("iceberg merge needs a primary key".into())
-            })?;
+            let key =
+                plan.pk_cols.first().cloned().ok_or_else(|| {
+                    Error::InvalidInput("iceberg merge needs a primary key".into())
+                })?;
             let idx = names.iter().position(|n| n == &key).ok_or_else(|| {
                 Error::InvalidInput(format!("iceberg merge: key column '{key}' not delivered"))
             })?;
@@ -1228,8 +1304,13 @@ impl crate::sink::Sink for IcebergSink {
         // lives under the table's own location, which only the catalog knows).
         let a = crate::guard::announce(&self.guard(), &self.table, &self.run).await?;
         *self.announced.lock().expect("announcement") = Some(a);
-        crate::guard::check_peers(&self.guard(), &self.table, &self.run, crate::guard::Mine::Keep)
-            .await?;
+        crate::guard::check_peers(
+            &self.guard(),
+            &self.table,
+            &self.run,
+            crate::guard::Mine::Keep,
+        )
+        .await?;
         self.names = Arc::new(names);
         self.delivered = Arc::new(delivered);
         self.field_ids = Arc::new(ids);
@@ -1245,8 +1326,14 @@ impl crate::sink::Sink for IcebergSink {
         // Merge only: a second multipart streams the equality-delete keys in
         // lockstep with the data file (one delete file per data file, I6).
         let del = if self.merge_key.is_some() {
-            let dkey = format!("{}data/{}-{n:05}-deletes.parquet", self.key_prefix, self.run_id);
-            let dpath = format!("{}/data/{}-{n:05}-deletes.parquet", self.location, self.run_id);
+            let dkey = format!(
+                "{}data/{}-{n:05}-deletes.parquet",
+                self.key_prefix, self.run_id
+            );
+            let dpath = format!(
+                "{}/data/{}-{n:05}-deletes.parquet",
+                self.location, self.run_id
+            );
             Some((Multipart::open(&s3, dkey).await?, dpath))
         } else {
             None
@@ -1393,7 +1480,12 @@ impl IcebergSink {
 
         // -- merge: one equality-delete file per data file, streamed by the
         // loaders (the delta's keys never gather in memory; I4/I6)
-        let delete_files = delete_data_files(files, mode, self.merge_key.map(|(_, fid)| fid), &partition_value(&pspec))?;
+        let delete_files = delete_data_files(
+            files,
+            mode,
+            self.merge_key.map(|(_, fid)| fid),
+            &partition_value(&pspec),
+        )?;
 
         // -- new watermark: the freshest cursor value this run shipped
         let numeric = self.cursor.map(|(_, n)| n).unwrap_or(false);
@@ -1418,7 +1510,9 @@ impl IcebergSink {
             // re-add gives the column a new field id) would have readers see
             // NULL where these files hold values. Only the snapshot ref was
             // required before, so a schema-only change passed (P2).
-            if meta.current_schema_id() != schema_id0 || meta.default_partition_spec_id() != spec_id0 {
+            if meta.current_schema_id() != schema_id0
+                || meta.default_partition_spec_id() != spec_id0
+            {
                 let e = Error::Transfer(format!(
                     "iceberg: the table's schema or partition spec changed during this load \
                      (schema {} -> {}, spec {} -> {}); its files were written for the old one, \
@@ -1476,8 +1570,10 @@ impl IcebergSink {
                 &format!("memory://{}-m0-a{attempt}.avro", self.run_id),
             )
             .await?;
-            let data_key =
-                format!("{}metadata/{}-a{attempt}-m0.avro", self.key_prefix, self.run_id);
+            let data_key = format!(
+                "{}metadata/{}-a{attempt}-m0.avro",
+                self.key_prefix, self.run_id
+            );
             s3.put_object(&data_key, data_bytes).await?;
             data_mf.manifest_path = format!(
                 "{}/metadata/{}-a{attempt}-m0.avro",
@@ -1496,8 +1592,10 @@ impl IcebergSink {
                     &format!("memory://{}-m1-a{attempt}.avro", self.run_id),
                 )
                 .await?;
-                let del_key =
-                    format!("{}metadata/{}-a{attempt}-m1.avro", self.key_prefix, self.run_id);
+                let del_key = format!(
+                    "{}metadata/{}-a{attempt}-m1.avro",
+                    self.key_prefix, self.run_id
+                );
                 s3.put_object(&del_key, del_bytes).await?;
                 del_mf.manifest_path = format!(
                     "{}/metadata/{}-a{attempt}-m1.avro",
@@ -1551,7 +1649,11 @@ impl IcebergSink {
                 );
                 props.insert(
                     "added-equality-deletes".to_string(),
-                    delete_files.iter().map(|d| d.record_count()).sum::<u64>().to_string(),
+                    delete_files
+                        .iter()
+                        .map(|d| d.record_count())
+                        .sum::<u64>()
+                        .to_string(),
                 );
             }
             let snapshot = Snapshot::builder()
@@ -1559,7 +1661,10 @@ impl IcebergSink {
                 .with_snapshot_id(snapshot_id)
                 .with_parent_snapshot_id(parent)
                 .with_sequence_number(seq)
-                .with_summary(Summary { operation, additional_properties: props })
+                .with_summary(Summary {
+                    operation,
+                    additional_properties: props,
+                })
                 .with_schema_id(meta.current_schema_id())
                 .with_timestamp_ms(snapshot_ts(&meta))
                 .build();
@@ -1614,15 +1719,23 @@ impl IcebergSink {
             }
             let requirements = vec![
                 TableRequirement::UuidMatch { uuid: meta.uuid() },
-                TableRequirement::CurrentSchemaIdMatch { current_schema_id: schema_id0 },
-                TableRequirement::DefaultSpecIdMatch { default_spec_id: spec_id0 },
+                TableRequirement::CurrentSchemaIdMatch {
+                    current_schema_id: schema_id0,
+                },
+                TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: spec_id0,
+                },
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
                     snapshot_id: parent,
                 },
             ];
 
-            let commit_try = match self.conn.commit_table(&self.table, &requirements, &updates).await {
+            let commit_try = match self
+                .conn
+                .commit_table(&self.table, &requirements, &updates)
+                .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     if *ambiguous {
@@ -1715,7 +1828,12 @@ fn partition_value(spec: &iceberg::spec::PartitionSpec) -> Struct {
     }
 }
 
-fn delete_data_files(files: &[FileDone], mode: Mode, fid: Option<i32>, part: &Struct) -> Result<Vec<DataFile>> {
+fn delete_data_files(
+    files: &[FileDone],
+    mode: Mode,
+    fid: Option<i32>,
+    part: &Struct,
+) -> Result<Vec<DataFile>> {
     if mode != Mode::Merge {
         if files.iter().any(|f| f.delete.is_some()) {
             return Err(Error::Transfer(format!(
@@ -1771,7 +1889,11 @@ async fn write_manifest_avro(
         .new_output(mem_path)
         .map_err(|e| Error::Transfer(format!("iceberg manifest io: {e}")))?;
     let b = ManifestWriterBuilder::new(out, Some(snapshot_id), schema, pspec);
-    let mut w = if deletes { b.build_v2_deletes() } else { b.build_v2_data() };
+    let mut w = if deletes {
+        b.build_v2_deletes()
+    } else {
+        b.build_v2_data()
+    };
     for df in dfs {
         w.add_file(df.clone(), UNASSIGNED_SEQUENCE_NUMBER)
             .map_err(|e| Error::Transfer(format!("iceberg manifest: {e}")))?;
@@ -1893,9 +2015,16 @@ const NUMERIC_OID: u32 = 1700;
 ///
 /// Iceberg records no mode, so it is read off the cursor: `_lsn` is only ever
 /// written by a drain, any other cursor only by append/merge.
-fn state_row_of(props: &HashMap<String, String>, source_id: &str) -> Option<crate::naming::StateRow> {
+fn state_row_of(
+    props: &HashMap<String, String>,
+    source_id: &str,
+) -> Option<crate::naming::StateRow> {
     let cur = props.get(&cur_prop_for(source_id))?;
-    let mode = if cur == CDC_CURSOR { crate::naming::STATE_MODE_CDC } else { "append/merge" };
+    let mode = if cur == CDC_CURSOR {
+        crate::naming::STATE_MODE_CDC
+    } else {
+        "append/merge"
+    };
     Some(crate::naming::StateRow::new(
         props.get(&wm_prop_for(source_id)).cloned(),
         Some(cur.clone()),
@@ -1923,7 +2052,9 @@ pub(crate) async fn cdc_clear_watermark(
     table: &str,
     source_id: &str,
 ) -> Result<()> {
-    let Some(meta) = conn.load_table(table).await? else { return Ok(()) };
+    let Some(meta) = conn.load_table(table).await? else {
+        return Ok(());
+    };
     let removals: Vec<String> = [wm_prop_for(source_id), cur_prop_for(source_id)]
         .into_iter()
         .filter(|k| meta.properties().contains_key(k))
@@ -1936,7 +2067,14 @@ pub(crate) async fn cdc_clear_watermark(
     // read as cleared, leaving a failed bootstrap's watermark with no error
     // anywhere (P2). A Conflict is the table replaced — its properties went
     // with it.
-    match conn.commit_table(table, &requirements, &[TableUpdate::RemoveProperties { removals }]).await? {
+    match conn
+        .commit_table(
+            table,
+            &requirements,
+            &[TableUpdate::RemoveProperties { removals }],
+        )
+        .await?
+    {
         CommitTry::Done | CommitTry::Conflict => Ok(()),
         CommitTry::Unknown(e) => Err(e),
     }
@@ -1984,9 +2122,18 @@ pub(crate) async fn cdc_set_watermark(
 /// table's own declared decimal is authoritative there.
 fn oid_delivered(oid: u32) -> Option<Delivered> {
     Some(match oid {
-        21 => Delivered::Int { bytes: 2, unsigned: false },
-        23 => Delivered::Int { bytes: 4, unsigned: false },
-        20 => Delivered::Int { bytes: 8, unsigned: false },
+        21 => Delivered::Int {
+            bytes: 2,
+            unsigned: false,
+        },
+        23 => Delivered::Int {
+            bytes: 4,
+            unsigned: false,
+        },
+        20 => Delivered::Int {
+            bytes: 8,
+            unsigned: false,
+        },
         700 => Delivered::Float32,
         701 => Delivered::Float64,
         16 => Delivered::Bool,
@@ -2047,7 +2194,10 @@ pub(crate) async fn cdc_bind(
                     .map(|f| f.field_type.as_ref())
                 {
                     Some(IceType::Primitive(PrimitiveType::Decimal { precision, scale })) => {
-                        Ok(Delivered::Decimal { p: *precision as u16, s: *scale as u16 })
+                        Ok(Delivered::Decimal {
+                            p: *precision as u16,
+                            s: *scale as u16,
+                        })
                     }
                     _ => Err(Error::InvalidInput(format!(
                         "log_based: column '{n}' is numeric on the source but not \
@@ -2109,7 +2259,10 @@ impl CdcBound {
         // Same rule as `commit` (M-14): a failure after an ambiguous attempt
         // is Unknown, never a reason to delete what that attempt references.
         let mut ambiguous = false;
-        let r = match self.cdc_commit_inner(source_id, pk_idx, w, &run_id, &mut uploaded, &mut ambiguous).await {
+        let r = match self
+            .cdc_commit_inner(source_id, pk_idx, w, &run_id, &mut uploaded, &mut ambiguous)
+            .await
+        {
             Err(e) if ambiguous => Ok(CommitEnd::Unknown(e)),
             other => other,
         };
@@ -2139,7 +2292,13 @@ impl CdcBound {
         uploaded: &mut Vec<String>,
         ambiguous: &mut bool,
     ) -> Result<CommitEnd> {
-        let CdcWindow { data, delete_ints, delete_texts, truncate, end_lsn } = w;
+        let CdcWindow {
+            data,
+            delete_ints,
+            delete_texts,
+            truncate,
+            end_lsn,
+        } = w;
         let (data_file, added_rows, added_bytes) = match data {
             Some((bytes, rows)) => {
                 let key = format!("{}data/{run_id}-cdc.parquet", self.key_prefix);
@@ -2192,7 +2351,10 @@ impl CdcBound {
 
         let schema = self.meta.current_schema().clone();
         let pspec = self.meta.default_partition_spec().as_ref().clone();
-        let (schema_id0, spec_id0) = (self.meta.current_schema_id(), self.meta.default_partition_spec_id());
+        let (schema_id0, spec_id0) = (
+            self.meta.current_schema_id(),
+            self.meta.default_partition_spec_id(),
+        );
         let mut meta = self.meta.clone();
         // See `commit`: every attempt's id is remembered for the later
         // reloads (review P0-5c).
@@ -2207,7 +2369,9 @@ impl CdcBound {
             // re-add gives the column a new field id) would have readers see
             // NULL where these files hold values. Only the snapshot ref was
             // required before, so a schema-only change passed (P2).
-            if meta.current_schema_id() != schema_id0 || meta.default_partition_spec_id() != spec_id0 {
+            if meta.current_schema_id() != schema_id0
+                || meta.default_partition_spec_id() != spec_id0
+            {
                 let e = Error::Transfer(format!(
                     "iceberg: the table's schema or partition spec changed during this load \
                      (schema {} -> {}, spec {} -> {}); its files were written for the old one, \
@@ -2328,14 +2492,22 @@ impl CdcBound {
             ];
             let requirements = vec![
                 TableRequirement::UuidMatch { uuid: meta.uuid() },
-                TableRequirement::CurrentSchemaIdMatch { current_schema_id: schema_id0 },
-                TableRequirement::DefaultSpecIdMatch { default_spec_id: spec_id0 },
+                TableRequirement::CurrentSchemaIdMatch {
+                    current_schema_id: schema_id0,
+                },
+                TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: spec_id0,
+                },
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
                     snapshot_id: parent,
                 },
             ];
-            let commit_try = match self.conn.commit_table(&self.table, &requirements, &updates).await {
+            let commit_try = match self
+                .conn
+                .commit_table(&self.table, &requirements, &updates)
+                .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     if *ambiguous {
@@ -2554,14 +2726,20 @@ mod tests {
             split_s3_uri("s3://lake/wh/ns/t").unwrap(),
             ("lake".into(), "wh/ns/t".into())
         );
-        assert_eq!(split_s3_uri("s3a://lake").unwrap(), ("lake".into(), "".into()));
+        assert_eq!(
+            split_s3_uri("s3a://lake").unwrap(),
+            ("lake".into(), "".into())
+        );
         assert!(split_s3_uri("gs://nope").is_err());
     }
 
     #[test]
     fn delivered_types_map_to_iceberg() {
         assert_eq!(
-            ice_type(&Delivered::Int { bytes: 8, unsigned: false }),
+            ice_type(&Delivered::Int {
+                bytes: 8,
+                unsigned: false
+            }),
             IceType::Primitive(PrimitiveType::Long)
         );
         assert_eq!(
@@ -2570,19 +2748,40 @@ mod tests {
         );
         assert_eq!(
             ice_type(&Delivered::Decimal { p: 0, s: 0 }),
-            IceType::Primitive(PrimitiveType::Decimal { precision: 38, scale: 0 })
+            IceType::Primitive(PrimitiveType::Decimal {
+                precision: 38,
+                scale: 0
+            })
         );
-        assert_eq!(ice_type(&Delivered::Uuid), IceType::Primitive(PrimitiveType::String));
+        assert_eq!(
+            ice_type(&Delivered::Uuid),
+            IceType::Primitive(PrimitiveType::String)
+        );
     }
 
     #[test]
     fn wal_oids_deliver_like_the_bootstrap() {
         // Must agree with delivered_of_udt in source/postgres.rs — the
         // bootstrap's full load built the table's schema from it.
-        assert_eq!(oid_delivered(20), Some(Delivered::Int { bytes: 8, unsigned: false }));
-        assert_eq!(oid_delivered(21), Some(Delivered::Int { bytes: 2, unsigned: false }));
+        assert_eq!(
+            oid_delivered(20),
+            Some(Delivered::Int {
+                bytes: 8,
+                unsigned: false
+            })
+        );
+        assert_eq!(
+            oid_delivered(21),
+            Some(Delivered::Int {
+                bytes: 2,
+                unsigned: false
+            })
+        );
         assert_eq!(oid_delivered(1184), Some(Delivered::DateTime { utc: true }));
-        assert_eq!(oid_delivered(1114), Some(Delivered::DateTime { utc: false }));
+        assert_eq!(
+            oid_delivered(1114),
+            Some(Delivered::DateTime { utc: false })
+        );
         assert_eq!(oid_delivered(2950), Some(Delivered::Uuid));
         assert_eq!(oid_delivered(1042), Some(Delivered::Text));
         assert_eq!(oid_delivered(3802), Some(Delivered::Json));
@@ -2595,7 +2794,10 @@ mod tests {
     fn delete_parquet_is_a_readable_file() {
         let bytes = write_delete_parquet(
             "id",
-            &Delivered::Int { bytes: 8, unsigned: false },
+            &Delivered::Int {
+                bytes: 8,
+                unsigned: false,
+            },
             1,
             &[1, 2, 3],
             &[],
@@ -2606,7 +2808,13 @@ mod tests {
         assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
     }
 
-    fn key_col_schema(bytes: Vec<u8>) -> (parquet::basic::Type, i32, Option<parquet::basic::LogicalType>) {
+    fn key_col_schema(
+        bytes: Vec<u8>,
+    ) -> (
+        parquet::basic::Type,
+        i32,
+        Option<parquet::basic::LogicalType>,
+    ) {
         use parquet::file::reader::{FileReader, SerializedFileReader};
         let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
         let col = reader.metadata().file_metadata().schema_descr().column(0);
@@ -2677,7 +2885,11 @@ mod tests {
     /// a mismatched row count refuses BEFORE the catalog commit.
     #[test]
     fn delete_data_files_is_one_per_data_file() {
-        let files = vec![done("d0", 3, true), done("d1", 4, true), done("d2", 5, true)];
+        let files = vec![
+            done("d0", 3, true),
+            done("d1", 4, true),
+            done("d2", 5, true),
+        ];
         let dfs = delete_data_files(&files, Mode::Merge, Some(7), &Struct::empty()).unwrap();
         assert_eq!(dfs.len(), 3);
         for (df, f) in dfs.iter().zip(&files) {
@@ -2698,7 +2910,11 @@ mod tests {
         assert!(delete_data_files(&files, Mode::Merge, None, &Struct::empty()).is_err());
         // Replace/append carry no delete files.
         let replaced = vec![done("d0", 3, false)];
-        assert!(delete_data_files(&replaced, Mode::Replace, None, &Struct::empty()).unwrap().is_empty());
+        assert!(
+            delete_data_files(&replaced, Mode::Replace, None, &Struct::empty())
+                .unwrap()
+                .is_empty()
+        );
         assert!(delete_data_files(&files, Mode::Replace, None, &Struct::empty()).is_err());
     }
 }

@@ -159,7 +159,8 @@ impl Keeper {
         every: std::time::Duration,
     ) -> Keeper {
         Self::every(every, move || {
-            let (dest, keys, token, evicted) = (dest.clone(), keys.clone(), token.clone(), evicted.clone());
+            let (dest, keys, token, evicted) =
+                (dest.clone(), keys.clone(), token.clone(), evicted.clone());
             async move {
                 if let Err(e) = dest.lease_renew(&keys, &token).await {
                     if std::env::var("APITAP_DEBUG").is_ok() {
@@ -196,7 +197,10 @@ impl Keeper {
                 tick().await;
             }
         });
-        Keeper { stop, handle: Some(handle) }
+        Keeper {
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// Stop AND JOIN. Joining matters: on ClickHouse a renewal is an INSERT, so
@@ -266,8 +270,16 @@ pub(crate) fn owner_verdict(row: Option<&Lease>, keys: &[String]) -> Result<()> 
 /// The watermark a unit writes when it closes — the only place one is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Watermark {
-    Set { table: String, source_id: String, lsn: u64, rows: u64 },
-    Clear { table: String, source_id: String },
+    Set {
+        table: String,
+        source_id: String,
+        lsn: u64,
+        rows: u64,
+    },
+    Clear {
+        table: String,
+        source_id: String,
+    },
 }
 
 impl Watermark {
@@ -284,14 +296,22 @@ impl Watermark {
 pub(crate) trait LeaseStore: Send + Sync + 'static {
     fn lease_key(&self, dest_table: &str) -> String;
     /// Open this run's rows (and on BigQuery its per-run fence table).
-    fn lease_open(&self, keys: &[String], token: &str)
-        -> impl std::future::Future<Output = Result<()>> + Send;
+    fn lease_open(
+        &self,
+        keys: &[String],
+        token: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
     /// Never blocks; never touches a collected or missing row.
-    fn lease_renew(&self, keys: &[String], token: &str)
-        -> impl std::future::Future<Output = Result<u64>> + Send;
+    fn lease_renew(
+        &self,
+        keys: &[String],
+        token: &str,
+    ) -> impl std::future::Future<Output = Result<u64>> + Send;
     /// Keys of `token` whose row EXISTS and is NOT collected. Expiry ignored.
-    fn lease_unclaimed(&self, token: &str)
-        -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+    fn lease_unclaimed(
+        &self,
+        token: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
     /// Drop run-scoped objects not tied to a table (BigQuery's fence). An
     /// error keeps every member's claim, so a collector finishes the job.
     fn close_run(&self, token: &str) -> impl std::future::Future<Output = Result<()>> + Send;
@@ -313,22 +333,32 @@ pub(crate) trait Fence: LeaseStore {
     fn serial_commit(&self) -> bool {
         false
     }
-    fn open_unit<'a>(&'a self, keys: &[String], token: &str)
-        -> impl std::future::Future<Output = Result<Self::Unit<'a>>> + Send;
+    fn open_unit<'a>(
+        &'a self,
+        keys: &[String],
+        token: &str,
+    ) -> impl std::future::Future<Output = Result<Self::Unit<'a>>> + Send;
     /// Like `open_unit`, but the unit's pin must CONTINUE the deadline `prev`:
     /// on ClickHouse `repin` refuses an open whose `prev` lapsed (something may
     /// have been fenced out since), which is how a group close keeps the
     /// per-member continuity proof while writing every mark in one statement.
     /// Destinations without a pinned deadline ignore it.
-    fn open_unit_at<'a>(&'a self, keys: &[String], token: &str, _prev: Option<u64>)
-        -> impl std::future::Future<Output = Result<Self::Unit<'a>>> + Send
-    {
+    fn open_unit_at<'a>(
+        &'a self,
+        keys: &[String],
+        token: &str,
+        _prev: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<Self::Unit<'a>>> + Send {
         self.open_unit(keys, token)
     }
     /// Writes every mark (and on BigQuery/Iceberg the data commit) and commits.
     /// `Ok` = the destination accepted the unit as the owner's.
-    fn close_unit<'a>(&'a self, u: Self::Unit<'a>, token: &str, marks: Vec<Watermark>)
-        -> impl std::future::Future<Output = Result<()>> + Send;
+    fn close_unit<'a>(
+        &'a self,
+        u: Self::Unit<'a>,
+        token: &str,
+        marks: Vec<Watermark>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 /// One open unit of writes. Only `Tenure::open` makes one, and `release`
@@ -356,8 +386,18 @@ impl<F: Fence> Tenure<F> {
     /// Lease first, then announce every member, then check every member — the
     /// order that makes a dead run collectable and two live ones unable to
     /// both proceed — then start renewing.
-    pub(crate) async fn acquire(dest: std::sync::Arc<F>, tables: &[String], run: RunId) -> Result<Self> {
-        Self::acquire_every(dest, tables, run, std::time::Duration::from_secs(renew_secs())).await
+    pub(crate) async fn acquire(
+        dest: std::sync::Arc<F>,
+        tables: &[String],
+        run: RunId,
+    ) -> Result<Self> {
+        Self::acquire_every(
+            dest,
+            tables,
+            run,
+            std::time::Duration::from_secs(renew_secs()),
+        )
+        .await
     }
 
     /// `acquire` with the keeper's period given, so a store's tests can watch
@@ -403,7 +443,13 @@ impl<F: Fence> Tenure<F> {
             }
         }
         let evicted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let keeper = Keeper::for_tenure(dest.clone(), keys, run.token().to_string(), evicted.clone(), every);
+        let keeper = Keeper::for_tenure(
+            dest.clone(),
+            keys,
+            run.token().to_string(),
+            evicted.clone(),
+            every,
+        );
         Ok(Tenure {
             dest,
             run,
@@ -439,7 +485,10 @@ impl<F: Fence> Tenure<F> {
         use std::sync::atomic::Ordering::SeqCst;
         let keys: Vec<String> = tables.iter().map(|t| self.dest.lease_key(t)).collect();
         if self.closing.load(SeqCst) {
-            return Err(Error::Locked(format!("{}: the run is winding down", keys.join(", "))));
+            return Err(Error::Locked(format!(
+                "{}: the run is winding down",
+                keys.join(", ")
+            )));
         }
         if self.evicted.load(SeqCst) {
             return Err(no_longer_holds(&keys));
@@ -447,20 +496,42 @@ impl<F: Fence> Tenure<F> {
         let g = self.units.clone().read_owned().await;
         // `release` may have started (and finished) while this waited.
         if self.closing.load(SeqCst) {
-            return Err(Error::Locked(format!("{}: the run is winding down", keys.join(", "))));
+            return Err(Error::Locked(format!(
+                "{}: the run is winding down",
+                keys.join(", ")
+            )));
         }
-        let unit = self.dest.open_unit_at(&keys, self.run.token(), prev).await?;
-        Ok(Held { unit, tables: tables.iter().map(|t| t.to_string()).collect(), _inflight: g })
+        let unit = self
+            .dest
+            .open_unit_at(&keys, self.run.token(), prev)
+            .await?;
+        Ok(Held {
+            unit,
+            tables: tables.iter().map(|t| t.to_string()).collect(),
+            _inflight: g,
+        })
     }
 
     /// Close a unit: its marks, then the commit — serialized where one run's
     /// closes share a fence object.
     pub(crate) async fn close<'t>(&'t self, h: Held<'t, F>, marks: Vec<Watermark>) -> Result<()> {
-        if let Some(m) = marks.iter().find(|m| !h.tables.iter().any(|t| t == m.table())) {
-            return Err(Error::Transfer(format!("internal: mark for unheld table {}", m.table())));
+        if let Some(m) = marks
+            .iter()
+            .find(|m| !h.tables.iter().any(|t| t == m.table()))
+        {
+            return Err(Error::Transfer(format!(
+                "internal: mark for unheld table {}",
+                m.table()
+            )));
         }
-        let _g = if self.dest.serial_commit() { Some(self.commit_gate.lock().await) } else { None };
-        let Held { unit, _inflight, .. } = h;
+        let _g = if self.dest.serial_commit() {
+            Some(self.commit_gate.lock().await)
+        } else {
+            None
+        };
+        let Held {
+            unit, _inflight, ..
+        } = h;
         let r = self.dest.close_unit(unit, self.run.token(), marks).await;
         drop(_inflight);
         r
@@ -475,7 +546,8 @@ impl<F: Fence> Tenure<F> {
     /// per member its scratch, its markers, and its lease only with the proof
     /// that its markers are gone (`give_back`).
     pub(crate) async fn release(&self) {
-        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _all = self.units.write().await;
         let keeper = self.keeper.lock().expect("keeper").take();
         if let Some(mut k) = keeper {
@@ -486,7 +558,6 @@ impl<F: Fence> Tenure<F> {
         let held = std::mem::take(&mut *self.announced.lock().expect("announced"));
         give_back_run(&*self.dest, held, self.run.token()).await;
     }
-
 }
 
 impl<F: Fence> Drop for Tenure<F> {
@@ -515,7 +586,11 @@ impl<F: Fence> Drop for Tenure<F> {
 /// after the TTL the next run collects the member like a dead drain's, and its
 /// sweep retries the drop. (The handoff's §0 L5 swept between markers and
 /// lease and ignored a failed sweep.)
-async fn give_back<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announced)>, token: &str) -> bool {
+async fn give_back<F: Fence>(
+    dest: &F,
+    held: Vec<(String, crate::guard::Announced)>,
+    token: &str,
+) -> bool {
     let mut all = true;
     for (t, a) in held {
         let (g, bare) = dest.guard(&t);
@@ -549,7 +624,11 @@ async fn give_back<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announce
 /// collector that takes them after the TTL deletes it (`lease_claim`).
 /// Deleting it first is safe: `release` has waited for every unit, and only a
 /// unit's close writes through the fence.
-async fn give_back_run<F: Fence>(dest: &F, held: Vec<(String, crate::guard::Announced)>, token: &str) {
+async fn give_back_run<F: Fence>(
+    dest: &F,
+    held: Vec<(String, crate::guard::Announced)>,
+    token: &str,
+) {
     if let Err(e) = dest.close_run(token).await {
         eprintln!(
             "apitap: could not drop run {token}'s own objects ({e}); every claim is kept so the \
@@ -585,7 +664,11 @@ mod tests {
         fn dest_label(&self, bare: &str) -> String {
             format!("s.{bare}")
         }
-        async fn list(&self, _b: &str, _k: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+        async fn list(
+            &self,
+            _b: &str,
+            _k: &[crate::naming::Artifact],
+        ) -> Result<Vec<crate::guard::Listed>> {
             Ok(Vec::new())
         }
         async fn create_marker(&self, raw: &str) -> Result<()> {
@@ -652,7 +735,14 @@ mod tests {
         }
         async fn lease_unclaimed(&self, _t: &str) -> Result<Vec<String>> {
             let collected = self.collected.lock().unwrap().clone();
-            Ok(self.keys.lock().unwrap().iter().filter(|k| !collected.contains(*k)).cloned().collect())
+            Ok(self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| !collected.contains(*k))
+                .cloned()
+                .collect())
         }
         async fn close_run(&self, _t: &str) -> Result<()> {
             self.log.lock().unwrap().push("close_run".into());
@@ -669,7 +759,10 @@ mod tests {
     impl Fence for FakeFence {
         type Unit<'a> = ();
         fn guard(&self, t: &str) -> (Box<dyn GuardStore + '_>, String) {
-            (Box::new(FakeGuard(self.log.clone(), self.sweep_fails)), t.to_string())
+            (
+                Box::new(FakeGuard(self.log.clone(), self.sweep_fails)),
+                t.to_string(),
+            )
         }
         fn serial_commit(&self) -> bool {
             self.serial
@@ -695,15 +788,23 @@ mod tests {
     }
 
     fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     const SLOW: Duration = Duration::from_secs(3600);
 
     async fn tenure(f: Arc<FakeFence>, every: Duration) -> Tenure<FakeFence> {
-        Tenure::acquire_every(f, &["a".to_string(), "b".to_string()], RunId::mint_drain("s"), every)
-            .await
-            .unwrap()
+        Tenure::acquire_every(
+            f,
+            &["a".to_string(), "b".to_string()],
+            RunId::mint_drain("s"),
+            every,
+        )
+        .await
+        .unwrap()
     }
 
     /// P2: an announce failing on the 2nd of 3 tables closes ALL three
@@ -735,7 +836,11 @@ mod tests {
             let f = Arc::new(FakeFence::default());
             let t = tenure(f.clone(), SLOW).await;
             t.evicted.store(true, Ordering::SeqCst);
-            let e = t.open(&["a"]).await.err().expect("an evicted run opens nothing");
+            let e = t
+                .open(&["a"])
+                .await
+                .err()
+                .expect("an evicted run opens nothing");
             assert!(matches!(e, Error::Locked(_)), "{e}");
             assert_eq!(f.opens.load(Ordering::SeqCst), 0, "no I/O once evicted");
             t.release().await;
@@ -763,12 +868,25 @@ mod tests {
             };
             tokio::join!(holder, releaser, opener);
             let ev = f.events();
-            let at = |e: &str| ev.iter().position(|x| x == e).unwrap_or_else(|| panic!("{e} missing: {ev:?}"));
+            let at = |e: &str| {
+                ev.iter()
+                    .position(|x| x == e)
+                    .unwrap_or_else(|| panic!("{e} missing: {ev:?}"))
+            };
             assert!(at("open_unit") < at("close_unit"), "{ev:?}");
-            assert!(at("close_unit") < at("keeper_stop"), "release passed an open unit: {ev:?}");
+            assert!(
+                at("close_unit") < at("keeper_stop"),
+                "release passed an open unit: {ev:?}"
+            );
             assert!(at("keeper_stop") < at("close_run"), "{ev:?}");
-            assert!(at("close_run") < at("sweep_run"), "the run's objects go before any member's: {ev:?}");
-            assert!(at("sweep_run") < at("drop_marker"), "scratch goes before the markers: {ev:?}");
+            assert!(
+                at("close_run") < at("sweep_run"),
+                "the run's objects go before any member's: {ev:?}"
+            );
+            assert!(
+                at("sweep_run") < at("drop_marker"),
+                "scratch goes before the markers: {ev:?}"
+            );
             assert!(at("drop_marker") < at("lease_close"), "{ev:?}");
         });
     }
@@ -779,13 +897,19 @@ mod tests {
     #[test]
     fn a_failed_sweep_keeps_markers_and_lease() {
         rt().block_on(async {
-            let f = Arc::new(FakeFence { sweep_fails: true, ..Default::default() });
+            let f = Arc::new(FakeFence {
+                sweep_fails: true,
+                ..Default::default()
+            });
             let t = tenure(f.clone(), SLOW).await;
             t.release().await;
             let ev = f.events();
             assert!(ev.iter().any(|e| e == "sweep_run"), "{ev:?}");
             for kept in ["drop_marker", "lease_close"] {
-                assert!(!ev.iter().any(|e| e == kept), "{kept} after a failed sweep: {ev:?}");
+                assert!(
+                    !ev.iter().any(|e| e == kept),
+                    "{kept} after a failed sweep: {ev:?}"
+                );
             }
         });
     }
@@ -798,13 +922,19 @@ mod tests {
     #[test]
     fn a_failed_close_run_keeps_every_claim() {
         rt().block_on(async {
-            let f = Arc::new(FakeFence { close_run_fails: true, ..Default::default() });
+            let f = Arc::new(FakeFence {
+                close_run_fails: true,
+                ..Default::default()
+            });
             let t = tenure(f.clone(), SLOW).await;
             t.release().await;
             let ev = f.events();
             assert!(ev.iter().any(|e| e == "close_run"), "{ev:?}");
             for kept in ["drop_marker", "lease_close"] {
-                assert!(!ev.iter().any(|e| e == kept), "{kept} after a failed close_run: {ev:?}");
+                assert!(
+                    !ev.iter().any(|e| e == kept),
+                    "{kept} after a failed close_run: {ev:?}"
+                );
             }
         });
     }
@@ -821,7 +951,13 @@ mod tests {
             ("dest_bq.rs", include_str!("logbased/dest_bq.rs")),
             ("dest_ice.rs", include_str!("logbased/dest_ice.rs")),
         ];
-        const TYPES: &[&str] = &["PgPool", "MySqlShared", "mysql_async::Pool", "ChConn", "BqConn"];
+        const TYPES: &[&str] = &[
+            "PgPool",
+            "MySqlShared",
+            "mysql_async::Pool",
+            "ChConn",
+            "BqConn",
+        ];
         const STATEMENTS: &[&str] = &["COMMIT", "START TRANSACTION", "ROLLBACK"];
         for (name, src) in FILES {
             let (code, strings) = outside_store(src).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -835,10 +971,16 @@ mod tests {
                 for lit in &strings {
                     // Source text, escapes unprocessed: `\n` and a line
                     // continuation are whitespace to SQL.
-                    let sql = lit.replace("\\\n", " ").replace("\\n", " ").replace("\\t", " ").replace("\\r", " ");
+                    let sql = lit
+                        .replace("\\\n", " ")
+                        .replace("\\n", " ")
+                        .replace("\\t", " ")
+                        .replace("\\r", " ");
                     let opens = sql.split(';').any(|stmt| {
                         let t = stmt.trim_start();
-                        t.starts_with(st) && !t[st.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                        t.starts_with(st)
+                            && !t[st.len()..]
+                                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
                     });
                     assert!(!opens, "{name}: {st} outside mod store: {lit:?}");
                 }
@@ -850,7 +992,8 @@ mod tests {
     fn has_word(hay: &str, word: &str) -> bool {
         let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
         hay.match_indices(word).any(|(i, _)| {
-            !hay[..i].chars().next_back().is_some_and(ident) && !hay[i + word.len()..].chars().next().is_some_and(ident)
+            !hay[..i].chars().next_back().is_some_and(ident)
+                && !hay[i + word.len()..].chars().next().is_some_and(ident)
         })
     }
 
@@ -861,7 +1004,10 @@ mod tests {
     /// nothing.
     fn outside_store(src: &str) -> std::result::Result<(String, Vec<String>), String> {
         #[derive(PartialEq)]
-        enum K { Code, Str }
+        enum K {
+            Code,
+            Str,
+        }
         // Lex into (kind, text) runs.
         let b = src.as_bytes();
         let mut runs: Vec<(K, String)> = vec![(K::Code, String::new())];
@@ -879,13 +1025,26 @@ mod tests {
             } else if rest.starts_with("/*") {
                 let (mut depth, mut j) = (0usize, i);
                 while j < b.len() {
-                    if src[j..].starts_with("/*") { depth += 1; j += 2; }
-                    else if src[j..].starts_with("*/") { depth -= 1; j += 2; if depth == 0 { break; } }
-                    else { j += 1; }
+                    if src[j..].starts_with("/*") {
+                        depth += 1;
+                        j += 2;
+                    } else if src[j..].starts_with("*/") {
+                        depth -= 1;
+                        j += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        j += 1;
+                    }
                 }
                 push(&mut runs, K::Code, " ");
                 i = j;
-            } else if rest.starts_with("r\"") || rest.starts_with("r#") || rest.starts_with("br\"") || rest.starts_with("br#") {
+            } else if rest.starts_with("r\"")
+                || rest.starts_with("r#")
+                || rest.starts_with("br\"")
+                || rest.starts_with("br#")
+            {
                 let start = if rest.starts_with('b') { i + 2 } else { i + 1 };
                 let hashes = src[start..].bytes().take_while(|&c| c == b'#').count();
                 if b.get(start + hashes) != Some(&b'"') {
@@ -918,8 +1077,14 @@ mod tests {
                     (b.get(i + 1 + c) == Some(&b'\'')).then_some(i + 2 + c)
                 };
                 match lit {
-                    Some(end) => { push(&mut runs, K::Code, " ' ' "); i = end; }
-                    None => { push(&mut runs, K::Code, "'"); i += 1; }
+                    Some(end) => {
+                        push(&mut runs, K::Code, " ' ' ");
+                        i = end;
+                    }
+                    None => {
+                        push(&mut runs, K::Code, "'");
+                        i += 1;
+                    }
                 }
             } else {
                 let c = rest.chars().next().unwrap();
@@ -933,7 +1098,9 @@ mod tests {
         let (mut cutting, mut depth, mut found) = (false, 0i64, 0);
         for (k, t) in runs {
             if k == K::Str {
-                if !cutting { strings.push(t); }
+                if !cutting {
+                    strings.push(t);
+                }
                 continue;
             }
             let mut code = t.as_str();
@@ -951,26 +1118,40 @@ mod tests {
                             depth = 1;
                             code = &code[at + m.len()..];
                         }
-                        _ => { out.push_str(code); break; }
+                        _ => {
+                            out.push_str(code);
+                            break;
+                        }
                     }
                 } else {
                     let mut end = None;
                     for (n, ch) in code.char_indices() {
                         match ch {
                             '{' => depth += 1,
-                            '}' => { depth -= 1; if depth == 0 { end = Some(n + 1); break; } }
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = Some(n + 1);
+                                    break;
+                                }
+                            }
                             _ => {}
                         }
                     }
                     match end {
-                        Some(e) => { cutting = false; code = &code[e..]; }
+                        Some(e) => {
+                            cutting = false;
+                            code = &code[e..];
+                        }
                         None => break,
                     }
                 }
             }
         }
         if found != 1 || cutting {
-            return Err(format!("expected one closed `mod store {{ … }}`, found {found} (open: {cutting})"));
+            return Err(format!(
+                "expected one closed `mod store {{ … }}`, found {found} (open: {cutting})"
+            ));
         }
         Ok((out, strings))
     }
@@ -982,21 +1163,29 @@ mod tests {
             let t = tenure(f.clone(), Duration::from_millis(10)).await;
             f.collected.lock().unwrap().insert("s.a".into());
             tokio::time::sleep(Duration::from_millis(60)).await;
-            assert!(t.evicted.load(Ordering::SeqCst), "a claimed key is an eviction");
+            assert!(
+                t.evicted.load(Ordering::SeqCst),
+                "a claimed key is an eviction"
+            );
             t.release().await;
 
             let f = Arc::new(FakeFence::default());
             let t = tenure(f.clone(), Duration::from_millis(10)).await;
             f.expired.lock().unwrap().insert("s.b".into());
             tokio::time::sleep(Duration::from_millis(60)).await;
-            assert!(!t.evicted.load(Ordering::SeqCst), "an expired but unclaimed lease is still ours");
+            assert!(
+                !t.evicted.load(Ordering::SeqCst),
+                "an expired but unclaimed lease is still ours"
+            );
             t.release().await;
         });
     }
 
     #[test]
     fn keeper_ignores_shutdown_flag() {
-        let _serial = crate::shutdown::tests::SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = crate::shutdown::tests::SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         crate::shutdown::request();
         rt().block_on(async {
             let f = Arc::new(FakeFence::default());
@@ -1011,7 +1200,10 @@ mod tests {
             let n = f.renews.load(Ordering::SeqCst);
             t.release().await;
             crate::shutdown::clear();
-            assert!(n >= 3, "a wind-down keeps the lease alive until release: {n} renewals");
+            assert!(
+                n >= 3,
+                "a wind-down keeps the lease alive until release: {n} renewals"
+            );
         });
         crate::shutdown::clear();
     }
@@ -1019,11 +1211,26 @@ mod tests {
     #[test]
     fn hold_refuses_missing_collected_lapsed() {
         let keys = vec!["s.a".to_string()];
-        assert!(matches!(owner_verdict(None, &keys), Err(Error::Locked(_))), "no row is not an owner");
-        let collected = Lease { expires_in: 100, collected: true };
-        assert!(matches!(owner_verdict(Some(&collected), &keys), Err(Error::Locked(_))));
-        let lapsed = Lease { expires_in: -5, collected: false };
-        assert!(owner_verdict(Some(&lapsed), &keys).is_ok(), "lapsed but unclaimed is still ours");
+        assert!(
+            matches!(owner_verdict(None, &keys), Err(Error::Locked(_))),
+            "no row is not an owner"
+        );
+        let collected = Lease {
+            expires_in: 100,
+            collected: true,
+        };
+        assert!(matches!(
+            owner_verdict(Some(&collected), &keys),
+            Err(Error::Locked(_))
+        ));
+        let lapsed = Lease {
+            expires_in: -5,
+            collected: false,
+        };
+        assert!(
+            owner_verdict(Some(&lapsed), &keys).is_ok(),
+            "lapsed but unclaimed is still ours"
+        );
     }
 
     #[test]
@@ -1035,7 +1242,11 @@ mod tests {
             drop(t);
             let n = f.renews.load(Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(f.renews.load(Ordering::SeqCst), n, "a dropped tenure keeps renewing");
+            assert_eq!(
+                f.renews.load(Ordering::SeqCst),
+                n,
+                "a dropped tenure keeps renewing"
+            );
         });
     }
 
@@ -1053,7 +1264,10 @@ mod tests {
     #[test]
     fn serial_commit_gate() {
         rt().block_on(async {
-            let f = Arc::new(FakeFence { serial: true, ..Default::default() });
+            let f = Arc::new(FakeFence {
+                serial: true,
+                ..Default::default()
+            });
             let t = tenure(f.clone(), SLOW).await;
             let one = async {
                 let h = t.open(&["a"]).await.unwrap();
@@ -1064,7 +1278,11 @@ mod tests {
                 t.close(h, vec![]).await.unwrap();
             };
             tokio::join!(one, two);
-            assert_eq!(f.max_in_close.load(Ordering::SeqCst), 1, "two closes overlapped");
+            assert_eq!(
+                f.max_in_close.load(Ordering::SeqCst),
+                1,
+                "two closes overlapped"
+            );
             t.release().await;
         });
     }
@@ -1075,7 +1293,10 @@ mod tests {
             let f = Arc::new(FakeFence::default());
             let t = tenure(f.clone(), SLOW).await;
             let h = t.open(&["a"]).await.unwrap();
-            let bad = Watermark::Clear { table: "b".into(), source_id: "x".into() };
+            let bad = Watermark::Clear {
+                table: "b".into(),
+                source_id: "x".into(),
+            };
             assert!(t.close(h, vec![bad]).await.is_err());
             t.release().await;
         });

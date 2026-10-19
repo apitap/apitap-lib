@@ -225,7 +225,12 @@ fn pgoutput_survives_anything_a_peer_can_send() {
                 for keep_binary in [false, true] {
                     // The contract is "Ok or Err" — the value is not the
                     // point, the absence of a panic is.
-                    match decode(&bytes::Bytes::from(m.clone()), in_stream, &oids, keep_binary) {
+                    match decode(
+                        &bytes::Bytes::from(m.clone()),
+                        in_stream,
+                        &oids,
+                        keep_binary,
+                    ) {
                         Ok(_) => ok += 1,
                         Err(_) => err += 1,
                     }
@@ -476,15 +481,17 @@ async fn walsender_frames_survive_hostile_lengths() {
     for (bytes, expect_cap) in hostile {
         let (client, mut server) = socket_pair().await;
         let (r, _w) = client.into_split();
-        let mut rd =
-            tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
+        let mut rd = tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
         // Write, then close: a reader waiting for bytes that never come must
         // see EOF rather than hang.
         server.write_all(&bytes).await.expect("write");
         server.shutdown().await.ok();
         drop(server);
         let got = super::walsender::read_frame_for_test(&mut rd).await;
-        assert!(got.is_err(), "a truncated frame must not be accepted: {bytes:?}");
+        assert!(
+            got.is_err(),
+            "a truncated frame must not be accepted: {bytes:?}"
+        );
         if expect_cap {
             let msg = format!("{:?}", got.unwrap_err());
             assert!(
@@ -658,7 +665,10 @@ async fn mysql_packets_survive_hostile_lengths() {
     drop(server);
     let mut seq = 0u8;
     let got = super::mywire::read_packet_raw_for_test(&mut c, &mut seq).await;
-    assert!(got.is_err(), "a packet whose body never arrives must not be accepted");
+    assert!(
+        got.is_err(),
+        "a packet whose body never arrives must not be accepted"
+    );
 
     // A continuation chain: several maximum-size packets in a row. Without a
     // ceiling on the ASSEMBLED payload this grows without bound.

@@ -2,10 +2,10 @@
 //! (or TabSeparated for the text fallback lane) into a staging MergeTree, swapped in
 //! atomically with `EXCHANGE TABLES`.
 
-use crate::sink::{FinishMarked, Loader, Msg};
 use crate::error::{Error, Result};
 use crate::pipe;
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
+use crate::sink::{FinishMarked, Loader, Msg};
 use crate::Mode;
 
 /// A ClickHouse HTTP endpoint parsed from a `clickhouse://user:pass@host:port/db` URL
@@ -107,7 +107,11 @@ async fn remove_lease_ttl(ch: &ChConn) -> Result<()> {
         ))
         .await?;
     if engine.contains(" TTL ") {
-        ch.exec(&format!("ALTER TABLE `{}` REMOVE TTL", crate::lease::LEASE_TABLE)).await?;
+        ch.exec(&format!(
+            "ALTER TABLE `{}` REMOVE TTL",
+            crate::lease::LEASE_TABLE
+        ))
+        .await?;
     }
     done.lock().expect("lease ttl memo").insert(key);
     Ok(())
@@ -185,7 +189,12 @@ pub(crate) async fn lease_unclaimed(ch: &ChConn, token: &str) -> Result<Vec<Stri
             tok = ch_str(token),
         ))
         .await?;
-    Ok(body.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty()).map(String::from).collect())
+    Ok(body
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 pub(crate) async fn lease_get(
@@ -223,7 +232,10 @@ pub(crate) async fn lease_get(
     }
     let expires_in: i64 = parse_num(f.next().unwrap_or(""), "lease expiry")?;
     let collected: u8 = parse_num(f.next().unwrap_or(""), "lease collected flag")?;
-    Ok(Some(crate::lease::Lease { expires_in, collected: collected != 0 }))
+    Ok(Some(crate::lease::Lease {
+        expires_in,
+        collected: collected != 0,
+    }))
 }
 
 /// Check-then-act, and the comment says so rather than pretending otherwise:
@@ -232,7 +244,11 @@ pub(crate) async fn lease_get(
 /// other's lock. The claim version is biased above every renewal, so the
 /// victim's keeper cannot write over it, and its statements carry the
 /// ownership predicate that reads it.
-pub(crate) async fn lease_claim(ch: &ChConn, key: &str, token: &str) -> Result<crate::guard::Claim> {
+pub(crate) async fn lease_claim(
+    ch: &ChConn,
+    key: &str,
+    token: &str,
+) -> Result<crate::guard::Claim> {
     use crate::guard::Claim;
     Ok(match lease_get(ch, key, token).await? {
         None => Claim::Absent,
@@ -270,7 +286,10 @@ impl ChGuard {
     }
 
     fn oc(&self) -> String {
-        self.on_cluster.as_deref().map(|c| format!(" ON CLUSTER `{c}`")).unwrap_or_default()
+        self.on_cluster
+            .as_deref()
+            .map(|c| format!(" ON CLUSTER `{c}`"))
+            .unwrap_or_default()
     }
 
     /// Kill every unfinished mutation of `table` that reads `scratch`.
@@ -293,18 +312,27 @@ impl ChGuard {
             ch_str(table),
             ch_str(scratch)
         );
-        let n = self.ch.read(&format!("SELECT count() FROM system.mutations WHERE {pred}")).await?;
+        let n = self
+            .ch
+            .read(&format!(
+                "SELECT count() FROM system.mutations WHERE {pred}"
+            ))
+            .await?;
         if n.trim() == "0" {
             return Ok(());
         }
-        self.ch.exec(&format!("KILL MUTATION WHERE {pred}")).await.map(|_| ()).map_err(|e| {
-            Error::Transfer(format!(
+        self.ch
+            .exec(&format!("KILL MUTATION WHERE {pred}"))
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                Error::Transfer(format!(
                 "{table}: a mutation still reads {scratch}, the key table of a run that stopped \
                  mid-window, and it could not be killed ({e}). It is kept until the mutation is \
                  gone: kill it with KILL MUTATION WHERE table = '{table}' AND position(command, \
                  '{scratch}') > 0, or let it finish; the next run then drops the key table"
             ))
-        })
+            })
     }
 }
 
@@ -323,7 +351,11 @@ impl crate::guard::GuardStore for ChGuard {
         &[Lock, Staging, New]
     }
 
-    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+    async fn list(
+        &self,
+        bare: &str,
+        kinds: &[crate::naming::Artifact],
+    ) -> Result<Vec<crate::guard::Listed>> {
         // The token sits BETWEEN head and suffix, so the pattern is
         // head + wildcard + suffix, never a prefix. `_` and `%` are LIKE
         // wildcards and every suffix is full of the first, so both are escaped;
@@ -331,7 +363,11 @@ impl crate::guard::GuardStore for ChGuard {
         // pattern goes through `ch_str`, which doubles the backslashes for the
         // string literal — ClickHouse unescapes the literal first, and LIKE then
         // sees `\_` exactly as intended.
-        let esc = |v: &str| v.replace('\\', "\\\\").replace('_', "\\_").replace('%', "\\%");
+        let esc = |v: &str| {
+            v.replace('\\', "\\\\")
+                .replace('_', "\\_")
+                .replace('%', "\\%")
+        };
         let mut out = Vec::new();
         for &a in kinds {
             let (head, suffix) = crate::naming::artifact_match(bare, a, crate::naming::ROOMY);
@@ -378,7 +414,11 @@ impl crate::guard::GuardStore for ChGuard {
         } else {
             format!("DROP TABLE IF EXISTS {}", ch_ident(raw))
         };
-        self.ch.exec(&sql).await.map(|_| ()).map_err(|e| Error::Transfer(format!("drop {raw}: {e}")))
+        self.ch
+            .exec(&sql)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Transfer(format!("drop {raw}: {e}")))
     }
 
     async fn lease_get(&self, key: &str, token: &str) -> Result<Option<crate::lease::Lease>> {
@@ -415,7 +455,14 @@ impl crate::guard::GuardStore for ChGuard {
         if first.is_ok() {
             first = self.kill_readers(bare, &kt).await;
         }
-        let r = self.drop_object(&artifact_ident_tok(bare, Artifact::ChangelogTmp, ROOMY, token)).await;
+        let r = self
+            .drop_object(&artifact_ident_tok(
+                bare,
+                Artifact::ChangelogTmp,
+                ROOMY,
+                token,
+            ))
+            .await;
         if first.is_ok() {
             first = r;
         }
@@ -429,7 +476,9 @@ fn summary_written_rows(h: &str) -> Option<u64> {
     let at = h.find("\"written_rows\"")? + "\"written_rows\"".len();
     let rest = h[at..].trim_start().strip_prefix(':')?.trim_start();
     let rest = rest.strip_prefix('"').unwrap_or(rest);
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -617,7 +666,11 @@ impl ChConn {
     /// `exec_with`, answering how many rows the statement WROTE, from the
     /// `X-ClickHouse-Summary` header (final, under `wait_end_of_query=1`).
     /// `None` = the header was absent, which is not the same as zero.
-    pub(crate) async fn exec_written(&self, query: &str, settings: &[(&str, &str)]) -> Result<Option<u64>> {
+    pub(crate) async fn exec_written(
+        &self,
+        query: &str,
+        settings: &[(&str, &str)],
+    ) -> Result<Option<u64>> {
         self.exec_inner(query, settings).await.map(|(_, w)| w)
     }
 
@@ -627,7 +680,11 @@ impl ChConn {
         self.exec_with(sql, &[("readonly", "2")]).await
     }
 
-    async fn exec_inner(&self, query: &str, settings: &[(&str, &str)]) -> Result<(String, Option<u64>)> {
+    async fn exec_inner(
+        &self,
+        query: &str,
+        settings: &[(&str, &str)],
+    ) -> Result<(String, Option<u64>)> {
         // Four attempts over ~7s of backoff: long enough for a rolling
         // restart or a failover to finish, short enough that a genuinely
         // down cluster still fails the run rather than hanging the schedule.
@@ -653,8 +710,7 @@ impl ChConn {
             // succeeded swaps the tables BACK; repeating an ATTACH duplicates
             // every row. Neither would raise anything.
             if matches!(&sent, Err(e) if e.is_connect()) && attempt < BACKOFF_MS.len() {
-                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt])).await;
                 attempt += 1;
                 continue;
             }
@@ -691,8 +747,7 @@ impl ChConn {
             let is_read = settings.iter().any(|(k, _)| *k == "readonly");
             let outcome_unknown = from_proxy_5xx && !is_read && status.as_u16() != 503;
             if from_proxy_5xx && !outcome_unknown && attempt < BACKOFF_MS.len() {
-                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt])).await;
                 attempt += 1;
                 continue;
             }
@@ -700,8 +755,7 @@ impl ChConn {
                 // A 5xx with no ClickHouse exception in it did not come from
                 // ClickHouse; say so, because "clickhouse 503" sends people
                 // reading the wrong logs.
-                let from_proxy =
-                    status.is_server_error() && !body.contains("DB::Exception");
+                let from_proxy = status.is_server_error() && !body.contains("DB::Exception");
                 return Err(Error::Transfer(format!(
                     "clickhouse {status}: {}{}{}",
                     body.trim(),
@@ -750,7 +804,9 @@ impl ChConn {
         body: reqwest::Body,
         settings: &[(&str, &str)],
     ) -> Result<()> {
-        self.insert_stream_summary(query, body, settings).await.map(|_| ())
+        self.insert_stream_summary(query, body, settings)
+            .await
+            .map(|_| ())
     }
 
     /// `insert_stream_with`, answering how many rows the server reported
@@ -879,7 +935,10 @@ fn sync_timeout_s() -> String {
 }
 
 fn sync_replica_settings(secs: &str) -> [(&'static str, &str); 2] {
-    [("distributed_ddl_task_timeout", secs), ("receive_timeout", secs)]
+    [
+        ("distributed_ddl_task_timeout", secs),
+        ("receive_timeout", secs),
+    ]
 }
 
 /// One scalar from a `FORMAT TabSeparatedRaw` answer: the value as stored,
@@ -983,7 +1042,6 @@ fn ch_base_type(t: &str) -> String {
     t.to_string()
 }
 
-
 /// Escape a string for a single-quoted ClickHouse literal.
 pub(crate) fn ch_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
@@ -1006,10 +1064,14 @@ pub(crate) fn state_read_sql(dest_table: &str, source_id: &str) -> String {
 /// The row `state_read_sql` returned, if any. An empty watermark reads as
 /// none (the column is a plain String, so "" is what an absent value became).
 pub(crate) fn state_row_of(body: &str) -> Result<Option<crate::naming::StateRow>> {
-    let Some(line) = body.lines().next() else { return Ok(None) };
+    let Some(line) = body.lines().next() else {
+        return Ok(None);
+    };
     let f: Vec<&str> = line.split('\t').collect();
     if f.len() != 3 {
-        return Err(Error::Transfer(format!("malformed state row from ClickHouse: {line:?}")));
+        return Err(Error::Transfer(format!(
+            "malformed state row from ClickHouse: {line:?}"
+        )));
     }
     let text = |s: &str| {
         crate::logbased::rowtext::tsv_unescape(s).map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -1047,7 +1109,11 @@ impl ChSink {
             let settings = sync_replica_settings(&secs);
             self.ch
                 .exec_with(
-                    &format!("SYSTEM SYNC REPLICA ON CLUSTER {} {}", ch_ident(cl), self.staging_t),
+                    &format!(
+                        "SYSTEM SYNC REPLICA ON CLUSTER {} {}",
+                        ch_ident(cl),
+                        self.staging_t
+                    ),
                     &settings,
                 )
                 .await
@@ -1165,7 +1231,11 @@ impl ChSink {
     /// for the next run's scan to name rather than failing a run that
     /// landed (or, for an append, re-landing it).
     async fn drop_staging_after_publish(&self) {
-        if let Err(e) = self.ch.exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t)).await {
+        if let Err(e) = self
+            .ch
+            .exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
+            .await
+        {
             crate::progress::warn(&format!(
                 "clickhouse: published, but dropping {} failed ({e}); the next run of \
                  this table will name it — drop it by hand (a table over \
@@ -1228,10 +1298,20 @@ impl ChSink {
 pub(crate) fn state_version_expr(keys: &[(&str, &str)]) -> String {
     let pred = keys
         .iter()
-        .map(|(t, s)| format!("(dest_table = '{}' AND source_id = '{}')", ch_str(t), ch_str(s)))
+        .map(|(t, s)| {
+            format!(
+                "(dest_table = '{}' AND source_id = '{}')",
+                ch_str(t),
+                ch_str(s)
+            )
+        })
         .collect::<Vec<_>>()
         .join(" OR ");
-    let pred = if pred.is_empty() { "0".to_string() } else { pred };
+    let pred = if pred.is_empty() {
+        "0".to_string()
+    } else {
+        pred
+    };
     format!(
         "greatest(now64(6), (SELECT max(synced_at) FROM `_apitap_state` WHERE {pred}) + toIntervalMicrosecond(1))"
     )
@@ -1596,7 +1676,11 @@ impl ChSink {
             // fresh empty one, and A's finalize exchanged B's empty table onto
             // the destination while returning A's row count.
             staging_t: ch_ident(&crate::naming::artifact_ident_run(
-                dest_bare, crate::naming::Artifact::Staging, crate::naming::ROOMY, run)),
+                dest_bare,
+                crate::naming::Artifact::Staging,
+                crate::naming::ROOMY,
+                run,
+            )),
             final_bare: dest_bare.to_string(),
             source_id: None,
             cursor_col: None,
@@ -1811,9 +1895,13 @@ impl crate::sink::Sink for ChSink {
         // announcement again if anything here fails; see `announce`.
         let a = crate::guard::announce(&self.guard(), &self.final_bare, &self.run).await?;
         *self.announced.lock().expect("announcement") = Some(a);
-        crate::guard::check_peers(&self.guard(), &self.final_bare, &self.run,
-                                  crate::guard::Mine::DeleteLeftovers)
-            .await?;
+        crate::guard::check_peers(
+            &self.guard(),
+            &self.final_bare,
+            &self.run,
+            crate::guard::Mine::DeleteLeftovers,
+        )
+        .await?;
         if self.ddl.on_cluster.is_some() {
             // Behind a load balancer every HTTP request may reach a DIFFERENT
             // node (seen live: a DROP landed on node A, the CREATE on node B →
@@ -2121,7 +2209,12 @@ impl crate::sink::Sink for ChSink {
         let state_wm = crate::naming::cursor_watermark(
             &self.final_bare,
             cursor,
-            state_row_of(&self.ch.exec(&state_read_sql(&self.final_bare, source_id)).await?)?,
+            state_row_of(
+                &self
+                    .ch
+                    .exec(&state_read_sql(&self.final_bare, source_id))
+                    .await?,
+            )?,
         )?;
         let n: u64 = self
             .ch
@@ -2173,7 +2266,9 @@ impl crate::sink::Sink for ChSink {
             state_wm,
             data_wm,
             siblings,
-            crate::plan::WmArbitration::Greatest { numeric: numeric_cursor },
+            crate::plan::WmArbitration::Greatest {
+                numeric: numeric_cursor,
+            },
             &self.final_bare,
             source_id,
         )?;
@@ -2200,9 +2295,16 @@ impl crate::sink::Sink for ChSink {
     async fn discard(&self) -> Result<()> {
         use crate::guard::GuardStore;
         let mut first_err = None;
-        for a in [crate::naming::Artifact::Staging, crate::naming::Artifact::New] {
+        for a in [
+            crate::naming::Artifact::Staging,
+            crate::naming::Artifact::New,
+        ] {
             let name = crate::naming::artifact_ident_run(
-                &self.final_bare, a, crate::naming::ROOMY, &self.run);
+                &self.final_bare,
+                a,
+                crate::naming::ROOMY,
+                &self.run,
+            );
             if let Err(e) = self.guard().drop_object(&name).await {
                 first_err.get_or_insert(e);
             }
@@ -2343,10 +2445,7 @@ impl ChSink {
                         .await?;
                     let _ = self
                         .ch
-                        .exec(&format!(
-                            "DROP TABLE IF EXISTS {}{oc}",
-                            self.staging_t
-                        ))
+                        .exec(&format!("DROP TABLE IF EXISTS {}{oc}", self.staging_t))
                         .await;
                 } else if self.ddl.engine.is_some() {
                     // The final table needs the USER's engine, so a name swap with
@@ -2383,7 +2482,13 @@ impl ChSink {
                                 self.final_t
                             ))
                             .await
-                            .map_err(|e| if flipped { flipped_lost(&self.final_bare, e) } else { e })?;
+                            .map_err(|e| {
+                                if flipped {
+                                    flipped_lost(&self.final_bare, e)
+                                } else {
+                                    e
+                                }
+                            })?;
                         self.ch
                             .exec(&format!(
                                 "ALTER TABLE {} ATTACH PARTITION ID 'all' FROM {}",
@@ -2421,8 +2526,11 @@ impl ChSink {
                         // covers Artifact::New too), rather than by blind-
                         // dropping a name a live run may be holding.
                         let tmp = ch_ident(&crate::naming::artifact_ident_run(
-                            &self.final_bare, crate::naming::Artifact::New,
-                            crate::naming::ROOMY, &self.run));
+                            &self.final_bare,
+                            crate::naming::Artifact::New,
+                            crate::naming::ROOMY,
+                            &self.run,
+                        ));
                         self.ch
                             .exec(&format!(
                                 "CREATE TABLE {tmp}{oc} ({create_cols}) \
@@ -2464,7 +2572,10 @@ impl ChSink {
                     // a peer published since the probe, instead of swapping
                     // the peer's table into staging and dropping it.
                     self.ch
-                        .exec(&format!("RENAME TABLE {} TO {}", self.staging_t, self.final_t))
+                        .exec(&format!(
+                            "RENAME TABLE {} TO {}",
+                            self.staging_t, self.final_t
+                        ))
                         .await
                         .map_err(|e| flipped_lost(&self.final_bare, e))?;
                     return self.publish_state_flipped(staged_wm.as_deref(), rows).await;
@@ -2488,7 +2599,8 @@ impl ChSink {
                 // Replace destroyed every source's rows — clear ALL stale state rows
                 // for this destination before the bootstrap (if any) re-inserts its own.
                 if flipped {
-                    self.publish_state_flipped(staged_wm.as_deref(), rows).await?;
+                    self.publish_state_flipped(staged_wm.as_deref(), rows)
+                        .await?;
                 } else {
                     self.ensure_state_table().await?;
                     self.ch
@@ -2658,7 +2770,12 @@ impl Loader for ChLoader {
             }
         }
         self.sent += buf.len() as u64;
-        if self.tx.send(Msg::Buf(bytes::Bytes::from(buf))).await.is_err() {
+        if self
+            .tx
+            .send(Msg::Buf(bytes::Bytes::from(buf)))
+            .await
+            .is_err()
+        {
             // The insert died — its task holds the real error.
             return Err(Self::real_error(&mut self.join).await);
         }
@@ -2667,7 +2784,9 @@ impl Loader for ChLoader {
 
     async fn finish(self) -> Result<u64> {
         use futures::SinkExt;
-        let Self { mut tx, mut join, .. } = self;
+        let Self {
+            mut tx, mut join, ..
+        } = self;
         let _ = tx.send(Msg::Finish).await; // clean end-of-body: ClickHouse commits
         drop(tx);
         match join.join().await {
@@ -2709,18 +2828,36 @@ mod tests {
     #[test]
     fn a_state_version_is_above_the_newest_row() {
         let v = super::state_version_expr(&[("t", "s"), ("u'x", "s")]);
-        assert!(v.starts_with("greatest(now64(6), (SELECT max(synced_at) FROM `_apitap_state` WHERE "), "{v}");
-        assert!(v.contains("(dest_table = 't' AND source_id = 's') OR (dest_table = 'u\\'x'"), "{v}");
+        assert!(
+            v.starts_with("greatest(now64(6), (SELECT max(synced_at) FROM `_apitap_state` WHERE "),
+            "{v}"
+        );
+        assert!(
+            v.contains("(dest_table = 't' AND source_id = 's') OR (dest_table = 'u\\'x'"),
+            "{v}"
+        );
         assert!(v.ends_with("+ toIntervalMicrosecond(1))"), "{v}");
     }
 
     /// P2: plain HTTP off loopback is flagged; loopback and https are not.
     #[test]
     fn plaintext_to_a_remote_host_is_flagged() {
-        assert!(super::plaintext_remote("clickhouse://u:p@10.0.0.5:8123/d", false));
-        assert!(!super::plaintext_remote("clickhouse://u:p@127.0.0.1:8123/d", false));
-        assert!(!super::plaintext_remote("clickhouse://u:p@localhost:8123/d", false));
-        assert!(!super::plaintext_remote("clickhouse+https://u:p@10.0.0.5:8443/d", true));
+        assert!(super::plaintext_remote(
+            "clickhouse://u:p@10.0.0.5:8123/d",
+            false
+        ));
+        assert!(!super::plaintext_remote(
+            "clickhouse://u:p@127.0.0.1:8123/d",
+            false
+        ));
+        assert!(!super::plaintext_remote(
+            "clickhouse://u:p@localhost:8123/d",
+            false
+        ));
+        assert!(!super::plaintext_remote(
+            "clickhouse+https://u:p@10.0.0.5:8443/d",
+            true
+        ));
     }
 
     /// P2: a raw-TSV scalar is the stored value, minus the row newline only.
@@ -2765,15 +2902,26 @@ mod tests {
                     let mut got = Vec::new();
                     // Read until the body is in.
                     let h = loop {
-                        let Ok(n) = c.read(&mut buf).await else { return };
-                        if n == 0 { return; }
+                        let Ok(n) = c.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
                         got.extend_from_slice(&buf[..n]);
                         let t = String::from_utf8_lossy(&got).to_string();
                         if let Some(h) = t.find("\r\n\r\n") {
-                            let len = t[..h].to_ascii_lowercase().lines()
-                                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            let len = t[..h]
+                                .to_ascii_lowercase()
+                                .lines()
+                                .find_map(|l| {
+                                    l.strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
                                 .unwrap_or(0);
-                            if got.len() >= h + 4 + len { break h; }
+                            if got.len() >= h + 4 + len {
+                                break h;
+                            }
                         }
                     };
                     let sql = String::from_utf8_lossy(&got[h + 4..]).to_string();
@@ -2789,13 +2937,19 @@ mod tests {
                 });
             }
         });
-        let g = ChGuard::new(ChConn::parse(&format!("clickhouse://default:x@127.0.0.1:{port}/default")).unwrap(), None);
+        let g = ChGuard::new(
+            ChConn::parse(&format!("clickhouse://default:x@127.0.0.1:{port}/default")).unwrap(),
+            None,
+        );
         (g, seen)
     }
 
     /// A mock that answers the first `fails` requests with `status` and a
     /// proxy's error page (no `DB::Exception`), then 200 "ok"; counts requests.
-    async fn proxy_status_mock(status: u16, fails: usize) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    async fn proxy_status_mock(
+        status: u16,
+        fails: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
@@ -2808,28 +2962,43 @@ mod tests {
                     let mut buf = vec![0u8; 16384];
                     let mut got = Vec::new();
                     loop {
-                        let Ok(k) = c.read(&mut buf).await else { return };
-                        if k == 0 { return; }
+                        let Ok(k) = c.read(&mut buf).await else {
+                            return;
+                        };
+                        if k == 0 {
+                            return;
+                        }
                         got.extend_from_slice(&buf[..k]);
                         let t = String::from_utf8_lossy(&got).to_string();
                         if let Some(h) = t.find("\r\n\r\n") {
-                            let len = t[..h].to_ascii_lowercase().lines()
-                                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            let len = t[..h]
+                                .to_ascii_lowercase()
+                                .lines()
+                                .find_map(|l| {
+                                    l.strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
                                 .unwrap_or(0);
-                            if got.len() >= h + 4 + len { break; }
+                            if got.len() >= h + 4 + len {
+                                break;
+                            }
                         }
                     }
                     let resp = if n < fails {
                         let b = "<html><body>Gateway error</body></html>";
                         format!("HTTP/1.1 {status} Proxy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())
                     } else {
-                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            .to_string()
                     };
                     let _ = c.write_all(resp.as_bytes()).await;
                 });
             }
         });
-        (format!("clickhouse://default:x@127.0.0.1:{port}/default"), hits)
+        (
+            format!("clickhouse://default:x@127.0.0.1:{port}/default"),
+            hits,
+        )
     }
 
     /// M-17: a proxy 502/504 retries a read but never a mutation (the
@@ -2860,7 +3029,10 @@ mod tests {
     }
 
     fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     /// A run's scratch is swept by the owner's release and by its collector,
@@ -2877,11 +3049,19 @@ mod tests {
                     return (false, "0\n".into());
                 }
                 // The first DROP fails.
-                (sql.contains("DROP TABLE") && !failed.swap(true, SeqCst), String::new())
+                (
+                    sql.contains("DROP TABLE") && !failed.swap(true, SeqCst),
+                    String::new(),
+                )
             }))
             .await;
             let r = g.sweep_run("t", "_tok").await;
-            let drops = seen.lock().unwrap().iter().filter(|b| b.contains("DROP TABLE IF EXISTS")).count();
+            let drops = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.contains("DROP TABLE IF EXISTS"))
+                .count();
             assert!(r.is_err(), "the failed drop is reported");
             assert_eq!(drops, 2, "the second drop was never attempted");
         });
@@ -2903,7 +3083,11 @@ mod tests {
                     if q.contains("system.mutations") && q.starts_with("SELECT") {
                         "look".to_string()
                     } else if q.starts_with("KILL MUTATION") {
-                        assert!(q.contains(&format!("position(command, '{kt}')")) && q.contains("table = 't'"), "{q}");
+                        assert!(
+                            q.contains(&format!("position(command, '{kt}')"))
+                                && q.contains("table = 't'"),
+                            "{q}"
+                        );
                         "kill".to_string()
                     } else if q.contains(&kt) {
                         "drop key table".to_string()
@@ -2922,30 +3106,65 @@ mod tests {
                 if sql.starts_with("KILL MUTATION") {
                     p2.store(false, std::sync::atomic::Ordering::SeqCst);
                 }
-                let n = if p2.load(std::sync::atomic::Ordering::SeqCst) { "1\n" } else { "0\n" };
-                (false, if sql.contains("system.mutations") { n.into() } else { String::new() })
+                let n = if p2.load(std::sync::atomic::Ordering::SeqCst) {
+                    "1\n"
+                } else {
+                    "0\n"
+                };
+                (
+                    false,
+                    if sql.contains("system.mutations") {
+                        n.into()
+                    } else {
+                        String::new()
+                    },
+                )
             }))
             .await;
             assert!(g.sweep_run("t", "_tok").await.is_ok());
-            assert_eq!(kinds(&seen.lock().unwrap()), ["look", "kill", "drop key table", "look", "drop other"]);
+            assert_eq!(
+                kinds(&seen.lock().unwrap()),
+                ["look", "kill", "drop key table", "look", "drop other"]
+            );
 
             // Nothing reads it: no KILL at all — the grant is not needed.
             let (g, seen) = mock(std::sync::Arc::new(|sql: &str| {
-                (false, if sql.contains("system.mutations") { "0\n".into() } else { String::new() })
+                (
+                    false,
+                    if sql.contains("system.mutations") {
+                        "0\n".into()
+                    } else {
+                        String::new()
+                    },
+                )
             }))
             .await;
             assert!(g.sweep_run("t", "_tok").await.is_ok());
-            assert_eq!(kinds(&seen.lock().unwrap()), ["look", "drop key table", "look", "drop other"]);
+            assert_eq!(
+                kinds(&seen.lock().unwrap()),
+                ["look", "drop key table", "look", "drop other"]
+            );
 
             // A mutation registered after the first look: killed after the drop.
             let looks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let (g, seen) = mock(std::sync::Arc::new(move |sql: &str| {
-                let first = sql.contains("system.mutations") && looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
-                (false, if sql.contains("system.mutations") { (if first { "0\n" } else { "1\n" }).into() } else { String::new() })
+                let first = sql.contains("system.mutations")
+                    && looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                (
+                    false,
+                    if sql.contains("system.mutations") {
+                        (if first { "0\n" } else { "1\n" }).into()
+                    } else {
+                        String::new()
+                    },
+                )
             }))
             .await;
             assert!(g.sweep_run("t", "_tok").await.is_ok());
-            assert_eq!(kinds(&seen.lock().unwrap()), ["look", "drop key table", "look", "kill", "drop other"]);
+            assert_eq!(
+                kinds(&seen.lock().unwrap()),
+                ["look", "drop key table", "look", "kill", "drop other"]
+            );
 
             // The kill fails (no KILL grant): the key table stays, the sweep
             // fails so the markers stay, and the other scratch still goes.
@@ -2953,7 +3172,14 @@ mod tests {
                 if sql.starts_with("KILL MUTATION") {
                     return (true, String::new());
                 }
-                (false, if sql.contains("system.mutations") { "1\n".into() } else { String::new() })
+                (
+                    false,
+                    if sql.contains("system.mutations") {
+                        "1\n".into()
+                    } else {
+                        String::new()
+                    },
+                )
             }))
             .await;
             let e = g.sweep_run("t", "_tok").await.unwrap_err().to_string();
@@ -2964,11 +3190,17 @@ mod tests {
 
     #[test]
     fn claim_seq_outranks_every_renewal() {
-        assert!(lease_seq(1, 0) > lease_seq(0, (1 << 62) - 1), "a claim at epoch 0 outranks any renewal");
+        assert!(
+            lease_seq(1, 0) > lease_seq(0, (1 << 62) - 1),
+            "a claim at epoch 0 outranks any renewal"
+        );
         let m = 1_790_000_000_000_000; // micros, 2026
         assert_eq!(lease_seq(1, m) - m, 1 << 62);
         assert_eq!(lease_seq(0, m), m);
-        assert!(lease_seq(1, (1 << 62) - 1) <= i64::MAX as u64, "stays below 2^63");
+        assert!(
+            lease_seq(1, (1 << 62) - 1) <= i64::MAX as u64,
+            "stays below 2^63"
+        );
     }
 
     #[test]
@@ -2977,7 +3209,11 @@ mod tests {
         assert_eq!(summary_written_rows(h), Some(1));
         assert_eq!(summary_written_rows(r#"{"written_rows":"0"}"#), Some(0));
         assert_eq!(summary_written_rows(r#"{"written_rows": 42}"#), Some(42));
-        assert_eq!(summary_written_rows(r#"{"read_rows":"3"}"#), None, "absent is not zero");
+        assert_eq!(
+            summary_written_rows(r#"{"read_rows":"3"}"#),
+            None,
+            "absent is not zero"
+        );
     }
 
     #[test]
@@ -3156,7 +3392,6 @@ mod tests {
         assert_eq!(ch_explicit_tz("DateTime64(6)"), None);
         assert_eq!(ch_explicit_tz("Int64"), None);
     }
-
 
     #[test]
     fn ch_types_for_deliveries_match_the_old_maps() {

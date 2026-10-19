@@ -93,7 +93,10 @@ fn decode_component(s: &str) -> Result<String> {
 
 /// Encode a repo-relative path, keeping '/' between segments.
 fn encode_path(p: &str) -> String {
-    p.split('/').map(encode_segment).collect::<Vec<_>>().join("/")
+    p.split('/')
+        .map(encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl GithubSource {
@@ -184,8 +187,14 @@ impl GithubSource {
         let resp = loop {
             attempt += 1;
             match self.req(url.clone()).send().await {
-                Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
-                    let wait = crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER));
+                Ok(r)
+                    if crate::http::store_retryable(r.status())
+                        && attempt < crate::http::STORE_ATTEMPTS =>
+                {
+                    let wait = crate::http::store_backoff(
+                        attempt,
+                        r.headers().get(reqwest::header::RETRY_AFTER),
+                    );
                     tokio::time::sleep(wait).await;
                 }
                 Ok(r) => break r,
@@ -225,29 +234,41 @@ impl GithubSource {
                     Some(r) => r.clone(),
                     None => {
                         let v: serde_json::Value = self
-                            .send(format!("{API}/repos/{}/{}", self.owner, self.repo), "repo lookup")
+                            .send(
+                                format!("{API}/repos/{}/{}", self.owner, self.repo),
+                                "repo lookup",
+                            )
                             .await?
                             .json()
                             .await
                             .map_err(|e| Error::Transfer(format!("github repo response: {e}")))?;
-                        v["default_branch"].as_str().map(str::to_string).ok_or_else(|| {
-                            Error::Transfer("github repo response missing default_branch".into())
-                        })?
+                        v["default_branch"]
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| {
+                                Error::Transfer(
+                                    "github repo response missing default_branch".into(),
+                                )
+                            })?
                     }
                 };
                 let v: serde_json::Value = self
                     .send(
-                        format!("{API}/repos/{}/{}/commits/{}", self.owner, self.repo, encode_segment(&name)),
+                        format!(
+                            "{API}/repos/{}/{}/commits/{}",
+                            self.owner,
+                            self.repo,
+                            encode_segment(&name)
+                        ),
                         "ref lookup",
                     )
                     .await?
                     .json()
                     .await
                     .map_err(|e| Error::Transfer(format!("github commit response: {e}")))?;
-                v["sha"]
-                    .as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| Error::Transfer(format!("github: ref '{name}' resolved to no commit sha")))
+                v["sha"].as_str().map(str::to_string).ok_or_else(|| {
+                    Error::Transfer(format!("github: ref '{name}' resolved to no commit sha"))
+                })
             })
             .await
     }
@@ -319,9 +340,11 @@ impl GithubSource {
     /// stem (or prefix-relative path) → repo path; loud on misses & ambiguity.
     async fn resolve(&self, table: &str) -> Result<String> {
         let tables = self.tables().await?;
-        Ok(csvfile::match_table(&tables, &self.prefix, table, &self.origin())?
-            .1
-            .clone())
+        Ok(
+            csvfile::match_table(&tables, &self.prefix, table, &self.origin())?
+                .1
+                .clone(),
+        )
     }
 
     async fn raw(&self, key: &str) -> Result<reqwest::Response> {
@@ -371,9 +394,7 @@ impl Source for GithubSource {
                     fed += b.len();
                     pump.feed(&b);
                 }
-                Some(Err(e)) => {
-                    return Err(Error::Transfer(format!("github probe '{key}': {e}")))
-                }
+                Some(Err(e)) => return Err(Error::Transfer(format!("github probe '{key}': {e}"))),
                 None => match pump.next_record(true)? {
                     Some(row) => break csvfile::row_strings(&row)?,
                     None => {
@@ -406,10 +427,7 @@ impl Source for GithubSource {
                 let mut out = Vec::with_capacity(ts.len());
                 for t in ts {
                     let entry = csvfile::match_table(&all, &self.prefix, t, &self.origin())?;
-                    out.push((
-                        csvfile::canonical_name(&all, entry, &self.prefix)?,
-                        entry.2,
-                    ));
+                    out.push((csvfile::canonical_name(&all, entry, &self.prefix)?, entry.2));
                 }
                 Ok(out)
             }
@@ -434,10 +452,7 @@ impl Source for GithubSource {
                         }
                     };
                     if keep {
-                        out.push((
-                            csvfile::canonical_name(&all, entry, &self.prefix)?,
-                            entry.2,
-                        ));
+                        out.push((csvfile::canonical_name(&all, entry, &self.prefix)?, entry.2));
                     }
                 }
                 Ok(out)
@@ -494,7 +509,12 @@ impl Source for GithubSource {
         pipes
             .run_inline(
                 stmts,
-                GhBody { src: self, plan, lane, chunk },
+                GhBody {
+                    src: self,
+                    plan,
+                    lane,
+                    chunk,
+                },
             )
             .await
     }
@@ -527,7 +547,9 @@ fn check_name(what: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name != "."
         && name != ".."
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
     if ok {
         Ok(())
     } else {
@@ -541,7 +563,9 @@ fn check_name(what: &str, name: &str) -> Result<()> {
 /// serves the ~130-byte pointer for an LFS-tracked file, and its lines landed
 /// as a two-row table, reported as success (P2).
 fn is_lfs_pointer(headers: &[String]) -> bool {
-    headers.first().is_some_and(|h| h.starts_with("version https://git-lfs.github.com/spec/"))
+    headers
+        .first()
+        .is_some_and(|h| h.starts_with("version https://git-lfs.github.com/spec/"))
 }
 
 #[cfg(test)]
@@ -558,7 +582,9 @@ mod tests {
     /// P2: an LFS pointer is recognised; a real header is not.
     #[test]
     fn an_lfs_pointer_is_not_a_header() {
-        assert!(super::is_lfs_pointer(&["version https://git-lfs.github.com/spec/v1".into()]));
+        assert!(super::is_lfs_pointer(&[
+            "version https://git-lfs.github.com/spec/v1".into()
+        ]));
         assert!(!super::is_lfs_pointer(&["id".into(), "version".into()]));
     }
 

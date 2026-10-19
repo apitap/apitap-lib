@@ -19,7 +19,10 @@ pub enum ArrowKind {
     Float64,
     Bool,
     /// Arrow decimal128 with the DECLARED precision/scale.
-    Decimal { p: u8, s: i8 },
+    Decimal {
+        p: u8,
+        s: i8,
+    },
     Date32,
     /// timestamptz — micros since Unix epoch, tz "UTC" in the schema.
     TimestampUtc,
@@ -70,16 +73,45 @@ pub fn arrow_kind(d: &Delivered) -> Option<ArrowKind> {
 /// utf8/binary carry i32 offsets starting at 0).
 #[derive(Debug, PartialEq)]
 pub enum FinishedCol {
-    I16 { validity: Option<Vec<u8>>, data: Vec<i16> },
-    I32 { validity: Option<Vec<u8>>, data: Vec<i32> },
-    I64 { validity: Option<Vec<u8>>, data: Vec<i64> },
-    F32 { validity: Option<Vec<u8>>, data: Vec<f32> },
-    F64 { validity: Option<Vec<u8>>, data: Vec<f64> },
+    I16 {
+        validity: Option<Vec<u8>>,
+        data: Vec<i16>,
+    },
+    I32 {
+        validity: Option<Vec<u8>>,
+        data: Vec<i32>,
+    },
+    I64 {
+        validity: Option<Vec<u8>>,
+        data: Vec<i64>,
+    },
+    F32 {
+        validity: Option<Vec<u8>>,
+        data: Vec<f32>,
+    },
+    F64 {
+        validity: Option<Vec<u8>>,
+        data: Vec<f64>,
+    },
     /// Data is ALSO a bitmap for bool.
-    Bool { validity: Option<Vec<u8>>, data: Vec<u8> },
-    Dec128 { validity: Option<Vec<u8>>, data: Vec<i128> },
-    Utf8 { validity: Option<Vec<u8>>, offsets: Vec<i32>, data: Vec<u8> },
-    Bin { validity: Option<Vec<u8>>, offsets: Vec<i32>, data: Vec<u8> },
+    Bool {
+        validity: Option<Vec<u8>>,
+        data: Vec<u8>,
+    },
+    Dec128 {
+        validity: Option<Vec<u8>>,
+        data: Vec<i128>,
+    },
+    Utf8 {
+        validity: Option<Vec<u8>>,
+        offsets: Vec<i32>,
+        data: Vec<u8>,
+    },
+    Bin {
+        validity: Option<Vec<u8>>,
+        offsets: Vec<i32>,
+        data: Vec<u8>,
+    },
 }
 
 /// One sealed batch: `rows` rows across `cols` (parallel to the schema).
@@ -135,20 +167,56 @@ fn mark(v: &mut Option<Vec<u8>>, row: usize, valid: bool) {
 }
 
 enum ColB {
-    I16 { v: Option<Vec<u8>>, d: Vec<i16> },
-    I32 { v: Option<Vec<u8>>, d: Vec<i32> },
-    I64 { v: Option<Vec<u8>>, d: Vec<i64> },
-    F32 { v: Option<Vec<u8>>, d: Vec<f32> },
-    F64 { v: Option<Vec<u8>>, d: Vec<f64> },
+    I16 {
+        v: Option<Vec<u8>>,
+        d: Vec<i16>,
+    },
+    I32 {
+        v: Option<Vec<u8>>,
+        d: Vec<i32>,
+    },
+    I64 {
+        v: Option<Vec<u8>>,
+        d: Vec<i64>,
+    },
+    F32 {
+        v: Option<Vec<u8>>,
+        d: Vec<f32>,
+    },
+    F64 {
+        v: Option<Vec<u8>>,
+        d: Vec<f64>,
+    },
     /// Data bitmap, same LSB-first order as validity.
-    Bool { v: Option<Vec<u8>>, d: Vec<u8> },
-    Dec { v: Option<Vec<u8>>, d: Vec<i128>, s: u32 },
+    Bool {
+        v: Option<Vec<u8>>,
+        d: Vec<u8>,
+    },
+    Dec {
+        v: Option<Vec<u8>>,
+        d: Vec<i128>,
+        s: u32,
+    },
     /// Days since Unix epoch (seals as I32).
-    D32 { v: Option<Vec<u8>>, d: Vec<i32> },
+    D32 {
+        v: Option<Vec<u8>>,
+        d: Vec<i32>,
+    },
     /// Micros since Unix epoch (seals as I64; utc/naive decode identically).
-    Ts { v: Option<Vec<u8>>, d: Vec<i64> },
-    Utf8 { v: Option<Vec<u8>>, off: Vec<i32>, d: Vec<u8> },
-    Bin { v: Option<Vec<u8>>, off: Vec<i32>, d: Vec<u8> },
+    Ts {
+        v: Option<Vec<u8>>,
+        d: Vec<i64>,
+    },
+    Utf8 {
+        v: Option<Vec<u8>>,
+        off: Vec<i32>,
+        d: Vec<u8>,
+    },
+    Bin {
+        v: Option<Vec<u8>>,
+        off: Vec<i32>,
+        d: Vec<u8>,
+    },
 }
 
 /// Fresh offsets vec: Arrow wants a leading 0 plus one entry per row.
@@ -175,21 +243,43 @@ impl ColB {
     /// uniformly. Every later batch re-reserves adaptively at seal.
     fn new(k: &ArrowKind, cap: usize) -> Self {
         match k {
-            ArrowKind::Int16 => ColB::I16 { v: None, d: Vec::with_capacity(cap / 2) },
-            ArrowKind::Int32 => ColB::I32 { v: None, d: Vec::with_capacity(cap / 4) },
-            ArrowKind::Int64 => ColB::I64 { v: None, d: Vec::with_capacity(cap / 8) },
-            ArrowKind::Float32 => ColB::F32 { v: None, d: Vec::with_capacity(cap / 4) },
-            ArrowKind::Float64 => ColB::F64 { v: None, d: Vec::with_capacity(cap / 8) },
-            ArrowKind::Bool => ColB::Bool { v: None, d: Vec::with_capacity(cap / 8) },
+            ArrowKind::Int16 => ColB::I16 {
+                v: None,
+                d: Vec::with_capacity(cap / 2),
+            },
+            ArrowKind::Int32 => ColB::I32 {
+                v: None,
+                d: Vec::with_capacity(cap / 4),
+            },
+            ArrowKind::Int64 => ColB::I64 {
+                v: None,
+                d: Vec::with_capacity(cap / 8),
+            },
+            ArrowKind::Float32 => ColB::F32 {
+                v: None,
+                d: Vec::with_capacity(cap / 4),
+            },
+            ArrowKind::Float64 => ColB::F64 {
+                v: None,
+                d: Vec::with_capacity(cap / 8),
+            },
+            ArrowKind::Bool => ColB::Bool {
+                v: None,
+                d: Vec::with_capacity(cap / 8),
+            },
             ArrowKind::Decimal { s, .. } => ColB::Dec {
                 v: None,
                 d: Vec::with_capacity(cap / 16),
                 s: (*s).max(0) as u32,
             },
-            ArrowKind::Date32 => ColB::D32 { v: None, d: Vec::with_capacity(cap / 4) },
-            ArrowKind::TimestampUtc | ArrowKind::TimestampNaive => {
-                ColB::Ts { v: None, d: Vec::with_capacity(cap / 8) }
-            }
+            ArrowKind::Date32 => ColB::D32 {
+                v: None,
+                d: Vec::with_capacity(cap / 4),
+            },
+            ArrowKind::TimestampUtc | ArrowKind::TimestampNaive => ColB::Ts {
+                v: None,
+                d: Vec::with_capacity(cap / 8),
+            },
             ArrowKind::Utf8 => ColB::Utf8 {
                 v: None,
                 off: offsets0(cap / 16 + 1),
@@ -202,8 +292,6 @@ impl ColB {
             },
         }
     }
-
-
 
     /// Resident bytes (data + offsets), for the batch seal gate.
     fn bytes(&self) -> usize {
@@ -228,31 +316,52 @@ impl ColB {
         match self {
             ColB::I16 { v, d } => {
                 let cap = adaptive(d.len() * 2) / 2;
-                FinishedCol::I16 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+                FinishedCol::I16 {
+                    validity: v.take(),
+                    data: replace(d, Vec::with_capacity(cap)),
+                }
             }
             ColB::I32 { v, d } | ColB::D32 { v, d } => {
                 let cap = adaptive(d.len() * 4) / 4;
-                FinishedCol::I32 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+                FinishedCol::I32 {
+                    validity: v.take(),
+                    data: replace(d, Vec::with_capacity(cap)),
+                }
             }
             ColB::I64 { v, d } | ColB::Ts { v, d } => {
                 let cap = adaptive(d.len() * 8) / 8;
-                FinishedCol::I64 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+                FinishedCol::I64 {
+                    validity: v.take(),
+                    data: replace(d, Vec::with_capacity(cap)),
+                }
             }
             ColB::F32 { v, d } => {
                 let cap = adaptive(d.len() * 4) / 4;
-                FinishedCol::F32 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+                FinishedCol::F32 {
+                    validity: v.take(),
+                    data: replace(d, Vec::with_capacity(cap)),
+                }
             }
             ColB::F64 { v, d } => {
                 let cap = adaptive(d.len() * 8) / 8;
-                FinishedCol::F64 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+                FinishedCol::F64 {
+                    validity: v.take(),
+                    data: replace(d, Vec::with_capacity(cap)),
+                }
             }
             ColB::Bool { v, d } => {
                 let cap = adaptive(d.len());
-                FinishedCol::Bool { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+                FinishedCol::Bool {
+                    validity: v.take(),
+                    data: replace(d, Vec::with_capacity(cap)),
+                }
             }
             ColB::Dec { v, d, .. } => {
                 let cap = adaptive(d.len() * 16) / 16;
-                FinishedCol::Dec128 { validity: v.take(), data: replace(d, Vec::with_capacity(cap)) }
+                FinishedCol::Dec128 {
+                    validity: v.take(),
+                    data: replace(d, Vec::with_capacity(cap)),
+                }
             }
             ColB::Utf8 { v, off, d } => {
                 let dcap = adaptive(d.len());
@@ -415,15 +524,42 @@ impl BatchBuilder {
     pub fn append_cell(&mut self, c: usize, val: CellVal) {
         let r = self.rows;
         match (&mut self.cols[c], val) {
-            (ColB::I16 { v, d }, CellVal::I16(x)) => { d.push(x); mark(v, r, true); }
-            (ColB::I32 { v, d }, CellVal::I32(x)) => { d.push(x); mark(v, r, true); }
-            (ColB::I64 { v, d }, CellVal::I64(x)) => { d.push(x); mark(v, r, true); }
-            (ColB::F32 { v, d }, CellVal::F32(x)) => { d.push(x); mark(v, r, true); }
-            (ColB::F64 { v, d }, CellVal::F64(x)) => { d.push(x); mark(v, r, true); }
-            (ColB::Bool { v, d }, CellVal::Bool(x)) => { push_bit(d, r, x); mark(v, r, true); }
-            (ColB::Dec { v, d, .. }, CellVal::Dec128(x)) => { d.push(x); mark(v, r, true); }
-            (ColB::D32 { v, d }, CellVal::DateDays(x)) => { d.push(x); mark(v, r, true); }
-            (ColB::Ts { v, d }, CellVal::TsMicros(x)) => { d.push(x); mark(v, r, true); }
+            (ColB::I16 { v, d }, CellVal::I16(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            (ColB::I32 { v, d }, CellVal::I32(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            (ColB::I64 { v, d }, CellVal::I64(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            (ColB::F32 { v, d }, CellVal::F32(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            (ColB::F64 { v, d }, CellVal::F64(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            (ColB::Bool { v, d }, CellVal::Bool(x)) => {
+                push_bit(d, r, x);
+                mark(v, r, true);
+            }
+            (ColB::Dec { v, d, .. }, CellVal::Dec128(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            (ColB::D32 { v, d }, CellVal::DateDays(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            (ColB::Ts { v, d }, CellVal::TsMicros(x)) => {
+                d.push(x);
+                mark(v, r, true);
+            }
             (ColB::Utf8 { v, off, d }, CellVal::Str(b)) => {
                 d.extend_from_slice(b);
                 off.push(d.len() as i32);
@@ -435,13 +571,34 @@ impl BatchBuilder {
                 mark(v, r, true);
             }
             (col, CellVal::Null) => match col {
-                ColB::I16 { v, d } => { d.push(0); mark(v, r, false); }
-                ColB::I32 { v, d } | ColB::D32 { v, d } => { d.push(0); mark(v, r, false); }
-                ColB::I64 { v, d } | ColB::Ts { v, d } => { d.push(0); mark(v, r, false); }
-                ColB::F32 { v, d } => { d.push(0.0); mark(v, r, false); }
-                ColB::F64 { v, d } => { d.push(0.0); mark(v, r, false); }
-                ColB::Bool { v, d } => { push_bit(d, r, false); mark(v, r, false); }
-                ColB::Dec { v, d, .. } => { d.push(0); mark(v, r, false); }
+                ColB::I16 { v, d } => {
+                    d.push(0);
+                    mark(v, r, false);
+                }
+                ColB::I32 { v, d } | ColB::D32 { v, d } => {
+                    d.push(0);
+                    mark(v, r, false);
+                }
+                ColB::I64 { v, d } | ColB::Ts { v, d } => {
+                    d.push(0);
+                    mark(v, r, false);
+                }
+                ColB::F32 { v, d } => {
+                    d.push(0.0);
+                    mark(v, r, false);
+                }
+                ColB::F64 { v, d } => {
+                    d.push(0.0);
+                    mark(v, r, false);
+                }
+                ColB::Bool { v, d } => {
+                    push_bit(d, r, false);
+                    mark(v, r, false);
+                }
+                ColB::Dec { v, d, .. } => {
+                    d.push(0);
+                    mark(v, r, false);
+                }
                 ColB::Utf8 { v, off, d } | ColB::Bin { v, off, d } => {
                     off.push(d.len() as i32);
                     mark(v, r, false);
@@ -479,8 +636,7 @@ impl BatchBuilder {
                 if win[pos] != b'd' {
                     return Ok((pos, FramedPush::Control));
                 }
-                let len =
-                    u32::from_be_bytes(win[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(win[pos + 1..pos + 5].try_into().unwrap()) as usize;
                 if len < 4 {
                     return Err(Error::Transfer("copy_out: bad message length".into()));
                 }
@@ -703,8 +859,7 @@ impl BatchBuilder {
                 if win[pos] != b'd' {
                     return Ok((pos, StageStopF::Control));
                 }
-                let len =
-                    u32::from_be_bytes(win[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(win[pos + 1..pos + 5].try_into().unwrap()) as usize;
                 if len < 4 {
                     return Err(Error::Transfer("copy_out: bad message length".into()));
                 }
@@ -714,11 +869,14 @@ impl BatchBuilder {
             }
             let pe = (pos + self.fr_left).min(win.len());
             if pe - pos < 2 {
-                return Ok((pos, if pos + self.fr_left > win.len() {
-                    StageStopF::NeedMore
-                } else {
-                    StageStopF::Straddle
-                }));
+                return Ok((
+                    pos,
+                    if pos + self.fr_left > win.len() {
+                        StageStopF::NeedMore
+                    } else {
+                        StageStopF::Straddle
+                    },
+                ));
             }
             let nc = i16::from_be_bytes(win[pos..pos + 2].try_into().unwrap());
             if nc == -1 {
@@ -733,11 +891,14 @@ impl BatchBuilder {
             let mut o = pos + 2;
             for c in 0..ncols {
                 if pe - o < 4 {
-                    return Ok((pos, if pos + self.fr_left > win.len() {
-                        StageStopF::NeedMore
-                    } else {
-                        StageStopF::Straddle
-                    }));
+                    return Ok((
+                        pos,
+                        if pos + self.fr_left > win.len() {
+                            StageStopF::NeedMore
+                        } else {
+                            StageStopF::Straddle
+                        },
+                    ));
                 }
                 let len = i32::from_be_bytes(win[o..o + 4].try_into().unwrap());
                 o += 4;
@@ -750,11 +911,14 @@ impl BatchBuilder {
                     self.st_len[c * ST_K + k] = -1;
                 } else {
                     if pe - o < len as usize {
-                        return Ok((pos, if pos + self.fr_left > win.len() {
-                            StageStopF::NeedMore
-                        } else {
-                            StageStopF::Straddle
-                        }));
+                        return Ok((
+                            pos,
+                            if pos + self.fr_left > win.len() {
+                                StageStopF::NeedMore
+                            } else {
+                                StageStopF::Straddle
+                            },
+                        ));
                     }
                     self.st_off[c * ST_K + k] = stage_off(o)?;
                     self.st_len[c * ST_K + k] = len;
@@ -870,8 +1034,7 @@ impl BatchBuilder {
                             push_bit(d, row0 + k, false);
                             continue;
                         }
-                        let on = len > 0
-                            && unsafe { *data.as_ptr().add(offs[k] as usize) } != 0;
+                        let on = len > 0 && unsafe { *data.as_ptr().add(offs[k] as usize) } != 0;
                         push_bit(d, row0 + k, on);
                         mark(v, row0 + k, true);
                     }
@@ -906,8 +1069,7 @@ impl BatchBuilder {
                             return Err(bad("date"));
                         }
                         let p = unsafe { data.as_ptr().add(offs[k] as usize) };
-                        let days =
-                            i32::from_be_bytes(unsafe { p.cast::<[u8; 4]>().read() });
+                        let days = i32::from_be_bytes(unsafe { p.cast::<[u8; 4]>().read() });
                         if days == i32::MAX || days == i32::MIN {
                             return Err(Error::Transfer(
                                 "date 'infinity' has no Arrow representation — cast or \
@@ -966,9 +1128,10 @@ impl BatchBuilder {
                             )
                         };
                         d.extend_from_slice(f);
-                        off.push(i32::try_from(d.len()).map_err(|_| {
-                            bad("varlen column past i32 offsets in one batch")
-                        })?);
+                        off.push(
+                            i32::try_from(d.len())
+                                .map_err(|_| bad("varlen column past i32 offsets in one batch"))?,
+                        );
                         mark(v, row0 + k, true);
                     }
                 }
@@ -978,7 +1141,6 @@ impl BatchBuilder {
         self.st_rows = 0;
         Ok(())
     }
-
 
     fn acc_bytes(&self) -> usize {
         self.cols.iter().map(ColB::bytes).sum()
@@ -1177,8 +1339,14 @@ mod tests {
         // NaN != NaN under PartialEq — compare the f64 column by bits.
         let (fa, fb) = match (&batch_a.cols[4], &batch_b.cols[4]) {
             (
-                FinishedCol::F64 { validity: va, data: da },
-                FinishedCol::F64 { validity: vb, data: db },
+                FinishedCol::F64 {
+                    validity: va,
+                    data: da,
+                },
+                FinishedCol::F64 {
+                    validity: vb,
+                    data: db,
+                },
             ) => {
                 assert_eq!(va, vb);
                 (
@@ -1197,7 +1365,10 @@ mod tests {
     #[test]
     fn kind_map_mirrors_the_parquet_gate() {
         use Delivered as D;
-        let int = |bytes| D::Int { bytes, unsigned: false };
+        let int = |bytes| D::Int {
+            bytes,
+            unsigned: false,
+        };
         assert_eq!(arrow_kind(&int(2)), Some(ArrowKind::Int16));
         assert_eq!(arrow_kind(&int(4)), Some(ArrowKind::Int32));
         assert_eq!(arrow_kind(&int(8)), Some(ArrowKind::Int64));
@@ -1212,8 +1383,14 @@ mod tests {
         assert_eq!(arrow_kind(&D::Text), Some(ArrowKind::Utf8));
         assert_eq!(arrow_kind(&D::Bytes), Some(ArrowKind::Binary));
         assert_eq!(arrow_kind(&D::Date), Some(ArrowKind::Date32));
-        assert_eq!(arrow_kind(&D::DateTime { utc: true }), Some(ArrowKind::TimestampUtc));
-        assert_eq!(arrow_kind(&D::DateTime { utc: false }), Some(ArrowKind::TimestampNaive));
+        assert_eq!(
+            arrow_kind(&D::DateTime { utc: true }),
+            Some(ArrowKind::TimestampUtc)
+        );
+        assert_eq!(
+            arrow_kind(&D::DateTime { utc: false }),
+            Some(ArrowKind::TimestampNaive)
+        );
     }
 
     #[test]
@@ -1354,7 +1531,11 @@ mod tests {
             _ => panic!("col 9 layout"),
         }
         match &batch.cols[10] {
-            FinishedCol::Utf8 { validity, offsets, data } => {
+            FinishedCol::Utf8 {
+                validity,
+                offsets,
+                data,
+            } => {
                 assert_eq!(validity.as_deref(), valid);
                 assert_eq!(offsets, &[0, 5, 5, 5]); // null and "" both repeat
                 assert_eq!(data, b"hello");
@@ -1362,7 +1543,11 @@ mod tests {
             _ => panic!("col 10 layout"),
         }
         match &batch.cols[11] {
-            FinishedCol::Bin { validity, offsets, data } => {
+            FinishedCol::Bin {
+                validity,
+                offsets,
+                data,
+            } => {
                 assert_eq!(validity.as_deref(), valid);
                 assert_eq!(offsets, &[0, 2, 2, 5]);
                 assert_eq!(data, &[0xDE, 0xAD, 1, 2, 3]);
@@ -1395,14 +1580,21 @@ mod tests {
         pgcopy::trailer(&mut t);
         b.push(&t).unwrap();
         let tail = b.finish().unwrap().expect("a partial remains");
-        assert_eq!(sealed.iter().map(|x| x.rows).collect::<Vec<_>>(), vec![3, 3, 3]);
+        assert_eq!(
+            sealed.iter().map(|x| x.rows).collect::<Vec<_>>(),
+            vec![3, 3, 3]
+        );
         assert_eq!(tail.rows, 1);
         assert_eq!(b.rows_total(), 10);
         // No NULLs anywhere → validity None; offsets re-seed at 0 per batch.
         match (&sealed[1].cols[0], &sealed[1].cols[1]) {
             (
                 FinishedCol::I64 { validity, data },
-                FinishedCol::Utf8 { validity: v2, offsets, .. },
+                FinishedCol::Utf8 {
+                    validity: v2,
+                    offsets,
+                    ..
+                },
             ) => {
                 assert!(validity.is_none() && v2.is_none());
                 assert_eq!(data, &[3, 4, 5]);
@@ -1449,8 +1641,15 @@ mod tests {
             assert!(batch.rows > 0);
             match (&batch.cols[0], &batch.cols[1]) {
                 (
-                    FinishedCol::Utf8 { validity, offsets, data },
-                    FinishedCol::I64 { validity: v2, data: ints },
+                    FinishedCol::Utf8 {
+                        validity,
+                        offsets,
+                        data,
+                    },
+                    FinishedCol::I64 {
+                        validity: v2,
+                        data: ints,
+                    },
                 ) => {
                     assert!(validity.is_none() && v2.is_none());
                     assert_eq!(offsets.len(), batch.rows + 1);
@@ -1578,7 +1777,9 @@ mod tests {
             match (&batch.cols[0], &batch.cols[1]) {
                 (
                     FinishedCol::I64 { data, .. },
-                    FinishedCol::Utf8 { offsets, data: d, .. },
+                    FinishedCol::Utf8 {
+                        offsets, data: d, ..
+                    },
                 ) => {
                     assert_eq!(data[0], 0);
                     assert_eq!(data[199], 199);

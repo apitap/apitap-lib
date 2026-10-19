@@ -65,7 +65,12 @@ impl ReadHandle {
         supervisor: tokio::task::JoinHandle<()>,
         completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        Self { schema, rx, supervisor, completed }
+        Self {
+            schema,
+            rx,
+            supervisor,
+            completed,
+        }
     }
 
     /// Blocking pull (called from an arbitrary consumer thread, GIL

@@ -15,8 +15,8 @@ pub(crate) mod clickhouse;
 pub(crate) mod gcs;
 pub(crate) mod iceberg;
 pub(crate) mod mysql;
-pub(crate) mod s3;
 pub(crate) mod postgres;
+pub(crate) mod s3;
 
 /// What ONE pipe of this sink's loader keeps resident at its worst instant,
 /// BEYOND the pipeline's measured chunk-scale term (`pipeline::PIPE_CHUNKS ×

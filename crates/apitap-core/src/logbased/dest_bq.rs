@@ -35,10 +35,10 @@ use crate::logbased::collapse::{Collapsed, Key};
 use crate::logbased::replay::{Ask, Memo, ReplayPlan, StampFacts, WindowId};
 use crate::logbased::resolve::{resolve_window, Image};
 use crate::logbased::window::{Bodies, DrainOutcome, TableWindow};
-use std::collections::HashMap;
 use crate::sink::bigquery::sql_str;
 use crate::wire::pgoutput::Cell;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 
 pub(crate) use store::{BqStore, BqUnit};
 
@@ -126,7 +126,11 @@ fn bare(dest_table: &str) -> &str {
 
 impl BqDest {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: BqStore::connect(url).await?, memo: Memo::default(), staged: Default::default() })
+        Ok(Self {
+            store: BqStore::connect(url).await?,
+            memo: Memo::default(),
+            staged: Default::default(),
+        })
     }
 
     /// The store: the lease and its fence table, the guard, and the units a
@@ -176,7 +180,9 @@ impl BqDest {
             return Ok(());
         }
         let table = bare(dest_table);
-        let Some(meta) = self.store.table_meta(table).await? else { return Ok(()) };
+        let Some(meta) = self.store.table_meta(table).await? else {
+            return Ok(());
+        };
         let mut types = column_types(&meta)?;
         types.insert(OP_COL.to_string(), "STRING".into());
         types.insert(CL_LSN.to_string(), "INT64".into());
@@ -243,7 +249,8 @@ impl BqDest {
         match &outcome.bodies {
             Bodies::Replica(w) => apply_group_unit(u, ctxs, w, &outcome.id, lanes).await,
             Bodies::Changelog(w) => {
-                let (out, plans) = apply_group_changelog_unit(u, &self.memo, ctxs, w, &outcome.id, lanes).await?;
+                let (out, plans) =
+                    apply_group_changelog_unit(u, &self.memo, ctxs, w, &outcome.id, lanes).await?;
                 let mut staged = self.staged.lock().unwrap();
                 for ((dt, _, sid), plan) in ctxs.iter().zip(plans) {
                     staged.insert((bare(dt).to_string(), sid.clone()), plan);
@@ -261,7 +268,11 @@ impl BqDest {
     /// member whose own transaction did commit is merely probed again.
     pub(crate) fn settle(&self, dest_table: &str, source_id: &str, ok: bool) {
         let table = bare(dest_table);
-        let plan = self.staged.lock().unwrap().remove(&(table.to_string(), source_id.to_string()));
+        let plan = self
+            .staged
+            .lock()
+            .unwrap()
+            .remove(&(table.to_string(), source_id.to_string()));
         match (ok, plan) {
             (true, Some(p)) => self.memo.committed(table, source_id, &p),
             (true, None) => {}
@@ -284,7 +295,12 @@ fn vet_pk(pk_cols: &[String]) -> Result<()> {
 /// A replica bootstrap's finish, inside its unit: drop what older releases
 /// left untokenized, and cluster the fresh target. The watermark is the
 /// unit's close.
-async fn bootstrap_unit(u: &mut BqUnit<'_>, dest_table: &str, pk_cols: &[String], rows: u64) -> Result<()> {
+async fn bootstrap_unit(
+    u: &mut BqUnit<'_>,
+    dest_table: &str,
+    pk_cols: &[String],
+    rows: u64,
+) -> Result<()> {
     vet_pk(pk_cols)?;
     let table = bare(dest_table);
     u.drop_legacy_scratch(table).await?;
@@ -336,7 +352,11 @@ async fn changelog_bootstrap_unit(
     // fail on every window forever, with the slot pinning WAL throughout.
     let types0 = column_types(&meta)?;
     let meta_cols = [OP_COL, CL_LSN, CL_SEQ, CL_AT];
-    match meta_cols.iter().filter(|c| types0.contains_key(**c)).count() {
+    match meta_cols
+        .iter()
+        .filter(|c| types0.contains_key(**c))
+        .count()
+    {
         0 => {}
         4 => return Ok(()),
         n => {
@@ -369,9 +389,18 @@ async fn changelog_bootstrap_unit(
     // references — hence the PK prefix rather than ClickHouse's key tuple.
     let cluster = match order_by {
         Some(spec) => bq_cluster_list(spec, &types0)?,
-        None => pk_cols.iter().take(4).map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "),
+        None => pk_cols
+            .iter()
+            .take(4)
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
     };
-    let cluster_sql = if cluster.trim().is_empty() { String::new() } else { format!("CLUSTER BY {cluster} ") };
+    let cluster_sql = if cluster.trim().is_empty() {
+        String::new()
+    } else {
+        format!("CLUSTER BY {cluster} ")
+    };
     // TWO guarded scripts, never one: BigQuery DDL is not transactional, and
     // `cdc_script` retries the whole script text on a transient error. The
     // CTAS reads the target and writes only this run's temp, so repeating it
@@ -395,7 +424,11 @@ async fn changelog_bootstrap_unit(
     u.swap(&tmp, table).await?;
     // The swap's IF reads the catalog; if it ever read it stale, the table
     // would still be the replica. Refused here rather than on the first window.
-    let rebuilt = u.table_get(table).await?.map(|m| column_types(&m)).transpose()?;
+    let rebuilt = u
+        .table_get(table)
+        .await?
+        .map(|m| column_types(&m))
+        .transpose()?;
     if !rebuilt.is_some_and(|t| t.contains_key(CL_LSN)) {
         return Err(Error::Transfer(format!(
             "log_based changelog: rebuilding BigQuery target {table} did not take — \
@@ -484,8 +517,15 @@ pub(crate) async fn apply_group_changelog_unit(
     lanes: usize,
 ) -> Result<(Vec<(u64, Watermark)>, Vec<ReplayPlan>)> {
     use futures::stream::{StreamExt as _, TryStreamExt as _};
-    let keys: Vec<(&str, &str)> = ctxs.iter().map(|(dt, _, sid)| (bare(dt), sid.as_str())).collect();
-    let unseen: Vec<(&str, &str)> = keys.iter().copied().filter(|(t, s)| memo.ask(t, s, id) == Ask::Probe).collect();
+    let keys: Vec<(&str, &str)> = ctxs
+        .iter()
+        .map(|(dt, _, sid)| (bare(dt), sid.as_str()))
+        .collect();
+    let unseen: Vec<(&str, &str)> = keys
+        .iter()
+        .copied()
+        .filter(|(t, s)| memo.ask(t, s, id) == Ask::Probe)
+        .collect();
     if !unseen.is_empty() {
         for ((t, s), (pending, ceiling)) in unseen.iter().zip(u.probe_group(&unseen).await?) {
             memo.probed(t, s, pending, ceiling);
@@ -498,8 +538,11 @@ pub(crate) async fn apply_group_changelog_unit(
             Ask::Nothing | Ask::Probe => None,
         })
         .collect();
-    let facts: HashMap<String, StampFacts> =
-        if asks.is_empty() { HashMap::new() } else { u.facts_group(id.start(), &asks).await? };
+    let facts: HashMap<String, StampFacts> = if asks.is_empty() {
+        HashMap::new()
+    } else {
+        u.facts_group(id.start(), &asks).await?
+    };
     // A member this window does not carry still runs the rule: an earlier
     // attempt at this start may have committed rows for it.
     let plans = ctxs
@@ -514,7 +557,9 @@ pub(crate) async fn apply_group_changelog_unit(
     let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
         .map(|i| async move {
             let (dt, q, sid) = &cref[i];
-            stage_changelog(ur, dt, sid, windows.get(q), &pref[i]).await.map(|(ev, sql)| (i, ev, sql))
+            stage_changelog(ur, dt, sid, windows.get(q), &pref[i])
+                .await
+                .map(|(ev, sql)| (i, ev, sql))
         })
         .buffer_unordered(lanes.max(1))
         .try_collect()
@@ -544,7 +589,9 @@ pub(crate) async fn apply_group_unit(
     let staged: Vec<(usize, u64, Vec<String>)> = futures::stream::iter(0..cref.len())
         .map(|i| async move {
             let (dt, q, _) = &cref[i];
-            stage(ur, dt, windows.get(q)).await.map(|(ev, sql)| (i, ev, sql))
+            stage(ur, dt, windows.get(q))
+                .await
+                .map(|(ev, sql)| (i, ev, sql))
         })
         .buffer_unordered(lanes.max(1))
         .try_collect()
@@ -572,7 +619,15 @@ fn into_groups(
         .zip(events)
         .zip(ends)
         .map(|(((dt, _, sid), ev), &lsn)| {
-            (ev, Watermark::Set { table: dt.clone(), source_id: sid.clone(), lsn, rows: ev })
+            (
+                ev,
+                Watermark::Set {
+                    table: dt.clone(),
+                    source_id: sid.clone(),
+                    lsn,
+                    rows: ev,
+                },
+            )
         })
         .collect()
 }
@@ -620,23 +675,35 @@ async fn read_base(
     keys: &[crate::logbased::changelog::CKey],
     cols: &[usize],
     plan: &ReplayPlan,
-) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
+) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>>
+{
     let mut out = std::collections::HashMap::with_capacity(keys.len());
     for sql in read_base_sqls(&u.fq(table), cast, keys, cols, plan)? {
         for row in u.query(&sql).await? {
             let Some(Some(slot)) = row.first() else {
-                return Err(Error::Transfer("log_based changelog: masked readback without its key slot".into()));
+                return Err(Error::Transfer(
+                    "log_based changelog: masked readback without its key slot".into(),
+                ));
             };
             let slot: usize = slot.parse().map_err(|_| {
-                Error::Transfer(format!("log_based changelog: masked readback slot '{slot}' is not a number"))
+                Error::Transfer(format!(
+                    "log_based changelog: masked readback slot '{slot}' is not a number"
+                ))
             })?;
             if row.len() != 1 + cols.len() {
-                return Err(Error::Transfer("log_based changelog: masked readback column count mismatch".into()));
+                return Err(Error::Transfer(
+                    "log_based changelog: masked readback column count mismatch".into(),
+                ));
             }
             let key = keys.get(slot).ok_or_else(|| {
-                Error::Transfer(format!("log_based changelog: masked readback slot {slot} is out of range"))
+                Error::Transfer(format!(
+                    "log_based changelog: masked readback slot {slot} is out of range"
+                ))
             })?;
-            let vals = row[1..].iter().map(|x| x.clone().map(bytes::Bytes::from)).collect();
+            let vals = row[1..]
+                .iter()
+                .map(|x| x.clone().map(bytes::Bytes::from))
+                .collect();
             out.insert(key.clone(), vals);
         }
     }
@@ -684,7 +751,10 @@ fn read_base_sqls(
                 .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
             let (oid, ty) = &cast.typed[cast.pk_pos[j]];
             let lit = format!("'{}'", sql_str(txt));
-            fields.push(format!("{} AS _apitap_k{j}", cast_expr_of(&lit, name, *oid, ty)?));
+            fields.push(format!(
+                "{} AS _apitap_k{j}",
+                cast_expr_of(&lit, name, *oid, ty)?
+            ));
         }
         key_rows.push(format!("SELECT {}", fields.join(", ")));
     }
@@ -759,7 +829,11 @@ struct ClTarget<'a> {
 /// The marker is never after the rows: a transaction that could commit rows
 /// without it would leave rows no marker names, which the next run reads as
 /// another writer's and numbers above — every event twice.
-fn changelog_group_sql(plan: &ReplayPlan, at: &ClTarget<'_>, insert: Option<String>) -> Vec<String> {
+fn changelog_group_sql(
+    plan: &ReplayPlan,
+    at: &ClTarget<'_>,
+    insert: Option<String>,
+) -> Vec<String> {
     debug_assert_eq!(insert.is_some(), !plan.to_append().is_empty(), "{plan:?}");
     let mut v = Vec::with_capacity(3);
     if let Some(x) = plan.trim_from() {
@@ -823,7 +897,11 @@ async fn stage_changelog(
     if range.is_empty() {
         return Ok((rows, changelog_group_sql(plan, &at, None)));
     }
-    let w = w.ok_or_else(|| Error::Transfer(format!("log_based: {table}: internal: rows to append from no window")))?;
+    let w = w.ok_or_else(|| {
+        Error::Transfer(format!(
+            "log_based: {table}: internal: rows to append from no window"
+        ))
+    })?;
     let (c, l) = (w.body(), w.layout());
     let (wal_cols, oids) = (l.cols(), l.oids());
     let meta = u.table_get(table).await?.ok_or_else(|| {
@@ -851,11 +929,18 @@ async fn stage_changelog(
     };
 
     let mut ndjson: Vec<u8> = Vec::new();
-    for (i, ev) in c.events.iter().enumerate().take(range.end).skip(range.start) {
+    for (i, ev) in c
+        .events
+        .iter()
+        .enumerate()
+        .take(range.end)
+        .skip(range.start)
+    {
         let row = patched.get(&i).or(ev.row.as_ref());
         push_change(&mut ndjson, wal_cols, row, ev.op.code(), plan.seq_of(i))?;
     }
-    u.load(table, &cast.staging_fields_changelog(), ndjson).await?;
+    u.load(table, &cast.staging_fields_changelog(), ndjson)
+        .await?;
 
     let bt = |c: &str| format!("`{c}`");
     let into = wal_cols
@@ -879,7 +964,11 @@ async fn stage_changelog(
         ])
         .collect::<Vec<_>>()
         .join(", ");
-    let insert = format!("INSERT INTO {} ({into}) SELECT {sel} FROM {};", at.table_fq, u.staging_fq(table));
+    let insert = format!(
+        "INSERT INTO {} ({into}) SELECT {sel} FROM {};",
+        at.table_fq,
+        u.staging_fq(table)
+    );
     Ok((rows, changelog_group_sql(plan, &at, Some(insert))))
 }
 
@@ -892,7 +981,12 @@ async fn stage_changelog(
 ///
 /// The same two guarded scripts as the changelog rebuild: a CTAS into this
 /// run's temp, then the idempotent swap.
-async fn cluster_target(u: &mut BqUnit<'_>, table: &str, pk_cols: &[String], rows: u64) -> Result<()> {
+async fn cluster_target(
+    u: &mut BqUnit<'_>,
+    table: &str,
+    pk_cols: &[String],
+    rows: u64,
+) -> Result<()> {
     const CLUSTER_MIN_ROWS: u64 = 1_000_000;
     if std::env::var("APITAP_BQ_CLUSTER").as_deref() == Ok("0") || rows < CLUSTER_MIN_ROWS {
         return Ok(());
@@ -910,7 +1004,11 @@ async fn cluster_target(u: &mut BqUnit<'_>, table: &str, pk_cols: &[String], row
             }
         }
     }
-    let cl = keys.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+    let cl = keys
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let tmp = u.tmp(table);
     u.ddl(&format!(
         "CREATE OR REPLACE TABLE {tmpfq} CLUSTER BY {cl} AS SELECT * FROM {t};",
@@ -981,7 +1079,13 @@ async fn stage(
             Image::Masked { row, moved_from } => {
                 let mask: String = row
                     .iter()
-                    .map(|c| if matches!(c, Cell::UnchangedToast) { '1' } else { '0' })
+                    .map(|c| {
+                        if matches!(c, Cell::UnchangedToast) {
+                            '1'
+                        } else {
+                            '0'
+                        }
+                    })
                     .collect();
                 push_upsert(&mut ndjson, wal_cols, row, Some(&mask), moved_from)?;
             }
@@ -1012,7 +1116,13 @@ async fn stage(
             t_load.elapsed().as_secs_f64(),
         );
     }
-    Ok((c.events, vec![format!("{};", plan.merge_sql(&u.fq(table), &u.staging_fq(table), c.truncate, moved))]))
+    Ok((
+        c.events,
+        vec![format!(
+            "{};",
+            plan.merge_sql(&u.fq(table), &u.staging_fq(table), c.truncate, moved)
+        )],
+    ))
 }
 
 // ── the per-table apply plan (cast expressions from the target DDL) ──────────
@@ -1179,12 +1289,27 @@ impl ApplyPlan {
             })
             .collect::<Vec<_>>()
             .join(",\n");
-        let insert_cols = self.cols.iter().map(|c| bt(c)).collect::<Vec<_>>().join(", ");
-        let insert_vals = self.cols.iter().map(|c| format!("S.{}", bt(c))).collect::<Vec<_>>().join(", ");
+        let insert_cols = self
+            .cols
+            .iter()
+            .map(|c| bt(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_vals = self
+            .cols
+            .iter()
+            .map(|c| format!("S.{}", bt(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let mut merge = String::new();
-        merge.push_str(&format!("MERGE {} T\nUSING (\n{}) S\nON {}\n", target_fq, source, on));
-        merge.push_str(&format!("WHEN MATCHED AND S.{OP_COL} = 'D' THEN\n  DELETE\n"));
+        merge.push_str(&format!(
+            "MERGE {} T\nUSING (\n{}) S\nON {}\n",
+            target_fq, source, on
+        ));
+        merge.push_str(&format!(
+            "WHEN MATCHED AND S.{OP_COL} = 'D' THEN\n  DELETE\n"
+        ));
         if !non_pk.is_empty() {
             merge.push_str(&format!("WHEN MATCHED THEN\n  UPDATE SET\n{set}\n"));
         }
@@ -1564,7 +1689,9 @@ fn changelog_select_list(meta: &Value) -> Result<String> {
         .ok_or_else(|| Error::Transfer("log_based: BigQuery table has no schema".into()))?;
     let mut out = Vec::with_capacity(fields.len());
     for f in fields {
-        let Some(n) = f["name"].as_str() else { continue };
+        let Some(n) = f["name"].as_str() else {
+            continue;
+        };
         let ty = f["type"].as_str().unwrap_or("");
         let required = f["mode"].as_str() == Some("REQUIRED");
         let scalar = !matches!(ty, "RECORD" | "STRUCT") && f["mode"].as_str() != Some("REPEATED");
@@ -1602,9 +1729,13 @@ mod store {
     use super::{bare, pack_whole_groups, CHUNK_BYTES, CL_LSN, CL_SEQ, OP_COL};
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
-    use crate::lease::{no_longer_holds, owned_margin_secs, Fence, LeaseStore, Watermark, LEASE_TABLE, LOST_MARK};
+    use crate::lease::{
+        no_longer_holds, owned_margin_secs, Fence, LeaseStore, Watermark, LEASE_TABLE, LOST_MARK,
+    };
     use crate::logbased::replay::{parse_ceiling, parse_facts, parse_pending, Pending, StampFacts};
-    use crate::naming::{artifact_ident, artifact_ident_tok, fence_ident, Artifact, CDC_PENDING_TABLE, ROOMY};
+    use crate::naming::{
+        artifact_ident, artifact_ident_tok, fence_ident, Artifact, CDC_PENDING_TABLE, ROOMY,
+    };
     use crate::sink::bigquery::{fence_fq, sql_str, BqConn, BqGuard};
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1778,7 +1909,11 @@ mod store {
         let mut distinct: Vec<&String> = keys.iter().collect();
         distinct.sort();
         distinct.dedup();
-        let inlist = distinct.iter().map(|k| format!("'{}'", sql_str(k))).collect::<Vec<_>>().join(", ");
+        let inlist = distinct
+            .iter()
+            .map(|k| format!("'{}'", sql_str(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "ASSERT (SELECT COUNT(*) FROM {fence_fq} WHERE NOT claimed) = 1\n\
                AND (SELECT COUNT(*) FROM {lease_fq} WHERE token = '{tok}' AND dest_key IN ({inlist})\n\
@@ -1795,7 +1930,13 @@ mod store {
     /// Move `tmp` onto `table` — only while `tmp` exists, so `cdc_script`'s
     /// whole-script retry can repeat it: a retry after the RENAME finds no
     /// temp and does nothing, one after the DROP finishes the move.
-    pub(super) fn swap_sql(dataset_fq: &str, tmp: &str, tmp_fq: &str, t_fq: &str, table: &str) -> String {
+    pub(super) fn swap_sql(
+        dataset_fq: &str,
+        tmp: &str,
+        tmp_fq: &str,
+        t_fq: &str,
+        table: &str,
+    ) -> String {
         format!(
             "IF (SELECT COUNT(*) FROM {dataset_fq}.INFORMATION_SCHEMA.TABLES WHERE table_name = '{tmp_s}') = 1 THEN\n\
                DROP TABLE IF EXISTS {t_fq};\n\
@@ -1816,14 +1957,27 @@ mod store {
     /// The unit's groups with each state statement appended to ITS TABLE'S
     /// group — never a group of its own, which `pack_whole_groups` could put
     /// in the next transaction, away from the data it records.
-    pub(super) fn close_groups(mut groups: Vec<(String, Vec<String>)>, states: Vec<(String, String)>) -> Vec<Vec<String>> {
+    pub(super) fn close_groups(
+        mut groups: Vec<(String, Vec<String>)>,
+        states: Vec<(String, String)>,
+    ) -> Vec<Vec<String>> {
         for (t, sql) in states {
             append(&mut groups, &t, vec![sql]);
         }
-        groups.into_iter().map(|(_, g)| g).filter(|g| !g.is_empty()).collect()
+        groups
+            .into_iter()
+            .map(|(_, g)| g)
+            .filter(|g| !g.is_empty())
+            .collect()
     }
 
-    pub(super) fn state_insert_sql(state_fq: &str, table: &str, source_id: &str, lsn: u64, rows: u64) -> String {
+    pub(super) fn state_insert_sql(
+        state_fq: &str,
+        table: &str,
+        source_id: &str,
+        lsn: u64,
+        rows: u64,
+    ) -> String {
         format!(
             "INSERT INTO {state_fq} \
              (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
@@ -1907,8 +2061,14 @@ mod store {
                 let cell = |i: usize| row.get(i).cloned().flatten();
                 // Pasted into SQL as a literal later: kept only if it is the
                 // timestamp that was asked for.
-                if let Some(at) = cell(3).filter(|a| a.bytes().all(|b| b.is_ascii_digit() || b" -:.+".contains(&b))) {
-                    self.hint.lock().unwrap().insert((table.to_string(), source_id.to_string()), at);
+                if let Some(at) = cell(3).filter(|a| {
+                    a.bytes()
+                        .all(|b| b.is_ascii_digit() || b" -:.+".contains(&b))
+                }) {
+                    self.hint
+                        .lock()
+                        .unwrap()
+                        .insert((table.to_string(), source_id.to_string()), at);
                 }
                 crate::naming::StateRow::new(cell(0), cell(1), cell(2))
             }))
@@ -1921,7 +2081,9 @@ mod store {
                 return Ok(());
             }
             if self.conn.table_get(CDC_PENDING_TABLE).await?.is_none() {
-                self.conn.cdc_script(&pending_ddl(&self.conn.fq(CDC_PENDING_TABLE))).await?;
+                self.conn
+                    .cdc_script(&pending_ddl(&self.conn.fq(CDC_PENDING_TABLE)))
+                    .await?;
             }
             self.pending_ready.store(true, Ordering::Relaxed);
             Ok(())
@@ -1946,14 +2108,21 @@ mod store {
                 return;
             }
             let r = async {
-                let Some(meta) = self.conn.table_get(CDC_PENDING_TABLE).await? else { return Ok(()) };
+                let Some(meta) = self.conn.table_get(CDC_PENDING_TABLE).await? else {
+                    return Ok(());
+                };
                 // numRows can lag a hair behind recent jobs; for a bloat
                 // threshold, exact is not interesting.
-                let rows: u64 = meta["numRows"].as_str().and_then(|n| n.parse().ok()).unwrap_or(0);
+                let rows: u64 = meta["numRows"]
+                    .as_str()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
                 if rows <= PENDING_COMPACT_ROWS {
                     return Ok(());
                 }
-                self.conn.cdc_script(&compact_pending_sql(&self.conn.fq(CDC_PENDING_TABLE))).await
+                self.conn
+                    .cdc_script(&compact_pending_sql(&self.conn.fq(CDC_PENDING_TABLE)))
+                    .await
             }
             .await;
             if let Err(e) = r {
@@ -1979,7 +2148,9 @@ mod store {
             match self.conn.cdc_script(sql).await {
                 Ok(()) => Ok(()),
                 Err(Error::Locked(_)) => Err(no_longer_holds(keys)),
-                Err(Error::Transfer(m)) if m.contains("Not found") && m.contains(&fence_ident(token)) => {
+                Err(Error::Transfer(m))
+                    if m.contains("Not found") && m.contains(&fence_ident(token)) =>
+                {
                     Err(no_longer_holds(keys))
                 }
                 Err(e) => Err(e),
@@ -2008,8 +2179,16 @@ mod store {
         /// own window). A month of slack on top, and the bound is a literal,
         /// so the default monthly `_apitap_at` partitions prune.
         pub(crate) fn prune(&self, table: &str, source_id: &str) -> String {
-            match self.s.hint.lock().unwrap().get(&(table.to_string(), source_id.to_string())) {
-                Some(at) => format!(" AND _apitap_at >= TIMESTAMP_SUB(TIMESTAMP '{at}', INTERVAL 31 DAY)"),
+            match self
+                .s
+                .hint
+                .lock()
+                .unwrap()
+                .get(&(table.to_string(), source_id.to_string()))
+            {
+                Some(at) => {
+                    format!(" AND _apitap_at >= TIMESTAMP_SUB(TIMESTAMP '{at}', INTERVAL 31 DAY)")
+                }
                 None => String::new(),
             }
         }
@@ -2017,12 +2196,18 @@ mod store {
         /// The newest marker and the ceiling of each member (`probe_group_sql`),
         /// in `members` order; the marker table made first if this is its
         /// first use, and compacted after if it grew (best-effort).
-        pub(crate) async fn probe_group(&self, members: &[(&str, &str)]) -> Result<Vec<(Option<Pending>, Option<u64>)>> {
+        pub(crate) async fn probe_group(
+            &self,
+            members: &[(&str, &str)],
+        ) -> Result<Vec<(Option<Pending>, Option<u64>)>> {
             self.s.ensure_pending_table().await?;
-            let m: Vec<(&str, &str, String, String)> =
-                members.iter().map(|&(t, s)| (t, s, self.fq(t), self.prune(t, s))).collect();
+            let m: Vec<(&str, &str, String, String)> = members
+                .iter()
+                .map(|&(t, s)| (t, s, self.fq(t), self.prune(t, s)))
+                .collect();
             let rows = self.query(&probe_group_sql(&self.pending_fq(), &m)).await?;
-            let unreadable = || Error::Transfer(format!("log_based changelog: unreadable probe {rows:?}"));
+            let unreadable =
+                || Error::Transfer(format!("log_based changelog: unreadable probe {rows:?}"));
             let (mut marks, mut ceils) = (HashMap::new(), HashMap::new());
             for r in &rows {
                 let c = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
@@ -2048,17 +2233,30 @@ mod store {
         }
 
         /// The facts at `stamp` of each asked (table, source, base), by table.
-        pub(crate) async fn facts_group(&self, stamp: u64, asks: &[(&str, &str, u32)]) -> Result<HashMap<String, StampFacts>> {
-            let a: Vec<(&str, String, u32, String)> =
-                asks.iter().map(|&(t, s, b)| (t, self.fq(t), b, self.prune(t, s))).collect();
+        pub(crate) async fn facts_group(
+            &self,
+            stamp: u64,
+            asks: &[(&str, &str, u32)],
+        ) -> Result<HashMap<String, StampFacts>> {
+            let a: Vec<(&str, String, u32, String)> = asks
+                .iter()
+                .map(|&(t, s, b)| (t, self.fq(t), b, self.prune(t, s)))
+                .collect();
             let mut out = HashMap::with_capacity(asks.len());
             for r in self.query(&facts_group_sql(stamp, &a)).await? {
                 let cells: Vec<String> = r.into_iter().map(Option::unwrap_or_default).collect();
-                let Some((t, rest)) = cells.split_first() else { continue };
-                out.insert(t.clone(), parse_facts(&rest.iter().map(String::as_str).collect::<Vec<_>>())?);
+                let Some((t, rest)) = cells.split_first() else {
+                    continue;
+                };
+                out.insert(
+                    t.clone(),
+                    parse_facts(&rest.iter().map(String::as_str).collect::<Vec<_>>())?,
+                );
             }
             if let Some((t, ..)) = asks.iter().find(|(t, ..)| !out.contains_key(*t)) {
-                return Err(Error::Transfer(format!("log_based changelog: {t}: no facts came back for its stamp")));
+                return Err(Error::Transfer(format!(
+                    "log_based changelog: {t}: no facts came back for its stamp"
+                )));
             }
             Ok(out)
         }
@@ -2104,8 +2302,16 @@ mod store {
 
         /// One window's rows into this run's staging table for `table`,
         /// WRITE_TRUNCATE — scratch, not the table of record.
-        pub(crate) async fn load(&self, table: &str, fields: &Value, ndjson: Vec<u8>) -> Result<()> {
-            self.s.conn.cdc_load_ndjson(&self.staging(table), fields, ndjson).await
+        pub(crate) async fn load(
+            &self,
+            table: &str,
+            fields: &Value,
+            ndjson: Vec<u8>,
+        ) -> Result<()> {
+            self.s
+                .conn
+                .cdc_load_ndjson(&self.staging(table), fields, ndjson)
+                .await
         }
 
         /// `stmts` join `table`'s group, which commits with its watermark.
@@ -2131,7 +2337,8 @@ mod store {
         /// `tmp` onto `table`, guarded and idempotent (`swap_sql`).
         pub(crate) async fn swap(&self, tmp: &str, table: &str) -> Result<()> {
             let ds = format!("`{}.{}`", self.s.conn.project, self.s.conn.dataset);
-            self.ddl(&swap_sql(&ds, tmp, &self.fq(tmp), &self.fq(table), table)).await
+            self.ddl(&swap_sql(&ds, tmp, &self.fq(tmp), &self.fq(table), table))
+                .await
         }
 
         /// A rebuild whose swap never finished leaves the new table under its
@@ -2139,7 +2346,11 @@ mod store {
         /// run left untokenized, is moved into place. `true` = healed.
         pub(crate) async fn heal(&self, table: &str) -> Result<bool> {
             let mut candidates = vec![self.tmp(table)];
-            candidates.extend(legacy_scratch(table).into_iter().filter(|n| n.ends_with(Artifact::ChangelogTmp.suffix())));
+            candidates.extend(
+                legacy_scratch(table)
+                    .into_iter()
+                    .filter(|n| n.ends_with(Artifact::ChangelogTmp.suffix())),
+            );
             for c in candidates {
                 if self.table_get(&c).await?.is_some() {
                     self.swap(&c, table).await?;
@@ -2229,15 +2440,28 @@ mod store {
         /// transactions as fit. Each chunk is its own transaction: a fence
         /// failure on chunk 2 leaves chunk 1 committed — as the owner, before
         /// any claim — and the next owner replays the rest.
-        async fn close_unit<'a>(&'a self, u: BqUnit<'a>, token: &str, marks: Vec<Watermark>) -> Result<()> {
+        async fn close_unit<'a>(
+            &'a self,
+            u: BqUnit<'a>,
+            token: &str,
+            marks: Vec<Watermark>,
+        ) -> Result<()> {
             let BqUnit { keys, groups, .. } = u;
             let state = self.conn.state_fq();
             let mut states = Vec::with_capacity(marks.len());
             for m in &marks {
                 match m {
-                    Watermark::Set { table, source_id, lsn, rows } => {
+                    Watermark::Set {
+                        table,
+                        source_id,
+                        lsn,
+                        rows,
+                    } => {
                         self.ensure_state_table().await?;
-                        states.push((bare(table).to_string(), state_insert_sql(&state, bare(table), source_id, *lsn, *rows)));
+                        states.push((
+                            bare(table).to_string(),
+                            state_insert_sql(&state, bare(table), source_id, *lsn, *rows),
+                        ));
                     }
                     Watermark::Clear { table, source_id } => {
                         // No state table: nothing to clear.
@@ -2255,7 +2479,11 @@ mod store {
                         // same group: a marker past the next stream's start
                         // is a rewind.
                         if self.pending_exists().await? {
-                            let sql = clear_pending_sql(&self.conn.fq(CDC_PENDING_TABLE), bare(table), source_id);
+                            let sql = clear_pending_sql(
+                                &self.conn.fq(CDC_PENDING_TABLE),
+                                bare(table),
+                                source_id,
+                            );
                             states.push((bare(table).to_string(), sql));
                         }
                     }
@@ -2267,7 +2495,11 @@ mod store {
             // last one's next line is COMMIT, so the whole transaction fails to
             // parse with an error that names neither the statement nor the
             // caller. Caught here, where the offender is still identifiable.
-            if let Some(bad) = chunks.iter().flatten().find(|s| !s.trim_end().ends_with(';')) {
+            if let Some(bad) = chunks
+                .iter()
+                .flatten()
+                .find(|s| !s.trim_end().ends_with(';'))
+            {
                 return Err(Error::Transfer(format!(
                     "log_based: a BigQuery statement is missing its ';' and would \
                      swallow the COMMIT that follows it: {}",
@@ -2277,7 +2509,8 @@ mod store {
             let (t0, jobs) = (std::time::Instant::now(), chunks.len());
             let fence = fence_fq(&self.conn, token);
             for chunk in chunks {
-                self.run_owned(&fenced_script(&fence, token, &chunk), &keys, token).await?;
+                self.run_owned(&fenced_script(&fence, token, &chunk), &keys, token)
+                    .await?;
             }
             if std::env::var("APITAP_DEBUG").is_ok() && jobs > 0 {
                 eprintln!(
@@ -2305,12 +2538,21 @@ mod tests {
     use crate::logbased::replay::replay_plan;
 
     fn types(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
-        pairs.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect()
     }
 
     #[test]
     fn cluster_list_takes_column_names_and_refuses_sql() {
-        let t = types(&[("id", "INT64"), ("cust", "STRING"), ("v", "STRING"), ("w", "STRING"), ("x", "STRING")]);
+        let t = types(&[
+            ("id", "INT64"),
+            ("cust", "STRING"),
+            ("v", "STRING"),
+            ("w", "STRING"),
+            ("x", "STRING"),
+        ]);
         assert_eq!(bq_cluster_list("id, cust", &t).unwrap(), "`id`, `cust`");
         assert_eq!(bq_cluster_list("`id`", &t).unwrap(), "`id`");
         // A `;` would otherwise chain statements inside the rebuild script.
@@ -2333,8 +2575,14 @@ mod tests {
             ("n", "INT64"),
         ]);
         // A DATE column is NOT used bare — bare is daily.
-        assert_eq!(bq_partition_expr("d", &t).unwrap(), "DATE_TRUNC(`d`, MONTH)");
-        assert_eq!(bq_partition_expr("dt", &t).unwrap(), "DATETIME_TRUNC(`dt`, MONTH)");
+        assert_eq!(
+            bq_partition_expr("d", &t).unwrap(),
+            "DATE_TRUNC(`d`, MONTH)"
+        );
+        assert_eq!(
+            bq_partition_expr("dt", &t).unwrap(),
+            "DATETIME_TRUNC(`dt`, MONTH)"
+        );
         assert_eq!(
             bq_partition_expr("_apitap_at", &t).unwrap(),
             "TIMESTAMP_TRUNC(`_apitap_at`, MONTH)"
@@ -2372,21 +2620,39 @@ mod tests {
         )
         .unwrap();
         let f = plan.staging_fields_changelog();
-        let names: Vec<&str> =
-            f.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = f
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["name"].as_str().unwrap())
+            .collect();
         assert_eq!(names, vec!["_apitap_op", "_apitap_seq", "id", "v"]);
     }
 
     #[test]
     fn cast_table_covers_the_bq_type_of_outputs() {
-        for ty in ["STRING", "INT64", "FLOAT64", "NUMERIC", "BIGNUMERIC", "BOOL", "BYTES", "DATE", "TIMESTAMP", "DATETIME"] {
+        for ty in [
+            "STRING",
+            "INT64",
+            "FLOAT64",
+            "NUMERIC",
+            "BIGNUMERIC",
+            "BOOL",
+            "BYTES",
+            "DATE",
+            "TIMESTAMP",
+            "DATETIME",
+        ] {
             assert!(cast_expr("c", 25, ty).is_ok(), "{ty} should be castable");
         }
         assert!(cast_expr("c", 25, "JSON").is_err());
         assert!(cast_expr("c", 25, "GEOGRAPHY").is_err());
         // A pg boolean stored as INT64 translates t/f → 1/0, not a failing CAST.
         let b = cast_expr("flag", BOOL_OID, "INT64").unwrap();
-        assert!(b.contains("THEN 1") && b.contains("THEN 0") && !b.contains("CAST"), "{b}");
+        assert!(
+            b.contains("THEN 1") && b.contains("THEN 0") && !b.contains("CAST"),
+            "{b}"
+        );
     }
 
     /// The masked readback must hand the staging column the text its cast
@@ -2434,7 +2700,10 @@ mod tests {
         let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
         let sql = &read_base_sqls("`p.d.t`", &plan, &keys, &[0, 1, 2], &replay).unwrap()[0];
         assert!(sql.contains("CAST(`id` AS STRING)"), "{sql}");
-        assert!(sql.contains("IF(`flag` IS NULL, NULL, IF(`flag`, 't', 'f'))"), "{sql}");
+        assert!(
+            sql.contains("IF(`flag` IS NULL, NULL, IF(`flag`, 't', 'f'))"),
+            "{sql}"
+        );
         assert!(
             sql.contains("IF(`blob` IS NULL, NULL, CONCAT(r'\\x', LOWER(TO_HEX(`blob`))))"),
             "{sql}"
@@ -2521,8 +2790,9 @@ mod tests {
         )
         .unwrap();
         let pad = "x".repeat(4000);
-        let keys: Vec<Vec<Vec<u8>>> =
-            (0..200).map(|i| vec![format!("{i}{pad}").into_bytes()]).collect();
+        let keys: Vec<Vec<Vec<u8>>> = (0..200)
+            .map(|i| vec![format!("{i}{pad}").into_bytes()])
+            .collect();
         let replay = replay_plan("t", None, None, &WindowId::new(1, 2), 1).unwrap();
         let sqls = read_base_sqls("`p.d.t`", &plan, &keys, &[1], &replay).unwrap();
         assert!(sqls.len() >= 2, "200 x 4 KB keys must not be one query");
@@ -2555,9 +2825,15 @@ mod tests {
         assert!(sql.contains("SUBSTR(S._apitap_mask, 2, 1)"), "{sql}"); // v at pos 2
         assert!(sql.contains("SUBSTR(S._apitap_mask, 3, 1)"), "{sql}"); // flag at pos 3
         assert!(!sql.contains("`id` = IF"), "PK must not be updated: {sql}");
-        assert!(!sql.contains("NOT MATCHED BY SOURCE"), "no truncate clause: {sql}");
+        assert!(
+            !sql.contains("NOT MATCHED BY SOURCE"),
+            "no truncate clause: {sql}"
+        );
         let sqlt = plan.merge_sql("`proj.ds.orders`", stg, true, false);
-        assert!(sqlt.contains("WHEN NOT MATCHED BY SOURCE THEN\n  DELETE"), "{sqlt}");
+        assert!(
+            sqlt.contains("WHEN NOT MATCHED BY SOURCE THEN\n  DELETE"),
+            "{sqlt}"
+        );
     }
 
     #[test]
@@ -2566,8 +2842,16 @@ mod tests {
         let pk = vec!["a".to_string(), "b".to_string()];
         let ty = types(&[("a", "INT64"), ("b", "STRING")]);
         let plan = ApplyPlan::build("j", &wal, &[23, 25], &pk, &ty).unwrap();
-        let sql = plan.merge_sql("`p.d.j`", "`p.d.j_0000000l000abcd__apitap_cdc`", false, false);
-        assert!(!sql.contains("UPDATE SET"), "no non-PK cols → no UPDATE clause: {sql}");
+        let sql = plan.merge_sql(
+            "`p.d.j`",
+            "`p.d.j_0000000l000abcd__apitap_cdc`",
+            false,
+            false,
+        );
+        assert!(
+            !sql.contains("UPDATE SET"),
+            "no non-PK cols → no UPDATE clause: {sql}"
+        );
         assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"), "{sql}");
     }
 
@@ -2575,7 +2859,14 @@ mod tests {
     fn upsert_omits_null_and_masked_columns() {
         let cols = vec!["id".to_string(), "v".to_string(), "big".to_string()];
         let mut out = Vec::new();
-        push_upsert(&mut out, &cols, &[Cell::Text("7".into()), Cell::Null, Cell::UnchangedToast], Some("001"), None).unwrap();
+        push_upsert(
+            &mut out,
+            &cols,
+            &[Cell::Text("7".into()), Cell::Null, Cell::UnchangedToast],
+            Some("001"),
+            None,
+        )
+        .unwrap();
         let line = String::from_utf8(out).unwrap();
         assert!(line.contains("\"_apitap_op\":\"U\""), "{line}");
         assert!(line.contains("\"_apitap_mask\":\"001\""), "{line}");
@@ -2618,7 +2909,11 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         let ty = types(&[("id", "INT64"), ("v", "STRING"), ("flag", "INT64")]);
         let plan = ApplyPlan::build("t", &wal, &[23, 25, 16], &["id".to_string()], &ty).unwrap();
         let (t, stg) = ("`p.d.t`", "`p.d.t_stg`");
-        assert_eq!(plan.merge_sql(t, stg, false, false), PLAIN_MERGE, "moved=false is 0.56.0's text");
+        assert_eq!(
+            plan.merge_sql(t, stg, false, false),
+            PLAIN_MERGE,
+            "moved=false is 0.56.0's text"
+        );
         assert_eq!(
             plan.merge_sql(t, stg, true, false),
             format!("{PLAIN_MERGE}WHEN NOT MATCHED BY SOURCE THEN\n  DELETE\n")
@@ -2643,8 +2938,14 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         // the old key has none. Raising there wedged the window for good; the
         // row keeps its mask and the plain arms decide — its own cells where
         // it already is, and the NOT MATCHED arm's ERROR where it is not.
-        assert!(!m.contains("ERROR('log_based: t:"), "no error for an empty old key: {m}");
-        assert!(!m.contains("IF(S.`_apitap_from_0` IS NOT NULL, NULL"), "a mask is dropped only where F was found: {m}");
+        assert!(
+            !m.contains("ERROR('log_based: t:"),
+            "no error for an empty old key: {m}"
+        );
+        assert!(
+            !m.contains("IF(S.`_apitap_from_0` IS NOT NULL, NULL"),
+            "a mask is dropped only where F was found: {m}"
+        );
         assert!(
             m.contains("       CASE WHEN S.`flag` IS NULL THEN NULL WHEN S.`flag` IN ('t','true','TRUE','1') THEN 1"),
             "every other cell is cast exactly as the plain form casts it: {m}"
@@ -2659,21 +2960,66 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         let pk2 = vec!["a".to_string(), "b".to_string()];
         let plan2 = ApplyPlan::build("j", &wal2, &[23, 25, 25], &pk2, &ty2).unwrap();
         let m2 = plan2.merge_sql("`p.d.j`", "`p.d.j_stg`", false, true);
-        assert!(m2.contains("ON F.`a` = CAST(S.`_apitap_from_0` AS INT64) AND F.`b` = S.`_apitap_from_1`\n"), "{m2}");
-        let names: Vec<String> = plan2.staging_fields().as_array().unwrap().iter()
-            .map(|f| f["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["_apitap_op", "_apitap_mask", "a", "b", "body", "_apitap_from_0", "_apitap_from_1"]);
+        assert!(
+            m2.contains(
+                "ON F.`a` = CAST(S.`_apitap_from_0` AS INT64) AND F.`b` = S.`_apitap_from_1`\n"
+            ),
+            "{m2}"
+        );
+        let names: Vec<String> = plan2
+            .staging_fields()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "_apitap_op",
+                "_apitap_mask",
+                "a",
+                "b",
+                "body",
+                "_apitap_from_0",
+                "_apitap_from_1"
+            ]
+        );
 
         // The staged row names its old key; a row that did not move names none.
         let mut out = Vec::new();
         let old: Key = vec![b"1".to_vec(), b"x".to_vec()];
-        push_upsert(&mut out, &wal2, &[Cell::Text("9".into()), Cell::Text("x".into()), Cell::UnchangedToast],
-                    Some("001"), Some(&old)).unwrap();
-        push_upsert(&mut out, &wal2, &[Cell::Text("3".into()), Cell::Text("y".into()), Cell::UnchangedToast],
-                    Some("001"), None).unwrap();
+        push_upsert(
+            &mut out,
+            &wal2,
+            &[
+                Cell::Text("9".into()),
+                Cell::Text("x".into()),
+                Cell::UnchangedToast,
+            ],
+            Some("001"),
+            Some(&old),
+        )
+        .unwrap();
+        push_upsert(
+            &mut out,
+            &wal2,
+            &[
+                Cell::Text("3".into()),
+                Cell::Text("y".into()),
+                Cell::UnchangedToast,
+            ],
+            Some("001"),
+            None,
+        )
+        .unwrap();
         let lines = String::from_utf8(out).unwrap();
         let (moved, stayed) = lines.split_once('\n').unwrap();
-        assert!(moved.contains("\"_apitap_from_0\":\"1\"") && moved.contains("\"_apitap_from_1\":\"x\""), "{moved}");
+        assert!(
+            moved.contains("\"_apitap_from_0\":\"1\"")
+                && moved.contains("\"_apitap_from_1\":\"x\""),
+            "{moved}"
+        );
         assert!(!stayed.contains("_apitap_from_"), "{stayed}");
     }
 
@@ -2730,20 +3076,29 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         // Sized so a pair straddles the limit: the INSERT fits alone, the
         // watermark row does not fit beside it. That is the boundary the old
         // packer cut through.
-        let pair = |i: usize| vec![format!("INSERT t{i} {}", "x".repeat(280)),
-                                   format!("STATE t{i}")];
+        let pair = |i: usize| {
+            vec![
+                format!("INSERT t{i} {}", "x".repeat(280)),
+                format!("STATE t{i}"),
+            ]
+        };
         let groups: Vec<Vec<String>> = (0..7).map(pair).collect();
         const LIMIT: usize = 295;
 
         let split = |batches: &Vec<Vec<String>>| {
-            batches.iter().any(|b| b.len() % 2 != 0
-                || b.chunks(2).any(|p| p[1] != format!("STATE {}",
-                    p[0].split_whitespace().nth(1).unwrap())))
+            batches.iter().any(|b| {
+                b.len() % 2 != 0
+                    || b.chunks(2).any(|p| {
+                        p[1] != format!("STATE {}", p[0].split_whitespace().nth(1).unwrap())
+                    })
+            })
         };
 
         // Control: the flat packer really does cut a pair in half here.
-        assert!(split(&pack_flat(groups.clone(), LIMIT)),
-                "the control did not reproduce the split — the sizes stopped exercising it");
+        assert!(
+            split(&pack_flat(groups.clone(), LIMIT)),
+            "the control did not reproduce the split — the sizes stopped exercising it"
+        );
 
         let batches = pack_whole_groups(groups, LIMIT);
         assert!(!split(&batches), "a pair was separated: {batches:?}");
@@ -2767,15 +3122,32 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
     fn fenced_script_shape() {
         let tok = "_0abcdefl000beef";
         let fence = format!("`p.d.{}`", crate::naming::fence_ident(tok));
-        let chunk = vec!["MERGE `p.d.t` T USING x S ON TRUE WHEN MATCHED THEN DELETE;".to_string(),
-                         "INSERT INTO `p.d._apitap_state` (a) VALUES (1);".to_string()];
+        let chunk = vec![
+            "MERGE `p.d.t` T USING x S ON TRUE WHEN MATCHED THEN DELETE;".to_string(),
+            "INSERT INTO `p.d._apitap_state` (a) VALUES (1);".to_string(),
+        ];
         let sql = store::fenced_script(&fence, tok, &chunk);
-        let stmts: Vec<&str> = sql.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let stmts: Vec<&str> = sql
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
         assert_eq!(stmts[0], "BEGIN TRANSACTION;", "{sql}");
-        assert_eq!(stmts[1], format!("UPDATE {fence} SET n = n + 1 WHERE NOT claimed;"), "{sql}");
-        assert!(stmts[2].starts_with("IF @@row_count <> 1 THEN RAISE") && stmts[2].contains(crate::lease::LOST_MARK),
-                "{sql}");
-        assert_eq!(&stmts[3..5], &[chunk[0].as_str(), chunk[1].as_str()], "{sql}");
+        assert_eq!(
+            stmts[1],
+            format!("UPDATE {fence} SET n = n + 1 WHERE NOT claimed;"),
+            "{sql}"
+        );
+        assert!(
+            stmts[2].starts_with("IF @@row_count <> 1 THEN RAISE")
+                && stmts[2].contains(crate::lease::LOST_MARK),
+            "{sql}"
+        );
+        assert_eq!(
+            &stmts[3..5],
+            &[chunk[0].as_str(), chunk[1].as_str()],
+            "{sql}"
+        );
         assert_eq!(*stmts.last().unwrap(), "COMMIT TRANSACTION;", "{sql}");
         assert_eq!(stmts.len(), 6, "{sql}");
         assert!(!sql.contains(crate::lease::LEASE_TABLE), "{sql}");
@@ -2790,18 +3162,35 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
     fn close_keeps_state_in_its_group() {
         let merge1 = format!("MERGE t1 {};", "x".repeat(300 << 10));
         let merge2 = "MERGE t2;".to_string();
-        let groups = vec![("t1".to_string(), vec![merge1.clone()]), ("t2".to_string(), vec![merge2.clone()])];
+        let groups = vec![
+            ("t1".to_string(), vec![merge1.clone()]),
+            ("t2".to_string(), vec![merge2.clone()]),
+        ];
         let st = |t: &str| store::state_insert_sql("`p.d._apitap_state`", t, "sid", 7, 1);
         // A member with no traffic has no group yet: its state makes one.
-        let states = vec![("t1".to_string(), st("t1")), ("t2".to_string(), st("t2")), ("t3".to_string(), st("t3"))];
+        let states = vec![
+            ("t1".to_string(), st("t1")),
+            ("t2".to_string(), st("t2")),
+            ("t3".to_string(), st("t3")),
+        ];
         let chunks = pack_whole_groups(store::close_groups(groups, states), CHUNK_BYTES);
         for (t, m) in [("t1", &merge1), ("t2", &merge2)] {
             let with_data: Vec<&Vec<String>> = chunks.iter().filter(|c| c.contains(m)).collect();
             assert_eq!(with_data.len(), 1, "{t}'s MERGE went out once");
-            assert!(with_data[0].contains(&st(t)), "{t}'s state is not in its MERGE's transaction");
+            assert!(
+                with_data[0].contains(&st(t)),
+                "{t}'s state is not in its MERGE's transaction"
+            );
         }
-        assert_eq!(chunks.iter().flatten().filter(|s| s.contains("INSERT INTO")).count(), 3,
-                   "every state row goes out exactly once");
+        assert_eq!(
+            chunks
+                .iter()
+                .flatten()
+                .filter(|s| s.contains("INSERT INTO"))
+                .count(),
+            3,
+            "every state row goes out exactly once"
+        );
     }
 
     /// D8, BigQuery's twin: a changelog table's share of its group's
@@ -2823,15 +3212,35 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         }
         let id = WindowId::new(100, 200);
         let at = |count: u64, max: Option<u32>| {
-            let l = Landed { count, max_seq: max };
-            StampFacts { all: l, from_base: l, distinct_seq: count }
+            let l = Landed {
+                count,
+                max_seq: max,
+            };
+            StampFacts {
+                all: l,
+                from_base: l,
+                distinct_seq: count,
+            }
         };
         let torn = StampFacts {
-            all: Landed { count: 2, max_seq: Some(4) },
-            from_base: Landed { count: 2, max_seq: Some(4) },
+            all: Landed {
+                count: 2,
+                max_seq: Some(4),
+            },
+            from_base: Landed {
+                count: 2,
+                max_seq: Some(4),
+            },
             distinct_seq: 2,
         };
-        let mark = |seq_base, events| St::Mark(MarkerRow { start: 100, seq_base, end: 200, events });
+        let mark = |seq_base, events| {
+            St::Mark(MarkerRow {
+                start: 100,
+                seq_base,
+                end: 200,
+                events,
+            })
+        };
         let here = Some(Pending::recorded(100, 0));
         let target = ClTarget {
             table: "t",
@@ -2842,12 +3251,24 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         };
         let insert = "INSERT INTO `p.d.t` (`id`) SELECT `id` FROM `p.d.t_x__apitap_cdc`;";
         let num = |sql: &str, after: &str| -> u64 {
-            let rest = &sql[sql.find(after).unwrap_or_else(|| panic!("{after} in {sql}")) + after.len()..];
-            rest.trim_start().split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+            let rest = &sql[sql
+                .find(after)
+                .unwrap_or_else(|| panic!("{after} in {sql}"))
+                + after.len()..];
+            rest.trim_start()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
         };
         let parse = |sql: &str| -> St {
             if sql.starts_with("DELETE FROM `p.d.t` ") {
-                assert!(sql.contains("_apitap_lsn = 100 AND _apitap_op != 'B'") && sql.contains(&target.prune), "{sql}");
+                assert!(
+                    sql.contains("_apitap_lsn = 100 AND _apitap_op != 'B'")
+                        && sql.contains(&target.prune),
+                    "{sql}"
+                );
                 St::Trim(num(sql, "_apitap_seq >=") as u32)
             } else if sql.starts_with("INSERT INTO `p.d._apitap_cdc_pending` ") {
                 assert!(sql.contains("VALUES ('t', 's\\'1', "), "{sql}");
@@ -2856,7 +3277,12 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
                     .take(4)
                     .map(|x| x.trim().parse().unwrap())
                     .collect();
-                St::Mark(MarkerRow { start: v[0], seq_base: v[1] as u32, end: v[2], events: v[3] })
+                St::Mark(MarkerRow {
+                    start: v[0],
+                    seq_base: v[1] as u32,
+                    end: v[2],
+                    events: v[3],
+                })
             } else if sql == insert {
                 St::Append
             } else {
@@ -2864,14 +3290,62 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
             }
         };
         let cases: Vec<(&str, Option<Pending>, Option<StampFacts>, usize, Vec<St>)> = vec![
-            ("R1, another writer's rows", None, Some(at(3, Some(2))), 5, vec![mark(3, 5), St::Append]),
-            ("R1, nothing at the stamp", None, None, 5, vec![mark(0, 5), St::Append]),
-            ("R2 torn", here, Some(torn), 5, vec![St::Trim(0), mark(0, 5), St::Append]),
-            ("R2 intact, resumed", here, Some(at(2, Some(1))), 5, vec![mark(0, 5), St::Append]),
-            ("R2 intact, all landed", here, Some(at(5, Some(4))), 5, vec![]),
-            ("R2 shorter replay", here, Some(at(8, Some(7))), 5, vec![St::Trim(5)]),
-            ("R2 absent member", here, Some(at(8, Some(7))), 0, vec![St::Trim(0)]),
-            ("R2 torn, absent member", here, Some(torn), 0, vec![St::Trim(0)]),
+            (
+                "R1, another writer's rows",
+                None,
+                Some(at(3, Some(2))),
+                5,
+                vec![mark(3, 5), St::Append],
+            ),
+            (
+                "R1, nothing at the stamp",
+                None,
+                None,
+                5,
+                vec![mark(0, 5), St::Append],
+            ),
+            (
+                "R2 torn",
+                here,
+                Some(torn),
+                5,
+                vec![St::Trim(0), mark(0, 5), St::Append],
+            ),
+            (
+                "R2 intact, resumed",
+                here,
+                Some(at(2, Some(1))),
+                5,
+                vec![mark(0, 5), St::Append],
+            ),
+            (
+                "R2 intact, all landed",
+                here,
+                Some(at(5, Some(4))),
+                5,
+                vec![],
+            ),
+            (
+                "R2 shorter replay",
+                here,
+                Some(at(8, Some(7))),
+                5,
+                vec![St::Trim(5)],
+            ),
+            (
+                "R2 absent member",
+                here,
+                Some(at(8, Some(7))),
+                0,
+                vec![St::Trim(0)],
+            ),
+            (
+                "R2 torn, absent member",
+                here,
+                Some(torn),
+                0,
+                vec![St::Trim(0)],
+            ),
             ("absent, no attempt here", None, None, 0, vec![]),
         ];
         for (what, p, f, n_ev, want) in cases {
@@ -2884,13 +3358,21 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
 
             // The close puts the watermark in the same group, last, and the
             // packer never splits a group: one transaction.
-            let st = store::state_insert_sql("`p.d._apitap_state`", "t", "s'1", plan.watermark(), 1);
+            let st =
+                store::state_insert_sql("`p.d._apitap_state`", "t", "s'1", plan.watermark(), 1);
             let chunks = pack_whole_groups(
-                store::close_groups(vec![("t".to_string(), sql.clone())], vec![("t".to_string(), st.clone())]),
+                store::close_groups(
+                    vec![("t".to_string(), sql.clone())],
+                    vec![("t".to_string(), st.clone())],
+                ),
                 CHUNK_BYTES,
             );
             assert_eq!(chunks.len(), 1, "{what}: {chunks:?}");
-            assert_eq!(chunks[0].last(), Some(&st), "{what}: the watermark is not the group's last write");
+            assert_eq!(
+                chunks[0].last(),
+                Some(&st),
+                "{what}: the watermark is not the group's last write"
+            );
             assert_eq!(chunks[0].len(), sql.len() + 1, "{what}: {chunks:?}");
         }
     }
@@ -2900,14 +3382,34 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
     #[test]
     fn guarded_ddl_asserts_fence_and_every_key() {
         let keys = vec!["d.b".to_string(), "d.a".to_string(), "d.b".to_string()];
-        let sql = store::guarded_ddl_script("`p.d._apitap_fence_x`", "`p.d._apitap_lease`", "_x", &keys, 150,
-                                            "DROP TABLE `p.d.t`;");
-        assert!(sql.starts_with("ASSERT (SELECT COUNT(*) FROM `p.d._apitap_fence_x` WHERE NOT claimed) = 1"), "{sql}");
-        assert!(sql.contains("dest_key IN ('d.a', 'd.b')") && sql.contains(") = 2"), "{sql}");
+        let sql = store::guarded_ddl_script(
+            "`p.d._apitap_fence_x`",
+            "`p.d._apitap_lease`",
+            "_x",
+            &keys,
+            150,
+            "DROP TABLE `p.d.t`;",
+        );
+        assert!(
+            sql.starts_with(
+                "ASSERT (SELECT COUNT(*) FROM `p.d._apitap_fence_x` WHERE NOT claimed) = 1"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("dest_key IN ('d.a', 'd.b')") && sql.contains(") = 2"),
+            "{sql}"
+        );
         assert!(sql.contains("INTERVAL 150 SECOND"), "{sql}");
         assert!(sql.contains(crate::lease::LOST_MARK), "{sql}");
         assert!(sql.trim_end().ends_with("DROP TABLE `p.d.t`;"), "{sql}");
-        let sw = store::swap_sql("`p.d`", "t_x__apitap_cl", "`p.d.t_x__apitap_cl`", "`p.d.t`", "t");
+        let sw = store::swap_sql(
+            "`p.d`",
+            "t_x__apitap_cl",
+            "`p.d.t_x__apitap_cl`",
+            "`p.d.t`",
+            "t",
+        );
         assert!(sw.starts_with("IF (SELECT COUNT(*) FROM `p.d`.INFORMATION_SCHEMA.TABLES WHERE table_name = 't_x__apitap_cl') = 1"),
                 "{sw}");
     }

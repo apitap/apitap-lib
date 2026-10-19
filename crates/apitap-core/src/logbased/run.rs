@@ -22,11 +22,10 @@ use crate::logbased::dest_ice::{IceDest, IceUnit};
 use crate::logbased::dest_my::{MyDest, MyTx};
 use crate::logbased::dest_pg::{quote_ident, quote_table, PgDest, PgUnit};
 use crate::logbased::drain::{drain, DrainSession};
-use crate::logbased::window::{DrainOutcome, Slice};
 use crate::logbased::mysource;
 use crate::logbased::resolve::Source;
+use crate::logbased::window::{DrainOutcome, Slice};
 use crate::naming::CdcWatermark;
-use std::sync::Arc;
 use crate::wire::pgoutput::lsn_from_string;
 use crate::wire::walsender::Walsender;
 use crate::{Mode, MultiReport, TableResult, TransferOptions, TransferReport};
@@ -34,6 +33,7 @@ use md5::{Digest as _, Md5};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// `partition_by`/`order_by` describe the CHANGELOG, not the table the
 /// bootstrap's bulk load creates — and the changelog's meta columns
@@ -238,7 +238,12 @@ impl Fence for Dest {
         })
     }
 
-    async fn close_unit<'a>(&'a self, u: Unit<'a>, token: &str, marks: Vec<Watermark>) -> Result<()> {
+    async fn close_unit<'a>(
+        &'a self,
+        u: Unit<'a>,
+        token: &str,
+        marks: Vec<Watermark>,
+    ) -> Result<()> {
         match (self, u) {
             (Dest::Pg(d), Unit::Pg(u)) => d.store().close_unit(u, token, marks).await,
             (Dest::My(d), Unit::My(u)) => d.store().close_unit(u, token, marks).await,
@@ -312,8 +317,14 @@ impl Dest {
         order_by: Option<&str>,
     ) -> Result<()> {
         match self {
-            Dest::Ch(d) => d.validate_changelog_ddl(dest_table, partition_by, order_by).await,
-            Dest::Bq(d) => d.validate_changelog_ddl(dest_table, partition_by, order_by).await,
+            Dest::Ch(d) => {
+                d.validate_changelog_ddl(dest_table, partition_by, order_by)
+                    .await
+            }
+            Dest::Bq(d) => {
+                d.validate_changelog_ddl(dest_table, partition_by, order_by)
+                    .await
+            }
             // The row stores refuse changelog=True outright, upstream of this.
             Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => Ok(()),
         }
@@ -345,20 +356,45 @@ impl Dest {
     ) -> Result<Watermark> {
         match (self, u, changelog) {
             (Dest::Ch(d), Unit::Ch(u), true) => {
-                d.changelog_bootstrap_finish(u, dest_table, source_id, pk_cols, lsn, partition_by, order_by).await?
+                d.changelog_bootstrap_finish(
+                    u,
+                    dest_table,
+                    source_id,
+                    pk_cols,
+                    lsn,
+                    partition_by,
+                    order_by,
+                )
+                .await?
             }
             (Dest::Bq(d), Unit::Bq(u), true) => {
-                d.changelog_bootstrap_finish(u, dest_table, source_id, pk_cols, lsn, partition_by, order_by).await?
+                d.changelog_bootstrap_finish(
+                    u,
+                    dest_table,
+                    source_id,
+                    pk_cols,
+                    lsn,
+                    partition_by,
+                    order_by,
+                )
+                .await?
             }
             (_, _, true) => return Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
             (Dest::Pg(d), Unit::Pg(u), false) => d.bootstrap_finish(u, dest_table, pk_cols).await?,
             (Dest::Ch(d), Unit::Ch(u), false) => d.bootstrap_finish(u, dest_table).await?,
             (Dest::My(d), Unit::My(u), false) => d.bootstrap_finish(u, dest_table, pk_cols).await?,
             (Dest::Ice(d), Unit::Ice(_), false) => d.bootstrap_finish(pk_cols)?,
-            (Dest::Bq(d), Unit::Bq(u), false) => d.bootstrap_finish(u, dest_table, pk_cols, rows).await?,
+            (Dest::Bq(d), Unit::Bq(u), false) => {
+                d.bootstrap_finish(u, dest_table, pk_cols, rows).await?
+            }
             _ => return Err(mismatch()),
         }
-        Ok(Watermark::Set { table: dest_table.into(), source_id: source_id.into(), lsn, rows })
+        Ok(Watermark::Set {
+            table: dest_table.into(),
+            source_id: source_id.into(),
+            lsn,
+            rows,
+        })
     }
 
     /// Apply one table's window inside `u`, and name the watermark the unit's
@@ -384,19 +420,32 @@ impl Dest {
             // A group of one, in either lane: the per-member path (the MySQL
             // source's windows).
             (Dest::Bq(_), Unit::Bq(u), _) => {
-                let one = [(dest_table.to_string(), qualified.to_string(), source_id.to_string())];
+                let one = [(
+                    dest_table.to_string(),
+                    qualified.to_string(),
+                    source_id.to_string(),
+                )];
                 let mut v = self.apply_group(u, &one, o, 1).await?;
                 v.pop().ok_or_else(mismatch)
             }
             (_, _, Slice::Changelog(_)) => Err(Error::InvalidInput(CHANGELOG_DEST_MSG.into())),
-            (Dest::Pg(d), Unit::Pg(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
-            (Dest::Ch(d), Unit::Ch(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id, o.binary).await,
-            (Dest::My(d), Unit::My(u), Slice::Replica(w)) => d.apply(u, dest_table, w, &o.id, source_id).await,
+            (Dest::Pg(d), Unit::Pg(u), Slice::Replica(w)) => {
+                d.apply(u, dest_table, w, &o.id, source_id).await
+            }
+            (Dest::Ch(d), Unit::Ch(u), Slice::Replica(w)) => {
+                d.apply(u, dest_table, w, &o.id, source_id, o.binary).await
+            }
+            (Dest::My(d), Unit::My(u), Slice::Replica(w)) => {
+                d.apply(u, dest_table, w, &o.id, source_id).await
+            }
             (Dest::Ice(d), Unit::Ice(u), Slice::Replica(w)) => {
                 let src = src.ok_or_else(|| {
-                    Error::InvalidInput("log_based: iceberg needs a Postgres source in this release".into())
+                    Error::InvalidInput(
+                        "log_based: iceberg needs a Postgres source in this release".into(),
+                    )
                 })?;
-                d.apply(u, dest_table, qualified, w, &o.id, source_id, &Source(src)).await
+                d.apply(u, dest_table, qualified, w, &o.id, source_id, &Source(src))
+                    .await
             }
             _ => Err(mismatch()),
         }
@@ -459,8 +508,9 @@ impl Dest {
         // windows. Safe concurrently: PgDest runs each apply in its own pooled
         // connection/tx, ChDest is an HTTP client with Mutex'd memo state, and
         // MySQL TEMPORARY tables are per-connection.
-        if let Ok(n) =
-            std::env::var("APITAP_CDC_APPLY_LANES").unwrap_or_default().parse::<usize>()
+        if let Ok(n) = std::env::var("APITAP_CDC_APPLY_LANES")
+            .unwrap_or_default()
+            .parse::<usize>()
         {
             return n.clamp(1, 64);
         }
@@ -542,7 +592,10 @@ fn ch_apply_lanes(mem: Option<u64>, cpu: Option<f64>) -> usize {
 /// `APITAP_BQ_APPLY_LANES`.
 fn bq_apply_lanes() -> usize {
     const CAP: usize = 8;
-    if let Ok(n) = std::env::var("APITAP_BQ_APPLY_LANES").unwrap_or_default().parse::<usize>() {
+    if let Ok(n) = std::env::var("APITAP_BQ_APPLY_LANES")
+        .unwrap_or_default()
+        .parse::<usize>()
+    {
         return n.clamp(1, 64);
     }
     match crate::pipeline::mem_limit_bytes() {
@@ -616,9 +669,15 @@ pub(crate) async fn run_task(
     opts: &TransferOptions,
 ) -> Result<TransferReport> {
     let started = std::time::Instant::now();
-    let (rows, parallel) =
-        run_group(src_url, dst_url, std::slice::from_ref(&table.to_string()), opts, 1).await
-            .map(|mut v| v.pop().expect("one result per table"))?;
+    let (rows, parallel) = run_group(
+        src_url,
+        dst_url,
+        std::slice::from_ref(&table.to_string()),
+        opts,
+        1,
+    )
+    .await
+    .map(|mut v| v.pop().expect("one result per table"))?;
     Ok(TransferReport {
         rows,
         elapsed_ms: started.elapsed().as_millis() as u64,
@@ -750,7 +809,12 @@ async fn run_sloted(
     let mut rxs = Vec::with_capacity(n);
     for g in &groups {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let (su, du, o2, g) = (src_url.to_string(), dst_url.to_string(), opts.clone(), g.clone());
+        let (su, du, o2, g) = (
+            src_url.to_string(),
+            dst_url.to_string(),
+            opts.clone(),
+            g.clone(),
+        );
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -822,7 +886,13 @@ async fn run_sloted(
                     Ok((r, p)) => (*r, *p, None),
                     Err(e) => (0, 1, Some(e.clone())),
                 };
-                TableResult { table: t.clone(), rows, elapsed_ms: elapsed_all, parallel, error }
+                TableResult {
+                    table: t.clone(),
+                    rows,
+                    elapsed_ms: elapsed_all,
+                    parallel,
+                    error,
+                }
             })
             .collect(),
     })
@@ -1005,8 +1075,12 @@ async fn run_group(
             }
             wms.push(wm);
         }
-        let have: Vec<&TableCtx> =
-            ctxs.iter().zip(&wms).filter(|(_, w)| w.is_some()).map(|(c, _)| c).collect();
+        let have: Vec<&TableCtx> = ctxs
+            .iter()
+            .zip(&wms)
+            .filter(|(_, w)| w.is_some())
+            .map(|(c, _)| c)
+            .collect();
         // Which slot name this run owns (system review 2026-10-07, P1). A
         // pipeline WITH state keeps the slot it already established — the new
         // destination-aware name when it has one, the legacy
@@ -1019,8 +1093,7 @@ async fn run_group(
         let slot_owned = if have.is_empty() {
             slot_new.clone()
         } else {
-            let existing =
-                existing_slots(&src, &[slot_new.as_str(), slot_legacy.as_str()]).await?;
+            let existing = existing_slots(&src, &[slot_new.as_str(), slot_legacy.as_str()]).await?;
             if existing.iter().any(|(n, _)| n == &slot_new) {
                 slot_new.clone()
             } else if existing.iter().any(|(n, _)| n == &slot_legacy) {
@@ -1061,7 +1134,17 @@ async fn run_group(
             // released them here and let the bulk lock cover the load, which
             // left the table free between the two and after the load, while
             // the drain still owned its slot and its watermark.)
-            bootstrap_group(src_url, dst_url, opts, &tenure, &src, slot, &ctxs, budget_denom).await
+            bootstrap_group(
+                src_url,
+                dst_url,
+                opts,
+                &tenure,
+                &src,
+                slot,
+                &ctxs,
+                budget_denom,
+            )
+            .await
         } else {
             let floors: Vec<u64> = wms.iter().map(|w| w.expect("all present").get()).collect();
             let wm = *floors.iter().min().expect("nonempty");
@@ -1170,7 +1253,12 @@ async fn run_group_mysql(
     async fn stamp(tenure: &Tenure<Dest>, adopt: &[(String, String)], server: u64) -> Result<()> {
         for (table, marker) in adopt {
             let h = tenure.open(&[table.as_str()]).await?;
-            let mark = Watermark::Set { table: table.clone(), source_id: marker.clone(), lsn: server, rows: 0 };
+            let mark = Watermark::Set {
+                table: table.clone(),
+                source_id: marker.clone(),
+                lsn: server,
+                rows: 0,
+            };
             tenure.close(h, vec![mark]).await?;
         }
         Ok(())
@@ -1222,7 +1310,8 @@ async fn run_group_mysql(
             let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, o2| {
                 let (su, du, r) = (su.clone(), du.clone(), run_c.clone());
                 async move {
-                    let rep = Box::pin(crate::transfer_within(&r, &su, &du, &table_arg, &o2)).await?;
+                    let rep =
+                        Box::pin(crate::transfer_within(&r, &su, &du, &table_arg, &o2)).await?;
                     Ok((rep.rows, rep.parallel))
                 }
             })
@@ -1238,8 +1327,17 @@ async fn run_group_mysql(
                 let finished = async {
                     let mut h = tenure.open(&[c.dest_table.as_str()]).await?;
                     let m = dest
-                        .bootstrap_finish(&mut h.unit, &c.dest_table, &c.source_id, &c.pk_cols, mark, *rows,
-                            opts.changelog, pb, ob)
+                        .bootstrap_finish(
+                            &mut h.unit,
+                            &c.dest_table,
+                            &c.source_id,
+                            &c.pk_cols,
+                            mark,
+                            *rows,
+                            opts.changelog,
+                            pb,
+                            ob,
+                        )
                         .await?;
                     tenure.close(h, vec![m]).await
                 }
@@ -1247,7 +1345,12 @@ async fn run_group_mysql(
                 if let Err(e) = finished {
                     // Same rollback as the Postgres group: a half-written group is
                     // worse than no group, because the next run refuses it.
-                    clear_group(&tenure, ctxs.iter().map(|c| (c.dest_table.as_str(), c.source_id.as_str()))).await;
+                    clear_group(
+                        &tenure,
+                        ctxs.iter()
+                            .map(|c| (c.dest_table.as_str(), c.source_id.as_str())),
+                    )
+                    .await;
                     return Err(e);
                 }
             }
@@ -1256,9 +1359,17 @@ async fn run_group_mysql(
         }
 
         // Drain from the group minimum — members ahead converge idempotently.
-        let wm = marks.iter().flatten().copied().min().map_or(0, CdcWatermark::get);
+        let wm = marks
+            .iter()
+            .flatten()
+            .copied()
+            .min()
+            .map_or(0, CdcWatermark::get);
         // Each member's own position (M-55): see `member_cap`.
-        let floors: Vec<u64> = marks.iter().map(|m| m.map_or(0, CdcWatermark::get)).collect();
+        let floors: Vec<u64> = marks
+            .iter()
+            .map(|m| m.map_or(0, CdcWatermark::get))
+            .collect();
         let cap = member_cap(wm, &floors);
         let seed = ctxs
             .iter()
@@ -1285,17 +1396,40 @@ async fn run_group_mysql(
         // TOAST-unchanged refetch to resolve.
         let members: Vec<crate::logbased::dest_bq::Member> = ctxs
             .iter()
-            .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
+            .map(|c| {
+                (
+                    c.dest_table.clone(),
+                    c.qualified.clone(),
+                    c.source_id.clone(),
+                )
+            })
             .collect();
         let (win_tx, win_rx) = tokio::sync::mpsc::channel::<DrainOutcome>(window_depth());
         let (applied_tx, _applied_rx) = tokio::sync::watch::channel::<u64>(wm);
-        let apply =
-            AbortOnDrop::spawn(apply_windows(tenure.clone(), None, members, floors, win_rx, applied_tx));
+        let apply = AbortOnDrop::spawn(apply_windows(
+            tenure.clone(),
+            None,
+            members,
+            floors,
+            win_rx,
+            applied_tx,
+        ));
         let drained = run_overlapped(
             async {
-                myrun::drain_windows(src_url, &pool, &ctxs, wm, cap, &seed, 30, budget, opts.changelog, win_tx)
-                    .await
-                    .map(|_| ())
+                myrun::drain_windows(
+                    src_url,
+                    &pool,
+                    &ctxs,
+                    wm,
+                    cap,
+                    &seed,
+                    30,
+                    budget,
+                    opts.changelog,
+                    win_tx,
+                )
+                .await
+                .map(|_| ())
             },
             apply,
         )
@@ -1319,7 +1453,10 @@ async fn run_group_mysql(
 async fn clear_group<'a>(tenure: &Tenure<Dest>, members: impl Iterator<Item = (&'a str, &'a str)>) {
     for (table, source_id) in members {
         if let Ok(h) = tenure.open(&[table]).await {
-            let mark = Watermark::Clear { table: table.into(), source_id: source_id.into() };
+            let mark = Watermark::Clear {
+                table: table.into(),
+                source_id: source_id.into(),
+            };
             let _ = tenure.close(h, vec![mark]).await;
         }
     }
@@ -1369,8 +1506,11 @@ async fn binary_renderable(src: &PgPool, ctxs: &[TableCtx]) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let unrendered: Vec<i64> =
-        oids.iter().copied().filter(|o| !u32::try_from(*o).is_ok_and(crate::wire::pgbindec::renders)).collect();
+    let unrendered: Vec<i64> = oids
+        .iter()
+        .copied()
+        .filter(|o| !u32::try_from(*o).is_ok_and(crate::wire::pgbindec::renders))
+        .collect();
     if !unrendered.is_empty() {
         crate::progress::note(&format!(
             "log_based: binary pgoutput off for this group — column type OIDs {unrendered:?} \
@@ -1391,7 +1531,10 @@ fn slot_names(ctxs: &[TableCtx], single: bool, dst_origin: &str) -> (String, Str
                     12
                 )
             ),
-            format!("apitap_{}", hex_prefix(&format!("{}\u{1f}{}", c.source_id, c.dest_table), 12)),
+            format!(
+                "apitap_{}",
+                hex_prefix(&format!("{}\u{1f}{}", c.source_id, c.dest_table), 12)
+            ),
         )
     } else {
         let mut new_pairs: Vec<String> = ctxs
@@ -1399,8 +1542,10 @@ fn slot_names(ctxs: &[TableCtx], single: bool, dst_origin: &str) -> (String, Str
             .map(|c| format!("{}\u{1f}{}\u{1f}{}", c.source_id, dst_origin, c.dest_table))
             .collect();
         new_pairs.sort_unstable();
-        let mut legacy_pairs: Vec<String> =
-            ctxs.iter().map(|c| format!("{}\u{1f}{}", c.source_id, c.dest_table)).collect();
+        let mut legacy_pairs: Vec<String> = ctxs
+            .iter()
+            .map(|c| format!("{}\u{1f}{}", c.source_id, c.dest_table))
+            .collect();
         legacy_pairs.sort_unstable();
         (
             format!("apitap_g{}", hex_prefix(&new_pairs.join("\u{1e}"), 11)),
@@ -1502,7 +1647,10 @@ async fn bootstrap_group(
     use futures::stream::StreamExt as _;
     let concurrency = bootstrap_lanes_for(dest.bootstrap_lanes(), budget_denom);
     let drop_slot = || async {
-        let _ = sqlx::query("SELECT pg_drop_replication_slot($1)").bind(slot).execute(src).await;
+        let _ = sqlx::query("SELECT pg_drop_replication_slot($1)")
+            .bind(slot)
+            .execute(src)
+            .await;
     };
     let loaded: Vec<Result<(u64, usize)>> = futures::stream::iter(ctxs.iter().map(|c| {
         let pinned_url = &pinned_url;
@@ -1517,8 +1665,14 @@ async fn bootstrap_group(
             o2.slots = None;
             strip_changelog_ddl(&mut o2);
             dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
-            let r = Box::pin(crate::transfer_within(run, pinned_url, dst_url, &c.table_arg, &o2))
-                .await?;
+            let r = Box::pin(crate::transfer_within(
+                run,
+                pinned_url,
+                dst_url,
+                &c.table_arg,
+                &o2,
+            ))
+            .await?;
             Ok((r.rows, r.parallel))
         }
     }))
@@ -1564,23 +1718,36 @@ async fn bootstrap_group(
     // Each finish is a unit of its own: its DDL and its watermark, fenced, and
     // the watermark written only by the unit's close. BigQuery's closes queue
     // on the tenure's commit gate (every one updates the run's fence row).
-    let fins: Vec<Result<()>> = futures::stream::iter(ctxs.iter().zip(&out).map(|(c, (rows, _))| {
-        async move {
+    let fins: Vec<Result<()>> =
+        futures::stream::iter(ctxs.iter().zip(&out).map(|(c, (rows, _))| async move {
             let (pb, ob) = ddl_for(opts, &c.table_arg, &c.qualified);
             let mut h = tenure.open(&[c.dest_table.as_str()]).await?;
             let m = dest
-                .bootstrap_finish(&mut h.unit, &c.dest_table, &c.source_id, &c.pk_cols, lsn, *rows,
-                    opts.changelog, pb, ob)
+                .bootstrap_finish(
+                    &mut h.unit,
+                    &c.dest_table,
+                    &c.source_id,
+                    &c.pk_cols,
+                    lsn,
+                    *rows,
+                    opts.changelog,
+                    pb,
+                    ob,
+                )
                 .await?;
             tenure.close(h, vec![m]).await
-        }
-    }))
-    .buffered(concurrency)
-    .collect()
-    .await;
+        }))
+        .buffered(concurrency)
+        .collect()
+        .await;
     if let Some(e) = fins.into_iter().find_map(Result::err) {
         // Make the rollback the message promises real.
-        clear_group(tenure, ctxs.iter().map(|c| (c.dest_table.as_str(), c.source_id.as_str()))).await;
+        clear_group(
+            tenure,
+            ctxs.iter()
+                .map(|c| (c.dest_table.as_str(), c.source_id.as_str())),
+        )
+        .await;
         drop_slot().await;
         return Err(e);
     }
@@ -1724,7 +1891,8 @@ async fn drain_group(
         Some(forced) => forced,
         None => matches!(tenure.dest(), Dest::Ch(_)) && binary_renderable(src, ctxs).await,
     };
-    ws.start_replication(slot, wm, publication, want_binary).await?;
+    ws.start_replication(slot, wm, publication, want_binary)
+        .await?;
     // P4: the CH lane renders RowBinary bodies straight from send-format
     // cells when the session actually negotiated `binary 'true'`. Other
     // lanes and changelog bodies keep the text path (their renderers and
@@ -1741,14 +1909,40 @@ async fn drain_group(
     let (applied_tx, applied_rx) = tokio::sync::watch::channel::<u64>(wm);
     let members: Vec<crate::logbased::dest_bq::Member> = ctxs
         .iter()
-        .map(|c| (c.dest_table.clone(), c.qualified.clone(), c.source_id.clone()))
+        .map(|c| {
+            (
+                c.dest_table.clone(),
+                c.qualified.clone(),
+                c.source_id.clone(),
+            )
+        })
         .collect();
-    let apply = AbortOnDrop::spawn(apply_windows(tenure, Some(src.clone()), members, floors, win_rx, applied_tx));
+    let apply = AbortOnDrop::spawn(apply_windows(
+        tenure,
+        Some(src.clone()),
+        members,
+        floors,
+        win_rx,
+        applied_tx,
+    ));
     let follow = follow_secs()
         .filter(|_| cap.is_none())
         .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let drained = run_overlapped(
-        drain_loop(&mut ws, win_tx, applied_rx, wm, stop_line, &key_cols, budget, changelog, follow, src, keep_binary, window_depth()),
+        drain_loop(
+            &mut ws,
+            win_tx,
+            applied_rx,
+            wm,
+            stop_line,
+            &key_cols,
+            budget,
+            changelog,
+            follow,
+            src,
+            keep_binary,
+            window_depth(),
+        ),
         apply,
     )
     .await;
@@ -1801,7 +1995,9 @@ where
     drained?;
     match joined {
         Ok(r) => r,
-        Err(j) => Err(Error::Transfer(format!("log_based: apply task panicked: {j}"))),
+        Err(j) => Err(Error::Transfer(format!(
+            "log_based: apply task panicked: {j}"
+        ))),
     }
 }
 
@@ -1846,8 +2042,20 @@ async fn drain_loop(
         }
         let t_drain = std::time::Instant::now();
         let follow_ctx = follow.map(|d| (src, FOLLOW_FLOOR, d));
-        let outcome =
-            drain(ws, &mut sess, cur, stop_line, key_cols, window_max_secs(), budget, &applied_rx, changelog, follow_ctx, keep_binary).await?;
+        let outcome = drain(
+            ws,
+            &mut sess,
+            cur,
+            stop_line,
+            key_cols,
+            window_max_secs(),
+            budget,
+            &applied_rx,
+            changelog,
+            follow_ctx,
+            keep_binary,
+        )
+        .await?;
         windows += 1;
         if dbg {
             eprintln!(
@@ -2041,7 +2249,9 @@ async fn apply_windows(
             let tables: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
             let r = async {
                 let mut h = t.open(&tables).await?;
-                let Unit::Bq(u) = &mut h.unit else { return Err(mismatch()) };
+                let Unit::Bq(u) = &mut h.unit else {
+                    return Err(mismatch());
+                };
                 let applied = dest.apply_group(u, &members, &o, lanes).await?;
                 let (rows, marks): (Vec<u64>, Vec<Watermark>) = applied.into_iter().unzip();
                 t.close(h, marks).await?;
@@ -2101,9 +2311,12 @@ async fn apply_windows(
                 Ok(())
             } else {
                 let e0 = marked.iter().map(|(_, _, _, e)| *e).min().unwrap_or(0);
-                let tables: Vec<&str> =
-                    marked.iter().map(|(i, _, _, _)| members[*i].0.as_str()).collect();
-                let marks: Vec<Watermark> = marked.iter().filter_map(|(_, _, m, _)| m.clone()).collect();
+                let tables: Vec<&str> = marked
+                    .iter()
+                    .map(|(i, _, _, _)| members[*i].0.as_str())
+                    .collect();
+                let marks: Vec<Watermark> =
+                    marked.iter().filter_map(|(_, _, m, _)| m.clone()).collect();
                 async {
                     let h = t.open_at(&tables, Some(e0)).await?;
                     t.close(h, marks).await
@@ -2153,8 +2366,10 @@ async fn apply_windows(
             let depth = window_depth().max(2);
             let mut seq = 0u64;
             let mut expected = 0u64;
-            let mut done: std::collections::BTreeMap<u64, (Vec<(u64, Option<Watermark>, u64)>, u64)> =
-                std::collections::BTreeMap::new();
+            let mut done: std::collections::BTreeMap<
+                u64,
+                (Vec<(u64, Option<Watermark>, u64)>, u64),
+            > = std::collections::BTreeMap::new();
             let mut inflight = futures::stream::FuturesUnordered::new();
             // The window this arm was entered with goes in FIRST: the old
             // loop started its own `win_rx.recv()` and never applied it, so
@@ -2174,7 +2389,16 @@ async fn apply_windows(
                     let (id, per, end) = $res?;
                     done.insert(id, (per, end));
                     while let Some((per, end)) = done.remove(&expected) {
-                        close_prefix_window(t, dest, &members, per, &mut rows_per, &applied_tx, end).await?;
+                        close_prefix_window(
+                            t,
+                            dest,
+                            &members,
+                            per,
+                            &mut rows_per,
+                            &applied_tx,
+                            end,
+                        )
+                        .await?;
                         expected += 1;
                     }
                     // Per settled window, not once after the arm: the row
@@ -2278,8 +2502,10 @@ where
     F: std::future::Future<Output = Result<T>>,
 {
     use futures::stream::StreamExt as _;
-    let done: Vec<Result<T>> =
-        futures::stream::iter(fs).buffer_unordered(lanes).collect().await;
+    let done: Vec<Result<T>> = futures::stream::iter(fs)
+        .buffer_unordered(lanes)
+        .collect()
+        .await;
     done.into_iter().collect()
 }
 
@@ -2292,8 +2518,10 @@ where
     F: std::future::Future<Output = Result<T>>,
 {
     use futures::stream::StreamExt as _;
-    let done: Vec<Result<T>> =
-        futures::stream::iter(fs).buffer_unordered(lanes).collect().await;
+    let done: Vec<Result<T>> = futures::stream::iter(fs)
+        .buffer_unordered(lanes)
+        .collect()
+        .await;
     let mut ok = Vec::with_capacity(done.len());
     let mut err = None;
     for r in done {
@@ -2328,7 +2556,9 @@ async fn apply_member(
     let dest = t.dest();
     let r = async {
         let mut h = t.open(&[dest_table]).await?;
-        let (n, m) = dest.apply(&mut h.unit, dest_table, qualified, source_id, o, src).await?;
+        let (n, m) = dest
+            .apply(&mut h.unit, dest_table, qualified, source_id, o, src)
+            .await?;
         t.close(h, vec![m]).await?;
         Ok(n)
     }
@@ -2357,7 +2587,10 @@ async fn apply_member_pending(
         return Ok((0, None, u64::MAX));
     }
     let mut h = t.open(&[dest_table]).await?;
-    let (n, m) = t.dest().apply(&mut h.unit, dest_table, qualified, source_id, o, src).await?;
+    let (n, m) = t
+        .dest()
+        .apply(&mut h.unit, dest_table, qualified, source_id, o, src)
+        .await?;
     let e0 = match &h.unit {
         Unit::Ch(u) => u.pin_deadline(),
         _ => 0,
@@ -2386,10 +2619,17 @@ fn url_database(src_url: &str) -> String {
 /// slot confirmations sent meanwhile (P2, T19).
 pub(crate) async fn wal_end_now(src: &sqlx::PgPool) -> Result<String> {
     let q = format!("SELECT {WAL_END}::text");
-    match tokio::time::timeout(std::time::Duration::from_secs(60), sqlx::query_as::<_, (String,)>(&q).fetch_one(src)).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        sqlx::query_as::<_, (String,)>(&q).fetch_one(src),
+    )
+    .await
+    {
         Ok(Ok((s,))) => Ok(s),
         Ok(Err(e)) => Err(Error::Transfer(format!("log_based: follow lsn read: {e}"))),
-        Err(_) => Err(Error::Transfer("log_based: follow lsn read: no answer in 60 s".into())),
+        Err(_) => Err(Error::Transfer(
+            "log_based: follow lsn read: no answer in 60 s".into(),
+        )),
     }
 }
 
@@ -2462,12 +2702,11 @@ async fn ensure_publication(
     publication: &str,
     qualified_tables: &[&str],
 ) -> Result<()> {
-    let exists: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM pg_publication WHERE pubname = $1")
-            .bind(publication)
-            .fetch_optional(src)
-            .await
-            .map_err(db_err)?;
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_publication WHERE pubname = $1")
+        .bind(publication)
+        .fetch_optional(src)
+        .await
+        .map_err(db_err)?;
     // publish_via_partition_root=true wherever the server knows the option
     // (PostgreSQL 13+). For a partitioned parent this is the difference between
     // working and silently discarding every change: without it the Relation
@@ -2476,13 +2715,12 @@ async fn ensure_publication(
     // function reads — with the option off, pg_publication_tables lists the
     // LEAVES, so the membership check below concluded the parent had vanished
     // and died re-adding it ("is already member of publication").
-    let viaroot: bool = sqlx::query_scalar::<_, i32>(
-        "SELECT current_setting('server_version_num')::int",
-    )
-    .fetch_one(src)
-    .await
-    .map(|v| v >= 130_000)
-    .unwrap_or(false);
+    let viaroot: bool =
+        sqlx::query_scalar::<_, i32>("SELECT current_setting('server_version_num')::int")
+            .fetch_one(src)
+            .await
+            .map(|v| v >= 130_000)
+            .unwrap_or(false);
     if exists.is_none() {
         let list = qualified_tables
             .iter()
@@ -2711,11 +2949,11 @@ async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
         .ok()
         .and_then(|v| parse_size(&v))
         .unwrap_or(4 << 30); // 4 GiB
-    // The number itself, always, in the machine's shape — before deciding
-    // whether a human also needs a sentence about it. This is the gauge an
-    // unattended pipeline alerts on: WAL a slot is holding on the SOURCE is
-    // the difference between "a schedule paused" and "the source's disk
-    // filled up".
+                             // The number itself, always, in the machine's shape — before deciding
+                             // whether a human also needs a sentence about it. This is the gauge an
+                             // unattended pipeline alerts on: WAL a slot is holding on the SOURCE is
+                             // the difference between "a schedule paused" and "the source's disk
+                             // filled up".
     crate::progress::gauge(
         "slot.wal",
         &[
@@ -2729,12 +2967,11 @@ async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
         // The cap is what turns "the disk filled up" into "the slot was
         // invalidated" — a bounded, recoverable failure. Name it, because most
         // servers ship with it unset.
-        let cap: Option<(String, String)> =
-            sqlx::query_as("SHOW max_slot_wal_keep_size")
-                .fetch_optional(src)
-                .await
-                .ok()
-                .flatten();
+        let cap: Option<(String, String)> = sqlx::query_as("SHOW max_slot_wal_keep_size")
+            .fetch_optional(src)
+            .await
+            .ok()
+            .flatten();
         let cap = cap
             .map(|(v, _)| v)
             .or(Some("-1".into()))
@@ -2748,7 +2985,11 @@ async fn slot_wal_report(src: &sqlx::PgPool, slot: &str) {
              That WAL cannot be freed until this drain confirms it, so a schedule \
              that stops holds the source's disk hostage.{}",
             human_bytes(bytes),
-            if bytes >= warn_at * 4 { " and growing past four times the warning threshold" } else { "" },
+            if bytes >= warn_at * 4 {
+                " and growing past four times the warning threshold"
+            } else {
+                ""
+            },
             if unbounded {
                 " max_slot_wal_keep_size is unlimited on this server: set it to \
                  bound the damage (an over-cap slot is invalidated instead, which \
@@ -2774,7 +3015,10 @@ pub(crate) fn parse_size(v: &str) -> Option<u64> {
         Some('G') | Some('g') => (&v[..v.len() - 1], 1u64 << 30),
         _ => (v, 1),
     };
-    num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(mult))
 }
 
 fn human_bytes(n: u64) -> String {
@@ -2796,7 +3040,10 @@ mod tests {
     /// A query value holding a path is not the database.
     #[test]
     fn the_url_database_is_its_path() {
-        assert_eq!(super::url_database("mysql://u:p@h:3306/bench?ssl-ca=/etc/ssl/ca.pem"), "bench");
+        assert_eq!(
+            super::url_database("mysql://u:p@h:3306/bench?ssl-ca=/etc/ssl/ca.pem"),
+            "bench"
+        );
         assert_eq!(super::url_database("mysql://u:p@h/bench"), "bench");
         assert_eq!(super::url_database("mysql://u:p@h"), "");
     }
@@ -2809,47 +3056,63 @@ mod tests {
     /// apply commits beside the next owner.
     #[test]
     fn overlapped_loop_joins_apply_on_error() {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
-            let finished = Arc::new(Mutex::new(None::<Instant>));
-            let f2 = finished.clone();
-            let apply = AbortOnDrop::spawn(async move {
-                let mut n = 0u64;
-                while rx.recv().await.is_some() {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    n += 1;
-                }
-                *f2.lock().unwrap() = Some(Instant::now());
-                Ok(vec![n])
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+                let finished = Arc::new(Mutex::new(None::<Instant>));
+                let f2 = finished.clone();
+                let apply = AbortOnDrop::spawn(async move {
+                    let mut n = 0u64;
+                    while rx.recv().await.is_some() {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        n += 1;
+                    }
+                    *f2.lock().unwrap() = Some(Instant::now());
+                    Ok(vec![n])
+                });
+                let drain = async move {
+                    for w in 0..2 {
+                        tx.send(w)
+                            .await
+                            .map_err(|_| Error::Transfer("apply gone".into()))?;
+                    }
+                    Err(Error::Transfer("the walsender went away".into()))
+                };
+                let r = run_overlapped(drain, apply).await;
+                let returned = Instant::now();
+                assert!(
+                    matches!(&r, Err(Error::Transfer(m)) if m.contains("walsender")),
+                    "{r:?}"
+                );
+                let done = finished
+                    .lock()
+                    .unwrap()
+                    .expect("the apply task was left running past the return");
+                assert!(returned >= done, "returned before the apply task finished");
             });
-            let drain = async move {
-                for w in 0..2 {
-                    tx.send(w).await.map_err(|_| Error::Transfer("apply gone".into()))?;
-                }
-                Err(Error::Transfer("the walsender went away".into()))
-            };
-            let r = run_overlapped(drain, apply).await;
-            let returned = Instant::now();
-            assert!(matches!(&r, Err(Error::Transfer(m)) if m.contains("walsender")), "{r:?}");
-            let done = finished.lock().unwrap().expect("the apply task was left running past the return");
-            assert!(returned >= done, "returned before the apply task finished");
-        });
     }
 
     /// Dropping the owner aborts the task instead of detaching it.
     #[test]
     fn a_dropped_apply_is_aborted() {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let ran = Arc::new(Mutex::new(false));
-            let r2 = ran.clone();
-            let apply = AbortOnDrop::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                *r2.lock().unwrap() = true;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let ran = Arc::new(Mutex::new(false));
+                let r2 = ran.clone();
+                let apply = AbortOnDrop::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    *r2.lock().unwrap() = true;
+                });
+                drop(apply);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                assert!(!*ran.lock().unwrap(), "a dropped apply task ran on");
             });
-            drop(apply);
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            assert!(!*ran.lock().unwrap(), "a dropped apply task ran on");
-        });
     }
 
     /// A pool error waits for every sibling already in flight: a member that
@@ -2860,21 +3123,33 @@ mod tests {
     #[test]
     fn a_pool_error_does_not_cancel_in_flight_siblings() {
         use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let sibling_ran = Arc::new(AtomicBool::new(false));
-            let s2 = sibling_ran.clone();
-            let fs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>> = vec![
-                Box::pin(async move { Err(Error::Transfer("boom".into())) }),
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(80)).await;
-                    s2.store(true, SeqCst);
-                    Ok(1)
-                }),
-            ];
-            let r = settle_all(2, fs).await;
-            assert!(matches!(&r, Err(Error::Transfer(m)) if m == "boom"), "{r:?}");
-            assert!(sibling_ran.load(SeqCst), "the in-flight sibling was cancelled");
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let sibling_ran = Arc::new(AtomicBool::new(false));
+                let s2 = sibling_ran.clone();
+                let fs: Vec<
+                    std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>,
+                > = vec![
+                    Box::pin(async move { Err(Error::Transfer("boom".into())) }),
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        s2.store(true, SeqCst);
+                        Ok(1)
+                    }),
+                ];
+                let r = settle_all(2, fs).await;
+                assert!(
+                    matches!(&r, Err(Error::Transfer(m)) if m == "boom"),
+                    "{r:?}"
+                );
+                assert!(
+                    sibling_ran.load(SeqCst),
+                    "the in-flight sibling was cancelled"
+                );
+            });
     }
 
     /// Only `lost` is refused up front; `unreserved` is a warning (the drain
@@ -2999,15 +3274,16 @@ mod tests {
         let (a, a_legacy) = slot_names(&[ctx("events")], true, "postgres://dst-a:5432/db");
         let (b, b_legacy) = slot_names(&[ctx("events")], true, "postgres://dst-b:5432/db");
         assert_ne!(a, b, "two destinations must not share a slot name");
-        assert_eq!(a_legacy, b_legacy, "the legacy name is the destination-blind pre-fix hash");
+        assert_eq!(
+            a_legacy, b_legacy,
+            "the legacy name is the destination-blind pre-fix hash"
+        );
         let (a2, _) = slot_names(&[ctx("events")], true, "postgres://dst-a:5432/db");
         assert_eq!(a, a2, "the same source + destination + table is stable");
-        let (g1, g1_legacy) =
-            slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-a:5432/db");
+        let (g1, g1_legacy) = slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-a:5432/db");
         let (g2, _) = slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-b:5432/db");
         assert_ne!(g1, g2, "groups too");
-        let (_, g2_legacy) =
-            slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-b:5432/db");
+        let (_, g2_legacy) = slot_names(&[ctx("a"), ctx("b")], false, "postgres://dst-b:5432/db");
         assert_eq!(g1_legacy, g2_legacy);
     }
 
@@ -3017,17 +3293,30 @@ mod tests {
     /// lane pool keeps every completed value AND the first error.
     #[test]
     fn settle_partial_keeps_the_values_a_sibling_failure_left() {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let fs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>> = vec![
-                Box::pin(async move { Ok(1) }),
-                Box::pin(async move { Err(Error::Transfer("boom".into())) }),
-                Box::pin(async move { Ok(2) }),
-            ];
-            let (mut done, err) = settle_partial(3, fs).await;
-            done.sort_unstable();
-            assert_eq!(done, vec![1, 2], "the finished units' values survive the failure");
-            assert!(matches!(&err, Some(Error::Transfer(m)) if m == "boom"), "{err:?}");
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let fs: Vec<
+                    std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>,
+                > = vec![
+                    Box::pin(async move { Ok(1) }),
+                    Box::pin(async move { Err(Error::Transfer("boom".into())) }),
+                    Box::pin(async move { Ok(2) }),
+                ];
+                let (mut done, err) = settle_partial(3, fs).await;
+                done.sort_unstable();
+                assert_eq!(
+                    done,
+                    vec![1, 2],
+                    "the finished units' values survive the failure"
+                );
+                assert!(
+                    matches!(&err, Some(Error::Transfer(m)) if m == "boom"),
+                    "{err:?}"
+                );
+            });
     }
 
     /// A ClickHouse group overlaps its members' applies by default, and the
@@ -3038,14 +3327,46 @@ mod tests {
     /// to serial when the memory headroom cannot hold one body.
     #[test]
     fn clickhouse_lanes_follow_cpu_and_memory_together() {
-        assert_eq!(ch_apply_lanes(None, None), 16, "no limits: the cap, not serial");
-        assert_eq!(ch_apply_lanes(Some(256 << 20), Some(0.5)), 8, "the target shape");
-        assert_eq!(ch_apply_lanes(Some(256 << 20), Some(1.0)), 8, "8 lanes fit the 256 MB cage");
-        assert_eq!(ch_apply_lanes(Some(256 << 20), Some(4.0)), 8, "4 CPU does not buy memory");
-        assert_eq!(ch_apply_lanes(Some(512 << 20), Some(1.0)), 16, "headroom: the quota adds lanes");
-        assert_eq!(ch_apply_lanes(Some(512 << 20), Some(0.5)), 8, "0.5 core stays at 8");
-        assert_eq!(ch_apply_lanes(Some(128 << 20), Some(4.0)), 1, "the memory bound wins");
-        assert_eq!(ch_apply_lanes(Some(96 << 20), Some(1.0)), 1, "no headroom: one at a time");
+        assert_eq!(
+            ch_apply_lanes(None, None),
+            16,
+            "no limits: the cap, not serial"
+        );
+        assert_eq!(
+            ch_apply_lanes(Some(256 << 20), Some(0.5)),
+            8,
+            "the target shape"
+        );
+        assert_eq!(
+            ch_apply_lanes(Some(256 << 20), Some(1.0)),
+            8,
+            "8 lanes fit the 256 MB cage"
+        );
+        assert_eq!(
+            ch_apply_lanes(Some(256 << 20), Some(4.0)),
+            8,
+            "4 CPU does not buy memory"
+        );
+        assert_eq!(
+            ch_apply_lanes(Some(512 << 20), Some(1.0)),
+            16,
+            "headroom: the quota adds lanes"
+        );
+        assert_eq!(
+            ch_apply_lanes(Some(512 << 20), Some(0.5)),
+            8,
+            "0.5 core stays at 8"
+        );
+        assert_eq!(
+            ch_apply_lanes(Some(128 << 20), Some(4.0)),
+            1,
+            "the memory bound wins"
+        );
+        assert_eq!(
+            ch_apply_lanes(Some(96 << 20), Some(1.0)),
+            1,
+            "no headroom: one at a time"
+        );
         assert_eq!(ch_apply_lanes(Some(32 << 20), Some(4.0)), 1);
     }
 
@@ -3056,7 +3377,10 @@ mod tests {
     fn row_stores_stay_serial_and_clickhouse_does_not() {
         std::env::remove_var("APITAP_CDC_APPLY_LANES");
         let d = Dest::Ch(ChDest::connect("clickhouse://default:@127.0.0.1:8123/default").unwrap());
-        assert!(d.apply_lanes() > 1, "ClickHouse must overlap its members by default");
+        assert!(
+            d.apply_lanes() > 1,
+            "ClickHouse must overlap its members by default"
+        );
     }
 
     /// The window lane pool must NOT drive the bootstrap: a bootstrap loads
@@ -3070,6 +3394,9 @@ mod tests {
         std::env::remove_var("APITAP_CDC_APPLY_LANES");
         let ch = Dest::Ch(ChDest::connect("clickhouse://default:@127.0.0.1:8123/default").unwrap());
         assert_eq!(ch.bootstrap_lanes(), 1, "ClickHouse bootstraps serially");
-        assert!(ch.apply_lanes() > 1, "…while its window apply still overlaps");
+        assert!(
+            ch.apply_lanes() > 1,
+            "…while its window apply still overlaps"
+        );
     }
 }

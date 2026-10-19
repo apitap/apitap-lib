@@ -18,8 +18,8 @@ use crate::lease::Watermark;
 use crate::logbased::collapse::{Collapsed, ResidueOp};
 use crate::logbased::replay::WindowId;
 use crate::logbased::rowtext::{
-    bytea_hex, render_my_key, render_my_row, row_key_refs, strip_utc_offset,
-    BOOL_OID, BYTEA_OID, TIMESTAMPTZ_OID, TIMETZ_OID,
+    bytea_hex, render_my_key, render_my_row, row_key_refs, strip_utc_offset, BOOL_OID, BYTEA_OID,
+    TIMESTAMPTZ_OID, TIMETZ_OID,
 };
 use crate::logbased::window::TableWindow;
 use crate::sink::mysql::sql_lit;
@@ -42,7 +42,9 @@ pub(crate) struct MyDest {
 
 impl MyDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: MyStore::connect(url)? })
+        Ok(Self {
+            store: MyStore::connect(url)?,
+        })
     }
 
     /// The store: the lease, the guard and the units a run's tenure takes.
@@ -56,13 +58,21 @@ impl MyDest {
         dest_table: &str,
         source_id: &str,
     ) -> Result<Option<crate::naming::CdcWatermark>> {
-        crate::naming::cdc_watermark(dest_table, self.store.read_state(dest_table, source_id).await?)
+        crate::naming::cdc_watermark(
+            dest_table,
+            self.store.read_state(dest_table, source_id).await?,
+        )
     }
 
     /// The bootstrap's replace path may or may not have carried the PK into
     /// the created table — ensure it, inside the unit whose close writes the
     /// state row.
-    pub(crate) async fn bootstrap_finish(&self, u: &mut MyTx, dest_table: &str, pk_cols: &[String]) -> Result<()> {
+    pub(crate) async fn bootstrap_finish(
+        &self,
+        u: &mut MyTx,
+        dest_table: &str,
+        pk_cols: &[String],
+    ) -> Result<()> {
         let has_pk: Option<u64> = u
             .catalog_first(
                 "SELECT COUNT(*) FROM information_schema.table_constraints \
@@ -72,9 +82,14 @@ impl MyDest {
             )
             .await?;
         if has_pk.unwrap_or(0) == 0 {
-            let pklist = pk_cols.iter().map(|c| my_ident(c)).collect::<Vec<_>>().join(", ");
+            let pklist = pk_cols
+                .iter()
+                .map(|c| my_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
             let ft = u.fq(bare(dest_table));
-            u.owned_ddl(&format!("ALTER TABLE {ft} ADD PRIMARY KEY ({pklist})")).await?;
+            u.owned_ddl(&format!("ALTER TABLE {ft} ADD PRIMARY KEY ({pklist})"))
+                .await?;
         }
         Ok(())
     }
@@ -156,7 +171,9 @@ async fn apply_unit(
             .iter()
             .map(|k| {
                 let (ty, cs, co) = type_of.get(k.as_str()).ok_or_else(|| {
-                    Error::Transfer(format!("log_based: PK column '{k}' missing at the MySQL destination"))
+                    Error::Transfer(format!(
+                        "log_based: PK column '{k}' missing at the MySQL destination"
+                    ))
                 })?;
                 Ok(twin_col_ddl(k, ty, *cs, *co))
             })
@@ -167,12 +184,20 @@ async fn apply_unit(
         // a primary key too (MASTER M-52). The rows are a key set, so the key
         // costs nothing — LOAD DATA LOCAL skips a repeated key — and the join
         // below probes it.
-        let pk = pk_cols.iter().map(|k| my_ident(k)).collect::<Vec<_>>().join(", ");
-        u.temp_ddl(&format!("CREATE TEMPORARY TABLE _ap_del ({ddl}, PRIMARY KEY ({pk})) ENGINE=InnoDB")).await?;
+        let pk = pk_cols
+            .iter()
+            .map(|k| my_ident(k))
+            .collect::<Vec<_>>()
+            .join(", ");
+        u.temp_ddl(&format!(
+            "CREATE TEMPORARY TABLE _ap_del ({ddl}, PRIMARY KEY ({pk})) ENGINE=InnoDB"
+        ))
+        .await?;
     }
     if !c.upserts.is_empty() {
         u.temp_ddl("DROP TEMPORARY TABLE IF EXISTS _ap_up").await?;
-        u.temp_ddl(&format!("CREATE TEMPORARY TABLE _ap_up LIKE {ft}")).await?;
+        u.temp_ddl(&format!("CREATE TEMPORARY TABLE _ap_up LIKE {ft}"))
+            .await?;
     }
 
     if clear {
@@ -184,14 +209,23 @@ async fn apply_unit(
         for row in &c.upserts {
             render_my_key(&row_key_refs(row, pk_idx), &pk_oids, &mut body)?;
         }
-        u.load(body, |id| load_sql(id, "_ap_del", pk_cols, &pk_oids), "load keys").await?;
+        u.load(
+            body,
+            |id| load_sql(id, "_ap_del", pk_cols, &pk_oids),
+            "load keys",
+        )
+        .await?;
         u.no_warnings("key load").await?;
         let join = pk_cols
             .iter()
             .map(|k| format!("t.{k} = d.{k}", k = my_ident(k)))
             .collect::<Vec<_>>()
             .join(" AND ");
-        u.exec(&format!("DELETE t FROM {ft} t JOIN _ap_del d ON {join}"), "delete join").await?;
+        u.exec(
+            &format!("DELETE t FROM {ft} t JOIN _ap_del d ON {join}"),
+            "delete join",
+        )
+        .await?;
     }
 
     if !c.upserts.is_empty() {
@@ -199,12 +233,24 @@ async fn apply_unit(
         for row in &c.upserts {
             render_my_row(row, oids, &mut body)?;
         }
-        u.load(body, |id| load_sql(id, "_ap_up", wal_cols, oids), "load rows").await?;
+        u.load(
+            body,
+            |id| load_sql(id, "_ap_up", wal_cols, oids),
+            "load rows",
+        )
+        .await?;
         u.no_warnings("row load").await?;
-        let collist = wal_cols.iter().map(|c| my_ident(c)).collect::<Vec<_>>().join(", ");
+        let collist = wal_cols
+            .iter()
+            .map(|c| my_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         // No ON DUPLICATE KEY: the delete phase already cleared every key.
-        u.exec(&format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up"), "bulk insert")
-            .await?;
+        u.exec(
+            &format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up"),
+            "bulk insert",
+        )
+        .await?;
     }
 
     // Residue tail: serial, ordered.
@@ -235,8 +281,11 @@ async fn apply_unit(
                 )
             }
             ResidueOp::Upsert { row } => {
-                let collist =
-                    wal_cols.iter().map(|c| my_ident(c)).collect::<Vec<_>>().join(", ");
+                let collist = wal_cols
+                    .iter()
+                    .map(|c| my_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let vals = row
                     .iter()
                     .zip(oids.iter())
@@ -259,9 +308,16 @@ async fn apply_unit(
                 }
             }
             ResidueOp::Delete { key } => {
-                format!("DELETE FROM {ft} WHERE {}", key_pred(pk_cols, key, &pk_oids)?)
+                format!(
+                    "DELETE FROM {ft} WHERE {}",
+                    key_pred(pk_cols, key, &pk_oids)?
+                )
             }
-            ResidueOp::Rekey { old_key, new_key, row } => {
+            ResidueOp::Rekey {
+                old_key,
+                new_key,
+                row,
+            } => {
                 must_find = Some(("move", new_key));
                 // Move the row rather than delete-and-reinsert: the columns
                 // this UPDATE does not name keep their values, and the
@@ -292,7 +348,10 @@ async fn apply_unit(
         };
         u.exec(&sql, "residue").await?;
         if let Some((kind, key)) = must_find {
-            let probe = format!("SELECT 1 FROM {ft} WHERE {} LIMIT 1", key_pred(pk_cols, key, &pk_oids)?);
+            let probe = format!(
+                "SELECT 1 FROM {ft} WHERE {} LIMIT 1",
+                key_pred(pk_cols, key, &pk_oids)?
+            );
             if !u.exists(&probe, "residue probe").await? {
                 return Err(crate::logbased::dest_pg::missing_row(dest_table, kind, key));
             }
@@ -309,7 +368,8 @@ mod store {
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{
-        no_longer_holds, owned_margin_secs, owner_verdict, ttl_secs, Fence, Lease, LeaseStore, Watermark,
+        no_longer_holds, owned_margin_secs, owner_verdict, ttl_secs, Fence, Lease, LeaseStore,
+        Watermark,
     };
     use crate::sink::mysql::{lease_t, sql_lit, MyGuard, MySqlShared, MySqlSink};
     use mysql_async::prelude::Queryable;
@@ -368,12 +428,21 @@ mod store {
         margin: u64,
         sql: &str,
     ) -> Vec<Step> {
-        let who = |k: &str| format!("dest_key = '{}' AND token = '{}'", sql_lit(k), sql_lit(token));
+        let who = |k: &str| {
+            format!(
+                "dest_key = '{}' AND token = '{}'",
+                sql_lit(k),
+                sql_lit(token)
+            )
+        };
         let mut sorted: Vec<&String> = keys.iter().collect();
         sorted.sort();
         let mut v = vec![Step::Run("START TRANSACTION".into())];
         for k in &sorted {
-            v.push(Step::Lock(format!("SELECT 1 FROM {lease} WHERE {} AND collected = 0 FOR UPDATE", who(k))));
+            v.push(Step::Lock(format!(
+                "SELECT 1 FROM {lease} WHERE {} AND collected = 0 FOR UPDATE",
+                who(k)
+            )));
         }
         for k in &sorted {
             v.push(Step::Run(format!(
@@ -381,9 +450,14 @@ mod store {
                  WHERE {} AND collected = 0",
                 who(k)
             )));
-            v.push(Step::Check(format!("SELECT collected FROM {lease} WHERE {}", who(k))));
+            v.push(Step::Check(format!(
+                "SELECT collected FROM {lease} WHERE {}",
+                who(k)
+            )));
         }
-        v.push(Step::Run(format!("SET SESSION lock_wait_timeout = {margin}")));
+        v.push(Step::Run(format!(
+            "SET SESSION lock_wait_timeout = {margin}"
+        )));
         v.push(Step::Ddl(sql.to_string()));
         v.push(Step::Run("SET SESSION lock_wait_timeout = DEFAULT".into()));
         v
@@ -405,7 +479,10 @@ mod store {
             T: mysql_async::prelude::FromRow + Send + 'static,
         {
             let db = self.shared.db().to_string();
-            self.conn().exec(sql, (db, table)).await.map_err(my_err("catalog"))
+            self.conn()
+                .exec(sql, (db, table))
+                .await
+                .map_err(my_err("catalog"))
         }
 
         pub(crate) async fn catalog_first<T>(&mut self, sql: &str, table: &str) -> Result<Option<T>>
@@ -413,7 +490,10 @@ mod store {
             T: mysql_async::prelude::FromRow + Send + 'static,
         {
             let db = self.shared.db().to_string();
-            self.conn().exec_first(sql, (db, table)).await.map_err(my_err("catalog"))
+            self.conn()
+                .exec_first(sql, (db, table))
+                .await
+                .map_err(my_err("catalog"))
         }
 
         /// `CREATE/DROP TEMPORARY TABLE` only, and only before the
@@ -424,10 +504,15 @@ mod store {
                 return Err(Error::Transfer(format!("internal: temp_ddl given {sql}")));
             }
             if self.in_tx {
-                return Err(Error::Transfer("internal: temporary DDL inside the unit's transaction".into()));
+                return Err(Error::Transfer(
+                    "internal: temporary DDL inside the unit's transaction".into(),
+                ));
             }
             self.twins = true;
-            self.conn().query_drop(sql).await.map_err(my_err("temp ddl"))
+            self.conn()
+                .query_drop(sql)
+                .await
+                .map_err(my_err("temp ddl"))
         }
 
         /// Open the transaction and take every lease row `FOR UPDATE` as its
@@ -439,7 +524,10 @@ mod store {
             }
             let lease = lease_t(self.shared.db());
             let (keys, token) = (self.keys.clone(), self.token.clone());
-            self.conn().query_drop("START TRANSACTION").await.map_err(my_err("begin"))?;
+            self.conn()
+                .query_drop("START TRANSACTION")
+                .await
+                .map_err(my_err("begin"))?;
             self.in_tx = true;
             let mut sorted = keys.clone();
             sorted.sort();
@@ -473,7 +561,11 @@ mod store {
         /// fenced transaction.
         pub(crate) async fn exists(&mut self, sql: &str, what: &'static str) -> Result<bool> {
             self.begin().await?;
-            self.conn().query_first::<u8, _>(sql).await.map(|r| r.is_some()).map_err(my_err(what))
+            self.conn()
+                .query_first::<u8, _>(sql)
+                .await
+                .map(|r| r.is_some())
+                .map_err(my_err(what))
         }
 
         /// LOAD DATA LOCAL of `body` inside the fenced transaction; `sql_of`
@@ -548,7 +640,9 @@ mod store {
         /// Galera).
         pub(crate) async fn owned_ddl(&mut self, sql: &str) -> Result<()> {
             if self.in_tx {
-                return Err(Error::Transfer("internal: owned DDL inside the unit's transaction".into()));
+                return Err(Error::Transfer(
+                    "internal: owned DDL inside the unit's transaction".into(),
+                ));
             }
             let plan = my_owned_ddl_plan(
                 &lease_t(self.shared.db()),
@@ -561,7 +655,10 @@ mod store {
             for step in &plan {
                 match step {
                     Step::Run(s) => {
-                        self.conn().query_drop(s.as_str()).await.map_err(my_err("owned ddl"))?;
+                        self.conn()
+                            .query_drop(s.as_str())
+                            .await
+                            .map_err(my_err("owned ddl"))?;
                         if s == "START TRANSACTION" {
                             self.in_tx = true;
                         }
@@ -570,7 +667,9 @@ mod store {
                         let v: Option<(i32,)> = match self.conn().query_first(s.as_str()).await {
                             Ok(r) => r,
                             Err(mysql_async::Error::Server(e)) if e.code == 1146 => None,
-                            Err(e) => return Err(Error::Transfer(format!("log_based: fence: {e}"))),
+                            Err(e) => {
+                                return Err(Error::Transfer(format!("log_based: fence: {e}")))
+                            }
                         };
                         let owner = match (step, v) {
                             (Step::Lock(_), Some(_)) => true,
@@ -584,7 +683,10 @@ mod store {
                     Step::Ddl(s) => {
                         // The implicit commit happens here, whatever the outcome.
                         self.in_tx = false;
-                        self.conn().query_drop(s.as_str()).await.map_err(my_err("owned ddl"))?;
+                        self.conn()
+                            .query_drop(s.as_str())
+                            .await
+                            .map_err(my_err("owned ddl"))?;
                     }
                 }
             }
@@ -594,7 +696,9 @@ mod store {
 
     impl Drop for MyTx {
         fn drop(&mut self) {
-            let Some(mut conn) = self.conn.take() else { return };
+            let Some(mut conn) = self.conn.take() else {
+                return;
+            };
             let (in_tx, twins) = (self.in_tx, self.twins);
             if !(in_tx || twins) {
                 return;
@@ -605,7 +709,9 @@ mod store {
                         let _ = conn.query_drop("ROLLBACK").await;
                     }
                     if twins {
-                        let _ = conn.query_drop("DROP TEMPORARY TABLE IF EXISTS _ap_del, _ap_up").await;
+                        let _ = conn
+                            .query_drop("DROP TEMPORARY TABLE IF EXISTS _ap_del, _ap_up")
+                            .await;
                     }
                 });
             }
@@ -614,7 +720,10 @@ mod store {
 
     impl MyStore {
         pub(crate) fn connect(url: &str) -> Result<Self> {
-            Ok(Self { shared: MySqlSink::shared_pool(url)?, state_ready: Default::default() })
+            Ok(Self {
+                shared: MySqlSink::shared_pool(url)?,
+                state_ready: Default::default(),
+            })
         }
 
         pub(crate) fn my_guard(&self) -> MyGuard {
@@ -631,16 +740,22 @@ mod store {
                 return Ok(());
             }
             let fq = self.fq("_apitap_state");
-            let ddl_err = |e: mysql_async::Error| Error::Transfer(format!("log_based: mysql state ddl: {e}"));
-            conn.query_drop(crate::sink::mysql::state_table_ddl(&fq)).await.map_err(ddl_err)?;
+            let ddl_err =
+                |e: mysql_async::Error| Error::Transfer(format!("log_based: mysql state ddl: {e}"));
+            conn.query_drop(crate::sink::mysql::state_table_ddl(&fq))
+                .await
+                .map_err(ddl_err)?;
             let stale: Option<u64> = conn
                 .query_first(crate::sink::mysql::state_collation_probe(self.shared.db()))
                 .await
                 .map_err(ddl_err)?;
             if stale.unwrap_or(0) > 0 {
-                conn.query_drop(crate::sink::mysql::state_collation_fix(&fq)).await.map_err(ddl_err)?;
+                conn.query_drop(crate::sink::mysql::state_collation_fix(&fq))
+                    .await
+                    .map_err(ddl_err)?;
             }
-            self.state_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.state_ready
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
 
@@ -742,21 +857,32 @@ mod store {
         /// Every mark, then per key the renewal and a READ of the row, judged
         /// by `owner_verdict` — never by an affected-row count — then COMMIT,
         /// then the twins go.
-        async fn close_unit<'a>(&'a self, mut u: MyTx, _token: &str, marks: Vec<Watermark>) -> Result<()> {
+        async fn close_unit<'a>(
+            &'a self,
+            mut u: MyTx,
+            _token: &str,
+            marks: Vec<Watermark>,
+        ) -> Result<()> {
             u.begin().await?;
             let state = self.fq("_apitap_state");
             for m in &marks {
                 let sql = match m {
-                    Watermark::Set { table, source_id, lsn, rows } => {
-                        state_upsert_sql(&state, table, source_id, *lsn, *rows)
-                    }
+                    Watermark::Set {
+                        table,
+                        source_id,
+                        lsn,
+                        rows,
+                    } => state_upsert_sql(&state, table, source_id, *lsn, *rows),
                     Watermark::Clear { table, source_id } => format!(
                         "DELETE FROM {state} WHERE dest_table = '{}' AND source_id = '{}'",
                         sql_lit(table),
                         sql_lit(source_id)
                     ),
                 };
-                u.conn().query_drop(sql).await.map_err(my_err("state write"))?;
+                u.conn()
+                    .query_drop(sql)
+                    .await
+                    .map_err(my_err("state write"))?;
             }
             let lease = lease_t(self.shared.db());
             let (keys, token) = (u.keys.clone(), u.token.clone());
@@ -782,9 +908,19 @@ mod store {
                     )
                     .await
                     .map_err(my_err("lease read"))?;
-                owner_verdict(row.map(|(c, e)| Lease { expires_in: e, collected: c != 0 }).as_ref(), &keys)?;
+                owner_verdict(
+                    row.map(|(c, e)| Lease {
+                        expires_in: e,
+                        collected: c != 0,
+                    })
+                    .as_ref(),
+                    &keys,
+                )?;
             }
-            u.conn().query_drop("COMMIT").await.map_err(my_err("commit"))?;
+            u.conn()
+                .query_drop("COMMIT")
+                .await
+                .map_err(my_err("commit"))?;
             u.in_tx = false;
             if u.twins {
                 // The pooled connection outlives this unit — don't leak the twins.
@@ -814,8 +950,11 @@ fn load_sql(id: u64, table: &str, cols: &[String], oids: &[u32]) -> String {
             names.push(my_ident(name));
         }
     }
-    let set_clause =
-        if sets.is_empty() { String::new() } else { format!(" SET {}", sets.join(", ")) };
+    let set_clause = if sets.is_empty() {
+        String::new()
+    } else {
+        format!(" SET {}", sets.join(", "))
+    };
     format!(
         "LOAD DATA LOCAL INFILE 'apitap:{id}' INTO TABLE {table} \
          CHARACTER SET utf8mb4 \
@@ -825,13 +964,7 @@ fn load_sql(id: u64, table: &str, cols: &[String], oids: &[u32]) -> String {
     )
 }
 
-fn state_upsert_sql(
-    state: &str,
-    dest_table: &str,
-    source_id: &str,
-    lsn: u64,
-    rows: u64,
-) -> String {
+fn state_upsert_sql(state: &str, dest_table: &str, source_id: &str, lsn: u64, rows: u64) -> String {
     format!(
         "INSERT INTO {state} \
            (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
@@ -887,7 +1020,12 @@ mod tests {
     #[test]
     fn the_twin_key_keeps_the_destination_collation() {
         assert_eq!(
-            twin_col_ddl("k", "varchar(10)", Some("utf8mb4"), Some("utf8mb4_0900_bin")),
+            twin_col_ddl(
+                "k",
+                "varchar(10)",
+                Some("utf8mb4"),
+                Some("utf8mb4_0900_bin")
+            ),
             "`k` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin"
         );
         assert_eq!(twin_col_ddl("id", "int", None, None), "`id` int");
@@ -899,13 +1037,17 @@ mod tests {
     #[test]
     fn lease_key_is_dest_label() {
         use crate::lease::LeaseStore;
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let d = MyStore::connect("mysql://root:x@127.0.0.1:1/bench").unwrap();
-            let g = d.my_guard();
-            for t in ["orders", "bench.orders", "Mixed Case"] {
-                assert_eq!(d.lease_key(t), g.dest_label(bare(t)), "{t}");
-            }
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let d = MyStore::connect("mysql://root:x@127.0.0.1:1/bench").unwrap();
+                let g = d.my_guard();
+                for t in ["orders", "bench.orders", "Mixed Case"] {
+                    assert_eq!(d.lease_key(t), g.dest_label(bare(t)), "{t}");
+                }
+            });
     }
 
     /// The order IS the argument: the row is locked, renewed and read back
@@ -915,17 +1057,43 @@ mod tests {
     fn owned_ddl_renews_before_ddl() {
         use store::Step;
         let keys = vec!["bench.t".to_string()];
-        let plan = store::my_owned_ddl_plan("`bench`.`_apitap_lease`", &keys, "_tok", 30, 15, "TRUNCATE TABLE `bench`.`t`");
-        let at = |p: &str| plan.iter().position(|s| s.sql().starts_with(p)).unwrap_or_else(|| panic!("{p}: {plan:?}"));
+        let plan = store::my_owned_ddl_plan(
+            "`bench`.`_apitap_lease`",
+            &keys,
+            "_tok",
+            30,
+            15,
+            "TRUNCATE TABLE `bench`.`t`",
+        );
+        let at = |p: &str| {
+            plan.iter()
+                .position(|s| s.sql().starts_with(p))
+                .unwrap_or_else(|| panic!("{p}: {plan:?}"))
+        };
         assert_eq!(at("START TRANSACTION"), 0);
-        assert!(matches!(&plan[1], Step::Lock(s) if s.contains("FOR UPDATE")), "{plan:?}");
+        assert!(
+            matches!(&plan[1], Step::Lock(s) if s.contains("FOR UPDATE")),
+            "{plan:?}"
+        );
         assert!(at("SELECT 1") < at("UPDATE"), "{plan:?}");
         assert!(at("UPDATE") < at("SELECT collected"), "{plan:?}");
-        assert!(plan[at("UPDATE")].sql().contains("expires_at") && plan[at("UPDATE")].sql().contains("collected = 0"));
+        assert!(
+            plan[at("UPDATE")].sql().contains("expires_at")
+                && plan[at("UPDATE")].sql().contains("collected = 0")
+        );
         assert!(matches!(&plan[at("SELECT collected")], Step::Check(_)));
-        assert!(at("SELECT collected") < at("SET SESSION lock_wait_timeout = 15"), "{plan:?}");
-        assert!(at("SET SESSION lock_wait_timeout = 15") < at("TRUNCATE"), "{plan:?}");
+        assert!(
+            at("SELECT collected") < at("SET SESSION lock_wait_timeout = 15"),
+            "{plan:?}"
+        );
+        assert!(
+            at("SET SESSION lock_wait_timeout = 15") < at("TRUNCATE"),
+            "{plan:?}"
+        );
         assert!(matches!(&plan[at("TRUNCATE")], Step::Ddl(_)));
-        assert_eq!(plan.last().unwrap().sql(), "SET SESSION lock_wait_timeout = DEFAULT");
+        assert_eq!(
+            plan.last().unwrap().sql(),
+            "SET SESSION lock_wait_timeout = DEFAULT"
+        );
     }
 }

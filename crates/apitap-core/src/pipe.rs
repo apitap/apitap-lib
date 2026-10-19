@@ -54,7 +54,9 @@ impl Latch {
 }
 
 pub(crate) fn cancelled() -> Error {
-    Error::Transfer("cancelled: a sibling worker failed first — its error is the one reported".into())
+    Error::Transfer(
+        "cancelled: a sibling worker failed first — its error is the one reported".into(),
+    )
 }
 
 /// The statement queue, owned by the set's latch. Replaces
@@ -144,7 +146,12 @@ impl<L: Loader> Pipe<L> {
         if self.latch.is_set() {
             return Err(cancelled());
         }
-        let r = self.inner.as_mut().expect("pipe consumed").send_framed(win).await;
+        let r = self
+            .inner
+            .as_mut()
+            .expect("pipe consumed")
+            .send_framed(win)
+            .await;
         if let (true, Ok((n, _))) = (self.counted, &r) {
             crate::progress::add_bytes(*n as u64);
         }
@@ -165,7 +172,9 @@ impl<L: Loader> Pipe<L> {
     /// loader. The latch is claimed BEFORE abort (D1) so siblings stop while a
     /// slow abort (BigQuery, S3) is still in flight.
     async fn drive<B: PipeBody<L>>(mut self, body: B, spans: Spans) -> Outcome {
-        let r = AssertUnwindSafe(body.run(&mut self, spans)).catch_unwind().await;
+        let r = AssertUnwindSafe(body.run(&mut self, spans))
+            .catch_unwind()
+            .await;
         let inner = self.inner.take().expect("a pipe is consumed exactly once");
         match r {
             Ok(Ok(rows)) if !self.latch.is_set() => match inner.finish().await {
@@ -183,7 +192,7 @@ impl<L: Loader> Pipe<L> {
                 Outcome::Cancelled
             }
             Ok(Err(e)) => {
-                let first = self.latch.claim();          // BEFORE abort: siblings stop during it (D1)
+                let first = self.latch.claim(); // BEFORE abort: siblings stop during it (D1)
                 let e = inner.abort(e).await;
                 if first {
                     Outcome::Cause(e)
@@ -195,7 +204,10 @@ impl<L: Loader> Pipe<L> {
             Err(p) => {
                 let first = self.latch.claim();
                 let e = inner
-                    .abort(Error::Transfer(format!("worker panicked: {}", panic_text(&*p))))
+                    .abort(Error::Transfer(format!(
+                        "worker panicked: {}",
+                        panic_text(&*p)
+                    )))
                     .await;
                 if first {
                     Outcome::Cause(e)
@@ -252,9 +264,7 @@ impl<T> JoinOnce<T> {
 
     /// Join the task once. `None` = a previous caller already joined it: there
     /// is nothing left to wait for, and NOT "it succeeded".
-    pub(crate) async fn join(
-        &mut self,
-    ) -> Option<std::result::Result<T, tokio::task::JoinError>> {
+    pub(crate) async fn join(&mut self) -> Option<std::result::Result<T, tokio::task::JoinError>> {
         match self.h.take() {
             Some(h) => Some(h.await),
             None => None,
@@ -314,7 +324,10 @@ async fn drive_span<T: SpanBody>(body: T, spans: Spans, latch: Arc<Latch>) -> Ou
         }
         Err(p) => {
             if latch.claim() {
-                Outcome::Cause(Error::Transfer(format!("worker panicked: {}", panic_text(&*p))))
+                Outcome::Cause(Error::Transfer(format!(
+                    "worker panicked: {}",
+                    panic_text(&*p)
+                )))
             } else {
                 Outcome::Cancelled
             }
@@ -624,8 +637,13 @@ mod tests {
     /// 1. The 0.56.0 loop returned at the first `Err` and left the siblings
     /// running; the crew instead stops them and consumes every pipe.
     enum CrewBody {
-        Boom { alive: Arc<AtomicUsize> },
-        Spin { alive: Arc<AtomicUsize>, seen: Arc<Mutex<Option<Spans>>> },
+        Boom {
+            alive: Arc<AtomicUsize>,
+        },
+        Spin {
+            alive: Arc<AtomicUsize>,
+            seen: Arc<Mutex<Option<Spans>>>,
+        },
     }
 
     impl PipeBody<FakeLoader> for CrewBody {
@@ -652,7 +670,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn first_error_cancels_siblings_and_consumes_every_pipe() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let loaders = (0..4).map(|i| FakeLoader::new(i, log.clone())).collect::<Vec<_>>();
+        let loaders = (0..4)
+            .map(|i| FakeLoader::new(i, log.clone()))
+            .collect::<Vec<_>>();
         let alive = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(None));
         let stmts: Vec<String> = (0..400).map(|i| format!("span {i}")).collect();
@@ -662,9 +682,14 @@ mod tests {
         let res = pipes
             .run(stmts, |i| {
                 if i == 0 {
-                    CrewBody::Boom { alive: alive.clone() }
+                    CrewBody::Boom {
+                        alive: alive.clone(),
+                    }
                 } else {
-                    CrewBody::Spin { alive: alive.clone(), seen: seen.clone() }
+                    CrewBody::Spin {
+                        alive: alive.clone(),
+                        seen: seen.clone(),
+                    }
                 }
             })
             .await;
@@ -674,8 +699,14 @@ mod tests {
         let events = drain(&log);
         let aborts = abort_events(&log);
         assert_eq!(aborts.len(), 4, "every pipe is consumed: {events:?}");
-        assert_eq!(finish_count(&log), 0, "a failed set never finishes a loader: {events:?}");
-        assert!(aborts.iter().any(|(id, cause)| *id == 0 && cause.contains("boom")));
+        assert_eq!(
+            finish_count(&log),
+            0,
+            "a failed set never finishes a loader: {events:?}"
+        );
+        assert!(aborts
+            .iter()
+            .any(|(id, cause)| *id == 0 && cause.contains("boom")));
         for (id, cause) in &aborts {
             if *id != 0 {
                 assert!(cause.contains("cancelled:"), "sibling {id}: {cause}");
@@ -685,7 +716,11 @@ mod tests {
             seen.lock().unwrap().as_ref().unwrap().remaining() > 0,
             "siblings must stop before the queue drains"
         );
-        assert_eq!(alive.load(SeqCst), 0, "run returns only after every task ended");
+        assert_eq!(
+            alive.load(SeqCst),
+            0,
+            "run returns only after every task ended"
+        );
     }
 
     /// 2. The cause is preserved even when its abort is the slowest thing in
@@ -710,9 +745,14 @@ mod tests {
         let res = Pipes::for_read(loaders)
             .run(stmts, |i| {
                 if i == 0 {
-                    CrewBody::Boom { alive: alive.clone() }
+                    CrewBody::Boom {
+                        alive: alive.clone(),
+                    }
                 } else {
-                    CrewBody::Spin { alive: alive.clone(), seen: seen.clone() }
+                    CrewBody::Spin {
+                        alive: alive.clone(),
+                        seen: seen.clone(),
+                    }
                 }
             })
             .await;
@@ -757,7 +797,9 @@ mod tests {
         let loader = FakeLoader::new(0, log.clone()).fail_send_at(2);
         let stmts = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
 
-        let res = Pipes::for_read(vec![loader]).run_inline(stmts, SendBody).await;
+        let res = Pipes::for_read(vec![loader])
+            .run_inline(stmts, SendBody)
+            .await;
 
         let err = res.expect_err("the send error must propagate");
         assert_eq!(err.to_string(), "transfer: send failed at 2");
@@ -767,7 +809,11 @@ mod tests {
             vec![(0, "transfer: send failed at 2".to_string())],
             "the failing pipe is aborted with its own error: {events:?}"
         );
-        assert_eq!(finish_count(&log), 0, "no clean end after a failed send: {events:?}");
+        assert_eq!(
+            finish_count(&log),
+            0,
+            "no clean end after a failed send: {events:?}"
+        );
     }
 
     /// 4. A panicking body is caught, aborts its own pipe, and still counts
@@ -800,16 +846,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn panicking_body_still_aborts_its_pipe() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let loaders = (0..3).map(|i| FakeLoader::new(i, log.clone())).collect::<Vec<_>>();
+        let loaders = (0..3)
+            .map(|i| FakeLoader::new(i, log.clone()))
+            .collect::<Vec<_>>();
         let alive = Arc::new(AtomicUsize::new(0));
         let stmts: Vec<String> = (0..64).map(|i| format!("span {i}")).collect();
 
         let res = Pipes::for_read(loaders)
             .run(stmts, |i| {
                 if i == 2 {
-                    PanicCrew::Panic { alive: alive.clone() }
+                    PanicCrew::Panic {
+                        alive: alive.clone(),
+                    }
                 } else {
-                    PanicCrew::Spin { alive: alive.clone() }
+                    PanicCrew::Spin {
+                        alive: alive.clone(),
+                    }
                 }
             })
             .await;
@@ -819,16 +871,31 @@ mod tests {
         let events = drain(&log);
         let aborts = abort_events(&log);
         assert_eq!(aborts.len(), 3, "every pipe is consumed: {events:?}");
-        assert_eq!(finish_count(&log), 0, "a panicked body never finishes: {events:?}");
-        assert!(aborts.iter().any(|(id, cause)| *id == 2 && cause.contains("worker panicked")));
-        assert_eq!(alive.load(SeqCst), 0, "run returns only after every task ended");
+        assert_eq!(
+            finish_count(&log),
+            0,
+            "a panicked body never finishes: {events:?}"
+        );
+        assert!(aborts
+            .iter()
+            .any(|(id, cause)| *id == 2 && cause.contains("worker panicked")));
+        assert_eq!(
+            alive.load(SeqCst),
+            0,
+            "run returns only after every task ended"
+        );
     }
 
     /// 5. Completion order is not ownership: a body that returns `Ok` after
     /// the set failed is aborted, not finished.
     enum LateCrew {
-        Fail { ready: Arc<AtomicBool> },
-        Late { ready: Arc<AtomicBool>, seen: Arc<Mutex<Option<Spans>>> },
+        Fail {
+            ready: Arc<AtomicBool>,
+        },
+        Late {
+            ready: Arc<AtomicBool>,
+            seen: Arc<Mutex<Option<Spans>>>,
+        },
     }
 
     impl PipeBody<FakeLoader> for LateCrew {
@@ -861,16 +928,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_body_that_drains_after_the_failure_does_not_finish() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let loaders = (0..2).map(|i| FakeLoader::new(i, log.clone())).collect::<Vec<_>>();
+        let loaders = (0..2)
+            .map(|i| FakeLoader::new(i, log.clone()))
+            .collect::<Vec<_>>();
         let ready = Arc::new(AtomicBool::new(false));
         let seen = Arc::new(Mutex::new(None));
 
         let res = Pipes::for_read(loaders)
             .run(vec!["only span".to_string()], |i| {
                 if i == 0 {
-                    LateCrew::Fail { ready: ready.clone() }
+                    LateCrew::Fail {
+                        ready: ready.clone(),
+                    }
                 } else {
-                    LateCrew::Late { ready: ready.clone(), seen: seen.clone() }
+                    LateCrew::Late {
+                        ready: ready.clone(),
+                        seen: seen.clone(),
+                    }
                 }
             })
             .await;
@@ -878,11 +952,17 @@ mod tests {
         let err = res.expect_err("the failing pipe's error is returned");
         assert!(err.to_string().contains("boom"), "got: {err}");
         let events = drain(&log);
-        assert_eq!(finish_count(&log), 0, "a body that returned Ok after the failure is aborted: {events:?}");
+        assert_eq!(
+            finish_count(&log),
+            0,
+            "a body that returned Ok after the failure is aborted: {events:?}"
+        );
         let aborts = abort_events(&log);
         assert_eq!(aborts.len(), 2, "{events:?}");
         assert!(
-            aborts.iter().any(|(id, cause)| *id == 1 && cause.contains("cancelled:")),
+            aborts
+                .iter()
+                .any(|(id, cause)| *id == 1 && cause.contains("cancelled:")),
             "pipe 1 must be cancelled, not finished: {events:?}"
         );
     }
@@ -911,7 +991,10 @@ mod tests {
             Ok(_) => panic!("the failing open must be returned"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("the third open failed"), "got: {err}");
+        assert!(
+            err.to_string().contains("the third open failed"),
+            "got: {err}"
+        );
         let events = drain(&log);
         assert_eq!(
             abort_events(&log),
@@ -968,8 +1051,13 @@ mod tests {
     /// 8. The loader-less lane stops siblings at their next span, exactly as
     /// the loader-bound crew does.
     enum SpanCrew {
-        Boom { alive: Arc<AtomicUsize> },
-        Spin { alive: Arc<AtomicUsize>, seen: Arc<Mutex<Option<Spans>>> },
+        Boom {
+            alive: Arc<AtomicUsize>,
+        },
+        Spin {
+            alive: Arc<AtomicUsize>,
+            seen: Arc<Mutex<Option<Spans>>>,
+        },
     }
 
     impl SpanBody for SpanCrew {
@@ -1001,9 +1089,14 @@ mod tests {
         let bodies = (0..4)
             .map(|i| {
                 if i == 0 {
-                    SpanCrew::Boom { alive: alive.clone() }
+                    SpanCrew::Boom {
+                        alive: alive.clone(),
+                    }
                 } else {
-                    SpanCrew::Spin { alive: alive.clone(), seen: seen.clone() }
+                    SpanCrew::Spin {
+                        alive: alive.clone(),
+                        seen: seen.clone(),
+                    }
                 }
             })
             .collect();
@@ -1016,7 +1109,11 @@ mod tests {
             seen.lock().unwrap().as_ref().unwrap().remaining() > 0,
             "siblings stop at their next span"
         );
-        assert_eq!(alive.load(SeqCst), 0, "run_tasks returns only after every task ended");
+        assert_eq!(
+            alive.load(SeqCst),
+            0,
+            "run_tasks returns only after every task ended"
+        );
     }
 
     /// 9. The crew is the only spawn: a source that pushed a loader into its
@@ -1091,7 +1188,11 @@ mod tests {
                 b'(' | b'[' => nest += 1,
                 b')' | b']' => nest -= 1,
                 b'{' | b';' if nest == 0 => {
-                    return if b[i] == b'{' { block_end(text, i) } else { i + 1 };
+                    return if b[i] == b'{' {
+                        block_end(text, i)
+                    } else {
+                        i + 1
+                    };
                 }
                 _ => {}
             }
@@ -1150,7 +1251,9 @@ mod tests {
                     continue;
                 }
                 b'r' if matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
-                    && !b.get(i.wrapping_sub(1)).is_some_and(|c| c.is_ascii_alphanumeric()) =>
+                    && !b
+                        .get(i.wrapping_sub(1))
+                        .is_some_and(|c| c.is_ascii_alphanumeric()) =>
                 {
                     let mut hashes = 0;
                     while b.get(i + 1 + hashes) == Some(&b'#') {
@@ -1188,8 +1291,14 @@ mod tests {
         // The token set lint, not a parser: these five spellings are the ways
         // 0.56.0 detached a worker, and a source cannot be written into the
         // crew without deleting every one of them.
-        const FORBIDDEN: [&str; 6] =
-            ["tokio::spawn", "task::spawn", "JoinSet", "JoinHandle", "WorkQueue", "fn pop("];
+        const FORBIDDEN: [&str; 6] = [
+            "tokio::spawn",
+            "task::spawn",
+            "JoinSet",
+            "JoinHandle",
+            "WorkQueue",
+            "fn pop(",
+        ];
         for (name, text) in WATCHED {
             // The test modules legitimately spawn (their 0.56.0-control bodies
             // live there); only production text is the source's surface, and
@@ -1215,10 +1324,18 @@ mod tests {
         listed.sort();
         let mut actual: Vec<String> = std::fs::read_dir(dir)
             .expect("src/source")
-            .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         actual.sort();
-        assert_eq!(listed, actual, "a source file is missing from WATCHED: add it (it must not spawn)");
+        assert_eq!(
+            listed, actual,
+            "a source file is missing from WATCHED: add it (it must not spawn)"
+        );
     }
 
     /// 10. The surface sources see is pinned: no `into_inner`, no `finish`,
@@ -1227,7 +1344,9 @@ mod tests {
     const SRC: &str = include_str!("pipe.rs");
 
     fn fn_names_in(src: &str, header: &str) -> Vec<String> {
-        let start = src.find(header).unwrap_or_else(|| panic!("impl not found: {header}"));
+        let start = src
+            .find(header)
+            .unwrap_or_else(|| panic!("impl not found: {header}"));
         let mut names = Vec::new();
         for line in src[start..].lines().skip(1) {
             if line == "}" {
@@ -1310,11 +1429,25 @@ mod tests {
 
         let err = res.expect_err("a panicking abort is an error, never a committed Ok");
         let msg = err.to_string();
-        assert!(msg.contains("worker panicked"), "the panic must be named: {msg}");
-        assert!(msg.contains("abort exploded"), "its payload must be named: {msg}");
+        assert!(
+            msg.contains("worker panicked"),
+            "the panic must be named: {msg}"
+        );
+        assert!(
+            msg.contains("abort exploded"),
+            "its payload must be named: {msg}"
+        );
         let events = drain(&log);
-        assert_eq!(panic_count(&log), 1, "the abort really panicked: {events:?}");
-        assert_eq!(finish_count(&log), 0, "a panicking abort never finishes: {events:?}");
+        assert_eq!(
+            panic_count(&log),
+            1,
+            "the abort really panicked: {events:?}"
+        );
+        assert_eq!(
+            finish_count(&log),
+            0,
+            "a panicking abort never finishes: {events:?}"
+        );
     }
 
     /// 13. (0.57.0 fix) The mirror of 12, so the fix cannot become "any panic
@@ -1373,7 +1506,12 @@ mod tests {
             err.to_string().contains("boom"),
             "the pipe that claimed keeps the error: {err}"
         );
-        assert_eq!(panic_count(&log), 1, "the sibling really panicked: {:?}", drain(&log));
+        assert_eq!(
+            panic_count(&log),
+            1,
+            "the sibling really panicked: {:?}",
+            drain(&log)
+        );
     }
 
     /// 14. The scanner itself, so lint 9's fix cannot rot back: an inline
@@ -1399,10 +1537,22 @@ mod tests {
 fn production() { tokio::spawn(async {}); }
 ";
         let prod = production_text(text);
-        assert!(!prod.contains("ROUTES"), "the inline const is test text: {prod}");
-        assert!(!prod.contains("not code"), "the test module is test text: {prod}");
-        assert!(!prod.contains("braces in a comment"), "and its comment: {prod}");
-        assert!(prod.contains("fn one()"), "the macro arm is production text: {prod}");
+        assert!(
+            !prod.contains("ROUTES"),
+            "the inline const is test text: {prod}"
+        );
+        assert!(
+            !prod.contains("not code"),
+            "the test module is test text: {prod}"
+        );
+        assert!(
+            !prod.contains("braces in a comment"),
+            "and its comment: {prod}"
+        );
+        assert!(
+            prod.contains("fn one()"),
+            "the macro arm is production text: {prod}"
+        );
         assert!(
             prod.contains("tokio::spawn"),
             "production text after the test module must survive — lint 9 missed it entirely in 0.57.0: {prod}"
@@ -1431,7 +1581,10 @@ fn production() { tokio::spawn(async {}); }
             matches!(j.join().await, Some(Ok(7))),
             "the first join carries the task's value"
         );
-        assert!(j.join().await.is_none(), "the second join has nothing to poll");
+        assert!(
+            j.join().await.is_none(),
+            "the second join has nothing to poll"
+        );
         assert!(j.is_finished(), "no task left is finished");
         assert!(j.join().await.is_none(), "and joining again stays None");
     }
@@ -1456,7 +1609,11 @@ fn production() { tokio::spawn(async {}); }
         /// in the same 413.
         fn refused(id: usize, log: Arc<Mutex<Vec<Ev>>>) -> Self {
             let task = tokio::spawn(async { Err(Error::Transfer(BODY_CAP_413.to_string())) });
-            Self { id, log, join: JoinOnce::new(task) }
+            Self {
+                id,
+                log,
+                join: JoinOnce::new(task),
+            }
         }
     }
 
@@ -1545,15 +1702,23 @@ fn production() { tokio::spawn(async {}); }
         let aborts = abort_events(&log);
         assert_eq!(aborts.len(), 4, "every pipe is consumed: {events:?}");
         assert!(
-            aborts.iter().any(|(id, cause)| *id == 0 && cause.contains("413")),
+            aborts
+                .iter()
+                .any(|(id, cause)| *id == 0 && cause.contains("413")),
             "and the abort that panicked is the one carrying it: {events:?}"
         );
         assert!(
-            aborts.iter().any(|(id, cause)| *id == 0 && cause.contains("task joined: false")),
+            aborts
+                .iter()
+                .any(|(id, cause)| *id == 0 && cause.contains("task joined: false")),
             "the abort waits for a task its send already joined, and does not \
              poll it again: {events:?}"
         );
-        assert_eq!(finish_count(&log), 0, "a refused insert never finishes: {events:?}");
+        assert_eq!(
+            finish_count(&log),
+            0,
+            "a refused insert never finishes: {events:?}"
+        );
     }
 
     /// 17. The rule the two tests above rest on, as a lint: every task a loader
@@ -1572,7 +1737,10 @@ fn production() { tokio::spawn(async {}); }
     fn every_loader_task_handle_is_a_join_once() {
         for (name, text) in SINKS_WITH_TASKS {
             let prod = production_text(text);
-            assert!(prod.len() > 0, "{name}: the scanner stripped the whole file — it would pass on anything");
+            assert!(
+                prod.len() > 0,
+                "{name}: the scanner stripped the whole file — it would pass on anything"
+            );
             // A FIELD declaration is the one spelling that means "this loader
             // holds a handle it will await": a spawn site's return type has no
             // colon in front of it.

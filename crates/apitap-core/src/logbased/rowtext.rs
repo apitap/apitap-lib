@@ -266,7 +266,11 @@ pub(crate) fn render_ch_row_binary_as_text(
 /// One full row for a TSV body when the stream is binary AND the cells are
 /// owned (`ResidueOp` rows): the same conversion as
 /// `render_ch_row_binary_as_text`, over `Cell`s.
-pub(crate) fn render_ch_row_cells_binary(row: &[Cell], oids: &[u32], out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn render_ch_row_cells_binary(
+    row: &[Cell],
+    oids: &[u32],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let mut tmp = Vec::new();
     for (i, cell) in row.iter().enumerate() {
         if i > 0 {
@@ -375,7 +379,10 @@ pub(crate) fn ch_key_literal(v: &[u8], oid: u32) -> Result<String> {
     let s = std::str::from_utf8(v)
         .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
     if NUMERIC_OIDS.contains(&oid) {
-        if !s.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E')) {
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E'))
+        {
             return Err(Error::Transfer(format!(
                 "log_based: numeric key value '{s}' has unexpected characters"
             )));
@@ -389,7 +396,10 @@ pub(crate) fn ch_key_literal(v: &[u8], oid: u32) -> Result<String> {
     if oid == BOOL_OID {
         return Ok(if v == b"t" { "1" } else { "0" }.to_string());
     }
-    Ok(format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")))
+    Ok(format!(
+        "'{}'",
+        s.replace('\\', "\\\\").replace('\'', "\\'")
+    ))
 }
 
 /// Strip the `+00` / `+00:00` suffix the WAL renders on timestamptz/timetz
@@ -435,9 +445,7 @@ pub(crate) fn render_my_value(v: &[u8], oid: u32, out: &mut Vec<u8>) -> Result<(
     match oid {
         BYTEA_OID => out.extend_from_slice(bytea_hex(v)?),
         BOOL_OID => out.push(if v == b"t" { b'1' } else { b'0' }),
-        TIMESTAMPTZ_OID | TIMETZ_OID => {
-            crate::wire::mytsv::tsv_escape(strip_utc_offset(v)?, out)
-        }
+        TIMESTAMPTZ_OID | TIMETZ_OID => crate::wire::mytsv::tsv_escape(strip_utc_offset(v)?, out),
         _ => crate::wire::mytsv::tsv_escape(v, out),
     }
     Ok(())
@@ -565,7 +573,9 @@ mod tests {
         for len in 0..300 {
             let v: Vec<u8> = (0..len)
                 .map(|_| {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     (state >> 33) as u8
                 })
                 .collect();

@@ -14,9 +14,9 @@ use crate::sink::bigquery::{BqConn, BqSink};
 use crate::sink::clickhouse::{ChConn, ChDdl, ChSink};
 use crate::sink::gcs::{GcsConn, GcsSink};
 use crate::sink::iceberg::{IcebergConn, IcebergSink};
-use crate::sink::s3::{S3Conn, S3Sink};
 use crate::sink::mysql::MySqlSink;
 use crate::sink::postgres::PgSink;
+use crate::sink::s3::{S3Conn, S3Sink};
 use crate::source::clickhouse::ChSource;
 use crate::source::github::GithubSource;
 use crate::source::github_api::GithubApiSource;
@@ -65,14 +65,38 @@ fn github_parallel(cores: usize) -> usize {
 
 // Named per-route profiles — a route line references ONE of these instead of
 // restating the literal; a new route adds a line here.
-const PG_PG: Profile = Profile { auto_parallel: pg_pg_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
-const TO_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
-const MY_PG: Profile = Profile { auto_parallel: my_pg_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
-const MY_MY: Profile = Profile { auto_parallel: my_my_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
-const TO_BQ: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+const PG_PG: Profile = Profile {
+    auto_parallel: pg_pg_parallel,
+    span_mult: 6,
+    table_pipe_cap: usize::MAX,
+};
+const TO_CH: Profile = Profile {
+    auto_parallel: to_ch_parallel,
+    span_mult: 6,
+    table_pipe_cap: usize::MAX,
+};
+const MY_PG: Profile = Profile {
+    auto_parallel: my_pg_parallel,
+    span_mult: 6,
+    table_pipe_cap: usize::MAX,
+};
+const MY_MY: Profile = Profile {
+    auto_parallel: my_my_parallel,
+    span_mult: 6,
+    table_pipe_cap: usize::MAX,
+};
+const TO_BQ: Profile = Profile {
+    auto_parallel: to_bq_parallel,
+    span_mult: 6,
+    table_pipe_cap: usize::MAX,
+};
 // GCS shares BigQuery's upload character: read + gzip/parquet-encode + upload,
 // bandwidth saturates past ~8 pipes.
-const TO_GCS: Profile = Profile { auto_parallel: to_bq_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
+const TO_GCS: Profile = Profile {
+    auto_parallel: to_bq_parallel,
+    span_mult: 6,
+    table_pipe_cap: usize::MAX,
+};
 // Same shape as GCS: object-store staging, parquet lane, no compose cap.
 const TO_S3: Profile = TO_GCS;
 // Iceberg = the S3 write path + a catalog commit at the end; same shape.
@@ -81,12 +105,28 @@ const TO_ICEBERG: Profile = TO_GCS;
 // query internally. The client only relays bytes (RowBinary in, RowBinary out),
 // so pipes buy overlapped network + server-side scans, not client CPU — the
 // same shape as the other ClickHouse-bound routes.
-const CH_CH: Profile = Profile { auto_parallel: to_ch_parallel, span_mult: 6, table_pipe_cap: usize::MAX };
-const GSHEETS: Profile = Profile { auto_parallel: gsheets_parallel, span_mult: 1, table_pipe_cap: 1 };
-const GITHUB: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
+const CH_CH: Profile = Profile {
+    auto_parallel: to_ch_parallel,
+    span_mult: 6,
+    table_pipe_cap: usize::MAX,
+};
+const GSHEETS: Profile = Profile {
+    auto_parallel: gsheets_parallel,
+    span_mult: 1,
+    table_pipe_cap: 1,
+};
+const GITHUB: Profile = Profile {
+    auto_parallel: github_parallel,
+    span_mult: 1,
+    table_pipe_cap: 1,
+};
 // Same single-stream shape for the API entities (pagination is serial; the
 // multi-table budget parallelizes ACROSS entities).
-const GH_API: Profile = Profile { auto_parallel: github_parallel, span_mult: 1, table_pipe_cap: 1 };
+const GH_API: Profile = Profile {
+    auto_parallel: github_parallel,
+    span_mult: 1,
+    table_pipe_cap: 1,
+};
 
 /// The single-table pipe resolver: exactly `parallel`, clamped to the span count.
 fn exact(parallel: usize) -> impl FnOnce(usize) -> usize {
@@ -132,7 +172,10 @@ struct SinkCfg {
 /// two ways, never how two servers differ. The table is deliberately NOT in
 /// here: two runs of different tables never share an artifact name anyway.
 pub(crate) fn mint_run(mode: crate::Mode, src_url: &str) -> Result<crate::naming::RunId> {
-    Ok(crate::naming::RunId::mint_bulk(land_kind(mode)?, &super::source_origin(src_url)))
+    Ok(crate::naming::RunId::mint_bulk(
+        land_kind(mode)?,
+        &super::source_origin(src_url),
+    ))
 }
 
 /// The identity of a bulk run spawned inside `parent` — the CDC bootstrap's
@@ -145,9 +188,12 @@ pub(crate) fn mint_run_within(
     src_url: &str,
     parent: &crate::naming::RunId,
 ) -> Result<crate::naming::RunId> {
-    Ok(crate::naming::RunId::mint_within(land_kind(mode)?, &super::source_origin(src_url), parent))
+    Ok(crate::naming::RunId::mint_within(
+        land_kind(mode)?,
+        &super::source_origin(src_url),
+        parent,
+    ))
 }
-
 
 /// How this run's mode lands rows, which is what decides whether a concurrent
 /// run of the same table can be allowed to proceed.
@@ -238,7 +284,14 @@ impl DstScheme for PgTo {
     type Shared = sqlx::PgPool;
     const BARE_DEST: bool = false;
     async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<PgSink> {
-        PgSink::connect(url, dest_table, cfg.shape.pipes + 1, cfg.pg_overlap, &cfg.run).await
+        PgSink::connect(
+            url,
+            dest_table,
+            cfg.shape.pipes + 1,
+            cfg.pg_overlap,
+            &cfg.run,
+        )
+        .await
     }
     async fn shared(url: &str, cfg: &SinkCfg) -> Result<sqlx::PgPool> {
         // +8 headroom over the budget: pipes take most connections, the extra
@@ -318,7 +371,12 @@ impl DstScheme for IceTo {
     type Shared = IcebergConn;
     const BARE_DEST: bool = true;
     async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<IcebergSink> {
-        IcebergSink::bind(IcebergConn::parse(url).await?, dest_table, cfg.shape, &cfg.run)
+        IcebergSink::bind(
+            IcebergConn::parse(url).await?,
+            dest_table,
+            cfg.shape,
+            &cfg.run,
+        )
     }
     async fn shared(url: &str, _cfg: &SinkCfg) -> Result<IcebergConn> {
         IcebergConn::parse(url).await
@@ -533,12 +591,32 @@ const NOT_YET: &[(&str, &str, &str)] = &[
     // destination wants PgCopyBinary (postgres/s3/iceberg, and the parquet
     // lanes of gcs/bigquery) or MyTsv (mysql): each is a new data-plane
     // encoder, per the cost model in plan.rs.
-    ("clickhouse", "postgres", "needs a ClickHouse→PgCopyBinary encoder"),
+    (
+        "clickhouse",
+        "postgres",
+        "needs a ClickHouse→PgCopyBinary encoder",
+    ),
     ("clickhouse", "mysql", "needs a ClickHouse→MyTsv encoder"),
-    ("clickhouse", "bigquery", "needs a ClickHouse→PgCopyBinary encoder"),
-    ("clickhouse", "gcs", "needs a ClickHouse→PgCopyBinary encoder"),
-    ("clickhouse", "s3", "needs a ClickHouse→PgCopyBinary encoder"),
-    ("clickhouse", "iceberg", "needs a ClickHouse→PgCopyBinary encoder"),
+    (
+        "clickhouse",
+        "bigquery",
+        "needs a ClickHouse→PgCopyBinary encoder",
+    ),
+    (
+        "clickhouse",
+        "gcs",
+        "needs a ClickHouse→PgCopyBinary encoder",
+    ),
+    (
+        "clickhouse",
+        "s3",
+        "needs a ClickHouse→PgCopyBinary encoder",
+    ),
+    (
+        "clickhouse",
+        "iceberg",
+        "needs a ClickHouse→PgCopyBinary encoder",
+    ),
 ];
 
 pub(crate) async fn single(
@@ -668,10 +746,8 @@ pub(crate) async fn multi(
         ));
     }
     let ch_ddl = ChDdl::from_opts(opts, dst_scheme == "clickhouse")?;
-    let (budget, results) = route_multi(
-        src_scheme, dst_scheme, src_url, dst_url, sel, opts, ch_ddl,
-    )
-    .await?;
+    let (budget, results) =
+        route_multi(src_scheme, dst_scheme, src_url, dst_url, sel, opts, ch_ddl).await?;
 
     Ok(MultiReport {
         rows: results
@@ -700,12 +776,24 @@ mod tests {
         assert!(land_kind(crate::Mode::LogBased).is_err());
         assert!(mint_run(crate::Mode::LogBased, "postgres://h/db").is_err());
         assert_eq!(land_kind(crate::Mode::Replace).unwrap(), BulkKind::Swap);
-        assert_eq!(land_kind(crate::Mode::Append).unwrap(), BulkKind::Incremental);
-        assert_eq!(land_kind(crate::Mode::Merge).unwrap(), BulkKind::Incremental);
-        for (mode, want) in [(crate::Mode::Replace, LandKind::Swap),
-                             (crate::Mode::Append, LandKind::Incremental),
-                             (crate::Mode::Merge, LandKind::Incremental)] {
-            assert_eq!(mint_run(mode, "postgres://h/db").unwrap().kind(), want, "{mode:?}");
+        assert_eq!(
+            land_kind(crate::Mode::Append).unwrap(),
+            BulkKind::Incremental
+        );
+        assert_eq!(
+            land_kind(crate::Mode::Merge).unwrap(),
+            BulkKind::Incremental
+        );
+        for (mode, want) in [
+            (crate::Mode::Replace, LandKind::Swap),
+            (crate::Mode::Append, LandKind::Incremental),
+            (crate::Mode::Merge, LandKind::Incremental),
+        ] {
+            assert_eq!(
+                mint_run(mode, "postgres://h/db").unwrap().kind(),
+                want,
+                "{mode:?}"
+            );
         }
     }
 
@@ -767,9 +855,23 @@ mod tests {
 
     #[test]
     fn every_source_reaches_every_destination_or_says_why_not() {
-        const SOURCES: &[&str] =
-            &["postgres", "mysql", "gsheets", "github", "github+api", "clickhouse"];
-        const DESTS: &[&str] = &["postgres", "clickhouse", "mysql", "bigquery", "gcs", "s3", "iceberg"];
+        const SOURCES: &[&str] = &[
+            "postgres",
+            "mysql",
+            "gsheets",
+            "github",
+            "github+api",
+            "clickhouse",
+        ];
+        const DESTS: &[&str] = &[
+            "postgres",
+            "clickhouse",
+            "mysql",
+            "bigquery",
+            "gcs",
+            "s3",
+            "iceberg",
+        ];
         // The declared sets must EQUAL what the table mentions — a new adapter
         // wired with a single route line would otherwise silently escape the
         // matrix walk below.
@@ -819,8 +921,16 @@ mod tests {
         // silently lose to the first line. Both are caught here.
         let mut seen = std::collections::HashSet::new();
         for (s, d) in ROUTES {
-            assert_eq!(norm(s), *s, "route source '{s}' is not the canonical spelling");
-            assert_eq!(norm(d), *d, "route dest '{d}' is not the canonical spelling");
+            assert_eq!(
+                norm(s),
+                *s,
+                "route source '{s}' is not the canonical spelling"
+            );
+            assert_eq!(
+                norm(d),
+                *d,
+                "route dest '{d}' is not the canonical spelling"
+            );
             assert!(seen.insert((s, d)), "duplicate route line {s}→{d}");
         }
     }
@@ -895,7 +1005,9 @@ mod tests {
         // is refused outright now, whether or not its base table is in the
         // same run. Assert on the property, not on the older wording.
         let msg = err.to_string();
-        assert!(msg.contains("working tables") || msg.contains("staging artifacts"),
-                "unexpected refusal: {msg}");
+        assert!(
+            msg.contains("working tables") || msg.contains("staging artifacts"),
+            "unexpected refusal: {msg}"
+        );
     }
 }

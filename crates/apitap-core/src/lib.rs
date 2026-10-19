@@ -23,31 +23,30 @@
 //! # Ok(()) }
 //! ```
 
-
 // Every `unsafe` operation states its own justification, even inside a
 // function that is already unsafe to call — an unsafe fn's signature says
 // what the CALLER must guarantee, not that its body may do anything.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-mod dialect;
-mod read;
-mod read_impl;
-mod error;
 mod aws;
-mod logbased;
+mod dialect;
+mod error;
 mod gcp;
 mod guard;
 mod http;
+mod lease;
+mod logbased;
+mod naming;
+pub(crate) mod pipe;
 mod pipeline;
 mod plan;
 mod progress;
-pub(crate) mod pipe;
-mod lease;
-mod naming;
+mod read;
+mod read_impl;
 pub mod shutdown;
-mod urlerr;
 mod sink;
 mod source;
+mod urlerr;
 mod wire;
 
 pub use error::{Error, Result};
@@ -286,7 +285,6 @@ impl Default for TransferOptions {
     }
 }
 
-
 /// What a [`transfer`] did.
 #[derive(Debug, Clone)]
 pub struct TransferReport {
@@ -331,7 +329,6 @@ pub struct MultiReport {
     /// Per-table outcomes, in completion order.
     pub tables: Vec<TableResult>,
 }
-
 
 /// Copy `table` from the source database to the destination, atomically replacing the
 /// destination table. The route is picked by the URL schemes; each pair negotiates the
@@ -490,7 +487,12 @@ pub async fn transfer_many(
         progress::Unit::Rows,
         tables.len(),
         |r: &MultiReport| r.tables.iter().map(|t| t.rows).sum(),
-        pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::List(tables), opts),
+        pipeline::dispatch::multi(
+            src_url,
+            dst_url,
+            pipeline::dispatch::TableSel::List(tables),
+            opts,
+        ),
     )
     .await
 }
@@ -524,7 +526,11 @@ pub async fn transfer_tables(
     }
     // Partition preserving the caller's order within each mode group.
     let group = |m: Mode| -> Vec<String> {
-        specs.iter().filter(|(_, mm)| *mm == m).map(|(t, _)| t.clone()).collect()
+        specs
+            .iter()
+            .filter(|(_, mm)| *mm == m)
+            .map(|(t, _)| t.clone())
+            .collect()
     };
     let mut results: Vec<TableResult> = Vec::with_capacity(specs.len());
     let mut budget = 0usize;
@@ -568,7 +574,11 @@ pub async fn transfer_tables(
         }
     }
     Ok(MultiReport {
-        rows: results.iter().filter(|t| t.error.is_none()).map(|t| t.rows).sum(),
+        rows: results
+            .iter()
+            .filter(|t| t.error.is_none())
+            .map(|t| t.rows)
+            .sum(),
         elapsed_ms: started.elapsed().as_millis() as u64,
         budget,
         tables: results,
@@ -592,7 +602,13 @@ pub async fn transfer_schema(
                 .into(),
         ));
     }
-    pipeline::dispatch::multi(src_url, dst_url, pipeline::dispatch::TableSel::Schema(schema), opts).await
+    pipeline::dispatch::multi(
+        src_url,
+        dst_url,
+        pipeline::dispatch::TableSel::Schema(schema),
+        opts,
+    )
+    .await
 }
 
 #[cfg(test)]

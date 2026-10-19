@@ -59,7 +59,10 @@ const _: () = assert!(matches!(
 const _: () = assert!(
     // A rename that forgot the other half would make apitap replicate its own
     // bookkeeping out of a ClickHouse source.
-    matches!(crate::naming::CDC_PENDING_TABLE.as_bytes(), b"_apitap_cdc_pending")
+    matches!(
+        crate::naming::CDC_PENDING_TABLE.as_bytes(),
+        b"_apitap_cdc_pending"
+    )
 );
 
 pub(crate) const CL_OP: &str = "_apitap_op";
@@ -83,7 +86,11 @@ pub(crate) struct ChDest {
 
 impl ChDest {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        Ok(Self { store: ChStore::connect(url)?, memo: Memo::default(), staged: Default::default() })
+        Ok(Self {
+            store: ChStore::connect(url)?,
+            memo: Memo::default(),
+            staged: Default::default(),
+        })
     }
 
     /// The store: the lease, the guard and the units a run's tenure takes.
@@ -105,7 +112,10 @@ impl ChDest {
         dest_table: &str,
         source_id: &str,
     ) -> Result<Option<crate::naming::CdcWatermark>> {
-        crate::naming::cdc_watermark(dest_table, self.store.read_state(dest_table, source_id).await?)
+        crate::naming::cdc_watermark(
+            dest_table,
+            self.store.read_state(dest_table, source_id).await?,
+        )
     }
 
     pub(crate) async fn validate_changelog_ddl(
@@ -114,7 +124,9 @@ impl ChDest {
         partition_by: Option<&str>,
         order_by: Option<&str>,
     ) -> Result<()> {
-        self.store.validate_changelog_ddl(dest_table, partition_by, order_by).await
+        self.store
+            .validate_changelog_ddl(dest_table, partition_by, order_by)
+            .await
     }
 
     pub(crate) async fn precheck_mode(&self, dest_table: &str, changelog: bool) -> Result<()> {
@@ -130,7 +142,11 @@ impl ChDest {
     /// a delete is a tombstone row its engine never reads: deletes never
     /// applied (MASTER M-26). A table whose engine names the pair got the
     /// columns at CREATE already — the engine cannot reference them otherwise.
-    pub(crate) async fn bootstrap_finish(&self, u: &mut ChUnit<'_>, dest_table: &str) -> Result<()> {
+    pub(crate) async fn bootstrap_finish(
+        &self,
+        u: &mut ChUnit<'_>,
+        dest_table: &str,
+    ) -> Result<()> {
         u.drop_legacy_scratch(dest_table).await?;
         Ok(())
     }
@@ -251,8 +267,12 @@ impl ChDest {
         id: &WindowId,
         source_id: &str,
     ) -> Result<(u64, Watermark)> {
-        let (n, mark, plan) = apply_changelog_unit(u, &self.memo, dest_table, w, id, source_id).await?;
-        self.staged.lock().unwrap().insert((dest_table.to_string(), source_id.to_string()), plan);
+        let (n, mark, plan) =
+            apply_changelog_unit(u, &self.memo, dest_table, w, id, source_id).await?;
+        self.staged
+            .lock()
+            .unwrap()
+            .insert((dest_table.to_string(), source_id.to_string()), plan);
         Ok((n, mark))
     }
 
@@ -300,7 +320,11 @@ impl ChDest {
 /// Baseline (`B`) rows carry the slot's consistent-point LSN, so any later
 /// change outranks them.
 fn current_view_sql(dest_table: &str, pk_cols: &[String]) -> String {
-    let keys = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+    let keys = pk_cols
+        .iter()
+        .map(|c| ch_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let view = ch_ident(&format!("{dest_table}__current"));
     let t = ch_ident(dest_table);
     format!(
@@ -363,9 +387,14 @@ async fn read_base(
     cols: &[usize],
     wal_cols: &[String],
     plan: &ReplayPlan,
-) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>> {
+) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>>
+{
     let t = ch_ident(dest_table);
-    let key_list = pk_cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+    let key_list = pk_cols
+        .iter()
+        .map(|c| ch_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut preds = Vec::with_capacity(keys.len());
     for k in keys {
         preds.push(format!("({})", key_pred(pk_cols, k, pk_oids, false)?));
@@ -413,7 +442,9 @@ async fn read_base(
     for line in body.lines().filter(|l| !l.is_empty()) {
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() != 1 + cols.len() {
-            return Err(Error::Transfer("log_based changelog: masked readback column count mismatch".into()));
+            return Err(Error::Transfer(
+                "log_based changelog: masked readback column count mismatch".into(),
+            ));
         }
         let key = f[0]
             .parse::<usize>()
@@ -533,7 +564,11 @@ async fn apply_changelog_unit(
             ChStep::Trim(from) => u.trim_owned(dest_table, plan.stamp(), from).await?,
             ChStep::Mark(m) => u.mark_pending_owned(dest_table, source_id, &m).await?,
             ChStep::Append => {
-                let w = w.ok_or_else(|| Error::Transfer(format!("log_based: {dest_table}: internal: rows to append from no window")))?;
+                let w = w.ok_or_else(|| {
+                    Error::Transfer(format!(
+                        "log_based: {dest_table}: internal: rows to append from no window"
+                    ))
+                })?;
                 let (cols, buf) = changelog_body(u, dest_table, w, &plan).await?;
                 u.insert_owned(dest_table, &cols, buf).await?;
             }
@@ -565,7 +600,17 @@ async fn changelog_body(
         let base = if keys.is_empty() || cols.is_empty() {
             std::collections::HashMap::new()
         } else {
-            read_base(u, dest_table, l.key_cols(), &l.key_oids(), &keys, &cols, wal_cols, plan).await?
+            read_base(
+                u,
+                dest_table,
+                l.key_cols(),
+                &l.key_oids(),
+                &keys,
+                &cols,
+                wal_cols,
+                plan,
+            )
+            .await?
         };
         c.resolve_masked(&cols, &base)?
     } else {
@@ -583,10 +628,18 @@ async fn changelog_body(
     // an ordering key — `(lsn, seq)` orders. Sent explicitly rather than left to
     // a default: the rebuild materialised `_apitap_at` as a plain column, so a
     // NULL would land as the epoch and pile the whole log into a 1970 partition.
-    let at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let at = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string();
     let mut buf = Vec::with_capacity(4 << 20);
     let range = plan.to_append();
-    for (i, ev) in c.events.iter().enumerate().take(range.end).skip(range.start) {
+    for (i, ev) in c
+        .events
+        .iter()
+        .enumerate()
+        .take(range.end)
+        .skip(range.start)
+    {
         match patched.get(&i).or(ev.row.as_ref()) {
             // A delete's old image carries the key and NULLs elsewhere — that
             // IS the delete record, so it renders like any row.
@@ -645,7 +698,11 @@ async fn apply_unit(
     let (wal_cols, oids, pk_cols, pk_idx) = (l.cols(), l.oids(), l.key_cols(), l.key_idx());
     let ft = ch_ident(dest_table);
     let pk_oids = l.key_oids();
-    let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
+    let pklist = pk_cols
+        .iter()
+        .map(|k| ch_ident(k))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     // P4: a binary stream's cells are pgoutput send-format bytes. When every
     // column of the PHYSICAL destination table maps to a RowBinary type, the
@@ -723,7 +780,8 @@ async fn apply_unit(
                         render_ch_row_rb(row, rt, &mut buf)?;
                         insert_only_suffix_rb(&mut buf, ver, false);
                     }
-                    u.insert_owned_rb(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                    u.insert_owned_rb(dest_table, &insert_only_cols(wal_cols), buf)
+                        .await?;
                 }
                 None => {
                     for row in &c.upserts {
@@ -734,7 +792,8 @@ async fn apply_unit(
                         }
                         insert_only_suffix(&mut buf, ver, false);
                     }
-                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf)
+                        .await?;
                 }
             }
         }
@@ -753,9 +812,7 @@ async fn apply_unit(
             let deletes: Vec<&Vec<Vec<u8>>> = c
                 .deletes
                 .iter()
-                .filter(|k| {
-                    !live.contains(&k.iter().map(|c| c.as_slice()).collect::<Vec<_>>())
-                })
+                .filter(|k| !live.contains(&k.iter().map(|c| c.as_slice()).collect::<Vec<_>>()))
                 .collect();
             if !deletes.is_empty() {
                 let mut buf = Vec::with_capacity(1 << 20);
@@ -766,7 +823,8 @@ async fn apply_unit(
                             render_ch_key_rb(&refs, prt, &mut buf)?;
                             insert_only_suffix_rb(&mut buf, ver, true);
                         }
-                        u.insert_owned_rb(dest_table, &insert_only_cols(pk_cols), buf).await?;
+                        u.insert_owned_rb(dest_table, &insert_only_cols(pk_cols), buf)
+                            .await?;
                     }
                     None => {
                         for key in deletes.iter() {
@@ -778,7 +836,8 @@ async fn apply_unit(
                             }
                             insert_only_suffix(&mut buf, ver, true);
                         }
-                        u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf).await?;
+                        u.insert_owned(dest_table, &insert_only_cols(pk_cols), buf)
+                            .await?;
                     }
                 }
             }
@@ -839,13 +898,21 @@ async fn apply_unit(
                 if replay {
                     if let Some(img) = u.journal_get(dest_table, &jk, id.start()).await? {
                         u.delete_owned(dest_table, &pred).await?;
-                        let cols = if insert_only { insert_only_cols(wal_cols) } else { wal_cols.to_vec() };
+                        let cols = if insert_only {
+                            insert_only_cols(wal_cols)
+                        } else {
+                            wal_cols.to_vec()
+                        };
                         u.insert_owned(dest_table, &cols, img).await?;
                         continue;
                     }
                 }
                 if !missing.is_empty() {
-                    let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
+                    let sel = missing
+                        .iter()
+                        .map(|&i| ch_ident(&wal_cols[i]))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     // Insert-only tables need the LIVE row: without FINAL the
                     // read can hit a tombstone or an older version, and the
                     // patched re-insert would resurrect a stale value
@@ -856,7 +923,10 @@ async fn apply_unit(
                         ))
                         .await?
                     } else {
-                        u.read(&format!("SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated")).await?
+                        u.read(&format!(
+                            "SELECT {sel} FROM {ft} WHERE {pred} FORMAT TabSeparated"
+                        ))
+                        .await?
                     };
                     let Some(line) = body.lines().next() else {
                         return Err(Error::Transfer(
@@ -867,7 +937,9 @@ async fn apply_unit(
                     };
                     let fields: Vec<&str> = line.split('\t').collect();
                     if fields.len() != missing.len() {
-                        return Err(Error::Transfer("log_based: masked-update readback column count mismatch".into()));
+                        return Err(Error::Transfer(
+                            "log_based: masked-update readback column count mismatch".into(),
+                        ));
                     }
                     for (&i, f) in missing.iter().zip(fields.iter()) {
                         // Readback is already destination-dialect: escape it
@@ -883,16 +955,21 @@ async fn apply_unit(
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
                 }
-                u.journal_put(dest_table, &jk, &buf, id.end(), id.start()).await?;
+                u.journal_put(dest_table, &jk, &buf, id.end(), id.start())
+                    .await?;
                 u.delete_owned(dest_table, &pred).await?;
                 if insert_only {
-                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf)
+                        .await?;
                 } else {
                     u.insert_owned(dest_table, wal_cols, buf).await?;
                 }
             }
             ResidueOp::Upsert { row } => {
-                let key: Vec<Vec<u8>> = row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect();
+                let key: Vec<Vec<u8>> = row_key_refs_cells(row, pk_idx)
+                    .into_iter()
+                    .map(|k| k.to_vec())
+                    .collect();
                 let pred = key_pred(pk_cols, &key, &pk_oids, binary)?;
                 u.delete_owned(dest_table, &pred).await?;
                 let mut buf = Vec::new();
@@ -903,7 +980,8 @@ async fn apply_unit(
                 }
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
-                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf)
+                        .await?;
                 } else {
                     u.insert_owned(dest_table, wal_cols, buf).await?;
                 }
@@ -912,7 +990,11 @@ async fn apply_unit(
                 let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
                 u.delete_owned(dest_table, &pred).await?;
             }
-            ResidueOp::Rekey { old_key, new_key, row } => {
+            ResidueOp::Rekey {
+                old_key,
+                new_key,
+                row,
+            } => {
                 // ClickHouse has no cheap row UPDATE, so the move is a readback
                 // + delete + insert like MaskedUpdate — except the readback
                 // addresses the OLD key. That is the whole difference: the row
@@ -931,7 +1013,8 @@ async fn apply_unit(
                     if let Some(img) = u.journal_get(dest_table, &jk, id.start()).await? {
                         u.delete_owned(dest_table, &old_pred).await?;
                         if insert_only {
-                            u.insert_owned(dest_table, &insert_only_cols(wal_cols), img).await?;
+                            u.insert_owned(dest_table, &insert_only_cols(wal_cols), img)
+                                .await?;
                         } else {
                             let new_pred = key_pred(pk_cols, new_key, &pk_oids, binary)?;
                             u.delete_owned(dest_table, &new_pred).await?;
@@ -941,20 +1024,29 @@ async fn apply_unit(
                     }
                 }
                 if !missing.is_empty() {
-                    let sel = missing.iter().map(|&i| ch_ident(&wal_cols[i])).collect::<Vec<_>>().join(", ");
+                    let sel = missing
+                        .iter()
+                        .map(|&i| ch_ident(&wal_cols[i]))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let body = if insert_only {
                         u.read(&format!(
                             "SELECT {sel} FROM {ft} FINAL WHERE {old_pred} AND _apitap_deleted = 0 FORMAT TabSeparated"
                         ))
                         .await?
                     } else {
-                        u.read(&format!("SELECT {sel} FROM {ft} WHERE {old_pred} FORMAT TabSeparated")).await?
+                        u.read(&format!(
+                            "SELECT {sel} FROM {ft} WHERE {old_pred} FORMAT TabSeparated"
+                        ))
+                        .await?
                     };
                     match body.lines().next() {
                         Some(line) => {
                             let fields: Vec<&str> = line.split('\t').collect();
                             if fields.len() != missing.len() {
-                                return Err(Error::Transfer("log_based: re-key readback column count mismatch".into()));
+                                return Err(Error::Transfer(
+                                    "log_based: re-key readback column count mismatch".into(),
+                                ));
                             }
                             for (&i, f) in missing.iter().zip(fields.iter()) {
                                 full[i] = match tsv_unescape(f) {
@@ -976,7 +1068,8 @@ async fn apply_unit(
                     insert_only_suffix(&mut buf, id.end(), false);
                 }
                 if !missing.is_empty() {
-                    u.journal_put(dest_table, &jk, &buf, id.end(), id.start()).await?;
+                    u.journal_put(dest_table, &jk, &buf, id.end(), id.start())
+                        .await?;
                 }
                 u.delete_owned(dest_table, &old_pred).await?;
                 // Replay-idempotent (review round 2 R2-4): a replayed window
@@ -993,7 +1086,8 @@ async fn apply_unit(
                     u.delete_owned(dest_table, &new_pred).await?;
                 }
                 if insert_only {
-                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf).await?;
+                    u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf)
+                        .await?;
                 } else {
                     u.insert_owned(dest_table, wal_cols, buf).await?;
                 }
@@ -1098,11 +1192,18 @@ fn rb_types_for(
 }
 
 mod store {
-    use super::{ch_engine_ok, ch_rebuild_ok, current_view_sql, is_shape_ok, ch_partition_expr, CL_AT, CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, JOURNAL, PENDING, STATE_CURSOR};
+    use super::{
+        ch_engine_ok, ch_partition_expr, ch_rebuild_ok, current_view_sql, is_shape_ok, CL_AT,
+        CL_BASELINE, CL_LSN, CL_OP, CL_SEQ, JOURNAL, PENDING, STATE_CURSOR,
+    };
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
-    use crate::lease::{no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark};
-    use crate::logbased::replay::{parse_ceiling, parse_facts, parse_pending, MarkerRow, Pending, StampFacts};
+    use crate::lease::{
+        no_longer_holds, owned_margin_secs, ttl_secs, Fence, LeaseStore, Watermark,
+    };
+    use crate::logbased::replay::{
+        parse_ceiling, parse_facts, parse_pending, MarkerRow, Pending, StampFacts,
+    };
     use crate::logbased::rowtext::copy_escape;
     use crate::naming::{artifact_ident, artifact_ident_tok, Artifact, ROOMY};
     use crate::sink::clickhouse::{ch_ident, ch_str, ChConn, ChGuard};
@@ -1201,7 +1302,14 @@ mod store {
     /// deadline — which proves every earlier statement (each started before
     /// this read) passed it too. Otherwise one of them may have been fenced
     /// out without a word, and the unit must not go on to a watermark.
-    pub(super) fn repin(now: u64, e: u64, owned: usize, keys: usize, margin_us: u64, prev: Option<u64>) -> Option<u64> {
+    pub(super) fn repin(
+        now: u64,
+        e: u64,
+        owned: usize,
+        keys: usize,
+        margin_us: u64,
+        prev: Option<u64>,
+    ) -> Option<u64> {
         let live = owned == keys && now.saturating_add(margin_us) < e;
         let continuous = prev.map_or(true, |p| now.saturating_add(margin_us) < p);
         (live && continuous).then_some(e)
@@ -1230,7 +1338,11 @@ mod store {
     /// half the budget left (the rule until this) could not run past that half
     /// without failing a live claim — a lightweight DELETE of a minute at TTL
     /// 300 replayed its window for ever. Short windows still never re-read.
-    pub(super) fn repin_due(elapsed: std::time::Duration, budget: std::time::Duration, force: bool) -> bool {
+    pub(super) fn repin_due(
+        elapsed: std::time::Duration,
+        budget: std::time::Duration,
+        force: bool,
+    ) -> bool {
         force || elapsed >= budget / 8
     }
 
@@ -1253,7 +1365,10 @@ mod store {
     /// Every owned statement ends before its predicate could go stale.
     fn owned_settings() -> Vec<(&'static str, String)> {
         let m = owned_margin_secs().to_string();
-        vec![("max_execution_time", m.clone()), ("http_receive_timeout", m)]
+        vec![
+            ("max_execution_time", m.clone()),
+            ("http_receive_timeout", m),
+        ]
     }
 
     /// `input()`'s structure for `cols`, typed from the table. Quoted as a
@@ -1265,14 +1380,27 @@ mod store {
                 types
                     .get(c)
                     .map(|t| format!("{} {t}", ch_ident(c)))
-                    .ok_or_else(|| Error::Transfer(format!("log_based: column {c} is not in the destination table")))
+                    .ok_or_else(|| {
+                        Error::Transfer(format!(
+                            "log_based: column {c} is not in the destination table"
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>>>()
             .map(|v| v.join(", "))
     }
 
-    pub(super) fn insert_owned_sql(table: &str, cols: &[String], structure: &str, pred: &str) -> String {
-        let cl = cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+    pub(super) fn insert_owned_sql(
+        table: &str,
+        cols: &[String],
+        structure: &str,
+        pred: &str,
+    ) -> String {
+        let cl = cols
+            .iter()
+            .map(|c| ch_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "INSERT INTO {t} ({cl}) SELECT {cl} FROM input('{s}') WHERE {pred} FORMAT TabSeparated",
             t = ch_ident(table),
@@ -1282,8 +1410,17 @@ mod store {
 
     /// The P4 twin of `insert_owned_sql`: same `input()` structure, same
     /// ownership predicate, RowBinary body.
-    pub(super) fn insert_owned_rb_sql(table: &str, cols: &[String], structure: &str, pred: &str) -> String {
-        let cl = cols.iter().map(|c| ch_ident(c)).collect::<Vec<_>>().join(", ");
+    pub(super) fn insert_owned_rb_sql(
+        table: &str,
+        cols: &[String],
+        structure: &str,
+        pred: &str,
+    ) -> String {
+        let cl = cols
+            .iter()
+            .map(|c| ch_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "INSERT INTO {t} ({cl}) SELECT {cl} FROM input('{s}') WHERE {pred} FORMAT RowBinary",
             t = ch_ident(table),
@@ -1411,7 +1548,10 @@ mod store {
             let has_ver = f.next().unwrap_or("0").trim() == "1";
             let has_deleted = f.next().unwrap_or("0").trim() == "1";
             let v = super::is_insert_only_shape(engine, has_ver, has_deleted);
-            self.insert_only.lock().unwrap().insert(table.to_string(), v);
+            self.insert_only
+                .lock()
+                .unwrap()
+                .insert(table.to_string(), v);
             if v {
                 crate::progress::note(&format!(
                     "insert-only apply: {table} (ReplacingMergeTree with tombstones; \
@@ -1431,7 +1571,10 @@ mod store {
         }
 
         fn patched(&self, table: &str) -> bool {
-            self.ensured.lock().unwrap().contains(&format!("\u{1}patch\u{1}{table}"))
+            self.ensured
+                .lock()
+                .unwrap()
+                .contains(&format!("\u{1}patch\u{1}{table}"))
         }
 
         /// Patch-part deletes (`lightweight_delete_mode='lightweight_update'`)
@@ -1590,7 +1733,9 @@ mod store {
             let mut cols = Vec::new();
             for line in desc.lines().filter(|l| !l.is_empty()) {
                 let mut it = line.splitn(2, '\t');
-                let (Some(n), Some(ty)) = (it.next(), it.next()) else { continue };
+                let (Some(n), Some(ty)) = (it.next(), it.next()) else {
+                    continue;
+                };
                 cols.push((n.to_string(), ty.to_string()));
             }
             Ok(cols)
@@ -1601,7 +1746,10 @@ mod store {
                 return Ok(t.clone());
             }
             let t: HashMap<String, String> = self.columns(table).await?.into_iter().collect();
-            self.structures.lock().unwrap().insert(table.to_string(), t.clone());
+            self.structures
+                .lock()
+                .unwrap()
+                .insert(table.to_string(), t.clone());
             Ok(t)
         }
 
@@ -1620,10 +1768,18 @@ mod store {
             // destination, for every table — the moment to notice a clustered
             // target and refuse before a bootstrap or a drain moves any data.
             self.refuse_clustered(dest_table).await?;
-            let body = match self.ch.read(&crate::sink::clickhouse::state_read_sql(dest_table, source_id)).await {
+            let body = match self
+                .ch
+                .read(&crate::sink::clickhouse::state_read_sql(
+                    dest_table, source_id,
+                ))
+                .await
+            {
                 Ok(b) => b,
                 // No state table at all = fresh destination.
-                Err(Error::Transfer(m)) if m.contains("UNKNOWN_TABLE") || m.contains("doesn't exist") => {
+                Err(Error::Transfer(m))
+                    if m.contains("UNKNOWN_TABLE") || m.contains("doesn't exist") =>
+                {
                     return Ok(None)
                 }
                 Err(e) => return Err(e),
@@ -1693,7 +1849,11 @@ mod store {
         /// row exists, is not collected, and has more than the margin left —
         /// the same test `owner_pred` makes server-side.
         async fn pin(&self, keys: &[String], token: &str, prev: Option<u64>) -> Result<Pin> {
-            let inlist = keys.iter().map(|k| format!("'{}'", ch_str(k))).collect::<Vec<_>>().join(", ");
+            let inlist = keys
+                .iter()
+                .map(|k| format!("'{}'", ch_str(k)))
+                .collect::<Vec<_>>()
+                .join(", ");
             let body = match self
                 .ch
                 .read(&format!(
@@ -1712,8 +1872,15 @@ mod store {
                 Err(Error::Transfer(m)) if m.contains("UNKNOWN_TABLE") => String::new(),
                 Err(e) => return Err(e),
             };
-            let mut f = body.trim().split('\t').map(|v| v.trim().parse::<u64>().unwrap_or(0));
-            let (now, e, owned) = (f.next().unwrap_or(0), f.next().unwrap_or(0), f.next().unwrap_or(0));
+            let mut f = body
+                .trim()
+                .split('\t')
+                .map(|v| v.trim().parse::<u64>().unwrap_or(0));
+            let (now, e, owned) = (
+                f.next().unwrap_or(0),
+                f.next().unwrap_or(0),
+                f.next().unwrap_or(0),
+            );
             let distinct = keys.iter().collect::<HashSet<_>>().len();
             match repin(now, e, owned as usize, distinct, margin_us(), prev) {
                 Some(e0) => {
@@ -1724,7 +1891,11 @@ mod store {
                     };
                     self.pins.lock().unwrap().insert(
                         pin_key(keys),
-                        CachedPin { e0: pin.e0, budget: pin.budget, at: pin.at },
+                        CachedPin {
+                            e0: pin.e0,
+                            budget: pin.budget,
+                            at: pin.at,
+                        },
                     );
                     Ok(pin)
                 }
@@ -1759,7 +1930,11 @@ mod store {
     impl ChUnit<'_> {
         fn pred(&self) -> String {
             let m = owned_margin_secs();
-            let mut p: Vec<String> = self.keys.iter().map(|k| owner_pred(k, &self.token, m)).collect();
+            let mut p: Vec<String> = self
+                .keys
+                .iter()
+                .map(|k| owner_pred(k, &self.token, m))
+                .collect();
             p.push(pinned_pred(self.pin.e0, margin_us()));
             p.join(" AND ")
         }
@@ -1793,8 +1968,6 @@ mod store {
             self.pin.e0
         }
 
-
-
         pub(super) async fn exec_owned(&mut self, sql: &str) -> Result<String> {
             self.owed = true;
             let st = owned_settings();
@@ -1815,7 +1988,8 @@ mod store {
             self.owed = true;
             let st = owned_settings();
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            self.s.ch
+            self.s
+                .ch
                 .insert_stream_written(sql, reqwest::Body::from(body), &st)
                 .await
         }
@@ -1847,7 +2021,12 @@ mod store {
         /// `body` (TabSeparated rows of `cols`) into `table`, through
         /// `input()` so the statement can carry the predicate: an evicted
         /// run's INSERT writes no row.
-        pub(crate) async fn insert_owned(&mut self, table: &str, cols: &[String], body: Vec<u8>) -> Result<()> {
+        pub(crate) async fn insert_owned(
+            &mut self,
+            table: &str,
+            cols: &[String],
+            body: Vec<u8>,
+        ) -> Result<()> {
             self.s.note("insert");
             self.keep(false).await?;
             let s = structure(cols, &self.s.types(table).await?)?;
@@ -1855,12 +2034,20 @@ mod store {
             let st = owned_settings();
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
             self.owed = true;
-            self.s.ch.insert_stream_with(&sql, reqwest::Body::from(body), &st).await
+            self.s
+                .ch
+                .insert_stream_with(&sql, reqwest::Body::from(body), &st)
+                .await
         }
 
         /// The RowBinary twin of `insert_owned` (P4): `body` is RowBinary
         /// bytes per the same `input()` structure.
-        pub(crate) async fn insert_owned_rb(&mut self, table: &str, cols: &[String], body: Vec<u8>) -> Result<()> {
+        pub(crate) async fn insert_owned_rb(
+            &mut self,
+            table: &str,
+            cols: &[String],
+            body: Vec<u8>,
+        ) -> Result<()> {
             self.s.note("insert");
             self.keep(false).await?;
             let s = structure(cols, &self.s.types(table).await?)?;
@@ -1868,7 +2055,10 @@ mod store {
             let st = owned_settings();
             let st: Vec<(&str, &str)> = st.iter().map(|(k, v)| (*k, v.as_str())).collect();
             self.owed = true;
-            self.s.ch.insert_stream_with(&sql, reqwest::Body::from(body), &st).await
+            self.s
+                .ch
+                .insert_stream_with(&sql, reqwest::Body::from(body), &st)
+                .await
         }
 
         /// The destination table's column → ClickHouse type map (DESCRIBE,
@@ -1884,7 +2074,14 @@ mod store {
         /// (its key predicate) BEFORE the op deletes anything. `after` is the
         /// window start: entries at or below it belong to committed windows
         /// and are swept, once per table per run.
-        pub(crate) async fn journal_put(&mut self, table: &str, k: &str, row: &[u8], ver: u64, after: u64) -> Result<()> {
+        pub(crate) async fn journal_put(
+            &mut self,
+            table: &str,
+            k: &str,
+            row: &[u8],
+            ver: u64,
+            after: u64,
+        ) -> Result<()> {
             self.s.ensure_journal_table().await?;
             if self.s.first_time(&format!("\u{1}jsweep\u{1}{table}")) {
                 let w = format!("dest_table = '{}' AND ver <= {after}", ch_str(table));
@@ -1898,12 +2095,18 @@ mod store {
             body.extend_from_slice(hex::encode(row).as_bytes());
             body.extend_from_slice(format!("\t{ver}\n").as_bytes());
             let cols = ["dest_table", "k", "row", "ver"].map(String::from);
-            self.insert_owned(JOURNAL.trim_matches('`'), &cols, body).await
+            self.insert_owned(JOURNAL.trim_matches('`'), &cols, body)
+                .await
         }
 
         /// The newest journalled row for `k` written by an attempt at a window
         /// that has not committed (`ver > after`), if any.
-        pub(crate) async fn journal_get(&mut self, table: &str, k: &str, after: u64) -> Result<Option<Vec<u8>>> {
+        pub(crate) async fn journal_get(
+            &mut self,
+            table: &str,
+            k: &str,
+            after: u64,
+        ) -> Result<Option<Vec<u8>>> {
             self.s.ensure_journal_table().await?;
             let body = self
                 .read(&format!(
@@ -1915,9 +2118,11 @@ mod store {
                 .await?;
             match body.lines().next() {
                 None => Ok(None),
-                Some(h) => hex::decode(h.trim())
-                    .map(Some)
-                    .map_err(|e| Error::Transfer(format!("log_based: residue journal row for {table} is corrupt: {e}"))),
+                Some(h) => hex::decode(h.trim()).map(Some).map_err(|e| {
+                    Error::Transfer(format!(
+                        "log_based: residue journal row for {table} is corrupt: {e}"
+                    ))
+                }),
             }
         }
 
@@ -1962,7 +2167,12 @@ mod store {
         /// A changelog replay's trim: this stamp's non-baseline rows from
         /// `from` up. A lightweight DELETE, and the log's parts are rewritten
         /// only here — on a replay, never on an ordinary window.
-        pub(crate) async fn trim_owned(&mut self, table: &str, stamp: u64, from: u32) -> Result<()> {
+        pub(crate) async fn trim_owned(
+            &mut self,
+            table: &str,
+            stamp: u64,
+            from: u32,
+        ) -> Result<()> {
             self.s.note("trim");
             let w = format!(
                 "{CL_LSN} = {stamp} AND {CL_OP} != '{b}' AND {CL_SEQ} >= {from}",
@@ -1976,7 +2186,12 @@ mod store {
         pub(crate) async fn clear_owned(&mut self, table: &str) -> Result<()> {
             self.s.note("clear");
             self.keep(false).await?;
-            let sql = format!("DELETE FROM {} WHERE {}{}", ch_ident(table), self.pred(), self.delete_mode(table));
+            let sql = format!(
+                "DELETE FROM {} WHERE {}{}",
+                ch_ident(table),
+                self.pred(),
+                self.delete_mode(table)
+            );
             self.exec_owned(&sql).await.map(|_| ())
         }
 
@@ -1991,13 +2206,24 @@ mod store {
         /// `input()` structure is read once per run: a TRUNCATE empties the
         /// table and keeps its columns. It also owns the once-per-run
         /// patch-mode ALTER on servers that need it (>= 25.7).
-        pub(crate) async fn key_table_reset(&mut self, table: &str, pk_cols: &[String]) -> Result<String> {
+        pub(crate) async fn key_table_reset(
+            &mut self,
+            table: &str,
+            pk_cols: &[String],
+        ) -> Result<String> {
             self.s.note("key_reset");
             let kt = artifact_ident_tok(table, Artifact::CdcDelete, ROOMY, &self.token);
             let (kq, ft) = (ch_ident(&kt), ch_ident(table));
             if self.s.first_time(&format!("\u{1}kt\u{1}{kt}")) {
-                let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
-                self.s.ch.exec(&format!("DROP TABLE IF EXISTS {kq}")).await?;
+                let pklist = pk_cols
+                    .iter()
+                    .map(|k| ch_ident(k))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.s
+                    .ch
+                    .exec(&format!("DROP TABLE IF EXISTS {kq}"))
+                    .await?;
                 self.s
                     .ch
                     .exec(&format!("CREATE TABLE {kq} ENGINE = MergeTree ORDER BY tuple() AS SELECT {pklist} FROM {ft} WHERE 0"))
@@ -2026,7 +2252,11 @@ mod store {
         /// the log's highest non-baseline stamp, which bounds every row an
         /// earlier run can have left (`replay::Memo`). The ceiling scans
         /// `_apitap_lsn` once per table per run.
-        pub(crate) async fn probe(&mut self, dest_table: &str, source_id: &str) -> Result<(Option<Pending>, Option<u64>)> {
+        pub(crate) async fn probe(
+            &mut self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<(Option<Pending>, Option<u64>)> {
             self.s.ensure_pending_table().await?;
             let t = ch_ident(dest_table);
             let body = self
@@ -2043,9 +2273,14 @@ mod store {
                 .await?;
             let f: Vec<&str> = body.trim_end_matches('\n').split('\t').collect();
             let [n, lsn, base, events, rows, top] = f[..] else {
-                return Err(Error::Transfer(format!("log_based changelog: {dest_table}: unreadable probe {body:?}")));
+                return Err(Error::Transfer(format!(
+                    "log_based changelog: {dest_table}: unreadable probe {body:?}"
+                )));
             };
-            Ok((parse_pending(n, lsn, base, events)?, parse_ceiling(rows, top)?))
+            Ok((
+                parse_pending(n, lsn, base, events)?,
+                parse_ceiling(rows, top)?,
+            ))
         }
 
         /// What is at `stamp` already: every non-baseline row, the ones from
@@ -2053,7 +2288,12 @@ mod store {
         /// the bootstrap stamps them with its consistent point, and the FIRST
         /// window after a bootstrap starts at exactly that point. Asked only on
         /// a replay, or where another writer's rows can be (`Memo::ask`).
-        pub(crate) async fn facts(&mut self, dest_table: &str, stamp: u64, base: u32) -> Result<StampFacts> {
+        pub(crate) async fn facts(
+            &mut self,
+            dest_table: &str,
+            stamp: u64,
+            base: u32,
+        ) -> Result<StampFacts> {
             let body = self
                 .read(&format!(
                     "SELECT count(), if(count() = 0, -1, toInt64(max({CL_SEQ}))), \
@@ -2070,7 +2310,12 @@ mod store {
 
         /// The changelog's intent marker for one attempt, written only by an
         /// owner: exactly one row, or this run no longer holds the table.
-        pub(crate) async fn mark_pending_owned(&mut self, dest_table: &str, source_id: &str, m: &MarkerRow) -> Result<()> {
+        pub(crate) async fn mark_pending_owned(
+            &mut self,
+            dest_table: &str,
+            source_id: &str,
+            m: &MarkerRow,
+        ) -> Result<()> {
             self.s.note("mark_pending");
             self.s.ensure_pending_table().await?;
             self.keep(false).await?;
@@ -2115,7 +2360,11 @@ mod store {
         /// failed bootstrap's rollback (`Watermark::Clear`), and the changelog
         /// bootstrap that starts a new stream (brief R-B2). A destination that
         /// never had a changelog has no marker table, and nothing to clear.
-        pub(crate) async fn clear_pending_owned(&mut self, dest_table: &str, source_id: &str) -> Result<()> {
+        pub(crate) async fn clear_pending_owned(
+            &mut self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<()> {
             self.s.note("clear_pending");
             self.keep(false).await?;
             let sql = format!(
@@ -2141,11 +2390,20 @@ mod store {
         /// the EXCHANGE is therefore a FRESH pin (nothing owned ran before it
         /// in this unit — see `keep`): a live claim passes however long the
         /// copy took, and a claim taken meanwhile still refuses the swap.
-        pub(crate) async fn changelog_rebuild(&mut self, table: &str, sel: &str, part: &str, order: &str) -> Result<()> {
+        pub(crate) async fn changelog_rebuild(
+            &mut self,
+            table: &str,
+            sel: &str,
+            part: &str,
+            order: &str,
+        ) -> Result<()> {
             self.s.note("rebuild");
             let tmp = artifact_ident_tok(table, Artifact::ChangelogTmp, ROOMY, &self.token);
             let (tq, ft) = (ch_ident(&tmp), ch_ident(table));
-            self.s.ch.exec(&format!("DROP TABLE IF EXISTS {tq}")).await?;
+            self.s
+                .ch
+                .exec(&format!("DROP TABLE IF EXISTS {tq}"))
+                .await?;
             self.s
                 .ch
                 .exec(&format!(
@@ -2158,7 +2416,8 @@ mod store {
                 ))
                 .await?;
             self.keep(true).await?;
-            self.exec_owned(&format!("EXCHANGE TABLES {tq} AND {ft}")).await?;
+            self.exec_owned(&format!("EXCHANGE TABLES {tq} AND {ft}"))
+                .await?;
             self.s.forget_shape(table);
             if self.keep(true).await.is_err() {
                 return Err(Error::Locked(format!(
@@ -2180,7 +2439,11 @@ mod store {
 
         pub(crate) async fn current_view(&mut self, table: &str, pk_cols: &[String]) -> Result<()> {
             self.s.note("view");
-            self.s.ch.exec(&current_view_sql(table, pk_cols)).await.map(|_| ())
+            self.s
+                .ch
+                .exec(&current_view_sql(table, pk_cols))
+                .await
+                .map(|_| ())
         }
 
         /// The scratch names releases before 0.57.0 used, untokenized. Only a
@@ -2188,7 +2451,13 @@ mod store {
         /// every live drain, so nothing else can be using them.
         pub(crate) async fn drop_legacy_scratch(&mut self, table: &str) -> Result<()> {
             for a in [Artifact::CdcDelete, Artifact::ChangelogTmp] {
-                self.s.ch.exec(&format!("DROP TABLE IF EXISTS {}", ch_ident(&artifact_ident(table, a, ROOMY)))).await?;
+                self.s
+                    .ch
+                    .exec(&format!(
+                        "DROP TABLE IF EXISTS {}",
+                        ch_ident(&artifact_ident(table, a, ROOMY))
+                    ))
+                    .await?;
             }
             Ok(())
         }
@@ -2201,7 +2470,8 @@ mod store {
 
         async fn lease_open(&self, keys: &[String], token: &str) -> Result<()> {
             for k in keys {
-                crate::sink::clickhouse::lease_write(&self.ch, k, token, ttl_secs() as i64, 0).await?;
+                crate::sink::clickhouse::lease_write(&self.ch, k, token, ttl_secs() as i64, 0)
+                    .await?;
             }
             Ok(())
         }
@@ -2234,9 +2504,12 @@ mod store {
             self.open_unit_at(keys, token, None).await
         }
 
-        fn open_unit_at<'a>(&'a self, keys: &[String], token: &str, prev: Option<u64>)
-            -> impl std::future::Future<Output = Result<ChUnit<'a>>> + Send
-        {
+        fn open_unit_at<'a>(
+            &'a self,
+            keys: &[String],
+            token: &str,
+            prev: Option<u64>,
+        ) -> impl std::future::Future<Output = Result<ChUnit<'a>>> + Send {
             let keys = keys.to_vec();
             let token = token.to_string();
             async move {
@@ -2256,7 +2529,13 @@ mod store {
                     // deadline that passed un-renewed refuses the open.
                     Some(p) => self.pin(&keys, &token, Some(p)).await?,
                 };
-                Ok(ChUnit { s: self, keys, token, pin, owed: false })
+                Ok(ChUnit {
+                    s: self,
+                    keys,
+                    token,
+                    pin,
+                    owed: false,
+                })
             }
         }
 
@@ -2264,7 +2543,12 @@ mod store {
         /// the predicate — the pinned deadline included — and must write
         /// exactly one row. A window whose statements an eviction or a lapse
         /// emptied therefore never moves the cursor.
-        async fn close_unit<'a>(&'a self, mut u: ChUnit<'a>, _token: &str, marks: Vec<Watermark>) -> Result<()> {
+        async fn close_unit<'a>(
+            &'a self,
+            mut u: ChUnit<'a>,
+            _token: &str,
+            marks: Vec<Watermark>,
+        ) -> Result<()> {
             self.ensure_state_table().await?;
             // A multi-member window's marks travel in ONE statement: every Set
             // mark is a row of one `_apitap_state` INSERT, each fenced by its
@@ -2284,18 +2568,34 @@ mod store {
                 u.keep(false).await?;
                 let mut body = Vec::with_capacity(64 * marks.len());
                 for m in &marks {
-                    if let Watermark::Set { table, source_id, lsn, rows } = m {
-                        render_state_batch_row(&self.lease_key(table), table, source_id, *lsn, *rows, &mut body);
+                    if let Watermark::Set {
+                        table,
+                        source_id,
+                        lsn,
+                        rows,
+                    } = m
+                    {
+                        render_state_batch_row(
+                            &self.lease_key(table),
+                            table,
+                            source_id,
+                            *lsn,
+                            *rows,
+                            &mut body,
+                        );
                     }
                 }
                 let keys: Vec<(&str, &str)> = marks
                     .iter()
                     .filter_map(|m| match m {
-                        Watermark::Set { table, source_id, .. } => Some((table.as_str(), source_id.as_str())),
+                        Watermark::Set {
+                            table, source_id, ..
+                        } => Some((table.as_str(), source_id.as_str())),
                         _ => None,
                     })
                     .collect();
-                let sql = state_batch_sql(&u.token, owned_margin_secs(), u.pin.e0, margin_us(), &keys);
+                let sql =
+                    state_batch_sql(&u.token, owned_margin_secs(), u.pin.e0, margin_us(), &keys);
                 match u.insert_state_batch(&sql, body).await? {
                     Some(n) if n as usize == marks.len() => return Ok(()),
                     Some(_) => return Err(no_longer_holds(&u.keys)),
@@ -2305,7 +2605,12 @@ mod store {
             for m in &marks {
                 u.keep(false).await?;
                 match m {
-                    Watermark::Set { table, source_id, lsn, rows } => {
+                    Watermark::Set {
+                        table,
+                        source_id,
+                        lsn,
+                        rows,
+                    } => {
                         // Before the state table's first row for a fresh
                         // bootstrap: the table did not exist at run admission.
                         self.refuse_clustered(table).await?;
@@ -2494,14 +2799,24 @@ fn cl_nullable(ty: &str) -> Option<String> {
     let t = ty.trim();
     let mut inner = t;
     let mut lc = 0usize;
-    while let Some(r) = inner.strip_prefix("LowCardinality(").and_then(|r| r.strip_suffix(')')) {
+    while let Some(r) = inner
+        .strip_prefix("LowCardinality(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
         inner = r.trim();
         lc += 1;
     }
     if inner.starts_with("Nullable(") {
         return None;
     }
-    for c in ["Array(", "Map(", "Tuple(", "Nested(", "AggregateFunction(", "SimpleAggregateFunction("] {
+    for c in [
+        "Array(",
+        "Map(",
+        "Tuple(",
+        "Nested(",
+        "AggregateFunction(",
+        "SimpleAggregateFunction(",
+    ] {
         if inner.starts_with(c) {
             return None;
         }
@@ -2578,9 +2893,7 @@ fn render_residue_row(
         }
         match cell {
             Cell::Null => out.extend_from_slice(b"\\N"),
-            Cell::Text(t) if verbatim.contains(&i) => {
-                crate::logbased::rowtext::copy_escape(t, out)
-            }
+            Cell::Text(t) if verbatim.contains(&i) => crate::logbased::rowtext::copy_escape(t, out),
             // A binary stream's WAL cells are send-format bytes; the readback
             // cells (verbatim) are already destination-dialect text.
             Cell::Text(t) if binary => {
@@ -2654,9 +2967,9 @@ mod tests {
         assert_eq!(String::from_utf8(buf).unwrap(), "a\tb\t4242\t1\n");
     }
 
-    use super::{ch_engine_ok, ch_partition_expr, ch_rebuild_ok, cl_nullable};
     use super::store::{insert_owned_sql, owner_pred, pinned_pred, repin, reuse_cached, structure};
     use super::*;
+    use super::{ch_engine_ok, ch_partition_expr, ch_rebuild_ok, cl_nullable};
     use crate::lease::{owned_margin_secs, ttl_secs, Fence, LeaseStore};
     use crate::logbased::window::Layout;
     use crate::wire::pgoutput::Tuple;
@@ -2668,8 +2981,14 @@ mod tests {
         let p = owner_pred("default.t", "_tok", 150);
         assert!(p.contains("count() > 0"), "{p}");
         assert!(p.contains("argMax(collected, seq) = 0"), "{p}");
-        assert!(p.contains("argMax(expires_at, seq) > now64(6) + INTERVAL 150 SECOND"), "{p}");
-        assert!(p.contains("dest_key = 'default.t' AND token = '_tok'"), "{p}");
+        assert!(
+            p.contains("argMax(expires_at, seq) > now64(6) + INTERVAL 150 SECOND"),
+            "{p}"
+        );
+        assert!(
+            p.contains("dest_key = 'default.t' AND token = '_tok'"),
+            "{p}"
+        );
     }
 
     #[test]
@@ -2684,7 +3003,10 @@ mod tests {
         let sql = insert_owned_sql("t", &cols, &structure(&cols, &types).unwrap(), "1");
         assert!(sql.contains("\\'UTC\\'"), "{sql}");
         assert!(sql.contains("\\'a\\'"), "{sql}");
-        assert!(sql.starts_with("INSERT INTO `t` (`ts`, `e`) SELECT `ts`, `e` FROM input('"), "{sql}");
+        assert!(
+            sql.starts_with("INSERT INTO `t` (`ts`, `e`) SELECT `ts`, `e` FROM input('"),
+            "{sql}"
+        );
         assert!(structure(&["nope".to_string()], &types).is_err());
     }
 
@@ -2700,7 +3022,9 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = l.accept().await else { return };
+                let Ok((mut s, _)) = l.accept().await else {
+                    return;
+                };
                 let answer = answer.clone();
                 tokio::spawn(async move {
                     let mut buf: Vec<u8> = Vec::new();
@@ -2730,12 +3054,24 @@ mod tests {
                         }
                         let body = String::from_utf8_lossy(&buf[end..end + len]).to_string();
                         buf.drain(..end + len);
-                        let path = head_raw.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        let path = head_raw
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("/")
+                            .to_string();
                         let url_query = reqwest::Url::parse(&format!("http://x{path}"))
                             .ok()
-                            .and_then(|u| u.query_pairs().find(|(k, _)| k == "query").map(|(_, v)| v.into_owned()))
+                            .and_then(|u| {
+                                u.query_pairs()
+                                    .find(|(k, _)| k == "query")
+                                    .map(|(_, v)| v.into_owned())
+                            })
                             .unwrap_or_default();
-                        let sql = if url_query.is_empty() { body } else { url_query };
+                        let sql = if url_query.is_empty() {
+                            body
+                        } else {
+                            url_query
+                        };
                         let (out, written) = answer(&sql);
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
@@ -2798,20 +3134,33 @@ mod tests {
     /// insert is what lets a replay count what already landed.
     #[test]
     fn unit_order_mark_insert_state() {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let s = ChStore::connect(&mock_ch().await).unwrap();
-            let w = one_insert_window();
-            let keys = vec![s.lease_key("t")];
-            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
-            let (n, mark, _) =
-                apply_changelog_unit(&mut u, &Memo::default(), "t", Some(&w), &WindowId::new(10, 20), "sid")
-                    .await
-                    .unwrap();
-            assert_eq!(n, 1);
-            s.close_unit(u, "_tok", vec![mark]).await.unwrap();
-            let _ = Arc::new(Mutex::new(()));
-            assert_eq!(*s.ops.lock().unwrap(), ["read", "mark_pending", "insert", "state"]);
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let s = ChStore::connect(&mock_ch().await).unwrap();
+                let w = one_insert_window();
+                let keys = vec![s.lease_key("t")];
+                let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+                let (n, mark, _) = apply_changelog_unit(
+                    &mut u,
+                    &Memo::default(),
+                    "t",
+                    Some(&w),
+                    &WindowId::new(10, 20),
+                    "sid",
+                )
+                .await
+                .unwrap();
+                assert_eq!(n, 1);
+                s.close_unit(u, "_tok", vec![mark]).await.unwrap();
+                let _ = Arc::new(Mutex::new(()));
+                assert_eq!(
+                    *s.ops.lock().unwrap(),
+                    ["read", "mark_pending", "insert", "state"]
+                );
+            });
     }
 
     /// D8: a changelog window writes in one order — the trim, the marker, the
@@ -2825,24 +3174,92 @@ mod tests {
         use ChStep::{Append, Mark, Trim};
         let id = WindowId::new(100, 200);
         let at = |count: u64, max: Option<u32>| {
-            let l = Landed { count, max_seq: max };
-            StampFacts { all: l, from_base: l, distinct_seq: count }
+            let l = Landed {
+                count,
+                max_seq: max,
+            };
+            StampFacts {
+                all: l,
+                from_base: l,
+                distinct_seq: count,
+            }
         };
         let torn = StampFacts {
-            all: Landed { count: 2, max_seq: Some(4) },
-            from_base: Landed { count: 2, max_seq: Some(4) },
+            all: Landed {
+                count: 2,
+                max_seq: Some(4),
+            },
+            from_base: Landed {
+                count: 2,
+                max_seq: Some(4),
+            },
             distinct_seq: 2,
         };
-        let mark = |seq_base, events| Mark(MarkerRow { start: 100, seq_base, end: 200, events });
+        let mark = |seq_base, events| {
+            Mark(MarkerRow {
+                start: 100,
+                seq_base,
+                end: 200,
+                events,
+            })
+        };
         let here = Some(Pending::recorded(100, 0));
-        let cases: Vec<(&str, Option<Pending>, Option<StampFacts>, usize, Vec<ChStep>)> = vec![
-            ("R1, another writer's rows", None, Some(at(3, Some(2))), 5, vec![mark(3, 5), Append]),
-            ("R1, nothing at the stamp", None, None, 5, vec![mark(0, 5), Append]),
-            ("R2 torn", here, Some(torn), 5, vec![Trim(0), mark(0, 5), Append]),
-            ("R2 intact, resumed", here, Some(at(2, Some(1))), 5, vec![mark(0, 5), Append]),
-            ("R2 intact, all landed", here, Some(at(5, Some(4))), 5, vec![]),
-            ("R2 shorter replay", here, Some(at(8, Some(7))), 5, vec![Trim(5)]),
-            ("R2 absent member", here, Some(at(8, Some(7))), 0, vec![Trim(0)]),
+        let cases: Vec<(
+            &str,
+            Option<Pending>,
+            Option<StampFacts>,
+            usize,
+            Vec<ChStep>,
+        )> = vec![
+            (
+                "R1, another writer's rows",
+                None,
+                Some(at(3, Some(2))),
+                5,
+                vec![mark(3, 5), Append],
+            ),
+            (
+                "R1, nothing at the stamp",
+                None,
+                None,
+                5,
+                vec![mark(0, 5), Append],
+            ),
+            (
+                "R2 torn",
+                here,
+                Some(torn),
+                5,
+                vec![Trim(0), mark(0, 5), Append],
+            ),
+            (
+                "R2 intact, resumed",
+                here,
+                Some(at(2, Some(1))),
+                5,
+                vec![mark(0, 5), Append],
+            ),
+            (
+                "R2 intact, all landed",
+                here,
+                Some(at(5, Some(4))),
+                5,
+                vec![],
+            ),
+            (
+                "R2 shorter replay",
+                here,
+                Some(at(8, Some(7))),
+                5,
+                vec![Trim(5)],
+            ),
+            (
+                "R2 absent member",
+                here,
+                Some(at(8, Some(7))),
+                0,
+                vec![Trim(0)],
+            ),
             ("R2 torn, absent member", here, Some(torn), 0, vec![Trim(0)]),
             ("absent, no attempt here", None, None, 0, vec![]),
         ];
@@ -2850,7 +3267,9 @@ mod tests {
             let steps = changelog_steps(&replay_plan("t", p, f.as_ref(), &id, n_ev).unwrap());
             assert_eq!(steps, want, "{what}");
             let pos = |pred: fn(&ChStep) -> bool| steps.iter().position(pred);
-            if let (Some(m), Some(a)) = (pos(|s| matches!(s, Mark(_))), pos(|s| matches!(s, Append))) {
+            if let (Some(m), Some(a)) =
+                (pos(|s| matches!(s, Mark(_))), pos(|s| matches!(s, Append)))
+            {
                 assert!(m < a, "{what}: the marker after the rows: {steps:?}");
             }
             if let Some(t) = pos(|s| matches!(s, Trim(_))) {
@@ -2860,21 +3279,34 @@ mod tests {
 
         // The executor runs them in that order, reads first, and writes no
         // state: a torn replay of the window at 10, marked at 10 by 0.57.0.
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let url = mock_ch_with("1\t10\t0\t3\t2\t10\n", "2\t4\t2\t4\t2\n").await;
-            let s = ChStore::connect(&url).unwrap();
-            let w = one_insert_window();
-            let keys = vec![s.lease_key("t")];
-            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
-            let (_, mark, plan) =
-                apply_changelog_unit(&mut u, &Memo::default(), "t", Some(&w), &WindowId::new(10, 20), "sid")
-                    .await
-                    .unwrap();
-            assert_eq!(plan.trim_from(), Some(0));
-            assert_eq!(*s.ops.lock().unwrap(), ["read", "read", "trim", "mark_pending", "insert"]);
-            s.close_unit(u, "_tok", vec![mark]).await.unwrap();
-            assert_eq!(s.ops.lock().unwrap().last(), Some(&"state"));
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let url = mock_ch_with("1\t10\t0\t3\t2\t10\n", "2\t4\t2\t4\t2\n").await;
+                let s = ChStore::connect(&url).unwrap();
+                let w = one_insert_window();
+                let keys = vec![s.lease_key("t")];
+                let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+                let (_, mark, plan) = apply_changelog_unit(
+                    &mut u,
+                    &Memo::default(),
+                    "t",
+                    Some(&w),
+                    &WindowId::new(10, 20),
+                    "sid",
+                )
+                .await
+                .unwrap();
+                assert_eq!(plan.trim_from(), Some(0));
+                assert_eq!(
+                    *s.ops.lock().unwrap(),
+                    ["read", "read", "trim", "mark_pending", "insert"]
+                );
+                s.close_unit(u, "_tok", vec![mark]).await.unwrap();
+                assert_eq!(s.ops.lock().unwrap().last(), Some(&"state"));
+            });
     }
 
     /// A multi-member window's marks are ONE `_apitap_state` INSERT: every
@@ -2888,38 +3320,50 @@ mod tests {
     #[test]
     fn a_windows_marks_are_one_state_statement() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let writes = Arc::new(AtomicUsize::new(0));
-            let w2 = writes.clone();
-            let url = mock_with(Arc::new(move |sql: &str| {
-                if sql.contains("toUnixTimestamp64Micro(min(e))") {
-                    return (format!("{T0}\t{}\t3\n", T0 + ttl_secs() * 1_000_000), 0);
-                }
-                if sql.starts_with("INSERT INTO") && sql.contains("_apitap_state") {
-                    w2.fetch_add(1, SeqCst);
-                    // The batched form is one statement carrying three rows;
-                    // the per-mark form carries one each.
-                    let n = if sql.contains("dest_key String, dest_table String") { 3 } else { 1 };
-                    return (String::new(), n);
-                }
-                (String::new(), 1)
-            }))
-            .await;
-            let s = ChStore::connect(&url).unwrap();
-            let keys = vec![s.lease_key("t1"), s.lease_key("t2"), s.lease_key("t3")];
-            let u = s.open_unit(&keys, "_tok").await.unwrap();
-            let marks: Vec<Watermark> = keys
-                .iter()
-                .map(|k| Watermark::Set {
-                    table: k.split('.').nth(1).unwrap().to_string(),
-                    source_id: "sid".into(),
-                    lsn: 42,
-                    rows: 7,
-                })
-                .collect();
-            s.close_unit(u, "_tok", marks).await.unwrap();
-            assert_eq!(writes.load(SeqCst), 1, "a window's marks are one state INSERT");
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writes = Arc::new(AtomicUsize::new(0));
+                let w2 = writes.clone();
+                let url = mock_with(Arc::new(move |sql: &str| {
+                    if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                        return (format!("{T0}\t{}\t3\n", T0 + ttl_secs() * 1_000_000), 0);
+                    }
+                    if sql.starts_with("INSERT INTO") && sql.contains("_apitap_state") {
+                        w2.fetch_add(1, SeqCst);
+                        // The batched form is one statement carrying three rows;
+                        // the per-mark form carries one each.
+                        let n = if sql.contains("dest_key String, dest_table String") {
+                            3
+                        } else {
+                            1
+                        };
+                        return (String::new(), n);
+                    }
+                    (String::new(), 1)
+                }))
+                .await;
+                let s = ChStore::connect(&url).unwrap();
+                let keys = vec![s.lease_key("t1"), s.lease_key("t2"), s.lease_key("t3")];
+                let u = s.open_unit(&keys, "_tok").await.unwrap();
+                let marks: Vec<Watermark> = keys
+                    .iter()
+                    .map(|k| Watermark::Set {
+                        table: k.split('.').nth(1).unwrap().to_string(),
+                        source_id: "sid".into(),
+                        lsn: 42,
+                        rows: 7,
+                    })
+                    .collect();
+                s.close_unit(u, "_tok", marks).await.unwrap();
+                assert_eq!(
+                    writes.load(SeqCst),
+                    1,
+                    "a window's marks are one state INSERT"
+                );
+            });
     }
 
     /// The key table is created once per run and TRUNCATEd per window, and
@@ -2932,32 +3376,50 @@ mod tests {
     fn key_table_shape_is_read_once_per_run() {
         use crate::naming::{artifact_ident_tok, Artifact, ROOMY};
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let kt = artifact_ident_tok("t", Artifact::CdcDelete, ROOMY, "_tok");
-            let reads = Arc::new(AtomicUsize::new(0));
-            let (r2, k2) = (reads.clone(), kt.clone());
-            let url = mock_with(Arc::new(move |sql: &str| {
-                if sql.contains("toUnixTimestamp64Micro(min(e))") {
-                    return (format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000), 0);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let kt = artifact_ident_tok("t", Artifact::CdcDelete, ROOMY, "_tok");
+                let reads = Arc::new(AtomicUsize::new(0));
+                let (r2, k2) = (reads.clone(), kt.clone());
+                let url = mock_with(Arc::new(move |sql: &str| {
+                    if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                        return (format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000), 0);
+                    }
+                    if sql.contains("SELECT name, type FROM system.columns")
+                        && sql.contains(&format!("table = '{k2}'"))
+                    {
+                        r2.fetch_add(1, SeqCst);
+                        return ("id\tInt32\n".into(), 0);
+                    }
+                    (String::new(), 1)
+                }))
+                .await;
+                let s = ChStore::connect(&url).unwrap();
+                let keys = vec![s.lease_key("t")];
+                let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+                let id = ["id".to_string()];
+                for _ in 0..3 {
+                    assert_eq!(u.key_table_reset("t", &id).await.unwrap(), kt);
+                    u.insert_owned(&kt, &id, b"1\n".to_vec()).await.unwrap();
                 }
-                if sql.contains("SELECT name, type FROM system.columns") && sql.contains(&format!("table = '{k2}'")) {
-                    r2.fetch_add(1, SeqCst);
-                    return ("id\tInt32\n".into(), 0);
-                }
-                (String::new(), 1)
-            }))
-            .await;
-            let s = ChStore::connect(&url).unwrap();
-            let keys = vec![s.lease_key("t")];
-            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
-            let id = ["id".to_string()];
-            for _ in 0..3 {
-                assert_eq!(u.key_table_reset("t", &id).await.unwrap(), kt);
-                u.insert_owned(&kt, &id, b"1\n".to_vec()).await.unwrap();
-            }
-            assert_eq!(reads.load(SeqCst), 1, "the key table's columns were read again after a TRUNCATE");
-            assert_eq!(s.ops.lock().unwrap().iter().filter(|o| **o == "key_reset").count(), 3);
-        });
+                assert_eq!(
+                    reads.load(SeqCst),
+                    1,
+                    "the key table's columns were read again after a TRUNCATE"
+                );
+                assert_eq!(
+                    s.ops
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|o| **o == "key_reset")
+                        .count(),
+                    3
+                );
+            });
     }
 
     /// A cached pin is reused only while less than an eighth of its budget
@@ -2965,9 +3427,16 @@ mod tests {
     #[test]
     fn pin_reuse_window_is_an_eighth_of_the_budget() {
         let b = std::time::Duration::from_secs(150);
-        assert_eq!(reuse_cached(42, b, std::time::Duration::ZERO), Some((42, b)));
+        assert_eq!(
+            reuse_cached(42, b, std::time::Duration::ZERO),
+            Some((42, b))
+        );
         let early = b / 16;
-        assert_eq!(reuse_cached(42, b, early), Some((42, b - early)), "early reuse must shrink the budget");
+        assert_eq!(
+            reuse_cached(42, b, early),
+            Some((42, b - early)),
+            "early reuse must shrink the budget"
+        );
         assert_eq!(reuse_cached(42, b, b / 8), None, "a stale pin was reused");
         assert_eq!(reuse_cached(42, b, b), None);
     }
@@ -2978,24 +3447,28 @@ mod tests {
     #[test]
     fn pin_reads_are_amortized_across_units() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let pins = Arc::new(AtomicUsize::new(0));
-            let p2 = pins.clone();
-            let url = mock_with(Arc::new(move |sql: &str| {
-                if sql.contains("toUnixTimestamp64Micro(min(e))") {
-                    p2.fetch_add(1, SeqCst);
-                    return (format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000), 0);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let pins = Arc::new(AtomicUsize::new(0));
+                let p2 = pins.clone();
+                let url = mock_with(Arc::new(move |sql: &str| {
+                    if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                        p2.fetch_add(1, SeqCst);
+                        return (format!("{T0}\t{}\t1\n", T0 + ttl_secs() * 1_000_000), 0);
+                    }
+                    (String::new(), 1)
+                }))
+                .await;
+                let s = ChStore::connect(&url).unwrap();
+                let keys = vec![s.lease_key("t")];
+                for _ in 0..4 {
+                    drop(s.open_unit(&keys, "_tok").await.unwrap());
                 }
-                (String::new(), 1)
-            }))
-            .await;
-            let s = ChStore::connect(&url).unwrap();
-            let keys = vec![s.lease_key("t")];
-            for _ in 0..4 {
-                drop(s.open_unit(&keys, "_tok").await.unwrap());
-            }
-            assert_eq!(pins.load(SeqCst), 1, "a unit boundary re-read the lease");
-        });
+                assert_eq!(pins.load(SeqCst), 1, "a unit boundary re-read the lease");
+            });
     }
 
     /// A re-pin extends the deadline only across no gap: a read that itself
@@ -3029,58 +3502,90 @@ mod tests {
         fn num_after(sql: &str, pat: &str) -> Option<u64> {
             let at = sql.find(pat)? + pat.len();
             let rest = &sql[at..];
-            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
             rest[..end].parse().ok()
         }
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let now = Arc::new(AtomicU64::new(T0));
-            let live = Arc::new(AtomicU64::new(T0 + ttl_secs() * 1_000_000));
-            let written = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
-            let (n2, l2, w2) = (now.clone(), live.clone(), written.clone());
-            let url = mock_with(Arc::new(move |sql: &str| {
-                let (now, live) = (n2.load(SeqCst), l2.load(SeqCst));
-                if sql.contains("toUnixTimestamp64Micro(min(e))") {
-                    return (format!("{now}\t{live}\t1\n"), 0);
-                }
-                if sql.contains("SELECT name, type FROM system.columns") {
-                    return ("id\tInt32\nv\tNullable(String)\n".into(), 0);
-                }
-                if sql.contains("SELECT engine FROM system.tables") {
-                    return ("MergeTree\n".into(), 0);
-                }
-                if !sql.contains("argMax(collected, seq) = 0") {
-                    return (String::new(), 0);
-                }
-                // The fence as the server evaluates it, at `now`: the live
-                // margin, and the pinned deadline where the statement has one.
-                let live_ok = num_after(sql, "INTERVAL ").map_or(true, |m| live > now + m * 1_000_000);
-                let pinned_ok = match (
-                    num_after(sql, "toUnixTimestamp64Micro(now64(6)) + "),
-                    sql.find("toUnixTimestamp64Micro(now64(6)) + ").and_then(|i| num_after(&sql[i..], " < ")),
-                ) {
-                    (Some(x), Some(e0)) => now + x < e0,
-                    _ => true,
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let now = Arc::new(AtomicU64::new(T0));
+                let live = Arc::new(AtomicU64::new(T0 + ttl_secs() * 1_000_000));
+                let written = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
+                let (n2, l2, w2) = (now.clone(), live.clone(), written.clone());
+                let url = mock_with(Arc::new(move |sql: &str| {
+                    let (now, live) = (n2.load(SeqCst), l2.load(SeqCst));
+                    if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                        return (format!("{now}\t{live}\t1\n"), 0);
+                    }
+                    if sql.contains("SELECT name, type FROM system.columns") {
+                        return ("id\tInt32\nv\tNullable(String)\n".into(), 0);
+                    }
+                    if sql.contains("SELECT engine FROM system.tables") {
+                        return ("MergeTree\n".into(), 0);
+                    }
+                    if !sql.contains("argMax(collected, seq) = 0") {
+                        return (String::new(), 0);
+                    }
+                    // The fence as the server evaluates it, at `now`: the live
+                    // margin, and the pinned deadline where the statement has one.
+                    let live_ok =
+                        num_after(sql, "INTERVAL ").map_or(true, |m| live > now + m * 1_000_000);
+                    let pinned_ok = match (
+                        num_after(sql, "toUnixTimestamp64Micro(now64(6)) + "),
+                        sql.find("toUnixTimestamp64Micro(now64(6)) + ")
+                            .and_then(|i| num_after(&sql[i..], " < ")),
+                    ) {
+                        (Some(x), Some(e0)) => now + x < e0,
+                        _ => true,
+                    };
+                    let w = u64::from(live_ok && pinned_ok);
+                    w2.lock().unwrap().push((
+                        sql.split_whitespace().take(3).collect::<Vec<_>>().join(" "),
+                        w,
+                    ));
+                    (String::new(), w)
+                }))
+                .await;
+                let s = ChStore::connect(&url).unwrap();
+                let keys = vec![s.lease_key("t")];
+                let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+                // Stopped for longer than the margin allows, short of the TTL: no
+                // claim is possible, but this statement is fenced out.
+                now.store(
+                    T0 + (ttl_secs() - owned_margin_secs() / 2) * 1_000_000,
+                    SeqCst,
+                );
+                u.insert_owned(
+                    "t",
+                    &["id".to_string(), "v".to_string()],
+                    b"1\ta\n".to_vec(),
+                )
+                .await
+                .unwrap();
+                // The keeper's tick lands on resume: a whole TTL again.
+                live.store(now.load(SeqCst) + ttl_secs() * 1_000_000, SeqCst);
+                let mark = Watermark::Set {
+                    table: "t".into(),
+                    source_id: "sid".into(),
+                    lsn: 20,
+                    rows: 1,
                 };
-                let w = u64::from(live_ok && pinned_ok);
-                w2.lock().unwrap().push((sql.split_whitespace().take(3).collect::<Vec<_>>().join(" "), w));
-                (String::new(), w)
-            }))
-            .await;
-            let s = ChStore::connect(&url).unwrap();
-            let keys = vec![s.lease_key("t")];
-            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
-            // Stopped for longer than the margin allows, short of the TTL: no
-            // claim is possible, but this statement is fenced out.
-            now.store(T0 + (ttl_secs() - owned_margin_secs() / 2) * 1_000_000, SeqCst);
-            u.insert_owned("t", &["id".to_string(), "v".to_string()], b"1\ta\n".to_vec()).await.unwrap();
-            // The keeper's tick lands on resume: a whole TTL again.
-            live.store(now.load(SeqCst) + ttl_secs() * 1_000_000, SeqCst);
-            let mark = Watermark::Set { table: "t".into(), source_id: "sid".into(), lsn: 20, rows: 1 };
-            let r = s.close_unit(u, "_tok", vec![mark]).await;
-            let w = written.lock().unwrap().clone();
-            assert_eq!(w.first().map(|x| x.1), Some(0), "the insert was not fenced out: {w:?}");
-            assert!(matches!(r, Err(Error::Locked(_))), "a window whose insert wrote nothing was recorded: {r:?} {w:?}");
-        });
+                let r = s.close_unit(u, "_tok", vec![mark]).await;
+                let w = written.lock().unwrap().clone();
+                assert_eq!(
+                    w.first().map(|x| x.1),
+                    Some(0),
+                    "the insert was not fenced out: {w:?}"
+                );
+                assert!(
+                    matches!(r, Err(Error::Locked(_))),
+                    "a window whose insert wrote nothing was recorded: {r:?} {w:?}"
+                );
+            });
     }
 
     /// The changelog rebuild's CTAS copies the whole table into this run's
@@ -3091,46 +3596,70 @@ mod tests {
     #[test]
     fn a_slow_rebuild_keeps_a_live_claim() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let now = Arc::new(AtomicU64::new(T0));
-            let live = Arc::new(AtomicU64::new(T0 + ttl_secs() * 1_000_000));
-            let (claimed, claim_in_copy) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-            let sent = Arc::new(Mutex::new(Vec::<String>::new()));
-            let (n2, l2, c2, cc2, s2) = (now.clone(), live.clone(), claimed.clone(), claim_in_copy.clone(), sent.clone());
-            let url = mock_with(Arc::new(move |sql: &str| {
-                if sql.contains("toUnixTimestamp64Micro(min(e))") {
-                    let owned = u64::from(!c2.load(SeqCst));
-                    return (format!("{}\t{}\t{owned}\n", n2.load(SeqCst), l2.load(SeqCst)), 0);
-                }
-                s2.lock().unwrap().push(sql.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
-                if sql.starts_with("CREATE TABLE") && sql.contains(" AS SELECT ") {
-                    // The copy takes three minutes; the keeper renews under
-                    // it — unless a collector claims the row meanwhile.
-                    let t = n2.fetch_add(180_000_000, SeqCst) + 180_000_000;
-                    l2.store(t + ttl_secs() * 1_000_000, SeqCst);
-                    c2.store(cc2.load(SeqCst), SeqCst);
-                }
-                (String::new(), 0)
-            }))
-            .await;
-            let s = ChStore::connect(&url).unwrap();
-            let keys = vec![s.lease_key("t")];
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let now = Arc::new(AtomicU64::new(T0));
+                let live = Arc::new(AtomicU64::new(T0 + ttl_secs() * 1_000_000));
+                let (claimed, claim_in_copy) = (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+                let (n2, l2, c2, cc2, s2) = (
+                    now.clone(),
+                    live.clone(),
+                    claimed.clone(),
+                    claim_in_copy.clone(),
+                    sent.clone(),
+                );
+                let url = mock_with(Arc::new(move |sql: &str| {
+                    if sql.contains("toUnixTimestamp64Micro(min(e))") {
+                        let owned = u64::from(!c2.load(SeqCst));
+                        return (
+                            format!("{}\t{}\t{owned}\n", n2.load(SeqCst), l2.load(SeqCst)),
+                            0,
+                        );
+                    }
+                    s2.lock()
+                        .unwrap()
+                        .push(sql.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
+                    if sql.starts_with("CREATE TABLE") && sql.contains(" AS SELECT ") {
+                        // The copy takes three minutes; the keeper renews under
+                        // it — unless a collector claims the row meanwhile.
+                        let t = n2.fetch_add(180_000_000, SeqCst) + 180_000_000;
+                        l2.store(t + ttl_secs() * 1_000_000, SeqCst);
+                        c2.store(cc2.load(SeqCst), SeqCst);
+                    }
+                    (String::new(), 0)
+                }))
+                .await;
+                let s = ChStore::connect(&url).unwrap();
+                let keys = vec![s.lease_key("t")];
 
-            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
-            let r = u.changelog_rebuild("t", "`id`", "tuple()", "`id`").await;
-            let log = sent.lock().unwrap().clone();
-            assert!(r.is_ok(), "a live claim failed after a slow copy: {r:?} {log:?}");
-            assert!(log.iter().any(|l| l == "EXCHANGE TABLES"), "{log:?}");
+                let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+                let r = u.changelog_rebuild("t", "`id`", "tuple()", "`id`").await;
+                let log = sent.lock().unwrap().clone();
+                assert!(
+                    r.is_ok(),
+                    "a live claim failed after a slow copy: {r:?} {log:?}"
+                );
+                assert!(log.iter().any(|l| l == "EXCHANGE TABLES"), "{log:?}");
 
-            // The same copy, with the claim collected while it ran: no swap.
-            sent.lock().unwrap().clear();
-            let mut u = s.open_unit(&keys, "_tok").await.unwrap();
-            claim_in_copy.store(true, SeqCst);
-            let r = u.changelog_rebuild("t", "`id`", "tuple()", "`id`").await;
-            let log = sent.lock().unwrap().clone();
-            assert!(matches!(r, Err(Error::Locked(_))), "a collected claim swapped: {r:?} {log:?}");
-            assert!(!log.iter().any(|l| l == "EXCHANGE TABLES"), "{log:?}");
-        });
+                // The same copy, with the claim collected while it ran: no swap.
+                sent.lock().unwrap().clear();
+                let mut u = s.open_unit(&keys, "_tok").await.unwrap();
+                claim_in_copy.store(true, SeqCst);
+                let r = u.changelog_rebuild("t", "`id`", "tuple()", "`id`").await;
+                let log = sent.lock().unwrap().clone();
+                assert!(
+                    matches!(r, Err(Error::Locked(_))),
+                    "a collected claim swapped: {r:?} {log:?}"
+                );
+                assert!(!log.iter().any(|l| l == "EXCHANGE TABLES"), "{log:?}");
+            });
     }
 
     /// A unit re-reads its pin early — an eighth of the budget — so an owned
@@ -3141,10 +3670,16 @@ mod tests {
         use super::store::repin_due;
         use std::time::Duration;
         let b = Duration::from_secs(120);
-        assert!(!repin_due(Duration::from_secs(1), b, false), "a short window re-read its pin");
+        assert!(
+            !repin_due(Duration::from_secs(1), b, false),
+            "a short window re-read its pin"
+        );
         assert!(repin_due(Duration::from_secs(1), b, true));
         assert!(repin_due(Duration::from_secs(15), b, false));
-        assert!(repin_due(Duration::from_secs(40), b, false), "a statement could start with a third of the budget gone");
+        assert!(
+            repin_due(Duration::from_secs(40), b, false),
+            "a statement could start with a third of the budget gone"
+        );
     }
 
     #[test]
@@ -3170,8 +3705,13 @@ mod tests {
     #[test]
     fn a_changelog_rebuild_refuses_replicated_even_with_the_escape_hatch() {
         // ch_rebuild_ok reads no environment: the hatch cannot reach it.
-        let e = ch_rebuild_ok("orders", "ReplicatedMergeTree").unwrap_err().to_string();
-        assert!(e.contains("EXCHANGE") && e.contains("APITAP_CH_CDC_ALLOW_REPLICATED"), "{e}");
+        let e = ch_rebuild_ok("orders", "ReplicatedMergeTree")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("EXCHANGE") && e.contains("APITAP_CH_CDC_ALLOW_REPLICATED"),
+            "{e}"
+        );
         assert!(ch_rebuild_ok("orders", "MergeTree").is_ok());
         assert!(ch_rebuild_ok("orders", "").is_ok());
     }
@@ -3181,18 +3721,36 @@ mod tests {
         // The whole point: this is the spelling BigQuery already takes, and it
         // must mean the same thing here — a MONTH, never one partition per
         // timestamp, which is what the literal reading used to produce.
-        assert_eq!(ch_partition_expr(Some("created_at")), "toYYYYMM(`created_at`)");
-        assert_eq!(ch_partition_expr(Some("  occurred_at  ")), "toYYYYMM(`occurred_at`)");
-        assert_eq!(ch_partition_expr(Some("`logged_at`")), "toYYYYMM(`logged_at`)");
-        assert_eq!(ch_partition_expr(Some("_apitap_at")), "toYYYYMM(`_apitap_at`)");
+        assert_eq!(
+            ch_partition_expr(Some("created_at")),
+            "toYYYYMM(`created_at`)"
+        );
+        assert_eq!(
+            ch_partition_expr(Some("  occurred_at  ")),
+            "toYYYYMM(`occurred_at`)"
+        );
+        assert_eq!(
+            ch_partition_expr(Some("`logged_at`")),
+            "toYYYYMM(`logged_at`)"
+        );
+        assert_eq!(
+            ch_partition_expr(Some("_apitap_at")),
+            "toYYYYMM(`_apitap_at`)"
+        );
         // Nothing given, or blank: the monthly default.
         assert_eq!(ch_partition_expr(None), "toYYYYMM(_apitap_at)");
         assert_eq!(ch_partition_expr(Some("   ")), "toYYYYMM(_apitap_at)");
         // Anything that is not a plain identifier stays the caller's own
         // expression — the escape hatch survives.
         assert_eq!(ch_partition_expr(Some("toYYYYMM(ts)")), "toYYYYMM(ts)");
-        assert_eq!(ch_partition_expr(Some("toStartOfWeek(ts)")), "toStartOfWeek(ts)");
-        assert_eq!(ch_partition_expr(Some("(toYYYYMM(ts), region)")), "(toYYYYMM(ts), region)");
+        assert_eq!(
+            ch_partition_expr(Some("toStartOfWeek(ts)")),
+            "toStartOfWeek(ts)"
+        );
+        assert_eq!(
+            ch_partition_expr(Some("(toYYYYMM(ts), region)")),
+            "(toYYYYMM(ts), region)"
+        );
         assert_eq!(ch_partition_expr(Some("tuple()")), "tuple()");
     }
 

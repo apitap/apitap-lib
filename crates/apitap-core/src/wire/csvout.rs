@@ -77,7 +77,12 @@ pub(crate) fn csv_quote_into(s: &[u8], out: &mut Vec<u8>) {
 /// BigQuery CSV semantics (probed live): unquoted empty = NULL, quoted "" =
 /// empty string — so a present value that is empty or contains a delimiter,
 /// quote, or newline gets quoted; everything else rides raw.
-pub(crate) fn append_csv_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+pub(crate) fn append_csv_value(
+    raw: &[u8],
+    d: &Delivered,
+    out: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) {
     scratch.clear();
     let val: &[u8] = if raw.contains(&b'\\') {
         unescape_into(raw, scratch);
@@ -127,7 +132,6 @@ pub(crate) fn append_csv_value(raw: &[u8], d: &Delivered, out: &mut Vec<u8>, scr
         }
     }
 }
-
 
 /// Transcode record-aligned TSV bytes into CSV. Returns rows converted.
 /// NULL fields become unquoted-empty (= NULL to BigQuery; probed live), and

@@ -363,8 +363,6 @@ mod tests {
     }
 }
 
-
-
 fn bad(what: &str) -> Error {
     Error::Transfer(format!("pg binary COPY: malformed {what} field"))
 }

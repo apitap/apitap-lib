@@ -76,7 +76,11 @@ pub(crate) fn sanitized(url: &str) -> String {
         }
     };
     let (userinfo, hostport) = split_authority(rest);
-    let host = if hostport.is_empty() { "<empty>" } else { hostport };
+    let host = if hostport.is_empty() {
+        "<empty>"
+    } else {
+        hostport
+    };
     match userinfo {
         None => format!("{scheme}://{host}"),
         Some(ui) => {
@@ -87,7 +91,10 @@ pub(crate) fn sanitized(url: &str) -> String {
             let user = if user.is_empty() { "<empty>" } else { user };
             match secret {
                 None => format!("{scheme}://{user}@{host}"),
-                Some(s) => format!("{scheme}://{user}:<{} chars, hidden>@{host}", s.chars().count()),
+                Some(s) => format!(
+                    "{scheme}://{user}:<{} chars, hidden>@{host}",
+                    s.chars().count()
+                ),
             }
         }
     }
@@ -234,10 +241,7 @@ mod tests {
         ] {
             let m = err(url);
             for secret in ["hunter2", "ssw0rd", "s3cr3t", "a/b?c#d"] {
-                assert!(
-                    !m.contains(secret),
-                    "leaked {secret:?} from {url:?}:\n{m}"
-                );
+                assert!(!m.contains(secret), "leaked {secret:?} from {url:?}:\n{m}");
             }
         }
     }
@@ -348,8 +352,17 @@ mod tests {
     /// already given up on.
     #[test]
     fn nothing_here_panics_on_a_string_that_is_not_a_url() {
-        for s in ["", "://", "@", "mysql://", "mysql://@", "mysql://:@", "no-scheme-at-all",
-                  "mysql://u:p@", "🙂://🙂:🙂@🙂"] {
+        for s in [
+            "",
+            "://",
+            "@",
+            "mysql://",
+            "mysql://@",
+            "mysql://:@",
+            "no-scheme-at-all",
+            "mysql://u:p@",
+            "🙂://🙂:🙂@🙂",
+        ] {
             let _ = sanitized(s);
             let _ = err(s);
         }

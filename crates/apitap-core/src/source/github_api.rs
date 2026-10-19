@@ -64,13 +64,31 @@ struct Col {
 }
 
 const fn c(name: &'static str, udt: &'static str, ex: Ex) -> Col {
-    Col { name, udt, ex, pk: false, native: None }
+    Col {
+        name,
+        udt,
+        ex,
+        pk: false,
+        native: None,
+    }
 }
 const fn pk(name: &'static str, udt: &'static str, ex: Ex) -> Col {
-    Col { name, udt, ex, pk: true, native: None }
+    Col {
+        name,
+        udt,
+        ex,
+        pk: true,
+        native: None,
+    }
 }
 const fn pk_bounded(name: &'static str, udt: &'static str, ex: Ex, native: &'static str) -> Col {
-    Col { name, udt, ex, pk: true, native: Some(native) }
+    Col {
+        name,
+        udt,
+        ex,
+        pk: true,
+        native: Some(native),
+    }
 }
 
 struct Entity {
@@ -159,11 +177,23 @@ const ENTITIES: &[Entity] = &[
         cols: &[
             // 40 hex today; 64 covers SHA-256 object format.
             pk_bounded("sha", "text", Ex::Txt(&["sha"]), "character varying(64)"),
-            c("author_name", "text", Ex::Txt(&["commit", "author", "name"])),
+            c(
+                "author_name",
+                "text",
+                Ex::Txt(&["commit", "author", "name"]),
+            ),
             c("author_login", "text", Ex::Txt(&["author", "login"])),
             c("message", "text", Ex::Txt(&["commit", "message"])),
-            c("authored_at", "timestamptz", Ex::Ts(&["commit", "author", "date"])),
-            c("committed_at", "timestamptz", Ex::Ts(&["commit", "committer", "date"])),
+            c(
+                "authored_at",
+                "timestamptz",
+                Ex::Ts(&["commit", "author", "date"]),
+            ),
+            c(
+                "committed_at",
+                "timestamptz",
+                Ex::Ts(&["commit", "committer", "date"]),
+            ),
             c("raw", "jsonb", Ex::Raw),
         ],
     },
@@ -301,7 +331,11 @@ fn entity(name: &str) -> Result<&'static Entity> {
     ENTITIES.iter().find(|e| e.name == name).ok_or_else(|| {
         Error::InvalidInput(format!(
             "unknown github+api table '{name}' (tables: {})",
-            ENTITIES.iter().map(|e| e.name).collect::<Vec<_>>().join(", ")
+            ENTITIES
+                .iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
     })
 }
@@ -362,8 +396,8 @@ fn env_nonempty(name: &str) -> Option<String> {
 
 impl GithubApiSource {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        let u = reqwest::Url::parse(url)
-            .map_err(|e| crate::urlerr::bad_url("github url", url, e))?;
+        let u =
+            reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("github url", url, e))?;
         let owner = u
             .host_str()
             .filter(|s| !s.is_empty())
@@ -394,7 +428,12 @@ impl GithubApiSource {
         })
     }
 
-    async fn send(&self, url: String, accept: Option<&str>, what: &str) -> Result<reqwest::Response> {
+    async fn send(
+        &self,
+        url: String,
+        accept: Option<&str>,
+        what: &str,
+    ) -> Result<reqwest::Response> {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -442,8 +481,7 @@ impl GithubApiSource {
                             });
                         if let Some(w) = wait {
                             if w <= 120 {
-                                tokio::time::sleep(std::time::Duration::from_secs(w.max(1)))
-                                    .await;
+                                tokio::time::sleep(std::time::Duration::from_secs(w.max(1))).await;
                                 continue;
                             }
                         }
@@ -531,7 +569,9 @@ fn next_page(
     pages: u64,
     cap: u64,
 ) -> Result<Option<String>> {
-    let Some(n) = next.filter(|_| !empty) else { return Ok(None) };
+    let Some(n) = next.filter(|_| !empty) else {
+        return Ok(None);
+    };
     if n == cur {
         return Err(Error::Transfer(format!(
             "github+api {entity}: the next page link points at the page just read ({cur})"
@@ -594,7 +634,6 @@ fn strip_json_nul(s: String) -> String {
         s
     }
 }
-
 
 /// True when this column's extraction would come up NULL for the object.
 fn extract_is_null(item: &Value, col: &Col) -> bool {
@@ -813,7 +852,10 @@ impl Source for GithubApiSource {
                 .iter()
                 .map(|c| LaneCol {
                     delivered: match c.udt.as_str() {
-                        "int8" => Delivered::Int { bytes: 8, unsigned: false },
+                        "int8" => Delivered::Int {
+                            bytes: 8,
+                            unsigned: false,
+                        },
                         "bool" => Delivered::Bool,
                         "timestamptz" => Delivered::DateTime { utc: true },
                         "jsonb" => Delivered::Json,
@@ -880,7 +922,12 @@ impl Source for GithubApiSource {
         pipes
             .run_inline(
                 stmts,
-                GhApiBody { src: self, plan, lane, chunk },
+                GhApiBody {
+                    src: self,
+                    plan,
+                    lane,
+                    chunk,
+                },
             )
             .await
     }
@@ -905,10 +952,13 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
         let strict = stmt["strict"].as_bool().unwrap_or(true);
         let cursor_col = stmt["cursor"].as_str().map(str::to_string);
         let cursor_path: Option<&'static [&'static str]> = cursor_col.as_deref().and_then(|cc| {
-            e.cols.iter().find(|c| c.name == cc).and_then(|c| match c.ex {
-                Ex::Ts(p) => Some(p),
-                _ => None,
-            })
+            e.cols
+                .iter()
+                .find(|c| c.name == cc)
+                .and_then(|c| match c.ex {
+                    Ex::Ts(p) => Some(p),
+                    _ => None,
+                })
         });
 
         // RowBinary lane: run the pgcopy stream through the same transcoder the
@@ -1041,11 +1091,22 @@ mod tests {
     #[test]
     fn paging_has_an_end() {
         let n = |u: &str| Some(u.to_string());
-        assert_eq!(super::next_page("issues", "a", n("b"), false, 1, 5).unwrap(), n("b"));
-        assert_eq!(super::next_page("issues", "a", n("b"), true, 1, 5).unwrap(), None);
-        assert_eq!(super::next_page("issues", "a", None, false, 1, 5).unwrap(), None);
+        assert_eq!(
+            super::next_page("issues", "a", n("b"), false, 1, 5).unwrap(),
+            n("b")
+        );
+        assert_eq!(
+            super::next_page("issues", "a", n("b"), true, 1, 5).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::next_page("issues", "a", None, false, 1, 5).unwrap(),
+            None
+        );
         assert!(super::next_page("issues", "a", n("a"), false, 1, 5).is_err());
-        let e = super::next_page("issues", "a", n("b"), false, 5, 5).unwrap_err().to_string();
+        let e = super::next_page("issues", "a", n("b"), false, 5, 5)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("APITAP_GITHUB_MAX_PAGES"), "{e}");
     }
 
@@ -1053,7 +1114,10 @@ mod tests {
     /// client-set committer dates silently freezes or skips.
     #[test]
     fn the_commits_entity_is_replace_only() {
-        let e = super::ENTITIES.iter().find(|e| e.name == "commits").unwrap();
+        let e = super::ENTITIES
+            .iter()
+            .find(|e| e.name == "commits")
+            .unwrap();
         assert!(
             e.cursor.is_none(),
             "committer dates are client-set and non-monotonic; an incremental \
@@ -1148,7 +1212,8 @@ mod tests {
             // cannot be indexed — the route would refuse at prepare().
             for col in e.cols.iter().filter(|c| c.pk && c.udt == "text") {
                 assert!(
-                    col.native.is_some_and(|n| n.starts_with("character varying(")),
+                    col.native
+                        .is_some_and(|n| n.starts_with("character varying(")),
                     "{}.{} is a text PK without a bounded native type",
                     e.name,
                     col.name

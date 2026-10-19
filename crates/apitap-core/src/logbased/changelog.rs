@@ -78,7 +78,12 @@ pub(crate) struct Changes {
 
 impl Changes {
     pub(crate) fn new(layout: Arc<Layout>) -> Self {
-        Self { events: Vec::new(), count: 0, masked: false, layout }
+        Self {
+            events: Vec::new(),
+            count: 0,
+            masked: false,
+            layout,
+        }
     }
 
     /// The window this accumulated, with its layout.
@@ -97,7 +102,11 @@ impl Changes {
     pub(crate) fn insert(&mut self, row: Tuple) {
         self.count += 1;
         self.note_mask(&row);
-        self.events.push(Change { op: ChangeOp::Insert, row: Some(row), moved_from: None });
+        self.events.push(Change {
+            op: ChangeOp::Insert,
+            row: Some(row),
+            moved_from: None,
+        });
     }
 
     /// An update lands as ONE `U` carrying the new image. A PK-changing update
@@ -113,16 +122,28 @@ impl Changes {
         if let Some(old) = old {
             let from = key_of(old, pk_idx);
             if from != key_of(&row, pk_idx) {
-                self.events.push(Change { op: ChangeOp::Delete, row: Some(old.clone()), moved_from: None });
+                self.events.push(Change {
+                    op: ChangeOp::Delete,
+                    row: Some(old.clone()),
+                    moved_from: None,
+                });
                 moved_from = Some(Box::new(from));
             }
         }
-        self.events.push(Change { op: ChangeOp::Update, row: Some(row), moved_from });
+        self.events.push(Change {
+            op: ChangeOp::Update,
+            row: Some(row),
+            moved_from,
+        });
     }
 
     pub(crate) fn delete(&mut self, old: Tuple) {
         self.count += 1;
-        self.events.push(Change { op: ChangeOp::Delete, row: Some(old), moved_from: None });
+        self.events.push(Change {
+            op: ChangeOp::Delete,
+            row: Some(old),
+            moved_from: None,
+        });
     }
 
     /// Which keys carry a masked cell, and the union of the columns they are
@@ -276,7 +297,11 @@ impl Changes {
     /// row of that table older than the truncate as gone.
     pub(crate) fn truncate(&mut self) {
         self.count += 1;
-        self.events.push(Change { op: ChangeOp::Truncate, row: None, moved_from: None });
+        self.events.push(Change {
+            op: ChangeOp::Truncate,
+            row: None,
+            moved_from: None,
+        });
     }
 }
 
@@ -328,7 +353,12 @@ mod tests {
         let ops: Vec<ChangeOp> = c.events.iter().map(|e| e.op).collect();
         assert_eq!(
             ops,
-            vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Update, ChangeOp::Delete]
+            vec![
+                ChangeOp::Insert,
+                ChangeOp::Update,
+                ChangeOp::Update,
+                ChangeOp::Delete
+            ]
         );
     }
 
@@ -342,7 +372,10 @@ mod tests {
         assert_eq!(c.count, 1);
         // The U half names where the row was; the D half is that key itself.
         assert_eq!(c.events[0].moved_from, None);
-        assert_eq!(c.events[1].moved_from.as_deref(), Some(&vec![b"1".to_vec()]));
+        assert_eq!(
+            c.events[1].moved_from.as_deref(),
+            Some(&vec![b"1".to_vec()])
+        );
     }
 
     #[test]
@@ -358,11 +391,19 @@ mod tests {
     /// Rows are `id, title, body`, keyed on id, `body` the TOASTed column. The
     /// rebuilt rows' `body` by event index, or the error's text; `base` is the
     /// destination's `body` per key.
-    fn bodies(c: &Changes, base: &[(&str, &str)]) -> std::result::Result<Vec<(usize, String)>, String> {
+    fn bodies(
+        c: &Changes,
+        base: &[(&str, &str)],
+    ) -> std::result::Result<Vec<(usize, String)>, String> {
         let (_, cols) = c.mask_plan();
         let base: HashMap<CKey, Vec<Option<bytes::Bytes>>> = base
             .iter()
-            .map(|(k, v)| (vec![k.as_bytes().to_vec()], vec![Some(bytes::Bytes::copy_from_slice(v.as_bytes()))]))
+            .map(|(k, v)| {
+                (
+                    vec![k.as_bytes().to_vec()],
+                    vec![Some(bytes::Bytes::copy_from_slice(v.as_bytes()))],
+                )
+            })
             .collect();
         let fixed = c.resolve_masked(&cols, &base).map_err(|e| e.to_string())?;
         let mut out: Vec<(usize, String)> = fixed
@@ -388,7 +429,10 @@ mod tests {
         let key_only = |k: &str| row(&[t(k), Cell::Null, Cell::Null]); // REPLICA IDENTITY DEFAULT
         let masked = |k: &str, title: &str| row(&[t(k), t(title), Cell::UnchangedToast]);
         let torn = |r: std::result::Result<Vec<(usize, String)>, String>| {
-            assert!(matches!(&r, Err(m) if m.contains("torn")), "want the torn error, got {r:?}")
+            assert!(
+                matches!(&r, Err(m) if m.contains("torn")),
+                "want the torn error, got {r:?}"
+            )
         };
 
         // (a) the window carried key 1's body (a full old image, as under
@@ -400,7 +444,10 @@ mod tests {
         b.update(Some(&key_only("1")), masked("9", "b"));
         assert_eq!(
             [bodies(&a, &[]), bodies(&b, &[("1", "OLD")])],
-            [Ok(vec![(2, "BIG".to_string())]), Ok(vec![(1, "OLD".to_string())])]
+            [
+                Ok(vec![(2, "BIG".to_string())]),
+                Ok(vec![(1, "OLD".to_string())])
+            ]
         );
         // …so the window's one readback asks for key 1, not 9.
         assert_eq!(b.mask_plan(), (vec![vec![b"1".to_vec()]], vec![2]));
@@ -436,7 +483,11 @@ mod tests {
         f.update(None, masked("5", "d")); // U 4
         assert_eq!(
             bodies(&f, &[("1", "OLD")]),
-            Ok(vec![(1, "OLD".to_string()), (3, "OLD".to_string()), (4, "OLD".to_string())])
+            Ok(vec![
+                (1, "OLD".to_string()),
+                (3, "OLD".to_string()),
+                (4, "OLD".to_string())
+            ])
         );
     }
 
@@ -444,7 +495,7 @@ mod tests {
     fn masked_cells_are_rebuilt_from_the_window_then_the_destination() {
         // id, title, body — body is the TOASTed column.
         let mut c = three();
-        c.insert(row(&[t("1"), t("a"), t("BIG")]));               // full image
+        c.insert(row(&[t("1"), t("a"), t("BIG")])); // full image
         c.update(None, row(&[t("1"), t("a2"), Cell::UnchangedToast]));
         c.update(None, row(&[t("2"), t("b"), Cell::UnchangedToast]));
         assert!(c.masked);
@@ -454,7 +505,10 @@ mod tests {
 
         // key 2 was never seen in this window, so it comes from the readback.
         let mut base = HashMap::new();
-        base.insert(vec![b"2".to_vec()], vec![Some(bytes::Bytes::from_static(b"OLD"))]);
+        base.insert(
+            vec![b"2".to_vec()],
+            vec![Some(bytes::Bytes::from_static(b"OLD"))],
+        );
         let fixed = c.resolve_masked(&cols, &base).unwrap();
 
         // Event 0 carried everything; only the two masked updates are rebuilt.
@@ -500,6 +554,9 @@ mod tests {
         c.truncate();
         c.insert(row(&[t("2"), t("b")]));
         let ops: Vec<ChangeOp> = c.events.iter().map(|e| e.op).collect();
-        assert_eq!(ops, vec![ChangeOp::Insert, ChangeOp::Truncate, ChangeOp::Insert]);
+        assert_eq!(
+            ops,
+            vec![ChangeOp::Insert, ChangeOp::Truncate, ChangeOp::Insert]
+        );
     }
 }

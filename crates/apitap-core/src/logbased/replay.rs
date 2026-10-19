@@ -60,11 +60,17 @@ pub(crate) struct Pending {
 
 impl Pending {
     pub(crate) fn recorded(start: u64, seq_base: u32) -> Self {
-        Self { start, seq_base: Some(seq_base) }
+        Self {
+            start,
+            seq_base: Some(seq_base),
+        }
     }
 
     pub(crate) fn legacy(start: u64) -> Self {
-        Self { start, seq_base: None }
+        Self {
+            start,
+            seq_base: None,
+        }
     }
 
     /// The base the facts are counted from: a legacy attempt numbered from 0.
@@ -143,7 +149,10 @@ impl ReplayPlan {
 
     /// `_apitap_seq` of the event at `ordinal`.
     pub(crate) fn seq_of(&self, ordinal: usize) -> u32 {
-        debug_assert!(self.to_append().contains(&ordinal), "{ordinal} is not appended by {self:?}");
+        debug_assert!(
+            self.to_append().contains(&ordinal),
+            "{ordinal} is not appended by {self:?}"
+        );
         // `replay_plan` proved `seq_base + events` fits.
         self.seq_base + ordinal as u32
     }
@@ -231,15 +240,19 @@ pub(crate) fn replay_plan(
             // so an interrupted attempt normally leaves `base..base+n`. Only
             // count == span proves it.
             let prefix = n == 0
-                || u32::try_from(n - 1).ok().and_then(|k| base.checked_add(k)).is_some_and(|last| {
-                    f.from_base.max_seq == Some(last)
-                });
+                || u32::try_from(n - 1)
+                    .ok()
+                    .and_then(|k| base.checked_add(k))
+                    .is_some_and(|last| f.from_base.max_seq == Some(last));
             if !prefix {
                 (base, 0, Some(base), n_ev > 0)
             } else if n <= n_ev as u64 {
                 (base, n as usize, None, n < n_ev as u64)
             } else {
-                let t = u32::try_from(n_ev).ok().and_then(|k| base.checked_add(k)).ok_or_else(|| overflow(base))?;
+                let t = u32::try_from(n_ev)
+                    .ok()
+                    .and_then(|k| base.checked_add(k))
+                    .ok_or_else(|| overflow(base))?;
                 (base, n_ev, Some(t), false)
             }
         }
@@ -251,12 +264,25 @@ pub(crate) fn replay_plan(
             (base, 0, None, n_ev > 0)
         }
     };
-    u32::try_from(n_ev).ok().and_then(|k| seq_base.checked_add(k)).ok_or_else(|| overflow(seq_base))?;
-    Ok(ReplayPlan { stamp: id.start, seq_base, skip, events: n_ev, trim_from, mark, watermark: id.end })
+    u32::try_from(n_ev)
+        .ok()
+        .and_then(|k| seq_base.checked_add(k))
+        .ok_or_else(|| overflow(seq_base))?;
+    Ok(ReplayPlan {
+        stamp: id.start,
+        seq_base,
+        skip,
+        events: n_ev,
+        trim_from,
+        mark,
+        watermark: id.end,
+    })
 }
 
 fn unreadable(what: &str, v: &str) -> Error {
-    Error::Transfer(format!("log_based: the destination answered {v:?} for {what}"))
+    Error::Transfer(format!(
+        "log_based: the destination answered {v:?} for {what}"
+    ))
 }
 
 fn count_of(what: &str, v: &str) -> Result<u64> {
@@ -275,7 +301,12 @@ fn max_of(what: &str, v: &str) -> Result<Option<u32>> {
 /// count, then the newest marker's start, base and event count. No marker is
 /// `None`; an `events` of 0 is a marker 0.56.0 wrote. Anything unreadable is
 /// an error, never "no marker": that reading appends a replay again.
-pub(crate) fn parse_pending(n: &str, lsn: &str, seq_base: &str, events: &str) -> Result<Option<Pending>> {
+pub(crate) fn parse_pending(
+    n: &str,
+    lsn: &str,
+    seq_base: &str,
+    events: &str,
+) -> Result<Option<Pending>> {
     if count_of("the marker count", n)? == 0 {
         return Ok(None);
     }
@@ -296,7 +327,10 @@ pub(crate) fn parse_facts(cells: &[&str]) -> Result<StampFacts> {
         return Err(unreadable("a stamp's facts", &cells.join("\t")));
     };
     let landed = |n: &str, mx: &str| -> Result<Landed> {
-        let l = Landed { count: count_of("a stamp's row count", n)?, max_seq: max_of("a stamp's max seq", mx)? };
+        let l = Landed {
+            count: count_of("a stamp's row count", n)?,
+            max_seq: max_of("a stamp's max seq", mx)?,
+        };
         // A count with no max, or a max over nothing, is not a row this
         // query can return: the columns are misread.
         if (l.count == 0) != l.max_seq.is_none() {
@@ -347,7 +381,9 @@ pub(crate) enum Ask {
     /// The newest marker and the ceiling (then `probed`, then `ask` again).
     Probe,
     /// The facts at this window's stamp, counted from `base`.
-    Facts { base: u32 },
+    Facts {
+        base: u32,
+    },
     Nothing,
 }
 
@@ -358,9 +394,13 @@ impl Memo {
 
     pub(crate) fn ask(&self, t: &str, sid: &str, id: &WindowId) -> Ask {
         let m = self.0.lock().unwrap();
-        let Some(s) = m.get(&Self::key(t, sid)) else { return Ask::Probe };
+        let Some(s) = m.get(&Self::key(t, sid)) else {
+            return Ask::Probe;
+        };
         match (s.pending, s.ceiling) {
-            (Some(p), _) if p.start == id.start => Ask::Facts { base: p.query_base() },
+            (Some(p), _) if p.start == id.start => Ask::Facts {
+                base: p.query_base(),
+            },
             (_, Some(c)) if c >= id.start => Ask::Facts { base: 0 },
             _ => Ask::Nothing,
         }
@@ -368,8 +408,17 @@ impl Memo {
 
     /// The probe's answer: the newest marker, and the highest non-baseline
     /// stamp (`None` for a log with no event yet).
-    pub(crate) fn probed(&self, t: &str, sid: &str, pending: Option<Pending>, ceiling: Option<u64>) {
-        self.0.lock().unwrap().insert(Self::key(t, sid), Seen { pending, ceiling });
+    pub(crate) fn probed(
+        &self,
+        t: &str,
+        sid: &str,
+        pending: Option<Pending>,
+        ceiling: Option<u64>,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(Self::key(t, sid), Seen { pending, ceiling });
     }
 
     /// `replay_plan` over what this memo holds and the facts it asked for.
@@ -384,7 +433,9 @@ impl Memo {
         let pending = match self.0.lock().unwrap().get(&Self::key(t, sid)) {
             Some(s) => s.pending,
             None => {
-                return Err(Error::Transfer(format!("log_based: {t}: internal: a changelog plan before its probe")))
+                return Err(Error::Transfer(format!(
+                    "log_based: {t}: internal: a changelog plan before its probe"
+                )))
             }
         };
         replay_plan(t, pending, f, id, events)
@@ -431,8 +482,15 @@ mod tests {
             id: &WindowId,
             n_ev: usize,
         ) -> Result<ReplayPlan> {
-            let only_watermark =
-                ReplayPlan { stamp: id.start, seq_base: 0, skip: n_ev, events: n_ev, trim_from: None, mark: false, watermark: id.end };
+            let only_watermark = ReplayPlan {
+                stamp: id.start,
+                seq_base: 0,
+                skip: n_ev,
+                events: n_ev,
+                trim_from: None,
+                mark: false,
+                watermark: id.end,
+            };
             // :847-850 — no event for this table: the watermark and nothing else.
             if n_ev == 0 {
                 return Ok(only_watermark);
@@ -455,7 +513,15 @@ mod tests {
                 return Ok(only_watermark);
             }
             // :898, :938 — seq is the ordinal from 0, whatever the stamp holds.
-            Ok(ReplayPlan { stamp: id.start, seq_base: 0, skip, events: n_ev, trim_from: None, mark: true, watermark: id.end })
+            Ok(ReplayPlan {
+                stamp: id.start,
+                seq_base: 0,
+                skip,
+                events: n_ev,
+                trim_from: None,
+                mark: true,
+                watermark: id.end,
+            })
         }
 
         /// 0.56.0 kept nothing between windows: every window read its table's
@@ -466,14 +532,28 @@ mod tests {
 
         impl Memo {
             pub(in super::super) fn ask(&self, t: &str, sid: &str, id: &WindowId) -> Ask {
-                match self.0.lock().unwrap().get(&(t.to_string(), sid.to_string())) {
+                match self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get(&(t.to_string(), sid.to_string()))
+                {
                     None => Ask::Probe,
                     Some(Some(p)) if p.start == id.start => Ask::Facts { base: 0 },
                     Some(_) => Ask::Nothing,
                 }
             }
-            pub(in super::super) fn probed(&self, t: &str, sid: &str, p: Option<Pending>, _ceiling: Option<u64>) {
-                self.0.lock().unwrap().insert((t.to_string(), sid.to_string()), p);
+            pub(in super::super) fn probed(
+                &self,
+                t: &str,
+                sid: &str,
+                p: Option<Pending>,
+                _ceiling: Option<u64>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert((t.to_string(), sid.to_string()), p);
             }
             /// The marker read is used up: the next window reads it again.
             pub(in super::super) fn plan(
@@ -484,28 +564,53 @@ mod tests {
                 id: &WindowId,
                 events: usize,
             ) -> Result<ReplayPlan> {
-                let p = self.0.lock().unwrap().remove(&(t.to_string(), sid.to_string())).flatten();
+                let p = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .remove(&(t.to_string(), sid.to_string()))
+                    .flatten();
                 replay_plan(t, p, f, id, events)
             }
             pub(in super::super) fn committed(&self, _t: &str, _sid: &str, _plan: &ReplayPlan) {}
             pub(in super::super) fn forget(&self, t: &str, sid: &str) {
-                self.0.lock().unwrap().remove(&(t.to_string(), sid.to_string()));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .remove(&(t.to_string(), sid.to_string()));
             }
         }
 
         /// :324-337 — `toString(argMax(lsn, at))`, parsed with `.ok()`: an
         /// empty table answers "0", which reads as a marker at 0, and junk
         /// reads as no marker.
-        pub(in super::super) fn parse_pending(_n: &str, lsn: &str, _base: &str, _events: &str) -> Result<Option<Pending>> {
+        pub(in super::super) fn parse_pending(
+            _n: &str,
+            lsn: &str,
+            _base: &str,
+            _events: &str,
+        ) -> Result<Option<Pending>> {
             Ok(lsn.trim().parse::<u64>().ok().map(Pending::legacy))
         }
 
         /// :351-382 — each cell `unwrap_or(0)`: a missing max and junk both
         /// read as 0. It counted every row at the stamp, from 0.
         pub(in super::super) fn parse_facts(cells: &[&str]) -> Result<StampFacts> {
-            let num = |i: usize| cells.get(i).and_then(|c| c.trim().parse::<u64>().ok()).unwrap_or(0);
-            let all = Landed { count: num(0), max_seq: Some(num(1) as u32) };
-            Ok(StampFacts { all, from_base: all, distinct_seq: all.count })
+            let num = |i: usize| {
+                cells
+                    .get(i)
+                    .and_then(|c| c.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            let all = Landed {
+                count: num(0),
+                max_seq: Some(num(1) as u32),
+            };
+            Ok(StampFacts {
+                all,
+                from_base: all,
+                distinct_seq: all.count,
+            })
         }
     }
 
@@ -522,8 +627,12 @@ mod tests {
 
     /// A stamp holding only an attempt of this window, numbered from `base`.
     fn attempt(base: u32, count: u64, max_seq: Option<u32>) -> StampFacts {
-        StampFacts { all: landed(count, max_seq), from_base: landed(count, max_seq), distinct_seq: count }
-            .with_base(base)
+        StampFacts {
+            all: landed(count, max_seq),
+            from_base: landed(count, max_seq),
+            distinct_seq: count,
+        }
+        .with_base(base)
     }
 
     impl StampFacts {
@@ -540,7 +649,11 @@ mod tests {
     /// Another writer's rows at the stamp, seq 0..count.
     fn foreign(count: u64) -> StampFacts {
         let l = landed(count, count.checked_sub(1).map(|m| m as u32));
-        StampFacts { all: l, from_base: l, distinct_seq: count }
+        StampFacts {
+            all: l,
+            from_base: l,
+            distinct_seq: count,
+        }
     }
 
     #[test]
@@ -549,9 +662,14 @@ mod tests {
         // carries 60. The 40 it does not carry come back in the next window
         // under that window's own stamp, so they must not stay at this one.
         for p in [Pending::recorded(S, 0), Pending::legacy(S)] {
-            let plan = plan_rule("t", Some(p), Some(&attempt(0, 100, Some(99))), &id(), 60).unwrap();
+            let plan =
+                plan_rule("t", Some(p), Some(&attempt(0, 100, Some(99))), &id(), 60).unwrap();
             assert_eq!(plan.to_append(), 60..60, "{p:?}");
-            assert_eq!(plan.trim_from(), Some(60), "{p:?}: the tail the replay does not carry stayed");
+            assert_eq!(
+                plan.trim_from(),
+                Some(60),
+                "{p:?}: the tail the replay does not carry stayed"
+            );
             assert_eq!(plan.marker(), None, "{p:?}");
             assert_eq!((plan.stamp(), plan.watermark()), (S, E), "{p:?}");
         }
@@ -566,13 +684,34 @@ mod tests {
         // D2: 40 rows another writer left at this stamp (a 0.55.x window
         // stamped with its end), and no marker here — none at all, or an
         // earlier window's. This window numbers above them.
-        for p in [None, Some(Pending::recorded(S - 1, 0)), Some(Pending::legacy(S - 1))] {
+        for p in [
+            None,
+            Some(Pending::recorded(S - 1, 0)),
+            Some(Pending::legacy(S - 1)),
+        ] {
             let plan = plan_rule("t", p, Some(&foreign(40)), &id(), 5).unwrap();
             assert_eq!(plan.to_append(), 0..5, "{p:?}");
-            assert_eq!(plan.seq_of(0), 40, "{p:?}: seq restarted under the rows already at the stamp");
+            assert_eq!(
+                plan.seq_of(0),
+                40,
+                "{p:?}: seq restarted under the rows already at the stamp"
+            );
             assert_eq!(plan.seq_of(4), 44, "{p:?}");
-            assert_eq!(plan.trim_from(), None, "{p:?}: another writer's rows were trimmed");
-            assert_eq!(plan.marker(), Some(MarkerRow { start: S, seq_base: 40, end: E, events: 5 }), "{p:?}");
+            assert_eq!(
+                plan.trim_from(),
+                None,
+                "{p:?}: another writer's rows were trimmed"
+            );
+            assert_eq!(
+                plan.marker(),
+                Some(MarkerRow {
+                    start: S,
+                    seq_base: 40,
+                    end: E,
+                    events: 5
+                }),
+                "{p:?}"
+            );
         }
         // Nothing at the stamp (no facts asked, or none found): from 0.
         for f in [None, Some(foreign(0))] {
@@ -581,7 +720,10 @@ mod tests {
         }
         // A window with nothing for this table and no attempt here: nothing.
         let plan = plan_rule("t", None, Some(&foreign(40)), &id(), 0).unwrap();
-        assert_eq!((plan.to_append(), plan.trim_from(), plan.marker()), (0..0, None, None));
+        assert_eq!(
+            (plan.to_append(), plan.trim_from(), plan.marker()),
+            (0..0, None, None)
+        );
     }
 
     #[test]
@@ -590,44 +732,112 @@ mod tests {
         // resume: trim everything from the base, append the window again. The
         // rows the trim leaves are foreign; the append reuses exactly the
         // attempt's seqs, so no pair repeats.
-        let f = StampFacts { all: landed(50, Some(60)), from_base: landed(50, Some(60)), distinct_seq: 50 };
+        let f = StampFacts {
+            all: landed(50, Some(60)),
+            from_base: landed(50, Some(60)),
+            distinct_seq: 50,
+        };
         for p in [Pending::recorded(S, 0), Pending::legacy(S)] {
             let plan = plan_rule("t", Some(p), Some(&f), &id(), 80).unwrap();
-            assert_eq!(plan.trim_from(), Some(0), "{p:?}: the torn attempt stays beside its re-append");
+            assert_eq!(
+                plan.trim_from(),
+                Some(0),
+                "{p:?}: the torn attempt stays beside its re-append"
+            );
             assert_eq!(plan.to_append(), 0..80, "{p:?}");
             assert_eq!(plan.seq_of(0), 0, "{p:?}");
             assert!(plan.marker().is_some(), "{p:?}");
         }
         // Above a base of 5: the foreign 0..4 stay.
-        let f = StampFacts { all: landed(55, Some(60)), from_base: landed(50, Some(60)), distinct_seq: 55 };
+        let f = StampFacts {
+            all: landed(55, Some(60)),
+            from_base: landed(50, Some(60)),
+            distinct_seq: 55,
+        };
         let plan = plan_rule("t", Some(Pending::recorded(S, 5)), Some(&f), &id(), 80).unwrap();
-        assert_eq!((plan.trim_from(), plan.to_append(), plan.seq_of(0)), (Some(5), 0..80, 5));
+        assert_eq!(
+            (plan.trim_from(), plan.to_append(), plan.seq_of(0)),
+            (Some(5), 0..80, 5)
+        );
         // Torn, and the replay no longer carries the table: trim only.
         let plan = plan_rule("t", Some(Pending::recorded(S, 5)), Some(&f), &id(), 0).unwrap();
-        assert_eq!((plan.trim_from(), plan.to_append(), plan.marker()), (Some(5), 0..0, None));
+        assert_eq!(
+            (plan.trim_from(), plan.to_append(), plan.marker()),
+            (Some(5), 0..0, None)
+        );
     }
 
     #[test]
     fn intact_resumes() {
         // D4: 30 of 100 landed as a prefix: resume at the 31st, re-mark.
-        let plan = plan_rule("t", Some(Pending::legacy(S)), Some(&attempt(0, 30, Some(29))), &id(), 100).unwrap();
-        assert_eq!((plan.to_append(), plan.seq_of(30), plan.trim_from()), (30..100, 30, None));
-        assert_eq!(plan.marker(), Some(MarkerRow { start: S, seq_base: 0, end: E, events: 100 }));
+        let plan = plan_rule(
+            "t",
+            Some(Pending::legacy(S)),
+            Some(&attempt(0, 30, Some(29))),
+            &id(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            (plan.to_append(), plan.seq_of(30), plan.trim_from()),
+            (30..100, 30, None)
+        );
+        assert_eq!(
+            plan.marker(),
+            Some(MarkerRow {
+                start: S,
+                seq_base: 0,
+                end: E,
+                events: 100
+            })
+        );
         // The same attempt numbered from 7, above 7 foreign rows: the prefix
         // is counted from the base, and 0.56.0 — counting every row at the
         // stamp — resumed at the 38th and lost seven events.
         let f = attempt(7, 30, Some(36));
         assert_eq!(f.all.count, 37);
         let plan = plan_rule("t", Some(Pending::recorded(S, 7)), Some(&f), &id(), 100).unwrap();
-        assert_eq!(plan.to_append(), 30..100, "resumed past events that never landed");
+        assert_eq!(
+            plan.to_append(),
+            30..100,
+            "resumed past events that never landed"
+        );
         assert_eq!((plan.seq_of(30), plan.trim_from()), (37, None));
-        assert_eq!(plan.marker(), Some(MarkerRow { start: S, seq_base: 7, end: E, events: 100 }));
+        assert_eq!(
+            plan.marker(),
+            Some(MarkerRow {
+                start: S,
+                seq_base: 7,
+                end: E,
+                events: 100
+            })
+        );
         // Everything landed: nothing to append, nothing to mark.
-        let plan = plan_rule("t", Some(Pending::recorded(S, 0)), Some(&attempt(0, 100, Some(99))), &id(), 100).unwrap();
-        assert_eq!((plan.to_append(), plan.trim_from(), plan.marker()), (100..100, None, None));
+        let plan = plan_rule(
+            "t",
+            Some(Pending::recorded(S, 0)),
+            Some(&attempt(0, 100, Some(99))),
+            &id(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            (plan.to_append(), plan.trim_from(), plan.marker()),
+            (100..100, None, None)
+        );
         // Nothing landed yet (the kill came between the marker and the rows).
-        let plan = plan_rule("t", Some(Pending::recorded(S, 0)), Some(&attempt(0, 0, None)), &id(), 100).unwrap();
-        assert_eq!((plan.to_append(), plan.trim_from(), plan.marker().is_some()), (0..100, None, true));
+        let plan = plan_rule(
+            "t",
+            Some(Pending::recorded(S, 0)),
+            Some(&attempt(0, 0, None)),
+            &id(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            (plan.to_append(), plan.trim_from(), plan.marker().is_some()),
+            (0..100, None, true)
+        );
     }
 
     #[test]
@@ -635,15 +845,29 @@ mod tests {
         // D5: an attempt at this start landed 100 rows for the table; the
         // replay carries none of its events (a group member the shorter
         // window does not reach). Every one comes back later, so none stays.
-        let plan = plan_rule("t", Some(Pending::recorded(S, 0)), Some(&attempt(0, 100, Some(99))), &id(), 0).unwrap();
-        assert_eq!(plan.trim_from(), Some(0), "the absent member kept the attempt's rows");
+        let plan = plan_rule(
+            "t",
+            Some(Pending::recorded(S, 0)),
+            Some(&attempt(0, 100, Some(99))),
+            &id(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.trim_from(),
+            Some(0),
+            "the absent member kept the attempt's rows"
+        );
         assert_eq!((plan.to_append(), plan.marker()), (0..0, None));
         let f = attempt(5, 100, Some(104));
         let plan = plan_rule("t", Some(Pending::recorded(S, 5)), Some(&f), &id(), 0).unwrap();
         assert_eq!((plan.trim_from(), plan.to_append()), (Some(5), 0..0));
         // Absent, and no attempt at this start: the watermark alone.
         let plan = plan_rule("t", Some(Pending::recorded(S - 1, 0)), None, &id(), 0).unwrap();
-        assert_eq!((plan.trim_from(), plan.to_append(), plan.marker()), (None, 0..0, None));
+        assert_eq!(
+            (plan.trim_from(), plan.to_append(), plan.marker()),
+            (None, 0..0, None)
+        );
     }
 
     #[test]
@@ -653,9 +877,20 @@ mod tests {
         // own count, and its plan slices the table's own events.
         let events: Vec<u32> = (0..40).collect();
         let f = attempt(0, 100, Some(99));
-        let plan = plan_rule("t", Some(Pending::recorded(S, 0)), Some(&f), &id(), events.len()).unwrap();
+        let plan = plan_rule(
+            "t",
+            Some(Pending::recorded(S, 0)),
+            Some(&f),
+            &id(),
+            events.len(),
+        )
+        .unwrap();
         assert_eq!(plan.to_append(), 40..40);
-        assert_eq!(plan.trim_from(), Some(40), "the 60 events this window does not carry stayed");
+        assert_eq!(
+            plan.trim_from(),
+            Some(40),
+            "the 60 events this window does not carry stayed"
+        );
         assert!(events[plan.to_append()].is_empty());
     }
 
@@ -663,52 +898,119 @@ mod tests {
     fn unmatched_is_err() {
         // D7. A marker past this start: the watermark went backwards.
         for f in [None, Some(attempt(0, 3, Some(2)))] {
-            let e = plan_rule("orders", Some(Pending::recorded(S + 1, 0)), f.as_ref(), &id(), 4).unwrap_err().to_string();
+            let e = plan_rule(
+                "orders",
+                Some(Pending::recorded(S + 1, 0)),
+                f.as_ref(),
+                &id(),
+                4,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(e.contains("moved backwards"), "{e}");
-            assert!(e.contains(&format!("{}", S + 1)) && e.contains(&format!("_apitap_lsn >= {S}")), "{e}");
+            assert!(
+                e.contains(&format!("{}", S + 1)) && e.contains(&format!("_apitap_lsn >= {S}")),
+                "{e}"
+            );
         }
         // A 0.56.0 marker at a stamp where seqs repeat: its attempt and an
         // older version's rows, which nothing tells apart.
-        let f = StampFacts { all: landed(5, Some(2)), from_base: landed(5, Some(2)), distinct_seq: 3 };
-        let e = plan_rule("orders", Some(Pending::legacy(S)), Some(&f), &id(), 4).unwrap_err().to_string();
-        assert!(e.contains("0.56.0 run was interrupted") && e.contains("FROM orders WHERE _apitap_lsn = 5000"), "{e}");
+        let f = StampFacts {
+            all: landed(5, Some(2)),
+            from_base: landed(5, Some(2)),
+            distinct_seq: 3,
+        };
+        let e = plan_rule("orders", Some(Pending::legacy(S)), Some(&f), &id(), 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("0.56.0 run was interrupted")
+                && e.contains("FROM orders WHERE _apitap_lsn = 5000"),
+            "{e}"
+        );
         // …the same stamp with a 0.57.0 marker knows its base: rows below it
         // may repeat (0.55.x under 0.56.0), and they are not its own.
-        let f = StampFacts { all: landed(8, Some(4)), from_base: landed(3, Some(4)), distinct_seq: 5 };
+        let f = StampFacts {
+            all: landed(8, Some(4)),
+            from_base: landed(3, Some(4)),
+            distinct_seq: 5,
+        };
         let plan = plan_rule("orders", Some(Pending::recorded(S, 2)), Some(&f), &id(), 4).unwrap();
         assert_eq!((plan.to_append(), plan.seq_of(3)), (3..4, 5));
         // A clean 0.56.0 marker: base 0, as 0.56.0 itself read it.
-        let plan = plan_rule("orders", Some(Pending::legacy(S)), Some(&attempt(0, 3, Some(2))), &id(), 4).unwrap();
+        let plan = plan_rule(
+            "orders",
+            Some(Pending::legacy(S)),
+            Some(&attempt(0, 3, Some(2))),
+            &id(),
+            4,
+        )
+        .unwrap();
         assert_eq!((plan.to_append(), plan.seq_of(3)), (3..4, 3));
         // A replay with no facts cannot decide anything.
         assert!(plan_rule("orders", Some(Pending::recorded(S, 0)), None, &id(), 4).is_err());
         // Past u32: seq is a UInt32 / INT64 column read back as u32.
-        let e = plan_rule("orders", Some(Pending::recorded(S, u32::MAX - 10)), Some(&attempt(0, 0, None)), &id(), 11)
-            .unwrap_err()
-            .to_string();
+        let e = plan_rule(
+            "orders",
+            Some(Pending::recorded(S, u32::MAX - 10)),
+            Some(&attempt(0, 0, None)),
+            &id(),
+            11,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("_apitap_seq's range"), "{e}");
-        let f = StampFacts { all: landed(1, Some(u32::MAX - 5)), from_base: landed(1, Some(u32::MAX - 5)), distinct_seq: 1 };
+        let f = StampFacts {
+            all: landed(1, Some(u32::MAX - 5)),
+            from_base: landed(1, Some(u32::MAX - 5)),
+            distinct_seq: 1,
+        };
         assert!(plan_rule("orders", None, Some(&f), &id(), 10).is_err());
-        let f = StampFacts { all: landed(1, Some(u32::MAX)), from_base: landed(1, Some(u32::MAX)), distinct_seq: 1 };
+        let f = StampFacts {
+            all: landed(1, Some(u32::MAX)),
+            from_base: landed(1, Some(u32::MAX)),
+            distinct_seq: 1,
+        };
         assert!(plan_rule("orders", None, Some(&f), &id(), 1).is_err());
         // …and the largest window that still fits.
-        assert!(plan_rule("orders", Some(Pending::recorded(S, u32::MAX - 10)), Some(&attempt(0, 0, None)), &id(), 10).is_ok());
+        assert!(plan_rule(
+            "orders",
+            Some(Pending::recorded(S, u32::MAX - 10)),
+            Some(&attempt(0, 0, None)),
+            &id(),
+            10
+        )
+        .is_ok());
     }
 
     #[test]
     fn memo_asks() {
         // D9.
         let m = MemoRule::default();
-        let (s0, s1, s2) = (WindowId::new(S, S + 10), WindowId::new(S + 10, S + 20), WindowId::new(S + 20, S + 30));
+        let (s0, s1, s2) = (
+            WindowId::new(S, S + 10),
+            WindowId::new(S + 10, S + 20),
+            WindowId::new(S + 20, S + 30),
+        );
         assert_eq!(m.ask("t", "sid", &s0), Ask::Probe, "a table never probed");
         // The run's first probe: an attempt at s0, and the log reaches s0.
         m.probed("t", "sid", Some(Pending::recorded(S, 3)), Some(S));
-        assert_eq!(m.ask("t", "sid", &s0), Ask::Facts { base: 3 }, "a replay of the marked window");
-        let plan = m.plan("t", "sid", Some(&attempt(3, 2, Some(4))), &s0, 5).unwrap();
+        assert_eq!(
+            m.ask("t", "sid", &s0),
+            Ask::Facts { base: 3 },
+            "a replay of the marked window"
+        );
+        let plan = m
+            .plan("t", "sid", Some(&attempt(3, 2, Some(4))), &s0, 5)
+            .unwrap();
         assert_eq!(plan.to_append(), 2..5);
         m.committed("t", "sid", &plan);
         // Steady state: past the ceiling, no marker there — no query at all.
-        assert_eq!(m.ask("t", "sid", &s1), Ask::Nothing, "a window past everything the run found was queried");
+        assert_eq!(
+            m.ask("t", "sid", &s1),
+            Ask::Nothing,
+            "a window past everything the run found was queried"
+        );
         let plan = m.plan("t", "sid", None, &s1, 4).unwrap();
         assert_eq!(plan.seq_of(0), 0);
         m.committed("t", "sid", &plan);
@@ -720,7 +1022,11 @@ mod tests {
         assert_eq!(m.ask("t", "sid", &s2), Ask::Probe);
         // Another writer's rows at this start, no marker: count them.
         m.probed("u", "sid", None, Some(S));
-        assert_eq!(m.ask("u", "sid", &s0), Ask::Facts { base: 0 }, "an older version's rows at the stamp were not counted");
+        assert_eq!(
+            m.ask("u", "sid", &s0),
+            Ask::Facts { base: 0 },
+            "an older version's rows at the stamp were not counted"
+        );
         assert_eq!(m.ask("u", "sid", &s1), Ask::Nothing);
         // A legacy marker counts from 0; tables and sources are apart.
         m.probed("v", "sid", Some(Pending::legacy(S)), Some(S));
@@ -735,24 +1041,53 @@ mod tests {
     fn parse_rows() {
         // D11. The ClickHouse probe row over an empty marker table, and a
         // BigQuery table with no 'm' row, both read as no marker.
-        assert_eq!(pending_rule("0", "0", "0", "0").unwrap(), None, "no marker read as one at position 0");
+        assert_eq!(
+            pending_rule("0", "0", "0", "0").unwrap(),
+            None,
+            "no marker read as one at position 0"
+        );
         // A marker 0.56.0 wrote, read through the ALTERed table: events = 0.
-        assert_eq!(pending_rule("1", "812", "0", "0").unwrap(), Some(Pending::legacy(812)));
+        assert_eq!(
+            pending_rule("1", "812", "0", "0").unwrap(),
+            Some(Pending::legacy(812))
+        );
         let p = pending_rule("3", "812", "7", "100").unwrap();
         assert_eq!(p, Some(Pending::recorded(812, 7)));
         assert_eq!(p.map(|p| p.start), Some(812));
-        for bad in [("1", "x", "0", "4"), ("1", "812", "-3", "4"), ("1", "812", "7", ""), ("n", "812", "7", "4"),
-                    ("1", "812", "4294967296", "4")] {
-            assert!(pending_rule(bad.0, bad.1, bad.2, bad.3).is_err(), "{bad:?} read as a marker or as none");
+        for bad in [
+            ("1", "x", "0", "4"),
+            ("1", "812", "-3", "4"),
+            ("1", "812", "7", ""),
+            ("n", "812", "7", "4"),
+            ("1", "812", "4294967296", "4"),
+        ] {
+            assert!(
+                pending_rule(bad.0, bad.1, bad.2, bad.3).is_err(),
+                "{bad:?} read as a marker or as none"
+            );
         }
         // Facts: -1 is "no row", on both engines.
-        assert_eq!(facts_rule(&["0", "-1", "0", "-1", "0"]).unwrap(), StampFacts::default(), "an empty stamp read as seq 0");
+        assert_eq!(
+            facts_rule(&["0", "-1", "0", "-1", "0"]).unwrap(),
+            StampFacts::default(),
+            "an empty stamp read as seq 0"
+        );
         assert_eq!(
             facts_rule(&["5", "9", "3", "9", "5"]).unwrap(),
-            StampFacts { all: landed(5, Some(9)), from_base: landed(3, Some(9)), distinct_seq: 5 }
+            StampFacts {
+                all: landed(5, Some(9)),
+                from_base: landed(3, Some(9)),
+                distinct_seq: 5
+            }
         );
-        for bad in [&["5", "nine", "3", "9", "5"][..], &["5", "9", "3", "9"], &["5", "-1", "0", "-1", "5"],
-                    &["0", "4", "0", "-1", "0"], &["3", "9", "5", "9", "3"], &[" ", "9", "3", "9", "5"]] {
+        for bad in [
+            &["5", "nine", "3", "9", "5"][..],
+            &["5", "9", "3", "9"],
+            &["5", "-1", "0", "-1", "5"],
+            &["0", "4", "0", "-1", "0"],
+            &["3", "9", "5", "9", "3"],
+            &[" ", "9", "3", "9", "5"],
+        ] {
             assert!(facts_rule(bad).is_err(), "{bad:?} was read as facts");
         }
         // The ceiling: ClickHouse's max over nothing is 0, BigQuery's -1.

@@ -46,7 +46,10 @@ async fn exchange(client: &reqwest::Client, uri: &str, assertion: &str) -> Resul
         let sent = client
             .post(uri)
             .timeout(crate::http::control_timeout())
-            .form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", assertion)])
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", assertion),
+            ])
             .send()
             .await;
         let resp = match sent {
@@ -57,10 +60,12 @@ async fn exchange(client: &reqwest::Client, uri: &str, assertion: &str) -> Resul
             }
         };
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| Error::Transfer(format!("google token exchange: body read: {}", e.without_url())))?;
+        let body = resp.text().await.map_err(|e| {
+            Error::Transfer(format!(
+                "google token exchange: body read: {}",
+                e.without_url()
+            ))
+        })?;
         if status.is_success() {
             return Ok(body);
         }
@@ -131,7 +136,10 @@ mod exchange_tests {
     /// P2: a server that accepts and never answers is a timeout, not a hang.
     #[test]
     fn a_silent_token_server_times_out() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
@@ -157,7 +165,10 @@ mod exchange_tests {
     #[test]
     fn the_token_exchange_retries_a_transient_failure() {
         assert_eq!(super::issued_at(1_000), 940);
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let serve = |answers: Vec<&'static str>| async move {

@@ -78,7 +78,10 @@ impl TablePlan {
     /// The cursor's column plan: in `cols`, or kept aside by a projection.
     pub(crate) fn cursor_plan(&self) -> Option<&ColumnPlan> {
         let c = self.cursor.as_deref()?;
-        self.cols.iter().find(|pc| pc.name == c).or(self.cursor_col.as_ref().filter(|pc| pc.name == c))
+        self.cols
+            .iter()
+            .find(|pc| pc.name == c)
+            .or(self.cursor_col.as_ref().filter(|pc| pc.name == c))
     }
 
     /// The auto-detect rule: exactly one integer-PK column.
@@ -182,14 +185,45 @@ pub(crate) fn is_numeric_udt(udt: &str) -> bool {
         .strip_prefix("nullable(")
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or(&lower);
-    let head = inner.split(|c: char| c == '(' || c == ' ').next().unwrap_or(inner);
+    let head = inner
+        .split(|c: char| c == '(' || c == ' ')
+        .next()
+        .unwrap_or(inner);
     matches!(
         head,
-        "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "tinyint" | "mediumint" | "int"
-            | "numeric" | "decimal" | "float4" | "float8" | "real" | "double" | "float"
-            | "int16" | "int32" | "int64" | "int128" | "int256"
-            | "uint8" | "uint16" | "uint32" | "uint64" | "uint128" | "uint256"
-            | "float32" | "float64" | "decimal32" | "decimal64" | "decimal128" | "decimal256"
+        "int2"
+            | "int4"
+            | "int8"
+            | "smallint"
+            | "integer"
+            | "bigint"
+            | "tinyint"
+            | "mediumint"
+            | "int"
+            | "numeric"
+            | "decimal"
+            | "float4"
+            | "float8"
+            | "real"
+            | "double"
+            | "float"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "int128"
+            | "int256"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uint128"
+            | "uint256"
+            | "float32"
+            | "float64"
+            | "decimal32"
+            | "decimal64"
+            | "decimal128"
+            | "decimal256"
             | "oid"
     )
 }
@@ -200,7 +234,11 @@ pub(crate) fn is_numeric_udt(udt: &str) -> bool {
 /// declared as-is they became Decimal(5,0), which stores 9999900 out of its
 /// precision, and Decimal(2,5), which ClickHouse refuses (P2).
 pub(crate) fn decimal_shape(p: i32, s: i32) -> (i32, i32) {
-    if s < 0 { (p - s, 0) } else { (p.max(s), s) }
+    if s < 0 {
+        (p - s, 0)
+    } else {
+        (p.max(s), s)
+    }
 }
 
 /// Compare two numeric watermark texts exactly: integers, decimals
@@ -390,7 +428,10 @@ mod wm_tests {
         plan.cols.retain(|c| c.name == "name");
         assert_eq!(plan.cursor_plan().map(|c| c.udt.as_str()), Some("int"));
         plan.cursor = Some("other".into());
-        assert!(plan.cursor_plan().is_none(), "a different cursor is not the kept one");
+        assert!(
+            plan.cursor_plan().is_none(),
+            "a different cursor is not the kept one"
+        );
     }
 
     /// P2: numeric(5,-2) needs 7 integer digits; numeric(2,5) needs p >= s.
@@ -404,10 +445,30 @@ mod wm_tests {
     /// P2: only number types arbitrate numerically.
     #[test]
     fn numeric_cursor_types_are_a_positive_list() {
-        for t in ["int8", "INT", "bigint", "numeric", "decimal(10,2)", "UInt64", "Nullable(Int32)", "Float64", "double"] {
+        for t in [
+            "int8",
+            "INT",
+            "bigint",
+            "numeric",
+            "decimal(10,2)",
+            "UInt64",
+            "Nullable(Int32)",
+            "Float64",
+            "double",
+        ] {
             assert!(super::is_numeric_udt(t), "{t}");
         }
-        for t in ["text", "varchar", "String", "DateTime64(3)", "Date32", "timestamptz", "date", "uuid", "bool"] {
+        for t in [
+            "text",
+            "varchar",
+            "String",
+            "DateTime64(3)",
+            "Date32",
+            "timestamptz",
+            "date",
+            "uuid",
+            "bool",
+        ] {
             assert!(!super::is_numeric_udt(t), "{t}");
         }
     }
@@ -439,25 +500,57 @@ mod wm_tests {
         use WmArbitration::*;
         let r = |o: Option<&str>, d: Option<&str>, sib, arb| {
             resolve_watermark(
-                o.map(String::from), d.map(String::from), sib, arb, "t", "src",
+                o.map(String::from),
+                d.map(String::from),
+                sib,
+                arb,
+                "t",
+                "src",
             )
         };
         // state-authoritative: data max is ignored when a state row exists
-        assert_eq!(r(Some("5"), Some("9"), false, StateAuthoritative).unwrap(), Some("5".into()));
+        assert_eq!(
+            r(Some("5"), Some("9"), false, StateAuthoritative).unwrap(),
+            Some("5".into())
+        );
         // greatest: fresher of the two, garbage state loses
-        assert_eq!(r(Some("5"), Some("9"), false, Greatest { numeric: true }).unwrap(), Some("9".into()));
+        assert_eq!(
+            r(Some("5"), Some("9"), false, Greatest { numeric: true }).unwrap(),
+            Some("9".into())
+        );
         // MASTER M-5: with sibling state rows the state row is authoritative
         // — max(own, data) would adopt a more advanced sibling's cursor and
         // skip this source's backlog.
-        assert_eq!(r(Some("40"), Some("100"), true, Greatest { numeric: true }).unwrap(), Some("40".into()));
-        assert_eq!(r(Some("40"), Some("100"), true, StateAuthoritative).unwrap(), Some("40".into()));
-        assert_eq!(r(Some("garbage"), Some("9"), false, Greatest { numeric: true }).unwrap(), Some("9".into()));
+        assert_eq!(
+            r(Some("40"), Some("100"), true, Greatest { numeric: true }).unwrap(),
+            Some("40".into())
+        );
+        assert_eq!(
+            r(Some("40"), Some("100"), true, StateAuthoritative).unwrap(),
+            Some("40".into())
+        );
+        assert_eq!(
+            r(
+                Some("garbage"),
+                Some("9"),
+                false,
+                Greatest { numeric: true }
+            )
+            .unwrap(),
+            Some("9".into())
+        );
         // fan-in: no own row + siblings = loud error
         assert!(r(None, Some("9"), true, Greatest { numeric: true }).is_err());
         assert!(r(None, None, true, StateAuthoritative).is_err());
         // no state anywhere: data is the only truth
-        assert_eq!(r(None, Some("9"), false, StateAuthoritative).unwrap(), Some("9".into()));
-        assert_eq!(r(None, None, false, Greatest { numeric: false }).unwrap(), None);
+        assert_eq!(
+            r(None, Some("9"), false, StateAuthoritative).unwrap(),
+            Some("9".into())
+        );
+        assert_eq!(
+            r(None, None, false, Greatest { numeric: false }).unwrap(),
+            None
+        );
     }
 
     /// What `Greatest` does and does not protect, both pinned.
@@ -470,7 +563,12 @@ mod wm_tests {
         use WmArbitration::*;
         let r = |o: &str, d: &str| {
             resolve_watermark(
-                Some(o.into()), Some(d.into()), false, Greatest { numeric: true }, "t", "src",
+                Some(o.into()),
+                Some(d.into()),
+                false,
+                Greatest { numeric: true },
+                "t",
+                "src",
             )
             .unwrap()
             .unwrap()

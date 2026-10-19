@@ -144,11 +144,7 @@ fn column_kind(
     arrow_kind(&lc.delivered).filter(|_| native)
 }
 
-pub(crate) async fn start(
-    src_url: &str,
-    table: &str,
-    opts: &ReadOptions,
-) -> Result<ReadHandle> {
+pub(crate) async fn start(src_url: &str, table: &str, opts: &ReadOptions) -> Result<ReadHandle> {
     tune_allocator();
     if opts.query.is_some() {
         return Err(Error::InvalidInput(
@@ -356,13 +352,31 @@ async fn plan_read<S: Source>(
         },
     };
 
-    Ok(ReadPlan { plan, lane, kinds, schema, stmts, used, cap, batch_bytes })
+    Ok(ReadPlan {
+        plan,
+        lane,
+        kinds,
+        schema,
+        stmts,
+        used,
+        cap,
+        batch_bytes,
+    })
 }
 
 /// The COPY-stream lane: one [`ArrowLoader`] per worker behind the source's
 /// own `run_workers` (Postgres always; MySQL under `APITAP_MY_ARROW=0`).
 fn launch_loaders<S: Source + 'static>(src: S, rp: ReadPlan, chunk: usize) -> ReadHandle {
-    let ReadPlan { plan, lane, kinds, schema, stmts, used, cap, batch_bytes } = rp;
+    let ReadPlan {
+        plan,
+        lane,
+        kinds,
+        schema,
+        stmts,
+        used,
+        cap,
+        batch_bytes,
+    } = rp;
     let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);
     let completed = Arc::new(AtomicBool::new(false));
     let loaders: Vec<ArrowLoader> = (0..used)
@@ -391,7 +405,16 @@ fn launch_loaders<S: Source + 'static>(src: S, rp: ReadPlan, chunk: usize) -> Re
 /// The MySQL direct-Arrow lane: workers append decoded cells straight into
 /// their builders and ship sealed batches — no Loader, no byte stream.
 fn launch_my_arrow(src: MySqlSource, rp: ReadPlan) -> ReadHandle {
-    let ReadPlan { plan, kinds, schema, stmts, used, cap, batch_bytes, .. } = rp;
+    let ReadPlan {
+        plan,
+        kinds,
+        schema,
+        stmts,
+        used,
+        cap,
+        batch_bytes,
+        ..
+    } = rp;
     let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);
     let completed = Arc::new(AtomicBool::new(false));
 
@@ -499,7 +522,10 @@ mod tests {
             assert!(super::pg_send_decodable(u, None), "{u}");
         }
         assert!(super::pg_send_decodable("numeric", Some(12)));
-        for u in ["numeric", "time", "timetz", "interval", "inet", "money", "_int4", "oid", "citext", "my_enum"] {
+        for u in [
+            "numeric", "time", "timetz", "interval", "inet", "money", "_int4", "oid", "citext",
+            "my_enum",
+        ] {
             assert!(!super::pg_send_decodable(u, None), "{u}");
         }
     }

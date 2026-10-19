@@ -83,7 +83,8 @@ fn decode_component(s: &str) -> Result<String> {
             i += 1;
         }
     }
-    String::from_utf8(out).map_err(|e| Error::InvalidInput(format!("s3 url path is not UTF-8: {e}")))
+    String::from_utf8(out)
+        .map_err(|e| Error::InvalidInput(format!("s3 url path is not UTF-8: {e}")))
 }
 
 /// Minimal XML tag extraction — S3's response surface here is flat elements
@@ -123,7 +124,10 @@ fn part_headers(body: &[u8]) -> [(&'static str, String); 1] {
     use base64::Engine as _;
     use md5::Digest as _;
     let digest = md5::Md5::digest(body);
-    [("content-md5", base64::engine::general_purpose::STANDARD.encode(digest))]
+    [(
+        "content-md5",
+        base64::engine::general_purpose::STANDARD.encode(digest),
+    )]
 }
 
 /// The five named entities and decimal/hex character references. An
@@ -177,7 +181,9 @@ fn xml_tags(body: &str, tag: &str) -> Vec<String> {
     let mut rest = body;
     while let Some(i) = rest.find(&open) {
         let start = i + open.len();
-        let Some(j) = rest[start..].find(&close) else { break };
+        let Some(j) = rest[start..].find(&close) else {
+            break;
+        };
         out.push(xml_unescape(&rest[start..start + j]));
         rest = &rest[start + j + close.len()..];
     }
@@ -340,12 +346,21 @@ impl S3Conn {
     pub(crate) async fn get_object(&self, object: &str) -> Result<Vec<u8>> {
         let uri = self.uri_for(object);
         let r = self
-            .request(reqwest::Method::GET, &uri, &[], Vec::new(), &payload_hash(b""), &[])
+            .request(
+                reqwest::Method::GET,
+                &uri,
+                &[],
+                Vec::new(),
+                &payload_hash(b""),
+                &[],
+            )
             .await?;
         let status = r.status();
         if !status.is_success() {
             let body = r.text().await.unwrap_or_default();
-            return Err(Error::Transfer(format!("s3 get {object}: {status} {body:.200}")));
+            return Err(Error::Transfer(format!(
+                "s3 get {object}: {status} {body:.200}"
+            )));
         }
         r.bytes()
             .await
@@ -386,12 +401,22 @@ impl S3Conn {
                         .map(|b| b.to_vec())
                         .map_err(|e| Error::Transfer(format!("s3 range get: {e}")));
                 }
-                Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
+                Ok(r)
+                    if crate::http::store_retryable(r.status())
+                        && attempt < crate::http::STORE_ATTEMPTS =>
+                {
                     last = Some(Error::Transfer(format!("s3 range get: {}", r.status())));
-                    tokio::time::sleep(crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER))).await;
+                    tokio::time::sleep(crate::http::store_backoff(
+                        attempt,
+                        r.headers().get(reqwest::header::RETRY_AFTER),
+                    ))
+                    .await;
                 }
                 Ok(r) => {
-                    return Err(Error::Transfer(format!("s3 range get {object}: {}", r.status())))
+                    return Err(Error::Transfer(format!(
+                        "s3 range get {object}: {}",
+                        r.status()
+                    )))
                 }
                 Err(e) if attempt < crate::http::STORE_ATTEMPTS => {
                     last = Some(Error::Transfer(format!("s3 range get: {e}")));
@@ -456,9 +481,18 @@ impl S3Conn {
                 req = req.header(k.as_str(), v);
             }
             let wait = match req.body(body.clone()).send().await {
-                Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
-                    last = Some(Error::Transfer(format!("s3 {method} {object_uri}: {}", r.status())));
-                    crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER))
+                Ok(r)
+                    if crate::http::store_retryable(r.status())
+                        && attempt < crate::http::STORE_ATTEMPTS =>
+                {
+                    last = Some(Error::Transfer(format!(
+                        "s3 {method} {object_uri}: {}",
+                        r.status()
+                    )));
+                    crate::http::store_backoff(
+                        attempt,
+                        r.headers().get(reqwest::header::RETRY_AFTER),
+                    )
                 }
                 Ok(r) => return Ok(r),
                 Err(e) if attempt < crate::http::STORE_ATTEMPTS => {
@@ -493,11 +527,19 @@ impl S3Conn {
         let uri = self.uri_for(object);
         let q = vec![("uploads".to_string(), String::new())];
         let r = self
-            .request(reqwest::Method::POST, &uri, &q, Vec::new(), &payload_hash(b""), &[])
+            .request(
+                reqwest::Method::POST,
+                &uri,
+                &q,
+                Vec::new(),
+                &payload_hash(b""),
+                &[],
+            )
             .await?;
         let body = Self::check(r, "create multipart").await?;
-        xml_tag(&body, "UploadId")
-            .ok_or_else(|| Error::Transfer(format!("s3 create multipart: no UploadId in {body:.200}")))
+        xml_tag(&body, "UploadId").ok_or_else(|| {
+            Error::Transfer(format!("s3 create multipart: no UploadId in {body:.200}"))
+        })
     }
 
     /// Upload one part; returns its ETag for the completion manifest.
@@ -515,7 +557,14 @@ impl S3Conn {
         ];
         let md5 = part_headers(&bytes);
         let r = self
-            .request(reqwest::Method::PUT, &uri, &q, bytes, UNSIGNED_PAYLOAD, &md5)
+            .request(
+                reqwest::Method::PUT,
+                &uri,
+                &q,
+                bytes,
+                UNSIGNED_PAYLOAD,
+                &md5,
+            )
             .await?;
         let etag = r
             .headers()
@@ -549,7 +598,9 @@ impl S3Conn {
         let text = Self::check(r, "complete multipart").await?;
         // S3 can return 200 with an <Error> body for late failures.
         if text.contains("<Error>") {
-            return Err(Error::Transfer(format!("s3 complete multipart: {text:.400}")));
+            return Err(Error::Transfer(format!(
+                "s3 complete multipart: {text:.400}"
+            )));
         }
         Ok(())
     }
@@ -562,7 +613,14 @@ impl S3Conn {
         let uri = self.uri_for(object);
         let q = vec![("uploadId".to_string(), upload_id.to_string())];
         let r = self
-            .request(reqwest::Method::DELETE, &uri, &q, Vec::new(), &payload_hash(b""), &[])
+            .request(
+                reqwest::Method::DELETE,
+                &uri,
+                &q,
+                Vec::new(),
+                &payload_hash(b""),
+                &[],
+            )
             .await?;
         // 404 = NoSuchUpload: already aborted or completed — the end state
         // this call exists to reach.
@@ -604,7 +662,14 @@ impl S3Conn {
                 q.push(("continuation-token".to_string(), t.clone()));
             }
             let r = self
-                .request(reqwest::Method::GET, &uri, &q, Vec::new(), &payload_hash(b""), &[])
+                .request(
+                    reqwest::Method::GET,
+                    &uri,
+                    &q,
+                    Vec::new(),
+                    &payload_hash(b""),
+                    &[],
+                )
                 .await?;
             let body = Self::check(r, "list").await?;
             out.extend(xml_tags(&body, "Key"));
@@ -624,7 +689,10 @@ impl S3Conn {
     /// The `discard` belt uses it to abort uploads whose owner no longer has a
     /// `Multipart` handle (a loader dropped after `abort_multipart_noted`
     /// failed) — parts left behind would bill invisibly.
-    pub(crate) async fn list_multipart_uploads(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+    pub(crate) async fn list_multipart_uploads(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
         let uri = if self.path_style {
             format!("/{}", enc_seg(&self.bucket))
         } else {
@@ -646,7 +714,14 @@ impl S3Conn {
                 q.push(("upload-id-marker".to_string(), i.clone()));
             }
             let r = self
-                .request(reqwest::Method::GET, &uri, &q, Vec::new(), &payload_hash(b""), &[])
+                .request(
+                    reqwest::Method::GET,
+                    &uri,
+                    &q,
+                    Vec::new(),
+                    &payload_hash(b""),
+                    &[],
+                )
                 .await?;
             let body = Self::check(r, "list multipart uploads").await?;
             let keys = xml_tags(&body, "Key");
@@ -669,7 +744,14 @@ impl S3Conn {
     pub(crate) async fn delete(&self, object: &str) -> Result<()> {
         let uri = self.uri_for(object);
         let r = self
-            .request(reqwest::Method::DELETE, &uri, &[], Vec::new(), &payload_hash(b""), &[])
+            .request(
+                reqwest::Method::DELETE,
+                &uri,
+                &[],
+                Vec::new(),
+                &payload_hash(b""),
+                &[],
+            )
             .await?;
         // 204 for present AND absent keys; other failures still surface.
         Self::check(r, "delete").await.map(|_| ())
@@ -745,7 +827,14 @@ impl S3Conn {
     async fn head_size(&self, object: &str) -> Result<u64> {
         let uri = self.uri_for(object);
         let r = self
-            .request(reqwest::Method::HEAD, &uri, &[], Vec::new(), &payload_hash(b""), &[])
+            .request(
+                reqwest::Method::HEAD,
+                &uri,
+                &[],
+                Vec::new(),
+                &payload_hash(b""),
+                &[],
+            )
             .await?;
         if !r.status().is_success() {
             return Err(Error::Transfer(format!("s3 head {object}: {}", r.status())));
@@ -848,7 +937,9 @@ pub(crate) fn classify(root: &str, key: &str) -> Staged {
             &format!("{tail}{}", crate::naming::Artifact::Staging.suffix()),
             crate::naming::Artifact::Staging,
         ) {
-            Some(_) => Staged::Run { seg: tail.to_string() },
+            Some(_) => Staged::Run {
+                seg: tail.to_string(),
+            },
             None => Staged::Foreign,
         };
     }
@@ -856,7 +947,9 @@ pub(crate) fn classify(root: &str, key: &str) -> Staged {
         &format!("{seg}{}", crate::naming::Artifact::Staging.suffix()),
         crate::naming::Artifact::Staging,
     ) {
-        Some(_) => Staged::Run { seg: seg.to_string() },
+        Some(_) => Staged::Run {
+            seg: seg.to_string(),
+        },
         None => Staged::Foreign,
     }
 }
@@ -886,10 +979,12 @@ pub(crate) fn segment_listed(
                 canonical: artifact_ident(bare, Artifact::Staging, ROOMY),
                 raw: legacy_raw.to_string(),
             },
-            Staged::Run { seg, .. } if key[root.len()..].starts_with(&lock_dir) => crate::guard::Listed {
-                canonical: artifact_ident_tok(bare, Artifact::Lock, ROOMY, &seg),
-                raw: key.clone(),
-            },
+            Staged::Run { seg, .. } if key[root.len()..].starts_with(&lock_dir) => {
+                crate::guard::Listed {
+                    canonical: artifact_ident_tok(bare, Artifact::Lock, ROOMY, &seg),
+                    raw: key.clone(),
+                }
+            }
             Staged::Run { seg, .. } => crate::guard::Listed {
                 canonical: artifact_ident_tok(bare, Artifact::Staging, ROOMY, &seg),
                 raw: run_raw(&seg),
@@ -938,18 +1033,27 @@ impl crate::guard::GuardStore for S3Guard {
         format!("s3://{}/{}{bare}", self.conn.bucket, self.conn.prefix)
     }
 
-    async fn list(&self, bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+    async fn list(
+        &self,
+        bare: &str,
+        _kinds: &[crate::naming::Artifact],
+    ) -> Result<Vec<crate::guard::Listed>> {
         let keys = self.conn.list(&self.root).await?;
         let url = format!("s3://{}/{}", self.conn.bucket, self.root);
         Ok(segment_listed(
             &self.root,
             bare,
             &keys,
-            &format!("the objects under s3://{}/{}", self.conn.bucket, self.conn.prefix),
-            &|seg| format!(
-                "the objects and multipart uploads under {url}{seg}/ \
-                 (`aws s3 rm --recursive`, `aws s3api abort-multipart-upload`)"
+            &format!(
+                "the objects under s3://{}/{}",
+                self.conn.bucket, self.conn.prefix
             ),
+            &|seg| {
+                format!(
+                    "the objects and multipart uploads under {url}{seg}/ \
+                 (`aws s3 rm --recursive`, `aws s3api abort-multipart-upload`)"
+                )
+            },
         ))
     }
 
@@ -1082,8 +1186,13 @@ impl crate::sink::Sink for S3Sink {
         // announcement again if anything here fails; see `announce`.
         let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
         *self.announced.lock().expect("announcement") = Some(a);
-        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::Keep)
-            .await?;
+        crate::guard::check_peers(
+            &self.guard(),
+            &self.bare,
+            &self.run,
+            crate::guard::Mine::Keep,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1134,7 +1243,10 @@ impl crate::sink::Sink for S3Sink {
                 // This run's part names are its own counter's: delete them by
                 // name, or the staging left behind reads as a live peer.
                 for n in 0..self.next_part.load(Ordering::Relaxed) {
-                    let _ = self.conn.delete(&format!("{}part-{n:05}.parquet", self.staging)).await;
+                    let _ = self
+                        .conn
+                        .delete(&format!("{}part-{n:05}.parquet", self.staging))
+                        .await;
                 }
                 first_err.get_or_insert(e);
             }
@@ -1215,7 +1327,10 @@ impl S3Sink {
 /// apitap's own part-file names — the ONLY things a stale-sweep may delete.
 pub(crate) fn is_part_object(name: &str) -> bool {
     let base = name.rsplit_once('/').map_or(name, |(_, b)| b);
-    let Some(r) = base.strip_prefix("part-").and_then(|r| r.strip_suffix(".parquet")) else {
+    let Some(r) = base
+        .strip_prefix("part-")
+        .and_then(|r| r.strip_suffix(".parquet"))
+    else {
         return false;
     };
     // `part-NNNNN` (before 0.62) or `part-<generation>-NNNNN`.
@@ -1223,7 +1338,9 @@ pub(crate) fn is_part_object(name: &str) -> bool {
     digits.len() == 5
         && digits.bytes().all(|b| b.is_ascii_digit())
         && gen.len() <= 32
-        && gen.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && gen
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// A new, sortable generation id for one publish's part names: milliseconds
@@ -1285,7 +1402,13 @@ pub(crate) struct Multipart {
 impl Multipart {
     pub(crate) async fn open(conn: &S3Conn, key: String) -> Result<Self> {
         let upload_id = conn.create_multipart(&key).await?;
-        Ok(Self { key, upload_id, etags: Vec::new(), part_no: 0, bytes: 0 })
+        Ok(Self {
+            key,
+            upload_id,
+            etags: Vec::new(),
+            part_no: 0,
+            bytes: 0,
+        })
     }
 
     /// Upload one part. Parts need no alignment — only the ≥5 MiB floor for
@@ -1318,9 +1441,10 @@ impl Multipart {
     /// read `key`/`bytes`.
     pub(crate) async fn complete(mut self, conn: &S3Conn, tail: Vec<u8>) -> Result<Multipart> {
         let done = match self.put(conn, tail).await {
-            Ok(()) => conn
-                .complete_multipart(&self.key, &self.upload_id, &self.etags)
-                .await,
+            Ok(()) => {
+                conn.complete_multipart(&self.key, &self.upload_id, &self.etags)
+                    .await
+            }
             Err(e) => Err(e),
         };
         match done {
@@ -1401,10 +1525,19 @@ mod tests {
         assert!(more_pages("<IsTruncated>true</IsTruncated>", true, 10_000, "p").is_err());
         // P2: a part carries its Content-MD5 (RFC 1864 vectors).
         assert_eq!(part_headers(b"")[0].1, "1B2M2Y8AsgTpgAmY7PhCfg==");
-        assert_eq!(part_headers(b"abc")[0], ("content-md5", "kAFQmDzST7DWlj99KOF/cg==".to_string()));
+        assert_eq!(
+            part_headers(b"abc")[0],
+            ("content-md5", "kAFQmDzST7DWlj99KOF/cg==".to_string())
+        );
         // P2: entity-decoded, as AWS and MinIO escape keys.
-        assert_eq!(xml_tags("<Key>a&amp;b&#39;c&#x9;&lt;d&gt;</Key>", "Key"), vec!["a&b'c\t<d>"]);
-        assert_eq!(xml_tag("<ETag>&quot;e1&quot;</ETag>", "ETag").as_deref(), Some("\"e1\""));
+        assert_eq!(
+            xml_tags("<Key>a&amp;b&#39;c&#x9;&lt;d&gt;</Key>", "Key"),
+            vec!["a&b'c\t<d>"]
+        );
+        assert_eq!(
+            xml_tag("<ETag>&quot;e1&quot;</ETag>", "ETag").as_deref(),
+            Some("\"e1\"")
+        );
         assert_eq!(xml_unescape("a & b &bogus; &#xZZ;"), "a & b &bogus; &#xZZ;");
     }
 
@@ -1413,7 +1546,10 @@ mod tests {
         assert!(is_part_object("lake/events/part-00003.parquet"));
         // M-32: a publish writes a new generation of names.
         let g = part_generation();
-        assert!(is_part_object(&format!("lake/events/part-{g}-00003.parquet")), "{g}");
+        assert!(
+            is_part_object(&format!("lake/events/part-{g}-00003.parquet")),
+            "{g}"
+        );
         assert_ne!(g, part_generation());
         assert!(!is_part_object("lake/events/part-Upper-00003.parquet"));
         assert!(!is_part_object("lake/events/part-3.parquet"));
@@ -1454,14 +1590,31 @@ mod tests {
             format!("{root}{}/part-00000.parquet", run.token()),
             format!("{root}notes/keep.txt"),
         ];
-        let listed = segment_listed(root, "orders", &keys, "legacy", &|seg| format!("under {seg}/"));
-        assert_eq!(listed.len(), 3, "one entry per segment, the foreign key skipped: {listed:?}");
-        let scan = blockers("orders", ROOMY, &run, GUARDED,
-                            listed.iter().map(|l| (l.canonical.as_str(), l.raw.as_str())));
+        let listed = segment_listed(root, "orders", &keys, "legacy", &|seg| {
+            format!("under {seg}/")
+        });
+        assert_eq!(
+            listed.len(),
+            3,
+            "one entry per segment, the foreign key skipped: {listed:?}"
+        );
+        let scan = blockers(
+            "orders",
+            ROOMY,
+            &run,
+            GUARDED,
+            listed
+                .iter()
+                .map(|l| (l.canonical.as_str(), l.raw.as_str())),
+        );
         assert_eq!(scan.blockers.len(), 1, "{scan:?}");
         assert_eq!(scan.blockers[0].name(), format!("under {}/", peer.token()));
-        let name = crate::naming::artifact_ident_run("orders", crate::naming::Artifact::Lock, ROOMY, &run);
-        assert_eq!(lock_key_of(root, &name).unwrap(), format!("{root}__apitap_lock/{}", run.token()));
+        let name =
+            crate::naming::artifact_ident_run("orders", crate::naming::Artifact::Lock, ROOMY, &run);
+        assert_eq!(
+            lock_key_of(root, &name).unwrap(),
+            format!("{root}__apitap_lock/{}", run.token())
+        );
         assert!(lock_key_of(root, "orders__apitap_staging").is_none());
     }
 
@@ -1479,7 +1632,10 @@ mod tests {
             Staged::Run { seg } => {
                 assert_eq!(seg, tok);
                 let peer = crate::naming::parse_peer(
-                    &format!("{seg}__apitap_staging"), crate::naming::Artifact::Staging).unwrap();
+                    &format!("{seg}__apitap_staging"),
+                    crate::naming::Artifact::Staging,
+                )
+                .unwrap();
                 assert_eq!(peer.kind, crate::naming::LandKind::Swap);
             }
             _ => panic!("a token segment must read as a run"),

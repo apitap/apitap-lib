@@ -74,9 +74,12 @@ fn synth(rows: usize) -> Vec<u8> {
 #[derive(Default)]
 struct Oracle {
     c0: Vec<i64>,
-    c1o: Vec<i32>, c1d: Vec<u8>,
-    c2o: Vec<i32>, c2d: Vec<u8>,
-    c3o: Vec<i32>, c3d: Vec<u8>,
+    c1o: Vec<i32>,
+    c1d: Vec<u8>,
+    c2o: Vec<i32>,
+    c2d: Vec<u8>,
+    c3o: Vec<i32>,
+    c3d: Vec<u8>,
     c4: Vec<i16>,
     c5: Vec<i32>,
     c6: Vec<i64>,
@@ -86,8 +89,10 @@ struct Oracle {
     c10: Vec<i32>,
     c11: Vec<i64>,
     c12: Vec<i64>,
-    c13o: Vec<i32>, c13d: Vec<u8>,
-    c14o: Vec<i32>, c14d: Vec<u8>,
+    c13o: Vec<i32>,
+    c13d: Vec<u8>,
+    c14o: Vec<i32>,
+    c14d: Vec<u8>,
     rows: usize,
 }
 
@@ -126,9 +131,7 @@ impl Oracle {
                 ($t:ty, $w:literal, $dst:expr) => {{
                     need!(4 + $w);
                     let p = unsafe { b.as_ptr().add(o + 4) };
-                    $dst.push(<$t>::from_be_bytes(unsafe {
-                        p.cast::<[u8; $w]>().read()
-                    }));
+                    $dst.push(<$t>::from_be_bytes(unsafe { p.cast::<[u8; $w]>().read() }));
                     o += 4 + $w;
                 }};
             }
@@ -251,5 +254,8 @@ fn main() {
     println!("production builder: {best_a:.3}s  ({gbs_a:.2} GB/s)  rows={total_a}");
     println!("oracle (baked)    : {best_b:.3}s  ({gbs_b:.2} GB/s)  rows={total_b}");
     println!("oracle speedup    : {:.2}x", best_a / best_b);
-    let _ = ArrowBatch { rows: 0, cols: Vec::<FinishedCol>::new() };
+    let _ = ArrowBatch {
+        rows: 0,
+        cols: Vec::<FinishedCol>::new(),
+    };
 }

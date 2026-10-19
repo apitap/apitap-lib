@@ -42,7 +42,10 @@ impl Layout {
     /// the WAL flags every column. The flags still decide one thing: under
     /// DEFAULT or USING INDEX an old image carries only the flagged columns, so
     /// the run's key must be among them.
-    pub(crate) fn from_relation(r: &Relation, key_cols: &HashMap<String, Vec<String>>) -> Result<Option<Layout>> {
+    pub(crate) fn from_relation(
+        r: &Relation,
+        key_cols: &HashMap<String, Vec<String>>,
+    ) -> Result<Option<Layout>> {
         let table = format!("{}.{}", r.namespace, r.name);
         let Some(want) = key_cols.get(&table) else {
             return Ok(None);
@@ -56,7 +59,9 @@ impl Layout {
         }
         let cols: Vec<String> = r.cols.iter().map(|c| c.name.clone()).collect();
         let key_idx = key_positions(&cols, want, |k| {
-            Error::Transfer(format!("log_based: key column '{k}' not in WAL relation for {table}"))
+            Error::Transfer(format!(
+                "log_based: key column '{k}' not in WAL relation for {table}"
+            ))
         })?;
         if r.replica_identity != b'f' {
             for &i in &key_idx {
@@ -133,15 +138,29 @@ impl Layout {
     pub(crate) fn for_test(cols: &[&str], oids: &[u32], keys: &[&str]) -> Arc<Layout> {
         let cols: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
         let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
-        let key_idx = key_positions(&cols, &keys, |k| Error::Transfer(format!("no key {k}"))).expect("keys in cols");
-        let oids = if oids.is_empty() { vec![0; cols.len()] } else { oids.to_vec() };
-        Arc::new(Layout { cols, oids, key_cols: keys, key_idx })
+        let key_idx = key_positions(&cols, &keys, |k| Error::Transfer(format!("no key {k}")))
+            .expect("keys in cols");
+        let oids = if oids.is_empty() {
+            vec![0; cols.len()]
+        } else {
+            oids.to_vec()
+        };
+        Arc::new(Layout {
+            cols,
+            oids,
+            key_cols: keys,
+            key_idx,
+        })
     }
 }
 
 /// Each key column's position among `cols`, in `keys` order; `missing` names
 /// the first one that is not there.
-fn key_positions(cols: &[String], keys: &[String], missing: impl Fn(&str) -> Error) -> Result<Vec<usize>> {
+fn key_positions(
+    cols: &[String],
+    keys: &[String],
+    missing: impl Fn(&str) -> Error,
+) -> Result<Vec<usize>> {
     keys.iter()
         .map(|k| cols.iter().position(|c| c == k).ok_or_else(|| missing(k)))
         .collect()
@@ -166,7 +185,9 @@ impl WindowBody for Collapsed {
         }
         for op in &self.residue {
             let row = match op {
-                ResidueOp::MaskedUpdate { row, .. } | ResidueOp::Upsert { row } | ResidueOp::Rekey { row, .. } => row,
+                ResidueOp::MaskedUpdate { row, .. }
+                | ResidueOp::Upsert { row }
+                | ResidueOp::Rekey { row, .. } => row,
                 ResidueOp::Delete { .. } => continue,
             };
             if row.len() != ncols {
@@ -253,14 +274,24 @@ impl Bodies {
         collapsers: HashMap<String, Collapser>,
         changelogs: HashMap<String, Changes>,
     ) -> Result<Bodies> {
-        debug_assert!(if changelog { collapsers.is_empty() } else { changelogs.is_empty() });
+        debug_assert!(if changelog {
+            collapsers.is_empty()
+        } else {
+            changelogs.is_empty()
+        });
         Ok(if changelog {
             Bodies::Changelog(
-                changelogs.into_iter().map(|(t, c)| c.seal(&t).map(|w| (t, w))).collect::<Result<_>>()?,
+                changelogs
+                    .into_iter()
+                    .map(|(t, c)| c.seal(&t).map(|w| (t, w)))
+                    .collect::<Result<_>>()?,
             )
         } else {
             Bodies::Replica(
-                collapsers.into_iter().map(|(t, c)| c.seal(&t).map(|w| (t, w))).collect::<Result<_>>()?,
+                collapsers
+                    .into_iter()
+                    .map(|(t, c)| c.seal(&t).map(|w| (t, w)))
+                    .collect::<Result<_>>()?,
             )
         })
     }
@@ -375,23 +406,35 @@ mod tests {
         let refused = |r: Result<()>| match r {
             Err(e) => {
                 let m = e.to_string();
-                assert!(m.contains("bench.t") && m.contains("has 4 columns") && m.contains("layout has 3"), "{m}");
+                assert!(
+                    m.contains("bench.t")
+                        && m.contains("has 4 columns")
+                        && m.contains("layout has 3"),
+                    "{m}"
+                );
             }
             Ok(()) => panic!("a 4-column row sealed into a 3-column layout"),
         };
 
         // Replica: rows of 3 and 4 cells — an upsert, and a residue row.
-        let up = Collapsed { upserts: vec![row(3), row(4)], ..Default::default() };
+        let up = Collapsed {
+            upserts: vec![row(3), row(4)],
+            ..Default::default()
+        };
         refused(TableWindow::seal("bench.t", l.clone(), up).map(|_| ()));
         let tail = Collapsed {
             upserts: vec![row(3)],
-            residue: vec![ResidueOp::Upsert { row: row(4).to_cells() }],
+            residue: vec![ResidueOp::Upsert {
+                row: row(4).to_cells(),
+            }],
             ..Default::default()
         };
         refused(TableWindow::seal("bench.t", l.clone(), tail).map(|_| ()));
         let good = Collapsed {
             upserts: vec![row(3)],
-            residue: vec![ResidueOp::Delete { key: vec![b"1".to_vec()] }],
+            residue: vec![ResidueOp::Delete {
+                key: vec![b"1".to_vec()],
+            }],
             ..Default::default()
         };
         assert!(TableWindow::seal("bench.t", l.clone(), good).is_ok());
@@ -423,7 +466,12 @@ mod tests {
             cols: cols
                 .iter()
                 .enumerate()
-                .map(|(i, (n, key))| RelationCol { key: *key, name: n.to_string(), type_oid: 20 + i as u32, type_mod: -1 })
+                .map(|(i, (n, key))| RelationCol {
+                    key: *key,
+                    name: n.to_string(),
+                    type_oid: 20 + i as u32,
+                    type_mod: -1,
+                })
                 .collect(),
         }
     }
@@ -447,20 +495,36 @@ mod tests {
         assert_eq!(l.key_cols(), keys.as_slice());
         assert_eq!(l.cols(), sc.names.as_slice());
         assert_eq!(l.oids(), &[0, 0, 0, 0]);
-        let e = Layout::from_mysql("bench.t", &sc, &["nope".to_string()]).expect_err("a missing key column");
-        assert!(e.to_string().contains("'nope'") && e.to_string().contains("bench.t"), "{e}");
+        let e = Layout::from_mysql("bench.t", &sc, &["nope".to_string()])
+            .expect_err("a missing key column");
+        assert!(
+            e.to_string().contains("'nope'") && e.to_string().contains("bench.t"),
+            "{e}"
+        );
 
         // Postgres: key (id1, id2) sits at 2 and 0, whatever the column order.
-        let keys: HashMap<String, Vec<String>> =
-            [("public.t".to_string(), vec!["id1".to_string(), "id2".to_string()])].into_iter().collect();
+        let keys: HashMap<String, Vec<String>> = [(
+            "public.t".to_string(),
+            vec!["id1".to_string(), "id2".to_string()],
+        )]
+        .into_iter()
+        .collect();
         let r = rel(b'd', &[("id2", true), ("v", false), ("id1", true)]);
-        let l = Layout::from_relation(&r, &keys).expect("ok").expect("tracked");
+        let l = Layout::from_relation(&r, &keys)
+            .expect("ok")
+            .expect("tracked");
         assert_eq!(l.key_idx(), &[2, 0]);
         assert_eq!(l.key_oids(), vec![22, 20]);
-        assert_eq!(l.cols(), &["id2".to_string(), "v".to_string(), "id1".to_string()]);
+        assert_eq!(
+            l.cols(),
+            &["id2".to_string(), "v".to_string(), "id1".to_string()]
+        );
         // FULL flags every column; the names still decide.
         let r = rel(b'f', &[("id2", true), ("v", true), ("id1", true)]);
-        assert_eq!(Layout::from_relation(&r, &keys).unwrap().unwrap().key_idx(), &[2, 0]);
+        assert_eq!(
+            Layout::from_relation(&r, &keys).unwrap().unwrap().key_idx(),
+            &[2, 0]
+        );
         // A key column the relation lacks names itself.
         let r = rel(b'd', &[("id2", true), ("v", false)]);
         let e = Layout::from_relation(&r, &keys).expect_err("missing id1");
@@ -470,6 +534,8 @@ mod tests {
         let r = rel(b'd', &[("id2", true), ("v", false), ("id1", false)]);
         assert!(Layout::from_relation(&r, &keys).is_err());
         assert!(Layout::from_relation(&rel(b'n', &[("id1", true), ("id2", true)]), &keys).is_err());
-        assert!(Layout::from_relation(&r, &HashMap::new()).unwrap().is_none());
+        assert!(Layout::from_relation(&r, &HashMap::new())
+            .unwrap()
+            .is_none());
     }
 }

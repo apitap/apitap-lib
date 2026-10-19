@@ -152,7 +152,11 @@ pub(crate) fn row_strings(row: &CsvRow<'_>) -> Result<Vec<String>> {
     (0..row.len())
         .map(|i| {
             let f = row.field(i);
-            let f = if i == 0 { f.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(f) } else { f };
+            let f = if i == 0 {
+                f.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(f)
+            } else {
+                f
+            };
             String::from_utf8(f.to_vec())
                 .map_err(|e| Error::InvalidInput(format!("csv header is not UTF-8: {e}")))
         })
@@ -165,11 +169,21 @@ pub(crate) fn row_strings(row: &CsvRow<'_>) -> Result<Vec<String>> {
 pub(crate) fn check_header(plan: &TablePlan, label: &str, row: &CsvRow<'_>) -> Result<()> {
     let now = text_plan(plan.engine, label, &row_strings(row)?)?;
     let same = now.cols.len() == plan.cols.len()
-        && now.cols.iter().zip(&plan.cols).all(|(a, b)| a.name == b.name);
+        && now
+            .cols
+            .iter()
+            .zip(&plan.cols)
+            .all(|(a, b)| a.name == b.name);
     if same {
         return Ok(());
     }
-    let names = |p: &TablePlan| p.cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(",");
+    let names = |p: &TablePlan| {
+        p.cols
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     Err(Error::InvalidInput(format!(
         "'{label}' header changed while it was read: planned [{}], streamed [{}] — the file \
          changed under the run; run it again",
@@ -180,7 +194,11 @@ pub(crate) fn check_header(plan: &TablePlan, label: &str, row: &CsvRow<'_>) -> R
 
 /// Build the all-text plan from a header row: names trimmed, blanks become
 /// `col_N`, duplicates fail loudly (case-insensitive).
-pub(crate) fn text_plan(engine: &'static str, label: &str, headers: &[String]) -> Result<TablePlan> {
+pub(crate) fn text_plan(
+    engine: &'static str,
+    label: &str,
+    headers: &[String],
+) -> Result<TablePlan> {
     let mut seen = std::collections::HashSet::new();
     let mut cols = Vec::with_capacity(headers.len());
     for (i, h) in headers.iter().enumerate() {
@@ -505,10 +523,17 @@ mod tests {
         );
         assert_eq!(canonical_name(&dup, &dup[0], "").unwrap(), "a/users");
         assert_eq!(canonical_name(&dup, &dup[2], "").unwrap(), "main");
-        assert_eq!(match_table(&dup, "", "b/users", "x://").unwrap().1, "b/users.csv");
-        let amb = match_table(&dup, "", "users", "x://").unwrap_err().to_string();
+        assert_eq!(
+            match_table(&dup, "", "b/users", "x://").unwrap().1,
+            "b/users.csv"
+        );
+        let amb = match_table(&dup, "", "users", "x://")
+            .unwrap_err()
+            .to_string();
         assert!(amb.contains("ambiguous") && amb.contains("a/users.csv"));
-        let ext = match_table(&dup, "", "b/users.csv", "x://").unwrap_err().to_string();
+        let ext = match_table(&dup, "", "b/users.csv", "x://")
+            .unwrap_err()
+            .to_string();
         assert!(ext.contains("without the .csv"));
         assert!(match_table(&dup, "", "nope", "x://")
             .unwrap_err()
@@ -517,7 +542,9 @@ mod tests {
 
         // Dotted stems would schema-split in the destinations — loud.
         let dotted = csv_tables(&[("2026.01.csv".to_string(), 32)], "");
-        let err = canonical_name(&dotted, &dotted[0], "").unwrap_err().to_string();
+        let err = canonical_name(&dotted, &dotted[0], "")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("schema qualifier"));
     }
 
@@ -583,7 +610,9 @@ mod tests {
         assert!(check_header(&plan, "x.csv", &pump.next_record(true).unwrap().unwrap()).is_ok());
         let mut pump = CsvPump::new();
         pump.feed(b"b,a\n");
-        let e = check_header(&plan, "x.csv", &pump.next_record(true).unwrap().unwrap()).unwrap_err().to_string();
+        let e = check_header(&plan, "x.csv", &pump.next_record(true).unwrap().unwrap())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("header changed"), "{e}");
     }
 }

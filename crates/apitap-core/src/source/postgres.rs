@@ -21,18 +21,18 @@
 //!   would be wrong here, the escape dialects differ (`\v`, `\b`, `\f`).
 
 use super::spans;
+use crate::dialect::postgres::{quote_ident, quote_ident_path};
+use crate::error::{Error, Result};
 use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
+use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::Source;
-use crate::error::{Error, Result};
-use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
+use crate::wire::pgcopy::SpanStrip;
 use crate::wire::pgmytsv::{my_tsv_type, MyType, PgToMyTsv};
 use crate::wire::rowbinary::{rb_type, RbType, Transcoder};
 use futures::TryStreamExt;
 use sqlx::postgres::{PgPoolCopyExt, PgPoolOptions};
 use sqlx::{PgPool, Row};
-use crate::wire::pgcopy::SpanStrip;
-use crate::dialect::postgres::{quote_ident, quote_ident_path};
 // ---------------------------------------------------------------------------------
 // Source
 // ---------------------------------------------------------------------------------
@@ -274,18 +274,13 @@ impl Source for PgSource {
     }
 
     fn uncovered_cols(&self, plan: &TablePlan, format: WireFormat) -> Vec<(String, String)> {
-        let miss = |covered: bool, c: &ColumnPlan| {
-            (!covered).then(|| (c.name.clone(), c.udt.clone()))
-        };
+        let miss =
+            |covered: bool, c: &ColumnPlan| (!covered).then(|| (c.name.clone(), c.udt.clone()));
         plan.cols
             .iter()
             .filter_map(|c| match format {
-                WireFormat::MyTsv => {
-                    miss(my_tsv_type(&c.udt, c.precision, c.scale).is_some(), c)
-                }
-                WireFormat::RowBinary => {
-                    miss(rb_type(&c.udt, c.precision, c.scale).is_some(), c)
-                }
+                WireFormat::MyTsv => miss(my_tsv_type(&c.udt, c.precision, c.scale).is_some(), c),
+                WireFormat::RowBinary => miss(rb_type(&c.udt, c.precision, c.scale).is_some(), c),
                 _ => None,
             })
             .collect()
@@ -345,7 +340,12 @@ impl Source for PgSource {
                 }
             })
             .collect();
-        Lane { format, cols, raw_frames: false, push_where: None }
+        Lane {
+            format,
+            cols,
+            raw_frames: false,
+            push_where: None,
+        }
     }
 
     async fn span_stmts(
@@ -365,9 +365,7 @@ impl Source for PgSource {
             .join(", ");
         let copy_opts = match lane.format {
             WireFormat::TabSeparated => "FORMAT text",
-            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::MyTsv => {
-                "FORMAT binary"
-            }
+            WireFormat::PgCopyBinary | WireFormat::RowBinary | WireFormat::MyTsv => "FORMAT binary",
         };
         // Incremental predicate — appended to EVERY statement in this fn, including
         // the min/max probe and the ctid fallback. The pushed-down query
@@ -621,7 +619,10 @@ fn delivered_of_udt(c: &ColumnPlan) -> Delivered {
         "numeric" => match (c.precision, c.scale) {
             (Some(p), Some(s)) if crate::plan::decimal_shape(p, s).0 <= 76 => {
                 let (p, s) = crate::plan::decimal_shape(p, s);
-                Delivered::Decimal { p: p as u16, s: s as u16 }
+                Delivered::Decimal {
+                    p: p as u16,
+                    s: s as u16,
+                }
             }
             _ => Delivered::Float64,
         },
@@ -737,7 +738,9 @@ async fn copy_out_worker<L: Loader>(
         _ => matches!(mode, PgReadMode::FrameRaw | PgReadMode::Transcode(_)),
     };
     let mut raw = if raw_wanted {
-        crate::wire::walsender::Walsender::connect_sql(&url).await.ok()
+        crate::wire::walsender::Walsender::connect_sql(&url)
+            .await
+            .ok()
     } else {
         None
     };
@@ -752,9 +755,9 @@ async fn copy_out_worker<L: Loader>(
                 );
                 if let Err(e) = ws.simple_query(&pin).await {
                     return Err(Error::Transfer(format!(
-                            "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
+                        "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
                              walsender session still open?"
-                        )));
+                    )));
                 }
             }
             if let Err(e) = ws.copy_out_start(&sql).await {
@@ -785,9 +788,7 @@ async fn copy_out_worker<L: Loader>(
                         FramedPush::Control => match ws.co_control().await {
                             Ok(true) => break 'copy,
                             Ok(false) => {}
-                            Err(e) => {
-                                return Err(Error::Transfer(format!("pg read: {e}")))
-                            }
+                            Err(e) => return Err(Error::Transfer(format!("pg read: {e}"))),
                         },
                         FramedPush::Straddle(mut left) => {
                             // Cross-message element (legal, never observed
@@ -797,9 +798,7 @@ async fn copy_out_worker<L: Loader>(
                                 while left > 0 {
                                     if ws.co_window().is_empty() {
                                         if let Err(e) = ws.co_refill().await {
-                                            return Err(Error::Transfer(format!(
-                                                    "pg read: {e}"
-                                                )));
+                                            return Err(Error::Transfer(format!("pg read: {e}")));
                                         }
                                     }
                                     let take = ws.co_window().len().min(left);
@@ -822,18 +821,15 @@ async fn copy_out_worker<L: Loader>(
                                         Ok(true) => break 'copy,
                                         Ok(false) => continue,
                                         Err(e) => {
-                                            return Err(Error::Transfer(format!(
-                                                    "pg read: {e}"
-                                                )))
+                                            return Err(Error::Transfer(format!("pg read: {e}")))
                                         }
                                     }
                                 }
-                                let len =
-                                    u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
+                                let len = u32::from_be_bytes(w[1..5].try_into().unwrap()) as usize;
                                 if len < 4 {
                                     return Err(Error::Transfer(
-                                            "copy_out: bad message length".into(),
-                                        ));
+                                        "copy_out: bad message length".into(),
+                                    ));
                                 }
                                 ws.co_advance(5);
                                 left = len - 4;
@@ -849,9 +845,7 @@ async fn copy_out_worker<L: Loader>(
                     match ws.copy_out_next(&mut piece, 256 << 10).await {
                         Ok(true) => {}
                         Ok(false) => break,
-                        Err(e) => {
-                            return Err(Error::Transfer(format!("pg read: {e}")))
-                        }
+                        Err(e) => return Err(Error::Transfer(format!("pg read: {e}"))),
                     }
                     let fresh = pipe.reclaim().unwrap_or_default();
                     let full = std::mem::replace(&mut piece, fresh);
@@ -867,13 +861,12 @@ async fn copy_out_worker<L: Loader>(
                     match ws.copy_out_next(&mut piece, 256 << 10).await {
                         Ok(true) => {}
                         Ok(false) => break,
-                        Err(e) => {
-                            return Err(Error::Transfer(format!("pg read: {e}")))
-                        }
+                        Err(e) => return Err(Error::Transfer(format!("pg read: {e}"))),
                     }
                     state.push(&piece, &mut out)?;
                     if out.len() >= chunk {
-                        let fresh = pipe.reclaim()
+                        let fresh = pipe
+                            .reclaim()
                             .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024));
                         let full = std::mem::replace(&mut out, fresh);
                         pipe.send(full).await?;
@@ -898,17 +891,14 @@ async fn copy_out_worker<L: Loader>(
             Some(snap) => {
                 let mut conn = match pool.acquire().await {
                     Ok(c) => c,
-                    Err(e) => {
-                        return Err(Error::Transfer(format!("pin acquire: {e}")))
-                    }
+                    Err(e) => return Err(Error::Transfer(format!("pin acquire: {e}"))),
                 };
                 let pin = async {
                     use sqlx::Executor as _;
                     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                         .await?;
                     conn.execute(
-                        format!("SET TRANSACTION SNAPSHOT '{}'", snap.replace('\'', "''"))
-                            .as_str(),
+                        format!("SET TRANSACTION SNAPSHOT '{}'", snap.replace('\'', "''")).as_str(),
                     )
                     .await?;
                     Ok::<_, sqlx::Error>(())
@@ -916,9 +906,9 @@ async fn copy_out_worker<L: Loader>(
                 .await;
                 if let Err(e) = pin {
                     return Err(Error::Transfer(format!(
-                            "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
+                        "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
                              walsender session still open?"
-                        )));
+                    )));
                 }
                 Some(conn)
             }
@@ -928,9 +918,7 @@ async fn copy_out_worker<L: Loader>(
             None => pool.copy_out_raw(&sql).await,
         } {
             Ok(s) => s,
-            Err(e) => {
-                return Err(Error::Transfer(format!("COPY OUT: {e}")))
-            }
+            Err(e) => return Err(Error::Transfer(format!("COPY OUT: {e}"))),
         };
         let mut state = match &mode {
             PgReadMode::Transcode(cols) => SpanState::Rb(Transcoder::new(cols.clone())),
@@ -953,7 +941,8 @@ async fn copy_out_worker<L: Loader>(
             // its buffers hands them back — at steady state this loop allocates
             // nothing (the fresh 4 MiB Vec per chunk was 99.9% of allocator traffic).
             if out.len() >= chunk {
-                let fresh = pipe.reclaim()
+                let fresh = pipe
+                    .reclaim()
                     .unwrap_or_else(|| Vec::with_capacity(chunk + 64 * 1024));
                 let full = std::mem::replace(&mut out, fresh);
                 pipe.send(full).await?;
@@ -976,8 +965,6 @@ async fn copy_out_worker<L: Loader>(
     }
     Ok(Rows::FromLoader)
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -1023,5 +1010,4 @@ mod tests {
             .push(b"NOTPGCOPY\0\0\0\0\0\0\0\0\0\0", &mut Vec::new())
             .is_err());
     }
-
 }

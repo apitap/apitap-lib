@@ -13,10 +13,10 @@
 //! pool the MySQL path does not carry and is refused loudly.
 
 use crate::error::{Error, Result};
-use crate::logbased::window::DrainOutcome;
 use crate::logbased::mysource::{
     self, drain_binlog, fetch_schema, master_position, pack_pos, MySession,
 };
+use crate::logbased::window::DrainOutcome;
 use crate::wire::mywire::MyWire;
 use crate::{Mode, TransferOptions};
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
@@ -152,7 +152,12 @@ pub(crate) async fn control_pool(src_url: &str) -> Result<MySqlPool> {
         .await
         // Diagnosed against the user's URL, like the bulk lane's connect: the
         // reserved-character and auth-plugin hints apply here too (M-42).
-        .map_err(|e| with_tls_hint(crate::urlerr::connect_err("log_based: mysql source connect", src_url, e), src_url))
+        .map_err(|e| {
+            with_tls_hint(
+                crate::urlerr::connect_err("log_based: mysql source connect", src_url, e),
+                src_url,
+            )
+        })
 }
 
 /// The TLS-default hint the bulk lanes give, when apitap chose the TLS mode
@@ -320,7 +325,7 @@ pub(crate) async fn drain_windows(
         start_pos,
         crate::logbased::mysource::HEARTBEAT_SECS,
     )
-        .await?;
+    .await?;
 
     // The dump's first event is an artificial ROTATE, sent before any
     // FORMAT_DESCRIPTION, with the checksum the session negotiated:
@@ -413,7 +418,9 @@ mod tests {
     /// explicit mode's does not get the hint.
     #[test]
     fn a_defaulted_tls_failure_names_the_opt_out() {
-        let e = || Error::Connect("mysql wire: ssl-mode requires TLS but the server offers none".into());
+        let e = || {
+            Error::Connect("mysql wire: ssl-mode requires TLS but the server offers none".into())
+        };
         let m = with_tls_hint(e(), "mysql://u:p@db.example/x").to_string();
         assert!(m.contains("ssl-mode=disabled"), "{m}");
         let m = with_tls_hint(e(), "mysql://u:p@db.example/x?ssl-mode=required").to_string();

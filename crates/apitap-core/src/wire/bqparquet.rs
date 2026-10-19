@@ -124,8 +124,7 @@ pub(crate) fn parquet_col_ok(udt: &str, precision: Option<i32>) -> bool {
     if !parquet_decodable(udt) {
         return false;
     }
-    !matches!(udt, "numeric" | "decimal")
-        || matches!(precision, Some(p) if (1..=38).contains(&p))
+    !matches!(udt, "numeric" | "decimal") || matches!(precision, Some(p) if (1..=38).contains(&p))
 }
 
 pub(crate) fn parquet_decodable(udt: &str) -> bool {
@@ -302,7 +301,10 @@ impl ColBuf {
                 }
                 // Checked: a timestamp past ~294 246 AD wrapped to a huge
                 // negative and was stored silently (P2-10).
-                v.push(us.checked_add(PG_EPOCH_MICROS).ok_or_else(|| bad("timestamp out of range"))?);
+                v.push(
+                    us.checked_add(PG_EPOCH_MICROS)
+                        .ok_or_else(|| bad("timestamp out of range"))?,
+                );
                 8
             }
             ColBuf::Bytes(v) => match d {
@@ -711,8 +713,7 @@ impl ParquetEncoder {
             if let Some((idx, numeric)) = self.cursor {
                 if i == idx {
                     let v = render_cursor(&self.delivered[i], f)?;
-                    self.wm =
-                        crate::plan::wm_max(self.wm.take(), Some(v), numeric);
+                    self.wm = crate::plan::wm_max(self.wm.take(), Some(v), numeric);
                 }
             }
         }
@@ -869,7 +870,11 @@ pub(crate) fn render_ts_micros(unix_us: i64, utc: bool) -> Result<String> {
     } else {
         format!(".{}", format!("{micros:06}").trim_end_matches('0'))
     };
-    Ok(if utc { format!("{base}{frac}+00") } else { format!("{base}{frac}") })
+    Ok(if utc {
+        format!("{base}{frac}+00")
+    } else {
+        format!("{base}{frac}")
+    })
 }
 
 /// UNIX-epoch days → `YYYY-MM-DD` (same rendering as the wire path).
@@ -965,7 +970,10 @@ mod tests {
     #[test]
     fn bytes_after_the_trailer_are_refused() {
         let names = vec!["id".into()];
-        let delivered = vec![Delivered::Int { bytes: 8, unsigned: false }];
+        let delivered = vec![Delivered::Int {
+            bytes: 8,
+            unsigned: false,
+        }];
         let mut enc = ParquetEncoder::new(names, delivered, None, RowGroup::Mib24).unwrap();
         let row = |v: i64| vec![Some(v.to_be_bytes().to_vec())];
         let mut stream = copy_stream(&[row(1), row(2)]);
@@ -1107,7 +1115,10 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let delivered = vec![
-            Delivered::Int { bytes: 8, unsigned: false },
+            Delivered::Int {
+                bytes: 8,
+                unsigned: false,
+            },
             Delivered::Float32,
             Delivered::Float64,
             Delivered::Bool,
@@ -1179,13 +1190,9 @@ mod tests {
     fn short_wide_rows_cannot_overshoot_the_row_group() {
         const RG: usize = 256 << 10;
         let names: Vec<String> = (0..12).map(|i| format!("c{i}")).collect();
-        let mut enc = ParquetEncoder::new(
-            names,
-            vec![Delivered::Text; 12],
-            None,
-            RowGroup::Test(RG),
-        )
-        .unwrap();
+        let mut enc =
+            ParquetEncoder::new(names, vec![Delivered::Text; 12], None, RowGroup::Test(RG))
+                .unwrap();
         // ~4 MiB of COPY bytes: 70 000 rows × (2 + 12×(4+1)) wire bytes.
         let rows: Vec<Vec<Option<Vec<u8>>>> = (0..70_000)
             .map(|_| (0..12).map(|_| Some(b"x".to_vec())).collect())
@@ -1224,7 +1231,10 @@ mod tests {
         const RG: usize = 64 << 10;
         let mut enc = ParquetEncoder::new_ext(
             vec!["id".into()],
-            vec![Delivered::Int { bytes: 8, unsigned: false }],
+            vec![Delivered::Int {
+                bytes: 8,
+                unsigned: false,
+            }],
             None,
             None,
             Some(0),
@@ -1305,6 +1315,8 @@ mod tests {
         };
         let data_vals = values(data_bytes);
         assert_eq!(values(key_bytes), data_vals);
-        assert!(data_vals.iter().all(|s| s.len() == 36 && s.as_bytes()[8] == b'-'));
+        assert!(data_vals
+            .iter()
+            .all(|s| s.len() == 36 && s.as_bytes()[8] == b'-'));
     }
 }

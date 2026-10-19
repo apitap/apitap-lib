@@ -27,13 +27,13 @@
 //! `greatest(state, data)`, so a crash between the two costs a bounded
 //! re-read, never a skip.
 
-use crate::sink::Loader;
 use crate::error::{Error, Result};
 use crate::pipe;
+use crate::plan::{wm_max, wm_pick};
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
+use crate::sink::Loader;
 use crate::wire::bqparquet::{RowGroup, SEND_THRESHOLD};
 use crate::Mode;
-use crate::plan::{wm_max, wm_pick};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -118,9 +118,7 @@ pub(crate) struct BqConn {
 /// rather than assumed.
 pub(crate) fn bq_ident(kind: &str, name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::InvalidInput(format!(
-            "bigquery: empty {kind} name"
-        )));
+        return Err(Error::InvalidInput(format!("bigquery: empty {kind} name")));
     }
     // BigQuery's own ceiling is 300 characters for a table and 1024 for a
     // column; one bound covers both without inventing a limit of its own.
@@ -130,7 +128,10 @@ pub(crate) fn bq_ident(kind: &str, name: &str) -> Result<()> {
             name.len()
         )));
     }
-    if let Some(bad) = name.chars().find(|c| *c == '`' || *c == '\\' || c.is_control()) {
+    if let Some(bad) = name
+        .chars()
+        .find(|c| *c == '`' || *c == '\\' || c.is_control())
+    {
         return Err(Error::InvalidInput(format!(
             "bigquery: {kind} name {name:?} contains {bad:?}, which cannot be \
              written inside a BigQuery quoted identifier — BigQuery has no \
@@ -144,8 +145,8 @@ impl BqConn {
     /// `bigquery://<project>/<dataset>?credentials=/path/key.json[&location=EU]`;
     /// without `credentials` the `GOOGLE_APPLICATION_CREDENTIALS` env var is used.
     pub(crate) async fn parse(url: &str) -> Result<Self> {
-        let u = reqwest::Url::parse(url)
-            .map_err(|e| crate::urlerr::bad_url("bigquery url", url, e))?;
+        let u =
+            reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("bigquery url", url, e))?;
         let project = u
             .host_str()
             .filter(|s| !s.is_empty())
@@ -348,7 +349,9 @@ impl BqConn {
                 None => return Ok(out),
             }
         }
-        Err(Error::Transfer("bigquery table listing: still paging after 100000 pages".into()))
+        Err(Error::Transfer(
+            "bigquery table listing: still paging after 100000 pages".into(),
+        ))
     }
 
     pub(crate) async fn ensure_dataset(&self) -> Result<()> {
@@ -437,8 +440,7 @@ impl BqConn {
                 Ok(()) => return Ok(()),
                 Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
                     attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -502,7 +504,9 @@ impl BqConn {
     /// Poll a load/copy job to DONE; adaptive backoff (dense early — small jobs
     /// finish in seconds; cheap 2s cadence after).
     async fn poll_job(&self, job_id: &str, location: Option<&str>) -> Result<Value> {
-        self.poll(job_id, location).await.map_err(ScriptErr::into_error)
+        self.poll(job_id, location)
+            .await
+            .map_err(ScriptErr::into_error)
     }
 
     /// `poll_job`, saying WHERE it failed — which is what decides whether the
@@ -512,7 +516,11 @@ impl BqConn {
     ///   * the job is DONE with an error (`Failed`): it committed nothing;
     ///   * 30 minutes and not DONE (`Failed`): not retried under any id — the
     ///     job may still commit, and a second one would run beside it.
-    async fn poll(&self, job_id: &str, location: Option<&str>) -> std::result::Result<Value, ScriptErr> {
+    async fn poll(
+        &self,
+        job_id: &str,
+        location: Option<&str>,
+    ) -> std::result::Result<Value, ScriptErr> {
         let loc = location
             .map(|l| format!("?location={l}"))
             .unwrap_or_default();
@@ -545,7 +553,10 @@ impl BqConn {
         let _ = self
             .api(
                 reqwest::Method::POST,
-                format!("{BQ_BASE}/projects/{}/jobs/{job_id}/cancel{loc}", self.project),
+                format!(
+                    "{BQ_BASE}/projects/{}/jobs/{job_id}/cancel{loc}",
+                    self.project
+                ),
                 Some(&serde_json::json!({})),
             )
             .await;
@@ -777,7 +788,10 @@ impl BqConn {
     /// `cdc_script`, saying whether a failure is DEFINITE: the job finished
     /// with an error (`true`), or its fate is unknown — a transport failure
     /// or a deadline, after which the script may still run (`false`).
-    pub(crate) async fn cdc_script_outcome(&self, sql: &str) -> std::result::Result<(), (Error, bool)> {
+    pub(crate) async fn cdc_script_outcome(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<(), (Error, bool)> {
         let mut id = fresh_job_id();
         let mut attempt = 0u32;
         loop {
@@ -813,7 +827,9 @@ impl BqConn {
     /// job's resource, whose statistics say what a DML statement changed.
     /// One attempt, under an id of its own.
     async fn query_job(&self, sql: &str) -> Result<Value> {
-        self.run_job(sql, &fresh_job_id()).await.map_err(ScriptErr::into_error)
+        self.run_job(sql, &fresh_job_id())
+            .await
+            .map_err(ScriptErr::into_error)
     }
 
     /// Load one CDC window's NDJSON into its staging table with WRITE_TRUNCATE
@@ -844,8 +860,7 @@ impl BqConn {
                     if retry == Retry::NewId {
                         id = fresh_job_id();
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
                 }
                 None => return Err(e.into_error()),
             }
@@ -930,7 +945,10 @@ impl BqConn {
         Self {
             client: crate::http::client(),
             credentials: Arc::new(String::new()),
-            auth: Arc::new(tokio::sync::Mutex::new((String::new(), std::time::Instant::now()))),
+            auth: Arc::new(tokio::sync::Mutex::new((
+                String::new(),
+                std::time::Instant::now(),
+            ))),
             project: project.to_string(),
             dataset: dataset.to_string(),
             location: None,
@@ -1211,8 +1229,8 @@ fn retryable(msg: &str) -> bool {
 mod staging_name_tests {
     use super::*;
     use crate::naming::{
-        artifact_ident, artifact_ident_run, artifact_match, parse_peer, Artifact, BulkKind, LandKind, RunId,
-        ROOMY, RUN_TOKEN_LEN,
+        artifact_ident, artifact_ident_run, artifact_match, parse_peer, Artifact, BulkKind,
+        LandKind, RunId, ROOMY, RUN_TOKEN_LEN,
     };
 
     /// The trap this sink has that no other does: worker tables end in `_<i>`,
@@ -1286,8 +1304,14 @@ mod retry_tests {
         let m = "Error in script: apitap-lease-lost: the lease was collected. \
                  Transaction was aborted due to an error";
         assert_eq!(script_error_class(m), ErrClass::Lost);
-        assert_eq!(script_error_class("Transaction is aborted due to concurrent update"), ErrClass::Retry);
-        assert_eq!(script_error_class("Syntax error: Unexpected identifier"), ErrClass::Fail);
+        assert_eq!(
+            script_error_class("Transaction is aborted due to concurrent update"),
+            ErrClass::Retry
+        );
+        assert_eq!(
+            script_error_class("Syntax error: Unexpected identifier"),
+            ErrClass::Fail
+        );
         // Under neither id, wherever it surfaced.
         assert_eq!(next_try(&ScriptErr::Failed(m.into()), 0), None);
         assert_eq!(next_try(&ScriptErr::Transport(m.into()), 0), None);
@@ -1308,11 +1332,16 @@ mod retry_tests {
         assert!(
             got.len() == 43
                 && got.starts_with("apitap_cdc_")
-                && got["apitap_cdc_".len()..].chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                && got["apitap_cdc_".len()..]
+                    .chars()
+                    .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
             "{got}: not apitap_cdc_ + 32 hex digits"
         );
         assert_eq!(r["projectId"], "proj");
-        assert_eq!(r["location"], "EU", "a client id is found again only in its location");
+        assert_eq!(
+            r["location"], "EU",
+            "a client id is found again only in its location"
+        );
         assert_eq!(body["configuration"]["query"]["query"], "SELECT 1");
         assert_eq!(body["configuration"]["query"]["useLegacySql"], false);
         assert_ne!(fresh_job_id(), fresh_job_id(), "two scripts, two ids");
@@ -1320,24 +1349,50 @@ mod retry_tests {
         // Where an attempt failed decides the id of the next.
         let t = |m: &str| next_try(&ScriptErr::Transport(m.into()), 0);
         let f = |m: &str| next_try(&ScriptErr::Failed(m.into()), 0);
-        assert_eq!(t("bigquery 503 Service Unavailable on https://x/jobs/j: backendError"), Some(Retry::SameId));
+        assert_eq!(
+            t("bigquery 503 Service Unavailable on https://x/jobs/j: backendError"),
+            Some(Retry::SameId)
+        );
         assert_eq!(
             t("bigquery GET https://x/jobs/j: error sending request for url (https://x/jobs/j)"),
             Some(Retry::SameId),
             "a poll that got no answer asks about the same job again"
         );
-        assert_eq!(t("bigquery 400 Bad Request on https://x/jobs: Syntax error"), None);
-        assert_eq!(f("bigquery job j failed: Transaction is aborted due to concurrent update"), Some(Retry::NewId));
-        assert_eq!(f("bigquery job j failed: Syntax error: Unexpected identifier"), None);
-        assert_eq!(t(&super::deadline_msg("j")), None, "a deadline is unknown fate: it may still commit");
+        assert_eq!(
+            t("bigquery 400 Bad Request on https://x/jobs: Syntax error"),
+            None
+        );
+        assert_eq!(
+            f("bigquery job j failed: Transaction is aborted due to concurrent update"),
+            Some(Retry::NewId)
+        );
+        assert_eq!(
+            f("bigquery job j failed: Syntax error: Unexpected identifier"),
+            None
+        );
+        assert_eq!(
+            t(&super::deadline_msg("j")),
+            None,
+            "a deadline is unknown fate: it may still commit"
+        );
         assert_eq!(f("bigquery job id j belongs to another query"), None);
-        assert_eq!(next_try(&ScriptErr::Transport("503 ".into()), 5), None, "bounded");
-        assert_eq!(next_try(&ScriptErr::Transport("503 ".into()), 4), Some(Retry::SameId));
+        assert_eq!(
+            next_try(&ScriptErr::Transport("503 ".into()), 5),
+            None,
+            "bounded"
+        );
+        assert_eq!(
+            next_try(&ScriptErr::Transport("503 ".into()), 4),
+            Some(Retry::SameId)
+        );
 
         // A 409 is adopted only for this very job.
         let job = serde_json::json!({"configuration": {"query": {"query": "SELECT 1"}}});
         assert!(adopt_existing(&job, "SELECT 1"));
-        assert!(!adopt_existing(&job, "SELECT 2"), "another query's job is never ours");
+        assert!(
+            !adopt_existing(&job, "SELECT 2"),
+            "another query's job is never ours"
+        );
         assert!(!adopt_existing(&serde_json::json!({}), "SELECT 1"));
         let load = serde_json::json!({"configuration": {"load": {"destinationTable":
             {"projectId": "p", "datasetId": "d", "tableId": "t_stg"}}}});
@@ -1365,7 +1420,9 @@ mod retry_tests {
             "bigquery resumable begin 403 Forbidden: {\"error\":{\"errors\":\
              [{\"reason\":\"rateLimitExceeded\",\"message\":\"Exceeded rate limits\"}]}}"
         ));
-        assert!(retryable("bigquery resumable begin 503 Service Unavailable: backendError"));
+        assert!(retryable(
+            "bigquery resumable begin 503 Service Unavailable: backendError"
+        ));
         // …and a real authorization failure on the same call must NOT loop.
         assert!(!retryable(
             "bigquery resumable begin 403 Forbidden: Access Denied: Project apitap"
@@ -1426,18 +1483,18 @@ fn check_col_name(name: &str) -> Result<()> {
 // destination (buffers arrive record-aligned per the Loader contract).
 #[cfg(test)]
 use crate::wire::csvout::append_csv_value;
-use crate::wire::csvout::tsv_to_csv;
 #[cfg(test)]
 use crate::wire::csvout::base64_into;
+use crate::wire::csvout::tsv_to_csv;
 
 // ============================================================================
 // Loader: one resumable-upload load job per worker
 // ============================================================================
 
 /// One sealed file's load job, kept whole so `quiesce` can name it to
-    /// `jobs.cancel` and then await its TERMINAL state. The handle alone would
-    /// leave `quiesce` unable to prove the job ended once its task was
-    /// disconnected.
+/// `jobs.cancel` and then await its TERMINAL state. The handle alone would
+/// leave `quiesce` unable to prove the job ended once its task was
+/// disconnected.
 #[derive(Debug)]
 struct PendingJob {
     id: String,
@@ -1586,8 +1643,7 @@ impl BqLoader {
                         "bigquery throttled the load-job start, retry {attempt}/5 in {}ms",
                         400u64 << attempt
                     ));
-                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -1688,8 +1744,9 @@ impl BqLoader {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
             }
-            let resp =
-                resp.ok_or_else(|| Error::Transfer("bigquery upload chunk: retries exhausted".into()))?;
+            let resp = resp.ok_or_else(|| {
+                Error::Transfer("bigquery upload chunk: retries exhausted".into())
+            })?;
             let status = resp.status().as_u16();
             match (status, total) {
                 // 308 = upload incomplete; its Range says how much the server
@@ -1698,7 +1755,8 @@ impl BqLoader {
                 // went to a gap, and the final PUT failed as "unexpected status
                 // 308" — a whole load lost on a recoverable answer (P2, R2-26 L2).
                 (308, None) => {
-                    let persisted = persisted_from(resp.headers().get("range").and_then(|v| v.to_str().ok()));
+                    let persisted =
+                        persisted_from(resp.headers().get("range").and_then(|v| v.to_str().ok()));
                     if persisted >= end {
                         self.offset = end;
                         return Ok(None);
@@ -2151,7 +2209,11 @@ impl BqSink {
         if self.conn.table_get(STATE_TABLE).await?.is_some() {
             return Ok(());
         }
-        match self.conn.table_create(STATE_TABLE, &state_schema_fields()).await {
+        match self
+            .conn
+            .table_create(STATE_TABLE, &state_schema_fields())
+            .await
+        {
             Ok(()) => Ok(()),
             // Two first-runs can race the CREATE; whoever loses appends fine.
             Err(Error::Transfer(m)) if is_conflict(&m) => Ok(()),
@@ -2422,18 +2484,26 @@ pub(crate) async fn lease_unclaimed(conn: &BqConn, token: &str) -> Result<Vec<St
             tok = sql_str(token),
         ))
         .await?;
-    Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect())
 }
 
 /// Read one lease row. Shared by both lanes: a drain and a bulk run only see
 /// each other's liveness because they read and write the same rows.
-pub(crate) async fn lease_get(conn: &BqConn, key: &str, token: &str)
-    -> Result<Option<crate::lease::Lease>>
-{
+pub(crate) async fn lease_get(
+    conn: &BqConn,
+    key: &str,
+    token: &str,
+) -> Result<Option<crate::lease::Lease>> {
     let sql = format!(
         "SELECT TIMESTAMP_DIFF(expires_at, CURRENT_TIMESTAMP(), SECOND) AS e, collected AS c \
          FROM {t} WHERE dest_key = '{k}' AND token = '{tok}'",
-        t = conn.fq(crate::lease::LEASE_TABLE), k = sql_str(key), tok = sql_str(token));
+        t = conn.fq(crate::lease::LEASE_TABLE),
+        k = sql_str(key),
+        tok = sql_str(token)
+    );
     let rows = match conn.cdc_query(&sql).await {
         Ok(r) => r,
         // No lease store = nothing is leased, never an error.
@@ -2444,10 +2514,20 @@ pub(crate) async fn lease_get(conn: &BqConn, key: &str, token: &str)
         }
         Err(e) => return Err(e),
     };
-    let Some(r) = rows.first() else { return Ok(None) };
+    let Some(r) = rows.first() else {
+        return Ok(None);
+    };
     Ok(Some(crate::lease::Lease {
-        expires_in: r.first().cloned().flatten().and_then(|v| v.parse().ok()).unwrap_or(0),
-        collected: matches!(r.get(1).cloned().flatten().as_deref(), Some("true") | Some("1")),
+        expires_in: r
+            .first()
+            .cloned()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        collected: matches!(
+            r.get(1).cloned().flatten().as_deref(),
+            Some("true") | Some("1")
+        ),
     }))
 }
 
@@ -2467,7 +2547,11 @@ pub(crate) async fn lease_get(conn: &BqConn, key: &str, token: &str)
 ///    raced step 3.
 ///
 /// Re-entrant: an already-collected row is `Taken` and re-runs steps 3-4.
-pub(crate) async fn lease_claim(conn: &BqConn, key: &str, token: &str) -> Result<crate::guard::Claim> {
+pub(crate) async fn lease_claim(
+    conn: &BqConn,
+    key: &str,
+    token: &str,
+) -> Result<crate::guard::Claim> {
     use crate::guard::Claim;
     let taken = conn
         .cdc_script(&format!(
@@ -2489,14 +2573,18 @@ pub(crate) async fn lease_claim(conn: &BqConn, key: &str, token: &str) -> Result
         Some(_) => {}
     }
     match conn
-        .cdc_script(&format!("UPDATE {} SET claimed = TRUE WHERE TRUE;", fence_fq(conn, token)))
+        .cdc_script(&format!(
+            "UPDATE {} SET claimed = TRUE WHERE TRUE;",
+            fence_fq(conn, token)
+        ))
         .await
     {
         Ok(()) => {}
         Err(Error::Transfer(m)) if m.contains("Not found") => {}
         Err(e) => return Err(e),
     }
-    conn.table_delete(&crate::naming::fence_ident(token)).await?;
+    conn.table_delete(&crate::naming::fence_ident(token))
+        .await?;
     Ok(Claim::Taken)
 }
 
@@ -2505,7 +2593,10 @@ pub(crate) async fn lease_close(conn: &BqConn, key: &str, token: &str) {
     let _ = conn
         .cdc_script(&format!(
             "DELETE FROM {t} WHERE dest_key = '{k}' AND token = '{tok}'",
-            t = conn.fq(crate::lease::LEASE_TABLE), k = sql_str(key), tok = sql_str(token)))
+            t = conn.fq(crate::lease::LEASE_TABLE),
+            k = sql_str(key),
+            tok = sql_str(token)
+        ))
         .await;
 }
 
@@ -2528,9 +2619,11 @@ impl BqGuard {
 
     /// The (canonical, raw) pairs of a dataset listing, for the kinds scanned.
     /// Pure, so the decoration rule is tested without a dataset.
-    pub(crate) fn listed(names: &[String], bare: &str, kinds: &[crate::naming::Artifact])
-        -> Vec<crate::guard::Listed>
-    {
+    pub(crate) fn listed(
+        names: &[String],
+        bare: &str,
+        kinds: &[crate::naming::Artifact],
+    ) -> Vec<crate::guard::Listed> {
         let mut out = Vec::new();
         for raw in names {
             for &a in kinds {
@@ -2539,7 +2632,10 @@ impl BqGuard {
                     continue;
                 }
                 if let Some(base) = staging_base(raw, suffix) {
-                    out.push(crate::guard::Listed { canonical: base.to_string(), raw: raw.clone() });
+                    out.push(crate::guard::Listed {
+                        canonical: base.to_string(),
+                        raw: raw.clone(),
+                    });
                     break;
                 }
             }
@@ -2558,7 +2654,11 @@ impl crate::guard::GuardStore for BqGuard {
         format!("{}.{bare}", self.conn.dataset)
     }
 
-    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+    async fn list(
+        &self,
+        bare: &str,
+        kinds: &[crate::naming::Artifact],
+    ) -> Result<Vec<crate::guard::Listed>> {
         // One listing per distinct head. The token sits BETWEEN head and
         // suffix, so the listing can only be narrowed to the head — which is
         // why every candidate is anchored on both ends (`staging_base`, then
@@ -2628,7 +2728,10 @@ impl crate::guard::GuardStore for BqGuard {
         let mut arts: Vec<Artifact> = vec![Artifact::ChangelogTmp];
         arts.extend(Artifact::cdc_staging_family());
         for a in arts {
-            let r = self.conn.table_delete(&artifact_ident_tok(bare, a, ROOMY, token)).await;
+            let r = self
+                .conn
+                .table_delete(&artifact_ident_tok(bare, a, ROOMY, token))
+                .await;
             if first.is_ok() {
                 first = r;
             }
@@ -2731,9 +2834,13 @@ impl crate::sink::Sink for BqSink {
         // announcement again if anything here fails; see `announce`.
         let a = crate::guard::announce(&self.guard(), &self.final_table, &self.run).await?;
         *self.announced.lock().expect("announcement") = Some(a);
-        crate::guard::check_peers(&self.guard(), &self.final_table, &self.run,
-                                  crate::guard::Mine::DeleteLeftovers)
-            .await?;
+        crate::guard::check_peers(
+            &self.guard(),
+            &self.final_table,
+            &self.run,
+            crate::guard::Mine::DeleteLeftovers,
+        )
+        .await?;
         if let Some(cursor) = plan.cursor.as_deref() {
             if let Some(idx) = plan.cols.iter().position(|c| c.name == cursor) {
                 let numeric = matches!(
@@ -2889,7 +2996,10 @@ impl crate::sink::Sink for BqSink {
             // what readers can still use. Best-effort — an error is noted
             // inside and never fails the run.
             self.conn.compact_state_if_bloated().await;
-            (crate::naming::cursor_watermark(&self.final_table, cursor, own)?, sib)
+            (
+                crate::naming::cursor_watermark(&self.final_table, cursor, own)?,
+                sib,
+            )
         } else {
             (None, false)
         };
@@ -3027,7 +3137,6 @@ impl BqSink {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3045,7 +3154,9 @@ mod tests {
     fn statuses_are_read_from_the_head_not_the_url() {
         let forbidden = "bigquery 403 Forbidden on https://bigquery.googleapis.com/bigquery/v2/projects/acme-409123/datasets/sales_2404/tables: rateLimitExceeded";
         assert!(!super::is_conflict(forbidden) && !super::is_status(forbidden, 404));
-        assert!(super::is_conflict("bigquery 409 Conflict on .../tables: Already Exists: Table p:d.t"));
+        assert!(super::is_conflict(
+            "bigquery 409 Conflict on .../tables: Already Exists: Table p:d.t"
+        ));
         assert!(super::is_status("bigquery 404 Not Found on .../d", 404));
     }
 
@@ -3062,9 +3173,16 @@ mod tests {
     /// body is an error, not an empty answer (T7).
     #[test]
     fn upload_errors_hide_the_session_and_bodies_are_read_whole() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
-            let e = reqwest::Client::new().get("http://127.0.0.1:1/x?upload_id=SECRET").send().await.unwrap_err();
+            let e = reqwest::Client::new()
+                .get("http://127.0.0.1:1/x?upload_id=SECRET")
+                .send()
+                .await
+                .unwrap_err();
             let m = super::upload_err(e).to_string();
             assert!(!m.contains("SECRET"), "{m}");
 
@@ -3075,10 +3193,17 @@ mod tests {
                 let (mut c, _) = l.accept().await.unwrap();
                 let mut buf = [0u8; 1024];
                 let _ = c.read(&mut buf).await;
-                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"a\"").await;
+                let _ = c
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"a\"")
+                    .await;
             });
-            let resp = reqwest::get(format!("http://127.0.0.1:{port}/")).await.unwrap();
-            assert!(super::body_text(resp, "probe").await.is_err(), "a body cut short is an error");
+            let resp = reqwest::get(format!("http://127.0.0.1:{port}/"))
+                .await
+                .unwrap();
+            assert!(
+                super::body_text(resp, "probe").await.is_err(),
+                "a body cut short is an error"
+            );
         });
     }
 
@@ -3116,7 +3241,10 @@ mod tests {
             1,
             "the un-awaited handle must still be owned by the loader: {jobs:?}"
         );
-        assert_eq!(jobs[0].id, "third", "and it is the one that had not been awaited");
+        assert_eq!(
+            jobs[0].id, "third",
+            "and it is the one that had not been awaited"
+        );
         // Still live: awaiting it now is what `quiesce` does. A detached handle
         // could not be awaited at all — its value would already be gone.
         assert_eq!(BqLoader::await_jobs(&mut jobs).await.expect("third"), 30);
@@ -3134,7 +3262,9 @@ mod tests {
     /// The body of `fn <header>`, brace matched with strings stepped over (a
     /// `format!` in these bodies carries `{committed}` and `{}`).
     fn fn_body<'a>(src: &'a str, header: &str) -> &'a str {
-        let i = src.find(header).unwrap_or_else(|| panic!("not found: {header}"));
+        let i = src
+            .find(header)
+            .unwrap_or_else(|| panic!("not found: {header}"));
         let start = i + header.len();
         let b = src.as_bytes();
         let (mut j, mut depth) = (start, 1i32);
@@ -3165,23 +3295,41 @@ mod tests {
     fn finish_quiesces_before_it_hands_back_its_error() {
         let src = include_str!("bigquery.rs");
         let finish = fn_body(src, "async fn finish(mut self) -> Result<u64> {");
-        assert!(finish.contains("self.commit().await"), "finish delegates: {finish}");
+        assert!(
+            finish.contains("self.commit().await"),
+            "finish delegates: {finish}"
+        );
         assert!(
             finish.contains("self.quiesce().await"),
             "finish consumed the loader, so its error arm must quiesce: {finish}"
         );
         let abort = fn_body(src, "async fn abort(mut self, cause: Error) -> Error {");
-        assert!(abort.contains("self.quiesce().await"), "abort shares it: {abort}");
+        assert!(
+            abort.contains("self.quiesce().await"),
+            "abort shares it: {abort}"
+        );
         let commit = fn_body(src, "async fn commit(&mut self) -> Result<u64> {");
         assert!(
             commit.contains("Self::await_jobs(&mut self.pending_jobs)"),
             "commit waits in place: {commit}"
         );
-        assert!(!commit.contains("mem::take"), "commit must never take the whole list: {commit}");
+        assert!(
+            !commit.contains("mem::take"),
+            "commit must never take the whole list: {commit}"
+        );
         let quiesce = fn_body(src, "async fn quiesce(&mut self) {");
-        assert!(quiesce.contains("/cancel"), "every job is cancelled: {quiesce}");
-        assert!(quiesce.contains("p.handle.join().await"), "and awaited to terminal: {quiesce}");
-        assert!(quiesce.contains("poll_job"), "with one extra poll: {quiesce}");
+        assert!(
+            quiesce.contains("/cancel"),
+            "every job is cancelled: {quiesce}"
+        );
+        assert!(
+            quiesce.contains("p.handle.join().await"),
+            "and awaited to terminal: {quiesce}"
+        );
+        assert!(
+            quiesce.contains("poll_job"),
+            "with one extra poll: {quiesce}"
+        );
     }
 
     /// The compaction deletes only rows older than their OWN key's newest:
@@ -3193,7 +3341,10 @@ mod tests {
     fn state_compaction_deletes_only_superseded_rows() {
         let sql = compact_state_sql("`p.d._apitap_state`");
         let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.starts_with("DELETE FROM `p.d._apitap_state` x WHERE EXISTS ("), "{flat}");
+        assert!(
+            flat.starts_with("DELETE FROM `p.d._apitap_state` x WHERE EXISTS ("),
+            "{flat}"
+        );
         for part in [
             "MAX(synced_at) AS newest FROM `p.d._apitap_state` GROUP BY dest_table, source_id",
             "y.dest_table = x.dest_table",
@@ -3426,13 +3577,23 @@ mod tests {
 
     #[test]
     fn cursor_max_renders_in_source_style() {
-        assert!(BqSink::cursor_max_expr("postgres", "timestamptz", "ts").unwrap().contains("FORMAT_TIMESTAMP"));
+        assert!(BqSink::cursor_max_expr("postgres", "timestamptz", "ts")
+            .unwrap()
+            .contains("FORMAT_TIMESTAMP"));
         // MySQL inverts the spellings: "timestamp"=UTC → TIMESTAMP,
         // "datetime"=tz-less → DATETIME.
-        assert!(BqSink::cursor_max_expr("mysql", "timestamp", "ts").unwrap().contains("FORMAT_TIMESTAMP"));
-        assert!(BqSink::cursor_max_expr("mysql", "datetime", "ts").unwrap().contains("FORMAT_DATETIME"));
-        assert!(BqSink::cursor_max_expr("postgres", "timestamp", "ts").unwrap().contains("FORMAT_DATETIME"));
-        assert!(BqSink::cursor_max_expr("postgres", "int8", "id").unwrap().starts_with("CAST(MAX"));
+        assert!(BqSink::cursor_max_expr("mysql", "timestamp", "ts")
+            .unwrap()
+            .contains("FORMAT_TIMESTAMP"));
+        assert!(BqSink::cursor_max_expr("mysql", "datetime", "ts")
+            .unwrap()
+            .contains("FORMAT_DATETIME"));
+        assert!(BqSink::cursor_max_expr("postgres", "timestamp", "ts")
+            .unwrap()
+            .contains("FORMAT_DATETIME"));
+        assert!(BqSink::cursor_max_expr("postgres", "int8", "id")
+            .unwrap()
+            .starts_with("CAST(MAX"));
     }
 
     #[test]
@@ -3538,13 +3699,37 @@ mod guard_tests {
             "orders".to_string(),
         ];
         let listed = BqGuard::listed(&names, "orders", GUARDED);
-        assert!(listed.contains(&crate::guard::Listed {
-            canonical: theirs.clone(), raw: format!("{theirs}_3") }), "{listed:?}");
-        assert_eq!(listed.len(), 2, "a user's orders_2024 is no candidate: {listed:?}");
-        let scan = blockers("orders", ROOMY, &run, GUARDED,
-                            listed.iter().map(|l| (l.canonical.as_str(), l.raw.as_str())));
+        assert!(
+            listed.contains(&crate::guard::Listed {
+                canonical: theirs.clone(),
+                raw: format!("{theirs}_3")
+            }),
+            "{listed:?}"
+        );
+        assert_eq!(
+            listed.len(),
+            2,
+            "a user's orders_2024 is no candidate: {listed:?}"
+        );
+        let scan = blockers(
+            "orders",
+            ROOMY,
+            &run,
+            GUARDED,
+            listed
+                .iter()
+                .map(|l| (l.canonical.as_str(), l.raw.as_str())),
+        );
         assert_eq!(scan.blockers.len(), 1, "{scan:?}");
-        assert_eq!(scan.blockers[0].name(), format!("{theirs}_3"), "refused by its raw name");
-        assert_eq!(scan.mine_leftovers, vec![format!("{mine}_3")], "deleted by its raw name");
+        assert_eq!(
+            scan.blockers[0].name(),
+            format!("{theirs}_3"),
+            "refused by its raw name"
+        );
+        assert_eq!(
+            scan.mine_leftovers,
+            vec![format!("{mine}_3")],
+            "deleted by its raw name"
+        );
     }
 }

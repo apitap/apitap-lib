@@ -75,12 +75,20 @@ pub(crate) enum PgoMessage {
     /// proto v2 streaming: an in-progress transaction's block opens. Until
     /// the matching StreamStop, every DML/Relation message carries a leading
     /// xid (the decoder strips it when `in_stream`).
-    StreamStart { xid: u32 },
+    StreamStart {
+        xid: u32,
+    },
     StreamStop,
     /// The streamed transaction committed — its buffered ops are real now.
-    StreamCommit { xid: u32, end_lsn: u64 },
+    StreamCommit {
+        xid: u32,
+        end_lsn: u64,
+    },
     /// The streamed transaction rolled back — drop everything buffered.
-    StreamAbort { xid: u32, sub_xid: u32 },
+    StreamAbort {
+        xid: u32,
+        sub_xid: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,7 +195,9 @@ impl Tuple {
         (0..self.cells.len()).map(|i| self.view(i))
     }
     pub(crate) fn has_toast(&self) -> bool {
-        self.cells.iter().any(|c| matches!(c, CellR::UnchangedToast))
+        self.cells
+            .iter()
+            .any(|c| matches!(c, CellR::UnchangedToast))
     }
     /// Materialize owned cells — the residue tail's format. Rare by design.
     pub(crate) fn to_cells(&self) -> Vec<Cell> {
@@ -195,9 +205,7 @@ impl Tuple {
             .iter()
             .map(|c| match *c {
                 CellR::Null => Cell::Null,
-                CellR::Text(o, l) => {
-                    Cell::Text(self.frame.slice(o as usize..(o + l) as usize))
-                }
+                CellR::Text(o, l) => Cell::Text(self.frame.slice(o as usize..(o + l) as usize)),
                 CellR::UnchangedToast => Cell::UnchangedToast,
             })
             .collect()
@@ -205,7 +213,10 @@ impl Tuple {
     /// Build a Tuple that owns freshly rendered bytes (the MySQL lane, whose
     /// decoder renders values rather than slicing a shared frame).
     pub(crate) fn from_rendered(frame: Vec<u8>, cells: Vec<CellR>) -> Self {
-        Self { frame: bytes::Bytes::from(frame), cells }
+        Self {
+            frame: bytes::Bytes::from(frame),
+            cells,
+        }
     }
 
     /// Build from owned cells by concatenation — test rigs and slow paths.
@@ -237,7 +248,11 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn new(src: &'a bytes::Bytes) -> Self {
-        Self { b: &src[..], src, pos: 0 }
+        Self {
+            b: &src[..],
+            src,
+            pos: 0,
+        }
     }
     fn u8(&mut self) -> Result<u8> {
         let v = *self.b.get(self.pos).ok_or_else(short)?;
@@ -326,7 +341,10 @@ impl<'a> Reader<'a> {
             // text rebuild below — one allocation and one text render per
             // row — is skipped entirely. Text streams take the same exit
             // (nothing to rebuild).
-            return Ok(Tuple { frame: self.src.clone(), cells });
+            return Ok(Tuple {
+                frame: self.src.clone(),
+                cells,
+            });
         }
         // Binary tuple: rebuild an OWNED frame with every `'b'` cell rendered
         // to its PG-text form and every `'t'` cell copied through. One
@@ -463,7 +481,13 @@ pub(crate) fn decode(
                     type_mod: r.i32()?,
                 });
             }
-            PgoMessage::Relation(Relation { rel_id, namespace, name, replica_identity, cols })
+            PgoMessage::Relation(Relation {
+                rel_id,
+                namespace,
+                name,
+                replica_identity,
+                cols,
+            })
         }
         b'I' => {
             let rel_id = r.u32()?;
@@ -477,7 +501,10 @@ pub(crate) fn decode(
                     )))
                 }
             }
-            PgoMessage::Insert { rel_id, new: r.tuple(oids, keep_binary)? }
+            PgoMessage::Insert {
+                rel_id,
+                new: r.tuple(oids, keep_binary)?,
+            }
         }
         b'U' => {
             let rel_id = r.u32()?;
@@ -485,7 +512,10 @@ pub(crate) fn decode(
             let mut old = None;
             let mut kind = r.u8()?;
             if kind == b'K' || kind == b'O' {
-                old = Some(OldImage { full: kind == b'O', tuple: r.tuple(oids, keep_binary)? });
+                old = Some(OldImage {
+                    full: kind == b'O',
+                    tuple: r.tuple(oids, keep_binary)?,
+                });
                 kind = r.u8()?;
             }
             if kind != b'N' {
@@ -494,7 +524,11 @@ pub(crate) fn decode(
                     kind as char
                 )));
             }
-            PgoMessage::Update { rel_id, old, new: r.tuple(oids, keep_binary)? }
+            PgoMessage::Update {
+                rel_id,
+                old,
+                new: r.tuple(oids, keep_binary)?,
+            }
         }
         b'D' => {
             let rel_id = r.u32()?;
@@ -508,7 +542,10 @@ pub(crate) fn decode(
             }
             PgoMessage::Delete {
                 rel_id,
-                old: OldImage { full: kind == b'O', tuple: r.tuple(oids, keep_binary)? },
+                old: OldImage {
+                    full: kind == b'O',
+                    tuple: r.tuple(oids, keep_binary)?,
+                },
             }
         }
         b'T' => {
@@ -561,11 +598,7 @@ mod tests {
     /// The message only. `decode` also reports which (sub)transaction a
     /// streamed change came from, which every test below predates and none of
     /// them are about.
-    fn dec(
-        payload: &bytes::Bytes,
-        in_stream: bool,
-        oids: &RelOids,
-    ) -> Result<PgoMessage> {
+    fn dec(payload: &bytes::Bytes, in_stream: bool, oids: &RelOids) -> Result<PgoMessage> {
         decode(payload, in_stream, oids, false).map(|(m, _)| m)
     }
 
@@ -575,10 +608,19 @@ mod tests {
 
     #[test]
     fn begin_commit_roundtrip() {
-        let b = frame(&[b"B", &7u64.to_be_bytes(), &99i64.to_be_bytes(), &5u32.to_be_bytes()]);
+        let b = frame(&[
+            b"B",
+            &7u64.to_be_bytes(),
+            &99i64.to_be_bytes(),
+            &5u32.to_be_bytes(),
+        ]);
         assert_eq!(
             dec(&b, false, &RelOids::new()).unwrap(),
-            PgoMessage::Begin { final_lsn: 7, commit_ts_us: 99, xid: 5 }
+            PgoMessage::Begin {
+                final_lsn: 7,
+                commit_ts_us: 99,
+                xid: 5
+            }
         );
         let c = frame(&[
             b"C",
@@ -589,7 +631,11 @@ mod tests {
         ]);
         assert_eq!(
             dec(&c, false, &RelOids::new()).unwrap(),
-            PgoMessage::Commit { commit_lsn: 7, end_lsn: 8, commit_ts_us: 99 }
+            PgoMessage::Commit {
+                commit_lsn: 7,
+                end_lsn: 8,
+                commit_ts_us: 99
+            }
         );
     }
 
@@ -611,7 +657,9 @@ mod tests {
             &25u32.to_be_bytes(),
             &(-1i32).to_be_bytes(),
         ]);
-        let PgoMessage::Relation(r) = dec(&rel, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Relation(r) = dec(&rel, false, &RelOids::new()).unwrap() else {
+            panic!()
+        };
         assert_eq!(r.rel_id, 42);
         assert_eq!(r.replica_identity, b'd');
         assert!(r.cols[0].key && !r.cols[1].key);
@@ -627,9 +675,14 @@ mod tests {
             b"9",
             b"n",
         ]);
-        let PgoMessage::Insert { rel_id, new } = dec(&ins, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Insert { rel_id, new } = dec(&ins, false, &RelOids::new()).unwrap() else {
+            panic!()
+        };
         assert_eq!(rel_id, 42);
-        assert_eq!(new.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9")), Cell::Null]);
+        assert_eq!(
+            new.to_cells(),
+            vec![Cell::Text(bytes::Bytes::from_static(b"9")), Cell::Null]
+        );
     }
 
     #[test]
@@ -650,10 +703,15 @@ mod tests {
             b"9",
             b"u",
         ]);
-        let PgoMessage::Update { old, new, .. } = dec(&upd, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Update { old, new, .. } = dec(&upd, false, &RelOids::new()).unwrap() else {
+            panic!()
+        };
         let old = old.unwrap();
         assert!(!old.full);
-        assert_eq!(old.tuple.to_cells(), vec![Cell::Text(bytes::Bytes::from_static(b"9"))]);
+        assert_eq!(
+            old.tuple.to_cells(),
+            vec![Cell::Text(bytes::Bytes::from_static(b"9"))]
+        );
         assert_eq!(new.view(1), Cellv::UnchangedToast);
         // The empty string stays a VALUE, never Null.
         let ins = frame(&[
@@ -664,7 +722,9 @@ mod tests {
             b"t",
             &0u32.to_be_bytes(),
         ]);
-        let PgoMessage::Insert { new, .. } = dec(&ins, false, &RelOids::new()).unwrap() else { panic!() };
+        let PgoMessage::Insert { new, .. } = dec(&ins, false, &RelOids::new()).unwrap() else {
+            panic!()
+        };
         assert_eq!(new.view(0), Cellv::Text(b""));
         assert_ne!(new.view(0), Cellv::Null);
     }
@@ -680,7 +740,11 @@ mod tests {
         ]);
         assert_eq!(
             dec(&t, false, &RelOids::new()).unwrap(),
-            PgoMessage::Truncate { rel_ids: vec![42, 43], cascade: true, restart_identity: true }
+            PgoMessage::Truncate {
+                rel_ids: vec![42, 43],
+                cascade: true,
+                restart_identity: true
+            }
         );
     }
 

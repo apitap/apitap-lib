@@ -44,8 +44,14 @@ async fn sheets_get(
             .send()
             .await;
         let resp = match sent {
-            Ok(r) if crate::http::store_retryable(r.status()) && attempt < crate::http::STORE_ATTEMPTS => {
-                let wait = crate::http::store_backoff(attempt, r.headers().get(reqwest::header::RETRY_AFTER));
+            Ok(r)
+                if crate::http::store_retryable(r.status())
+                    && attempt < crate::http::STORE_ATTEMPTS =>
+            {
+                let wait = crate::http::store_backoff(
+                    attempt,
+                    r.headers().get(reqwest::header::RETRY_AFTER),
+                );
                 tokio::time::sleep(wait).await;
                 continue;
             }
@@ -62,9 +68,13 @@ async fn sheets_get(
             .await
             .map_err(|e| Error::Transfer(format!("gsheets response read: {e}")))?;
         if !status.is_success() {
-            return Err(Error::Transfer(format!("gsheets api ({status}): {}", body.trim())));
+            return Err(Error::Transfer(format!(
+                "gsheets api ({status}): {}",
+                body.trim()
+            )));
         }
-        return serde_json::from_str(&body).map_err(|e| Error::Transfer(format!("gsheets response: {e}")));
+        return serde_json::from_str(&body)
+            .map_err(|e| Error::Transfer(format!("gsheets response: {e}")));
     }
 }
 /// Rows per HTTP fetch: large enough to amortize the round-trip, small enough
@@ -89,8 +99,8 @@ pub(crate) struct GsheetsSource {
 
 impl GsheetsSource {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        let u = reqwest::Url::parse(url)
-            .map_err(|e| crate::urlerr::bad_url("gsheets url", url, e))?;
+        let u =
+            reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("gsheets url", url, e))?;
         // The spreadsheet id rides as the host; ids are [A-Za-z0-9_-] so they
         // survive URL host parsing intact.
         let spreadsheet = u
@@ -153,7 +163,13 @@ impl GsheetsSource {
     /// and the run succeeded (P2). Both are errors now.
     async fn grid_rows(&self, tab: &str) -> Result<i64> {
         let meta = self
-            .get_json("", &[("fields", "sheets(properties(title,gridProperties(rowCount)))")])
+            .get_json(
+                "",
+                &[(
+                    "fields",
+                    "sheets(properties(title,gridProperties(rowCount)))",
+                )],
+            )
             .await?;
         grid_rows_of(&meta, tab)
     }
@@ -244,7 +260,13 @@ impl Source for GsheetsSource {
         tables: Option<&[String]>,
     ) -> Result<Vec<(String, i64)>> {
         let meta = self
-            .get_json("", &[("fields", "sheets(properties(title,gridProperties(rowCount)))")])
+            .get_json(
+                "",
+                &[(
+                    "fields",
+                    "sheets(properties(title,gridProperties(rowCount)))",
+                )],
+            )
             .await?;
         let all: Vec<(String, i64)> = meta["sheets"]
             .as_array()
@@ -336,7 +358,12 @@ impl Source for GsheetsSource {
         pipes
             .run_inline(
                 stmts,
-                GsBody { src: self, plan, lane, chunk },
+                GsBody {
+                    src: self,
+                    plan,
+                    lane,
+                    chunk,
+                },
             )
             .await
     }
@@ -368,7 +395,9 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
         let mut start = 2usize; // row 1 is the header
         let mut rows_sent: u64 = 0;
         loop {
-            let Some(next) = next_page_start(start, grid_rows) else { break };
+            let Some(next) = next_page_start(start, grid_rows) else {
+                break;
+            };
             start = next;
             let cells = format!("A{start}:ZZZ{}", start + page_rows - 1);
             let page = self.src.values(&GsheetsSource::range(&tab, &cells)).await?;
@@ -395,7 +424,8 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
                 enc.row_end(&mut out);
                 rows_sent += 1;
                 if out.len() >= self.chunk {
-                    let buf = std::mem::replace(&mut out, Vec::with_capacity(self.chunk + 64 * 1024));
+                    let buf =
+                        std::mem::replace(&mut out, Vec::with_capacity(self.chunk + 64 * 1024));
                     pipe.send(buf).await?;
                 }
             }
@@ -441,7 +471,11 @@ fn grid_rows_of(meta: &serde_json::Value, tab: &str) -> Result<i64> {
         .as_array()
         .into_iter()
         .flatten()
-        .find(|s| s["properties"]["title"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(tab)))
+        .find(|s| {
+            s["properties"]["title"]
+                .as_str()
+                .is_some_and(|t| t.eq_ignore_ascii_case(tab))
+        })
         .and_then(|s| s["properties"]["gridProperties"]["rowCount"].as_i64())
         .ok_or_else(|| {
             Error::InvalidInput(format!(
@@ -467,7 +501,10 @@ mod tests {
     /// P2: a 429 is retried (with its Retry-After), a 403 is the answer.
     #[test]
     fn a_throttled_sheets_get_is_retried() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let serve = |answers: Vec<&'static str>| async move {

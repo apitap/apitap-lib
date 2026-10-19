@@ -33,7 +33,6 @@ use tokio_rustls::rustls;
 /// until the process dies. This is the bound.
 const MAX_PAYLOAD: usize = 1 << 30;
 
-
 // Capability flags (the subset we speak).
 const CLIENT_LONG_PASSWORD: u32 = 0x1;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x8;
@@ -66,7 +65,9 @@ enum SslPref {
     /// The bool records whether the URL SAID so, which decides whether a
     /// cleartext fallback is worth telling the operator about — see the
     /// walsender's note for the same reasoning.
-    Preferred { explicit: bool },
+    Preferred {
+        explicit: bool,
+    },
     Required,
     VerifyIdentity,
 }
@@ -136,8 +137,7 @@ fn connectable_host(h: &str) -> &str {
         .unwrap_or(h)
 }
 pub(crate) fn parse_my_url(url: &str) -> Result<MyConnInfo> {
-    let u = reqwest::Url::parse(url)
-        .map_err(|e| crate::urlerr::bad_url("mysql url", url, e))?;
+    let u = reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("mysql url", url, e))?;
     let host = u
         .host_str()
         .map(connectable_host)
@@ -228,10 +228,7 @@ fn parse_err(body: &[u8]) -> Error {
     if msg.first() == Some(&b'#') && msg.len() >= 6 {
         msg = &msg[6..];
     }
-    Error::Transfer(format!(
-        "mysql [{code}]: {}",
-        String::from_utf8_lossy(msg)
-    ))
+    Error::Transfer(format!("mysql [{code}]: {}", String::from_utf8_lossy(msg)))
 }
 
 /// Length-encoded integer; returns (value, bytes consumed).
@@ -316,10 +313,11 @@ fn parse_handshake(p: &[u8]) -> Result<Handshake> {
     if p.first() != Some(&10) {
         return Err(desync("handshake protocol version"));
     }
-    let mut pos = 1 + p[1..]
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| desync("handshake server version"))?
+    let mut pos = 1
+        + p[1..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| desync("handshake server version"))?
         + 1
         + 4;
     if p.len() < pos + 8 + 1 + 2 {
@@ -363,7 +361,11 @@ fn parse_handshake(p: &[u8]) -> Result<Handshake> {
     if plugin.is_empty() {
         plugin = "mysql_native_password".into();
     }
-    Ok(Handshake { caps, nonce, plugin })
+    Ok(Handshake {
+        caps,
+        nonce,
+        plugin,
+    })
 }
 
 /// Accept-anything verifier: MySQL `ssl-mode=required` semantics — the
@@ -405,7 +407,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
-async fn tls_upgrade(tcp: TcpStream, host: &str, ssl: SslPref, ssl_ca: Option<&str>) -> Result<IoBox> {
+async fn tls_upgrade(
+    tcp: TcpStream,
+    host: &str,
+    ssl: SslPref,
+    ssl_ca: Option<&str>,
+) -> Result<IoBox> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -453,10 +460,7 @@ async fn tls_upgrade(tcp: TcpStream, host: &str, ssl: SslPref, ssl_ca: Option<&s
 /// One packet read straight off the raw TCP socket (pre-TLS phase only).
 /// Same door as the walsender's, for the same reason.
 #[cfg(test)]
-pub(super) async fn read_packet_raw_for_test(
-    tcp: &mut TcpStream,
-    seq: &mut u8,
-) -> Result<Vec<u8>> {
+pub(super) async fn read_packet_raw_for_test(tcp: &mut TcpStream, seq: &mut u8) -> Result<Vec<u8>> {
     read_packet_raw(tcp, seq).await
 }
 
@@ -526,9 +530,12 @@ fn set_keepalive(tcp: &TcpStream) {
 impl MyWire {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let info = parse_my_url(url)?;
-        tokio::time::timeout(std::time::Duration::from_secs(10), Self::connect_inner(&info))
-            .await
-            .map_err(|_| Error::Connect("mysql wire: connect timed out (10s)".into()))?
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Self::connect_inner(&info),
+        )
+        .await
+        .map_err(|_| Error::Connect("mysql wire: connect timed out (10s)".into()))?
     }
 
     async fn connect_inner(info: &MyConnInfo) -> Result<Self> {
@@ -1034,7 +1041,9 @@ mod tests {
 
         let (mut peer, ours) = tokio::io::duplex(1 << 16);
         let mut w = over(ours);
-        peer.write_all(&[3, 0, 0, 0, b'a', b'b', b'c']).await.unwrap();
+        peer.write_all(&[3, 0, 0, 0, b'a', b'b', b'c'])
+            .await
+            .unwrap();
         assert_eq!(&w.read_packet_capped(1 << 20).await.unwrap()[..], b"abc");
     }
 
@@ -1213,8 +1222,8 @@ mod tests {
 
     #[test]
     fn url_parse_decodes_credentials_and_gates_tls() {
-        let i = parse_my_url("mysql://ro%40ot:p%23w@db.example:3307/bench?ssl-mode=disabled")
-            .unwrap();
+        let i =
+            parse_my_url("mysql://ro%40ot:p%23w@db.example:3307/bench?ssl-mode=disabled").unwrap();
         assert_eq!(i.user, "ro@ot");
         assert_eq!(i.password, "p#w");
         assert_eq!(i.port, 3307);
@@ -1241,14 +1250,17 @@ mod tests {
         assert!(!SslPref::Required.verifies());
         // MySQL writes it with an underscore; a hyphen is the same mode.
         assert_eq!(
-            parse_my_url("mysql://u:p@h/db?ssl-mode=VERIFY-IDENTITY").unwrap().ssl,
+            parse_my_url("mysql://u:p@h/db?ssl-mode=VERIFY-IDENTITY")
+                .unwrap()
+                .ssl,
             SslPref::VerifyIdentity
         );
         // verify_ca checks the chain but NOT the hostname, which rustls cannot
         // express — refused by name rather than silently moved either way.
         assert!(parse_my_url("mysql://u:p@h/db?ssl-mode=verify_ca").is_err());
         // P2-9: ssl-ca (and its aliases) reaches the raw plane.
-        let ci = parse_my_url("mysql://u:p@h/db?ssl-mode=verify_identity&ssl-ca=/etc/ca.pem").unwrap();
+        let ci =
+            parse_my_url("mysql://u:p@h/db?ssl-mode=verify_identity&ssl-ca=/etc/ca.pem").unwrap();
         assert_eq!(ci.ssl_ca.as_deref(), Some("/etc/ca.pem"));
         let ci = parse_my_url("mysql://u:p@h/db?sslrootcert=/x.pem").unwrap();
         assert_eq!(ci.ssl_ca.as_deref(), Some("/x.pem"));

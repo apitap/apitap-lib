@@ -175,7 +175,10 @@ pub(crate) fn store_retryable(s: reqwest::StatusCode) -> bool {
 /// The wait before attempt `attempt + 1` (1-based): 0.5, 1, 2, 4, 8 s plus up
 /// to a quarter of jitter, or the server's `Retry-After` seconds (capped at
 /// 60 s) when it sent one.
-pub(crate) fn store_backoff(attempt: u32, retry_after: Option<&reqwest::header::HeaderValue>) -> Duration {
+pub(crate) fn store_backoff(
+    attempt: u32,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+) -> Duration {
     if let Some(secs) = retry_after
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -203,7 +206,10 @@ mod store_retry_tests {
         assert!(store_retryable(S::SERVICE_UNAVAILABLE) && !store_retryable(S::FORBIDDEN));
         let d1 = store_backoff(1, None);
         let d5 = store_backoff(5, None);
-        assert!(d1 >= Duration::from_millis(500) && d1 < Duration::from_millis(700), "{d1:?}");
+        assert!(
+            d1 >= Duration::from_millis(500) && d1 < Duration::from_millis(700),
+            "{d1:?}"
+        );
         assert!(d5 >= Duration::from_secs(8), "{d5:?}");
         let ra = reqwest::header::HeaderValue::from_static("3");
         assert_eq!(store_backoff(1, Some(&ra)), Duration::from_secs(3));

@@ -55,13 +55,23 @@ pub(crate) fn cursor_quoted(udt: &str) -> crate::error::Result<bool> {
 /// resolve to 127.0.0.1 is not either, because this must be decidable from the
 /// URL alone, before any DNS.
 pub(crate) fn host_is_loopback(url: &str) -> bool {
-    match reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)) {
+    match reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+    {
         Some(h) => {
-            let h = h.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+            let h = h
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase();
             h == "localhost"
                 || h == "::1"
-                || h.parse::<std::net::Ipv4Addr>().map(|a| a.is_loopback()).unwrap_or(false)
-                || h.parse::<std::net::Ipv6Addr>().map(|a| a.is_loopback()).unwrap_or(false)
+                || h.parse::<std::net::Ipv4Addr>()
+                    .map(|a| a.is_loopback())
+                    .unwrap_or(false)
+                || h.parse::<std::net::Ipv6Addr>()
+                    .map(|a| a.is_loopback())
+                    .unwrap_or(false)
         }
         None => false, // unparseable: assume the risky case, require TLS
     }
@@ -82,7 +92,10 @@ pub(crate) fn secure_url(url: &str) -> String {
 /// Does this URL already say what it wants from TLS?
 pub(crate) fn has_explicit_ssl_mode(url: &str) -> bool {
     reqwest::Url::parse(url)
-        .map(|u| u.query_pairs().any(|(k, _)| k == "ssl-mode" || k == "sslmode"))
+        .map(|u| {
+            u.query_pairs()
+                .any(|(k, _)| k == "ssl-mode" || k == "sslmode")
+        })
         .unwrap_or(false)
 }
 
@@ -122,7 +135,7 @@ mod tls_default_tests {
             assert!(host_is_loopback(u), "{u} is loopback");
         }
         for u in [
-            "mysql://u:p@10.0.0.9/db",       // private, but off this machine
+            "mysql://u:p@10.0.0.9/db", // private, but off this machine
             "mysql://u:p@192.168.1.20/db",
             "mysql://u:p@db.internal/db",
             "mysql://u:p@prod-host:3306/db",
@@ -147,7 +160,10 @@ mod tests {
     #[test]
     fn the_tls_hint_does_not_offer_verify_ca() {
         let h = super::tls_required_hint("mysql://u@db.example/x");
-        assert!(h.contains("verify_ca is refused") && !h.contains("verify_ca /"), "{h}");
+        assert!(
+            h.contains("verify_ca is refused") && !h.contains("verify_ca /"),
+            "{h}"
+        );
     }
 
     /// P0-4: the CDC lanes now share this mapping with the bulk lanes —

@@ -199,9 +199,13 @@ impl GcsConn {
             attempt += 1;
             match build().send().await {
                 Ok(resp)
-                    if crate::http::store_retryable(resp.status()) && attempt < crate::http::STORE_ATTEMPTS =>
+                    if crate::http::store_retryable(resp.status())
+                        && attempt < crate::http::STORE_ATTEMPTS =>
                 {
-                    let wait = crate::http::store_backoff(attempt, resp.headers().get(reqwest::header::RETRY_AFTER));
+                    let wait = crate::http::store_backoff(
+                        attempt,
+                        resp.headers().get(reqwest::header::RETRY_AFTER),
+                    );
                     tokio::time::sleep(wait).await;
                 }
                 Ok(resp) => return Ok(resp),
@@ -512,14 +516,21 @@ impl crate::guard::GuardStore for GcsGuard {
         format!("gcs://{}/{}{bare}", self.conn.bucket, self.conn.prefix)
     }
 
-    async fn list(&self, bare: &str, _kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+    async fn list(
+        &self,
+        bare: &str,
+        _kinds: &[crate::naming::Artifact],
+    ) -> Result<Vec<crate::guard::Listed>> {
         let keys = self.conn.list(&self.root).await?;
         let url = format!("gcs://{}/{}", self.conn.bucket, self.root);
         Ok(crate::sink::s3::segment_listed(
             &self.root,
             bare,
             &keys,
-            &format!("the objects under gcs://{}/{}", self.conn.bucket, self.conn.prefix),
+            &format!(
+                "the objects under gcs://{}/{}",
+                self.conn.bucket, self.conn.prefix
+            ),
             &|seg| format!("the objects under {url}{seg}/"),
         ))
     }
@@ -653,10 +664,7 @@ impl crate::sink::Sink for GcsSink {
         // A single-column table's NULL row would be a BLANK CSV line — which
         // every standard reader silently drops. No honest spelling exists
         // (quoted "" means empty string), so refuse instead of losing rows.
-        if self.conn.format == GcsFormat::Csv
-            && plan.cols.len() == 1
-            && plan.cols[0].nullable
-        {
+        if self.conn.format == GcsFormat::Csv && plan.cols.len() == 1 && plan.cols[0].nullable {
             return Err(Error::InvalidInput(format!(
                 "single nullable column '{}' can't round-trip through CSV (a NULL \
                  row is a blank line, dropped by CSV readers) — use format=parquet, \
@@ -689,8 +697,13 @@ impl crate::sink::Sink for GcsSink {
         // announcement again if anything here fails; see `announce`.
         let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
         *self.announced.lock().expect("announcement") = Some(a);
-        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::Keep)
-            .await?;
+        crate::guard::check_peers(
+            &self.guard(),
+            &self.bare,
+            &self.run,
+            crate::guard::Mine::Keep,
+        )
+        .await?;
         if self.conn.format == GcsFormat::Csv {
             // The header is its own tiny gzip member, named to sort BEFORE the
             // part files so finalize's sorted compose puts it first —
@@ -778,7 +791,10 @@ impl crate::sink::Sink for GcsSink {
                 // This run's part names are its own counter's: delete them by
                 // name, or the staging left behind reads as a live peer.
                 for n in 0..self.next_part.load(Ordering::Relaxed) {
-                    let _ = self.conn.delete(&format!("{}part-{n:05}.{}", self.staging, self.ext())).await;
+                    let _ = self
+                        .conn
+                        .delete(&format!("{}part-{n:05}.{}", self.staging, self.ext()))
+                        .await;
                 }
                 first_err.get_or_insert(e);
             }
@@ -856,7 +872,10 @@ impl GcsSink {
                 // naming them. Only apitap's OWN part files are swept.
                 let mut left = Vec::new();
                 for s in stale {
-                    if !fresh.contains(&s) && is_part_object(&s) && self.conn.delete(&s).await.is_err() {
+                    if !fresh.contains(&s)
+                        && is_part_object(&s)
+                        && self.conn.delete(&s).await.is_err()
+                    {
                         left.push(s);
                     }
                 }
@@ -978,7 +997,9 @@ impl crate::sink::Loader for GcsLoader {
         // until the session expired (P2).
         let tail = match (self.pq.take(), self.gz.take()) {
             (Some(mut pq), _) => pq.finish_file().map(|_| pq.out.take_all()),
-            (None, Some(gz)) => gz.finish().map_err(|e| Error::Transfer(format!("gcs gzip finish: {e}"))),
+            (None, Some(gz)) => gz
+                .finish()
+                .map_err(|e| Error::Transfer(format!("gcs gzip finish: {e}"))),
             (None, None) => Ok(Vec::new()),
         };
         let pending = match tail {
@@ -995,7 +1016,11 @@ impl crate::sink::Loader for GcsLoader {
         let mut crc = std::mem::replace(&mut self.crc, CRC32C.digest());
         crc.update(&pending);
         let sum = crc32c_b64(crc.finalize());
-        if let Err(e) = self.conn.put_chunk(&self.session, self.offset, pending, Some(total), Some(&sum)).await {
+        if let Err(e) = self
+            .conn
+            .put_chunk(&self.session, self.offset, pending, Some(total), Some(&sum))
+            .await
+        {
             self.conn.cancel(&self.session).await;
             return Err(e);
         }
@@ -1057,7 +1082,10 @@ mod tests {
             Staged::Run { seg } => {
                 assert_eq!(seg, tok);
                 let peer = crate::naming::parse_peer(
-                    &format!("{seg}__apitap_staging"), crate::naming::Artifact::Staging).unwrap();
+                    &format!("{seg}__apitap_staging"),
+                    crate::naming::Artifact::Staging,
+                )
+                .unwrap();
                 assert_eq!(peer.kind, crate::naming::LandKind::Swap);
             }
             _ => panic!("a token segment must read as a run"),

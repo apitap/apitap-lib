@@ -20,12 +20,12 @@
 //! module exists to preserve.
 
 use crate::error::{Error, Result};
-use std::str::FromStr;
 use crate::wire::pgoutput::lsn_to_string;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use bytes::Buf as _;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use bytes::Buf as _;
+use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -251,7 +251,11 @@ pub(crate) fn pg_binary_setting() -> Option<bool> {
 fn read_coalesce_us() -> u64 {
     match std::env::var("APITAP_READ_COALESCE_US") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
-        Ok(v) => v.parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(READ_COALESCE_US),
+        Ok(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(READ_COALESCE_US),
         Err(_) => READ_COALESCE_US,
     }
 }
@@ -274,7 +278,11 @@ fn connect_timeout_secs() -> u64 {
 fn recv_buffer_bytes() -> usize {
     match std::env::var("APITAP_RECV_BUF_BYTES") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
-        Ok(v) => v.parse::<usize>().ok().filter(|n| *n > 0).unwrap_or(RECV_BUF_BYTES),
+        Ok(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(RECV_BUF_BYTES),
         Err(_) => RECV_BUF_BYTES,
     }
 }
@@ -310,9 +318,7 @@ const MAX_FRAME: usize = 1 << 30;
 /// it a socket — without anything about the production path changing shape
 /// to accommodate a test.
 #[cfg(test)]
-pub(super) async fn read_frame_for_test(
-    rd: &mut BufReader<PgRead>,
-) -> Result<(u8, bytes::Bytes)> {
+pub(super) async fn read_frame_for_test(rd: &mut BufReader<PgRead>) -> Result<(u8, bytes::Bytes)> {
     read_frame(rd).await
 }
 
@@ -359,7 +365,10 @@ async fn read_frame(rd: &mut BufReader<PgRead>) -> Result<(u8, bytes::Bytes)> {
 #[derive(Debug)]
 pub(crate) enum WalEvent {
     /// One pgoutput message payload starting at `wal_start`.
-    XLogData { wal_start: u64, payload: bytes::Bytes },
+    XLogData {
+        wal_start: u64,
+        payload: bytes::Bytes,
+    },
     /// Primary keepalive: server's current WAL end and whether it wants an
     /// immediate reply.
     Keepalive { wal_end: u64, reply_requested: bool },
@@ -474,9 +483,8 @@ async fn tls_upgrade(
             // option, and quietly keeping the public anchors alongside it
             // would verify against a wider set than the user asked for.
             Some(path) => {
-                let pem = std::fs::read_to_string(path).map_err(|e| {
-                    Error::InvalidInput(format!("sslrootcert {path}: {e}"))
-                })?;
+                let pem = std::fs::read_to_string(path)
+                    .map_err(|e| Error::InvalidInput(format!("sslrootcert {path}: {e}")))?;
                 let certs = pem_certs(&pem);
                 if certs.is_empty() {
                     return Err(Error::InvalidInput(format!(
@@ -486,9 +494,9 @@ async fn tls_upgrade(
                     )));
                 }
                 for c in certs {
-                    roots.add(c).map_err(|e| {
-                        Error::InvalidInput(format!("sslrootcert {path}: {e}"))
-                    })?;
+                    roots
+                        .add(c)
+                        .map_err(|e| Error::InvalidInput(format!("sslrootcert {path}: {e}")))?;
                 }
             }
             None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
@@ -689,8 +697,7 @@ fn connectable_host(h: &str) -> &str {
         .unwrap_or(h)
 }
 fn parse_url(url: &str) -> Result<ConnInfo> {
-    let u = reqwest::Url::parse(url)
-        .map_err(|e| crate::urlerr::bad_url("postgres url", url, e))?;
+    let u = reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("postgres url", url, e))?;
     // Mode spelling is validated here first, for the named refusals below
     // (verify-ca, typos) — sqlx's own parse error says less.
     let mut url_ssl: Option<SslMode> = None;
@@ -858,7 +865,9 @@ fn decode_workmem_override() -> Result<Option<String>> {
 /// unit (`kB`, `MB`, `GB`, `TB`, `B`, case-insensitive, space allowed).
 fn parse_pg_size(s: &str) -> Option<u64> {
     let s = s.trim();
-    let split = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
     let n: f64 = num.trim().parse().ok()?;
     if !n.is_finite() || n < 0.0 {
@@ -938,7 +947,9 @@ impl Walsender {
         let ci = parse_url(url)?;
         let stream = TcpStream::connect((ci.host.as_str(), ci.port))
             .await
-            .map_err(|e| Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port)))?;
+            .map_err(|e| {
+                Error::Transfer(format!("walsender connect {}:{}: {e}", ci.host, ci.port))
+            })?;
         stream.set_nodelay(true).ok();
         // Bursts land in fewer, larger reads with a bigger receive buffer
         // (inventory #6, design §14.26). `0` leaves the kernel default.
@@ -969,32 +980,34 @@ impl Walsender {
                 let (r, w) = stream.into_split();
                 (PgRead::Tcp(r), PgWrite::Tcp(w))
             }
-            SslMode::Prefer { explicit } => match tls_upgrade(stream, &ci.host, false, ci.root_cert.as_deref()).await? {
-                Ok(tls) => {
-                    let (r, w) = tokio::io::split(tls);
-                    (PgRead::Tls(r), PgWrite::Tls(w))
-                }
-                // The server said no. `prefer` means exactly that this is
-                // allowed — but it is also the case a reviewer of a URL would
-                // never guess from reading it, so the run says so. Once per
-                // process, not once per connection: a `slots=8` run opens
-                // nine of these and the ninth copy tells nobody anything.
-                Err(plain) => {
-                    if explicit {
-                        static SAID: std::sync::Once = std::sync::Once::new();
-                        let (h, p) = (ci.host.clone(), ci.port);
-                        SAID.call_once(|| {
-                            crate::progress::warn(&format!(
-                                "postgres {h}:{p} refused TLS and sslmode=prefer permits \
+            SslMode::Prefer { explicit } => {
+                match tls_upgrade(stream, &ci.host, false, ci.root_cert.as_deref()).await? {
+                    Ok(tls) => {
+                        let (r, w) = tokio::io::split(tls);
+                        (PgRead::Tls(r), PgWrite::Tls(w))
+                    }
+                    // The server said no. `prefer` means exactly that this is
+                    // allowed — but it is also the case a reviewer of a URL would
+                    // never guess from reading it, so the run says so. Once per
+                    // process, not once per connection: a `slots=8` run opens
+                    // nine of these and the ninth copy tells nobody anything.
+                    Err(plain) => {
+                        if explicit {
+                            static SAID: std::sync::Once = std::sync::Once::new();
+                            let (h, p) = (ci.host.clone(), ci.port);
+                            SAID.call_once(|| {
+                                crate::progress::warn(&format!(
+                                    "postgres {h}:{p} refused TLS and sslmode=prefer permits \
                                  cleartext — this connection is NOT encrypted. \
                                  sslmode=require makes that a failure instead."
-                            ));
-                        });
+                                ));
+                            });
+                        }
+                        let (r, w) = plain.into_split();
+                        (PgRead::Tcp(r), PgWrite::Tcp(w))
                     }
-                    let (r, w) = plain.into_split();
-                    (PgRead::Tcp(r), PgWrite::Tcp(w))
                 }
-            },
+            }
             SslMode::Require | SslMode::VerifyFull => {
                 let verify = ci.ssl == SslMode::VerifyFull;
                 match tls_upgrade(stream, &ci.host, verify, ci.root_cert.as_deref()).await? {
@@ -1086,7 +1099,10 @@ impl Walsender {
         }
         body.push(0);
         let len = (body.len() + 4) as u32;
-        self.wr.write_all(&len.to_be_bytes()).await.map_err(io_err)?;
+        self.wr
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(io_err)?;
         self.wr.write_all(&body).await.map_err(io_err)?;
         self.wr.flush().await.map_err(io_err)?;
 
@@ -1104,17 +1120,15 @@ impl Walsender {
                     // library: the process it aborts is the caller's.
                     let short =
                         || Error::Transfer("walsender: truncated authentication request".into());
-                    let code = u32::from_be_bytes(
-                        msg.get(0..4).ok_or_else(short)?.try_into().unwrap(),
-                    );
+                    let code =
+                        u32::from_be_bytes(msg.get(0..4).ok_or_else(short)?.try_into().unwrap());
                     // A cleartext or MD5 request is a downgrade the PEER
                     // chooses, not us: on an unverified channel a MITM can
                     // ask for the password itself, and MD5 is offline-
                     // crackable even over TLS. Allowed only when the channel
                     // is verified (verify-full) or the operator opted in
                     // (system review 2026-10-07, auth downgrade).
-                    let downgrade_ok =
-                        ci.ssl == SslMode::VerifyFull || auth_downgrade_allowed();
+                    let downgrade_ok = ci.ssl == SslMode::VerifyFull || auth_downgrade_allowed();
                     let guard_downgrade = |what: &str| -> Result<()> {
                         if downgrade_ok {
                             return Ok(());
@@ -1163,10 +1177,9 @@ impl Walsender {
                             scram = Some(st);
                         }
                         11 => {
-                            let server_first = std::str::from_utf8(
-                                msg.get(4..).ok_or_else(bad_scram)?,
-                            )
-                                .map_err(|_| bad_scram())?;
+                            let server_first =
+                                std::str::from_utf8(msg.get(4..).ok_or_else(bad_scram)?)
+                                    .map_err(|_| bad_scram())?;
                             let st = scram.as_mut().ok_or_else(bad_scram)?;
                             let fin = st.client_final(server_first, &ci.password)?;
                             self.send_msg(b'p', fin.as_bytes()).await?;
@@ -1232,10 +1245,7 @@ impl Walsender {
     }
 
     async fn read_message(&mut self) -> Result<(u8, bytes::Bytes)> {
-        let rd = self
-            .rd
-            .as_mut()
-            .expect("direct read outside CopyBoth");
+        let rd = self.rd.as_mut().expect("direct read outside CopyBoth");
         read_frame(rd).await
     }
 
@@ -1258,9 +1268,8 @@ impl Walsender {
                     // frame, which in a library means the caller's process
                     // dies instead of seeing an error it could handle.
                     let short = || Error::Transfer("walsender: truncated DataRow".into());
-                    let n = u16::from_be_bytes(
-                        msg.get(0..2).ok_or_else(short)?.try_into().unwrap(),
-                    ) as usize;
+                    let n = u16::from_be_bytes(msg.get(0..2).ok_or_else(short)?.try_into().unwrap())
+                        as usize;
                     // Capacity is bounded by what the frame could possibly
                     // hold: two bytes per field at the absolute minimum.
                     let mut row = Vec::with_capacity(n.min(msg.len() / 2 + 1));
@@ -1401,8 +1410,7 @@ impl Walsender {
                 let (tag, len) = if self.co_head_len == 0 && n - i >= 5 {
                     // Common case: the whole header sits in the window.
                     let tag = avail[i];
-                    let len =
-                        u32::from_be_bytes(avail[i + 1..i + 5].try_into().unwrap()) as usize;
+                    let len = u32::from_be_bytes(avail[i + 1..i + 5].try_into().unwrap()) as usize;
                     i += 5;
                     (tag, len)
                 } else {
@@ -1700,10 +1708,7 @@ impl Walsender {
         assert!(self.copying, "next_event outside CopyBoth");
         loop {
             let (tag, msg) = {
-                let rd = self
-                    .rd
-                    .as_mut()
-                    .expect("read half present in CopyBoth");
+                let rd = self.rd.as_mut().expect("read half present in CopyBoth");
                 let scan = self.scan.as_mut().expect("scanner present in CopyBoth");
                 scan.next_raw(rd).await?
             };
@@ -1718,8 +1723,7 @@ impl Walsender {
                             if msg.len() < 25 {
                                 return Err(short());
                             }
-                            let wal_start =
-                                u64::from_be_bytes(msg[1..9].try_into().unwrap());
+                            let wal_start = u64::from_be_bytes(msg[1..9].try_into().unwrap());
                             // bytes 9..17 wal_end, 17..25 server clock — unused.
                             // `advance` on the owned Bytes: a pointer bump
                             // with no refcount promotion — `slice(25..)`
@@ -1735,12 +1739,13 @@ impl Walsender {
                             }
                             let wal_end = u64::from_be_bytes(msg[1..9].try_into().unwrap());
                             let reply_requested = msg.get(17).copied().unwrap_or(0) == 1;
-                            return Ok(Some(WalEvent::Keepalive { wal_end, reply_requested }));
+                            return Ok(Some(WalEvent::Keepalive {
+                                wal_end,
+                                reply_requested,
+                            }));
                         }
                         _ => {
-                            return Err(Error::Transfer(
-                                "walsender: unknown CopyData frame".into(),
-                            ))
+                            return Err(Error::Transfer("walsender: unknown CopyData frame".into()))
                         }
                     }
                 }
@@ -1793,29 +1798,20 @@ impl Walsender {
         // about it.
         const DRAIN_SECS: u64 = 30;
         let mut err: Option<Error> = None;
-        let drained = tokio::time::timeout(
-            std::time::Duration::from_secs(DRAIN_SECS),
-            async {
-                loop {
-                    let (tag, msg) = {
-                        let rd = self
-                            .rd
-                            .as_mut()
-                            .expect("read half present in CopyBoth");
-                        let scan = self
-                            .scan
-                            .as_mut()
-                            .expect("scanner present in CopyBoth");
-                        scan.next_raw(rd).await?
-                    };
-                    match tag {
-                        b'Z' => return Ok(()),
-                        b'E' => err = Some(parse_error(&msg)),
-                        _ => {} // drain in-flight frames (d/c/N/C)
-                    }
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(DRAIN_SECS), async {
+            loop {
+                let (tag, msg) = {
+                    let rd = self.rd.as_mut().expect("read half present in CopyBoth");
+                    let scan = self.scan.as_mut().expect("scanner present in CopyBoth");
+                    scan.next_raw(rd).await?
+                };
+                match tag {
+                    b'Z' => return Ok(()),
+                    b'E' => err = Some(parse_error(&msg)),
+                    _ => {} // drain in-flight frames (d/c/N/C)
                 }
-            },
-        )
+            }
+        })
         .await;
         self.copying = false;
         self.scan = None;
@@ -1968,8 +1964,7 @@ impl ScramState {
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = Sha256::digest(&client_key);
         let without_proof = format!("c={},r={r}", B64.encode(b"n,,"));
-        let auth_message =
-            format!("{},{server_first},{without_proof}", self.client_first_bare);
+        let auth_message = format!("{},{server_first},{without_proof}", self.client_first_bare);
         let client_sig = hmac_sha256(&stored_key, auth_message.as_bytes());
         let proof: Vec<u8> = client_key
             .iter()
@@ -1992,15 +1987,17 @@ impl ScramState {
     /// server's answer unchanged — apitap sends no channel binding, so only
     /// a verified certificate (sslmode=verify-full) rules that out.
     fn verify_server(&self, server_final: &str) -> Result<()> {
-        let v = server_final.strip_prefix("v=").ok_or_else(|| {
-            Error::Transfer(
-                "walsender: SCRAM server-final carries no v= signature — the \
+        let v = server_final
+            .strip_prefix("v=")
+            .ok_or_else(|| {
+                Error::Transfer(
+                    "walsender: SCRAM server-final carries no v= signature — the \
                  peer never proved it knows the password, as a fake server would \
                  not; refusing to treat the connection as authenticated."
-                    .into(),
-            )
-        })?
-        .trim_end_matches(['\0', '\n']);
+                        .into(),
+                )
+            })?
+            .trim_end_matches(['\0', '\n']);
         let got = B64.decode(v).map_err(|_| bad_scram())?;
         let want = self.server_signature.borrow();
         let want = want.as_deref().ok_or_else(bad_scram)?;
@@ -2075,15 +2072,23 @@ mod tests {
         };
         assert!(super::is_guc_rejection(&frame("22023")));
         assert!(super::is_guc_rejection(&frame("42501")));
-        assert!(!super::is_guc_rejection(&frame("28P01")), "a wrong password is the answer");
-        assert!(!super::is_guc_rejection(&crate::error::Error::Transfer("walsender connect: refused".into())));
+        assert!(
+            !super::is_guc_rejection(&frame("28P01")),
+            "a wrong password is the answer"
+        );
+        assert!(!super::is_guc_rejection(&crate::error::Error::Transfer(
+            "walsender connect: refused".into()
+        )));
     }
 
     /// P2/T19: a server that accepts the socket and never answers startup
     /// is a named error within the deadline, not a hang.
     #[test]
     fn a_silent_server_is_a_connect_timeout() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
@@ -2093,10 +2098,20 @@ mod tests {
             });
             std::env::set_var("APITAP_PG_CONNECT_TIMEOUT_SECS", "2");
             let url = format!("postgres://u@127.0.0.1:{port}/d?sslmode=disable");
-            let r = tokio::time::timeout(std::time::Duration::from_secs(10), super::Walsender::connect_sql(&url)).await;
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                super::Walsender::connect_sql(&url),
+            )
+            .await;
             std::env::remove_var("APITAP_PG_CONNECT_TIMEOUT_SECS");
-            let e = r.expect("the connect must give up by itself").err().expect("no server answered");
-            assert!(e.to_string().contains("APITAP_PG_CONNECT_TIMEOUT_SECS"), "{e}");
+            let e = r
+                .expect("the connect must give up by itself")
+                .err()
+                .expect("no server answered");
+            assert!(
+                e.to_string().contains("APITAP_PG_CONNECT_TIMEOUT_SECS"),
+                "{e}"
+            );
         });
     }
 
@@ -2242,7 +2257,10 @@ mod tests {
         let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
                             s=W22ZaJ0SNY7soEsUEjb6gQ==,i=2000000000";
         let e = st.client_final(server_first, "pencil").unwrap_err();
-        assert!(format!("{e}").contains("iterations"), "refusal names the cap");
+        assert!(
+            format!("{e}").contains("iterations"),
+            "refusal names the cap"
+        );
     }
 
     #[test]
@@ -2274,7 +2292,10 @@ mod tests {
         let _g = crate::dialect::postgres::env_guard();
         let ci = parse_url("postgres://u%40x:p%3Aw@h:5433/db").unwrap();
         assert_eq!((ci.user.as_str(), ci.password.as_str()), ("u@x", "p:w"));
-        assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("h", 5433, "db"));
+        assert_eq!(
+            (ci.host.as_str(), ci.port, ci.db.as_str()),
+            ("h", 5433, "db")
+        );
         // NOT libpq's default any more off-loopback: the replication socket
         // follows the pools and verifies TLS for a non-local host with no
         // sslmode (round 2 §1.1.5); loopback keeps `prefer`.
@@ -2293,11 +2314,16 @@ mod tests {
         assert_eq!((ci6.host.as_str(), ci6.port), ("2001:db8::1", 5433));
         assert_eq!(parse_url("postgres://u:p@[::1]/db").unwrap().host, "::1");
         // A name is left exactly as it was.
-        assert_eq!(parse_url("postgres://u:p@db.example/x").unwrap().host, "db.example");
+        assert_eq!(
+            parse_url("postgres://u:p@db.example/x").unwrap().host,
+            "db.example"
+        );
         // Both spellings, because a URL that works for the pool must not
         // mean something weaker for the replication socket.
         assert_eq!(
-            parse_url("postgres://u:p@h/db?ssl-mode=require").unwrap().ssl,
+            parse_url("postgres://u:p@h/db?ssl-mode=require")
+                .unwrap()
+                .ssl,
             SslMode::Require
         );
         for (q, want) in [
@@ -2322,8 +2348,17 @@ mod tests {
     #[test]
     fn the_url_resolves_like_the_sqlx_pool() {
         let _g = crate::dialect::postgres::env_guard();
-        for v in ["PGHOST", "PGHOSTADDR", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE",
-                  "PGOPTIONS", "PGSSLMODE", "PGSSLROOTCERT"] {
+        for v in [
+            "PGHOST",
+            "PGHOSTADDR",
+            "PGPORT",
+            "PGUSER",
+            "PGPASSWORD",
+            "PGDATABASE",
+            "PGOPTIONS",
+            "PGSSLMODE",
+            "PGSSLROOTCERT",
+        ] {
             std::env::remove_var(v);
         }
         let ci = parse_url(
@@ -2331,19 +2366,40 @@ mod tests {
              &user=r&password=s%26t&options=-csearch_path%3Dsales",
         )
         .unwrap();
-        assert_eq!((ci.host.as_str(), ci.port, ci.db.as_str()), ("real.example", 5544, "right"));
+        assert_eq!(
+            (ci.host.as_str(), ci.port, ci.db.as_str()),
+            ("real.example", 5544, "right")
+        );
         assert_eq!((ci.user.as_str(), ci.password.as_str()), ("r", "s&t"));
         assert_eq!(ci.options.as_deref(), Some("-csearch_path=sales"));
         // The TLS default follows the EFFECTIVE host, not the authority.
-        assert_eq!(parse_url("postgres://u:p@db.example/x?host=127.0.0.1").unwrap().ssl,
-                   SslMode::Prefer { explicit: false });
-        assert_eq!(parse_url("postgres://u:p@localhost/x?host=db.example").unwrap().ssl,
-                   SslMode::VerifyFull);
+        assert_eq!(
+            parse_url("postgres://u:p@db.example/x?host=127.0.0.1")
+                .unwrap()
+                .ssl,
+            SslMode::Prefer { explicit: false }
+        );
+        assert_eq!(
+            parse_url("postgres://u:p@localhost/x?host=db.example")
+                .unwrap()
+                .ssl,
+            SslMode::VerifyFull
+        );
         // hostaddr wins like host does.
-        assert_eq!(parse_url("postgres://u:p@decoy/x?hostaddr=10.1.2.3").unwrap().host, "10.1.2.3");
+        assert_eq!(
+            parse_url("postgres://u:p@decoy/x?hostaddr=10.1.2.3")
+                .unwrap()
+                .host,
+            "10.1.2.3"
+        );
         // sqlx's other CA spellings.
-        assert_eq!(parse_url("postgres://u:p@h/x?ssl-ca=/ca.pem").unwrap().root_cert.as_deref(),
-                   Some("/ca.pem"));
+        assert_eq!(
+            parse_url("postgres://u:p@h/x?ssl-ca=/ca.pem")
+                .unwrap()
+                .root_cert
+                .as_deref(),
+            Some("/ca.pem")
+        );
 
         // The environment fills what the URL leaves out — and PGSSLMODE is
         // the operator's explicit choice.
@@ -2353,10 +2409,19 @@ mod tests {
         std::env::set_var("PGOPTIONS", "-cstatement_timeout=0");
         std::env::set_var("PGSSLMODE", "require");
         let ci = parse_url("postgres://u@h").unwrap();
-        assert_eq!((ci.port, ci.db.as_str(), ci.password.as_str()), (6000, "envdb", "envpw"));
+        assert_eq!(
+            (ci.port, ci.db.as_str(), ci.password.as_str()),
+            (6000, "envdb", "envpw")
+        );
         assert_eq!(ci.options.as_deref(), Some("-cstatement_timeout=0"));
         assert_eq!(ci.ssl, SslMode::Require);
-        for v in ["PGPORT", "PGDATABASE", "PGPASSWORD", "PGOPTIONS", "PGSSLMODE"] {
+        for v in [
+            "PGPORT",
+            "PGDATABASE",
+            "PGPASSWORD",
+            "PGOPTIONS",
+            "PGSSLMODE",
+        ] {
             std::env::remove_var(v);
         }
         // A socket is refused on this plane (the raw COPY caller falls back
@@ -2422,7 +2487,9 @@ mod tests {
                 )
                 .await
                 .expect("dml");
-                sql.simple_query("TRUNCATE walsmoke").await.expect("truncate");
+                sql.simple_query("TRUNCATE walsmoke")
+                    .await
+                    .expect("truncate");
 
                 let lsn = pgoutput::lsn_from_string(&consistent_point).unwrap();
                 ws.start_replication("apitap_walsmoke", lsn, "walsmoke_pub", false)
@@ -2434,14 +2501,15 @@ mod tests {
                 while commits < 2 {
                     match ws.next_event().await.expect("event") {
                         Some(WalEvent::XLogData { payload, .. }) => {
-                            match pgoutput::decode(&payload, false, &Default::default(), false).map(|(m, _)| m)
+                            match pgoutput::decode(&payload, false, &Default::default(), false)
+                                .map(|(m, _)| m)
                                 .expect("decode")
                             {
                                 PgoMessage::Insert { new, .. } => {
                                     ins += 1;
-                                    if new.views().any(|c| {
-                                        matches!(c, pgoutput::Cellv::Text(t) if t.is_empty())
-                                    }) {
+                                    if new.views().any(
+                                        |c| matches!(c, pgoutput::Cellv::Text(t) if t.is_empty()),
+                                    ) {
                                         empty_string_seen = true;
                                     }
                                 }
@@ -2452,7 +2520,9 @@ mod tests {
                                 _ => {}
                             }
                         }
-                        Some(WalEvent::Keepalive { reply_requested, .. }) => {
+                        Some(WalEvent::Keepalive {
+                            reply_requested, ..
+                        }) => {
                             if reply_requested {
                                 ws.standby_status(lsn, false).await.unwrap();
                             }
@@ -2461,7 +2531,10 @@ mod tests {
                     }
                 }
                 assert_eq!((ins, upd, del, trunc), (2, 1, 1, 1), "full op coverage");
-                assert!(empty_string_seen, "empty string must arrive as Text(\"\"), not Null");
+                assert!(
+                    empty_string_seen,
+                    "empty string must arrive as Text(\"\"), not Null"
+                );
                 ws.stop_replication().await.expect("clean stop");
                 sql.simple_query("DROP TABLE walsmoke; DROP PUBLICATION walsmoke_pub")
                     .await

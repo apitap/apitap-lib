@@ -2,7 +2,6 @@
 //! The GIL is released for the whole transfer (`allow_threads`), so other Python
 //! threads keep running while bytes move.
 
-
 // Every `unsafe` operation states its own justification, even inside a
 // function that is already unsafe to call — an unsafe fn's signature says
 // what the CALLER must guarantee, not that its body may do anything.
@@ -454,7 +453,10 @@ fn read(
         })?;
     let names = handle.schema.iter().map(|f| f.name.clone()).collect();
     let stream = capsule::new_stream(handle) as usize;
-    Ok(PgRead { stream: Some(stream), names })
+    Ok(PgRead {
+        stream: Some(stream),
+        names,
+    })
 }
 
 /// Schema-only probe: (name, dtype-tag, nullable) per column, no workers

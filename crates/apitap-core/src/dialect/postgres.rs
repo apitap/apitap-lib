@@ -16,7 +16,9 @@ fn effective_host(url: &reqwest::Url) -> Option<String> {
             .find(|(key, _)| key == k)
             .map(|(_, v)| v.into_owned())
     };
-    q("hostaddr").or_else(|| q("host")).or_else(|| url.host_str().map(str::to_string))
+    q("hostaddr")
+        .or_else(|| q("host"))
+        .or_else(|| url.host_str().map(str::to_string))
 }
 
 /// A host that never crosses a switch: a Unix socket path (a query `host`
@@ -25,14 +27,22 @@ fn effective_host(url: &reqwest::Url) -> Option<String> {
 /// is NOT local, and a hostname that happens to resolve to 127.0.0.1 is not
 /// either, because this must be decidable from the URL alone.
 pub(crate) fn host_is_local(h: &str) -> bool {
-    let h = h.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let h = h
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
     // `%2F…` is the same socket path, percent-encoded in the authority —
     // without this it read as remote and got verify-full (MASTER M-50).
-    h.starts_with('/') || h.starts_with("%2f")
+    h.starts_with('/')
+        || h.starts_with("%2f")
         || h == "localhost"
         || h == "::1"
-        || h.parse::<std::net::Ipv4Addr>().map(|a| a.is_loopback()).unwrap_or(false)
-        || h.parse::<std::net::Ipv6Addr>().map(|a| a.is_loopback()).unwrap_or(false)
+        || h.parse::<std::net::Ipv4Addr>()
+            .map(|a| a.is_loopback())
+            .unwrap_or(false)
+        || h.parse::<std::net::Ipv6Addr>()
+            .map(|a| a.is_loopback())
+            .unwrap_or(false)
 }
 
 /// Is the EFFECTIVE host of this URL local? Unparseable counts as NOT local,
@@ -59,8 +69,7 @@ pub(crate) fn url_is_local(url: &str) -> bool {
 /// operator's explicit decision. Explicit URL modes of any value, including
 /// `disable`, always win.
 pub(crate) fn secure_url(url: &str) -> String {
-    if crate::dialect::mysql::has_explicit_ssl_mode(url)
-        || std::env::var_os("PGSSLMODE").is_some()
+    if crate::dialect::mysql::has_explicit_ssl_mode(url) || std::env::var_os("PGSSLMODE").is_some()
     {
         return url.to_string();
     }
@@ -86,10 +95,16 @@ pub(crate) fn secure_url(url: &str) -> String {
 /// reserved-character hint for a password holding `?` (the appended
 /// parameter lands inside the "password"), and the TLS hint wrapped an
 /// already-prefixed error a second time ("connect: connect: …").
-pub(crate) fn connect_error(what: &str, user_url: &str, e: impl std::fmt::Display) -> crate::error::Error {
+pub(crate) fn connect_error(
+    what: &str,
+    user_url: &str,
+    e: impl std::fmt::Display,
+) -> crate::error::Error {
     let base = crate::urlerr::connect_err(what, user_url, e);
     match (base, tls_hint_for(user_url)) {
-        (crate::error::Error::Connect(m), Some(h)) => crate::error::Error::Connect(format!("{m}{h}")),
+        (crate::error::Error::Connect(m), Some(h)) => {
+            crate::error::Error::Connect(format!("{m}{h}"))
+        }
         (other, _) => other,
     }
 }
@@ -124,7 +139,6 @@ pub(crate) fn quote_ident_path(path: &str) -> String {
         .join(".")
 }
 
-
 /// The PG*-reading tests (here and in `wire::walsender`) run in parallel
 /// with the ones that set those variables (cargo's default); without one
 /// crate-wide lock the setter's window leaks into the readers and the suite
@@ -146,10 +160,17 @@ mod tests {
     fn the_tls_hint_is_only_for_a_defaulted_mode() {
         let _g = env_guard();
         std::env::remove_var("PGSSLMODE");
-        let explicit = connect_error("x", "postgres://u:p@prod.example/db?sslmode=disable", "password authentication failed");
+        let explicit = connect_error(
+            "x",
+            "postgres://u:p@prod.example/db?sslmode=disable",
+            "password authentication failed",
+        );
         assert!(!explicit.to_string().contains("requires TLS"), "{explicit}");
         let defaulted = connect_error("x", "postgres://u:p@prod.example/db", "tls handshake eof");
-        assert!(defaulted.to_string().contains("requires TLS"), "{defaulted}");
+        assert!(
+            defaulted.to_string().contains("requires TLS"),
+            "{defaulted}"
+        );
         assert!(tls_hint_for("postgres://u@127.0.0.1/db").is_none());
     }
 
@@ -234,7 +255,6 @@ mod tests {
         assert_eq!(quote_ident_path("public.events"), r#""public"."events""#);
         assert_eq!(quote_ident_path("bare"), r#""bare""#);
     }
-
 }
 
 pub(crate) const DEFAULT_PORT: u16 = 5432;

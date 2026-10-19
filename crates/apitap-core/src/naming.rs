@@ -348,12 +348,17 @@ impl NonceState {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.subsec_nanos() as u64)
                     .unwrap_or(0);
-                self.base.store(ns.wrapping_mul(0x9E37_79B9).wrapping_add(pid as u64), SeqCst);
+                self.base.store(
+                    ns.wrapping_mul(0x9E37_79B9).wrapping_add(pid as u64),
+                    SeqCst,
+                );
                 self.next.store(0, SeqCst);
                 self.pid.store(pid, SeqCst);
             }
         }
-        self.base.load(SeqCst).wrapping_add(self.next.fetch_add(1, SeqCst))
+        self.base
+            .load(SeqCst)
+            .wrapping_add(self.next.fetch_add(1, SeqCst))
     }
 }
 
@@ -391,7 +396,10 @@ impl RunId {
     /// whole first run instead of dropping them for the load and hoping nobody
     /// takes the table in between (0.56.0 did exactly that).
     pub(crate) fn mint_within(kind: BulkKind, source_id: &str, parent: &RunId) -> Self {
-        RunId { parent: Some(parent.token.clone()), ..Self::mint_bulk(kind, source_id) }
+        RunId {
+            parent: Some(parent.token.clone()),
+            ..Self::mint_bulk(kind, source_id)
+        }
     }
 
     fn mint_token(kind: LandKind, source_id: &str) -> Self {
@@ -502,7 +510,11 @@ mod flipped_tests {
         assert_eq!(a2, a1.wrapping_add(1), "one process counts up");
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b1 = st.next(4_000_002);
-        assert_ne!(b1, a2.wrapping_add(1), "a child does not continue the parent's count");
+        assert_ne!(
+            b1,
+            a2.wrapping_add(1),
+            "a child does not continue the parent's count"
+        );
         assert_eq!(st.next(4_000_002), b1.wrapping_add(1));
     }
 
@@ -511,8 +523,16 @@ mod flipped_tests {
     #[test]
     fn a_lost_first_run_explains_both_cases() {
         let m = lost_first_run("orders", "");
-        assert!(!m.contains("Re-run: the new state row makes this an incremental load"), "{m}");
-        assert!(m.contains("SAME") && m.contains("DIFFERENT") && m.contains("do not use mode='replace'"), "{m}");
+        assert!(
+            !m.contains("Re-run: the new state row makes this an incremental load"),
+            "{m}"
+        );
+        assert!(
+            m.contains("SAME")
+                && m.contains("DIFFERENT")
+                && m.contains("do not use mode='replace'"),
+            "{m}"
+        );
     }
 
     /// R2-2: only an Incremental token landing as Replace is a flipped
@@ -520,10 +540,19 @@ mod flipped_tests {
     /// land incrementally and never publish destructively.
     #[test]
     fn only_an_incremental_token_landing_as_replace_flips() {
-        assert!(flipped_bootstrap(LandKind::Incremental, crate::Mode::Replace));
+        assert!(flipped_bootstrap(
+            LandKind::Incremental,
+            crate::Mode::Replace
+        ));
         assert!(!flipped_bootstrap(LandKind::Swap, crate::Mode::Replace));
-        assert!(!flipped_bootstrap(LandKind::Incremental, crate::Mode::Append));
-        assert!(!flipped_bootstrap(LandKind::Incremental, crate::Mode::Merge));
+        assert!(!flipped_bootstrap(
+            LandKind::Incremental,
+            crate::Mode::Append
+        ));
+        assert!(!flipped_bootstrap(
+            LandKind::Incremental,
+            crate::Mode::Merge
+        ));
         assert!(!flipped_bootstrap(LandKind::Cdc, crate::Mode::Replace));
     }
 }
@@ -676,10 +705,16 @@ pub(crate) fn blockers<'a>(
         .iter()
         .map(|&a| {
             let n = artifact_ident_run(bare, a, limit, run);
-            (a, parse_peer(&n, a).expect("a name this process minted parses"))
+            (
+                a,
+                parse_peer(&n, a).expect("a name this process minted parses"),
+            )
         })
         .collect();
-    let mut out = Scan { blockers: Vec::new(), mine_leftovers: Vec::new() };
+    let mut out = Scan {
+        blockers: Vec::new(),
+        mine_leftovers: Vec::new(),
+    };
     for (canonical, raw) in listed {
         for (a, me) in &mine {
             // A name of a DIFFERENT kind classifies as `Foreign` here — the
@@ -697,7 +732,9 @@ pub(crate) fn blockers<'a>(
                         out.mine_leftovers.push(raw.to_string());
                     }
                 }
-                Found::Legacy => out.blockers.push(Blocker::Legacy { name: raw.to_string() }),
+                Found::Legacy => out.blockers.push(Blocker::Legacy {
+                    name: raw.to_string(),
+                }),
                 Found::Live(peer) => {
                     if let Some(b) = lock_blocks(me, std::iter::once(&peer)) {
                         out.blockers.push(Blocker::Live {
@@ -730,8 +767,7 @@ pub(crate) fn blockers<'a>(
 pub(crate) fn collectable(b: &Blocker) -> Option<&str> {
     match b {
         Blocker::Live { artifact, peer, .. }
-            if peer.kind == LandKind::Cdc
-                && compat::markers(LandKind::Cdc).contains(artifact) =>
+            if peer.kind == LandKind::Cdc && compat::markers(LandKind::Cdc).contains(artifact) =>
         {
             Some(&peer.token)
         }
@@ -749,10 +785,11 @@ pub(crate) fn blocker_error(
 ) -> crate::error::Error {
     match b {
         Blocker::Legacy { name } => legacy_error(dest, name),
-        Blocker::Live { name, peer, mine, .. } => locked_error(dest, name, mine, peer, now, lease),
+        Blocker::Live {
+            name, peer, mine, ..
+        } => locked_error(dest, name, mine, peer, now, lease),
     }
 }
-
 
 /// May `mine` proceed while `peer` is running?
 ///
@@ -936,7 +973,6 @@ pub(crate) fn legacy_error(dest: &str, artifact_name: &str) -> crate::error::Err
     ))
 }
 
-
 /// The refusal one run gives when another already holds the table.
 ///
 /// Here rather than in each sink because it was written seven times and drifted
@@ -964,14 +1000,15 @@ pub(crate) fn locked_error(
         LandKind::Cdc => "draining changes into it",
     };
     let why = match (mine.kind, peer.kind) {
-        (LandKind::Swap, _) | (_, LandKind::Swap) =>
+        (LandKind::Swap, _) | (_, LandKind::Swap) => {
             "a replace swaps the whole table, so whichever finishes second \
-             throws the other's work away",
-        (LandKind::Cdc, _) | (_, LandKind::Cdc) =>
+             throws the other's work away"
+        }
+        (LandKind::Cdc, _) | (_, LandKind::Cdc) => {
             "a CDC drain owns the watermark and the replication slot, and two \
-             of them cannot share either",
-        _ =>
-            "both read the same watermark and would land the same rows twice",
+             of them cannot share either"
+        }
+        _ => "both read the same watermark and would land the same rows twice",
     };
     // What the operator should do, and it is genuinely three different things.
     //
@@ -1034,7 +1071,12 @@ pub(crate) fn artifact_ident_run(
 /// [`artifact_ident_run`] for a token that is not this process's run — the
 /// dead run whose scratch a collector sweeps, or the run a store method was
 /// handed by token.
-pub(crate) fn artifact_ident_tok(bare: &str, artifact: Artifact, limit: usize, token: &str) -> String {
+pub(crate) fn artifact_ident_tok(
+    bare: &str,
+    artifact: Artifact,
+    limit: usize,
+    token: &str,
+) -> String {
     let (head, suffix) = artifact_match(bare, artifact, limit);
     format!("{head}{token}{suffix}")
 }
@@ -1052,13 +1094,18 @@ pub(crate) fn fence_ident(token: &str) -> String {
 /// Does `name` look like a run's fence table? The prefix plus the token's own
 /// leading `_`, so `_apitap_fencepost` stays a user's table.
 fn is_fence(name: &str) -> bool {
-    name.strip_prefix("_apitap_fence").is_some_and(|rest| rest.starts_with('_'))
+    name.strip_prefix("_apitap_fence")
+        .is_some_and(|rest| rest.starts_with('_'))
 }
 
 /// The two fixed parts of every name this table+artifact can produce: the head
 /// it always starts with, and the suffix it always ends with. A sweep is
 /// `LIKE '<head>%<suffix>'`.
-pub(crate) fn artifact_match(bare: &str, artifact: Artifact, limit: usize) -> (String, &'static str) {
+pub(crate) fn artifact_match(
+    bare: &str,
+    artifact: Artifact,
+    limit: usize,
+) -> (String, &'static str) {
     let suffix = artifact.suffix();
     // The token is part of the budget, so the head gives way sooner than it
     // does for an un-tokenized name. Everything else is `artifact_ident`'s
@@ -1194,9 +1241,18 @@ mod pg_state_key_tests {
     /// the other lane's row.
     #[test]
     fn the_pair_covers_both_spellings_either_way_round() {
-        assert_eq!(pg_state_keys("orders"), ("orders".into(), "public.orders".into()));
-        assert_eq!(pg_state_keys("public.orders"), ("orders".into(), "public.orders".into()));
-        assert_eq!(pg_state_keys("sales.orders"), ("orders".into(), "sales.orders".into()));
+        assert_eq!(
+            pg_state_keys("orders"),
+            ("orders".into(), "public.orders".into())
+        );
+        assert_eq!(
+            pg_state_keys("public.orders"),
+            ("orders".into(), "public.orders".into())
+        );
+        assert_eq!(
+            pg_state_keys("sales.orders"),
+            ("orders".into(), "sales.orders".into())
+        );
     }
 
     /// The bare name comes FIRST, because it is what the CDC lane writes and
@@ -1238,8 +1294,16 @@ pub(crate) struct StateRow {
 impl StateRow {
     /// A NULL `cursor_col` or `mode` reads as "": a row an older writer left
     /// without them is judged on what it does say.
-    pub(crate) fn new(watermark: Option<String>, cursor_col: Option<String>, mode: Option<String>) -> Self {
-        Self { watermark, cursor_col: cursor_col.unwrap_or_default(), mode: mode.unwrap_or_default() }
+    pub(crate) fn new(
+        watermark: Option<String>,
+        cursor_col: Option<String>,
+        mode: Option<String>,
+    ) -> Self {
+        Self {
+            watermark,
+            cursor_col: cursor_col.unwrap_or_default(),
+            mode: mode.unwrap_or_default(),
+        }
     }
 
     fn is_cdc(&self) -> bool {
@@ -1272,7 +1336,9 @@ pub(crate) enum StateVerdict {
 ///   different cursor. A row with no recorded cursor is the lane's own (an
 ///   older bulk writer that did not record one).
 pub(crate) fn state_verdict(row: Option<StateRow>, lane: Lane<'_>) -> StateVerdict {
-    let Some(row) = row else { return StateVerdict::Absent };
+    let Some(row) = row else {
+        return StateVerdict::Absent;
+    };
     let mine = match lane {
         Lane::Cdc => row.is_cdc() && row.cursor_col == STATE_CURSOR_LSN,
         Lane::Cursor { cursor } => {
@@ -1302,13 +1368,16 @@ impl CdcWatermark {
 /// error on every destination: reading it as "no state" (BigQuery did until
 /// 0.57.0) re-bootstraps a table whose drain has already confirmed its
 /// position to the source.
-pub(crate) fn cdc_watermark(dest: &str, row: Option<StateRow>) -> crate::error::Result<Option<CdcWatermark>> {
+pub(crate) fn cdc_watermark(
+    dest: &str,
+    row: Option<StateRow>,
+) -> crate::error::Result<Option<CdcWatermark>> {
     use crate::error::Error;
     match state_verdict(row, Lane::Cdc) {
         StateVerdict::Absent => Ok(None),
-        StateVerdict::Mine(None) => {
-            Err(Error::Transfer(format!("log_based: {dest}: state row has NULL watermark")))
-        }
+        StateVerdict::Mine(None) => Err(Error::Transfer(format!(
+            "log_based: {dest}: state row has NULL watermark"
+        ))),
         StateVerdict::Mine(Some(w)) => w
             .parse::<u64>()
             .map(|v| Some(CdcWatermark(v)))
@@ -1338,7 +1407,11 @@ const CLEAR_STATE: &str =
 /// Why a row is not the asking lane's, in the words an operator acts on. The
 /// three texts keep every phrase the state-contract leg asks for: "CDC-managed"
 /// and "LSN", "cursor" and "LSN", and both quoted cursors.
-pub(crate) fn foreign_state_error(dest: &str, lane: Lane<'_>, row: &StateRow) -> crate::error::Error {
+pub(crate) fn foreign_state_error(
+    dest: &str,
+    lane: Lane<'_>,
+    row: &StateRow,
+) -> crate::error::Error {
     crate::error::Error::InvalidInput(match lane {
         Lane::Cursor { .. } if row.is_cdc() => format!(
             "{dest}: this destination table is CDC-managed — its state watermark is an LSN, \
@@ -1381,8 +1454,12 @@ pub(crate) const CDC_PENDING_TABLE: &str = "_apitap_cdc_pending";
 pub(crate) const RESIDUE_JOURNAL_TABLE: &str = "_apitap_residue_journal";
 
 /// Every table apitap owns whose name is a whole word rather than a suffix.
-pub(crate) const OWN_TABLES: &[&str] =
-    &[STATE_TABLE, CDC_PENDING_TABLE, crate::lease::LEASE_TABLE, RESIDUE_JOURNAL_TABLE];
+pub(crate) const OWN_TABLES: &[&str] = &[
+    STATE_TABLE,
+    CDC_PENDING_TABLE,
+    crate::lease::LEASE_TABLE,
+    RESIDUE_JOURNAL_TABLE,
+];
 
 /// What every SUPPORTED apitap writes beside a table and scans for — so a claim
 /// about another version is a compiled fact with a test, not an assumption.
@@ -1424,8 +1501,12 @@ pub(crate) mod compat {
         /// G0 (<0.55.0) writes the un-tokenized name, which is `Found::Legacy`
         /// and refused — never coexisted with. 0.55.0 is not a neighbour:
         /// the stability page says upgrade it to 0.55.1 first.
-        pub(crate) const SUPPORTED: &'static [Generation] =
-            &[Generation::G1, Generation::G2, Generation::G3, Generation::G4];
+        pub(crate) const SUPPORTED: &'static [Generation] = &[
+            Generation::G1,
+            Generation::G2,
+            Generation::G3,
+            Generation::G4,
+        ];
         pub(crate) const fn versions(self) -> &'static str {
             match self {
                 Self::G0 => "<0.55.0",
@@ -1482,12 +1563,18 @@ pub(crate) mod compat {
     /// What rolling back to a generation replicates as if it were user data:
     /// the current bookkeeping tables it does not know to hide.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const ROLLBACK_LEAKS: &[(Generation, &[&str])] =
-        &[
-            (Generation::G1, &[CDC_PENDING_TABLE, crate::lease::LEASE_TABLE, RESIDUE_JOURNAL_TABLE]),
-            (Generation::G2, &[RESIDUE_JOURNAL_TABLE]),
-            (Generation::G3, &[RESIDUE_JOURNAL_TABLE]),
-        ];
+    pub(crate) const ROLLBACK_LEAKS: &[(Generation, &[&str])] = &[
+        (
+            Generation::G1,
+            &[
+                CDC_PENDING_TABLE,
+                crate::lease::LEASE_TABLE,
+                RESIDUE_JOURNAL_TABLE,
+            ],
+        ),
+        (Generation::G2, &[RESIDUE_JOURNAL_TABLE]),
+        (Generation::G3, &[RESIDUE_JOURNAL_TABLE]),
+    ];
 
     /// The ONLY place a marker set is chosen. `guard::announce` creates exactly
     /// these, empty. A bulk run's staging is not a marker: the sink's own
@@ -1533,8 +1620,12 @@ mod tests {
                 for n in [1usize, 10, 40, 46, 47, 48, 62, 63, 64, 100, 500] {
                     let bare = "t".repeat(n);
                     let out = artifact_ident(&bare, a, lim);
-                    assert!(out.len() <= lim,
-                            "{:?} at bare={n} limit={lim}: {} bytes", a, out.len());
+                    assert!(
+                        out.len() <= lim,
+                        "{:?} at bare={n} limit={lim}: {} bytes",
+                        a,
+                        out.len()
+                    );
                 }
             }
         }
@@ -1549,8 +1640,12 @@ mod tests {
             for &lim in LIMITS {
                 for n in 1..=(lim + 20) {
                     let bare = "t".repeat(n);
-                    assert_ne!(artifact_ident(&bare, a, lim), bare,
-                               "{:?} at bare={n} limit={lim}", a);
+                    assert_ne!(
+                        artifact_ident(&bare, a, lim),
+                        bare,
+                        "{:?} at bare={n} limit={lim}",
+                        a
+                    );
                 }
             }
         }
@@ -1566,8 +1661,11 @@ mod tests {
                 let mut seen = std::collections::HashSet::new();
                 for &a in Artifact::ALL {
                     let name = artifact_ident(&bare, a, lim);
-                    assert!(seen.insert(name.clone()),
-                            "{:?} collides at bare={n} limit={lim}: {name}", a);
+                    assert!(
+                        seen.insert(name.clone()),
+                        "{:?} collides at bare={n} limit={lim}: {name}",
+                        a
+                    );
                 }
             }
         }
@@ -1581,8 +1679,12 @@ mod tests {
             for &lim in LIMITS {
                 let x = format!("{}alpha", "p".repeat(lim));
                 let y = format!("{}beta1", "p".repeat(lim));
-                assert_ne!(artifact_ident(&x, a, lim), artifact_ident(&y, a, lim),
-                           "{:?} at limit={lim}", a);
+                assert_ne!(
+                    artifact_ident(&x, a, lim),
+                    artifact_ident(&y, a, lim),
+                    "{:?} at limit={lim}",
+                    a
+                );
             }
         }
     }
@@ -1599,8 +1701,12 @@ mod tests {
                     // Only the namespaced ones are recognised as apitap's —
                     // `__current` is deliberately not, so that a user table
                     // called `orders__current` is left alone.
-                    assert_eq!(is_artifact(&out), a.reserved(),
-                               "{:?} recognition disagrees with reserved(): {out}", a);
+                    assert_eq!(
+                        is_artifact(&out),
+                        a.reserved(),
+                        "{:?} recognition disagrees with reserved(): {out}",
+                        a
+                    );
                 }
             }
         }
@@ -1611,8 +1717,10 @@ mod tests {
     fn the_same_inputs_always_give_the_same_name() {
         for &a in Artifact::ALL {
             let bare = "z".repeat(200);
-            assert_eq!(artifact_ident(&bare, a, PG_IDENT_MAX),
-                       artifact_ident(&bare, a, PG_IDENT_MAX));
+            assert_eq!(
+                artifact_ident(&bare, a, PG_IDENT_MAX),
+                artifact_ident(&bare, a, PG_IDENT_MAX)
+            );
         }
     }
 
@@ -1620,10 +1728,14 @@ mod tests {
     /// so adopting this module is not a migration.
     #[test]
     fn short_names_are_unchanged_from_the_historical_format() {
-        assert_eq!(artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX),
-                   "orders__apitap_staging");
-        assert_eq!(artifact_ident("orders", Artifact::Old, MY_IDENT_MAX),
-                   "orders__apitap_old");
+        assert_eq!(
+            artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX),
+            "orders__apitap_staging"
+        );
+        assert_eq!(
+            artifact_ident("orders", Artifact::Old, MY_IDENT_MAX),
+            "orders__apitap_old"
+        );
     }
 
     /// The generated exclusion must name EVERY artifact, in both dialects.
@@ -1661,9 +1773,12 @@ mod tests {
         assert!(!is_artifact("orders__current"), "would refuse a real table");
         assert!(is_artifact("orders__apitap_staging"));
         for a in Artifact::ALL.iter().filter(|a| a.reserved()) {
-            assert!(a.suffix().contains("apitap"),
-                    "{:?} is reserved but not namespaced — reserving it could \
-                     hide a user's table", a);
+            assert!(
+                a.suffix().contains("apitap"),
+                "{:?} is reserved but not namespaced — reserving it could \
+                     hide a user's table",
+                a
+            );
         }
     }
 
@@ -1671,9 +1786,11 @@ mod tests {
 
     fn peer(kind: LandKind, src: &str) -> PeerRun {
         let id = RunId::mint_token(kind, src);
-        parse_peer(&artifact_ident_run("t", Artifact::Staging, PG_IDENT_MAX, &id),
-                   Artifact::Staging)
-            .expect("a name this module minted must parse")
+        parse_peer(
+            &artifact_ident_run("t", Artifact::Staging, PG_IDENT_MAX, &id),
+            Artifact::Staging,
+        )
+        .expect("a name this module minted must parse")
     }
 
     /// The lock protocol, at the level where it is decidable: given the peers a
@@ -1690,17 +1807,32 @@ mod tests {
         let app_b = peer(LandKind::Incremental, "postgres://other:5432/db");
 
         // exclusive against everything
-        assert!(lock_blocks(&replace_a, [&app_b]).is_some(), "replace yields to any peer");
-        assert!(lock_blocks(&app_b, [&replace_a]).is_some(), "…and any peer yields to replace");
-        assert!(lock_blocks(&cdc_a, [&app_b]).is_some(), "a CDC drain is exclusive");
-        assert!(lock_blocks(&app_b, [&cdc_a]).is_some(), "…in both directions");
+        assert!(
+            lock_blocks(&replace_a, [&app_b]).is_some(),
+            "replace yields to any peer"
+        );
+        assert!(
+            lock_blocks(&app_b, [&replace_a]).is_some(),
+            "…and any peer yields to replace"
+        );
+        assert!(
+            lock_blocks(&cdc_a, [&app_b]).is_some(),
+            "a CDC drain is exclusive"
+        );
+        assert!(
+            lock_blocks(&app_b, [&cdc_a]).is_some(),
+            "…in both directions"
+        );
 
         // same source: two appends would read one watermark twice
         assert!(lock_blocks(&app_a, [&app_a]).is_some());
 
         // FAN-IN stays allowed. Delete this assertion and "refuse everything"
         // passes the whole test.
-        assert!(lock_blocks(&app_a, [&app_b]).is_none(), "fan-in must proceed");
+        assert!(
+            lock_blocks(&app_a, [&app_b]).is_none(),
+            "fan-in must proceed"
+        );
         assert!(lock_blocks(&app_b, [&app_a]).is_none());
 
         // an empty scan is the common case
@@ -1719,7 +1851,13 @@ mod tests {
     /// The verdict the old `guard_verdict` wrapper gave: the first blocker of a
     /// scan over the guarded kinds, as the error a sink would raise.
     fn verdict(run: &RunId, names: &[&str]) -> crate::error::Result<()> {
-        let scan = blockers("orders", PG_IDENT_MAX, run, GUARDED, names.iter().map(|n| (*n, *n)));
+        let scan = blockers(
+            "orders",
+            PG_IDENT_MAX,
+            run,
+            GUARDED,
+            names.iter().map(|n| (*n, *n)),
+        );
         match scan.blockers.first() {
             None => Ok(()),
             Some(b) => Err(blocker_error("public.orders", b, now_unix(), None)),
@@ -1763,12 +1901,16 @@ mod tests {
 
         // An un-tokenized name still refuses with the LEGACY message, whichever
         // kind it is: an apitap that predates the lock is loading into it.
-        for legacy in [artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX),
-                       artifact_ident("orders", Artifact::Lock, PG_IDENT_MAX)] {
+        for legacy in [
+            artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX),
+            artifact_ident("orders", Artifact::Lock, PG_IDENT_MAX),
+        ] {
             let e = verdict(&mine, &[legacy.as_str()])
                 .expect_err("an un-tokenized artifact is refused, never collected");
-            assert!(format!("{e}").contains("older than 0.55.0")
-                    || format!("{e}").contains("legacy"), "{legacy}: {e}");
+            assert!(
+                format!("{e}").contains("older than 0.55.0") || format!("{e}").contains("legacy"),
+                "{legacy}: {e}"
+            );
         }
     }
 
@@ -1781,13 +1923,21 @@ mod tests {
         assert!(fence.starts_with("_apitap_fence_"), "{fence}");
         assert!(is_artifact(&fence), "{fence}");
         assert!(is_artifact("_apitap_fence_0abcdefl123wxyz"));
-        assert!(!is_artifact("_apitap_fencepost"), "only the prefix plus a token's own `_`");
+        assert!(
+            !is_artifact("_apitap_fencepost"),
+            "only the prefix plus a token's own `_`"
+        );
         for d in [Dialect::Postgres, Dialect::MySql] {
             let clause = sql_exclusion("table_name", d);
-            assert!(clause.contains("apitap") && clause.contains("fence"), "{d:?}: {clause}");
+            assert!(
+                clause.contains("apitap") && clause.contains("fence"),
+                "{d:?}: {clause}"
+            );
         }
         assert!(sql_exclusion("t", Dialect::Postgres).contains(r"NOT LIKE '\_apitap\_fence\_%'"));
-        assert!(sql_exclusion("t", Dialect::MySql).contains("NOT LIKE '|_apitap|_fence|_%' ESCAPE '|'"));
+        assert!(
+            sql_exclusion("t", Dialect::MySql).contains("NOT LIKE '|_apitap|_fence|_%' ESCAPE '|'")
+        );
     }
 
     /// The tokenized name the stores build for someone else's token is the
@@ -1796,8 +1946,11 @@ mod tests {
     fn a_name_built_from_a_token_is_the_runs_own_name() {
         let run = RunId::mint_drain("s");
         for &a in Artifact::ALL {
-            assert_eq!(artifact_ident_tok("orders", a, ROOMY, run.token()),
-                       artifact_ident_run("orders", a, ROOMY, &run), "{a:?}");
+            assert_eq!(
+                artifact_ident_tok("orders", a, ROOMY, run.token()),
+                artifact_ident_run("orders", a, ROOMY, &run),
+                "{a:?}"
+            );
         }
     }
 
@@ -1806,7 +1959,10 @@ mod tests {
     #[test]
     fn the_lock_artifact_obeys_the_artifact_contract() {
         assert!(Artifact::ALL.contains(&Artifact::Lock));
-        assert!(Artifact::Lock.reserved(), "__apitap_lock is namespaced, so reserve it");
+        assert!(
+            Artifact::Lock.reserved(),
+            "__apitap_lock is namespaced, so reserve it"
+        );
         let run = RunId::mint_token(LandKind::Swap, "postgres://h:5432/db");
         for &lim in &[PG_IDENT_MAX, MY_IDENT_MAX, ROOMY] {
             let name = artifact_ident_run("orders", Artifact::Lock, lim, &run);
@@ -1817,9 +1973,16 @@ mod tests {
         }
         // and it is not confused with any other kind
         assert_eq!(
-            classify(&artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &run),
-                     "orders", Artifact::Lock, PG_IDENT_MAX, &run, now_unix()),
-            Found::Mine);
+            classify(
+                &artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &run),
+                "orders",
+                Artifact::Lock,
+                PG_IDENT_MAX,
+                &run,
+                now_unix()
+            ),
+            Found::Mine
+        );
     }
 
     /// The guard and the watermark must mean the same thing by "source".
@@ -1862,26 +2025,45 @@ mod tests {
         ];
         let want = hash_of(Mode::Append, spellings[0]);
         for u in &spellings {
-            assert_eq!(hash_of(Mode::Append, u), want, "one server, one source hash: {u}");
+            assert_eq!(
+                hash_of(Mode::Append, u),
+                want,
+                "one server, one source hash: {u}"
+            );
         }
 
         // …and the peers built from them refuse each other rather than reading
         // as fan-in.
-        let a = peer(LandKind::Incremental, &crate::pipeline::source_origin(spellings[0]));
-        let b = peer(LandKind::Incremental, &crate::pipeline::source_origin(spellings[3]));
-        assert!(peer_blocks(&a, &b), "same source must be refused, not read as fan-in");
+        let a = peer(
+            LandKind::Incremental,
+            &crate::pipeline::source_origin(spellings[0]),
+        );
+        let b = peer(
+            LandKind::Incremental,
+            &crate::pipeline::source_origin(spellings[3]),
+        );
+        assert!(
+            peer_blocks(&a, &b),
+            "same source must be refused, not read as fan-in"
+        );
 
         // The other half of the matrix must still hold: a genuinely DIFFERENT
         // server is fan-in and stays ALLOWED. Without this assertion the fix
         // "refuse everything" would pass, and that removes a capability the
         // manual advertises.
         let elsewhere = hash_of(Mode::Append, "postgres://bench:pw@10.0.0.9:5432/bench");
-        assert_ne!(elsewhere, want, "two servers must not collapse into one hash");
+        assert_ne!(
+            elsewhere, want,
+            "two servers must not collapse into one hash"
+        );
         let far = peer(
             LandKind::Incremental,
             &crate::pipeline::source_origin("postgres://bench:pw@10.0.0.9:5432/bench"),
         );
-        assert!(!peer_blocks(&a, &far), "fan-in from two servers must still pass");
+        assert!(
+            !peer_blocks(&a, &far),
+            "fan-in from two servers must still pass"
+        );
     }
 
     /// Everything a concurrent run needs must survive the round trip through a
@@ -1913,7 +2095,12 @@ mod tests {
                     let bare = "t".repeat(n);
                     let id = RunId::mint_token(LandKind::Swap, "s");
                     let name = artifact_ident_run(&bare, a, lim, &id);
-                    assert!(name.len() <= lim, "{:?} bare={n} lim={lim}: {}", a, name.len());
+                    assert!(
+                        name.len() <= lim,
+                        "{:?} bare={n} lim={lim}: {}",
+                        a,
+                        name.len()
+                    );
                     assert_ne!(name, bare, "never equal to its own table");
                     assert!(name.ends_with(a.suffix()));
                     assert!(parse_peer(&name, a).is_some(), "{name}");
@@ -1977,8 +2164,14 @@ mod tests {
         let r = peer(LandKind::Swap, "postgres://h/db::orders");
         let c = peer(LandKind::Cdc, "postgres://h/db::orders");
 
-        assert!(peer_blocks(&a1, &a2), "same source appending twice = duplicate rows");
-        assert!(!peer_blocks(&a1, &b), "fan-in from two sources must stay allowed");
+        assert!(
+            peer_blocks(&a1, &a2),
+            "same source appending twice = duplicate rows"
+        );
+        assert!(
+            !peer_blocks(&a1, &b),
+            "fan-in from two sources must stay allowed"
+        );
         assert!(!peer_blocks(&b, &a1), "and it is symmetric");
 
         for other in [&a1, &b, &c] {
@@ -1997,8 +2190,11 @@ mod tests {
             .unwrap()
             .as_secs();
         let p = peer(LandKind::Swap, "s");
-        assert!(p.started_unix <= now && now - p.started_unix < 5,
-                "started {} vs now {now}", p.started_unix);
+        assert!(
+            p.started_unix <= now && now - p.started_unix < 5,
+            "started {} vs now {now}",
+            p.started_unix
+        );
     }
 
     // ── classification ────────────────────────────────────────────────────
@@ -2013,12 +2209,20 @@ mod tests {
             // `orders` and `orders_items` share a prefix, which is entirely
             // ordinary, and their artifacts must not see each other.
             let theirs = artifact_ident_run("orders_items", a, PG_IDENT_MAX, &run);
-            assert_eq!(classify(&theirs, "orders", a, PG_IDENT_MAX, &run, now),
-                       Found::Foreign, "{:?}: {theirs}", a);
+            assert_eq!(
+                classify(&theirs, "orders", a, PG_IDENT_MAX, &run, now),
+                Found::Foreign,
+                "{:?}: {theirs}",
+                a
+            );
             // And the reverse: the longer name must not claim the shorter's.
             let ours = artifact_ident_run("orders", a, PG_IDENT_MAX, &run);
-            assert_eq!(classify(&ours, "orders_items", a, PG_IDENT_MAX, &run, now),
-                       Found::Foreign, "{:?}: {ours}", a);
+            assert_eq!(
+                classify(&ours, "orders_items", a, PG_IDENT_MAX, &run, now),
+                Found::Foreign,
+                "{:?}: {ours}",
+                a
+            );
         }
     }
 
@@ -2033,8 +2237,16 @@ mod tests {
         // Far past any horizon: ownership is checked before age, on purpose.
         let much_later = now_unix() + 10_000_000;
         assert_eq!(
-            classify(&mine, "orders", Artifact::Staging, PG_IDENT_MAX, &run, much_later),
-            Found::Mine);
+            classify(
+                &mine,
+                "orders",
+                Artifact::Staging,
+                PG_IDENT_MAX,
+                &run,
+                much_later
+            ),
+            Found::Mine
+        );
     }
 
     /// A foreign artifact is NEVER collected on age, however old its token
@@ -2049,10 +2261,13 @@ mod tests {
         let theirs = RunId::mint_token(LandKind::Swap, "b");
         let name = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &theirs);
         for at in [now_unix(), now_unix() + 10_000_000] {
-            assert!(matches!(
-                classify(&name, "orders", Artifact::Staging, PG_IDENT_MAX, &ours, at),
-                Found::Live(_)),
-                "a peer stays a peer at every age — see classify's comment");
+            assert!(
+                matches!(
+                    classify(&name, "orders", Artifact::Staging, PG_IDENT_MAX, &ours, at),
+                    Found::Live(_)
+                ),
+                "a peer stays a peer at every age — see classify's comment"
+            );
         }
     }
 
@@ -2073,14 +2288,27 @@ mod tests {
         let run = RunId::mint_token(LandKind::Swap, "s");
         for &a in Artifact::ALL {
             let legacy = artifact_ident("orders", a, PG_IDENT_MAX);
-            assert_eq!(classify(&legacy, "orders", a, PG_IDENT_MAX, &run, now_unix()),
-                       Found::Legacy, "{:?}: {legacy}", a);
+            assert_eq!(
+                classify(&legacy, "orders", a, PG_IDENT_MAX, &run, now_unix()),
+                Found::Legacy,
+                "{:?}: {legacy}",
+                a
+            );
         }
         // And the refusal has to be actionable: it names the object and tells
         // the operator what to check before removing it.
-        let msg = format!("{}", legacy_error("public.orders", "orders__apitap_staging"));
-        assert!(msg.contains("orders__apitap_staging"), "names the object: {msg}");
-        assert!(msg.contains("older than 0.55.0"), "names what to look for: {msg}");
+        let msg = format!(
+            "{}",
+            legacy_error("public.orders", "orders__apitap_staging")
+        );
+        assert!(
+            msg.contains("orders__apitap_staging"),
+            "names the object: {msg}"
+        );
+        assert!(
+            msg.contains("older than 0.55.0"),
+            "names what to look for: {msg}"
+        );
     }
 
     /// Anything else beside the table is none of our business.
@@ -2088,10 +2316,18 @@ mod tests {
     fn an_unrelated_name_is_left_alone() {
         let run = RunId::mint_token(LandKind::Swap, "s");
         let now = now_unix();
-        for name in ["orders", "orders_backup", "orders__apitap_stagingX",
-                     "totally_unrelated", "__apitap_staging"] {
-            assert_eq!(classify(name, "orders", Artifact::Staging, PG_IDENT_MAX, &run, now),
-                       Found::Foreign, "{name}");
+        for name in [
+            "orders",
+            "orders_backup",
+            "orders__apitap_stagingX",
+            "totally_unrelated",
+            "__apitap_staging",
+        ] {
+            assert_eq!(
+                classify(name, "orders", Artifact::Staging, PG_IDENT_MAX, &run, now),
+                Found::Foreign,
+                "{name}"
+            );
         }
     }
 
@@ -2099,41 +2335,96 @@ mod tests {
     /// told the operator to wait 0 seconds for a cleanup that never happens.
     #[test]
     fn the_refusal_tells_the_truth_about_collection() {
-        let mine = PeerRun { started_unix: 100, kind: LandKind::Swap,
-                             source_hash: "aaa".into(), token: "_x".into() };
-        let peer = PeerRun { started_unix: 40, kind: LandKind::Incremental,
-                             source_hash: "bbb".into(), token: "_y".into() };
+        let mine = PeerRun {
+            started_unix: 100,
+            kind: LandKind::Swap,
+            source_hash: "aaa".into(),
+            token: "_x".into(),
+        };
+        let peer = PeerRun {
+            started_unix: 40,
+            kind: LandKind::Incremental,
+            source_hash: "bbb".into(),
+            token: "_y".into(),
+        };
         // NO LEASE — a staging object, a pre-lease lock, an operator's plant.
         // Nothing will ever collect it, and the words must not suggest otherwise.
-        let msg = format!("{}", locked_error("public.orders", "orders_x__apitap_staging",
-                                             &mine, &peer, 100, None));
+        let msg = format!(
+            "{}",
+            locked_error(
+                "public.orders",
+                "orders_x__apitap_staging",
+                &mine,
+                &peer,
+                100,
+                None
+            )
+        );
         assert!(msg.contains("60s ago"), "{msg}");
-        assert!(msg.contains("appending to it"), "names what the peer is doing: {msg}");
-        assert!(msg.contains("throws the other's work away"), "names why: {msg}");
+        assert!(
+            msg.contains("appending to it"),
+            "names what the peer is doing: {msg}"
+        );
+        assert!(
+            msg.contains("throws the other's work away"),
+            "names why: {msg}"
+        );
         assert!(msg.contains("max_active_runs"), "names the remedy: {msg}");
         // The recovery instruction must name the object and must not promise a
         // cleanup that does not exist — an earlier draft told the operator to
         // wait N seconds for one.
-        assert!(msg.contains("orders_x__apitap_staging"), "names the object: {msg}");
+        assert!(
+            msg.contains("orders_x__apitap_staging"),
+            "names the object: {msg}"
+        );
         assert!(msg.contains("remove"), "{msg}");
-        assert!(!msg.contains("nothing for you to do"), "promises no cleanup: {msg}");
+        assert!(
+            !msg.contains("nothing for you to do"),
+            "promises no cleanup: {msg}"
+        );
 
         // A LIVE lease: the peer is renewing, so the honest instruction is to
         // do nothing, and the deadline has to be in the message or an operator
         // cannot tell a wait from a wedge.
-        let live = crate::lease::Lease { expires_in: 58, collected: false };
-        let msg = format!("{}", locked_error("public.orders", "orders_y__apitap_lock",
-                                             &mine, &peer, 100, Some(&live)));
+        let live = crate::lease::Lease {
+            expires_in: 58,
+            collected: false,
+        };
+        let msg = format!(
+            "{}",
+            locked_error(
+                "public.orders",
+                "orders_y__apitap_lock",
+                &mine,
+                &peer,
+                100,
+                Some(&live)
+            )
+        );
         assert!(msg.contains("58s"), "names the deadline: {msg}");
         assert!(msg.contains("nothing for you to do"), "{msg}");
-        assert!(!msg.contains("nothing collects it on its own"),
-                "must not repeat the no-collection sentence when there IS one: {msg}");
+        assert!(
+            !msg.contains("nothing collects it on its own"),
+            "must not repeat the no-collection sentence when there IS one: {msg}"
+        );
 
         // A LAPSED lease whose claim could not be taken: the owner holds the
         // row, which is evidence it is alive INSIDE an apply.
-        let busy = crate::lease::Lease { expires_in: -5, collected: false };
-        let msg = format!("{}", locked_error("public.orders", "orders_y__apitap_lock",
-                                             &mine, &peer, 100, Some(&busy)));
+        let busy = crate::lease::Lease {
+            expires_in: -5,
+            collected: false,
+        };
+        let msg = format!(
+            "{}",
+            locked_error(
+                "public.orders",
+                "orders_y__apitap_lock",
+                &mine,
+                &peer,
+                100,
+                Some(&busy)
+            )
+        );
         assert!(msg.contains("applying a window right now"), "{msg}");
         assert!(msg.contains("Nothing for you to do"), "{msg}");
     }
@@ -2155,15 +2446,30 @@ mod tests {
         let app = RunId::mint_bulk(BulkKind::Incremental, "postgres://other:5432/db");
         let name = |a, r: &RunId| artifact_ident_run("orders", a, PG_IDENT_MAX, r);
         let cases = [
-            (name(Artifact::Lock, &drain), Some(drain.token().to_string())),
-            (name(Artifact::Staging, &drain), Some(drain.token().to_string())),
+            (
+                name(Artifact::Lock, &drain),
+                Some(drain.token().to_string()),
+            ),
+            (
+                name(Artifact::Staging, &drain),
+                Some(drain.token().to_string()),
+            ),
             (name(Artifact::Lock, &swap), None),
             (name(Artifact::Staging, &swap), None),
             (name(Artifact::Staging, &app), None),
-            (artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX), None),
+            (
+                artifact_ident("orders", Artifact::Staging, PG_IDENT_MAX),
+                None,
+            ),
         ];
         for (n, want) in &cases {
-            let scan = blockers("orders", PG_IDENT_MAX, &mine, GUARDED, [(n.as_str(), n.as_str())]);
+            let scan = blockers(
+                "orders",
+                PG_IDENT_MAX,
+                &mine,
+                GUARDED,
+                [(n.as_str(), n.as_str())],
+            );
             assert_eq!(scan.blockers.len(), 1, "{n} must block a replace: {scan:?}");
             let got = collectable(&scan.blockers[0]).map(str::to_string);
             assert_eq!(&got, want, "{n}");
@@ -2182,15 +2488,30 @@ mod tests {
         let other = RunId::mint_bulk(BulkKind::Swap, "postgres://h:5432/db");
         let kinds = [Artifact::Lock, Artifact::Staging, Artifact::Old];
         let n = |a, r: &RunId| artifact_ident_run("orders", a, MY_IDENT_MAX, r);
-        let (my_staging, my_old, my_lock) =
-            (n(Artifact::Staging, &run), n(Artifact::Old, &run), n(Artifact::Lock, &run));
+        let (my_staging, my_old, my_lock) = (
+            n(Artifact::Staging, &run),
+            n(Artifact::Old, &run),
+            n(Artifact::Lock, &run),
+        );
         let their_staging = n(Artifact::Staging, &other);
         let listed = [&my_staging, &my_old, &my_lock, &their_staging];
-        let scan = blockers("orders", MY_IDENT_MAX, &run, &kinds,
-                            listed.iter().map(|x| (x.as_str(), x.as_str())));
-        assert_eq!(scan.mine_leftovers, vec![my_staging.clone(), my_old.clone()],
-                   "own staging and own Old are leftovers; own lock is not");
-        assert_eq!(scan.blockers.len(), 1, "the other run's staging blocks: {scan:?}");
+        let scan = blockers(
+            "orders",
+            MY_IDENT_MAX,
+            &run,
+            &kinds,
+            listed.iter().map(|x| (x.as_str(), x.as_str())),
+        );
+        assert_eq!(
+            scan.mine_leftovers,
+            vec![my_staging.clone(), my_old.clone()],
+            "own staging and own Old are leftovers; own lock is not"
+        );
+        assert_eq!(
+            scan.blockers.len(),
+            1,
+            "the other run's staging blocks: {scan:?}"
+        );
         assert_eq!(scan.blockers[0].name(), their_staging);
     }
 
@@ -2202,7 +2523,13 @@ mod tests {
         let peer = RunId::mint_bulk(BulkKind::Swap, "t");
         let canonical = artifact_ident_run("orders", Artifact::Staging, ROOMY, &peer);
         let raw = format!("{canonical}_3");
-        let scan = blockers("orders", ROOMY, &run, GUARDED, [(canonical.as_str(), raw.as_str())]);
+        let scan = blockers(
+            "orders",
+            ROOMY,
+            &run,
+            GUARDED,
+            [(canonical.as_str(), raw.as_str())],
+        );
         assert_eq!(scan.blockers.len(), 1);
         assert_eq!(scan.blockers[0].name(), raw);
     }
@@ -2221,18 +2548,62 @@ mod tests {
         let lock = |r: &RunId| artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, r);
         let (parent_lock, child_lock, other_lock) = (lock(&parent), lock(&child), lock(&other));
         let now = now_unix();
-        assert_eq!(classify(&parent_lock, "orders", Artifact::Lock, PG_IDENT_MAX, &child, now),
-                   Found::Parent, "the child must not yield to the drain that spawned it");
-        assert!(matches!(classify(&child_lock, "orders", Artifact::Lock, PG_IDENT_MAX, &parent, now),
-                         Found::Live(_)), "one-directional: the parent does not own its child");
-        assert!(matches!(classify(&other_lock, "orders", Artifact::Lock, PG_IDENT_MAX, &child, now),
-                         Found::Live(_)), "an unrelated drain is still a peer");
-        let scan = blockers("orders", PG_IDENT_MAX, &child, GUARDED,
-                            [(parent_lock.as_str(), parent_lock.as_str()),
-                             (other_lock.as_str(), other_lock.as_str())]);
+        assert_eq!(
+            classify(
+                &parent_lock,
+                "orders",
+                Artifact::Lock,
+                PG_IDENT_MAX,
+                &child,
+                now
+            ),
+            Found::Parent,
+            "the child must not yield to the drain that spawned it"
+        );
+        assert!(
+            matches!(
+                classify(
+                    &child_lock,
+                    "orders",
+                    Artifact::Lock,
+                    PG_IDENT_MAX,
+                    &parent,
+                    now
+                ),
+                Found::Live(_)
+            ),
+            "one-directional: the parent does not own its child"
+        );
+        assert!(
+            matches!(
+                classify(
+                    &other_lock,
+                    "orders",
+                    Artifact::Lock,
+                    PG_IDENT_MAX,
+                    &child,
+                    now
+                ),
+                Found::Live(_)
+            ),
+            "an unrelated drain is still a peer"
+        );
+        let scan = blockers(
+            "orders",
+            PG_IDENT_MAX,
+            &child,
+            GUARDED,
+            [
+                (parent_lock.as_str(), parent_lock.as_str()),
+                (other_lock.as_str(), other_lock.as_str()),
+            ],
+        );
         assert_eq!(scan.blockers.len(), 1, "{scan:?}");
         assert_eq!(scan.blockers[0].name(), other_lock);
-        assert!(scan.mine_leftovers.is_empty(), "the parent's lock is never the child's to drop");
+        assert!(
+            scan.mine_leftovers.is_empty(),
+            "the parent's lock is never the child's to drop"
+        );
     }
 
     /// What keeps every "delete my leftovers" path away from the parent's
@@ -2243,11 +2614,28 @@ mod tests {
         let parent = RunId::mint_drain(src);
         let child = RunId::mint_within(BulkKind::Swap, src, &parent);
         let marker = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &parent);
-        assert_eq!(classify(&marker, "orders", Artifact::Staging, PG_IDENT_MAX, &child, now_unix()),
-                   Found::Parent);
-        let scan = blockers("orders", PG_IDENT_MAX, &child, GUARDED,
-                            [(marker.as_str(), marker.as_str())]);
-        assert!(scan.blockers.is_empty() && scan.mine_leftovers.is_empty(), "{scan:?}");
+        assert_eq!(
+            classify(
+                &marker,
+                "orders",
+                Artifact::Staging,
+                PG_IDENT_MAX,
+                &child,
+                now_unix()
+            ),
+            Found::Parent
+        );
+        let scan = blockers(
+            "orders",
+            PG_IDENT_MAX,
+            &child,
+            GUARDED,
+            [(marker.as_str(), marker.as_str())],
+        );
+        assert!(
+            scan.blockers.is_empty() && scan.mine_leftovers.is_empty(),
+            "{scan:?}"
+        );
     }
 
     // ── compatibility across releases ────────────────────────────────────
@@ -2268,10 +2656,14 @@ mod tests {
         assert!(Generation::G0.scans().is_empty());
         for &reader in Generation::SUPPORTED {
             for kind in [LandKind::Swap, LandKind::Incremental, LandKind::Cdc] {
-                assert!(meets(Generation::CURRENT.announces(kind), reader.scans()),
-                        "a {} reader scans {:?} and cannot see a current {kind:?} run, \
-                         which announces {:?}", reader.versions(), reader.scans(),
-                        Generation::CURRENT.announces(kind));
+                assert!(
+                    meets(Generation::CURRENT.announces(kind), reader.scans()),
+                    "a {} reader scans {:?} and cannot see a current {kind:?} run, \
+                         which announces {:?}",
+                    reader.versions(),
+                    reader.scans(),
+                    Generation::CURRENT.announces(kind)
+                );
             }
         }
     }
@@ -2284,16 +2676,24 @@ mod tests {
         for &writer in Generation::SUPPORTED {
             for kind in [LandKind::Swap, LandKind::Incremental, LandKind::Cdc] {
                 let seen = meets(writer.announces(kind), Generation::CURRENT.scans());
-                assert!(seen || KNOWN_HOLES.contains(&(writer, kind)),
-                        "a {} {kind:?} run announces {:?}, which the current scan \
+                assert!(
+                    seen || KNOWN_HOLES.contains(&(writer, kind)),
+                    "a {} {kind:?} run announces {:?}, which the current scan \
                          {:?} cannot see, and no hole is declared",
-                        writer.versions(), writer.announces(kind), Generation::CURRENT.scans());
+                    writer.versions(),
+                    writer.announces(kind),
+                    Generation::CURRENT.scans()
+                );
             }
         }
         for &(g, k) in KNOWN_HOLES {
-            assert!(g.announces(k).is_empty(),
-                    "({}, {k:?}) is declared a hole but announces {:?} — a hole that \
-                     closed must leave KNOWN_HOLES", g.versions(), g.announces(k));
+            assert!(
+                g.announces(k).is_empty(),
+                "({}, {k:?}) is declared a hole but announces {:?} — a hole that \
+                     closed must leave KNOWN_HOLES",
+                g.versions(),
+                g.announces(k)
+            );
         }
     }
 
@@ -2303,9 +2703,17 @@ mod tests {
     #[test]
     fn markers_are_announced_minus_prepare() {
         for kind in [LandKind::Swap, LandKind::Incremental, LandKind::Cdc] {
-            let rest: Vec<Artifact> = Generation::CURRENT.announces(kind).iter()
-                .filter(|a| !compat::markers(kind).contains(a)).copied().collect();
-            let want: &[Artifact] = if kind == LandKind::Cdc { &[] } else { &[Artifact::Staging] };
+            let rest: Vec<Artifact> = Generation::CURRENT
+                .announces(kind)
+                .iter()
+                .filter(|a| !compat::markers(kind).contains(a))
+                .copied()
+                .collect();
+            let want: &[Artifact] = if kind == LandKind::Cdc {
+                &[]
+            } else {
+                &[Artifact::Staging]
+            };
             assert_eq!(rest, want, "{kind:?}");
         }
     }
@@ -2321,19 +2729,29 @@ mod tests {
     fn own_tables_is_the_current_exclusion_and_rollback_leaks_are_derived() {
         assert_eq!(OWN_TABLES, Generation::CURRENT.excludes());
         for &(g, leaks) in ROLLBACK_LEAKS {
-            let derived: Vec<&str> = OWN_TABLES.iter()
-                .filter(|t| !g.excludes().contains(t)).copied().collect();
+            let derived: Vec<&str> = OWN_TABLES
+                .iter()
+                .filter(|t| !g.excludes().contains(t))
+                .copied()
+                .collect();
             assert_eq!(derived, leaks, "rolling back to {}", g.versions());
         }
     }
 
     #[test]
     fn own_tables_are_frozen_at_four_names() {
-        assert_eq!(OWN_TABLES, &["_apitap_state", "_apitap_cdc_pending", "_apitap_lease",
-                                 "_apitap_residue_journal"],
-                   "every whole-word bookkeeping table is replicated as user data by every \
+        assert_eq!(
+            OWN_TABLES,
+            &[
+                "_apitap_state",
+                "_apitap_cdc_pending",
+                "_apitap_lease",
+                "_apitap_residue_journal"
+            ],
+            "every whole-word bookkeeping table is replicated as user data by every \
                     older generation on rollback; adding one updates ROLLBACK_LEAKS and \
-                    failure-modes.md#upgrading-and-rolling-back in the same commit.");
+                    failure-modes.md#upgrading-and-rolling-back in the same commit."
+        );
         assert_eq!(OWN_TABLES.len(), 4);
     }
 
@@ -2341,7 +2759,10 @@ mod tests {
     #[test]
     fn a_token_reads_back_its_kind() {
         assert_eq!(RunId::mint_bulk(BulkKind::Swap, "s").kind(), LandKind::Swap);
-        assert_eq!(RunId::mint_bulk(BulkKind::Incremental, "s").kind(), LandKind::Incremental);
+        assert_eq!(
+            RunId::mint_bulk(BulkKind::Incremental, "s").kind(),
+            LandKind::Incremental
+        );
         assert_eq!(RunId::mint_drain("s").kind(), LandKind::Cdc);
         let r = RunId::mint_drain("s");
         assert!(r.is_self(r.token()));
@@ -2352,16 +2773,40 @@ mod tests {
     #[test]
     fn a_lease_is_lapsed_when_it_has_run_out_or_was_already_taken() {
         use crate::lease::Lease;
-        assert!(!Lease { expires_in: 1, collected: false }.lapsed(), "still alive");
-        assert!(Lease { expires_in: 0, collected: false }.lapsed(), "exactly out");
-        assert!(Lease { expires_in: -1, collected: false }.lapsed());
+        assert!(
+            !Lease {
+                expires_in: 1,
+                collected: false
+            }
+            .lapsed(),
+            "still alive"
+        );
+        assert!(
+            Lease {
+                expires_in: 0,
+                collected: false
+            }
+            .lapsed(),
+            "exactly out"
+        );
+        assert!(Lease {
+            expires_in: -1,
+            collected: false
+        }
+        .lapsed());
         // Already collected counts as lapsed ON PURPOSE. Two collectors racing
         // one dead lock must BOTH succeed: collecting is not proceeding, and
         // each then meets the other's lock and at least one yields. Tighten this
         // to `AND NOT collected` and the second collector refuses over a lock
         // that no longer exists.
-        assert!(Lease { expires_in: 9_999, collected: true }.lapsed(),
-                "an already-taken lease must not block the second collector");
+        assert!(
+            Lease {
+                expires_in: 9_999,
+                collected: true
+            }
+            .lapsed(),
+            "an already-taken lease must not block the second collector"
+        );
     }
 
     /// The renewal must fit inside the TTL many times over, at every setting the
@@ -2369,8 +2814,12 @@ mod tests {
     /// declares a live run dead the first time a tick is late.
     #[test]
     fn a_lease_outlives_at_least_eight_renewals() {
-        assert!(crate::lease::ttl_secs() >= 8 * crate::lease::renew_secs(),
-                "ttl {} vs renew {}", crate::lease::ttl_secs(), crate::lease::renew_secs());
+        assert!(
+            crate::lease::ttl_secs() >= 8 * crate::lease::renew_secs(),
+            "ttl {} vs renew {}",
+            crate::lease::ttl_secs(),
+            crate::lease::renew_secs()
+        );
     }
 
     /// Multi-byte names must not be cut through a character.
@@ -2386,7 +2835,11 @@ mod tests {
     // ── state_verdict: who may read a state row (E1-E5) ──────────────────────
 
     fn row(wm: Option<&str>, cursor: Option<&str>, mode: Option<&str>) -> Option<StateRow> {
-        Some(StateRow::new(wm.map(String::from), cursor.map(String::from), mode.map(String::from)))
+        Some(StateRow::new(
+            wm.map(String::from),
+            cursor.map(String::from),
+            mode.map(String::from),
+        ))
     }
 
     /// E1. An `append` row is the cursor lane's, and a drain is REFUSED it —
@@ -2395,13 +2848,28 @@ mod tests {
     #[test]
     fn state_verdict_a_cursor_row_is_foreign_to_cdc() {
         let r = row(Some("500"), Some("id"), Some("append"));
-        assert!(matches!(state_verdict(r.clone(), Lane::Cdc), StateVerdict::Foreign(_)));
-        assert_eq!(state_verdict(r.clone(), Lane::Cursor { cursor: "id" }), StateVerdict::Mine(Some("500".into())));
+        assert!(matches!(
+            state_verdict(r.clone(), Lane::Cdc),
+            StateVerdict::Foreign(_)
+        ));
+        assert_eq!(
+            state_verdict(r.clone(), Lane::Cursor { cursor: "id" }),
+            StateVerdict::Mine(Some("500".into()))
+        );
         let e = cdc_watermark("t", r).unwrap_err().to_string();
-        assert!(e.contains("mode='append'") && e.contains("'id'") && e.contains("LSN"), "{e}");
+        assert!(
+            e.contains("mode='append'") && e.contains("'id'") && e.contains("LSN"),
+            "{e}"
+        );
         // merge is the cursor lane too, and a row with no mode is nobody's drain
-        assert!(matches!(state_verdict(row(Some("5"), Some("id"), Some("merge")), Lane::Cdc), StateVerdict::Foreign(_)));
-        assert!(matches!(state_verdict(row(Some("5"), Some("_lsn"), None), Lane::Cdc), StateVerdict::Foreign(_)));
+        assert!(matches!(
+            state_verdict(row(Some("5"), Some("id"), Some("merge")), Lane::Cdc),
+            StateVerdict::Foreign(_)
+        ));
+        assert!(matches!(
+            state_verdict(row(Some("5"), Some("_lsn"), None), Lane::Cdc),
+            StateVerdict::Foreign(_)
+        ));
     }
 
     /// E2. A `log_based` row is the drain's, and the cursor lane is refused it
@@ -2410,16 +2878,26 @@ mod tests {
     #[test]
     fn state_verdict_a_cdc_row_is_foreign_to_the_cursor_lane() {
         let r = row(Some("123456"), Some("_lsn"), Some("log_based"));
-        assert_eq!(state_verdict(r.clone(), Lane::Cdc), StateVerdict::Mine(Some("123456".into())));
+        assert_eq!(
+            state_verdict(r.clone(), Lane::Cdc),
+            StateVerdict::Mine(Some("123456".into()))
+        );
         for cursor in ["id", "_lsn", ""] {
-            assert!(matches!(state_verdict(r.clone(), Lane::Cursor { cursor }), StateVerdict::Foreign(_)),
-                    "cursor {cursor:?} read a CDC row");
+            assert!(
+                matches!(
+                    state_verdict(r.clone(), Lane::Cursor { cursor }),
+                    StateVerdict::Foreign(_)
+                ),
+                "cursor {cursor:?} read a CDC row"
+            );
         }
         let e = cursor_watermark("t", "id", r).unwrap_err().to_string();
         assert!(e.contains("CDC-managed") && e.contains("LSN"), "{e}");
         // log_based that does not track `_lsn` is not a position a drain can use
-        assert!(matches!(state_verdict(row(Some("1"), Some("id"), Some("log_based")), Lane::Cdc),
-                         StateVerdict::Foreign(_)));
+        assert!(matches!(
+            state_verdict(row(Some("1"), Some("id"), Some("log_based")), Lane::Cdc),
+            StateVerdict::Foreign(_)
+        ));
     }
 
     /// E3. A cursor switch is refused naming both cursors; a row that recorded
@@ -2428,12 +2906,24 @@ mod tests {
     #[test]
     fn state_verdict_a_cursor_switch_is_foreign_and_an_unrecorded_cursor_is_not() {
         let r = row(Some("77"), Some("id"), Some("append"));
-        assert!(matches!(state_verdict(r.clone(), Lane::Cursor { cursor: "n" }), StateVerdict::Foreign(_)));
+        assert!(matches!(
+            state_verdict(r.clone(), Lane::Cursor { cursor: "n" }),
+            StateVerdict::Foreign(_)
+        ));
         let e = cursor_watermark("t", "n", r).unwrap_err().to_string();
         assert!(e.contains("'id'") && e.contains("'n'"), "{e}");
-        assert_eq!(cursor_watermark("t", "n", row(Some("77"), None, Some("append"))).unwrap(), Some("77".into()));
-        assert_eq!(cursor_watermark("t", "n", row(Some("77"), Some(""), None)).unwrap(), Some("77".into()));
-        assert_eq!(cursor_watermark("t", "n", row(None, Some("n"), Some("append"))).unwrap(), None);
+        assert_eq!(
+            cursor_watermark("t", "n", row(Some("77"), None, Some("append"))).unwrap(),
+            Some("77".into())
+        );
+        assert_eq!(
+            cursor_watermark("t", "n", row(Some("77"), Some(""), None)).unwrap(),
+            Some("77".into())
+        );
+        assert_eq!(
+            cursor_watermark("t", "n", row(None, Some("n"), Some("append"))).unwrap(),
+            None
+        );
         assert_eq!(cursor_watermark("t", "n", None).unwrap(), None);
     }
 
@@ -2445,14 +2935,21 @@ mod tests {
         assert_eq!(cdc_watermark("t", None).unwrap(), None);
         let w = cdc_watermark("t", row(Some("42"), Some("_lsn"), Some("log_based"))).unwrap();
         assert_eq!(w.map(CdcWatermark::get), Some(42));
-        let e = cdc_watermark("orders", row(None, Some("_lsn"), Some("log_based"))).unwrap_err().to_string();
+        let e = cdc_watermark("orders", row(None, Some("_lsn"), Some("log_based")))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("orders") && e.contains("NULL watermark"), "{e}");
-        let e = cdc_watermark("t", row(Some("0/16B3748"), Some("_lsn"), Some("log_based"))).unwrap_err().to_string();
+        let e = cdc_watermark("t", row(Some("0/16B3748"), Some("_lsn"), Some("log_based")))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("bad LSN state '0/16B3748'"), "{e}");
         // the group drains from its minimum
         let a = cdc_watermark("a", row(Some("9"), Some("_lsn"), Some("log_based"))).unwrap();
         let b = cdc_watermark("b", row(Some("10"), Some("_lsn"), Some("log_based"))).unwrap();
-        assert_eq!([b, a].into_iter().flatten().min().map(CdcWatermark::get), Some(9));
+        assert_eq!(
+            [b, a].into_iter().flatten().min().map(CdcWatermark::get),
+            Some(9)
+        );
     }
 
     /// E5. Every `_apitap_state` read selects `watermark, cursor_col, mode`
@@ -2490,15 +2987,25 @@ mod tests {
                     for op in ["=", "!=", "<>", "in(", "like"] {
                         let needle = format!("{kw}{col}{op}");
                         if let Some(at) = code.find(&needle) {
-                            let from = code[..at].char_indices().rev().nth(40).map_or(0, |(i, _)| i);
+                            let from = code[..at]
+                                .char_indices()
+                                .rev()
+                                .nth(40)
+                                .map_or(0, |(i, _)| i);
                             let to = (at + 60).min(code.len());
-                            let to = (to..=code.len()).find(|&i| code.is_char_boundary(i)).unwrap();
+                            let to = (to..=code.len())
+                                .find(|&i| code.is_char_boundary(i))
+                                .unwrap();
                             hits.push(format!("{name}: …{}…", &code[from..to]));
                         }
                     }
                 }
             }
         }
-        assert!(hits.is_empty(), "a state read filters on the row's vocabulary:\n{}", hits.join("\n"));
+        assert!(
+            hits.is_empty(),
+            "a state read filters on the row's vocabulary:\n{}",
+            hits.join("\n")
+        );
     }
 }

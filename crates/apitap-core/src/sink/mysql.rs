@@ -27,11 +27,11 @@
 //! longer drops anything on sight either — it lists what is there, reaps
 //! orphans by age and refuses live peers that cannot coexist.
 
-use crate::sink::{FinishMarked, Loader, Msg};
 use crate::dialect::mysql::{is_binary_udt, my_ident};
 use crate::error::{Error, Result};
 use crate::pipe;
 use crate::plan::{Delivered, DestState, Lane, TablePlan, WireFormat};
+use crate::sink::{FinishMarked, Loader, Msg};
 use crate::Mode;
 use bytes::Bytes;
 use futures::channel::mpsc;
@@ -44,7 +44,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 type Registry = Arc<Mutex<HashMap<u64, InfileData>>>;
-
 
 /// Escape a string as a MySQL SQL single-quoted literal body (no surrounding
 /// quotes). Only used for the tiny state-row writes, never the bulk path.
@@ -160,15 +159,25 @@ fn count_of(v: Option<String>) -> Result<u64> {
 /// instead of this remedy (P2).
 fn pk_unindexable(ty: &str) -> bool {
     let up = ty.trim().to_ascii_uppercase();
-    let head = up.split(|c: char| c == '(' || c == ' ').next().unwrap_or("");
+    let head = up
+        .split(|c: char| c == '(' || c == ' ')
+        .next()
+        .unwrap_or("");
     let varchar_w: Option<u32> = up
         .strip_prefix("VARCHAR(")
         .and_then(|r| r.split(')').next())
         .and_then(|n| n.trim().parse().ok());
     matches!(
         head,
-        "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB"
-            | "LONGBLOB" | "JSON"
+        "TINYTEXT"
+            | "TEXT"
+            | "MEDIUMTEXT"
+            | "LONGTEXT"
+            | "TINYBLOB"
+            | "BLOB"
+            | "MEDIUMBLOB"
+            | "LONGBLOB"
+            | "JSON"
     ) || varchar_w.is_some_and(|n| n > 768)
 }
 
@@ -184,7 +193,10 @@ pub(crate) fn lease_t(db: &str) -> String {
 }
 
 async fn ensure_lease_table(pool: &Pool, db: &str) -> Result<()> {
-    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
     conn.query_drop(format!(
         "CREATE TABLE IF NOT EXISTS {} (\
            dest_key VARCHAR(320) NOT NULL, \
@@ -200,7 +212,10 @@ async fn ensure_lease_table(pool: &Pool, db: &str) -> Result<()> {
 
 pub(crate) async fn lease_open(pool: &Pool, db: &str, keys: &[String], token: &str) -> Result<()> {
     ensure_lease_table(pool, db).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
     for k in keys {
         conn.exec_drop(
             format!(
@@ -235,8 +250,16 @@ async fn short_lock_wait(conn: &mut mysql_async::Conn) -> Result<()> {
 /// Never over a collected row: a renewal that could clear nothing but could
 /// extend a collected row's `expires_at` is harmless today, and would not be
 /// the day something reads expiry beside the flag.
-pub(crate) async fn lease_renew(pool: &Pool, db: &str, keys: &[String], token: &str) -> Result<u64> {
-    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+pub(crate) async fn lease_renew(
+    pool: &Pool,
+    db: &str,
+    keys: &[String],
+    token: &str,
+) -> Result<u64> {
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
     short_lock_wait(&mut conn).await?;
     let mut done = 0u64;
     for k in keys {
@@ -261,10 +284,19 @@ pub(crate) async fn lease_renew(pool: &Pool, db: &str, keys: &[String], token: &
 
 /// This run's keys whose row exists and is not collected. Expiry ignored.
 pub(crate) async fn lease_unclaimed(pool: &Pool, db: &str, token: &str) -> Result<Vec<String>> {
-    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
-    conn.exec(format!("SELECT dest_key FROM {} WHERE token = ? AND collected = 0", lease_t(db)), (token,))
+    let mut conn = pool
+        .get_conn()
         .await
-        .map_err(|e| Error::Transfer(format!("lease read: {e}")))
+        .map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    conn.exec(
+        format!(
+            "SELECT dest_key FROM {} WHERE token = ? AND collected = 0",
+            lease_t(db)
+        ),
+        (token,),
+    )
+    .await
+    .map_err(|e| Error::Transfer(format!("lease read: {e}")))
 }
 
 pub(crate) async fn lease_get(
@@ -273,7 +305,10 @@ pub(crate) async fn lease_get(
     key: &str,
     token: &str,
 ) -> Result<Option<crate::lease::Lease>> {
-    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
     let row: Option<(i64, i8)> = match conn
         .exec_first(
             format!(
@@ -303,14 +338,22 @@ pub(crate) async fn lease_get(
 /// CHANGED rows, so re-claiming a row that already said 1 reported 0, and a
 /// collection that died half way was refused for ever. Now: lock the row
 /// (`FOR UPDATE`, 1 s wait), look at it, and decide.
-pub(crate) async fn lease_claim(pool: &Pool, db: &str, key: &str, token: &str)
-    -> Result<crate::guard::Claim>
-{
+pub(crate) async fn lease_claim(
+    pool: &Pool,
+    db: &str,
+    key: &str,
+    token: &str,
+) -> Result<crate::guard::Claim> {
     use crate::guard::Claim;
-    let mut conn = pool.get_conn().await.map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|e| Error::Transfer(format!("mysql: {e}")))?;
     short_lock_wait(&mut conn).await?;
     let t = lease_t(db);
-    conn.query_drop("START TRANSACTION").await.map_err(|e| Error::Transfer(format!("lease claim: {e}")))?;
+    conn.query_drop("START TRANSACTION")
+        .await
+        .map_err(|e| Error::Transfer(format!("lease claim: {e}")))?;
     let row: std::result::Result<Option<(i8, i8)>, mysql_async::Error> = conn
         .exec_first(
             format!(
@@ -336,15 +379,24 @@ pub(crate) async fn lease_claim(pool: &Pool, db: &str, key: &str, token: &str)
     };
     if write {
         if let Err(e) = conn
-            .exec_drop(format!("UPDATE {t} SET collected = 1 WHERE dest_key = ? AND token = ?"), (key, token))
+            .exec_drop(
+                format!("UPDATE {t} SET collected = 1 WHERE dest_key = ? AND token = ?"),
+                (key, token),
+            )
             .await
         {
             let _ = conn.query_drop("ROLLBACK").await;
             return Err(Error::Transfer(format!("lease claim: {e}")));
         }
     }
-    let end = if verdict == Claim::Taken { "COMMIT" } else { "ROLLBACK" };
-    conn.query_drop(end).await.map_err(|e| Error::Transfer(format!("lease claim: {e}")))?;
+    let end = if verdict == Claim::Taken {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    };
+    conn.query_drop(end)
+        .await
+        .map_err(|e| Error::Transfer(format!("lease claim: {e}")))?;
     Ok(verdict)
 }
 
@@ -352,7 +404,10 @@ pub(crate) async fn lease_close(pool: &Pool, db: &str, key: &str, token: &str) {
     if let Ok(mut conn) = pool.get_conn().await {
         let _ = conn
             .exec_drop(
-                format!("DELETE FROM {} WHERE dest_key = ? AND token = ?", lease_t(db)),
+                format!(
+                    "DELETE FROM {} WHERE dest_key = ? AND token = ?",
+                    lease_t(db)
+                ),
                 (key, token),
             )
             .await;
@@ -401,7 +456,11 @@ impl crate::guard::GuardStore for MyGuard {
         &[Lock, Staging, Old]
     }
 
-    async fn list(&self, bare: &str, kinds: &[crate::naming::Artifact]) -> Result<Vec<crate::guard::Listed>> {
+    async fn list(
+        &self,
+        bare: &str,
+        kinds: &[crate::naming::Artifact],
+    ) -> Result<Vec<crate::guard::Listed>> {
         // `_` and `%` are LIKE wildcards and every suffix is full of the first.
         // MySQL does not enable backslash escaping under NO_BACKSLASH_ESCAPES,
         // so the escape character is declared explicitly — the same convention
@@ -412,7 +471,8 @@ impl crate::guard::GuardStore for MyGuard {
         for &a in kinds {
             // The token sits BETWEEN the head and the suffix, so the pattern is
             // head + wildcard + suffix — not a prefix.
-            let (head, suffix) = crate::naming::artifact_match(bare, a, crate::naming::MY_IDENT_MAX);
+            let (head, suffix) =
+                crate::naming::artifact_match(bare, a, crate::naming::MY_IDENT_MAX);
             let found: Vec<String> = conn
                 .exec(
                     // BASE TABLE only, the way the Postgres scan is
@@ -421,7 +481,10 @@ impl crate::guard::GuardStore for MyGuard {
                     "SELECT table_name FROM information_schema.tables \
                      WHERE table_schema = ? AND table_type = 'BASE TABLE' \
                        AND table_name LIKE ? ESCAPE '|'",
-                    (self.shared.db.as_str(), format!("{}%{}", esc(&head), esc(suffix))),
+                    (
+                        self.shared.db.as_str(),
+                        format!("{}%{}", esc(&head), esc(suffix)),
+                    ),
                 )
                 .await
                 .map_err(|e| Error::Transfer(format!("staging scan: {e}")))?;
@@ -443,9 +506,9 @@ impl crate::guard::GuardStore for MyGuard {
         .await
     }
 
-
     async fn drop_object(&self, raw: &str) -> Result<()> {
-        self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(raw))).await
+        self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(raw)))
+            .await
     }
 
     async fn lease_get(&self, key: &str, token: &str) -> Result<Option<crate::lease::Lease>> {
@@ -480,7 +543,11 @@ impl MySqlShared {
                 // unhelpful TLS error is how an operator ends up disabling
                 // security wholesale instead of narrowly — so the opt-out is
                 // named in the message.
-                let hint = self.tls_hint.as_deref().map(|h| format!(" — {h}")).unwrap_or_default();
+                let hint = self
+                    .tls_hint
+                    .as_deref()
+                    .map(|h| format!(" — {h}"))
+                    .unwrap_or_default();
                 Error::Transfer(format!("mysql conn: {e}{hint}"))
             }),
             Err(_) => Err(Error::Transfer(
@@ -506,7 +573,10 @@ impl MySqlShared {
         // The body is COMPLETE at registration, so a clean end of this plain
         // stream is a genuine end-of-file: LOAD DATA commits what it read.
         let data: InfileData = Box::pin(rx);
-        self.registry.lock().expect("infile registry").insert(id, data);
+        self.registry
+            .lock()
+            .expect("infile registry")
+            .insert(id, data);
         id
     }
 
@@ -529,8 +599,8 @@ impl MySqlShared {
 /// says so; `required` encrypts without verifying; `verify_ca` checks the
 /// chain; `verify_identity` checks the chain and the hostname.
 fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>, bool)> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| crate::urlerr::bad_url("mysql url", url, e))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| crate::urlerr::bad_url("mysql url", url, e))?;
     let mut mode: Option<String> = None;
     let kept: Vec<(String, String)> = parsed
         .query_pairs()
@@ -579,9 +649,7 @@ fn split_ssl_mode(url: &str) -> Result<(String, Option<SslOpts>, bool)> {
         }
         "required" => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
         // Chain only: skip the hostname check, keep the chain check.
-        "verify_ca" => Some(
-            SslOpts::default().with_danger_skip_domain_validation(true),
-        ),
+        "verify_ca" => Some(SslOpts::default().with_danger_skip_domain_validation(true)),
         "verify_identity" => Some(SslOpts::default()),
         other => {
             return Err(Error::InvalidInput(format!(
@@ -662,17 +730,12 @@ impl MySqlSink {
             registry,
             next_id: Arc::new(AtomicU64::new(0)),
             db,
-            tls_hint: tls_defaulted
-                .then(|| crate::dialect::mysql::tls_required_hint(url).into()),
+            tls_hint: tls_defaulted.then(|| crate::dialect::mysql::tls_required_hint(url).into()),
         })
     }
 
     /// Bind one destination table onto the shared resources.
-    pub(crate) fn bind(
-        shared: MySqlShared,
-        dest_table: &str,
-        run: &crate::naming::RunId,
-    ) -> Self {
+    pub(crate) fn bind(shared: MySqlShared, dest_table: &str, run: &crate::naming::RunId) -> Self {
         let bare = dest_table.rsplit_once('.').map_or(dest_table, |(_, t)| t);
         // The run's token is IN both names, which is what makes it impossible
         // for one run to publish another's work: the swap renames objects only
@@ -687,9 +750,17 @@ impl MySqlSink {
             db: shared.db,
             tls_hint: shared.tls_hint,
             staging: crate::naming::artifact_ident_run(
-                bare, crate::naming::Artifact::Staging, crate::naming::MY_IDENT_MAX, run),
+                bare,
+                crate::naming::Artifact::Staging,
+                crate::naming::MY_IDENT_MAX,
+                run,
+            ),
             old: crate::naming::artifact_ident_run(
-                bare, crate::naming::Artifact::Old, crate::naming::MY_IDENT_MAX, run),
+                bare,
+                crate::naming::Artifact::Old,
+                crate::naming::MY_IDENT_MAX,
+                run,
+            ),
             announced: Mutex::new(None),
             run: run.clone(),
             bare: bare.to_string(),
@@ -714,7 +785,11 @@ impl MySqlSink {
                 // unhelpful TLS error is how an operator ends up disabling
                 // security wholesale instead of narrowly — so the opt-out is
                 // named in the message.
-                let hint = self.tls_hint.as_deref().map(|h| format!(" — {h}")).unwrap_or_default();
+                let hint = self
+                    .tls_hint
+                    .as_deref()
+                    .map(|h| format!(" — {h}"))
+                    .unwrap_or_default();
                 Error::Transfer(format!("mysql conn: {e}{hint}"))
             }),
             Err(_) => Err(Error::Transfer(
@@ -888,7 +963,10 @@ impl MySqlSink {
     /// a failure (an FK naming the parked table, a lock) is a warning that
     /// names the leftover, never a failed run (MASTER review M-62).
     async fn drop_after_publish(&self, table: &str) {
-        if let Err(e) = self.exec(&format!("DROP TABLE IF EXISTS {}", self.fq(table))).await {
+        if let Err(e) = self
+            .exec(&format!("DROP TABLE IF EXISTS {}", self.fq(table)))
+            .await
+        {
             crate::progress::warn(&format!(
                 "mysql: published, but dropping {table} failed ({e}); the next run of this \
                  table will name it — drop it by hand"
@@ -1129,8 +1207,13 @@ impl crate::sink::Sink for MySqlSink {
         // announcement again if anything here fails; see `announce`.
         let a = crate::guard::announce(&self.guard(), &self.bare, &self.run).await?;
         *self.announced.lock().expect("announcement") = Some(a);
-        crate::guard::check_peers(&self.guard(), &self.bare, &self.run, crate::guard::Mine::DeleteLeftovers)
-            .await?;
+        crate::guard::check_peers(
+            &self.guard(),
+            &self.bare,
+            &self.run,
+            crate::guard::Mine::DeleteLeftovers,
+        )
+        .await?;
         self.exec(&format!(
             "CREATE TABLE {} ({}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
             self.fq(&self.staging),
@@ -1491,7 +1574,9 @@ impl MySqlSink {
                     // legal fan-in, and the branch below would rename the
                     // table this run never created out of the way and drop
                     // it. Refuse; the re-run reads the new state row.
-                    return Err(Error::InvalidInput(crate::naming::lost_first_run(&self.bare, "")));
+                    return Err(Error::InvalidInput(crate::naming::lost_first_run(
+                        &self.bare, "",
+                    )));
                 }
                 if exists {
                     // Atomic across both tables: readers never see it missing.
@@ -1544,7 +1629,9 @@ impl MySqlSink {
                 // state write failing between them left the rows published
                 // with the watermark behind them (M-62). The state table is
                 // ensured first — its DDL would commit implicitly.
-                let state = staged_wm.as_ref().and_then(|wm| self.state_upsert_sql(wm, rows));
+                let state = staged_wm
+                    .as_ref()
+                    .and_then(|wm| self.state_upsert_sql(wm, rows));
                 if state.is_some() {
                     self.ensure_state_table().await?;
                 }
@@ -1583,7 +1670,6 @@ impl MySqlSink {
         }
     }
 }
-
 
 pub(crate) struct MySqlLoader {
     tx: mpsc::Sender<Msg<Bytes>>,
@@ -1657,7 +1743,9 @@ impl Loader for MySqlLoader {
         }
         match self.join.join().await {
             Some(r) => r.map_err(|e| Error::Transfer(format!("mysql loader join: {e}")))?,
-            None => Err(Error::Transfer("mysql LOAD DATA task had already ended".into())),
+            None => Err(Error::Transfer(
+                "mysql LOAD DATA task had already ended".into(),
+            )),
         }
     }
 
@@ -1703,10 +1791,7 @@ impl Loader for MySqlLoader {
             .remove(&self.id);
         let joined = self.join.join().await;
         if std::env::var_os("APITAP_DEBUG").is_some() {
-            eprintln!(
-                "[mysql loader {}] {killed}; join: {joined:?}",
-                self.id
-            );
+            eprintln!("[mysql loader {}] {killed}; join: {joined:?}", self.id);
         }
         cause
     }
@@ -1718,10 +1803,24 @@ mod abort_tests {
     /// P2: TEXT/BLOB keys and wide VARCHARs are caught whatever their case.
     #[test]
     fn unindexable_key_types_are_caught_in_any_case() {
-        for t in ["varchar(1000)", "VARCHAR(769)", "longtext", "text", "TINYTEXT", "blob", "json"] {
+        for t in [
+            "varchar(1000)",
+            "VARCHAR(769)",
+            "longtext",
+            "text",
+            "TINYTEXT",
+            "blob",
+            "json",
+        ] {
             assert!(super::pk_unindexable(t), "{t}");
         }
-        for t in ["varchar(255)", "VARCHAR(768)", "int", "bigint unsigned", "char(36)"] {
+        for t in [
+            "varchar(255)",
+            "VARCHAR(768)",
+            "int",
+            "bigint unsigned",
+            "char(36)",
+        ] {
             assert!(!super::pk_unindexable(t), "{t}");
         }
     }
@@ -1736,7 +1835,9 @@ mod abort_tests {
 
     /// The body of `fn <header>`, brace matched with strings stepped over.
     fn fn_body<'a>(src: &'a str, header: &str) -> &'a str {
-        let i = src.find(header).unwrap_or_else(|| panic!("not found: {header}"));
+        let i = src
+            .find(header)
+            .unwrap_or_else(|| panic!("not found: {header}"));
         let start = i + header.len();
         let b = src.as_bytes();
         let (mut j, mut depth) = (start, 1i32);
@@ -1773,30 +1874,59 @@ mod abort_tests {
     fn the_kill_goes_out_before_the_stream_closes() {
         let src = include_str!("mysql.rs");
         let abort = fn_body(src, "async fn abort(mut self, cause: Error) -> Error {");
-        let kill = abort.find("self.kill_statement().await")
+        let kill = abort
+            .find("self.kill_statement().await")
             .expect("abort must stop the statement server-side");
-        let close = abort.find("self.tx.close_channel()")
+        let close = abort
+            .find("self.tx.close_channel()")
             .expect("abort must still close the stream");
-        assert!(kill < close, "the KILL must leave while the load is in flight: {abort}");
+        assert!(
+            kill < close,
+            "the KILL must leave while the load is in flight: {abort}"
+        );
         assert!(
             abort.find("self.join.join().await").is_some(),
             "and the loader is still awaited: {abort}"
         );
 
-        let killer = fn_body(src, "async fn kill_statement(&self) -> std::result::Result<(), String> {");
-        assert!(killer.contains("KILL QUERY"), "statement-level, so the pool keeps a live conn: {killer}");
-        assert!(killer.contains("self.conn_id"), "the load's own CONNECTION_ID(): {killer}");
-        assert!(killer.contains("self.pool.get_conn()"), "issued from another connection: {killer}");
+        let killer = fn_body(
+            src,
+            "async fn kill_statement(&self) -> std::result::Result<(), String> {",
+        );
+        assert!(
+            killer.contains("KILL QUERY"),
+            "statement-level, so the pool keeps a live conn: {killer}"
+        );
+        assert!(
+            killer.contains("self.conn_id"),
+            "the load's own CONNECTION_ID(): {killer}"
+        );
+        assert!(
+            killer.contains("self.pool.get_conn()"),
+            "issued from another connection: {killer}"
+        );
         assert!(killer.contains("timeout("), "bounded: {killer}");
 
         let open = fn_body(src, "async fn loader(&self) -> Result<MySqlLoader> {");
-        assert!(open.contains("SELECT CONNECTION_ID()"), "the id is taken at open: {open}");
+        assert!(
+            open.contains("SELECT CONNECTION_ID()"),
+            "the id is taken at open: {open}"
+        );
         // P2: the id stays ours until the loader says so — the task holds its
         // connection until released, and an abort closes it instead of pooling it.
-        assert!(open.contains("released.await"), "the task waits to be released: {open}");
-        assert!(open.contains("conn.disconnect()"), "an unpooled close after an abort: {open}");
+        assert!(
+            open.contains("released.await"),
+            "the task waits to be released: {open}"
+        );
+        assert!(
+            open.contains("conn.disconnect()"),
+            "an unpooled close after an abort: {open}"
+        );
         let fin = fn_body(src, "async fn finish(mut self) -> Result<u64> {");
-        assert!(fin.contains("send(true)"), "finish pools the connection: {fin}");
+        assert!(
+            fin.contains("send(true)"),
+            "finish pools the connection: {fin}"
+        );
         assert!(abort.contains("send(false)"), "abort closes it: {abort}");
     }
 }
@@ -1827,7 +1957,10 @@ mod ssl_default_tests {
         // remote, nothing said: TLS — this is the behaviour change. Until
         // 0.55.1 this returned None and sent the password in clear.
         assert!(ssl_of("mysql://u:p@prod-host/db"));
-        assert!(defaulted("mysql://u:p@prod-host/db"), "the hint must be attached");
+        assert!(
+            defaulted("mysql://u:p@prod-host/db"),
+            "the hint must be attached"
+        );
         assert!(ssl_of("mysql://u:p@10.0.0.9/db"), "private is not loopback");
 
         // remote, explicitly disabled: the operator's choice stands, and
@@ -1840,4 +1973,3 @@ mod ssl_default_tests {
         assert!(!defaulted("mysql://u:p@prod-host/db?ssl-mode=required"));
     }
 }
-

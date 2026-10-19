@@ -280,7 +280,10 @@ pub(crate) mod tests {
     fn disposition() -> usize {
         unsafe {
             let mut cur: libc::sigaction = std::mem::zeroed();
-            assert_eq!(libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut cur), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut cur),
+                0
+            );
             cur.sa_sigaction
         }
     }
@@ -401,7 +404,11 @@ pub(crate) mod tests {
                 "the child survived its second SIGTERM and exited {} instead",
                 libc::WEXITSTATUS(status)
             );
-            assert_eq!(libc::WTERMSIG(status), libc::SIGTERM, "died of the right signal");
+            assert_eq!(
+                libc::WTERMSIG(status),
+                libc::SIGTERM,
+                "died of the right signal"
+            );
         }
         // The parent took no signal of its own.
         assert_eq!(SIGNALS.load(Ordering::Relaxed), 0);
@@ -445,7 +452,10 @@ pub(crate) mod tests {
             act.sa_sigaction = theirs_ptr;
             libc::sigemptyset(&mut act.sa_mask);
             act.sa_flags = libc::SA_RESTART;
-            assert_eq!(libc::sigaction(libc::SIGTERM, &act, std::ptr::null_mut()), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, &act, std::ptr::null_mut()),
+                0
+            );
         }
         {
             let _g = Guard::install();
@@ -469,7 +479,10 @@ pub(crate) mod tests {
             act.sa_sigaction = on_sigterm as *const () as usize;
             libc::sigemptyset(&mut act.sa_mask);
             act.sa_flags = libc::SA_RESTART;
-            assert_eq!(libc::sigaction(libc::SIGTERM, &act, std::ptr::null_mut()), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, &act, std::ptr::null_mut()),
+                0
+            );
         }
         {
             let _g = Guard::install();
@@ -513,7 +526,10 @@ pub(crate) mod tests {
             act.sa_sigaction = theirs_ptr;
             libc::sigemptyset(&mut act.sa_mask);
             act.sa_flags = libc::SA_SIGINFO;
-            assert_eq!(libc::sigaction(libc::SIGTERM, &act, std::ptr::null_mut()), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, &act, std::ptr::null_mut()),
+                0
+            );
         }
         {
             let _g = Guard::install();
@@ -550,7 +566,10 @@ pub(crate) mod tests {
         let outer = Guard::install();
         request();
         let inner = Guard::install();
-        assert!(requested(), "the second run must not clear the first's stop");
+        assert!(
+            requested(),
+            "the second run must not clear the first's stop"
+        );
         drop(inner);
         drop(outer);
         std::env::remove_var("APITAP_GRACEFUL_STOP");

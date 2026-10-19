@@ -166,7 +166,10 @@ impl DrainSession {
                     )
                 })?;
                 self.slot_by_name.insert(Arc::from(table), s);
-                self.slots.push(RelState { table: Arc::from(table), tracked });
+                self.slots.push(RelState {
+                    table: Arc::from(table),
+                    tracked,
+                });
                 s
             }
         };
@@ -190,9 +193,7 @@ fn cells_bytes(row: &Tuple) -> usize {
 fn op_bytes(op: &StreamOp) -> usize {
     match op {
         StreamOp::Insert(t) | StreamOp::Delete(t) => cells_bytes(t),
-        StreamOp::Update(old, new, _) => {
-            cells_bytes(new) + old.as_ref().map_or(0, cells_bytes)
-        }
+        StreamOp::Update(old, new, _) => cells_bytes(new) + old.as_ref().map_or(0, cells_bytes),
         StreamOp::Truncate => 0,
     }
 }
@@ -333,7 +334,10 @@ pub(crate) async fn drain(
         t_recv += t_ph.elapsed();
         match ev {
             None => break,
-            Some(WalEvent::Keepalive { wal_end, reply_requested }) => {
+            Some(WalEvent::Keepalive {
+                wal_end,
+                reply_requested,
+            }) => {
                 if reply_requested {
                     // Never confirm progress mid-drain: report the last lsn
                     // the APPLY side committed (under overlap the previous
@@ -359,8 +363,7 @@ pub(crate) async fn drain(
                             if now > stop_line {
                                 stop_line = now;
                             } else {
-                                tokio::time::sleep(std::time::Duration::from_millis(200))
-                                    .await;
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             }
                             continue;
                         }
@@ -407,215 +410,244 @@ pub(crate) async fn drain(
                 // (sub)transaction; outside one there is nothing to name.
                 let sub = change_xid.or(in_stream);
                 match msg {
-                PgoMessage::Begin { .. } => {
-                    tx_buf.clear();
-                    tx_bytes = 0;
-                }
-                PgoMessage::Commit { end_lsn: e, .. } => {
-                    if relayout {
-                        // The window ends at the previous commit; this one
-                        // opens the next, whose bodies take the new layout.
-                        sess.carry = Some((std::mem::take(&mut tx_buf), e));
-                        hit_budget = true;
-                        break;
+                    PgoMessage::Begin { .. } => {
+                        tx_buf.clear();
+                        tx_bytes = 0;
                     }
-                    let t_ph = std::time::Instant::now();
-                    flush_ops(tx_buf.drain(..), sess, &mut collapsers, &mut changelogs, changelog)?;
-                    t_flush += t_ph.elapsed();
-                    tx_bytes = 0;
-                    end_lsn = e;
-                    if e >= stop_line {
-                        break;
-                    }
-                    if buf_bytes + sess.stream_bytes >= max_buf_bytes {
-                        hit_budget = true;
-                        break;
-                    }
-                }
-                PgoMessage::StreamStart { xid } => {
-                    in_stream = Some(xid);
-                    sess.streams.entry(xid).or_default();
-                }
-                PgoMessage::StreamStop => in_stream = None,
-                PgoMessage::StreamCommit { xid, end_lsn: e } => {
-                    let ops = sess.streams.remove(&xid).unwrap_or_default();
-                    // The ops leave the session's buffer and land in this
-                    // window's collapsers, so the charge moves with them.
-                    let n: usize = ops.iter().map(|(_, o, _)| op_bytes(o)).sum();
-                    sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
-                    let ops = ops.into_iter().map(|(t, o, _)| (t, o));
-                    if relayout {
-                        sess.carry = Some((ops.collect(), e));
-                        hit_budget = true;
-                        break;
-                    }
-                    buf_bytes += n;
-                    let t_ph = std::time::Instant::now();
-                    flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog)?;
-                    t_flush += t_ph.elapsed();
-                    end_lsn = e;
-                    if e >= stop_line {
-                        break;
-                    }
-                    if buf_bytes + sess.stream_bytes >= max_buf_bytes {
-                        hit_budget = true;
-                        break;
-                    }
-                }
-                PgoMessage::StreamAbort { xid, sub_xid } => {
-                    // Stream Abort names the top-level transaction and the
-                    // (sub)transaction that aborted. Both cases are now
-                    // handled by removing exactly what that xid produced:
-                    // when they are equal the whole transaction goes, and
-                    // when they differ only the rolled-back subtransaction's
-                    // rows do.
-                    //
-                    // This is possible because every streamed change carries
-                    // the xid that produced it and the buffer keeps it. The
-                    // first version of this code read only the first xid and
-                    // discarded the WHOLE transaction on any savepoint
-                    // rollback — silently, watermark and all; the second
-                    // refused the window, which was safe but stopped runs for
-                    // rollbacks in traffic apitap does not even replicate.
-                    if let Some(ops) = sess.streams.get_mut(&xid) {
-                        let before = ops.len();
-                        let freed: usize = ops
-                            .iter()
-                            .filter(|(_, _, sx)| *sx == sub_xid || sub_xid == xid)
-                            .map(|(_, o, _)| op_bytes(o))
-                            .sum();
-                        if sub_xid == xid {
-                            ops.clear();
-                        } else {
-                            ops.retain(|(_, _, sx)| *sx != sub_xid);
+                    PgoMessage::Commit { end_lsn: e, .. } => {
+                        if relayout {
+                            // The window ends at the previous commit; this one
+                            // opens the next, whose bodies take the new layout.
+                            sess.carry = Some((std::mem::take(&mut tx_buf), e));
+                            hit_budget = true;
+                            break;
                         }
-                        sess.stream_bytes = sess.stream_bytes.saturating_sub(freed);
-                        if dbg_stream && before != ops.len() {
-                            eprintln!(
-                                "[log_based] stream {xid}: subtransaction {sub_xid} \
+                        let t_ph = std::time::Instant::now();
+                        flush_ops(
+                            tx_buf.drain(..),
+                            sess,
+                            &mut collapsers,
+                            &mut changelogs,
+                            changelog,
+                        )?;
+                        t_flush += t_ph.elapsed();
+                        tx_bytes = 0;
+                        end_lsn = e;
+                        if e >= stop_line {
+                            break;
+                        }
+                        if buf_bytes + sess.stream_bytes >= max_buf_bytes {
+                            hit_budget = true;
+                            break;
+                        }
+                    }
+                    PgoMessage::StreamStart { xid } => {
+                        in_stream = Some(xid);
+                        sess.streams.entry(xid).or_default();
+                    }
+                    PgoMessage::StreamStop => in_stream = None,
+                    PgoMessage::StreamCommit { xid, end_lsn: e } => {
+                        let ops = sess.streams.remove(&xid).unwrap_or_default();
+                        // The ops leave the session's buffer and land in this
+                        // window's collapsers, so the charge moves with them.
+                        let n: usize = ops.iter().map(|(_, o, _)| op_bytes(o)).sum();
+                        sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                        let ops = ops.into_iter().map(|(t, o, _)| (t, o));
+                        if relayout {
+                            sess.carry = Some((ops.collect(), e));
+                            hit_budget = true;
+                            break;
+                        }
+                        buf_bytes += n;
+                        let t_ph = std::time::Instant::now();
+                        flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog)?;
+                        t_flush += t_ph.elapsed();
+                        end_lsn = e;
+                        if e >= stop_line {
+                            break;
+                        }
+                        if buf_bytes + sess.stream_bytes >= max_buf_bytes {
+                            hit_budget = true;
+                            break;
+                        }
+                    }
+                    PgoMessage::StreamAbort { xid, sub_xid } => {
+                        // Stream Abort names the top-level transaction and the
+                        // (sub)transaction that aborted. Both cases are now
+                        // handled by removing exactly what that xid produced:
+                        // when they are equal the whole transaction goes, and
+                        // when they differ only the rolled-back subtransaction's
+                        // rows do.
+                        //
+                        // This is possible because every streamed change carries
+                        // the xid that produced it and the buffer keeps it. The
+                        // first version of this code read only the first xid and
+                        // discarded the WHOLE transaction on any savepoint
+                        // rollback — silently, watermark and all; the second
+                        // refused the window, which was safe but stopped runs for
+                        // rollbacks in traffic apitap does not even replicate.
+                        if let Some(ops) = sess.streams.get_mut(&xid) {
+                            let before = ops.len();
+                            let freed: usize = ops
+                                .iter()
+                                .filter(|(_, _, sx)| *sx == sub_xid || sub_xid == xid)
+                                .map(|(_, o, _)| op_bytes(o))
+                                .sum();
+                            if sub_xid == xid {
+                                ops.clear();
+                            } else {
+                                ops.retain(|(_, _, sx)| *sx != sub_xid);
+                            }
+                            sess.stream_bytes = sess.stream_bytes.saturating_sub(freed);
+                            if dbg_stream && before != ops.len() {
+                                eprintln!(
+                                    "[log_based] stream {xid}: subtransaction {sub_xid} \
                                  rolled back, dropped {} of {before} buffered rows",
-                                before - ops.len()
-                            );
-                        }
-                        if sub_xid == xid {
-                            sess.streams.remove(&xid);
-                        }
-                    }
-                }
-                PgoMessage::Relation(r) => {
-                    sess.rel_oids.insert(
-                        r.rel_id,
-                        Arc::new(r.cols.iter().map(|c| c.type_oid).collect()),
-                    );
-                    let table = format!("{}.{}", r.namespace, r.name);
-                    let layout = Layout::from_relation(&r, key_cols)?;
-                    let tracked = layout.is_some();
-                    let slot = sess.rel_slot(&table, tracked)?;
-                    if let Some(new) = layout {
-                        // pgoutput re-sends a Relation on every relcache
-                        // invalidation, and most change nothing (an ANALYZE,
-                        // a GRANT): only a different layout replaces the one
-                        // the window's bodies were built with, and only then
-                        // does a window holding a body of the table end.
-                        if sess.layouts.get(&table).map_or(true, |old| **old != new) {
-                            let i = usize::from(slot);
-                            relayout |= collapsers.get(i).is_some_and(|c| c.is_some())
-                                || changelogs.get(i).is_some_and(|c| c.is_some());
-                            sess.layouts.insert(table.clone(), Arc::new(new));
-                        }
-                    }
-                    sess.register_rel(r.rel_id, slot);
-                    sess.last_rel = Some((r.rel_id, slot));
-                }
-                PgoMessage::Insert { rel_id, new } => {
-                    if let Some(t) = tracked(sess, rel_id)? {
-                        decoded += 1;
-                        let n = cells_bytes(&new);
-                        let op = StreamOp::Insert(new);
-                        match in_stream {
-                            Some(x) => {
-                                sess.stream_bytes += n;
-                                if sess.stream_bytes > tx_limit {
-                                    return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, tx_limit));
-                                }
-                                open_stream(sess, x)?
-                                    .push((t, op, sub.unwrap_or(x)));
+                                    before - ops.len()
+                                );
                             }
-                            None => {
-                                buf_bytes += n;
-                                tx_bytes += n;
-                                if tx_bytes > tx_limit {
-                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, tx_bytes, tx_limit));
-                                }
-                                tx_buf.push((t, op));
+                            if sub_xid == xid {
+                                sess.streams.remove(&xid);
                             }
                         }
                     }
-                }
-                PgoMessage::Update { rel_id, old, new } => {
-                    if let Some(t) = tracked(sess, rel_id)? {
-                        decoded += 1;
-                        let old_full = old.as_ref().is_some_and(|o| o.full);
-                        let old = old.map(|o| o.tuple);
-                        let n = cells_bytes(&new) + old.as_ref().map_or(0, cells_bytes);
-                        let op = StreamOp::Update(old, new, old_full);
-                        match in_stream {
-                            Some(x) => {
-                                sess.stream_bytes += n;
-                                if sess.stream_bytes > tx_limit {
-                                    return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, tx_limit));
-                                }
-                                open_stream(sess, x)?
-                                    .push((t, op, sub.unwrap_or(x)));
-                            }
-                            None => {
-                                buf_bytes += n;
-                                tx_bytes += n;
-                                if tx_bytes > tx_limit {
-                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, tx_bytes, tx_limit));
-                                }
-                                tx_buf.push((t, op));
+                    PgoMessage::Relation(r) => {
+                        sess.rel_oids.insert(
+                            r.rel_id,
+                            Arc::new(r.cols.iter().map(|c| c.type_oid).collect()),
+                        );
+                        let table = format!("{}.{}", r.namespace, r.name);
+                        let layout = Layout::from_relation(&r, key_cols)?;
+                        let tracked = layout.is_some();
+                        let slot = sess.rel_slot(&table, tracked)?;
+                        if let Some(new) = layout {
+                            // pgoutput re-sends a Relation on every relcache
+                            // invalidation, and most change nothing (an ANALYZE,
+                            // a GRANT): only a different layout replaces the one
+                            // the window's bodies were built with, and only then
+                            // does a window holding a body of the table end.
+                            if sess.layouts.get(&table).map_or(true, |old| **old != new) {
+                                let i = usize::from(slot);
+                                relayout |= collapsers.get(i).is_some_and(|c| c.is_some())
+                                    || changelogs.get(i).is_some_and(|c| c.is_some());
+                                sess.layouts.insert(table.clone(), Arc::new(new));
                             }
                         }
+                        sess.register_rel(r.rel_id, slot);
+                        sess.last_rel = Some((r.rel_id, slot));
                     }
-                }
-                PgoMessage::Delete { rel_id, old } => {
-                    if let Some(t) = tracked(sess, rel_id)? {
-                        decoded += 1;
-                        let n = cells_bytes(&old.tuple);
-                        let op = StreamOp::Delete(old.tuple);
-                        match in_stream {
-                            Some(x) => {
-                                sess.stream_bytes += n;
-                                if sess.stream_bytes > tx_limit {
-                                    return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, tx_limit));
-                                }
-                                open_stream(sess, x)?
-                                    .push((t, op, sub.unwrap_or(x)));
-                            }
-                            None => {
-                                buf_bytes += n;
-                                tx_bytes += n;
-                                if tx_bytes > tx_limit {
-                                    return Err(tx_too_big(&sess.slots[usize::from(t)].table, tx_bytes, tx_limit));
-                                }
-                                tx_buf.push((t, op));
-                            }
-                        }
-                    }
-                }
-                PgoMessage::Truncate { rel_ids, .. } => {
-                    for rid in rel_ids {
-                        if let Some(t) = tracked(sess, rid)? {
-                            let op = StreamOp::Truncate;
+                    PgoMessage::Insert { rel_id, new } => {
+                        if let Some(t) = tracked(sess, rel_id)? {
+                            decoded += 1;
+                            let n = cells_bytes(&new);
+                            let op = StreamOp::Insert(new);
                             match in_stream {
-                                Some(x) => open_stream(sess, x)?.push((t, op, sub.unwrap_or(x))),
-                                None => tx_buf.push((t, op)),
+                                Some(x) => {
+                                    sess.stream_bytes += n;
+                                    if sess.stream_bytes > tx_limit {
+                                        return Err(streams_too_big(
+                                            sess.streams.len(),
+                                            sess.stream_bytes,
+                                            tx_limit,
+                                        ));
+                                    }
+                                    open_stream(sess, x)?.push((t, op, sub.unwrap_or(x)));
+                                }
+                                None => {
+                                    buf_bytes += n;
+                                    tx_bytes += n;
+                                    if tx_bytes > tx_limit {
+                                        return Err(tx_too_big(
+                                            &sess.slots[usize::from(t)].table,
+                                            tx_bytes,
+                                            tx_limit,
+                                        ));
+                                    }
+                                    tx_buf.push((t, op));
+                                }
                             }
                         }
                     }
-                }
-                PgoMessage::Origin | PgoMessage::Type => {}
+                    PgoMessage::Update { rel_id, old, new } => {
+                        if let Some(t) = tracked(sess, rel_id)? {
+                            decoded += 1;
+                            let old_full = old.as_ref().is_some_and(|o| o.full);
+                            let old = old.map(|o| o.tuple);
+                            let n = cells_bytes(&new) + old.as_ref().map_or(0, cells_bytes);
+                            let op = StreamOp::Update(old, new, old_full);
+                            match in_stream {
+                                Some(x) => {
+                                    sess.stream_bytes += n;
+                                    if sess.stream_bytes > tx_limit {
+                                        return Err(streams_too_big(
+                                            sess.streams.len(),
+                                            sess.stream_bytes,
+                                            tx_limit,
+                                        ));
+                                    }
+                                    open_stream(sess, x)?.push((t, op, sub.unwrap_or(x)));
+                                }
+                                None => {
+                                    buf_bytes += n;
+                                    tx_bytes += n;
+                                    if tx_bytes > tx_limit {
+                                        return Err(tx_too_big(
+                                            &sess.slots[usize::from(t)].table,
+                                            tx_bytes,
+                                            tx_limit,
+                                        ));
+                                    }
+                                    tx_buf.push((t, op));
+                                }
+                            }
+                        }
+                    }
+                    PgoMessage::Delete { rel_id, old } => {
+                        if let Some(t) = tracked(sess, rel_id)? {
+                            decoded += 1;
+                            let n = cells_bytes(&old.tuple);
+                            let op = StreamOp::Delete(old.tuple);
+                            match in_stream {
+                                Some(x) => {
+                                    sess.stream_bytes += n;
+                                    if sess.stream_bytes > tx_limit {
+                                        return Err(streams_too_big(
+                                            sess.streams.len(),
+                                            sess.stream_bytes,
+                                            tx_limit,
+                                        ));
+                                    }
+                                    open_stream(sess, x)?.push((t, op, sub.unwrap_or(x)));
+                                }
+                                None => {
+                                    buf_bytes += n;
+                                    tx_bytes += n;
+                                    if tx_bytes > tx_limit {
+                                        return Err(tx_too_big(
+                                            &sess.slots[usize::from(t)].table,
+                                            tx_bytes,
+                                            tx_limit,
+                                        ));
+                                    }
+                                    tx_buf.push((t, op));
+                                }
+                            }
+                        }
+                    }
+                    PgoMessage::Truncate { rel_ids, .. } => {
+                        for rid in rel_ids {
+                            if let Some(t) = tracked(sess, rid)? {
+                                let op = StreamOp::Truncate;
+                                match in_stream {
+                                    Some(x) => {
+                                        open_stream(sess, x)?.push((t, op, sub.unwrap_or(x)))
+                                    }
+                                    None => tx_buf.push((t, op)),
+                                }
+                            }
+                        }
+                    }
+                    PgoMessage::Origin | PgoMessage::Type => {}
                 }
             }
         }
@@ -655,10 +687,7 @@ pub(crate) async fn drain(
         binary: keep_binary,
     };
     if dbg_stream {
-        eprintln!(
-            "[events] decoded={decoded} collapsed={}",
-            outcome.events()
-        );
+        eprintln!("[events] decoded={decoded} collapsed={}", outcome.events());
         let t_seal = t_seal.elapsed();
         eprintln!(
             "[drain] recv={:.2}s decode={:.2}s flush={:.2}s seal={:.3}s total={:.2}s",
@@ -675,7 +704,9 @@ pub(crate) async fn drain(
 /// The layout a table's first op of the window builds its body with.
 fn layout_of(layouts: &HashMap<String, Arc<Layout>>, table: &str) -> Result<Arc<Layout>> {
     layouts.get(table).cloned().ok_or_else(|| {
-        Error::Transfer(format!("log_based: no column layout for {table} — decoder invariant broken"))
+        Error::Transfer(format!(
+            "log_based: no column layout for {table} — decoder invariant broken"
+        ))
     })
 }
 
@@ -769,7 +800,10 @@ mod tests {
     #[test]
     fn a_change_for_a_closed_stream_is_an_error() {
         let mut s = DrainSession::default();
-        let e = open_stream(&mut s, 7).err().expect("no stream 7 is open").to_string();
+        let e = open_stream(&mut s, 7)
+            .err()
+            .expect("no stream 7 is open")
+            .to_string();
         assert!(e.contains("desync"), "{e}");
         s.streams.insert(7, Vec::new());
         assert!(open_stream(&mut s, 7).is_ok());
@@ -815,14 +849,21 @@ mod tests {
         sess.register_rel(101, slot);
         assert!(!sess.rels.contains_key(&100) && !sess.rel_oids.contains_key(&100));
         assert_eq!(sess.rels.get(&101), Some(&slot));
-        assert_eq!(sess.rels.get(&200), Some(&other), "another table's oid stays");
+        assert_eq!(
+            sess.rels.get(&200),
+            Some(&other),
+            "another table's oid stays"
+        );
     }
 
     /// P2: the streamed cap names how many transactions share it.
     #[test]
     fn the_stream_cap_names_every_open_stream() {
         let e = streams_too_big(2, 300 << 20, 256 << 20).to_string();
-        assert!(e.contains("2 streamed transaction(s)") && !e.contains("one transaction"), "{e}");
+        assert!(
+            e.contains("2 streamed transaction(s)") && !e.contains("one transaction"),
+            "{e}"
+        );
     }
 
     /// The knob may shorten the wait, but never removes it: zero and junk

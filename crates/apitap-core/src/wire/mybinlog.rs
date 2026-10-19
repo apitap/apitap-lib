@@ -16,7 +16,9 @@
 //! stripping 4 bytes uniformly when checksums are on is correct.
 
 use crate::error::{Error, Result};
-use crate::wire::pgoutput::{Cell, CellR, Cellv, OldImage, PgoMessage, Relation, RelationCol, Tuple};
+use crate::wire::pgoutput::{
+    Cell, CellR, Cellv, OldImage, PgoMessage, Relation, RelationCol, Tuple,
+};
 use std::collections::HashMap;
 
 /// The 19-byte common header every event after v4 carries.
@@ -116,7 +118,9 @@ pub(crate) fn split_event(ev: &[u8], checksummed: bool) -> Result<(EventHeader, 
         flags: u16::from_le_bytes(ev[17..19].try_into().unwrap()),
     };
     let end = if checksummed {
-        ev.len().checked_sub(4).ok_or_else(|| bad("no room for checksum"))?
+        ev.len()
+            .checked_sub(4)
+            .ok_or_else(|| bad("no room for checksum"))?
     } else {
         ev.len()
     };
@@ -223,8 +227,14 @@ impl<'a> R<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         // Checked: a lenenc length near u64::MAX overflowed `p + n` (a
         // panic under overflow checks) (P2, T17).
-        let end = self.p.checked_add(n).ok_or_else(|| bad("truncated slice"))?;
-        let s = self.b.get(self.p..end).ok_or_else(|| bad("truncated slice"))?;
+        let end = self
+            .p
+            .checked_add(n)
+            .ok_or_else(|| bad("truncated slice"))?;
+        let s = self
+            .b
+            .get(self.p..end)
+            .ok_or_else(|| bad("truncated slice"))?;
         self.p += n;
         Ok(s)
     }
@@ -236,7 +246,9 @@ impl<'a> R<'a> {
     }
     fn u48le(&mut self) -> Result<u64> {
         let s = self.take(6)?;
-        Ok(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], 0, 0]))
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], 0, 0,
+        ]))
     }
     fn u64le(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
@@ -314,7 +326,14 @@ pub(crate) fn parse_table_map(body: &[u8]) -> Result<TableMap> {
             }
             _ => 0,
         };
-        cols.push(ColDef { kind, meta, nullable: false, unsigned: false, binary: false, labels: None });
+        cols.push(ColDef {
+            kind,
+            meta,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        });
     }
     // Null bitmap (LSB-first, one bit per column).
     let bmlen = (ncols + 7) / 8;
@@ -322,7 +341,12 @@ pub(crate) fn parse_table_map(body: &[u8]) -> Result<TableMap> {
     for (i, c) in cols.iter_mut().enumerate() {
         c.nullable = bm[i / 8] & (1 << (i % 8)) != 0;
     }
-    Ok(TableMap { table_id, db, table, cols })
+    Ok(TableMap {
+        table_id,
+        db,
+        table,
+        cols,
+    })
 }
 
 /// Bits of a row-image bitmap (LSB-first within each byte).
@@ -344,7 +368,11 @@ fn bit(bm: &[u8], i: usize) -> bool {
 /// mysqlbinlog documentation instead of a server and refused every
 /// DATE/ENUM/SET/TEXT table on every drain (MASTER M-1, REPRO).
 pub(crate) fn catalog_kind(dt: &str) -> Option<(u8, Option<u8>)> {
-    let dt = dt.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let dt = dt
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     Some(match dt.as_str() {
         "tinyint" => (MT_TINY, None),
         "smallint" => (MT_SHORT, None),
@@ -368,8 +396,8 @@ pub(crate) fn catalog_kind(dt: &str) -> Option<(u8, Option<u8>)> {
         "json" => (MT_JSON, None),
         // ALL text/blob sizes arrive as MYSQL_TYPE_BLOB; the size is the
         // metadata byte (captured: length_size 1/2/3/4 per size).
-        "tinytext" | "text" | "mediumtext" | "longtext" | "tinyblob" | "blob"
-        | "mediumblob" | "longblob" => (MT_BLOB, None),
+        "tinytext" | "text" | "mediumtext" | "longtext" | "tinyblob" | "blob" | "mediumblob"
+        | "longblob" => (MT_BLOB, None),
         _ => return None,
     })
 }
@@ -426,11 +454,19 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
     match c.kind {
         MT_TINY => {
             let v = r.u8()?;
-            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i8)) }
+            if c.unsigned {
+                Ok(int_bytes(v))
+            } else {
+                Ok(int_bytes(v as i8))
+            }
         }
         MT_SHORT => {
             let v = r.u16le()?;
-            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i16)) }
+            if c.unsigned {
+                Ok(int_bytes(v))
+            } else {
+                Ok(int_bytes(v as i16))
+            }
         }
         MT_INT24 => {
             let b = r.take(3)?;
@@ -439,17 +475,29 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
                 Ok(int_bytes(raw))
             } else {
                 // Sign-extend 24 bits.
-                let v = if raw & 0x80_0000 != 0 { (raw | 0xFF00_0000) as i32 } else { raw as i32 };
+                let v = if raw & 0x80_0000 != 0 {
+                    (raw | 0xFF00_0000) as i32
+                } else {
+                    raw as i32
+                };
                 Ok(int_bytes(v))
             }
         }
         MT_LONG => {
             let v = r.u32le()?;
-            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i32)) }
+            if c.unsigned {
+                Ok(int_bytes(v))
+            } else {
+                Ok(int_bytes(v as i32))
+            }
         }
         MT_LONGLONG => {
             let v = r.u64le()?;
-            if c.unsigned { Ok(int_bytes(v)) } else { Ok(int_bytes(v as i64)) }
+            if c.unsigned {
+                Ok(int_bytes(v))
+            } else {
+                Ok(int_bytes(v as i64))
+            }
         }
         MT_FLOAT => {
             let v = f32::from_le_bytes(r.take(4)?.try_into().unwrap());
@@ -463,7 +511,11 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
         }
         MT_YEAR => {
             let v = r.u8()? as u32;
-            if v == 0 { Ok(b"0000".to_vec()) } else { Ok(int_bytes(1900 + v)) }
+            if v == 0 {
+                Ok(b"0000".to_vec())
+            } else {
+                Ok(int_bytes(1900 + v))
+            }
         }
         MT_DATE => {
             let b = r.take(3)?;
@@ -614,7 +666,11 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
         }
         MT_VARCHAR | MT_VAR_STRING => {
             // The prefix width follows the declared max length in BYTES.
-            let n = if c.meta < 256 { r.u8()? as usize } else { r.u16le()? as usize };
+            let n = if c.meta < 256 {
+                r.u8()? as usize
+            } else {
+                r.u16le()? as usize
+            };
             Ok(r.take(n)?.to_vec())
         }
         MT_BIT => {
@@ -664,7 +720,11 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
                     render_set(&c.labels, v)
                 }
                 _ => {
-                    let n = if len < 256 { r.u8()? as usize } else { r.u16le()? as usize };
+                    let n = if len < 256 {
+                        r.u8()? as usize
+                    } else {
+                        r.u16le()? as usize
+                    };
                     let mut v = r.take(n)?.to_vec();
                     // The server strips TRAILING 0x00 from BINARY(n) on the
                     // wire; re-pad to the declared byte length for binary
@@ -678,7 +738,11 @@ fn decode_cell(r: &mut R<'_>, c: &ColDef) -> Result<Vec<u8>> {
             }
         }
         MT_ENUM => {
-            let v = if c.meta & 0xFF == 1 { r.u8()? as u64 } else { r.u16le()? as u64 };
+            let v = if c.meta & 0xFF == 1 {
+                r.u8()? as u64
+            } else {
+                r.u16le()? as u64
+            };
             render_enum(&c.labels, v)
         }
         MT_SET => {
@@ -743,12 +807,18 @@ fn render_enum(labels: &Option<std::sync::Arc<Vec<String>>>, v: u64) -> Result<V
 /// of writing 'read,write'; it is a different value.
 fn render_set(labels: &Option<std::sync::Arc<Vec<String>>>, v: u64) -> Result<Vec<u8>> {
     let l = labels.as_ref().ok_or_else(|| {
-        bad("SET column has no members in the source catalog — refusing to write \
-             the raw bitmask, which is not what the bulk load writes")
+        bad(
+            "SET column has no members in the source catalog — refusing to write \
+             the raw bitmask, which is not what the bulk load writes",
+        )
     })?;
     // Bits outside the declared members mean the definition moved under us.
     // Dropping them quietly would lose data the source still has.
-    let declared = if l.len() >= 64 { u64::MAX } else { (1u64 << l.len()) - 1 };
+    let declared = if l.len() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << l.len()) - 1
+    };
     if v & !declared != 0 {
         return Err(bad(&format!(
             "SET bitmask {v} carries bits outside the {} declared members — the \
@@ -1152,11 +1222,17 @@ pub(crate) fn to_messages(
             }),
             RowOp::Delete => out.push(PgoMessage::Delete {
                 rel_id,
-                old: OldImage { full: true, tuple: before.ok_or_else(|| bad("delete without image"))? },
+                old: OldImage {
+                    full: true,
+                    tuple: before.ok_or_else(|| bad("delete without image"))?,
+                },
             }),
             RowOp::Update => out.push(PgoMessage::Update {
                 rel_id,
-                old: before.map(|t| OldImage { full: true, tuple: t }),
+                old: before.map(|t| OldImage {
+                    full: true,
+                    tuple: t,
+                }),
                 new: after.ok_or_else(|| bad("update without after-image"))?,
             }),
         }
@@ -1219,9 +1295,7 @@ pub(crate) fn unhandled(t: u8) -> Error {
     let hint = match t {
         39 => "partial JSON update rows (MySQL 8) — set binlog_row_value_options=''",
         26 => "INCIDENT: the master reports it LOST events — this stream has a hole",
-        165..=171 => {
-            "compressed query/rows events (MariaDB) — set log_bin_compress=OFF"
-        }
+        165..=171 => "compressed query/rows events (MariaDB) — set log_bin_compress=OFF",
         6 | 8 | 10 | 11 | 12 | 17 | 18 => {
             "LOAD DATA statement-based events — set binlog_format=ROW"
         }
@@ -1251,7 +1325,9 @@ mod tests {
     fn legacy_decimal_carries_no_metadata() {
         // table id 6B, flags 2B, db "d", table "t", ncols 2, kinds, meta 2B (VARCHAR's), null bitmap
         let mut body = vec![1, 0, 0, 0, 0, 0, 0, 0];
-        body.extend_from_slice(&[1, b'd', 0, 1, b't', 0, 2, MT_DECIMAL, MT_VARCHAR, 2, 0x10, 0x00, 0]);
+        body.extend_from_slice(&[
+            1, b'd', 0, 1, b't', 0, 2, MT_DECIMAL, MT_VARCHAR, 2, 0x10, 0x00, 0,
+        ]);
         let tm = parse_table_map(&body).unwrap();
         assert_eq!(tm.cols[1].meta, 16, "VARCHAR's metadata, not shifted");
     }
@@ -1271,7 +1347,10 @@ mod tests {
         assert!(super::decode_decimal(&mut super::R::new(&[0x80]), 2, 5).is_err());
         assert!(super::decode_decimal(&mut super::R::new(&[]), 0, 0).is_err());
         assert!(super::decode_decimal(&mut super::R::new(&[0x80; 40]), 66, 0).is_err());
-        assert_eq!(super::decode_decimal(&mut super::R::new(&[0x81]), 1, 0).unwrap(), b"1");
+        assert_eq!(
+            super::decode_decimal(&mut super::R::new(&[0x81]), 1, 0).unwrap(),
+            b"1"
+        );
     }
 
     /// MASTER M-3 + M-36: stripped BINARY values are re-padded to the
@@ -1294,7 +1373,10 @@ mod tests {
         let v = decode_cell(&mut r, &bin).unwrap();
         assert_eq!(v.len(), 16);
         assert_eq!(v[15], 0x00);
-        let ch = ColDef { binary: false, ..bin };
+        let ch = ColDef {
+            binary: false,
+            ..bin
+        };
         let mut r = R::new(&b);
         assert_eq!(decode_cell(&mut r, &ch).unwrap().len(), 15);
 
@@ -1386,18 +1468,39 @@ mod tests {
         // Metadata is (bits % 8) << 8 | whole bytes: BIT(8) = (0, 1). The
         // value is the BYTE, not a rendering of it — the bulk load writes
         // 0x05, so anything printable here would be a second spelling.
-        let bit = ColDef { kind: MT_BIT, meta: 0x0001, nullable: false, unsigned: false, binary: false, labels: None };
+        let bit = ColDef {
+            kind: MT_BIT,
+            meta: 0x0001,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let mut r = R::new(&[0x05]);
         assert_eq!(decode_cell(&mut r, &bit).unwrap(), vec![0x05]);
         // BIT(12) = (4, 1) — two bytes, not the five the swapped halves asked
         // for. The trailing byte proves the reader stopped where it should.
-        let wide = ColDef { kind: MT_BIT, meta: 0x0401, nullable: false, unsigned: false, binary: false, labels: None };
+        let wide = ColDef {
+            kind: MT_BIT,
+            meta: 0x0401,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let mut r = R::new(&[0x0A, 0xAA, 0x7F]);
         assert_eq!(decode_cell(&mut r, &wide).unwrap(), vec![0x0A, 0xAA]);
 
         // TIME2 is biased by 0x800000 with negatives stored as the complement;
         // masking the sign away turned -01:00:00 into 1023:00:00.
-        let t = ColDef { kind: MT_TIME2, meta: 0, nullable: false, unsigned: false, binary: false, labels: None };
+        let t = ColDef {
+            kind: MT_TIME2,
+            meta: 0,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let packed: u32 = 0x80_0000 - (1 << 12);
         let b = [(packed >> 16) as u8, (packed >> 8) as u8, packed as u8];
         let mut r = R::new(&b);
@@ -1467,7 +1570,11 @@ mod tests {
         let (h, body) = split_event(&e, true).unwrap();
         assert_eq!(h.event_type, EV_XID);
         assert_eq!(h.log_pos, 2864);
-        assert_eq!(h.event_size as usize, e.len(), "size counts the trailer (live-verified)");
+        assert_eq!(
+            h.event_size as usize,
+            e.len(),
+            "size counts the trailer (live-verified)"
+        );
         assert_eq!(body, &[7u8; 8]);
         // Without checksums the trailer belongs to the body.
         let (_, body) = split_event(&e, false).unwrap();
@@ -1495,7 +1602,10 @@ mod tests {
         b.extend_from_slice(&[12, 4]); // NEWDECIMAL precision/scale
         b.push(0b0000_0110); // nullable: col1, col2
         let m = parse_table_map(&b).unwrap();
-        assert_eq!((m.table_id, m.db.as_str(), m.table.as_str()), (42, "bench", "t"));
+        assert_eq!(
+            (m.table_id, m.db.as_str(), m.table.as_str()),
+            (42, "bench", "t")
+        );
         assert_eq!(m.cols.len(), 3);
         assert_eq!(m.cols[1].kind, MT_VARCHAR);
         assert_eq!(m.cols[1].meta, 300);
@@ -1513,7 +1623,14 @@ mod tests {
         enc.extend_from_slice(&1234u32.to_be_bytes());
         enc.extend_from_slice(&(5678u16).to_be_bytes());
         enc[0] |= 0x80; // positive
-        let c = ColDef { kind: MT_NEWDECIMAL, meta: (12 << 8) | 4, nullable: false, unsigned: false, binary: false, labels: None };
+        let c = ColDef {
+            kind: MT_NEWDECIMAL,
+            meta: (12 << 8) | 4,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let mut r = R::new(&enc);
         assert_eq!(decode_cell(&mut r, &c).unwrap(), b"1234.5678");
 
@@ -1539,7 +1656,14 @@ mod tests {
             packed as u8,
         ];
         enc.extend_from_slice(&[0, 0, 4]); // 4 micros, 3-byte tail
-        let c = ColDef { kind: MT_DATETIME2, meta: 6, nullable: false, unsigned: false, binary: false, labels: None };
+        let c = ColDef {
+            kind: MT_DATETIME2,
+            meta: 6,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let mut r = R::new(&enc);
         assert_eq!(
             String::from_utf8(decode_cell(&mut r, &c).unwrap()).unwrap(),
@@ -1550,14 +1674,28 @@ mod tests {
         let secs: i32 = 1_785_882_723;
         let mut enc = secs.to_be_bytes().to_vec();
         enc.push(0); // fsp=1 tail
-        let c = ColDef { kind: MT_TIMESTAMP2, meta: 1, nullable: false, unsigned: false, binary: false, labels: None };
+        let c = ColDef {
+            kind: MT_TIMESTAMP2,
+            meta: 1,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let mut r = R::new(&enc);
         let got = String::from_utf8(decode_cell(&mut r, &c).unwrap()).unwrap();
         assert!(got.ends_with("+00"), "{got}");
         assert!(got.starts_with("2026-"), "{got}");
 
         // DATE
-        let c = ColDef { kind: MT_DATE, meta: 0, nullable: false, unsigned: false, binary: false, labels: None };
+        let c = ColDef {
+            kind: MT_DATE,
+            meta: 0,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let v: u32 = (2026 << 9) | (8 << 5) | 5;
         let enc = v.to_le_bytes();
         let mut r = R::new(&enc[..3]);
@@ -1567,12 +1705,78 @@ mod tests {
     #[test]
     fn ints_honour_signedness_and_widths() {
         let cases: Vec<(ColDef, Vec<u8>, &str)> = vec![
-            (ColDef { kind: MT_TINY, meta: 0, nullable: false, unsigned: false, binary: false, labels: None }, vec![0xFF], "-1"),
-            (ColDef { kind: MT_TINY, meta: 0, nullable: false, unsigned: true, binary: false, labels: None }, vec![0xFF], "255"),
-            (ColDef { kind: MT_INT24, meta: 0, nullable: false, unsigned: false, binary: false, labels: None }, vec![0xFF, 0xFF, 0xFF], "-1"),
-            (ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, binary: false, labels: None }, (-42i32).to_le_bytes().to_vec(), "-42"),
-            (ColDef { kind: MT_LONGLONG, meta: 0, nullable: false, unsigned: true, binary: false, labels: None }, u64::MAX.to_le_bytes().to_vec(), "18446744073709551615"),
-            (ColDef { kind: MT_YEAR, meta: 0, nullable: false, unsigned: false, binary: false, labels: None }, vec![126], "2026"),
+            (
+                ColDef {
+                    kind: MT_TINY,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
+                vec![0xFF],
+                "-1",
+            ),
+            (
+                ColDef {
+                    kind: MT_TINY,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: true,
+                    binary: false,
+                    labels: None,
+                },
+                vec![0xFF],
+                "255",
+            ),
+            (
+                ColDef {
+                    kind: MT_INT24,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
+                vec![0xFF, 0xFF, 0xFF],
+                "-1",
+            ),
+            (
+                ColDef {
+                    kind: MT_LONG,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
+                (-42i32).to_le_bytes().to_vec(),
+                "-42",
+            ),
+            (
+                ColDef {
+                    kind: MT_LONGLONG,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: true,
+                    binary: false,
+                    labels: None,
+                },
+                u64::MAX.to_le_bytes().to_vec(),
+                "18446744073709551615",
+            ),
+            (
+                ColDef {
+                    kind: MT_YEAR,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
+                vec![126],
+                "2026",
+            ),
         ];
         for (c, bytes, want) in cases {
             let mut r = R::new(&bytes);
@@ -1584,13 +1788,27 @@ mod tests {
     #[test]
     fn varchar_prefix_width_follows_the_declared_byte_length() {
         // meta < 256 -> 1-byte prefix
-        let c = ColDef { kind: MT_VARCHAR, meta: 100, nullable: false, unsigned: false, binary: false, labels: None };
+        let c = ColDef {
+            kind: MT_VARCHAR,
+            meta: 100,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let mut enc = vec![2u8];
         enc.extend_from_slice(b"hi");
         let mut r = R::new(&enc);
         assert_eq!(decode_cell(&mut r, &c).unwrap(), b"hi");
         // meta >= 256 (utf8mb4 VARCHAR(64) = 256 bytes) -> 2-byte prefix
-        let c = ColDef { kind: MT_VARCHAR, meta: 300, nullable: false, unsigned: false, binary: false, labels: None };
+        let c = ColDef {
+            kind: MT_VARCHAR,
+            meta: 300,
+            nullable: false,
+            unsigned: false,
+            binary: false,
+            labels: None,
+        };
         let mut enc = 260u16.to_le_bytes().to_vec();
         enc.extend_from_slice(&[b'x'; 260]);
         let mut r = R::new(&enc);
@@ -1607,8 +1825,22 @@ mod tests {
             db: "bench".into(),
             table: "t".into(),
             cols: vec![
-                ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, binary: false, labels: None },
-                ColDef { kind: MT_VARCHAR, meta: 100, nullable: true, unsigned: false, binary: false, labels: None },
+                ColDef {
+                    kind: MT_LONG,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
+                ColDef {
+                    kind: MT_VARCHAR,
+                    meta: 100,
+                    nullable: true,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
             ],
         };
         let head = |b: &mut Vec<u8>| {
@@ -1669,7 +1901,11 @@ mod tests {
             assert!(is_rows(t), "type {t} must be a rows event");
         }
         // MariaDB frame events are safe to skip; its GTID opens a transaction.
-        for t in [EV_MA_ANNOTATE_ROWS, EV_MA_BINLOG_CHECKPOINT, EV_MA_GTID_LIST] {
+        for t in [
+            EV_MA_ANNOTATE_ROWS,
+            EV_MA_BINLOG_CHECKPOINT,
+            EV_MA_GTID_LIST,
+        ] {
             assert!(skippable(t), "type {t} must be skippable");
         }
         assert!(is_tx_start(EV_MA_GTID));
@@ -1679,7 +1915,10 @@ mod tests {
         // Events that can carry data (or announce loss) are never skippable —
         // the reader refuses on them instead.
         for t in [39u8, 26, 166, 0, 200] {
-            assert!(!skippable(t) && !is_rows(t), "type {t} must reach the refusal");
+            assert!(
+                !skippable(t) && !is_rows(t),
+                "type {t} must reach the refusal"
+            );
             assert!(unhandled(t).to_string().contains(&t.to_string()));
         }
     }
@@ -1691,9 +1930,30 @@ mod tests {
             db: "bench".into(),
             table: "t".into(),
             cols: vec![
-                ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, binary: false, labels: None },
-                ColDef { kind: MT_VARCHAR, meta: 100, nullable: true, unsigned: false, binary: false, labels: None },
-                ColDef { kind: MT_LONG, meta: 0, nullable: true, unsigned: false, binary: false, labels: None },
+                ColDef {
+                    kind: MT_LONG,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
+                ColDef {
+                    kind: MT_VARCHAR,
+                    meta: 100,
+                    nullable: true,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
+                ColDef {
+                    kind: MT_LONG,
+                    meta: 0,
+                    nullable: true,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                },
             ],
         };
         // WRITE_ROWS: all three present, third NULL.
@@ -1726,7 +1986,11 @@ mod tests {
         b.extend_from_slice(&9i32.to_le_bytes());
         let ev = parse_rows(&b, EV_WRITE_ROWS, &map).unwrap();
         let after = ev.rows[0].1.clone().unwrap();
-        assert_eq!(after.view(1), Cellv::UnchangedToast, "absent column must not read as NULL");
+        assert_eq!(
+            after.view(1),
+            Cellv::UnchangedToast,
+            "absent column must not read as NULL"
+        );
         assert_eq!(after.view(2), Cellv::Text(b"9"));
     }
 
@@ -1739,14 +2003,36 @@ mod tests {
                 table_id: 42,
                 db: "bench".into(),
                 table: "t".into(),
-                cols: vec![ColDef { kind: MT_LONG, meta: 0, nullable: false, unsigned: false, binary: false, labels: None }],
+                cols: vec![ColDef {
+                    kind: MT_LONG,
+                    meta: 0,
+                    nullable: false,
+                    unsigned: false,
+                    binary: false,
+                    labels: None,
+                }],
             },
         );
         st.schemas.insert(
             "bench.t".into(),
-            TableSchema { names: vec!["id".into()], kinds: vec![None], binaries: vec![false], key: vec![true], unsigned: vec![false], labels: vec![None] },
+            TableSchema {
+                names: vec!["id".into()],
+                kinds: vec![None],
+                binaries: vec![false],
+                key: vec![true],
+                unsigned: vec![false],
+                labels: vec![None],
+            },
         );
-        let ev = RowsEvent { table_id: 42, rows: vec![(None, Some(Tuple::from_cells(&[Cell::Text(bytes::Bytes::from_static(b"1"))])))] };
+        let ev = RowsEvent {
+            table_id: 42,
+            rows: vec![(
+                None,
+                Some(Tuple::from_cells(&[Cell::Text(bytes::Bytes::from_static(
+                    b"1",
+                ))])),
+            )],
+        };
         let msgs = to_messages(&mut st, EV_WRITE_ROWS, ev).unwrap();
         match &msgs[0] {
             PgoMessage::Relation(r) => {

@@ -216,10 +216,7 @@ pub(crate) fn gauge(event: &str, fields: &[(&str, String)]) {
     let mut err = std::io::stderr().lock();
     let _ = match fmt {
         Format::Json => {
-            let body: Vec<String> = fields
-                .iter()
-                .map(|(k, v)| json_field(k, v))
-                .collect();
+            let body: Vec<String> = fields.iter().map(|(k, v)| json_field(k, v)).collect();
             writeln!(
                 err,
                 "{{\"ts\":\"{}\",\"event\":\"{event}\",{}}}",
@@ -228,13 +225,11 @@ pub(crate) fn gauge(event: &str, fields: &[(&str, String)]) {
             )
         }
         Format::Plain => {
-            let body: Vec<String> =
-                fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let body: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
             writeln!(err, "{} apitap {event} {}", stamp(), body.join(" "))
         }
         Format::Live => {
-            let body: Vec<String> =
-                fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let body: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
             writeln!(err, "\r\x1b[Kapitap ▸ {event} {}", body.join(" "))
         }
     };
@@ -459,7 +454,11 @@ fn render(
                  \"rows_exact\":{},\"bytes\":{},\"{}_per_s\":{},\"bytes_per_s\":{},\
                  \"elapsed_s\":{:.1}",
                 stamp(),
-                if done { "transfer.done" } else { "transfer.progress" },
+                if done {
+                    "transfer.done"
+                } else {
+                    "transfer.progress"
+                },
                 json_esc(&name),
                 unit.word(),
                 rows,
@@ -471,7 +470,9 @@ fn render(
                 elapsed.as_secs_f64(),
             );
             if ttotal > 0 {
-                s.push_str(&format!(",\"tables_done\":{tdone},\"tables_total\":{ttotal}"));
+                s.push_str(&format!(
+                    ",\"tables_done\":{tdone},\"tables_total\":{ttotal}"
+                ));
             }
             if window > 0 {
                 s.push_str(&format!(",\"window\":{window}"));
@@ -661,7 +662,8 @@ mod tests {
         let line = format!("{{{}}}", json_field("note", "a\\b\n\"c\"\u{1}"));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["note"], "a\\b\n\"c\"\u{1}");
-        let nan: serde_json::Value = serde_json::from_str(&format!("{{{}}}", json_field("r", "NaN"))).unwrap();
+        let nan: serde_json::Value =
+            serde_json::from_str(&format!("{{{}}}", json_field("r", "NaN"))).unwrap();
         assert_eq!(nan["r"], "NaN");
         assert_eq!(json_field("r", "12.5"), "\"r\":12.5");
     }
@@ -672,7 +674,10 @@ mod tests {
         let _g = exclusive();
         std::env::set_var("APITAP_PROGRESS", "json");
         let outer = Reporter::start("t", Unit::Rows, -1, 0).expect("outer");
-        assert!(Reporter::start("t", Unit::Rows, -1, 0).is_none(), "the inner does not start");
+        assert!(
+            Reporter::start("t", Unit::Rows, -1, 0).is_none(),
+            "the inner does not start"
+        );
         assert!(is_on());
         drop(outer);
         assert!(!is_on());

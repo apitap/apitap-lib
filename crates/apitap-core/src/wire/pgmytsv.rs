@@ -52,11 +52,7 @@ pub(crate) enum MyType {
 /// Which Postgres udt_names this lane covers. Anything else → no common wire
 /// format for postgres → mysql, and the negotiation error tells the user to
 /// cast the column in a source view.
-pub(crate) fn my_tsv_type(
-    udt: &str,
-    precision: Option<i32>,
-    scale: Option<i32>,
-) -> Option<MyType> {
+pub(crate) fn my_tsv_type(udt: &str, precision: Option<i32>, scale: Option<i32>) -> Option<MyType> {
     Some(match udt {
         "int2" | "int4" | "int8" => MyType::Int,
         "float4" => MyType::Float32,
@@ -574,14 +570,20 @@ mod tests {
         input.extend([0u8; 1024]);
         let mut out = Vec::new();
         let e = t.push(&input, &mut out).unwrap_err().to_string();
-        assert!(e.contains("field b") && e.contains("APITAP_MEM_BUDGET"), "{e}");
+        assert!(
+            e.contains("field b") && e.contains("APITAP_MEM_BUDGET"),
+            "{e}"
+        );
         assert!(t.buf.len() < 64 << 10);
 
         let mut t = PgToMyTsv::with_max_field(vec![(MyType::Bytea, "b".to_string())], 64 << 10);
         let mut input = b"PGCOPY\n\xff\r\n\0".to_vec();
         input.extend(0u32.to_be_bytes());
         input.extend((1u32 << 30).to_be_bytes());
-        assert!(t.push(&input, &mut Vec::new()).is_err(), "a 1 GiB header extension");
+        assert!(
+            t.push(&input, &mut Vec::new()).is_err(),
+            "a 1 GiB header extension"
+        );
     }
 
     fn render(ty: MyType, f: &[u8]) -> String {
@@ -618,7 +620,10 @@ mod tests {
         assert_eq!(s, format!("1{}", "0001".repeat(9)));
         assert_eq!(s.len(), 37);
         // integer with implied trailing zero groups: 12 × 10^4 (weight 1)
-        assert_eq!(render(MyType::Numeric, &pg_numeric(&[12], 1, 0, 0)), "120000");
+        assert_eq!(
+            render(MyType::Numeric, &pg_numeric(&[12], 1, 0, 0)),
+            "120000"
+        );
         // zero
         assert_eq!(render(MyType::Numeric, &pg_numeric(&[], 0, 0, 0)), "0");
         assert_eq!(render(MyType::Numeric, &pg_numeric(&[], 0, 0, 2)), "0.00");
@@ -717,7 +722,10 @@ mod tests {
             my_tsv_type("numeric", Some(65), Some(30)),
             Some(MyType::Numeric)
         );
-        assert_eq!(my_tsv_type("numeric", None, None), Some(MyType::NumericDouble));
+        assert_eq!(
+            my_tsv_type("numeric", None, None),
+            Some(MyType::NumericDouble)
+        );
         assert_eq!(my_tsv_type("numeric", Some(66), Some(0)), None); // p past 65
         assert_eq!(my_tsv_type("numeric", Some(50), Some(35)), None); // s past 30
         assert_eq!(my_tsv_type("numeric", Some(2), Some(5)), None); // s > p (PG 15)
@@ -731,23 +739,32 @@ mod tests {
     fn numeric_double_range_checks() {
         // 1e400: digits [1], weight 100 — exact render, but DOUBLE can't hold it
         let mut out = Vec::new();
-        assert!(
-            render_field(MyType::NumericDouble, "c", &pg_numeric(&[1], 100, 0, 0), &mut out)
-                .is_err()
-        );
+        assert!(render_field(
+            MyType::NumericDouble,
+            "c",
+            &pg_numeric(&[1], 100, 0, 0),
+            &mut out
+        )
+        .is_err());
         // 1e-400: dscale 400 → renders sub-denormal, parses to 0.0 while nonzero
         let mut out = Vec::new();
-        assert!(
-            render_field(MyType::NumericDouble, "c", &pg_numeric(&[1], -100, 0, 400), &mut out)
-                .is_err()
-        );
+        assert!(render_field(
+            MyType::NumericDouble,
+            "c",
+            &pg_numeric(&[1], -100, 0, 400),
+            &mut out
+        )
+        .is_err());
         // in-range value passes and stays exact text
         assert_eq!(
             render(MyType::NumericDouble, &pg_numeric(&[1234, 5678], 0, 0, 4)),
             "1234.5678"
         );
         // true zero still renders
-        assert_eq!(render(MyType::NumericDouble, &pg_numeric(&[], 0, 0, 0)), "0");
+        assert_eq!(
+            render(MyType::NumericDouble, &pg_numeric(&[], 0, 0, 0)),
+            "0"
+        );
     }
 
     #[test]

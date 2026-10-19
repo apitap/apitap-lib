@@ -46,10 +46,8 @@ pub struct ArrowArray {
 
 #[repr(C)]
 pub struct ArrowArrayStream {
-    pub get_schema:
-        Option<unsafe extern "C" fn(*mut ArrowArrayStream, *mut ArrowSchema) -> c_int>,
-    pub get_next:
-        Option<unsafe extern "C" fn(*mut ArrowArrayStream, *mut ArrowArray) -> c_int>,
+    pub get_schema: Option<unsafe extern "C" fn(*mut ArrowArrayStream, *mut ArrowSchema) -> c_int>,
+    pub get_next: Option<unsafe extern "C" fn(*mut ArrowArrayStream, *mut ArrowArray) -> c_int>,
     pub get_last_error: Option<unsafe extern "C" fn(*mut ArrowArrayStream) -> *const c_char>,
     pub release: Option<unsafe extern "C" fn(*mut ArrowArrayStream)>,
     pub private_data: *mut c_void,
@@ -133,7 +131,9 @@ pub unsafe fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
         let format_ptr: *const c_char = match static_format(f.kind) {
             Some(cs) => cs.as_ptr(),
             None => {
-                let ArrowKind::Decimal { p, s } = f.kind else { unreachable!() };
+                let ArrowKind::Decimal { p, s } = f.kind else {
+                    unreachable!()
+                };
                 let cs = CString::new(format!("d:{p},{s}")).expect("no NUL");
                 let p = cs.as_ptr();
                 own.push(cs);
@@ -159,7 +159,10 @@ pub unsafe fn export_schema(fields: &[ArrowField], out: *mut ArrowSchema) {
         });
         child_ptrs.push(Box::into_raw(child));
     }
-    let priv_ = Box::new(SchemaPrivate { _strings: strings, child_ptrs });
+    let priv_ = Box::new(SchemaPrivate {
+        _strings: strings,
+        child_ptrs,
+    });
     let priv_ptr = Box::into_raw(priv_);
     unsafe {
         (*out).format = c"+s".as_ptr();
@@ -293,12 +296,24 @@ fn export_col(col: FinishedCol, rows: usize) -> *mut ArrowArray {
         FinishedCol::F64 { validity, data } => fixed!(validity, data),
         FinishedCol::Bool { validity, data } => fixed!(validity, data),
         FinishedCol::Dec128 { validity, data } => fixed!(validity, data),
-        FinishedCol::Utf8 { validity, offsets, data } => varlen!(validity, offsets, data),
-        FinishedCol::Bin { validity, offsets, data } => varlen!(validity, offsets, data),
+        FinishedCol::Utf8 {
+            validity,
+            offsets,
+            data,
+        } => varlen!(validity, offsets, data),
+        FinishedCol::Bin {
+            validity,
+            offsets,
+            data,
+        } => varlen!(validity, offsets, data),
     }
 
     let n_buffers = bufs.len() as i64;
-    let priv_ = Box::new(ArrayPrivate { _buffers: bufs, child_ptrs: Vec::new(), _keep: keep });
+    let priv_ = Box::new(ArrayPrivate {
+        _buffers: bufs,
+        child_ptrs: Vec::new(),
+        _keep: keep,
+    });
     let priv_ptr = Box::into_raw(priv_);
     let arr = Box::new(ArrowArray {
         length: rows as i64,
@@ -329,11 +344,18 @@ fn export_col(col: FinishedCol, rows: usize) -> *mut ArrowArray {
 /// unsafe block, which is how the missing signature showed up).
 pub unsafe fn export_batch(batch: ArrowBatch, out: *mut ArrowArray) {
     let rows = batch.rows;
-    let child_ptrs: Vec<*mut ArrowArray> =
-        batch.cols.into_iter().map(|c| export_col(c, rows)).collect();
+    let child_ptrs: Vec<*mut ArrowArray> = batch
+        .cols
+        .into_iter()
+        .map(|c| export_col(c, rows))
+        .collect();
     // A struct array has ONE buffer slot (its own validity) — NULL here.
     let bufs: Vec<*const c_void> = vec![null()];
-    let priv_ = Box::new(ArrayPrivate { _buffers: bufs, child_ptrs, _keep: Vec::new() });
+    let priv_ = Box::new(ArrayPrivate {
+        _buffers: bufs,
+        child_ptrs,
+        _keep: Vec::new(),
+    });
     let priv_ptr = Box::into_raw(priv_);
     unsafe {
         (*out).length = rows as i64;
@@ -362,10 +384,7 @@ pub struct StreamState {
 /// exported (so `private_data` is its `StreamState`), `out` points at
 /// writable, uninitialised `ArrowSchema` storage, and the consumer does not
 /// call stream methods concurrently.
-unsafe extern "C" fn stream_get_schema(
-    s: *mut ArrowArrayStream,
-    out: *mut ArrowSchema,
-) -> c_int {
+unsafe extern "C" fn stream_get_schema(s: *mut ArrowArrayStream, out: *mut ArrowSchema) -> c_int {
     // SAFETY: per the contract above.
     unsafe {
         let st = &mut *((*s).private_data as *mut StreamState);
@@ -387,14 +406,16 @@ unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowAr
     // The export runs inside the catch too: it indexes validity bitmaps and
     // grows vectors, and a panic there unwound across the boundary and
     // aborted Python (P2). `out` is written only on success.
-    let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match st.handle.next_batch() {
-        Ok(Some(batch)) => {
-            // SAFETY: `out` is writable, uninitialised array storage.
-            unsafe { export_batch(batch, out) };
-            Ok(true)
+    let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match st.handle.next_batch() {
+            Ok(Some(batch)) => {
+                // SAFETY: `out` is writable, uninitialised array storage.
+                unsafe { export_batch(batch, out) };
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(e) => Err(e),
         }
-        Ok(None) => Ok(false),
-        Err(e) => Err(e),
     }));
     let next = match pulled {
         Ok(r) => r,
@@ -412,15 +433,15 @@ unsafe extern "C" fn stream_get_next(s: *mut ArrowArrayStream, out: *mut ArrowAr
             unsafe {
                 std::ptr::write(
                     out,
-                ArrowArray {
-                    length: 0,
-                    null_count: 0,
-                    offset: 0,
-                    n_buffers: 0,
-                    n_children: 0,
-                    buffers: null_mut(),
-                    children: null_mut(),
-                    dictionary: null_mut(),
+                    ArrowArray {
+                        length: 0,
+                        null_count: 0,
+                        offset: 0,
+                        n_buffers: 0,
+                        n_children: 0,
+                        buffers: null_mut(),
+                        children: null_mut(),
+                        dictionary: null_mut(),
                         release: None,
                         private_data: null_mut(),
                     },
@@ -469,7 +490,11 @@ unsafe extern "C" fn stream_release(s: *mut ArrowArrayStream) {
 /// Heap-allocate the C stream over a finished [`ReadHandle`].
 pub fn new_stream(handle: ReadHandle) -> *mut ArrowArrayStream {
     let schema = handle.schema.clone();
-    let state = Box::new(StreamState { handle, schema, last_error: None });
+    let state = Box::new(StreamState {
+        handle,
+        schema,
+        last_error: None,
+    });
     Box::into_raw(Box::new(ArrowArrayStream {
         get_schema: Some(stream_get_schema),
         get_next: Some(stream_get_next),

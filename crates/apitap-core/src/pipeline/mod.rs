@@ -20,7 +20,6 @@ use crate::wire::bqparquet::RowGroup;
 use crate::{Mode, TableResult, TransferOptions, TransferReport};
 use std::future::Future;
 
-
 /// Credential-free source identity for the destination's state table:
 /// `scheme://host:port/db::table`. NEVER includes userinfo.
 /// Collapse URL-scheme aliases to one canonical spelling per engine. THE single
@@ -63,13 +62,19 @@ pub(crate) fn source_origin(src_url: &str) -> String {
             // authority's own spelling is kept when it IS the effective host,
             // so existing state rows keep their identity.
             if scheme == "postgres" {
-                if let Ok(o) = <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(src_url) {
+                if let Ok(o) =
+                    <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(src_url)
+                {
                     let resolved = match o.get_socket() {
                         Some(p) => p.display().to_string(),
                         None => o.get_host().to_string(),
                     };
                     let decoded = crate::wire::walsender::percent_decode(host).unwrap_or_default();
-                    let host = if decoded == resolved { host.to_string() } else { resolved };
+                    let host = if decoded == resolved {
+                        host.to_string()
+                    } else {
+                        resolved
+                    };
                     let db = o.get_database().unwrap_or("");
                     return format!("{scheme}://{host}:{}/{db}", o.get_port());
                 }
@@ -100,7 +105,6 @@ pub(crate) fn source_identity(src_url: &str, table: &str) -> String {
     };
     format!("{origin}::{table}")
 }
-
 
 /// The container/cgroup memory limit, if one is set (v2 `memory.max`, v1 fallback).
 ///
@@ -173,7 +177,10 @@ pub(crate) fn cpu_limit_cores() -> Option<f64> {
     let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
     // v2 unified hierarchy: one "0::<path>" line, one cgroup2 mount.
-    if let Some(rel) = own.lines().find_map(|l| l.strip_prefix("0::").map(str::trim)) {
+    if let Some(rel) = own
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(str::trim))
+    {
         if let Some((point, root)) = cgroup_mount(&mounts, "cgroup2", None) {
             let rel = rel.strip_prefix(root.as_str()).unwrap_or(rel);
             if let Some(cores) = smallest_cpu_limit_up(&point, rel, true) {
@@ -228,7 +235,9 @@ fn smallest_cpu_limit_up(mount: &str, rel: &str, v2: bool) -> Option<f64> {
     let mut best: Option<f64> = None;
     loop {
         let cores = if v2 {
-            std::fs::read_to_string(dir.join("cpu.max")).ok().and_then(|s| cpu_max_cores(s.trim()))
+            std::fs::read_to_string(dir.join("cpu.max"))
+                .ok()
+                .and_then(|s| cpu_max_cores(s.trim()))
         } else {
             cfs_quota_cores(&dir)
         };
@@ -255,7 +264,10 @@ fn cpu_max_cores(s: &str) -> Option<f64> {
 fn cfs_quota_cores(dir: &std::path::Path) -> Option<f64> {
     let quota = std::fs::read_to_string(dir.join("cpu.cfs_quota_us")).ok()?;
     let period = std::fs::read_to_string(dir.join("cpu.cfs_period_us")).ok()?;
-    let (q, p) = (quota.trim().parse::<i64>().ok()?, period.trim().parse::<u64>().ok()?);
+    let (q, p) = (
+        quota.trim().parse::<i64>().ok()?,
+        period.trim().parse::<u64>().ok()?,
+    );
     (q > 0 && p > 0).then(|| q as f64 / p as f64)
 }
 
@@ -720,9 +732,7 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     // only when someone is watching.
     if crate::progress::is_on() {
         if let Ok(cat) = src.catalog(None, Some(&[table.to_string()])).await {
-            crate::progress::set_total_estimate(
-                cat.first().map(|(_, est)| *est).unwrap_or(-1),
-            );
+            crate::progress::set_total_estimate(cat.first().map(|(_, est)| *est).unwrap_or(-1));
         }
     }
 
@@ -802,9 +812,15 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     // own catch) skipped the discard below: the staging and its announcement
     // stayed, and every later run of the table refused as `locked` (P2-12).
     // It now takes the error arm like any other failure.
-    let staged: Result<(u64, usize)> = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(staged))
-        .await
-        .unwrap_or_else(|p| Err(Error::Transfer(format!("panicked: {}", crate::pipe::panic_text(&*p)))));
+    let staged: Result<(u64, usize)> =
+        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(staged))
+            .await
+            .unwrap_or_else(|p| {
+                Err(Error::Transfer(format!(
+                    "panicked: {}",
+                    crate::pipe::panic_text(&*p)
+                )))
+            });
 
     let (rows, used) = match staged {
         Ok(v) => v,
@@ -902,7 +918,10 @@ impl<'a> Grant<'a> {
         let target = target.max(1);
         while self.count > target {
             let take = self.count - target;
-            let last = self.held.last_mut().expect("grant holds at least one permit");
+            let last = self
+                .held
+                .last_mut()
+                .expect("grant holds at least one permit");
             let n = last.num_permits();
             if n <= take {
                 self.held.pop();
@@ -1010,7 +1029,12 @@ where
                 .await
             }))
             .await
-            .unwrap_or_else(|p| Err(Error::Transfer(format!("panicked: {}", crate::pipe::panic_text(&*p)))));
+            .unwrap_or_else(|p| {
+                Err(Error::Transfer(format!(
+                    "panicked: {}",
+                    crate::pipe::panic_text(&*p)
+                )))
+            });
 
             crate::progress::table_done();
             match out {
@@ -1058,11 +1082,22 @@ mod tests {
         }
         let o = super::source_origin;
         assert_eq!(o("postgres://u:p@h/db"), "postgres://h:5432/db");
-        assert_eq!(o("postgresql://u:p@h:5433/db?application_name=x"), "postgres://h:5433/db");
-        assert_eq!(o("postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db"),
-                   o("postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db?application_name=y"));
-        assert_ne!(o("postgres://u:p@lb/db?host=a"), o("postgres://u:p@lb/db?host=b"));
-        assert_eq!(o("postgres://u:p@lb:1/x?host=a&port=2&dbname=y"), "postgres://a:2/y");
+        assert_eq!(
+            o("postgresql://u:p@h:5433/db?application_name=x"),
+            "postgres://h:5433/db"
+        );
+        assert_eq!(
+            o("postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db"),
+            o("postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db?application_name=y")
+        );
+        assert_ne!(
+            o("postgres://u:p@lb/db?host=a"),
+            o("postgres://u:p@lb/db?host=b")
+        );
+        assert_eq!(
+            o("postgres://u:p@lb:1/x?host=a&port=2&dbname=y"),
+            "postgres://a:2/y"
+        );
         assert_eq!(o("mysql://u:p@h/db"), "mysql://h:3306/db");
     }
 
@@ -1071,7 +1106,10 @@ mod tests {
     #[test]
     fn watermark_moved_detects_any_change() {
         assert!(!super::watermark_moved(&None, &None));
-        assert!(!super::watermark_moved(&Some("5".into()), &Some("5".into())));
+        assert!(!super::watermark_moved(
+            &Some("5".into()),
+            &Some("5".into())
+        ));
         assert!(super::watermark_moved(&Some("5".into()), &Some("7".into())));
         assert!(super::watermark_moved(&Some("5".into()), &None));
         assert!(super::watermark_moved(&None, &Some("5".into())));
@@ -1085,11 +1123,8 @@ mod tests {
     /// process does not have.
     #[test]
     fn the_smallest_limit_on_the_path_is_the_one_that_applies() {
-        let base = std::env::temp_dir().join(format!(
-            "apitap-cg-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("apitap-cg-{}-{}", std::process::id(), line!()));
         let leaf = base.join("system.slice/app.service/container");
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(base.join("system.slice/memory.max"), "536870912\n").unwrap();
@@ -1126,11 +1161,8 @@ mod tests {
     /// fails the last assert.
     #[test]
     fn the_smallest_cpu_quota_on_the_path_is_the_one_that_applies() {
-        let base = std::env::temp_dir().join(format!(
-            "apitap-cpu-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("apitap-cpu-{}-{}", std::process::id(), line!()));
         let leaf = base.join("system.slice/app.service/container");
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(base.join("system.slice/cpu.max"), "200000 100000\n").unwrap();
@@ -1418,9 +1450,17 @@ mod tests {
         const MB: u64 = 1024 * 1024;
         for (name, r, want_rg) in [
             ("s3", S3Sink::pipe_residency(Mode::Replace), RowGroup::Mib8),
-            ("gcs", GcsSink::pipe_residency(Mode::Replace), RowGroup::Mib8),
+            (
+                "gcs",
+                GcsSink::pipe_residency(Mode::Replace),
+                RowGroup::Mib8,
+            ),
             ("bq", BqSink::pipe_residency(Mode::Replace), RowGroup::Mib8),
-            ("ice", IcebergSink::pipe_residency(Mode::Replace), RowGroup::Mib8),
+            (
+                "ice",
+                IcebergSink::pipe_residency(Mode::Replace),
+                RowGroup::Mib8,
+            ),
         ] {
             assert_eq!(
                 fit(2, None, Some(256 * MB), &PipeCost::transfer(r)),
@@ -1497,7 +1537,13 @@ mod tests {
             (1024, 8),
         ] {
             assert_eq!(
-                fit(READ_PIPE_CAP, Some(DEFAULT_CHUNK), Some(mem * MB), &PipeCost::READ).pipes,
+                fit(
+                    READ_PIPE_CAP,
+                    Some(DEFAULT_CHUNK),
+                    Some(mem * MB),
+                    &PipeCost::READ
+                )
+                .pipes,
                 want,
                 "{mem} MiB"
             );
@@ -1578,5 +1624,4 @@ mod tests {
         drop(first); // release all 4
         assert_eq!(waiter.await.unwrap(), 3); // woke with 3, not 1
     }
-
 }

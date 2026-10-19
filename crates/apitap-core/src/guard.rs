@@ -45,7 +45,10 @@ impl Listed {
     /// A name every engine spells one way.
     pub(crate) fn same(name: impl Into<String>) -> Self {
         let n = name.into();
-        Listed { canonical: n.clone(), raw: n }
+        Listed {
+            canonical: n.clone(),
+            raw: n,
+        }
     }
 }
 
@@ -165,12 +168,22 @@ pub(crate) async fn announce(s: &dyn GuardStore, bare: &str, run: &RunId) -> Res
         }
         names.push(n);
     }
-    Ok(Announced { key: s.dest_label(bare), token: run.token().into(), names, done: false })
+    Ok(Announced {
+        key: s.dest_label(bare),
+        token: run.token().into(),
+        names,
+        done: false,
+    })
 }
 
 /// Scan `bare`'s neighbours and decide: proceed, collect the provably dead, or
 /// refuse. See the module doc for the order and why each step is where it is.
-pub(crate) async fn check_peers(s: &dyn GuardStore, bare: &str, run: &RunId, mine: Mine) -> Result<()> {
+pub(crate) async fn check_peers(
+    s: &dyn GuardStore,
+    bare: &str,
+    run: &RunId,
+    mine: Mine,
+) -> Result<()> {
     let kinds = s.scan_kinds();
     let listed = s.list(bare, kinds).await?;
     let scan = naming::blockers(
@@ -178,14 +191,20 @@ pub(crate) async fn check_peers(s: &dyn GuardStore, bare: &str, run: &RunId, min
         s.limit(),
         run,
         kinds,
-        listed.iter().map(|l| (l.canonical.as_str(), l.raw.as_str())),
+        listed
+            .iter()
+            .map(|l| (l.canonical.as_str(), l.raw.as_str())),
     );
     let dest = s.dest_label(bare);
     let now = naming::now_unix();
     // 1. An uncollectable blocker refuses before ANY lease row is read or
     //    claimed: no dead drain is claimed on the way to a refusal this run
     //    would issue anyway.
-    if let Some(b) = scan.blockers.iter().find(|b| naming::collectable(b).is_none()) {
+    if let Some(b) = scan
+        .blockers
+        .iter()
+        .find(|b| naming::collectable(b).is_none())
+    {
         return Err(naming::blocker_error(&dest, b, now, None));
     }
     // 2. One decision per TOKEN: a dead drain has two markers, one claim.
@@ -256,7 +275,11 @@ pub(crate) async fn release(
         return Err(a);
     }
     a.done = true;
-    Ok(Released { key: a.key.clone(), token: a.token.clone(), _priv: () })
+    Ok(Released {
+        key: a.key.clone(),
+        token: a.token.clone(),
+        _priv: (),
+    })
 }
 
 /// The proof for a table this run never put a marker on — its announce
@@ -296,11 +319,20 @@ mod tests {
     impl FakeStore {
         fn with(names: &[&str]) -> Self {
             let s = FakeStore::default();
-            s.names.lock().unwrap().extend(names.iter().map(|n| n.to_string()));
+            s.names
+                .lock()
+                .unwrap()
+                .extend(names.iter().map(|n| n.to_string()));
             s
         }
         fn lease(&self, tok: &str, expires_in: i64, collected: bool) {
-            self.leases.lock().unwrap().insert(tok.into(), Lease { expires_in, collected });
+            self.leases.lock().unwrap().insert(
+                tok.into(),
+                Lease {
+                    expires_in,
+                    collected,
+                },
+            );
         }
         fn note(&self, what: String) {
             self.log.lock().unwrap().push(what);
@@ -312,7 +344,12 @@ mod tests {
             self.log().iter().filter(|l| l.starts_with(prefix)).count()
         }
         fn at(&self, prefix: &str) -> Vec<usize> {
-            self.log().iter().enumerate().filter(|(_, l)| l.starts_with(prefix)).map(|(i, _)| i).collect()
+            self.log()
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.starts_with(prefix))
+                .map(|(i, _)| i)
+                .collect()
         }
         fn has(&self, n: &str) -> bool {
             self.names.lock().unwrap().contains(n)
@@ -336,7 +373,10 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|n| match dec.iter().find(|(_, raw)| *raw == n) {
-                    Some((canonical, raw)) => Listed { canonical: canonical.clone(), raw: raw.clone() },
+                    Some((canonical, raw)) => Listed {
+                        canonical: canonical.clone(),
+                        raw: raw.clone(),
+                    },
                     None => Listed::same(n.clone()),
                 })
                 .collect())
@@ -359,7 +399,12 @@ mod tests {
         }
         async fn lease_get(&self, _key: &str, token: &str) -> Result<Option<Lease>> {
             self.note(format!("lease_get {token}"));
-            Ok(self.leases.lock().unwrap().get(token).map(|l| Lease { ..*l }))
+            Ok(self
+                .leases
+                .lock()
+                .unwrap()
+                .get(token)
+                .map(|l| Lease { ..*l }))
         }
         async fn lease_claim(&self, _key: &str, token: &str) -> Result<Claim> {
             self.note(format!("lease_claim {token}"));
@@ -384,12 +429,17 @@ mod tests {
     }
 
     fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     fn names_of(r: &RunId) -> (String, String) {
-        (artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, r),
-         artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, r))
+        (
+            artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, r),
+            artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, r),
+        )
     }
 
     /// G1. The scan that decides is taken after every marker of this run exists.
@@ -401,7 +451,12 @@ mod tests {
             let a = announce(&s, "orders", &run).await.unwrap();
             check_peers(&s, "orders", &run, Mine::Keep).await.unwrap();
             let creates = s.at("create ");
-            assert_eq!(creates.len(), 2, "a drain announces a lock and a marker: {:?}", s.log());
+            assert_eq!(
+                creates.len(),
+                2,
+                "a drain announces a lock and a marker: {:?}",
+                s.log()
+            );
             assert!(s.at("list")[0] > *creates.last().unwrap(), "{:?}", s.log());
             release(&s, a).await.unwrap();
         });
@@ -416,7 +471,11 @@ mod tests {
             let (lock, marker) = names_of(&run);
             s.fail_create.lock().unwrap().insert(marker.clone());
             assert!(announce(&s, "orders", &run).await.is_err());
-            assert!(!s.has(&lock), "the lock alone must not stand: {:?}", s.log());
+            assert!(
+                !s.has(&lock),
+                "the lock alone must not stand: {:?}",
+                s.log()
+            );
             assert_eq!(s.count(&format!("drop {lock}")), 1, "{:?}", s.log());
         });
     }
@@ -432,11 +491,16 @@ mod tests {
             let s = FakeStore::with(&[&dead_lock, &bulk_staging]);
             s.lease(dead.token(), -60, false);
             let run = RunId::mint_bulk(BulkKind::Swap, "postgres://h/db");
-            let e = check_peers(&s, "orders", &run, Mine::DeleteLeftovers).await.unwrap_err();
+            let e = check_peers(&s, "orders", &run, Mine::DeleteLeftovers)
+                .await
+                .unwrap_err();
             assert!(format!("{e}").contains("locked:"), "{e}");
             assert_eq!(s.count("lease_get"), 0, "{:?}", s.log());
             assert_eq!(s.count("lease_claim"), 0, "{:?}", s.log());
-            assert!(s.has(&dead_lock), "nothing is collected on the way to a refusal");
+            assert!(
+                s.has(&dead_lock),
+                "nothing is collected on the way to a refusal"
+            );
         });
     }
 
@@ -450,13 +514,18 @@ mod tests {
             let s = FakeStore::with(&[&lock, &marker]);
             s.lease(dead.token(), -60, false);
             let run = RunId::mint_bulk(BulkKind::Swap, "postgres://h/db");
-            check_peers(&s, "orders", &run, Mine::DeleteLeftovers).await.unwrap();
+            check_peers(&s, "orders", &run, Mine::DeleteLeftovers)
+                .await
+                .unwrap();
             assert_eq!(s.count("lease_claim"), 1, "{:?}", s.log());
             assert_eq!(s.count("sweep_run"), 1, "{:?}", s.log());
             assert_eq!(s.count("drop "), 2, "{:?}", s.log());
             assert_eq!(s.count("lease_close"), 0, "{:?}", s.log());
             assert!(!s.has(&lock) && !s.has(&marker));
-            assert!(s.leases.lock().unwrap()[dead.token()].collected, "the row stays, collected");
+            assert!(
+                s.leases.lock().unwrap()[dead.token()].collected,
+                "the row stays, collected"
+            );
         });
     }
 
@@ -471,14 +540,24 @@ mod tests {
             s.lease(dead.token(), -60, false);
             s.fail_drop.lock().unwrap().insert(marker.clone());
             let run = RunId::mint_bulk(BulkKind::Swap, "postgres://h/db");
-            let e = check_peers(&s, "orders", &run, Mine::DeleteLeftovers).await.unwrap_err();
-            assert!(format!("{e}").contains("next run finishes the collection"), "{e}");
+            let e = check_peers(&s, "orders", &run, Mine::DeleteLeftovers)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{e}").contains("next run finishes the collection"),
+                "{e}"
+            );
             assert!(s.leases.lock().unwrap()[dead.token()].collected);
             assert!(s.has(&marker), "the marker still stands");
             s.fail_drop.lock().unwrap().clear();
-            check_peers(&s, "orders", &run, Mine::DeleteLeftovers).await
+            check_peers(&s, "orders", &run, Mine::DeleteLeftovers)
+                .await
                 .expect("the next run re-claims the collected row and finishes");
-            assert!(!s.has(&lock) && !s.has(&marker), "{:?}", s.names.lock().unwrap());
+            assert!(
+                !s.has(&lock) && !s.has(&marker),
+                "{:?}",
+                s.names.lock().unwrap()
+            );
         });
     }
 
@@ -492,7 +571,8 @@ mod tests {
             s.lease(dead.token(), -60, false);
             let run = RunId::mint_bulk(BulkKind::Swap, "postgres://h/db");
             check_peers(&s, "orders", &run, Mine::Keep).await.unwrap();
-            let (claim, sweep, drops) = (s.at("lease_claim")[0], s.at("sweep_run")[0], s.at("drop "));
+            let (claim, sweep, drops) =
+                (s.at("lease_claim")[0], s.at("sweep_run")[0], s.at("drop "));
             assert!(claim < sweep && sweep < drops[0], "{:?}", s.log());
         });
     }
@@ -510,7 +590,10 @@ mod tests {
             assert_eq!(back.names().len(), 2);
             s.fail_drop.lock().unwrap().clear();
             let proof = release(&s, back).await.expect("all gone now");
-            assert_eq!((proof.key.as_str(), proof.token.as_str()), ("public.orders", run.token()));
+            assert_eq!(
+                (proof.key.as_str(), proof.token.as_str()),
+                ("public.orders", run.token())
+            );
             s.lease_close(proof).await;
             assert_eq!(s.count("lease_close"), 1);
         });
@@ -529,7 +612,10 @@ mod tests {
             s.fail_drop.lock().unwrap().insert(lock.clone());
             let back = release(&s, a).await.expect_err("the lock would not drop");
             back.abandon();
-            assert!(s.has(&lock), "abandoning names what is left; it deletes nothing");
+            assert!(
+                s.has(&lock),
+                "abandoning names what is left; it deletes nothing"
+            );
             assert_eq!(s.count("lease_close"), 0, "no proof, so no lease close");
         });
     }
@@ -543,8 +629,13 @@ mod tests {
             let (_, staging) = names_of(&run);
             let raw = format!("{staging}_3");
             let s = FakeStore::with(&[&raw]);
-            s.decorate.lock().unwrap().insert(staging.clone(), raw.clone());
-            check_peers(&s, "orders", &run, Mine::DeleteLeftovers).await.unwrap();
+            s.decorate
+                .lock()
+                .unwrap()
+                .insert(staging.clone(), raw.clone());
+            check_peers(&s, "orders", &run, Mine::DeleteLeftovers)
+                .await
+                .unwrap();
             assert_eq!(s.at(&format!("drop {raw}")).len(), 1, "{:?}", s.log());
             assert!(!s.has(&raw));
         });
@@ -555,8 +646,12 @@ mod tests {
     /// file that stops deciding must leave the list in the same commit.
     #[test]
     fn no_guard_decision_outside() {
-        const DECISIONS: &[&str] =
-            &["naming::classify(", "naming::blockers(", "naming::collectable(", "peer_blocks("];
+        const DECISIONS: &[&str] = &[
+            "naming::classify(",
+            "naming::blockers(",
+            "naming::collectable(",
+            "peer_blocks(",
+        ];
         // Emptied one adapter at a time (handoff §3 steps 7-13). It stays empty:
         // a file that starts deciding again fails here, by name.
         const NOT_YET: &[&str] = &[];
@@ -568,7 +663,10 @@ mod tests {
                 if p.extension().is_some_and(|x| x == "rs") {
                     let text = std::fs::read_to_string(&p).unwrap();
                     if DECISIONS.iter().any(|d| text.contains(d)) {
-                        deciding.push(format!("{dir}/{}", p.file_name().unwrap().to_string_lossy()));
+                        deciding.push(format!(
+                            "{dir}/{}",
+                            p.file_name().unwrap().to_string_lossy()
+                        ));
                     }
                 }
             }
@@ -576,7 +674,9 @@ mod tests {
         deciding.sort();
         let mut allowed: Vec<String> = NOT_YET.iter().map(|s| s.to_string()).collect();
         allowed.sort();
-        assert_eq!(deciding, allowed,
-                   "guard decisions outside guard.rs must match the shrinking allow-list exactly");
+        assert_eq!(
+            deciding, allowed,
+            "guard decisions outside guard.rs must match the shrinking allow-list exactly"
+        );
     }
 }
