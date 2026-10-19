@@ -190,6 +190,23 @@ pub(crate) struct Transcoder {
     /// Tuples emitted since the last harvest — the honest live row count for
     /// this lane, free because the tuple loop already knows each boundary.
     rows: u64,
+    /// The largest field this process buffers (see `max_field_bytes`).
+    max_field: usize,
+}
+
+/// The largest COPY field the pg -> ClickHouse transcoder carries: half the
+/// process's memory limit, or Postgres's own 1 GB ceiling. A partial tuple is
+/// carried until it completes, so a field's claimed length was buffered
+/// without bound and a big bytea or text OOM-killed the lane in the cage
+/// (P2, as the pg -> mysql transcoder). Read once: a transcoder is built per span.
+fn max_field_bytes() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        crate::pipeline::mem_limit_bytes()
+            .map(|m| (m / 2) as usize)
+            .unwrap_or(usize::MAX)
+            .min(1 << 30)
+    })
 }
 
 impl Transcoder {
@@ -204,7 +221,13 @@ impl Transcoder {
             header_done: false,
             finished: false,
             rows: 0,
+            max_field: max_field_bytes(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_field(cols: Vec<(RbType, bool)>, max_field: usize) -> Self {
+        Self { max_field, ..Self::new(cols) }
     }
 
     /// Feed input; append transcoded RowBinary to `out`.
@@ -247,7 +270,7 @@ impl Transcoder {
                 self.header_done = true;
             }
             while !self.finished {
-                match try_tuple_at(&self.cols, &self.buf[self.pos..], out)? {
+                match try_tuple_at(&self.cols, self.max_field, &self.buf[self.pos..], out)? {
                     Some((consumed, finished)) => {
                         self.pos += consumed;
                         if !finished {
@@ -276,7 +299,7 @@ impl Transcoder {
         // bulk of each coalesced piece.
         let mut off = 0usize;
         while !self.finished {
-            match try_tuple_at(&self.cols, &inp[off..], out)? {
+            match try_tuple_at(&self.cols, self.max_field, &inp[off..], out)? {
                 Some((consumed, finished)) => {
                     off += consumed;
                     if !finished {
@@ -308,6 +331,7 @@ impl Transcoder {
 /// (`out` is left untouched in that case).
 fn try_tuple_at(
     cols: &[(RbType, bool)],
+    max_field: usize,
     b: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<Option<(usize, bool)>> {
@@ -350,6 +374,14 @@ fn try_tuple_at(
             )));
         }
         let len = len as usize;
+        if len > max_field {
+            out.truncate(out_start);
+            return Err(Error::Transfer(format!(
+                "pg binary COPY: a field of {len} bytes is above the {} MiB this process can \
+                 buffer (half its memory limit; APITAP_MEM_BUDGET sets it)",
+                max_field >> 20
+            )));
+        }
         if b.len() < off + len {
             out.truncate(out_start);
             return Ok(None);
@@ -462,6 +494,22 @@ fn bad(what: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// P2: a field claiming more than the cap is refused on the chunk that
+    /// shows its length, before anything is carried for it.
+    #[test]
+    fn a_field_past_the_cap_is_refused_before_it_is_buffered() {
+        let mut t = Transcoder::with_max_field(vec![(RbType::String, false)], 64 << 10);
+        let mut input = b"PGCOPY\n\xff\r\n\0".to_vec();
+        input.extend(0u32.to_be_bytes());
+        input.extend(0u32.to_be_bytes());
+        input.extend(1i16.to_be_bytes());
+        input.extend(0x7FFF_FFFFi32.to_be_bytes());
+        input.extend([0u8; 1024]);
+        let e = t.push(&input, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("APITAP_MEM_BUDGET"), "{e}");
+        assert!(t.buf.len() < 64 << 10);
+    }
+
     /// numeric(9,-3) holds 12 integer digits: Decimal64, scale 0, not the
     /// Decimal32 its declared p picked; numeric(2,5) is Decimal(5,5) (P2).
     #[test]
