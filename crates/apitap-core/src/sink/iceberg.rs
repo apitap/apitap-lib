@@ -1192,7 +1192,7 @@ impl crate::sink::Sink for IcebergSink {
                 // panic) AFTER the whole load, leaving the claim behind and
                 // every later run refused (review round 2 R2-5). Same rule
                 // cdc_bind applies, moved up front where it costs nothing.
-                if !m.default_partition_spec().fields().is_empty() {
+                if !m.default_partition_spec().is_unpartitioned() {
                     return Err(Error::InvalidInput(format!(
                         "iceberg table '{}' is partitioned — apitap writes unpartitioned tables only; land into an unpartitioned table, or export and partition it on the warehouse side",
                         self.table
@@ -1383,7 +1383,7 @@ impl IcebergSink {
                     .content(DataContentType::Data)
                     .file_path(f.path.clone())
                     .file_format(DataFileFormat::Parquet)
-                    .partition(Struct::empty())
+                    .partition(partition_value(&pspec))
                     .record_count(f.rows)
                     .file_size_in_bytes(f.bytes)
                     .build()
@@ -1393,7 +1393,7 @@ impl IcebergSink {
 
         // -- merge: one equality-delete file per data file, streamed by the
         // loaders (the delta's keys never gather in memory; I4/I6)
-        let delete_files = delete_data_files(files, mode, self.merge_key.map(|(_, fid)| fid))?;
+        let delete_files = delete_data_files(files, mode, self.merge_key.map(|(_, fid)| fid), &partition_value(&pspec))?;
 
         // -- new watermark: the freshest cursor value this run shipped
         let numeric = self.cursor.map(|(_, n)| n).unwrap_or(false);
@@ -1702,7 +1702,20 @@ impl IcebergSink {
 /// one-to-one rule (I6) is unit-testable: every data file must carry its
 /// streamed key companion, with the same row count and the table's field id.
 /// Replace/append must carry none.
-fn delete_data_files(files: &[FileDone], mode: Mode, fid: Option<i32>) -> Result<Vec<DataFile>> {
+/// A data file's partition under an unpartitioned spec: empty, or one null
+/// per field when every field is a `void` transform (a v1 table's removed
+/// partition fields, kept by an upgrade to v2). Such a table was refused as
+/// "partitioned", and an empty struct beside void fields would fail the
+/// manifest's per-field zip (P2, R3-22).
+fn partition_value(spec: &iceberg::spec::PartitionSpec) -> Struct {
+    if spec.fields().is_empty() {
+        Struct::empty()
+    } else {
+        Struct::from_iter(spec.fields().iter().map(|_| None))
+    }
+}
+
+fn delete_data_files(files: &[FileDone], mode: Mode, fid: Option<i32>, part: &Struct) -> Result<Vec<DataFile>> {
     if mode != Mode::Merge {
         if files.iter().any(|f| f.delete.is_some()) {
             return Err(Error::Transfer(format!(
@@ -1733,7 +1746,7 @@ fn delete_data_files(files: &[FileDone], mode: Mode, fid: Option<i32>) -> Result
                 .content(DataContentType::EqualityDeletes)
                 .file_path(d.path.clone())
                 .file_format(DataFileFormat::Parquet)
-                .partition(Struct::empty())
+                .partition(part.clone())
                 .record_count(d.rows)
                 .file_size_in_bytes(d.bytes)
                 .equality_ids(Some(vec![fid]))
@@ -2014,7 +2027,7 @@ pub(crate) async fn cdc_bind(
              dropped? The state went with it; the next run re-bootstraps"
         ))
     })?;
-    if !meta.default_partition_spec().fields().is_empty() {
+    if !meta.default_partition_spec().is_unpartitioned() {
         return Err(Error::InvalidInput(format!(
             "log_based: iceberg table '{table}' is partitioned — the log_based \
              apply writes unpartitioned tables only (same as merge)"
@@ -2138,7 +2151,7 @@ impl CdcBound {
                     .content(DataContentType::Data)
                     .file_path(path)
                     .file_format(DataFileFormat::Parquet)
-                    .partition(Struct::empty())
+                    .partition(partition_value(self.meta.default_partition_spec()))
                     .record_count(rows)
                     .file_size_in_bytes(size)
                     .build()
@@ -2166,7 +2179,7 @@ impl CdcBound {
                 .content(DataContentType::EqualityDeletes)
                 .file_path(path)
                 .file_format(DataFileFormat::Parquet)
-                .partition(Struct::empty())
+                .partition(partition_value(self.meta.default_partition_spec()))
                 .record_count(n_del as u64)
                 .file_size_in_bytes(size)
                 .equality_ids(Some(vec![fid]))
@@ -2665,7 +2678,7 @@ mod tests {
     #[test]
     fn delete_data_files_is_one_per_data_file() {
         let files = vec![done("d0", 3, true), done("d1", 4, true), done("d2", 5, true)];
-        let dfs = delete_data_files(&files, Mode::Merge, Some(7)).unwrap();
+        let dfs = delete_data_files(&files, Mode::Merge, Some(7), &Struct::empty()).unwrap();
         assert_eq!(dfs.len(), 3);
         for (df, f) in dfs.iter().zip(&files) {
             assert_eq!(df.content_type(), DataContentType::EqualityDeletes);
@@ -2676,16 +2689,16 @@ mod tests {
         }
         // A data file without its companion cannot commit.
         let missing = vec![done("d0", 3, true), done("d1", 4, false)];
-        assert!(delete_data_files(&missing, Mode::Merge, Some(7)).is_err());
+        assert!(delete_data_files(&missing, Mode::Merge, Some(7), &Struct::empty()).is_err());
         // ...and neither can a record-count mismatch.
         let mut bad = vec![done("d0", 3, true)];
         bad[0].delete.as_mut().unwrap().rows = 2;
-        assert!(delete_data_files(&bad, Mode::Merge, Some(7)).is_err());
+        assert!(delete_data_files(&bad, Mode::Merge, Some(7), &Struct::empty()).is_err());
         // Merge without a key id is a prepare bug, not an empty commit.
-        assert!(delete_data_files(&files, Mode::Merge, None).is_err());
+        assert!(delete_data_files(&files, Mode::Merge, None, &Struct::empty()).is_err());
         // Replace/append carry no delete files.
         let replaced = vec![done("d0", 3, false)];
-        assert!(delete_data_files(&replaced, Mode::Replace, None).unwrap().is_empty());
-        assert!(delete_data_files(&files, Mode::Replace, None).is_err());
+        assert!(delete_data_files(&replaced, Mode::Replace, None, &Struct::empty()).unwrap().is_empty());
+        assert!(delete_data_files(&files, Mode::Replace, None, &Struct::empty()).is_err());
     }
 }

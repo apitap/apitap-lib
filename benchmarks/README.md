@@ -688,6 +688,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_ice_hardening.v3 --> `e2e_ice_hardening.py v3` | an Iceberg table of format-version 3 is refused before anything is written |
 | <!-- claim: leg.e2e_ice_hardening.numeric --> `e2e_ice_hardening.py numeric` | a PG15+ numeric(2,4) value lands exact in Iceberg (decimal(4,4)) |
 | <!-- claim: leg.e2e_ice_hardening.schema --> `e2e_ice_hardening.py schema` | a schema evolved through the catalog during an append refuses the commit; nothing from that load lands |
+| <!-- claim: leg.e2e_ice_hardening.void --> `e2e_ice_hardening.py void` | an Iceberg table whose partition spec is only `void` fields (unpartitioned in fact) takes an append |
 | <!-- claim: leg.e2e_logbased_dests.ice --> `e2e_logbased_dests.py ice` | the same drain into Iceberg |
 | <!-- claim: leg.e2e_logbased_multi --> `e2e_logbased_multi.py` | many tables share ONE replication slot |
 | <!-- claim: leg.e2e_cdc_types --> `e2e_cdc_types.py` | bootstrap and drain agree on every type |

@@ -8,7 +8,10 @@ P2 findings (docs/review/2026-10-18-p2-triage.md):
   schema    a commit required only the snapshot ref: a schema evolved by
             another writer during the load passed, and the files (written
             with the old field ids) were committed against the new schema.
-Usage: e2e_ice_hardening.py v3|numeric|schema
+  void      a spec whose only fields are `void` transforms is unpartitioned in
+            fact (an upgraded v1 table's removed fields); it was refused as
+            "partitioned".
+Usage: e2e_ice_hardening.py v3|numeric|schema|void
 """
 import json
 import subprocess
@@ -143,6 +146,38 @@ def schema():
         drop(v)
 
 
+def wipe_prefix(t):
+    # A purge drops the table's files, not keys apitap left beside them
+    # (a claim marker under metadata/apitap-runs/ from a run that died).
+    sys.path.insert(0, "benchmarks")
+    import _rig
+    for k in _rig.s3_list(f"pgowh/{NS}/{t}/"):
+        _rig.s3_delete(k)
+
+
+def void():
+    t = "ice_void_spec"
+    pg(f"DROP TABLE IF EXISTS {t}")
+    drop(t)
+    wipe_prefix(t)
+    try:
+        pg(f"CREATE TABLE {t} (id bigint PRIMARY KEY); INSERT INTO {t} SELECT generate_series(1, 5)")
+        schema = {"type": "struct", "schema-id": 0,
+                  "fields": [{"id": 1, "name": "id", "required": False, "type": "long"}]}
+        rest("POST", f"/namespaces/{NS}/tables", {"name": t, "schema": schema,
+             "partition-spec": {"spec-id": 0, "fields": [{"source-id": 1, "field-id": 1000, "name": "id_null",
+                                                          "transform": "void"}]},
+             "properties": {"format-version": "2"}})
+        apitap.transfer(PG, ICE, table=t, mode="append", cursor="id")
+        n = ice_rows(t, "SELECT count(*), sum(id) FROM {T}")[0]
+        assert n == (5, 15), f"the rows land in the void-spec table: {n}"
+        print(f"  append into a void-only partition spec: {n[0]} rows")
+    finally:
+        pg(f"DROP TABLE IF EXISTS {t}")
+        drop(t)
+        wipe_prefix(t)
+
+
 def _try(f):
     try:
         f()
@@ -153,7 +188,7 @@ def _try(f):
 
 if __name__ == "__main__":
     which = sys.argv[1:]
-    cases = {"v3": v3, "numeric": numeric, "schema": schema}
+    cases = {"v3": v3, "numeric": numeric, "schema": schema, "void": void}
     assert len(which) == 1 and which[0] in cases, "usage: e2e_ice_hardening.py " + "|".join(cases)
     cases[which[0]]()
     print(f"✓ Iceberg hardening: {which[0]}")
