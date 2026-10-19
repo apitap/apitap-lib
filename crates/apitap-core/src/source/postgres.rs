@@ -413,13 +413,9 @@ impl Source for PgSource {
                     // (no span matched them) ride the last one (P2).
                     let ranges = spans(lo, hi, want);
                     let last = ranges.len() - 1;
+                    let nullable = plan.cursor_plan().is_none_or(|pc| pc.nullable);
                     for (k, (rlo, rhi)) in ranges.into_iter().enumerate() {
-                        let range = match (k == 0, k == last) {
-                            (true, true) => "true".to_string(),
-                            (true, false) => format!("{qcol} <= {rhi}"),
-                            (false, true) => format!("({qcol} >= {rlo} OR {qcol} IS NULL)"),
-                            (false, false) => format!("{qcol} >= {rlo} AND {qcol} <= {rhi}"),
-                        };
+                        let range = span_range(&qcol, k == 0, k == last, rlo, rhi, nullable);
                         stmts.push(format!(
                             "COPY (SELECT {select_list} FROM {src_t} \
                              WHERE {range}{dpred}) \
@@ -1009,5 +1005,49 @@ mod tests {
         assert!(strip
             .push(b"NOTPGCOPY\0\0\0\0\0\0\0\0\0\0", &mut Vec::new())
             .is_err());
+    }
+}
+
+/// The WHERE of one integer-cursor span. The edge spans stay open (the
+/// min/max probe runs before the workers' snapshot), and NULL cursors, which
+/// no range matches, ride the last span (P2). That `OR col IS NULL` only for
+/// a column that can hold one: on a NOT NULL key (every primary key) it kept
+/// the planner off the index, and the last span seq-scanned the WHOLE table
+/// to return its share: a 4-way split read 1.96x the rows.
+fn span_range(qcol: &str, first: bool, last: bool, lo: i64, hi: i64, nullable: bool) -> String {
+    match (first, last) {
+        (true, true) => "true".to_string(),
+        (true, false) => format!("{qcol} <= {hi}"),
+        (false, true) if nullable => format!("({qcol} >= {lo} OR {qcol} IS NULL)"),
+        (false, true) => format!("{qcol} >= {lo}"),
+        (false, false) => format!("{qcol} >= {lo} AND {qcol} <= {hi}"),
+    }
+}
+
+#[cfg(test)]
+mod span_range_tests {
+    use super::span_range;
+
+    /// A NOT NULL cursor's last span is a plain range the index can serve;
+    /// only a nullable one carries the NULL rows.
+    #[test]
+    fn the_null_clause_rides_only_a_nullable_cursor() {
+        assert_eq!(
+            span_range("\"id\"", false, true, 7, 9, false),
+            "\"id\" >= 7"
+        );
+        assert_eq!(
+            span_range("\"id\"", false, true, 7, 9, true),
+            "(\"id\" >= 7 OR \"id\" IS NULL)"
+        );
+        assert_eq!(
+            span_range("\"id\"", true, false, 1, 3, false),
+            "\"id\" <= 3"
+        );
+        assert_eq!(span_range("\"id\"", true, true, 1, 3, true), "true");
+        assert_eq!(
+            span_range("\"id\"", false, false, 4, 6, true),
+            "\"id\" >= 4 AND \"id\" <= 6"
+        );
     }
 }
