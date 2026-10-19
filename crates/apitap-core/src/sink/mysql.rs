@@ -1798,7 +1798,6 @@ impl Loader for MySqlLoader {
 }
 #[cfg(test)]
 mod abort_tests {
-    use super::*;
 
     /// P2: TEXT/BLOB keys and wide VARCHARs are caught whatever their case.
     #[test]

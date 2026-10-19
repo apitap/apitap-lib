@@ -16,9 +16,7 @@
 //! stripping 4 bytes uniformly when checksums are on is correct.
 
 use crate::error::{Error, Result};
-use crate::wire::pgoutput::{
-    Cell, CellR, Cellv, OldImage, PgoMessage, Relation, RelationCol, Tuple,
-};
+use crate::wire::pgoutput::{CellR, OldImage, PgoMessage, Relation, RelationCol, Tuple};
 use std::collections::HashMap;
 
 /// The 19-byte common header every event after v4 carries.
@@ -265,15 +263,6 @@ impl<'a> R<'a> {
             0xFE => self.u64le()?,
             v => v as u64,
         })
-    }
-    fn nul_str(&mut self) -> Result<String> {
-        let end = self.b[self.p..]
-            .iter()
-            .position(|&c| c == 0)
-            .ok_or_else(|| bad("unterminated string"))?;
-        let s = String::from_utf8_lossy(&self.b[self.p..self.p + end]).into_owned();
-        self.p += end + 1;
-        Ok(s)
     }
 }
 
@@ -1550,6 +1539,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::wire::pgoutput::{Cell, Cellv};
 
     fn hdr(t: u8, body: &[u8], log_pos: u32) -> Vec<u8> {
         let mut e = Vec::new();

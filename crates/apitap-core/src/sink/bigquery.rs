@@ -937,24 +937,6 @@ impl BqConn {
         }
         self.poll(job_id, Some(&loc)).await.map(|_| ())
     }
-
-    /// A credential-free connection for unit tests (SQL-shape assertions only —
-    /// any network call panics on the empty token).
-    #[cfg(test)]
-    pub(crate) fn fake(project: &str, dataset: &str) -> Self {
-        Self {
-            client: crate::http::client(),
-            credentials: Arc::new(String::new()),
-            auth: Arc::new(tokio::sync::Mutex::new((
-                String::new(),
-                std::time::Instant::now(),
-            ))),
-            project: project.to_string(),
-            dataset: dataset.to_string(),
-            location: None,
-            job_loc: Arc::new(tokio::sync::OnceCell::new()),
-        }
-    }
 }
 
 fn rows_of(v: &Value) -> Vec<Vec<Option<String>>> {

@@ -456,6 +456,7 @@ impl<L: Loader> Pipes<L> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.pipes.len()
     }

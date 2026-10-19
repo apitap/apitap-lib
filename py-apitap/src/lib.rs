@@ -12,7 +12,6 @@ mod capsule;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::ffi::CStr;
-use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 pyo3::create_exception!(
@@ -126,11 +125,6 @@ where
             .enable_all()
             .build()
             .expect("tokio multi_thread runtime")
-            .block_on(fut),
-        None => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio current_thread runtime")
             .block_on(fut),
     }
 }
@@ -396,7 +390,7 @@ impl PgRead {
             if cap.is_null() {
                 return Err(PyErr::fetch(py));
             }
-            Ok(unsafe { pyo3::Bound::from_owned_ptr(py, cap) }.unbind())
+            Ok(pyo3::Bound::from_owned_ptr(py, cap).unbind())
         }
     }
 

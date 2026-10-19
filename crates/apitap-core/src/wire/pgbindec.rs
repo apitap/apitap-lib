@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn float_normalization_matches_the_string_version() {
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut check = |s: &str| {
+        let check = |s: &str| {
             let mut buf = [0u8; 32];
             let (n, e) = super::normalize(s, &mut buf);
             let (want, we) = normalize_ref(s);

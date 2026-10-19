@@ -45,16 +45,6 @@ pub(crate) fn host_is_local(h: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Is the EFFECTIVE host of this URL local? Unparseable counts as NOT local,
-/// the risky side, like the MySQL helper.
-pub(crate) fn url_is_local(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| effective_host(&u))
-        .map(|h| host_is_local(&h))
-        .unwrap_or(false)
-}
-
 /// The Postgres TLS default (review 2026-10-14 P0-3; round 2 §1.1 hardened
 /// it): a URL that says nothing about TLS and whose EFFECTIVE host is not
 /// local gets `sslmode=verify-full`. sqlx's own default is `prefer` — it

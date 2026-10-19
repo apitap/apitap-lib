@@ -287,17 +287,17 @@ fn recv_buffer_bytes() -> usize {
     }
 }
 
-/// The socket closes when this type is dropped, whatever path got us here.
-///
-/// The plaintext transport did this for free: `TcpStream::into_split` gives
-/// an `OwnedWriteHalf` that shuts the write side down on drop. The TLS
-/// transport does NOT — `tokio::io::split` halves have no `Drop` and share
-/// one lock, so the fd survives until BOTH halves go. With the read half in
-/// a pump task (the 0.59/0.60 shape) the write half dropping left the read
-/// half parked in `read_frame` on a dead connection; a replication slot
-/// stayed `active` and the NEXT run refused it as in use. The scanner owns
-/// no task — the read half is a field of `self` again, so both halves go
-/// with one drop and this failure mode cannot exist.
+// The socket closes when this type is dropped, whatever path got us here.
+//
+// The plaintext transport did this for free: `TcpStream::into_split` gives
+// an `OwnedWriteHalf` that shuts the write side down on drop. The TLS
+// transport does NOT — `tokio::io::split` halves have no `Drop` and share
+// one lock, so the fd survives until BOTH halves go. With the read half in
+// a pump task (the 0.59/0.60 shape) the write half dropping left the read
+// half parked in `read_frame` on a dead connection; a replication slot
+// stayed `active` and the NEXT run refused it as in use. The scanner owns
+// no task — the read half is a field of `self` again, so both halves go
+// with one drop and this failure mode cannot exist.
 
 /// The opt-in that lets a cleartext/MD5 authentication downgrade through on
 /// an unverified channel; anything but exactly "1" is a no (system review
