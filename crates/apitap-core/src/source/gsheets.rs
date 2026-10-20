@@ -423,7 +423,7 @@ impl<L: Loader> PipeBody<L> for GsBody<'_> {
                 enc.row_start(ncols, &mut out);
                 for i in 0..ncols {
                     let cell = row.get(i).map(String::as_str).unwrap_or("");
-                    enc.cell(i, cell.as_bytes(), &mut out);
+                    enc.cell(i, cell.as_bytes(), self.plan.cols[i].nullable, &mut out);
                 }
                 enc.row_end(&mut out);
                 rows_sent += 1;

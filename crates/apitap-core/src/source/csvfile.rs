@@ -386,7 +386,7 @@ where
             enc.row_start(ncols, &mut out);
             for i in 0..ncols {
                 let cell = if i < row.len() { row.field(i) } else { b"" };
-                enc.cell(i, cell, &mut out);
+                enc.cell(i, cell, plan.cols[i].nullable, &mut out);
             }
             enc.row_end(&mut out);
             rows_sent += 1;

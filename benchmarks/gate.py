@@ -239,6 +239,7 @@ LEGS = [
     leg("e2e_cdc_progress.py",     "a Postgres drain reports rows while it runs"),
     leg("e2e_ch_insert_only.py",   "a Replacing destination takes the tombstone path, FINAL exact"),
     leg("e2e_ch_tombstone_sort_key.py", "a Replacing destination whose ORDER BY is not the key never takes the tombstone path"),
+    leg("e2e_text_source_order_by.py", "a CSV from GitHub lands in ClickHouse with order_by= on one of its columns"),
     leg("e2e_pg_ch_binary_types.py", "a PG→CH table binary pgoutput cannot render drains on text"),
     leg("e2e_read_pg_types.py",    "read() of PG types without a send decoder equals the server's ::text"),
     leg("e2e_pg_url_planes.py",    "read() and the walsender dial the server the URL resolves to"),

@@ -47,8 +47,9 @@ impl TextEnc {
         }
     }
 
-    /// Cell `i` of the current row; empty = NULL.
-    pub(crate) fn cell(self, i: usize, cell: &[u8], out: &mut Vec<u8>) {
+    /// Cell `i` of the current row; empty = NULL, unless the column is not
+    /// `nullable`, where it is the empty string.
+    pub(crate) fn cell(self, i: usize, cell: &[u8], nullable: bool, out: &mut Vec<u8>) {
         match self {
             Self::PgBinary => {
                 if cell.is_empty() {
@@ -57,7 +58,15 @@ impl TextEnc {
                     pgc::field(cell, out);
                 }
             }
-            // Nullable(String): null flag, then varint+bytes.
+            // Nullable(String): null flag, then varint+bytes. A column the
+            // sink declared non-Nullable (an order_by or engine column, the
+            // cursor) has no flag byte: framed with one, ClickHouse read the
+            // flag as the length and the stream shifted for the rest of the
+            // insert — a failed load, or garbage rows (deep review D32).
+            Self::RowBinary if !nullable => {
+                varint(cell.len() as u64, out);
+                out.extend_from_slice(cell);
+            }
             Self::RowBinary => {
                 if cell.is_empty() {
                     out.push(1);
@@ -92,5 +101,26 @@ impl TextEnc {
         if self == Self::PgBinary {
             pgc::trailer(out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextEnc;
+
+    /// D32: a column the sink made non-Nullable carries no flag byte; an
+    /// empty cell there is the empty string, not a NULL.
+    #[test]
+    fn a_non_nullable_cell_has_no_null_flag() {
+        let enc = TextEnc::RowBinary;
+        let mut out = Vec::new();
+        enc.cell(0, b"id7", false, &mut out);
+        enc.cell(1, b"", false, &mut out);
+        enc.cell(2, b"v", true, &mut out);
+        enc.cell(3, b"", true, &mut out);
+        assert_eq!(
+            out,
+            [&[3u8][..], b"id7", &[0], &[0, 1], b"v", &[1]].concat()
+        );
     }
 }
