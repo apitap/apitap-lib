@@ -990,10 +990,17 @@ async fn apply_unit(
     }
     let mut ordinal: std::collections::HashMap<(u64, String), u32> =
         std::collections::HashMap::new();
+    // 0.62.0 keyed an entry `n|pred`, n counted over the window (N1). Its
+    // entries are valid for the first replay after an upgrade, which starts
+    // at the dead attempt's own start; a miss on the new key tries the old.
+    let mut legacy_ordinal: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut jkey = |pos: u64, pred: &str| {
         let n = ordinal.entry((pos, pred.to_string())).or_insert(0);
         *n += 1;
-        format!("{pos}|{n}|{pred}")
+        let l = legacy_ordinal.entry(pred.to_string()).or_insert(0);
+        *l += 1;
+        (format!("{pos}|{n}|{pred}"), format!("{l}|{pred}"))
     };
     for (op, &pos) in c.residue.iter().zip(&c.residue_at) {
         match op {
@@ -1006,9 +1013,13 @@ async fn apply_unit(
                     .map(|(i, _)| i)
                     .collect();
                 let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
-                let jk = jkey(pos, &pred);
+                let (jk, legacy_jk) = jkey(pos, &pred);
                 if replay {
-                    let hit = u.journal_get(dest_table, &jk, id.start()).await?;
+                    let mut hit = u.journal_get(dest_table, &jk, id.start()).await?;
+                    let legacy = hit.is_none();
+                    if legacy {
+                        hit = u.journal_get(dest_table, &legacy_jk, id.start()).await?;
+                    }
                     if dbg {
                         eprintln!(
                             "[residue] masked {jk} journal {}",
@@ -1020,8 +1031,11 @@ async fn apply_unit(
                         let cols = if insert_only {
                             // The journal holds the image without its version:
                             // it lands at THIS window's end, never the dead
-                            // attempt's, which could outrank a later write.
-                            insert_only_suffix(&mut img, id.end(), false);
+                            // attempt's, which could outrank a later write. A
+                            // 0.62.0 image carries its version already.
+                            if !legacy {
+                                insert_only_suffix(&mut img, id.end(), false);
+                            }
                             insert_only_cols(wal_cols)
                         } else {
                             wal_cols.to_vec()
@@ -1134,9 +1148,13 @@ async fn apply_unit(
                     .map(|(i, _)| i)
                     .collect();
                 let old_pred = key_pred(pk_cols, old_key, &pk_oids, binary)?;
-                let jk = jkey(pos, &old_pred);
+                let (jk, legacy_jk) = jkey(pos, &old_pred);
                 if replay && !missing.is_empty() {
-                    let hit = u.journal_get(dest_table, &jk, id.start()).await?;
+                    let mut hit = u.journal_get(dest_table, &jk, id.start()).await?;
+                    let legacy = hit.is_none();
+                    if legacy {
+                        hit = u.journal_get(dest_table, &legacy_jk, id.start()).await?;
+                    }
                     if dbg {
                         eprintln!(
                             "[residue] rekey {jk} journal {}",
@@ -1146,7 +1164,9 @@ async fn apply_unit(
                     if let Some(mut img) = hit {
                         u.delete_owned(dest_table, &old_pred).await?;
                         if insert_only {
-                            insert_only_suffix(&mut img, id.end(), false);
+                            if !legacy {
+                                insert_only_suffix(&mut img, id.end(), false);
+                            }
                             u.insert_owned(dest_table, &insert_only_cols(wal_cols), img)
                                 .await?;
                         } else {
@@ -1189,10 +1209,22 @@ async fn apply_unit(
                                 };
                             }
                         }
-                        // The old key is not there and nothing was journalled
-                        // for this op: an attempt from before the journal
-                        // existed already moved the row. (A journalled op never
-                        // reaches here — the replay branch above took it.)
+                        // A replay, the old key empty, and nothing journalled in
+                        // either key format: every attempt since 0.62.0
+                        // journals before it moves a row, so where the row
+                        // went is unknown. Skipping it lost the row silently
+                        // (N1); the run stops instead.
+                        None if replay => {
+                            return Err(Error::Transfer(format!(
+                                "log_based: re-key of a row missing at the destination and \
+                                 not in the residue journal ({old_pred}) — a replay out of \
+                                 order? Re-bootstrap {dest_table} (clear its _apitap_state \
+                                 row)"
+                            )));
+                        }
+                        // The old key is not there and this is a first attempt:
+                        // an attempt from before the journal existed already
+                        // moved the row.
                         None => continue,
                     }
                 }

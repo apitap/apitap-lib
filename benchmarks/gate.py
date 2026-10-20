@@ -289,6 +289,7 @@ LEGS = [
     leg("e2e_ch_changelog_mass_mask.py", "a ClickHouse changelog window with thousands of masked rows applies"),
     leg("e2e_ch_changelog_ext_key.py", "a changelog keeps the value an earlier update in the window set on an out-of-line key"),
     leg("e2e_ch_journal_window.py",  "a ClickHouse residue journal entry is only reused by its own op"),
+    leg("e2e_ch_journal_upgrade.py",  "a residue journal row that 0.62.0 wrote still recovers its op", {"wheel-0620"}),
     leg("e2e_pg_other_slots.py",     "a run names the other inactive apitap slots holding WAL for its tables"),
     leg("e2e_my_auth_plugin.py",     "a MySQL user on an unspoken auth plugin is told how to fix it", {"mariadb"}),
     leg("e2e_my_lower_case_names.py", "MySQL CDC with lower_case_table_names=1 follows a mixed-case table"),
@@ -437,6 +438,7 @@ def capabilities():
             why[cap] = f"{env} {reason}"
     need_wheel("wheel-0551", "APITAP_PY_0551", "0.55.1")
     need_wheel("wheel-0560", "APITAP_PY_0560", "0.56.0")
+    need_wheel("wheel-0620", "APITAP_PY_0620", "0.62.0")
 
     cpu = cgroup_cores()
     if cpu > 0.6:
