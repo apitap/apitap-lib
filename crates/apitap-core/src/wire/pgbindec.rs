@@ -53,8 +53,8 @@ pub(crate) fn render(oid: u32, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
         1700 => numeric(raw, out)?,
         // Text-shaped types: `send` format IS the text bytes.
         25 | 1043 | 1042 | 19 | 114 | 142 | 705 => out.extend_from_slice(raw),
-        // bytea: the WAL text plane always renders \x hex (bytea_output does
-        // not apply to logical decoding) — match it.
+        // bytea: the WAL text plane renders \x hex (the session pins
+        // bytea_output = hex) — match it.
         17 => {
             out.extend_from_slice(b"\\x");
             push_hex(raw, out);

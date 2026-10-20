@@ -129,7 +129,8 @@ pub(crate) fn row_key_refs<'a>(row: &'a Tuple, pk_idx: &[usize]) -> Vec<&'a [u8]
 }
 
 /// Decode Postgres bytea TEXT form to raw bytes. The WAL always renders
-/// `\x…` hex (`bytea_output` does not apply to logical decoding).
+/// `\x…` hex (the replication session pins `bytea_output = hex`: pgoutput's
+/// text cells honour it).
 pub(crate) fn decode_bytea(t: &[u8]) -> Result<Vec<u8>> {
     let hex_part = t
         .strip_prefix(b"\\x")

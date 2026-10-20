@@ -1080,6 +1080,12 @@ impl Walsender {
             ("DateStyle", "ISO"),
             ("IntervalStyle", "postgres"),
             ("extra_float_digits", "3"),
+            // pgoutput's text cells go through byteaout, which reads THIS
+            // session's bytea_output: a role or database set to 'escape'
+            // streamed `\000A` where every apply expects `\x0041`, and the
+            // MySQL, Iceberg and BigQuery lanes refused every window (deep
+            // review D33). The COPY plane dials through here too.
+            ("bytea_output", "hex"),
         ];
         if replication {
             params.push(("replication", "database"));

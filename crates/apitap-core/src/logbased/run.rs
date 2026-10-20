@@ -946,7 +946,9 @@ async fn run_group(
         // FULL, an ALTER), and so did the TOAST refetch (P2, T19).
         .after_connect(|conn, _meta| {
             Box::pin(async move {
-                sqlx::Executor::execute(conn, "SET lock_timeout = '30s'").await?;
+                sqlx::Executor::execute(&mut *conn, "SET lock_timeout = '30s'").await?;
+                // The TOAST refetch reads bytea as text (D33).
+                sqlx::Executor::execute(conn, "SET bytea_output = 'hex'").await?;
                 Ok(())
             })
         })

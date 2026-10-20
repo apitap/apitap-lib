@@ -49,7 +49,10 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
                 // ClickHouse's best_effort parser reads — saves an AT TIME ZONE cast on
                 // every row. Binary streams are timezone-independent, so this is safe
                 // for every lane.
-                sqlx::Executor::execute(conn, "SET timezone = 'UTC'").await?;
+                sqlx::Executor::execute(&mut *conn, "SET timezone = 'UTC'").await?;
+                // A text-mode bytea is `\x` hex everywhere apitap reads it,
+                // whatever the role or database sets (deep review D33).
+                sqlx::Executor::execute(conn, "SET bytea_output = 'hex'").await?;
                 Ok(())
             })
         })
