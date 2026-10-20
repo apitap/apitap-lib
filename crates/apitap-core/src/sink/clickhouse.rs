@@ -1154,13 +1154,15 @@ impl ChSink {
     /// what would be lost; `engine=` (and the table rebuilt deliberately) or a
     /// drop is the operator's call.
     async fn refuse_lossy_replace(&self) -> Result<()> {
+        // See `replace_losses` for what a plain rebuild would drop.
         let lit = ch_str(&self.final_bare);
         let row = self
             .ch
             .exec(&format!(
                 "SELECT engine, engine_full, partition_key, \
                         (SELECT count() FROM system.columns WHERE database = currentDatabase() \
-                         AND table = '{lit}' AND compression_codec != '') \
+                         AND table = '{lit}' AND compression_codec != ''), \
+                        (SELECT engine FROM system.databases WHERE name = currentDatabase()) \
                  FROM system.tables WHERE database = currentDatabase() AND name = '{lit}' \
                  FORMAT TabSeparatedRaw"
             ))
@@ -1170,25 +1172,14 @@ impl ChSink {
             return Ok(());
         }
         let mut f = row.split('\t');
-        let (engine, full, part, codecs) = (
+        let (engine, full, part, codecs, db_engine) = (
             f.next().unwrap_or(""),
             f.next().unwrap_or(""),
             f.next().unwrap_or(""),
             f.next().unwrap_or("0"),
+            f.next().unwrap_or(""),
         );
-        let mut lost = Vec::new();
-        if engine != "MergeTree" {
-            lost.push(format!("its engine {engine}"));
-        }
-        if !part.is_empty() {
-            lost.push(format!("PARTITION BY {part}"));
-        }
-        if full.contains(" TTL ") {
-            lost.push("its TTL".to_string());
-        }
-        if codecs.trim() != "0" {
-            lost.push(format!("the codecs on {} column(s)", codecs.trim()));
-        }
+        let lost = replace_losses(engine, full, part, codecs, db_engine);
         if lost.is_empty() {
             return Ok(());
         }
@@ -1710,6 +1701,41 @@ impl ChSink {
             announced: std::sync::Mutex::new(None),
         })
     }
+}
+
+/// What rebuilding an existing table as a plain `MergeTree` (a replace
+/// without engine=) would drop. The server's own default rebuild counts as
+/// plain: ClickHouse Cloud makes every MergeTree a SharedMergeTree, and a
+/// `Replicated` database makes it a ReplicatedMergeTree, so on either a
+/// replace without engine= was refused although nothing would be lost (deep
+/// review D21). Any other engine (SharedReplacingMergeTree included), a
+/// PARTITION BY, a TTL or column codecs is a loss.
+fn replace_losses(
+    engine: &str,
+    full: &str,
+    part: &str,
+    codecs: &str,
+    db_engine: &str,
+) -> Vec<String> {
+    let plain = match engine {
+        "MergeTree" | "SharedMergeTree" => true,
+        "ReplicatedMergeTree" => db_engine == "Replicated",
+        _ => false,
+    };
+    let mut lost = Vec::new();
+    if !plain {
+        lost.push(format!("its engine {engine}"));
+    }
+    if !part.is_empty() {
+        lost.push(format!("PARTITION BY {part}"));
+    }
+    if full.contains(" TTL ") {
+        lost.push("its TTL".to_string());
+    }
+    if codecs.trim() != "0" {
+        lost.push(format!("the codecs on {} column(s)", codecs.trim()));
+    }
+    lost
 }
 
 /// DROP one of apitap's OWN tables (staging, a shadow copy, the generation
@@ -3107,6 +3133,34 @@ mod tests {
             assert!(r.is_err(), "the failed drop is reported");
             assert_eq!(drops, 2, "the second drop was never attempted");
         });
+    }
+
+    /// D21: the server's own default rebuild is not a loss. Cloud makes a
+    /// MergeTree a SharedMergeTree, a Replicated database a
+    /// ReplicatedMergeTree; anything else, and partitioning, TTL or codecs,
+    /// still is.
+    #[test]
+    fn a_server_default_engine_is_not_a_replace_loss() {
+        use super::replace_losses;
+        assert!(replace_losses("MergeTree", "", "", "0", "Atomic").is_empty());
+        assert!(replace_losses("SharedMergeTree", "", "", "0", "Shared").is_empty());
+        assert!(replace_losses("ReplicatedMergeTree", "", "", "0", "Replicated").is_empty());
+        assert_eq!(
+            replace_losses("ReplicatedMergeTree", "", "", "0", "Atomic"),
+            ["its engine ReplicatedMergeTree"]
+        );
+        assert_eq!(
+            replace_losses("SharedReplacingMergeTree", "", "", "0", "Shared"),
+            ["its engine SharedReplacingMergeTree"]
+        );
+        assert_eq!(
+            replace_losses("SharedMergeTree", "x TTL ts", "toYYYYMM(ts)", "2", "Shared"),
+            [
+                "PARTITION BY toYYYYMM(ts)",
+                "its TTL",
+                "the codecs on 2 column(s)"
+            ]
+        );
     }
 
     /// A DELETE whose client is gone goes on as a mutation that reads the key
