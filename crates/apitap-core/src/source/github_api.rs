@@ -632,12 +632,31 @@ fn strip_nul(s: &str) -> std::borrow::Cow<'_, str> {
 
 fn strip_json_nul(s: String) -> String {
     // serde_json renders U+0000 as the escape \u0000 — remove it before the
-    // jsonb field for the same Postgres reason.
-    if s.contains("\\u0000") {
-        s.replace("\\u0000", "")
-    } else {
-        s
+    // jsonb field for the same Postgres reason. Escape by escape, not by
+    // substring: a body holding the TEXT `\u0000` serializes as `\\u0000`,
+    // and a plain replace matched from its second backslash, leaving `\`
+    // to escape the closing quote — invalid JSON, or the wrong text (D27).
+    if !s.contains("\\u0000") {
+        return s;
     }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            if b[i + 1..].starts_with(b"u0000") {
+                i += 6;
+            } else {
+                out.extend_from_slice(&b[i..i + 2]);
+                i += 2;
+            }
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    // Only ASCII escapes were removed, so the bytes are still UTF-8.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// True when this column's extraction would come up NULL for the object.
@@ -1113,6 +1132,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("APITAP_GITHUB_MAX_PAGES"), "{e}");
+    }
+
+    /// D27: only a REAL NUL escape goes. A body holding the literal text
+    /// `\u0000` serializes as `\\u0000`; the escaped backslash stays, and
+    /// so does the JSON around it.
+    #[test]
+    fn strip_json_nul_keeps_an_escaped_backslash() {
+        let lit = serde_json::json!({ "b": "seq \\u0000" }).to_string();
+        assert_eq!(super::strip_json_nul(lit.clone()), lit);
+        let lit_b = serde_json::json!({ "b": "x \\u0000b" }).to_string();
+        assert_eq!(super::strip_json_nul(lit_b.clone()), lit_b);
+        let nul = serde_json::json!({ "b": "a\u{0}b" }).to_string();
+        assert_eq!(super::strip_json_nul(nul), r#"{"b":"ab"}"#);
+        let both = serde_json::json!({ "b": "\\\u{0}" }).to_string();
+        assert_eq!(super::strip_json_nul(both), r#"{"b":"\\"}"#);
     }
 
     /// R2-11: the commits entity must stay replace-only — a cursor over
