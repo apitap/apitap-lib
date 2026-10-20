@@ -69,7 +69,7 @@ def refused(label, ddl_sql, table, dest=None):
 
 
 def more():
-    """N5: the forms the first parser let through."""
+    """N5: the forms the first parser let through; N16: a rename rotation."""
     # The tracked table is the WITH TABLE side of an exchange.
     t2 = "my_partition_ddl_x"
     my(f"DROP TABLE IF EXISTS {t2}; DROP TABLE IF EXISTS {T}")
@@ -86,6 +86,19 @@ def more():
         ch(f"DROP TABLE IF EXISTS {t2}")
         if ch("SELECT count() FROM system.tables WHERE database = 'default' AND name = '_apitap_state'") != "0":
             ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table = '{t2}' SETTINGS mutations_sync = 1")
+    # A rotation renames another table onto the tracked name (N16).
+    tr = "my_ddl_rotate"
+    my(f"DROP TABLE IF EXISTS {tr}; DROP TABLE IF EXISTS {tr}_new; DROP TABLE IF EXISTS {tr}_old; "
+       f"CREATE TABLE {tr} (id int PRIMARY KEY); INSERT INTO {tr} VALUES (1),(2); "
+       f"CREATE TABLE {tr}_new (id int PRIMARY KEY); INSERT INTO {tr}_new VALUES (5)")
+    ch(f"DROP TABLE IF EXISTS {tr}")
+    try:
+        refused("RENAME rotation", f"RENAME TABLE {tr} TO {tr}_old, {tr}_new TO {tr}", tr)
+    finally:
+        my(f"DROP TABLE IF EXISTS {tr}; DROP TABLE IF EXISTS {tr}_new; DROP TABLE IF EXISTS {tr}_old")
+        ch(f"DROP TABLE IF EXISTS {tr}")
+        if ch("SELECT count() FROM system.tables WHERE database = 'default' AND name = '_apitap_state'") != "0":
+            ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table = '{tr}' SETTINGS mutations_sync = 1")
     # The tracked table's whole database goes, and comes back.
     # Named across databases from `bench`: the dropped one cannot be dialled.
     db, td = "apitap_ddl_db", "my_ddl_db_t"

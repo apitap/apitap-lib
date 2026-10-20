@@ -901,10 +901,17 @@ pub(crate) async fn drain_binlog(
                              removes or swaps rows without row events, so the \
                              destination cannot follow it and would keep rows the \
                              source no longer has. Re-bootstrap {q} (clear its \
-                             _apitap_state row) to copy it fresh",
+                             _apitap_state row) to copy it fresh{}",
                             crate::sink::char_excerpt(head, 120),
                             sess.file,
-                            h.log_pos
+                            h.log_pos,
+                            if what == "RENAME TABLE" {
+                                ". An online schema change's cut-over (gh-ost, \
+                                 pt-online-schema-change) is such a rename: \
+                                 re-bootstrap after each one"
+                            } else {
+                                ""
+                            }
                         )));
                     }
                     // Anything already buffered belongs to the transaction this
@@ -1204,9 +1211,11 @@ fn truncate_target(sql: &str, db: &str) -> Option<String> {
 /// `ALTER TABLE [IF EXISTS] t DROP|TRUNCATE|EXCHANGE PARTITION` (both tables
 /// of an exchange), MariaDB's `CONVERT PARTITION|TABLE`, `DISCARD|IMPORT
 /// TABLESPACE`, `DROP TABLE t[, u]`, `DROP DATABASE|SCHEMA d` (as `d.*`) and
-/// MariaDB's `CREATE OR REPLACE TABLE t` (N5 added the ones D13 missed).
-/// `RENAME TABLE` is not here: it is
-/// the online-schema-change cut-over, whose new table arrived as rows.
+/// MariaDB's `CREATE OR REPLACE TABLE t` (N5 added the ones D13 missed),
+/// and a RENAME onto or away from a tracked name, `RENAME TABLE a TO b[, ..]`
+/// or `ALTER TABLE a RENAME [TO] b` (N16): the name then holds another
+/// table's rows, none of them sent as events. That includes the gh-ost and
+/// pt-osc cut-over; the refusal says so and names the re-bootstrap.
 fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
     let mut s = strip_leading_noise(sql);
     let word = |s: &mut &str, w: &str| -> bool {
@@ -1271,6 +1280,26 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
         }
         return out;
     }
+    if word(&mut s, "rename") {
+        if !word(&mut s, "table") && !word(&mut s, "tables") {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        loop {
+            let Some(from) = name(&mut s) else { break };
+            if !word(&mut s, "to") {
+                break;
+            }
+            let Some(to) = name(&mut s) else { break };
+            out.push((from, "RENAME TABLE"));
+            out.push((to, "RENAME TABLE"));
+            if !s.starts_with(',') {
+                break;
+            }
+            s = s[1..].trim_start();
+        }
+        return out;
+    }
     if word(&mut s, "create") {
         if !(word(&mut s, "or") && word(&mut s, "replace")) {
             return Vec::new();
@@ -1310,6 +1339,9 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
                 // The tablespace's rows vanish, or appear from a file.
                 ["discard", "tablespace"] => "DISCARD TABLESPACE",
                 ["import", "tablespace"] => "IMPORT TABLESPACE",
+                // `ALTER TABLE t RENAME [TO|AS] x`: t's rows leave the name (N16);
+                // `RENAME COLUMN|INDEX|KEY` only renames inside the table.
+                ["rename", w] if !matches!(*w, "column" | "index" | "key") => "RENAME TABLE",
                 ["exchange", "partition"] => {
                     // Both tables swap rows: the WITH TABLE side too (N5).
                     let mut out = vec![(t.clone(), "EXCHANGE PARTITION")];
@@ -1530,6 +1562,22 @@ mod query_verbs_tests {
             data_ddl("CREATE OR REPLACE TABLE t (id int)", "app"),
             t(&[("app.t", "CREATE OR REPLACE TABLE")])
         );
+        // N16: a rename onto or away from a name.
+        assert_eq!(
+            data_ddl("RENAME TABLE t TO t_old, t_new TO t", "app"),
+            t(&[
+                ("app.t", "RENAME TABLE"),
+                ("app.t_old", "RENAME TABLE"),
+                ("app.t_new", "RENAME TABLE"),
+                ("app.t", "RENAME TABLE")
+            ])
+        );
+        assert_eq!(
+            data_ddl("ALTER TABLE t RENAME TO t2", "app"),
+            t(&[("app.t", "RENAME TABLE")])
+        );
+        assert!(data_ddl("ALTER TABLE t RENAME COLUMN a TO b", "app").is_empty());
+        assert!(data_ddl("ALTER TABLE t RENAME INDEX i TO j", "app").is_empty());
         // N5: what D13's first parser let through.
         assert_eq!(
             data_ddl("DROP DATABASE IF EXISTS `shop`", "app"),
@@ -1576,7 +1624,6 @@ mod query_verbs_tests {
             "DROP TEMPORARY TABLE t",
             "DROP INDEX i ON t",
             "CREATE TABLE t (id int)",
-            "RENAME TABLE t TO t_old, t_new TO t",
             "TRUNCATE t",
         ] {
             assert!(data_ddl(sql, "app").is_empty(), "{sql}");
