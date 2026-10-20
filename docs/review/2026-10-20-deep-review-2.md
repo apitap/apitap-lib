@@ -16,7 +16,13 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N2 | FIXED: a tombstone-shaped table on the general path reads back with FINAL | `15684e4` | `e2e_ch_tombstone_upgrade` (0.62.1 data, current code: 7 of 10 keys stale) |
 | N18 | FIXED: the MySQL type spellings admit a MySQL source only | `c1bd09b` | `e2e_parquet_pg_time` (0.62.1: unreadable parquet, invalid UTF-8) |
 | gate | FIXED: a mis-registered leg had broken `gate.py` from `76691a1` | `1d32189` | `gate.py --matrix` |
-| rest | OPEN: N3/N14, N4/N13, N5/N15, N7, N8/N11, N10, N12, N16, N17, N19-N25, N27-N29 | — | — |
+| N8 / N11 | FIXED: the bootstrap walsender pins idle_in_transaction_session_timeout = 0 (and transaction_timeout = 0 on PG 17+) | `8206972` | `e2e_pg_cdc_snapshot_idle` (0.62.1: "invalid snapshot identifier") |
+| N3 / N14 | FIXED: a later move away from a key makes an earlier op on it moot | `4fc6d7c` | `e2e_masked_then_delete` pg, my (0.62.1: refused) |
+| N5 / N15 | FIXED: DROP DATABASE, ALTER TABLE IF EXISTS, EXCHANGE's WITH TABLE side, CONVERT, DISCARD/IMPORT TABLESPACE refuse | `2a58119` | `e2e_my_partition_ddl` (0.62.1: green, destination [9,1,2]) |
+| N4 / N13 | FIXED: the key twin's load lets 1062 through (and SHOW WARNINGS is read before the count) | `393f88a` | `e2e_my_ci_key_change` (0.62.1: key load refused) |
+| N7 | NEEDS DESIGN: the fix is persisting the source relation oid per member; the state row is a bare LSN that 0.55.1/0.56.0 also parse, so it needs a format or a side table | — | — |
+| N16 | NEEDS A DECISION: refusing RENAME onto a tracked name also stops every gh-ost/pt-osc cut-over | — | — |
+| rest | OPEN: N10, N12, N17, N19-N25, N27-N29 | — | — |
 
 ## Fix verdicts
 
