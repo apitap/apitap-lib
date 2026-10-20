@@ -829,7 +829,7 @@ async fn apply_unit(
     // tombstone path for the bulk — no key table, no DELETE; the ordered
     // residue tail below stays as-is (it deletes before it inserts, so no
     // same-version tie can arise).
-    let insert_only = u.insert_only(dest_table).await;
+    let insert_only = u.insert_only(dest_table, pk_cols).await;
 
     if !insert_only && (!c.deletes.is_empty() || !c.upserts.is_empty()) {
         let kt = u.key_table_reset(dest_table, pk_cols).await?;
@@ -1282,6 +1282,17 @@ fn is_insert_only_shape(engine_full: &str, has_ver: bool, has_deleted: bool) -> 
         && has_deleted
 }
 
+/// The columns of `system.tables.sorting_key` (`tenant_id, id`, quoted or
+/// not). An expression (`toDate(ts)`) stays as written, so it never equals a
+/// key column.
+fn sorting_cols(sorting_key: &str) -> Vec<String> {
+    sorting_key
+        .split(',')
+        .map(|c| c.trim().trim_matches('`').to_string())
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
 /// The column list an insert-only row is written with: the source columns
 /// plus the bookkeeping pair, in that order (design §14, slice 3).
 fn insert_only_cols(cols: &[String]) -> Vec<String> {
@@ -1367,8 +1378,13 @@ mod store {
         /// Once-per-run insert-only verdict per destination table (design
         /// §14): a Replacing-family engine carrying `_apitap_ver` and
         /// `_apitap_deleted` takes the tombstone path instead of
-        /// delete-then-insert. One catalog round trip per table, cached.
-        insert_only: Mutex<HashMap<String, bool>>,
+        /// delete-then-insert. One catalog round trip per table, cached:
+        /// the engine shape and the sorting key's columns.
+        insert_only: Mutex<HashMap<String, (bool, Vec<String>)>>,
+        /// The verdict an apply reached for a table, shape AND sorting key
+        /// against the replica identity (deep review D9). The parallel gate
+        /// reads it; a table not applied yet is not proven insert-only.
+        insert_only_verdict: Mutex<HashMap<String, bool>>,
         #[cfg(test)]
         pub(super) ops: Mutex<Vec<&'static str>>,
     }
@@ -1632,6 +1648,7 @@ mod store {
                 structures: Default::default(),
                 pins: Default::default(),
                 insert_only: Default::default(),
+                insert_only_verdict: Default::default(),
                 #[cfg(test)]
                 ops: Default::default(),
             })
@@ -1642,19 +1659,66 @@ mod store {
             self.ops.lock().unwrap().push(_op);
         }
 
-        /// The store-level name for the per-table insert-only probe — the
-        /// parallel-apply gate (review P0-7) needs it before any unit opens.
+        /// The verdict an apply of `table` reached — the parallel-apply gate
+        /// (review P0-7) asks it before a window opens its units. A table no
+        /// window has applied yet is not proven, so its first window runs
+        /// serially.
         pub(crate) async fn insert_only(&self, table: &str) -> bool {
-            self.detect_insert_only(table).await
+            self.insert_only_verdict
+                .lock()
+                .unwrap()
+                .get(table)
+                .copied()
+                .unwrap_or(false)
+        }
+
+        /// Whether `table` takes the tombstone path: the engine shape, AND a
+        /// sorting key that is exactly the replica identity `pk`. A tombstone
+        /// carries the key columns only and ReplacingMergeTree collapses by
+        /// the WHOLE sorting key, so with ORDER BY (tenant_id, id) over key
+        /// id a delete landed at (0, id) and the live row stayed, and a
+        /// tenant change left two rows (deep review D9). Such a table applies
+        /// by delete-then-insert, which addresses rows by the key.
+        pub(crate) async fn insert_only_for(&self, table: &str, pk: &[String]) -> bool {
+            let (shape, sorting) = self.detect_insert_only(table).await;
+            let keyed = {
+                let mut a: Vec<&str> = sorting.iter().map(String::as_str).collect();
+                let mut b: Vec<&str> = pk.iter().map(String::as_str).collect();
+                a.sort_unstable();
+                b.sort_unstable();
+                a == b
+            };
+            let v = shape && keyed;
+            let first = self
+                .insert_only_verdict
+                .lock()
+                .unwrap()
+                .insert(table.to_string(), v)
+                .is_none();
+            if first && v {
+                crate::progress::note(&format!(
+                    "insert-only apply: {table} (ReplacingMergeTree with tombstones; \
+                     readers need FINAL or __current)"
+                ));
+            } else if first && shape {
+                crate::progress::note(&format!(
+                    "{table} is ReplacingMergeTree(_apitap_ver, _apitap_deleted) but its \
+                     ORDER BY ({}) is not the key ({}): a tombstone would miss the row, so \
+                     it applies by delete-then-insert",
+                    sorting.join(", "),
+                    pk.join(", ")
+                ));
+            }
+            v
         }
 
         /// Insert-only detection (design §14): one catalog round trip per
         /// table per run. Any failure — unknown table, old server without
         /// `system.columns`, transport — reads as "not insert-only", which is
         /// exactly today's behaviour.
-        async fn detect_insert_only(&self, table: &str) -> bool {
+        async fn detect_insert_only(&self, table: &str) -> (bool, Vec<String>) {
             if let Some(v) = self.insert_only.lock().unwrap().get(table) {
-                return *v;
+                return v.clone();
             }
             let tbl = ch_str(table);
             // A LEFT JOIN, not correlated subqueries: ClickHouse refuses a
@@ -1665,11 +1729,12 @@ mod store {
                 .ch
                 .read(&format!(
                     "SELECT t.engine_full, countIf(c.name = '_apitap_ver' AND c.type = 'UInt64'), \
-                            countIf(c.name = '_apitap_deleted' AND c.type = 'UInt8') \
+                            countIf(c.name = '_apitap_deleted' AND c.type = 'UInt8'), \
+                            t.sorting_key \
                      FROM system.tables t \
                      LEFT JOIN system.columns c ON c.database = t.database AND c.table = t.name \
                      WHERE t.database = currentDatabase() AND t.name = '{tbl}' \
-                     GROUP BY t.engine_full LIMIT 1 FORMAT TabSeparated"
+                     GROUP BY t.engine_full, t.sorting_key LIMIT 1 FORMAT TabSeparated"
                 ))
                 .await
             {
@@ -1685,17 +1750,15 @@ mod store {
             let engine = f.next().unwrap_or("").trim();
             let has_ver = f.next().unwrap_or("0").trim() == "1";
             let has_deleted = f.next().unwrap_or("0").trim() == "1";
-            let v = super::is_insert_only_shape(engine, has_ver, has_deleted);
+            let sorting = super::sorting_cols(f.next().unwrap_or(""));
+            let v = (
+                super::is_insert_only_shape(engine, has_ver, has_deleted),
+                sorting,
+            );
             self.insert_only
                 .lock()
                 .unwrap()
-                .insert(table.to_string(), v);
-            if v {
-                crate::progress::note(&format!(
-                    "insert-only apply: {table} (ReplacingMergeTree with tombstones; \
-                     readers need FINAL or __current)"
-                ));
-            }
+                .insert(table.to_string(), v.clone());
             v
         }
 
@@ -2133,9 +2196,10 @@ mod store {
         }
 
         /// The cached insert-only verdict for this unit's destination table
-        /// (design §14); the first call per run reads the catalog.
-        pub(crate) async fn insert_only(&self, table: &str) -> bool {
-            self.s.detect_insert_only(table).await
+        /// (design §14, deep review D9); the first call per run reads the
+        /// catalog.
+        pub(crate) async fn insert_only(&self, table: &str, pk: &[String]) -> bool {
+            self.s.insert_only_for(table, pk).await
         }
 
         /// A read the server refuses to let write.
