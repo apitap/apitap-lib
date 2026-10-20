@@ -158,7 +158,7 @@ impl GithubSource {
             }
         }
         Ok(Self {
-            client: crate::http::client(),
+            client: crate::http::client_follow(),
             owner,
             repo,
             prefix,

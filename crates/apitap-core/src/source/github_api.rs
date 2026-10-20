@@ -420,7 +420,7 @@ impl GithubApiSource {
             )));
         }
         Ok(Self {
-            client: crate::http::client(),
+            client: crate::http::client_follow(),
             owner,
             repo,
             token: env_nonempty("GITHUB_TOKEN").or_else(|| env_nonempty("GH_TOKEN")),

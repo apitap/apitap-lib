@@ -81,6 +81,34 @@ pub(crate) fn pool_idle_ms() -> u64 {
 const POOL_IDLE_MS: u64 = 5000;
 
 pub(crate) fn client_idle(idle: Duration) -> reqwest::Client {
+    builder(idle)
+        // Follow only a redirect that keeps the request. A 301/302/303 to a
+        // POST is re-sent as a GET without its body: an Iceberg commit
+        // became a LoadTable that answered 200 and counted as committed, and
+        // a ClickHouse INSERT (`?query=` in the URL, rows in the body) can
+        // land zero rows with a 200 (deep review D23). Those come back as
+        // themselves, and every caller fails a status it does not expect.
+        // 307/308 keep the method and body (S3 answers a new bucket outside
+        // us-east-1 with a 307), so they are still followed.
+        .redirect(reqwest::redirect::Policy::custom(|a| {
+            if matches!(a.status().as_u16(), 307 | 308) && a.previous().len() < 10 {
+                a.follow()
+            } else {
+                a.stop()
+            }
+        }))
+        .build()
+        .unwrap_or_default()
+}
+
+/// `client()` that follows redirects, for the read-only GET sources whose
+/// files are served from elsewhere: GitHub release assets and raw files, and
+/// a Sheets export, answer with a redirect to their storage host.
+pub(crate) fn client_follow() -> reqwest::Client {
+    builder(Duration::from_secs(90)).build().unwrap_or_default()
+}
+
+fn builder(idle: Duration) -> reqwest::ClientBuilder {
     let mut b = reqwest::Client::builder()
         .connect_timeout(env_secs("APITAP_HTTP_CONNECT_TIMEOUT", CONNECT_SECS))
         .pool_idle_timeout(idle)
@@ -98,7 +126,7 @@ pub(crate) fn client_idle(idle: Duration) -> reqwest::Client {
     {
         b = b.read_timeout(Duration::from_secs(secs));
     }
-    b.build().unwrap_or_default()
+    b
 }
 
 /// A reqwest error that says WHY. reqwest's Display stops at "error sending
@@ -198,6 +226,73 @@ mod why_tests {
             .unwrap_err();
         let m = super::why(e);
         assert!(m.to_lowercase().contains("refused"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server answering every request with `status`, Location = `/next`,
+    /// and counting what reaches `/next`.
+    async fn redirecting(
+        status: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<String>>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let Ok(Ok((mut s, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), l.accept()).await
+                else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let answer = if line.contains(" /next ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    format!("HTTP/1.1 {status}\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                };
+                seen.push(line);
+                let _ = s.write_all(answer.as_bytes()).await;
+            }
+            seen
+        });
+        (addr, h)
+    }
+
+    /// D23: a 302 to a POST comes back as the 302, never as the 200 of the
+    /// GET a followed redirect would have sent; a 307 keeps the POST.
+    #[tokio::test]
+    async fn a_post_is_never_turned_into_a_get() {
+        let (addr, h) = redirecting("302 Found").await;
+        let r = super::client()
+            .post(format!("http://{addr}/commit"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 302);
+        let seen = h.await.unwrap();
+        assert_eq!(seen.len(), 1, "the redirect was followed: {seen:?}");
+
+        let (addr, h) = redirecting("307 Temporary Redirect").await;
+        let r = super::client()
+            .post(format!("http://{addr}/commit"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let seen = h.await.unwrap();
+        assert!(seen[1].starts_with("POST /next "), "{seen:?}");
     }
 }
 
