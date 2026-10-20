@@ -961,6 +961,9 @@ impl IcebergSink {
         let mut acc: Option<String> = None;
         let mut numeric = false;
         let mut saw_file = false;
+        // Rows whose cursor is NULL in every row group (D22): they bound
+        // nothing, but a table of ONLY such rows has no watermark at all.
+        let mut null_only = false;
         for mf in list.entries() {
             let m_bytes = s3.get_object(&self.uri_to_key(&mf.manifest_path)?).await?;
             let manifest = Manifest::parse_avro(&m_bytes)
@@ -975,7 +978,10 @@ impl IcebergSink {
                     .footer_cursor_max(&s3, df.file_path(), df.file_size_in_bytes(), cursor)
                     .await?
                 else {
-                    continue; // 0-row file (some writers land them) — nothing to learn
+                    // A 0-row file (some writers land them), or one whose
+                    // cursor is NULL throughout — nothing to learn.
+                    null_only |= df.record_count() > 0;
+                    continue;
                 };
                 numeric = num;
                 acc = wm_max(acc, Some(v), num);
@@ -984,6 +990,15 @@ impl IcebergSink {
         let _ = numeric;
         if !saw_file {
             return Ok(None);
+        }
+        if acc.is_none() && null_only {
+            // No watermark is not "copy everything": that would land every
+            // row a second time.
+            return Err(Error::InvalidInput(format!(
+                "iceberg: every row of the destination has a NULL '{cursor}', so \
+                 there is no watermark to resume an append from — use a cursor the \
+                 rows carry"
+            )));
         }
         Ok(acc)
     }
@@ -1040,8 +1055,19 @@ impl IcebergSink {
         // FIXED_LEN_BYTE_ARRAY decimals (a MySQL BIGINT UNSIGNED lands as
         // decimal(20,0)): big-endian two's complement, read as i128.
         let mut max_d: Option<i128> = None;
+        let mut counted = false;
         for rg in md.row_groups() {
-            match rg.column(idx).statistics() {
+            let stats = rg.column(idx).statistics();
+            // A row group whose cursor is NULL in every row has statistics
+            // with no min/max. The delta never selects a NULL cursor, so the
+            // group says nothing about the watermark; refusing it ("run once
+            // with mode='replace'") was a loop, since a replace seeds no
+            // watermark and the next append read these footers again (D22).
+            if stats.and_then(|st| st.null_count_opt()) == Some(rg.num_rows() as u64) {
+                continue;
+            }
+            counted = true;
+            match stats {
                 Some(Statistics::Int64(v)) => {
                     let m = *v.max_opt().ok_or_else(no_stats)?;
                     max_i = Some(max_i.map_or(m, |a| a.max(m)));
@@ -1077,6 +1103,9 @@ impl IcebergSink {
                 }
                 _ => return Err(no_stats()),
             }
+        }
+        if !counted {
+            return Ok(None);
         }
         match (col.physical_type(), col.logical_type(), max_i, max_s) {
             (
