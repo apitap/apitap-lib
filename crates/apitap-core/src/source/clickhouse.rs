@@ -58,6 +58,21 @@ fn lit(s: &str) -> String {
 /// nullability. `LowCardinality(T)` is fully transparent on the wire (the
 /// dictionary is never sent) — but it still has to come off before the inner
 /// type can be matched.
+/// The delta's watermark as a value of the cursor's type. The watermark is
+/// UTC wall-clock text: the destination column is DateTime64(6, 'UTC'). A
+/// bare string compared with a DateTime('America/Chicago') column is parsed
+/// in the COLUMN's zone (session_timezone covers only zone-less columns), so
+/// the threshold moved by the zone's offset: a negative offset skipped hours
+/// of rows, a positive one re-sent them (deep review D5). As an explicit UTC
+/// DateTime64 the comparison is between instants, whatever the column's zone.
+fn delta_literal(udt: &str, literal: &str) -> String {
+    let (inner, _) = peel(udt);
+    match inner.split('(').next().unwrap_or("") {
+        "DateTime" | "DateTime64" => format!("toDateTime64({literal}, 6, 'UTC')"),
+        _ => literal.to_string(),
+    }
+}
+
 fn peel(ty: &str) -> (String, bool) {
     let mut t = ty.trim().to_string();
     let mut nullable = false;
@@ -550,7 +565,21 @@ impl crate::source::Source for ChSource {
             .collect::<Vec<_>>()
             .join(", ");
         let dpred = delta
-            .map(|d| format!(" AND {} {} {}", q(&d.col), d.op, d.literal))
+            .map(|d| {
+                let udt = plan
+                    .cols
+                    .iter()
+                    .chain(plan.cursor_col.iter())
+                    .find(|c| c.name == d.col)
+                    .map(|c| c.udt.as_str())
+                    .unwrap_or("");
+                format!(
+                    " AND {} {} {}",
+                    q(&d.col),
+                    d.op,
+                    delta_literal(udt, &d.literal)
+                )
+            })
             .unwrap_or_default();
         let one =
             |pred: String| format!("SELECT {select_list} FROM {src} WHERE {pred} FORMAT RowBinary");
@@ -884,5 +913,24 @@ mod tests {
         // backslash-first escape also closes the backslash injection.
         assert_eq!(q("we`ird"), "`we\\`ird`");
         assert_eq!(lit("o'hara"), "'o\\'hara'");
+    }
+}
+
+#[cfg(test)]
+mod delta_literal_tests {
+    use super::delta_literal;
+
+    #[test]
+    fn a_datetime_watermark_is_compared_as_a_utc_instant() {
+        let w = "'2026-10-20 12:00:00.000000'";
+        let want = "toDateTime64('2026-10-20 12:00:00.000000', 6, 'UTC')";
+        assert_eq!(delta_literal("DateTime('America/Chicago')", w), want);
+        assert_eq!(
+            delta_literal("Nullable(DateTime64(3, 'Asia/Jakarta'))", w),
+            want
+        );
+        assert_eq!(delta_literal("DateTime", w), want);
+        assert_eq!(delta_literal("Date", "'2026-10-20'"), "'2026-10-20'");
+        assert_eq!(delta_literal("UInt64", "42"), "42");
     }
 }
