@@ -1359,14 +1359,27 @@ impl PgSink {
                     .map_err(|e| Error::Transfer(format!("swap commit: {e}")))?;
                 // Re-apply what the swap destroyed. Runs AFTER the commit so index
                 // builds don't extend the exclusive-lock window; the data is already
-                // live. A failure here is reported with the exact statement — the
-                // rows are correct, only the post-DDL needs attention.
+                // live. EVERY statement runs: one that fails (an FK the new rows
+                // break, a NOT NULL a source NULL breaks) used to end the loop,
+                // and the grants, indexes and publication membership behind it
+                // were never restored — and the next replace captured the
+                // degraded table, so they were gone for good (deep review D24).
+                // The failures are reported together, each with its statement.
+                let mut failed = Vec::new();
                 for ddl in &self.restore_ddl {
-                    sqlx::query(ddl).execute(&self.pool).await.map_err(|e| {
-                        Error::Transfer(format!(
-                            "rows landed, but restoring destination DDL failed: `{ddl}`: {e}"
-                        ))
-                    })?;
+                    if let Err(e) = sqlx::query(ddl).execute(&self.pool).await {
+                        failed.push(format!("`{ddl}`: {e}"));
+                    }
+                }
+                if !failed.is_empty() {
+                    return Err(Error::Transfer(format!(
+                        "rows landed, but {} of {} destination DDL statement(s) could not be \
+                         restored; the rest were. Run these once the cause is fixed — the \
+                         next replace copies the table as it is now: {}",
+                        failed.len(),
+                        self.restore_ddl.len(),
+                        failed.join("; ")
+                    )));
                 }
                 Ok(())
             }
