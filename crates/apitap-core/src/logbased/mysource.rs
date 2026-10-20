@@ -886,8 +886,14 @@ pub(crate) async fn drain_binlog(
                     // destination cannot follow it, so the run stops before
                     // anything of it is applied, naming the fix.
                     for (t, what) in data_ddl(head, &db) {
-                        let Some(q) = sess.tracked.keys().find(|k| k.eq_ignore_ascii_case(&t))
-                        else {
+                        // `db.*` (DROP DATABASE) is every tracked table in db.
+                        let hit = |k: &&String| match t.strip_suffix(".*") {
+                            Some(d) => k
+                                .split_once('.')
+                                .is_some_and(|(kd, _)| kd.eq_ignore_ascii_case(d)),
+                            None => k.eq_ignore_ascii_case(&t),
+                        };
+                        let Some(q) = sess.tracked.keys().find(hit) else {
                             continue;
                         };
                         return Err(Error::Transfer(format!(
@@ -1195,8 +1201,11 @@ fn truncate_target(sql: &str, db: &str) -> Option<String> {
 /// QUERY, even under binlog_format=ROW, so a dropped partition's rows never
 /// reach the drain as deletes; treated as schema-only, the destination kept
 /// them forever. TRUNCATE is applied (`truncate_target`); these are refused:
-/// `ALTER TABLE t DROP|TRUNCATE|EXCHANGE PARTITION`, `DROP TABLE t[, u]` and
-/// MariaDB's `CREATE OR REPLACE TABLE t`. `RENAME TABLE` is not here: it is
+/// `ALTER TABLE [IF EXISTS] t DROP|TRUNCATE|EXCHANGE PARTITION` (both tables
+/// of an exchange), MariaDB's `CONVERT PARTITION|TABLE`, `DISCARD|IMPORT
+/// TABLESPACE`, `DROP TABLE t[, u]`, `DROP DATABASE|SCHEMA d` (as `d.*`) and
+/// MariaDB's `CREATE OR REPLACE TABLE t` (N5 added the ones D13 missed).
+/// `RENAME TABLE` is not here: it is
 /// the online-schema-change cut-over, whose new table arrived as rows.
 fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
     let mut s = strip_leading_noise(sql);
@@ -1227,6 +1236,25 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
         })
     };
     if word(&mut s, "drop") {
+        // Every table of the database goes, with no row events (N5): `db.*`
+        // stands for each tracked table in it.
+        if word(&mut s, "database") || word(&mut s, "schema") {
+            if word(&mut s, "if") {
+                word(&mut s, "exists");
+            }
+            let end = s
+                .find(|c: char| c.is_whitespace() || c == ';')
+                .unwrap_or(s.len());
+            let d: String = s[..end]
+                .chars()
+                .filter(|c| *c != '`' && *c != '"')
+                .collect();
+            return if d.is_empty() {
+                Vec::new()
+            } else {
+                vec![(format!("{d}.*"), "DROP DATABASE")]
+            };
+        }
         if word(&mut s, "temporary") || !word(&mut s, "table") {
             return Vec::new();
         }
@@ -1260,6 +1288,10 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
         if !word(&mut s, "table") {
             return Vec::new();
         }
+        // MariaDB 10.5+: `ALTER TABLE IF EXISTS t ...` (N5).
+        if word(&mut s, "if") {
+            word(&mut s, "exists");
+        }
         let Some(t) = name(&mut s) else {
             return Vec::new();
         };
@@ -1272,7 +1304,27 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
             let what = match w {
                 ["drop", "partition"] => "DROP PARTITION",
                 ["truncate", "partition"] => "TRUNCATE PARTITION",
-                ["exchange", "partition"] => "EXCHANGE PARTITION",
+                // MariaDB 10.7+: rows leave as a table, or arrive from one.
+                ["convert", "partition"] => "CONVERT PARTITION",
+                ["convert", "table"] => "CONVERT TABLE",
+                // The tablespace's rows vanish, or appear from a file.
+                ["discard", "tablespace"] => "DISCARD TABLESPACE",
+                ["import", "tablespace"] => "IMPORT TABLESPACE",
+                ["exchange", "partition"] => {
+                    // Both tables swap rows: the WITH TABLE side too (N5).
+                    let mut out = vec![(t.clone(), "EXCHANGE PARTITION")];
+                    let toks: Vec<&str> = s.split_whitespace().collect();
+                    let other = toks.windows(3).find_map(|p| {
+                        (p[0].eq_ignore_ascii_case("with") && p[1].eq_ignore_ascii_case("table"))
+                            .then_some(p[2])
+                    });
+                    if let Some(mut rest) = other {
+                        if let Some(t2) = name(&mut rest) {
+                            out.push((t2, "EXCHANGE PARTITION"));
+                        }
+                    }
+                    return out;
+                }
                 _ => continue,
             };
             return vec![(t, what)];
@@ -1465,7 +1517,10 @@ mod query_verbs_tests {
         );
         assert_eq!(
             data_ddl("ALTER TABLE e EXCHANGE PARTITION p WITH TABLE e_old", "app"),
-            t(&[("app.e", "EXCHANGE PARTITION")])
+            t(&[
+                ("app.e", "EXCHANGE PARTITION"),
+                ("app.e_old", "EXCHANGE PARTITION")
+            ])
         );
         assert_eq!(
             data_ddl("DROP TABLE IF EXISTS `a`, other.b;", "app"),
@@ -1474,6 +1529,44 @@ mod query_verbs_tests {
         assert_eq!(
             data_ddl("CREATE OR REPLACE TABLE t (id int)", "app"),
             t(&[("app.t", "CREATE OR REPLACE TABLE")])
+        );
+        // N5: what D13's first parser let through.
+        assert_eq!(
+            data_ddl("DROP DATABASE IF EXISTS `shop`", "app"),
+            t(&[("shop.*", "DROP DATABASE")])
+        );
+        assert_eq!(
+            data_ddl("DROP SCHEMA shop;", "app"),
+            t(&[("shop.*", "DROP DATABASE")])
+        );
+        assert_eq!(
+            data_ddl("ALTER TABLE IF EXISTS events DROP PARTITION p1", "app"),
+            t(&[("app.events", "DROP PARTITION")])
+        );
+        assert_eq!(
+            data_ddl(
+                "ALTER TABLE e EXCHANGE PARTITION p WITH TABLE `arch`.e_old",
+                "app"
+            ),
+            t(&[
+                ("app.e", "EXCHANGE PARTITION"),
+                ("arch.e_old", "EXCHANGE PARTITION")
+            ])
+        );
+        assert_eq!(
+            data_ddl("ALTER TABLE e CONVERT PARTITION p1 TO TABLE e_p1", "app"),
+            t(&[("app.e", "CONVERT PARTITION")])
+        );
+        assert_eq!(
+            data_ddl(
+                "ALTER TABLE e CONVERT TABLE e_new TO PARTITION p9 VALUES LESS THAN (9)",
+                "app"
+            ),
+            t(&[("app.e", "CONVERT TABLE")])
+        );
+        assert_eq!(
+            data_ddl("ALTER TABLE e IMPORT TABLESPACE", "app"),
+            t(&[("app.e", "IMPORT TABLESPACE")])
         );
         // Schema-only, or not data-losing: none of these.
         for sql in [

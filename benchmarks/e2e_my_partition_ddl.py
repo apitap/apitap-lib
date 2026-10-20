@@ -54,6 +54,57 @@ def ids_dst():
     return ch(f"SELECT arrayStringConcat(groupArray(toString(id)), ',') FROM (SELECT id FROM {T} ORDER BY id)")
 
 
+def refused(label, ddl_sql, table, dest=None):
+    """Bootstrap `table` (already created), run `ddl_sql`, drain: refused, or exact."""
+    kw = {"dest_table": dest} if dest else {}
+    apitap.transfer(MY, CH, table=table, mode="log_based", **kw)
+    my(ddl_sql)
+    try:
+        apitap.transfer(MY, CH, table=table, mode="log_based", **kw)
+    except Exception as e:  # noqa: BLE001 — the message is what is checked
+        assert "removes or swaps rows" in str(e), f"[{label}] refused for the wrong reason: {e}"
+        print(f"  [{label}] refused: {str(e)[:100]}...")
+    else:
+        raise AssertionError(f"[{label}] a green drain after {ddl_sql!r}: the destination keeps the old rows")
+
+
+def more():
+    """N5: the forms the first parser let through."""
+    # The tracked table is the WITH TABLE side of an exchange.
+    t2 = "my_partition_ddl_x"
+    my(f"DROP TABLE IF EXISTS {t2}; DROP TABLE IF EXISTS {T}")
+    ch(f"DROP TABLE IF EXISTS {t2}")
+    try:
+        my(f"CREATE TABLE {T} (id int NOT NULL, m int NOT NULL, PRIMARY KEY (id, m)) "
+           f"PARTITION BY RANGE (m) (PARTITION p1 VALUES LESS THAN (2), PARTITION p2 VALUES LESS THAN (3)); "
+           f"INSERT INTO {T} VALUES (1,1),(2,1); "
+           f"CREATE TABLE {t2} (id int NOT NULL, m int NOT NULL, PRIMARY KEY (id, m)); "
+           f"INSERT INTO {t2} VALUES (7,1)")
+        refused("exchange WITH TABLE", f"ALTER TABLE {T} EXCHANGE PARTITION p1 WITH TABLE {t2}", t2)
+    finally:
+        my(f"DROP TABLE IF EXISTS {t2}")
+        ch(f"DROP TABLE IF EXISTS {t2}")
+        if ch("SELECT count() FROM system.tables WHERE database = 'default' AND name = '_apitap_state'") != "0":
+            ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table = '{t2}' SETTINGS mutations_sync = 1")
+    # The tracked table's whole database goes, and comes back.
+    # Named across databases from `bench`: the dropped one cannot be dialled.
+    db, td = "apitap_ddl_db", "my_ddl_db_t"
+    my(f"DROP DATABASE IF EXISTS {db}; CREATE DATABASE {db}; "
+       f"CREATE TABLE {db}.{td} (id int PRIMARY KEY); INSERT INTO {db}.{td} VALUES (1),(2)")
+    ch(f"DROP TABLE IF EXISTS {td}")
+    try:
+        # Recreated before the next drain: a plain drop is caught at startup
+        # (the table is not in the catalog); this shape is the silent one.
+        refused("DROP DATABASE", f"DROP DATABASE {db}; CREATE DATABASE {db}; "
+                f"CREATE TABLE {db}.{td} (id int PRIMARY KEY); INSERT INTO {db}.{td} VALUES (9)",
+                f"{db}.{td}", td)
+    finally:
+        my(f"DROP DATABASE IF EXISTS {db}")
+        ch(f"DROP TABLE IF EXISTS {td}")
+        if ch("SELECT count() FROM system.tables WHERE database = 'default' AND name = '_apitap_state'") != "0":
+            ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table = '{td}' SETTINGS mutations_sync = 1")
+
+
 def main():
     wipe()
     try:
@@ -78,6 +129,7 @@ def main():
             print("  the drain applied DROP PARTITION exactly")
     finally:
         wipe()
+    more()
     print("✓ MySQL CDC never ignores a DDL that removes tracked rows")
 
 
