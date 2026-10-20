@@ -116,6 +116,13 @@ impl Changes {
     /// and its `U` names the old key in `moved_from`.
     pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple) {
         self.count += 1;
+        // An out-of-line key the UPDATE left alone arrives unchanged-TOAST;
+        // read as `[""]` it made every such update a move, and the carry of
+        // the row's resolved cells went under the wrong key (D7).
+        let row = match old {
+            Some(o) => crate::logbased::collapse::key_from_old(self.layout.key_idx(), o, row),
+            None => row,
+        };
         self.note_mask(&row);
         let mut moved_from = None;
         let pk_idx = self.layout.key_idx();
@@ -488,6 +495,41 @@ mod tests {
                 (3, "OLD".to_string()),
                 (4, "OLD".to_string())
             ])
+        );
+    }
+
+    /// D7: an out-of-line key the UPDATE left alone arrives unchanged-TOAST.
+    /// It is the old key, not a move: no `D` half, and the second update's
+    /// masked body inherits the first's NEW value, not the destination's OLD.
+    #[test]
+    fn an_unchanged_out_of_line_key_is_not_a_move() {
+        let mut c = three();
+        let old = row(&[t("K"), Cell::Null, Cell::Null]);
+        c.update(Some(&old), row(&[Cell::UnchangedToast, t("t1"), t("NEW")]));
+        c.update(
+            Some(&old),
+            row(&[Cell::UnchangedToast, t("t2"), Cell::UnchangedToast]),
+        );
+        assert_eq!(c.events.len(), 2, "an unchanged key made a D half");
+        assert!(c.events.iter().all(|e| e.moved_from.is_none()));
+        let (keys, cols) = c.mask_plan();
+        assert_eq!(keys, vec![vec![b"K".to_vec()]]);
+        assert_eq!(cols, vec![2]);
+        let mut base = HashMap::new();
+        base.insert(
+            vec![b"K".to_vec()],
+            vec![Some(bytes::Bytes::from_static(b"OLD"))],
+        );
+        let fixed = c.resolve_masked(&cols, &base).unwrap();
+        let cell = |i: usize, col: usize| match fixed[&i].view(col) {
+            Cellv::Text(t) => String::from_utf8_lossy(t).to_string(),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(cell(1, 0), "K");
+        assert_eq!(
+            cell(1, 2),
+            "NEW",
+            "the second update reverted body to the pre-window value"
         );
     }
 

@@ -279,6 +279,7 @@ LEGS = [
     leg("e2e_my_composite_cursor.py", "an append without cursor= never auto-picks part of a composite key"),
     leg("e2e_ch_tz_cursor.py",        "a ClickHouse-source DateTime cursor with its own time zone resumes exactly"),
     leg("e2e_ch_changelog_mass_mask.py", "a ClickHouse changelog window with thousands of masked rows applies"),
+    leg("e2e_ch_changelog_ext_key.py", "a changelog keeps the value an earlier update in the window set on an out-of-line key"),
     leg("e2e_ch_journal_window.py",  "a ClickHouse residue journal entry is only reused by its own op"),
     leg("e2e_pg_other_slots.py",     "a run names the other inactive apitap slots holding WAL for its tables"),
     leg("e2e_my_auth_plugin.py",     "a MySQL user on an unspoken auth plugin is told how to fix it", {"mariadb"}),

@@ -93,6 +93,28 @@ impl DeleteSet {
     }
 }
 
+/// A new image's key cells that arrived unchanged-TOAST (an out-of-line key
+/// the UPDATE left alone), filled from the old image: an unchanged key IS the
+/// old key. Postgres logs the old key whenever an identity column is stored
+/// externally, so the value is there. Both the replica collapse and the
+/// changelog read a row's key through this; the changelog read `[""]` and
+/// took the update for a move (deep review D7).
+pub(crate) fn key_from_old(idx: &[usize], old: &Tuple, row: Tuple) -> Tuple {
+    if !idx
+        .iter()
+        .any(|&i| matches!(row.get(i), Some(Cellv::UnchangedToast)))
+    {
+        return row;
+    }
+    let mut cells = row.to_cells();
+    for &i in idx {
+        if let (Some(Cell::UnchangedToast), Some(Cellv::Text(t))) = (cells.get(i), old.get(i)) {
+            cells[i] = Cell::Text(bytes::Bytes::copy_from_slice(t));
+        }
+    }
+    Tuple::from_cells(&cells)
+}
+
 /// One table's collapsed window.
 #[derive(Debug, Default)]
 pub(crate) struct Collapsed {
@@ -267,20 +289,7 @@ impl Collapser {
     /// as an "unsupported layout" on every rerun, wedging the lane (P2). The
     /// rare path rebuilds the tuple; the common one returns it untouched.
     fn key_from_old(&self, old: &Tuple, row: Tuple) -> Tuple {
-        let idx = self.layout.key_idx();
-        if !idx
-            .iter()
-            .any(|&i| matches!(row.get(i), Some(Cellv::UnchangedToast)))
-        {
-            return row;
-        }
-        let mut cells = row.to_cells();
-        for &i in idx {
-            if let (Some(Cell::UnchangedToast), Some(Cellv::Text(t))) = (cells.get(i), old.get(i)) {
-                cells[i] = Cell::Text(bytes::Bytes::copy_from_slice(t));
-            }
-        }
-        Tuple::from_cells(&cells)
+        key_from_old(self.layout.key_idx(), old, row)
     }
 
     /// Key of an OLD image. `K` images carry ONLY key columns as Text, with
