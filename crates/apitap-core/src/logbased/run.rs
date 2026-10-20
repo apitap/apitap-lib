@@ -1310,7 +1310,14 @@ async fn run_group_mysql(
             let su = src_url.to_string();
             let du = dst_url.to_string();
             let run_c = tenure.run().clone();
-            let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, o2| {
+            let (mark, out) = myrun::bootstrap(&pool, &ctxs, opts, |table_arg, mut o2| {
+                // The Postgres bootstrap defaults a ClickHouse ORDER BY to the
+                // key; this one never did, so a composite or text key landed
+                // ORDER BY tuple(): every window's delete scanned the table, and
+                // a Replacing engine collapsed all rows toward one (D16).
+                if let Some(c) = ctxs.iter().find(|c| c.table_arg == table_arg) {
+                    dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
+                }
                 let (su, du, r) = (su.clone(), du.clone(), run_c.clone());
                 async move {
                     let rep =

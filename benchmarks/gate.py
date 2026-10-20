@@ -289,6 +289,7 @@ LEGS = [
     leg("e2e_my_auth_plugin.py",     "a MySQL user on an unspoken auth plugin is told how to fix it", {"mariadb"}),
     leg("e2e_my_lower_case_names.py", "MySQL CDC with lower_case_table_names=1 follows a mixed-case table"),
     leg("e2e_my_partition_ddl.py",   "MySQL CDC refuses a DDL that removes tracked rows without row events"),
+    leg("e2e_my_ch_bootstrap_order.py", "a MySQL CDC bootstrap into ClickHouse orders the table by its key"),
     leg("e2e_my_table_id_reuse.py",  "MySQL CDC never applies an untracked table's rows to a tracked one after a restart"),
     leg("e2e_read_pushdown.py",      "read().lazy() pushdown returns exactly the rows polars keeps, Postgres", argv=["pg"]),
     leg("e2e_read_pushdown.py",      "read().lazy() pushdown returns exactly the rows polars keeps, MySQL", argv=["my"]),
