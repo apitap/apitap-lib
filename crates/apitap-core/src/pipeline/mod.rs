@@ -628,8 +628,11 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     let mut plan = src.probe(table).await?;
     // An incremental run auto-picks only a single-column key (D6); a replace
     // still splits its read on any lone integer key column.
+    // A source may name its own split column (ClickHouse: the leading
+    // sorting key, the only split that prunes granules); a replace keeps it
+    // when there is no lone integer key, instead of reading one stream (D26).
     plan.cursor = opts.cursor.clone().or_else(|| match opts.mode {
-        Mode::Replace => plan.single_int_pk(),
+        Mode::Replace => plan.single_int_pk().or_else(|| plan.cursor.clone()),
         _ => plan.auto_cursor(),
     });
     sink.adjust_plan(&mut plan);

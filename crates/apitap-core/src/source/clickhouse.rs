@@ -356,6 +356,7 @@ impl crate::source::Source for ChSource {
             ))
             .await?;
         let mut cols = Vec::new();
+        let mut sort_ints = Vec::new();
         for line in rows.lines().filter(|l| !l.trim().is_empty()) {
             let mut f = line.split('\t');
             let (cname, ty, pk) = (
@@ -365,15 +366,24 @@ impl crate::source::Source for ChSource {
             );
             let (inner, nullable) = peel(&ty);
             let d = delivered_of(&inner);
-            let int_pk = pk && matches!(d, Delivered::Int { .. }) && !nullable;
+            // A ClickHouse PRIMARY KEY is the sparse sorting prefix, never
+            // unique: flagged as the table's integer key, ORDER BY (user_id,
+            // ts) made user_id the auto-picked append cursor, and run 2 never
+            // copied a new event of an existing user (deep review D26). The
+            // sort-key columns still order the destination (`pk_cols`), and
+            // the leading one still splits a read (`cursor` below).
+            let sort_int = pk && matches!(d, Delivered::Int { .. }) && !nullable;
             let (precision, scale) = match d {
                 Delivered::Decimal { p, s } => (Some(p as i32), Some(s as i32)),
                 _ => (None, None),
             };
+            if sort_int {
+                sort_ints.push(cname.clone());
+            }
             cols.push(ColumnPlan {
                 name: cname,
                 nullable,
-                int_pk,
+                int_pk: false,
                 native_ddl: Some(ty.clone()),
                 udt: inner,
                 precision,
@@ -414,11 +424,7 @@ impl crate::source::Source for ChSource {
                     && !c.nullable
             })
             .map(|c| c.name.clone());
-        let pk_cols: Vec<String> = cols
-            .iter()
-            .filter(|c| c.int_pk)
-            .map(|c| c.name.clone())
-            .collect();
+        let pk_cols = sort_ints;
 
         Ok(TablePlan {
             engine: "clickhouse",
