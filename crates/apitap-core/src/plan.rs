@@ -92,6 +92,21 @@ impl TablePlan {
             _ => None,
         }
     }
+
+    /// The cursor an incremental run may pick by itself: the integer column
+    /// of a SINGLE-column primary key. A composite key's integer part is not
+    /// unique: MySQL marks every column of PRIMARY KEY (tenant_id INT, sku
+    /// VARCHAR) as PRI, single_int_pk returned tenant_id, and run 2 read
+    /// `tenant_id > max(tenant_id)` and never copied a new sku of an existing
+    /// tenant (deep review D6). A source that does not report its key
+    /// (pk_cols empty) keeps the int_pk rule; a replace may still split on
+    /// single_int_pk, where any integer column covers the table.
+    pub(crate) fn auto_cursor(&self) -> Option<String> {
+        if self.pk_cols.len() > 1 {
+            return None;
+        }
+        self.single_int_pk()
+    }
 }
 
 /// Stream formats that can cross the process. Negotiation picks the FIRST format the
@@ -587,5 +602,40 @@ mod wm_tests {
         // destination, where trusting 5000 is correct. 0.56.0's `pending`
         // column is what tells the two apart; until then this is the gap.
         assert_eq!(r("5000", "3000"), "5000");
+    }
+}
+
+#[cfg(test)]
+mod auto_cursor_tests {
+    fn col(n: &str, int_pk: bool) -> super::ColumnPlan {
+        super::ColumnPlan {
+            name: n.into(),
+            nullable: false,
+            int_pk,
+            native_ddl: None,
+            udt: if int_pk { "int" } else { "varchar" }.into(),
+            precision: None,
+            scale: None,
+        }
+    }
+
+    /// D6: the integer part of a composite key is never an incremental cursor.
+    #[test]
+    fn a_composite_keys_integer_part_is_not_an_incremental_cursor() {
+        let composite = super::TablePlan {
+            engine: "mysql",
+            cols: vec![col("tenant_id", true), col("sku", false)],
+            cursor: None,
+            pk_cols: vec!["tenant_id".into(), "sku".into()],
+            cursor_col: None,
+        };
+        assert_eq!(composite.auto_cursor(), None);
+        assert_eq!(composite.single_int_pk().as_deref(), Some("tenant_id"));
+        let single = super::TablePlan {
+            pk_cols: vec!["tenant_id".into()],
+            cols: vec![col("tenant_id", true), col("sku", false)],
+            ..composite
+        };
+        assert_eq!(single.auto_cursor().as_deref(), Some("tenant_id"));
     }
 }

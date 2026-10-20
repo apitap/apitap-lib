@@ -626,7 +626,12 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
     source_id: &str,
 ) -> Result<TransferReport> {
     let mut plan = src.probe(table).await?;
-    plan.cursor = opts.cursor.clone().or_else(|| plan.single_int_pk());
+    // An incremental run auto-picks only a single-column key (D6); a replace
+    // still splits its read on any lone integer key column.
+    plan.cursor = opts.cursor.clone().or_else(|| match opts.mode {
+        Mode::Replace => plan.single_int_pk(),
+        _ => plan.auto_cursor(),
+    });
     sink.adjust_plan(&mut plan);
 
     // Incremental resolution: find the watermark in the DESTINATION (stateless — no

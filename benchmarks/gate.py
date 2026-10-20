@@ -274,6 +274,7 @@ LEGS = [
     leg("e2e_pg_char_key_residue.py", "a char(n) key on the Postgres CDC residue path matches its row"),
     leg("e2e_masked_then_delete.py",  "a masked update whose key the window deletes never wedges a Postgres destination", argv=["pg"]),
     leg("e2e_masked_then_delete.py",  "the same, into MySQL", argv=["my"]),
+    leg("e2e_my_composite_cursor.py", "an append without cursor= never auto-picks part of a composite key"),
     leg("e2e_pg_other_slots.py",     "a run names the other inactive apitap slots holding WAL for its tables"),
     leg("e2e_my_auth_plugin.py",     "a MySQL user on an unspoken auth plugin is told how to fix it", {"mariadb"}),
     leg("e2e_my_lower_case_names.py", "MySQL CDC with lower_case_table_names=1 follows a mixed-case table"),
