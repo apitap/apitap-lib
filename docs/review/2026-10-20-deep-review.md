@@ -17,7 +17,7 @@ Each fix below had a leg that failed on the build without it and passes with it;
 | D11 | FIXED: `residue_cast` maps character → bpchar, keeps array brackets | `5e13b3b` | `e2e_pg_char_key_residue` (pre-fix HEAD) |
 | D12 | FIXED: a masked op whose key a later op deletes is not refused (pg and my) | `879821d` | `e2e_masked_then_delete` pg, my (pre-fix HEAD) |
 | D31 | FIXED: the holder sets `idle_in_transaction_session_timeout = 0` (and `transaction_timeout = 0` on PG 17+) | `1aadf13` | `e2e_pg_snapshot_idle` (pre-fix HEAD: "invalid snapshot identifier") |
-| D10 | OPEN: a fault-injection leg (cut mid-residue, shorter 1 MiB replay, then a newer masked op) stayed green on the pre-fix build, so the stale entry was never reused. Not fixed blind; needs instrumenting the apply to find which assumption fails | — | — |
+| D10 | FIXED after 0.62.0: a journal entry is keyed by its op's commit position (`pos\|n\|pred`, `ver = pos`), and an insert-only image takes this window's `_apitap_ver` at apply. The first leg proved nothing: `APITAP_DEBUG` traces showed attempt A was cut in the set phase, before any journal row existed; armed on the journal write it reproduces | (this commit) | `e2e_ch_journal_window` (0.62.0: "lost update: id=1 is 'a'") |
 | D3, D4, D8, D19 | BLOCKED: BigQuery, the bench service-account key is invalid | — | — |
 | other P1 | OPEN: all were already in 0.61.0, and the 0.63.0 work list | — | — |
 

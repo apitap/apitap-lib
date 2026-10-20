@@ -863,6 +863,7 @@ pub(crate) async fn drain_binlog(
                         &sess.layouts,
                         &mut changelogs,
                         &mut collapsers,
+                        pack_pos(&sess.file, h.log_pos),
                     )?;
                     end_mark = pack_pos(&sess.file, h.log_pos);
                     if end_mark >= stop_line {
@@ -882,6 +883,7 @@ pub(crate) async fn drain_binlog(
                         &sess.layouts,
                         &mut changelogs,
                         &mut collapsers,
+                        pack_pos(&sess.file, h.log_pos),
                     )?;
                     // A DDL may change any table's columns, and the QUERY
                     // event's `db` is the session's default database, not
@@ -927,6 +929,7 @@ pub(crate) async fn drain_binlog(
                                     &sess.layouts,
                                     &mut changelogs,
                                     &mut collapsers,
+                                    pack_pos(&sess.file, h.log_pos),
                                 )?;
                             }
                             // A truncate of a table this run does not track is
@@ -969,6 +972,7 @@ pub(crate) async fn drain_binlog(
                     &sess.layouts,
                     &mut changelogs,
                     &mut collapsers,
+                    pack_pos(&sess.file, h.log_pos),
                 )?;
                 end_mark = pack_pos(&sess.file, h.log_pos);
                 if end_mark >= stop_line {
@@ -1083,6 +1087,7 @@ fn drain_tx(
     layouts: &HashMap<String, Arc<Layout>>,
     changelogs: &mut HashMap<String, Changes>,
     collapsers: &mut HashMap<String, Collapser>,
+    pos: u64,
 ) -> Result<()> {
     let layout_of = |t: &str| {
         layouts.get(t).cloned().ok_or_else(|| {
@@ -1113,6 +1118,7 @@ fn drain_tx(
         let c = collapsers
             .get_mut(table.as_ref())
             .expect("collapser just ensured");
+        c.at(pos);
         match op {
             TxOp::Insert(row) => c.insert(row)?,
             TxOp::Update(old, row) => c.update(old.as_ref(), row)?,
@@ -1458,6 +1464,7 @@ mod truncate_tests {
             &layouts,
             &mut HashMap::new(),
             &mut collapsers,
+            0,
         )
         .expect("drain");
         let w = collapsers
@@ -1480,6 +1487,7 @@ mod truncate_tests {
             &layouts,
             &mut changelogs,
             &mut HashMap::new(),
+            0,
         )
         .expect("drain");
         let w = changelogs
@@ -1505,6 +1513,7 @@ mod truncate_tests {
                 &layouts,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
+                0,
             )
             .expect_err("an op with no layout");
             assert!(e.to_string().contains("bench.other"), "{e}");
@@ -1534,6 +1543,7 @@ mod truncate_tests {
             &layouts,
             &mut HashMap::new(),
             &mut collapsers,
+            0,
         )
         .expect("drain");
         let w = collapsers

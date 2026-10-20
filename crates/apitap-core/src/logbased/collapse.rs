@@ -106,6 +106,10 @@ pub(crate) struct Collapsed {
     /// this ordered list (sticky per key — the set phases can no longer
     /// order correctly against it). Applied serially, last.
     pub residue: Vec<ResidueOp>,
+    /// The source commit position of each residue op's transaction, parallel
+    /// to `residue`. With the op's key it names the op whatever window it
+    /// lands in, which is what the ClickHouse residue journal is keyed by.
+    pub residue_at: Vec<u64>,
     /// A TRUNCATE was seen: destination truncates before applying the rest.
     pub truncate: bool,
     /// Row events consumed (for reporting).
@@ -176,9 +180,31 @@ pub(crate) struct Collapser {
     /// version kept `(Key, Vec<Cell>)` and `finish()` threw the key away,
     /// which cost a clone per upsert for nothing.
     upserts: Vec<Option<Tuple>>,
-    residue: Vec<ResidueOp>,
+    residue: Tail,
     truncate: bool,
     events: u64,
+}
+
+/// The ordered tail and where each op came from. A field of its own so a push
+/// borrows only it, inside an entry of `map`.
+#[derive(Default)]
+struct Tail {
+    ops: Vec<ResidueOp>,
+    at: Vec<u64>,
+    /// The commit position of the transaction being landed (`Collapser::at`).
+    pos: u64,
+}
+
+impl Tail {
+    fn push(&mut self, op: ResidueOp) {
+        self.ops.push(op);
+        self.at.push(self.pos);
+    }
+
+    fn clear(&mut self) {
+        self.ops.clear();
+        self.at.clear();
+    }
 }
 
 impl Collapser {
@@ -187,10 +213,17 @@ impl Collapser {
             layout,
             map: HashMap::default(),
             upserts: Vec::new(),
-            residue: Vec::new(),
+            residue: Tail::default(),
             truncate: false,
             events: 0,
         }
+    }
+
+    /// The commit position of the transaction whose ops come next. Both CDC
+    /// lanes land a transaction only at its commit, so the position is known
+    /// before its first op.
+    pub(crate) fn at(&mut self, pos: u64) {
+        self.residue.pos = pos;
     }
 
     /// Key of a FULL row tuple (new image) — from the key column indices.
@@ -491,7 +524,8 @@ impl Collapser {
         Collapsed {
             deletes,
             upserts: self.upserts.into_iter().flatten().collect(),
-            residue: self.residue,
+            residue: self.residue.ops,
+            residue_at: self.residue.at,
             truncate: self.truncate,
             events: self.events,
         }
@@ -944,6 +978,38 @@ mod tests {
         assert!(matches!(out.residue[0], ResidueOp::MaskedUpdate { .. }));
         assert!(matches!(out.residue[1], ResidueOp::Upsert { .. }));
         assert!(matches!(out.residue[2], ResidueOp::Delete { .. }));
+    }
+
+    /// D10: every residue op carries its transaction's commit position, the
+    /// half of its journal identity that does not depend on where the window
+    /// started; a truncate drops positions with the ops they belonged to.
+    #[test]
+    fn residue_ops_carry_their_commit_position() {
+        let masked = |cl: &mut Collapser| {
+            cl.update(
+                Some(&row(&[t("1"), Cell::Null])),
+                row(&[t("1"), Cell::UnchangedToast]),
+            )
+            .unwrap()
+        };
+        let mut cl = c();
+        cl.at(10);
+        masked(&mut cl);
+        cl.at(20);
+        masked(&mut cl);
+        cl.delete(&row(&[t("1"), Cell::Null])).unwrap();
+        let out = cl.finish();
+        assert_eq!(out.residue.len(), 3);
+        assert_eq!(out.residue_at, vec![10, 20, 20]);
+
+        let mut cl = c();
+        cl.at(10);
+        masked(&mut cl);
+        cl.truncate();
+        cl.at(30);
+        masked(&mut cl);
+        let out = cl.finish();
+        assert_eq!(out.residue_at, vec![30]);
     }
 
     #[test]

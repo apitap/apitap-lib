@@ -964,17 +964,39 @@ async fn apply_unit(
     // can return the WRONG row (`Rekey 1→2; Rekey 3→1` reads C at key 1) or
     // nothing (a crash between DELETE and INSERT). The first attempt
     // journalled every image it computed from the pre-window state; the
-    // replay reuses those. An op is identified by its key and its ordinal
-    // among this window's residue ops on that key — stable across attempts,
-    // which all start at the same watermark.
+    // replay reuses those. An op is identified by its transaction's commit
+    // position, its key and its ordinal among that transaction's ops on the
+    // key. Not by its ordinal in the window: a replay can end sooner than the
+    // dead attempt (a budget, a deadline), and the next window then starts
+    // its count inside the dead attempt's range, where `1|k` named another
+    // op and handed it that op's image — a lost update (deep review D10).
+    // The entry's `ver` is the same position, so the sweep (`ver <= start`)
+    // drops exactly the entries of ops a committed window has applied.
+    if c.residue_at.len() != c.residue.len() {
+        return Err(Error::Transfer(format!(
+            "log_based: {dest_table}: {} residue ops but {} positions — collapse invariant broken",
+            c.residue.len(),
+            c.residue_at.len()
+        )));
+    }
     let replay = !c.residue.is_empty() && u.journal_live(dest_table, id.start()).await?;
-    let mut ordinal: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut jkey = |pred: &str| {
-        let n = ordinal.entry(pred.to_string()).or_insert(0);
+    let dbg = std::env::var_os("APITAP_DEBUG").is_some();
+    if dbg && !c.residue.is_empty() {
+        eprintln!(
+            "[residue] {dest_table} window {}..{} ops={} replay={replay}",
+            id.start(),
+            id.end(),
+            c.residue.len()
+        );
+    }
+    let mut ordinal: std::collections::HashMap<(u64, String), u32> =
+        std::collections::HashMap::new();
+    let mut jkey = |pos: u64, pred: &str| {
+        let n = ordinal.entry((pos, pred.to_string())).or_insert(0);
         *n += 1;
-        format!("{n}|{pred}")
+        format!("{pos}|{n}|{pred}")
     };
-    for op in &c.residue {
+    for (op, &pos) in c.residue.iter().zip(&c.residue_at) {
         match op {
             ResidueOp::MaskedUpdate { key, row } => {
                 let mut full = row.clone();
@@ -985,11 +1007,22 @@ async fn apply_unit(
                     .map(|(i, _)| i)
                     .collect();
                 let pred = key_pred(pk_cols, key, &pk_oids, binary)?;
-                let jk = jkey(&pred);
+                let jk = jkey(pos, &pred);
                 if replay {
-                    if let Some(img) = u.journal_get(dest_table, &jk, id.start()).await? {
+                    let hit = u.journal_get(dest_table, &jk, id.start()).await?;
+                    if dbg {
+                        eprintln!(
+                            "[residue] masked {jk} journal {}",
+                            if hit.is_some() { "HIT" } else { "miss" }
+                        );
+                    }
+                    if let Some(mut img) = hit {
                         u.delete_owned(dest_table, &pred).await?;
                         let cols = if insert_only {
+                            // The journal holds the image without its version:
+                            // it lands at THIS window's end, never the dead
+                            // attempt's, which could outrank a later write.
+                            insert_only_suffix(&mut img, id.end(), false);
                             insert_only_cols(wal_cols)
                         } else {
                             wal_cols.to_vec()
@@ -1043,11 +1076,14 @@ async fn apply_unit(
                 }
                 let mut buf = Vec::new();
                 render_residue_row(&full, oids, &missing, binary, &mut buf)?;
+                if dbg {
+                    eprintln!("[residue] put {jk} ver={pos}");
+                }
+                u.journal_put(dest_table, &jk, &buf, pos, id.start())
+                    .await?;
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
                 }
-                u.journal_put(dest_table, &jk, &buf, id.end(), id.start())
-                    .await?;
                 u.delete_owned(dest_table, &pred).await?;
                 if insert_only {
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf)
@@ -1099,11 +1135,19 @@ async fn apply_unit(
                     .map(|(i, _)| i)
                     .collect();
                 let old_pred = key_pred(pk_cols, old_key, &pk_oids, binary)?;
-                let jk = jkey(&old_pred);
+                let jk = jkey(pos, &old_pred);
                 if replay && !missing.is_empty() {
-                    if let Some(img) = u.journal_get(dest_table, &jk, id.start()).await? {
+                    let hit = u.journal_get(dest_table, &jk, id.start()).await?;
+                    if dbg {
+                        eprintln!(
+                            "[residue] rekey {jk} journal {}",
+                            if hit.is_some() { "HIT" } else { "miss" }
+                        );
+                    }
+                    if let Some(mut img) = hit {
                         u.delete_owned(dest_table, &old_pred).await?;
                         if insert_only {
+                            insert_only_suffix(&mut img, id.end(), false);
                             u.insert_owned(dest_table, &insert_only_cols(wal_cols), img)
                                 .await?;
                         } else {
@@ -1155,12 +1199,15 @@ async fn apply_unit(
                 }
                 let mut buf = Vec::new();
                 render_residue_row(&full, oids, &missing, binary, &mut buf)?;
+                if !missing.is_empty() {
+                    if dbg {
+                        eprintln!("[residue] put {jk} ver={pos}");
+                    }
+                    u.journal_put(dest_table, &jk, &buf, pos, id.start())
+                        .await?;
+                }
                 if insert_only {
                     insert_only_suffix(&mut buf, id.end(), false);
-                }
-                if !missing.is_empty() {
-                    u.journal_put(dest_table, &jk, &buf, id.end(), id.start())
-                        .await?;
                 }
                 u.delete_owned(dest_table, &old_pred).await?;
                 // Replay-idempotent (review round 2 R2-4): a replayed window
@@ -2161,9 +2208,10 @@ mod store {
             self.s.types(table).await
         }
 
-        /// Journal the rendered row a residue op is about to write at `k`
-        /// (its key predicate) BEFORE the op deletes anything. `after` is the
-        /// window start: entries at or below it belong to committed windows
+        /// Journal the rendered row a residue op is about to write BEFORE the
+        /// op deletes anything. `k` names the op (`pos|n|key predicate`) and
+        /// `ver` is its transaction's commit position. `after` is the window
+        /// start: entries at or below it are ops a committed window applied,
         /// and are swept, once per table per run.
         pub(crate) async fn journal_put(
             &mut self,
@@ -2190,8 +2238,8 @@ mod store {
                 .await
         }
 
-        /// The newest journalled row for `k` written by an attempt at a window
-        /// that has not committed (`ver > after`), if any.
+        /// The journalled row for the op `k`, if an attempt wrote one and no
+        /// committed window has applied the op since (`ver > after`).
         pub(crate) async fn journal_get(
             &mut self,
             table: &str,

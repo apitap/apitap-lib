@@ -386,6 +386,7 @@ mod tests {
                 residue,
                 truncate,
                 events: 1,
+                ..Default::default()
             };
             Bodies::Replica(HashMap::from([(
                 "a".to_string(),

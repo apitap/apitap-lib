@@ -283,7 +283,7 @@ pub(crate) async fn drain(
     if let Some((ops, e)) = sess.carry.take() {
         buf_bytes += ops.iter().map(|(_, o)| op_bytes(o)).sum::<usize>();
         let t_ph = std::time::Instant::now();
-        flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog)?;
+        flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog, e)?;
         t_flush += t_ph.elapsed();
         end_lsn = e;
         carried_to_stop = e >= stop_line;
@@ -429,6 +429,7 @@ pub(crate) async fn drain(
                             &mut collapsers,
                             &mut changelogs,
                             changelog,
+                            e,
                         )?;
                         t_flush += t_ph.elapsed();
                         tx_bytes = 0;
@@ -460,7 +461,7 @@ pub(crate) async fn drain(
                         }
                         buf_bytes += n;
                         let t_ph = std::time::Instant::now();
-                        flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog)?;
+                        flush_ops(ops, sess, &mut collapsers, &mut changelogs, changelog, e)?;
                         t_flush += t_ph.elapsed();
                         end_lsn = e;
                         if e >= stop_line {
@@ -720,6 +721,7 @@ fn flush_ops(
     collapsers: &mut Vec<Option<Collapser>>,
     changelogs: &mut Vec<Option<Changes>>,
     changelog: bool,
+    pos: u64,
 ) -> Result<()> {
     for (slot, op) in ops {
         let i = usize::from(slot);
@@ -750,6 +752,7 @@ fn flush_ops(
             collapsers[i] = Some(Collapser::new(layout_of(&sess.layouts, table)?));
         }
         let c = collapsers[i].as_mut().expect("collapser just ensured");
+        c.at(pos);
         match op {
             StreamOp::Insert(row) => c.insert(row)?,
             StreamOp::Update(old, row, full) => c.update_image(old.as_ref(), full, row)?,

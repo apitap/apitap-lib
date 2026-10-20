@@ -433,6 +433,7 @@ mod tests {
             ],
             truncate: false,
             events: 5,
+            ..Default::default()
         };
         // Finals in first-touch order, the masked update patched from its
         // in-window base, then the key the window only deleted.
