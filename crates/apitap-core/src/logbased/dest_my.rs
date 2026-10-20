@@ -268,7 +268,8 @@ async fn apply_unit(
     }
 
     // Residue tail: serial, ordered.
-    for op in &c.residue {
+    let moot = crate::logbased::collapse::deleted_later(&c.residue);
+    for (op, &moot) in c.residue.iter().zip(&moot) {
         // The row a zero-match must not hide (P2): affected rows on MySQL
         // count CHANGED rows, so the check is a probe, not the count.
         let mut must_find: Option<(&'static str, &crate::logbased::collapse::Key)> = None;
@@ -361,7 +362,7 @@ async fn apply_unit(
             }
         };
         u.exec(&sql, "residue").await?;
-        if let Some((kind, key)) = must_find {
+        if let (Some((kind, key)), false) = (must_find, moot) {
             let probe = format!(
                 "SELECT 1 FROM {ft} WHERE {} LIMIT 1",
                 key_pred(pk_cols, key, &pk_oids)?

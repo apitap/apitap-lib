@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::logbased::window::{Layout, TableWindow};
 use crate::wire::pgoutput::{Cell, Cellv, Tuple};
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A replica-identity key: the key columns' text values in key-column order.
@@ -656,6 +656,65 @@ pub(crate) mod gen {
             }
             .expect("a well-formed event");
         }
+    }
+}
+
+/// For each residue op, whether a LATER op in the same window deletes the
+/// key it has to find (a masked update's key, a move's new key). Such an op
+/// finding no row has lost nothing: the window removes that row anyway. The
+/// OLTP appliers refuse a masked update that matches no row, and a re-applied
+/// part of a window (a group straddling a member's floor) holding
+/// "masked update k, then delete k" met a row already deleted and was refused
+/// on every rerun (deep review D12).
+pub(crate) fn deleted_later(residue: &[ResidueOp]) -> Vec<bool> {
+    let mut out = vec![false; residue.len()];
+    let mut gone: HashSet<&Key> = HashSet::new();
+    for (i, op) in residue.iter().enumerate().rev() {
+        match op {
+            ResidueOp::MaskedUpdate { key, .. } => out[i] = gone.contains(key),
+            ResidueOp::Rekey { new_key, .. } => out[i] = gone.contains(new_key),
+            ResidueOp::Delete { key } => {
+                gone.insert(key);
+            }
+            ResidueOp::Upsert { .. } => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod deleted_later_tests {
+    use super::{deleted_later, ResidueOp};
+
+    #[test]
+    fn only_an_op_whose_key_a_later_op_deletes_is_moot() {
+        let k = |v: &str| vec![v.as_bytes().to_vec()];
+        let ops = vec![
+            ResidueOp::MaskedUpdate {
+                key: k("a"),
+                row: vec![],
+            },
+            ResidueOp::MaskedUpdate {
+                key: k("b"),
+                row: vec![],
+            },
+            ResidueOp::Delete { key: k("a") },
+            ResidueOp::Rekey {
+                old_key: k("c"),
+                new_key: k("d"),
+                row: vec![],
+            },
+            ResidueOp::Delete { key: k("d") },
+            ResidueOp::MaskedUpdate {
+                key: k("a"),
+                row: vec![],
+            },
+        ];
+        // a: deleted after op 0; the masked update AFTER the delete is not moot.
+        assert_eq!(
+            deleted_later(&ops),
+            vec![true, false, false, true, false, false]
+        );
     }
 }
 

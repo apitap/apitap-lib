@@ -352,7 +352,8 @@ async fn apply_unit(
     // Residue tail: serial, ordered (masked updates and their followers).
     // Every value travels as a $n bind, cast with the column's own type (see
     // `casts` above).
-    for op in &c.residue {
+    let moot = crate::logbased::collapse::deleted_later(&c.residue);
+    for (op, &moot) in c.residue.iter().zip(&moot) {
         let mut binds: Vec<Option<String>> = Vec::new();
         // What a zero-row answer means for this op: a masked update must
         // find its row, a move must find its new key (P2, below).
@@ -463,7 +464,7 @@ async fn apply_unit(
         // unsent TOAST value — while the window committed (P2). CH and BQ
         // refuse it; so does this lane now. A move that matches nothing on a
         // REPLAY is fine: its new key is already there.
-        if let (0, Some((kind, key))) = (n, must_match) {
+        if let (0, Some((kind, key)), false) = (n, must_match, moot) {
             let mut kb: Vec<Option<String>> = Vec::new();
             let pred = key_pred_bound(pk_cols, key, &casts, &key_hex, &mut kb);
             let found = if kind == "move" {
