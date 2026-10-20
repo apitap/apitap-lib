@@ -23,7 +23,7 @@ use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::plan::{ColumnPlan, Delivered, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::clickhouse::ChConn;
 use crate::sink::Loader;
-use crate::source::spans;
+use crate::source::{span_range, spans};
 
 pub(crate) struct ChSource {
     conn: ChConn,
@@ -644,10 +644,15 @@ impl crate::source::Source for ChSource {
                     let (Some(lo), Some(hi)) = (num(lo, "min")?, num(hi, "max")?) else {
                         return Ok(vec![one(format!("true{dpred}"))]);
                     };
-                    return Ok(spans(lo, hi, want)
+                    let ranges = spans(lo, hi, want);
+                    let last = ranges.len() - 1;
+                    let nullable = plan.cursor_plan().is_none_or(|pc| pc.nullable);
+                    return Ok(ranges
                         .into_iter()
-                        .map(|(rlo, rhi)| {
-                            one(format!("{qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}"))
+                        .enumerate()
+                        .map(|(k, (rlo, rhi))| {
+                            let range = span_range(&qcol, k == 0, k == last, rlo, rhi, nullable);
+                            one(format!("{range}{dpred}"))
                         })
                         .collect());
                 }

@@ -5,7 +5,7 @@
 //! wire format directly — ClickHouse RowBinary or Postgres binary COPY, no
 //! intermediate text, no Arrow.
 
-use super::spans;
+use super::{span_range, spans};
 use crate::dialect::mysql::{is_binary_udt, my_ident, my_ident_path};
 use crate::error::{Error, Result};
 use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
@@ -1137,10 +1137,14 @@ impl Source for MySqlSource {
                 match (lo.as_deref(), hi.as_deref()) {
                     (Some(l), Some(h)) => {
                         if let Some((lo, hi)) = cursor_bounds(Some(l), Some(h)) {
-                            for (rlo, rhi) in spans(lo, hi, want) {
+                            let ranges = spans(lo, hi, want);
+                            let last = ranges.len() - 1;
+                            let nullable = plan.cursor_plan().is_none_or(|pc| pc.nullable);
+                            for (k, (rlo, rhi)) in ranges.into_iter().enumerate() {
+                                let range =
+                                    span_range(&qcol, k == 0, k == last, rlo, rhi, nullable);
                                 stmts.push(format!(
-                                    "SELECT {select_list} FROM {src_t} \
-                                     WHERE {qcol} >= {rlo} AND {qcol} <= {rhi}{dpred}"
+                                    "SELECT {select_list} FROM {src_t} WHERE {range}{dpred}"
                                 ));
                             }
                         }

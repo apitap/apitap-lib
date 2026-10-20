@@ -300,6 +300,7 @@ LEGS = [
     leg("e2e_pg_hardening.py",       "a Postgres replace keeps NOT NULL columns", argv=["notnull"]),
     leg("e2e_pg_hardening.py",       "a Postgres replace keeps FOR TABLE publication membership", argv=["pub"]),
     leg("e2e_pg_hardening.py",       "a parallel Postgres read copies NULL-cursor rows", argv=["nullcursor"]),
+    leg("e2e_null_cursor_spans.py",  "a parallel MySQL read copies NULL-cursor rows"),
     leg("e2e_pg_hardening.py",       "numeric with a negative or oversized scale lands in a Decimal that holds it", argv=["negscale"]),
     leg("e2e_pg_hardening.py",       "a Postgres destination name past 63 bytes is refused", argv=["longname"]),
     leg("e2e_pg_hardening.py",      "a Postgres replace into a referenced table is refused before the load", argv=["fkref"]),

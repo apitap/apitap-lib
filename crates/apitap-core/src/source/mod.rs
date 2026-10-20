@@ -114,6 +114,59 @@ pub(crate) fn spans(lo: i64, hi: i64, n: usize) -> Vec<(i64, i64)> {
     out
 }
 
+/// The WHERE of one integer-cursor span. The edge spans stay open (the
+/// min/max probe runs before the read: on Postgres before the workers'
+/// snapshot, on MySQL and ClickHouse before each span's own statement), and
+/// NULL cursors, which no range matches, ride the last span (P2; deep review
+/// D30 for MySQL and ClickHouse, whose closed spans dropped them). That `OR col IS NULL` only for
+/// a column that can hold one: on a NOT NULL key (every primary key) it kept
+/// the planner off the index, and the last span seq-scanned the WHOLE table
+/// to return its share: a 4-way split read 1.96x the rows.
+pub(crate) fn span_range(
+    qcol: &str,
+    first: bool,
+    last: bool,
+    lo: i64,
+    hi: i64,
+    nullable: bool,
+) -> String {
+    match (first, last) {
+        (true, true) => "true".to_string(),
+        (true, false) => format!("{qcol} <= {hi}"),
+        (false, true) if nullable => format!("({qcol} >= {lo} OR {qcol} IS NULL)"),
+        (false, true) => format!("{qcol} >= {lo}"),
+        (false, false) => format!("{qcol} >= {lo} AND {qcol} <= {hi}"),
+    }
+}
+
+#[cfg(test)]
+mod span_range_tests {
+    use super::span_range;
+
+    /// A NOT NULL cursor's last span is a plain range the index can serve;
+    /// only a nullable one carries the NULL rows.
+    #[test]
+    fn the_null_clause_rides_only_a_nullable_cursor() {
+        assert_eq!(
+            span_range("\"id\"", false, true, 7, 9, false),
+            "\"id\" >= 7"
+        );
+        assert_eq!(
+            span_range("\"id\"", false, true, 7, 9, true),
+            "(\"id\" >= 7 OR \"id\" IS NULL)"
+        );
+        assert_eq!(
+            span_range("\"id\"", true, false, 1, 3, false),
+            "\"id\" <= 3"
+        );
+        assert_eq!(span_range("\"id\"", true, true, 1, 3, true), "true");
+        assert_eq!(
+            span_range("\"id\"", false, false, 4, 6, true),
+            "\"id\" >= 4 AND \"id\" <= 6"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
