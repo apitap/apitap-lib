@@ -874,6 +874,25 @@ pub(crate) async fn drain_binlog(
                         break;
                     }
                 } else if verb == QueryVerb::Ddl {
+                    // A DDL that removes rows without row events (D13): the
+                    // destination cannot follow it, so the run stops before
+                    // anything of it is applied, naming the fix.
+                    for (t, what) in data_ddl(head, &db) {
+                        let Some(q) = sess.tracked.keys().find(|k| k.eq_ignore_ascii_case(&t))
+                        else {
+                            continue;
+                        };
+                        return Err(Error::Transfer(format!(
+                            "binlog: {what} on the tracked table {q} ({}) at {}:{} \
+                             removes or swaps rows without row events, so the \
+                             destination cannot follow it and would keep rows the \
+                             source no longer has. Re-bootstrap {q} (clear its \
+                             _apitap_state row) to copy it fresh",
+                            crate::sink::char_excerpt(head, 120),
+                            sess.file,
+                            h.log_pos
+                        )));
+                    }
                     // Anything already buffered belongs to the transaction this
                     // DDL implicitly committed, so it lands FIRST, under the
                     // layouts it was decoded against.
@@ -1163,6 +1182,97 @@ fn truncate_target(sql: &str, db: &str) -> Option<String> {
     })
 }
 
+/// The tables a DDL statement removes or swaps rows of WITHOUT row events,
+/// with what it does (deep review D13). MySQL and MariaDB log every DDL as a
+/// QUERY, even under binlog_format=ROW, so a dropped partition's rows never
+/// reach the drain as deletes; treated as schema-only, the destination kept
+/// them forever. TRUNCATE is applied (`truncate_target`); these are refused:
+/// `ALTER TABLE t DROP|TRUNCATE|EXCHANGE PARTITION`, `DROP TABLE t[, u]` and
+/// MariaDB's `CREATE OR REPLACE TABLE t`. `RENAME TABLE` is not here: it is
+/// the online-schema-change cut-over, whose new table arrived as rows.
+fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
+    let mut s = strip_leading_noise(sql);
+    let word = |s: &mut &str, w: &str| -> bool {
+        if starts_with_word(s, w) {
+            *s = s[w.len()..].trim_start();
+            true
+        } else {
+            false
+        }
+    };
+    // One table name: `db`.`t`, db.t, `t` or t, up to a separator.
+    let name = |s: &mut &str| -> Option<String> {
+        let end = s
+            .find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '('))
+            .unwrap_or(s.len());
+        let n: String = s[..end]
+            .chars()
+            .filter(|c| *c != '`' && *c != '"')
+            .collect();
+        *s = s[end..].trim_start();
+        (!n.is_empty()).then(|| {
+            if n.contains('.') {
+                n
+            } else {
+                format!("{db}.{n}")
+            }
+        })
+    };
+    if word(&mut s, "drop") {
+        if word(&mut s, "temporary") || !word(&mut s, "table") {
+            return Vec::new();
+        }
+        if word(&mut s, "if") {
+            word(&mut s, "exists");
+        }
+        let mut out = Vec::new();
+        while let Some(t) = name(&mut s) {
+            out.push((t, "DROP TABLE"));
+            if !s.starts_with(',') {
+                break;
+            }
+            s = s[1..].trim_start();
+        }
+        return out;
+    }
+    if word(&mut s, "create") {
+        if !(word(&mut s, "or") && word(&mut s, "replace")) {
+            return Vec::new();
+        }
+        word(&mut s, "temporary");
+        if !word(&mut s, "table") {
+            return Vec::new();
+        }
+        return name(&mut s)
+            .map(|t| vec![(t, "CREATE OR REPLACE TABLE")])
+            .unwrap_or_default();
+    }
+    if word(&mut s, "alter") {
+        while word(&mut s, "online") || word(&mut s, "ignore") {}
+        if !word(&mut s, "table") {
+            return Vec::new();
+        }
+        let Some(t) = name(&mut s) else {
+            return Vec::new();
+        };
+        let lower = s.to_ascii_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        for w in words.windows(2) {
+            let what = match w {
+                ["drop", "partition"] => "DROP PARTITION",
+                ["truncate", "partition"] => "TRUNCATE PARTITION",
+                ["exchange", "partition"] => "EXCHANGE PARTITION",
+                _ => continue,
+            };
+            return vec![(t, what)];
+        }
+    }
+    Vec::new()
+}
+
 /// Case-insensitive WORD-prefix test: `s` starts with `w` and the following
 /// character (if any) is not alphanumeric/underscore. The old spellings
 /// (`s[..k.len()].eq_ignore_ascii_case(k)`) compared a fixed slice, which
@@ -1326,7 +1436,51 @@ mod charset_tests {
 
 #[cfg(test)]
 mod query_verbs_tests {
-    use super::{is_ddl, query_verb, starts_with_word, QueryVerb};
+    use super::{data_ddl, is_ddl, query_verb, starts_with_word, QueryVerb};
+
+    /// D13: the DDL that removes or swaps rows without row events, by table.
+    #[test]
+    fn data_changing_ddl_names_its_tables() {
+        let t = |v: &[(&str, &'static str)]| -> Vec<(String, &'static str)> {
+            v.iter().map(|(a, b)| (a.to_string(), *b)).collect()
+        };
+        assert_eq!(
+            data_ddl("ALTER TABLE events DROP PARTITION p2026_01", "app"),
+            t(&[("app.events", "DROP PARTITION")])
+        );
+        assert_eq!(
+            data_ddl(
+                "/* job */ alter online table `app`.`events` truncate partition p1, p2",
+                "x"
+            ),
+            t(&[("app.events", "TRUNCATE PARTITION")])
+        );
+        assert_eq!(
+            data_ddl("ALTER TABLE e EXCHANGE PARTITION p WITH TABLE e_old", "app"),
+            t(&[("app.e", "EXCHANGE PARTITION")])
+        );
+        assert_eq!(
+            data_ddl("DROP TABLE IF EXISTS `a`, other.b;", "app"),
+            t(&[("app.a", "DROP TABLE"), ("other.b", "DROP TABLE")])
+        );
+        assert_eq!(
+            data_ddl("CREATE OR REPLACE TABLE t (id int)", "app"),
+            t(&[("app.t", "CREATE OR REPLACE TABLE")])
+        );
+        // Schema-only, or not data-losing: none of these.
+        for sql in [
+            "ALTER TABLE events ADD COLUMN v int",
+            "ALTER TABLE events ADD PARTITION (PARTITION p3 VALUES LESS THAN (3))",
+            "ALTER TABLE events REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (5))",
+            "DROP TEMPORARY TABLE t",
+            "DROP INDEX i ON t",
+            "CREATE TABLE t (id int)",
+            "RENAME TABLE t TO t_old, t_new TO t",
+            "TRUNCATE t",
+        ] {
+            assert!(data_ddl(sql, "app").is_empty(), "{sql}");
+        }
+    }
 
     /// The old `begin` check compared SIX bytes to a five-letter word (so a
     /// transaction-open never matched) and `is_ddl` sliced fixed prefixes (a
