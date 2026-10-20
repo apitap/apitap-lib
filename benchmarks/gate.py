@@ -276,6 +276,7 @@ LEGS = [
     leg("e2e_masked_then_delete.py",  "the same, into MySQL", argv=["my"]),
     leg("e2e_my_composite_cursor.py", "an append without cursor= never auto-picks part of a composite key"),
     leg("e2e_ch_tz_cursor.py",        "a ClickHouse-source DateTime cursor with its own time zone resumes exactly"),
+    leg("e2e_ch_changelog_mass_mask.py", "a ClickHouse changelog window with thousands of masked rows applies"),
     leg("e2e_pg_other_slots.py",     "a run names the other inactive apitap slots holding WAL for its tables"),
     leg("e2e_my_auth_plugin.py",     "a MySQL user on an unspoken auth plugin is told how to fix it", {"mariadb"}),
     leg("e2e_my_lower_case_names.py", "MySQL CDC with lower_case_table_names=1 follows a mixed-case table"),

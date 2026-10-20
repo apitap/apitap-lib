@@ -377,6 +377,12 @@ fn before_window(plan: &ReplayPlan) -> String {
 /// (`Changes::resolve_masked`); the destination only has to answer for what
 /// came before them. Filtered by key first, so this probes the sorting key
 /// rather than scanning the log; the `T` bound reads only `T` rows.
+///
+/// The keys go out in chunks: every key predicate is written twice (the
+/// WHERE and the slot multiIf), and one statement for a window of ~7,000
+/// masked int keys passed ClickHouse's max_query_size (256 KiB): "Max query
+/// size exceeded" before anything was appended, on every replay of the same
+/// window (deep review D1).
 #[allow(clippy::too_many_arguments)]
 async fn read_base(
     u: &mut ChUnit<'_>,
@@ -389,16 +395,90 @@ async fn read_base(
     plan: &ReplayPlan,
 ) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>>
 {
+    let mut preds = Vec::with_capacity(keys.len());
+    let mut tuples = Vec::with_capacity(keys.len());
+    for k in keys {
+        preds.push(format!("({})", key_pred(pk_cols, k, pk_oids, false)?));
+        let lits = key_literals(k, pk_oids, false)?;
+        tuples.push(if lits.len() == 1 {
+            lits.into_iter().next().unwrap_or_default()
+        } else {
+            format!("({})", lits.join(", "))
+        });
+    }
+    // What one key costs in the statement: its predicate in the multiIf,
+    // its tuple in the IN list, its slot index, and the joiners.
+    let lens: Vec<usize> = preds
+        .iter()
+        .zip(&tuples)
+        .enumerate()
+        .map(|(i, (p, t))| p.len() + t.len() + i.to_string().len() + 8)
+        .collect();
+    let mut out = std::collections::HashMap::with_capacity(keys.len());
+    for r in chunk_by_bytes(&lens, READBACK_PRED_BYTES, READBACK_KEYS) {
+        let part = read_base_chunk(
+            u,
+            dest_table,
+            pk_cols,
+            &keys[r.clone()],
+            &preds[r.clone()],
+            &tuples[r],
+            cols,
+            wal_cols,
+            plan,
+        )
+        .await?;
+        out.extend(part);
+    }
+    Ok(out)
+}
+
+/// Keys per readback statement. The slot multiIf costs (matched rows x
+/// branches): 4,000 keys took 1.7 s per statement where 1,000 keep it small.
+const READBACK_KEYS: usize = 1000;
+
+/// Key bytes per readback statement, counted as the SQL they become: well
+/// under the 256 KiB max_query_size default, with room for the fixed SQL.
+const READBACK_PRED_BYTES: usize = 160 << 10;
+
+/// Consecutive index ranges whose summed lengths stay within `cap` and that
+/// hold at most `max_items`; an item longer than `cap` gets a range of its
+/// own. Empty input, no ranges.
+fn chunk_by_bytes(lens: &[usize], cap: usize, max_items: usize) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut start, mut sum) = (0, 0);
+    for (i, &n) in lens.iter().enumerate() {
+        if i > start && (sum + n > cap || i - start >= max_items) {
+            out.push(start..i);
+            (start, sum) = (i, 0);
+        }
+        sum += n;
+    }
+    if start < lens.len() {
+        out.push(start..lens.len());
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_base_chunk(
+    u: &mut ChUnit<'_>,
+    dest_table: &str,
+    pk_cols: &[String],
+    keys: &[crate::logbased::changelog::CKey],
+    preds: &[String],
+    tuples: &[String],
+    cols: &[usize],
+    wal_cols: &[String],
+    plan: &ReplayPlan,
+) -> Result<std::collections::HashMap<crate::logbased::changelog::CKey, Vec<Option<bytes::Bytes>>>>
+{
     let t = ch_ident(dest_table);
     let key_list = pk_cols
         .iter()
         .map(|c| ch_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut preds = Vec::with_capacity(keys.len());
-    for k in keys {
-        preds.push(format!("({})", key_pred(pk_cols, k, pk_oids, false)?));
-    }
     // Rows meet the requested keys by SLOT, never by text (as BigQuery's
     // readback does): each answer carries the index of the predicate it
     // matched, and the map is keyed by the REQUESTED key. Keyed by the key
@@ -432,7 +512,18 @@ async fn read_base(
                ORDER BY {CL_LSN} DESC, {CL_SEQ} DESC, {CL_OP} = '{base}' ASC \
                LIMIT 1 BY {key_list} \
              ) WHERE {CL_OP} != '{del}' FORMAT TabSeparated",
-            keys = preds.join(" OR "),
+            // IN, not an OR of the predicates: the set is converted to the
+            // key columns' types (the same equality), and a 4,000-term OR
+            // took 37 s to analyse where the IN list takes 1.7 s (D1).
+            keys = format!(
+                "{} IN ({})",
+                if pk_cols.len() == 1 {
+                    key_list.clone()
+                } else {
+                    format!("({key_list})")
+                },
+                tuples.join(", ")
+            ),
             tr = ch_str("T"),
             del = ch_str("D"),
             base = ch_str(CL_BASELINE),
@@ -2858,22 +2949,28 @@ fn render_ch_row_trim(
 fn key_pred(pk_cols: &[String], key: &[Vec<u8>], pk_oids: &[u32], binary: bool) -> Result<String> {
     Ok(pk_cols
         .iter()
-        .zip(key.iter())
+        .zip(key_literals(key, pk_oids, binary)?)
+        .map(|(c, lit)| format!("{} = {}", ch_ident(c), lit))
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+/// One ClickHouse literal per key column, as `key_pred` compares them.
+fn key_literals(key: &[Vec<u8>], pk_oids: &[u32], binary: bool) -> Result<Vec<String>> {
+    key.iter()
         .zip(pk_oids.iter())
-        .map(|((c, v), &oid)| {
+        .map(|(v, &oid)| {
             // Binary streams store send-format key bytes: convert to the
             // Postgres text form before the literal (predicates are text).
-            let lit = if binary {
+            if binary {
                 let mut t = Vec::new();
                 crate::wire::pgbindec::render(oid, v, &mut t)?;
-                ch_key_literal(&t, oid)?
+                ch_key_literal(&t, oid)
             } else {
-                ch_key_literal(v, oid)?
-            };
-            Ok(format!("{} = {}", ch_ident(c), lit))
+                ch_key_literal(v, oid)
+            }
         })
-        .collect::<Result<Vec<_>>>()?
-        .join(" AND "))
+        .collect()
 }
 
 /// Render a residue row where the cells at `verbatim` indices came back from
@@ -3778,5 +3875,33 @@ mod tests {
         assert_eq!(cl_nullable("Array(String)"), None);
         assert_eq!(cl_nullable("Map(String, UInt64)"), None);
         assert_eq!(cl_nullable("Tuple(UInt8, String)"), None);
+    }
+}
+
+#[cfg(test)]
+mod chunk_by_bytes_tests {
+    use super::chunk_by_bytes;
+
+    #[test]
+    fn chunks_stay_within_the_cap_and_cover_every_key_once() {
+        assert_eq!(
+            chunk_by_bytes(&[], 10, 9),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert_eq!(chunk_by_bytes(&[4, 4, 4], 10, 9), vec![0..2, 2..3]);
+        assert_eq!(chunk_by_bytes(&[4, 4, 2], 10, 9), vec![0..3]);
+        assert_eq!(
+            chunk_by_bytes(&[1, 1, 1, 1, 1], 10, 2),
+            vec![0..2, 2..4, 4..5]
+        );
+        // An item over the cap travels alone, never dropped.
+        assert_eq!(chunk_by_bytes(&[3, 50, 3], 10, 9), vec![0..1, 1..2, 2..3]);
+        let lens = vec![40; 7000];
+        let r = chunk_by_bytes(&lens, 160 << 10, 1000);
+        assert_eq!(r.iter().map(|r| r.len()).sum::<usize>(), 7000);
+        assert!(r
+            .iter()
+            .all(|r| r.len() * 40 <= 160 << 10 && r.len() <= 1000));
+        assert!(r.windows(2).all(|w| w[0].end == w[1].start));
     }
 }

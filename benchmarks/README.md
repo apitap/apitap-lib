@@ -656,6 +656,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_masked_then_delete.my --> `e2e_masked_then_delete.py my` | the same, into MySQL |
 | <!-- claim: leg.e2e_my_composite_cursor --> `e2e_my_composite_cursor.py` | an append from MySQL without cursor= on PRIMARY KEY (tenant_id, sku) refuses instead of tracking tenant_id and skipping new skus; an explicit cursor= works |
 | <!-- claim: leg.e2e_ch_tz_cursor --> `e2e_ch_tz_cursor.py` | ch -> ch append on a DateTime('America/Chicago') / DateTime('Asia/Jakarta') cursor resumes from the UTC watermark as an instant: no rows skipped, re-sent or refused |
+| <!-- claim: leg.e2e_ch_changelog_mass_mask --> `e2e_ch_changelog_mass_mask.py` | one UPDATE masking 20,000 TOASTed rows applies on changelog=True into ClickHouse: the readback is chunked under max_query_size and __current equals the source |
 | <!-- claim: leg.e2e_pg_other_slots --> `e2e_pg_other_slots.py` | a run names every other inactive apitap slot that publishes its tables, with what it retains and the statement that drops it |
 | <!-- claim: leg.e2e_my_auth_plugin --> `e2e_my_auth_plugin.py` | a MySQL user on an auth plugin apitap does not speak (MariaDB ed25519) is told which plugins work and the ALTER USER that switches |
 | <!-- claim: leg.e2e_my_lower_case_names --> `e2e_my_lower_case_names.py` | MySQL CDC on a lower_case_table_names=1 server follows a table named in mixed case |
