@@ -24,7 +24,7 @@ use crate::logbased::rowtext::{
 use crate::logbased::window::TableWindow;
 use crate::sink::mysql::sql_lit;
 use crate::wire::pgoutput::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) use store::{MyStore, MyTx};
 
@@ -201,13 +201,27 @@ async fn apply_unit(
     }
 
     if clear {
+        // Each key once. A key deleted and re-inserted in one window is in
+        // both sets, and the twin's primary key made LOAD DATA LOCAL skip the
+        // second copy with Warning 1062, which `no_warnings` refuses: the
+        // window was cut the same way on every rerun (deep review D2).
         let mut body = Vec::with_capacity(1 << 20);
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut line = Vec::new();
+        let mut push = |refs: &[&[u8]], body: &mut Vec<u8>| -> Result<()> {
+            line.clear();
+            render_my_key(refs, &pk_oids, &mut line)?;
+            if seen.insert(line.clone()) {
+                body.extend_from_slice(&line);
+            }
+            Ok(())
+        };
         for key in c.deletes.iter() {
             let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
-            render_my_key(&refs, &pk_oids, &mut body)?;
+            push(&refs, &mut body)?;
         }
         for row in &c.upserts {
-            render_my_key(&row_key_refs(row, pk_idx), &pk_oids, &mut body)?;
+            push(&row_key_refs(row, pk_idx), &mut body)?;
         }
         u.load(
             body,
