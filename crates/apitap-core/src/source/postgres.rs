@@ -557,6 +557,25 @@ async fn export_snapshot(pool: &PgPool) -> Result<(std::sync::Arc<str>, sqlx::Pg
     let mut conn = sqlx::PgConnection::connect_with(&pool.connect_options())
         .await
         .map_err(err)?;
+    // The holder sends nothing until the last span is done, so on the server
+    // it sits idle in transaction for the whole read. A role or database
+    // idle_in_transaction_session_timeout (common on managed servers) killed
+    // it, the exported snapshot went with it, and every later span failed
+    // "invalid snapshot identifier", late and on every retry (deep review
+    // D31). PG 17's transaction_timeout ends it the same way. Both are
+    // session settings any role may change.
+    conn.execute("SET idle_in_transaction_session_timeout = 0")
+        .await
+        .map_err(err)?;
+    let ver: String = sqlx::query_scalar("SHOW server_version_num")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(err)?;
+    if ver.trim().parse::<u32>().is_ok_and(|v| v >= 170000) {
+        conn.execute("SET transaction_timeout = 0")
+            .await
+            .map_err(err)?;
+    }
     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(err)?;
@@ -751,8 +770,9 @@ async fn copy_out_worker<L: Loader>(
                 );
                 if let Err(e) = ws.simple_query(&pin).await {
                     return Err(Error::Transfer(format!(
-                        "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
-                             walsender session still open?"
+                        "SET TRANSACTION SNAPSHOT: {e} — the session that exported it \
+                             (a CDC slot's walsender, or a parallel read's snapshot holder) \
+                             has ended; a server timeout or a terminated backend ends it"
                     )));
                 }
             }
@@ -902,8 +922,9 @@ async fn copy_out_worker<L: Loader>(
                 .await;
                 if let Err(e) = pin {
                     return Err(Error::Transfer(format!(
-                        "SET TRANSACTION SNAPSHOT: {e} — is the slot's \
-                             walsender session still open?"
+                        "SET TRANSACTION SNAPSHOT: {e} — the session that exported it \
+                             (a CDC slot's walsender, or a parallel read's snapshot holder) \
+                             has ended; a server timeout or a terminated backend ends it"
                     )));
                 }
                 Some(conn)
