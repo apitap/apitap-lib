@@ -1365,6 +1365,18 @@ pub struct ChDdl {
     pub on_cluster: Option<String>,
 }
 
+/// An engine that merges rows sharing a sorting key on its own (Replacing,
+/// Summing, Aggregating, Collapsing, VersionedCollapsing, Graphite), plain or
+/// Replicated/Shared.
+fn collapses_by_key(engine: &str) -> bool {
+    let family = engine.split('(').next().unwrap_or("").trim();
+    let family = family
+        .strip_prefix("Replicated")
+        .or_else(|| family.strip_prefix("Shared"))
+        .unwrap_or(family);
+    family != "MergeTree" && family.ends_with("MergeTree")
+}
+
 /// The MergeTree family — the only engines whose parts survive our staging→final
 /// ATTACH/EXCHANGE choreography.
 const MERGETREE_FAMILY: [&str; 14] = [
@@ -1873,10 +1885,38 @@ impl crate::sink::Sink for ChSink {
             Some(keys) => format!("({keys})"),
             None => match self.ddl.order_by.as_deref() {
                 Some(ob) => format!("({ob})"),
-                None => plan
-                    .cursor
-                    .as_deref()
-                    .map_or("tuple()".to_string(), ch_ident),
+                // A ClickHouse source's own sorting key (N26): its cursor is
+                // only the leading key column, a split hint — ordered by that
+                // alone, ORDER BY (tenant_id, id) became (tenant_id).
+                None if plan.engine == "clickhouse" && !plan.pk_cols.is_empty() => format!(
+                    "({})",
+                    plan.pk_cols
+                        .iter()
+                        .map(|c| ch_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => {
+                    let ob = plan
+                        .cursor
+                        .as_deref()
+                        .map_or("tuple()".to_string(), ch_ident);
+                    // An engine that merges rows sharing a sorting key, over
+                    // an EMPTY key, merges every row into one, silently (N26).
+                    if ob == "tuple()" {
+                        if let Some(e) = self.ddl.engine.as_deref().filter(|e| collapses_by_key(e))
+                        {
+                            return Err(Error::InvalidInput(format!(
+                                "engine='{e}' merges rows that share the sorting key, and \
+                                 {} has none to default to (no order_by=, no single \
+                                 integer key): every row would merge into one. Pass \
+                                 order_by= with the table's key",
+                                self.final_t
+                            )));
+                        }
+                    }
+                    ob
+                }
             },
         };
         let primary_key = self
@@ -3133,6 +3173,32 @@ mod tests {
             assert!(r.is_err(), "the failed drop is reported");
             assert_eq!(drops, 2, "the second drop was never attempted");
         });
+    }
+
+    /// N26: the engines that merge rows sharing a sorting key, whatever the
+    /// Replicated/Shared prefix; MergeTree itself does not.
+    #[test]
+    fn which_engines_collapse_by_key() {
+        use super::collapses_by_key;
+        for e in [
+            "ReplacingMergeTree",
+            "ReplacingMergeTree(ver)",
+            "ReplicatedReplacingMergeTree('/p', '{replica}', ver)",
+            "SharedReplacingMergeTree",
+            "SummingMergeTree",
+            "CollapsingMergeTree(sign)",
+        ] {
+            assert!(collapses_by_key(e), "{e}");
+        }
+        for e in [
+            "MergeTree",
+            "ReplicatedMergeTree",
+            "SharedMergeTree",
+            "Memory",
+            "Log",
+        ] {
+            assert!(!collapses_by_key(e), "{e}");
+        }
     }
 
     /// D21: the server's own default rebuild is not a loss. Cloud makes a

@@ -285,6 +285,7 @@ LEGS = [
     leg("e2e_my_composite_cursor.py", "an append without cursor= never auto-picks part of a composite key"),
     leg("e2e_ch_tz_cursor.py",        "a ClickHouse-source DateTime cursor with its own time zone resumes exactly"),
     leg("e2e_ch_sort_key_cursor.py", "a ClickHouse append without cursor= never auto-picks a sorting-key column"),
+    leg("e2e_ch_replace_sort_key.py", "a ch -> ch replace orders the new table by the source's sorting key"),
     leg("e2e_ch_changelog_mass_mask.py", "a ClickHouse changelog window with thousands of masked rows applies"),
     leg("e2e_ch_changelog_ext_key.py", "a changelog keeps the value an earlier update in the window set on an out-of-line key"),
     leg("e2e_ch_journal_window.py",  "a ClickHouse residue journal entry is only reused by its own op"),

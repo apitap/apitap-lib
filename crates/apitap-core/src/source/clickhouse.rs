@@ -356,10 +356,9 @@ impl crate::source::Source for ChSource {
             ))
             .await?;
         let mut cols = Vec::new();
-        let mut sort_ints = Vec::new();
         for line in rows.lines().filter(|l| !l.trim().is_empty()) {
             let mut f = line.split('\t');
-            let (cname, ty, pk) = (
+            let (cname, ty, _in_key) = (
                 f.next().unwrap_or_default().to_string(),
                 f.next().unwrap_or_default().to_string(),
                 f.next().unwrap_or("0") == "1",
@@ -372,14 +371,10 @@ impl crate::source::Source for ChSource {
             // copied a new event of an existing user (deep review D26). The
             // sort-key columns still order the destination (`pk_cols`), and
             // the leading one still splits a read (`cursor` below).
-            let sort_int = pk && matches!(d, Delivered::Int { .. }) && !nullable;
             let (precision, scale) = match d {
                 Delivered::Decimal { p, s } => (Some(p as i32), Some(s as i32)),
                 _ => (None, None),
             };
-            if sort_int {
-                sort_ints.push(cname.clone());
-            }
             cols.push(ColumnPlan {
                 name: cname,
                 nullable,
@@ -424,7 +419,19 @@ impl crate::source::Source for ChSource {
                     && !c.nullable
             })
             .map(|c| c.name.clone());
-        let pk_cols = sort_ints;
+        // The source's sorting key, as columns: what a ch -> ch destination is
+        // ordered by when no order_by= is given. A key with an expression in
+        // it (`toDate(ts)`) is not a column list, so it orders nothing (N26).
+        let key: Vec<String> = sorting_key
+            .split(',')
+            .map(|s| s.trim().trim_matches('`').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let pk_cols = if !key.is_empty() && key.iter().all(|k| cols.iter().any(|c| &c.name == k)) {
+            key
+        } else {
+            Vec::new()
+        };
 
         Ok(TablePlan {
             engine: "clickhouse",
