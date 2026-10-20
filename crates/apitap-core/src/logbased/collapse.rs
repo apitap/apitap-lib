@@ -702,20 +702,28 @@ pub(crate) mod gen {
     }
 }
 
-/// For each residue op, whether a LATER op in the same window deletes the
-/// key it has to find (a masked update's key, a move's new key). Such an op
-/// finding no row has lost nothing: the window removes that row anyway. The
-/// OLTP appliers refuse a masked update that matches no row, and a re-applied
-/// part of a window (a group straddling a member's floor) holding
-/// "masked update k, then delete k" met a row already deleted and was refused
-/// on every rerun (deep review D12).
+/// For each residue op, whether a LATER op in the same window takes the row
+/// away from the key it has to find (a masked update's key, a move's new
+/// key): deletes it, or moves it on. Such an op finding no row has lost
+/// nothing: the window removes that row from there anyway. The OLTP appliers
+/// refuse a masked update that matches no row, and a re-applied part of a
+/// window (a group straddling a member's floor) holding "masked update k,
+/// then delete k" met a row already deleted and was refused on every rerun
+/// (deep review D12). "Masked update k, move k -> j" and a chain "move k ->
+/// j, move j -> m" were refused the same way (deep review 2, N3).
 pub(crate) fn deleted_later(residue: &[ResidueOp]) -> Vec<bool> {
     let mut out = vec![false; residue.len()];
     let mut gone: HashSet<&Key> = HashSet::new();
     for (i, op) in residue.iter().enumerate().rev() {
         match op {
             ResidueOp::MaskedUpdate { key, .. } => out[i] = gone.contains(key),
-            ResidueOp::Rekey { new_key, .. } => out[i] = gone.contains(new_key),
+            ResidueOp::Rekey {
+                old_key, new_key, ..
+            } => {
+                out[i] = gone.contains(new_key);
+                // The row leaves `old_key` here, for every op before this one.
+                gone.insert(old_key);
+            }
             ResidueOp::Delete { key } => {
                 gone.insert(key);
             }
@@ -758,6 +766,29 @@ mod deleted_later_tests {
             deleted_later(&ops),
             vec![true, false, false, true, false, false]
         );
+    }
+
+    /// N3: a later move away from a key takes the row from it too.
+    #[test]
+    fn a_later_move_away_makes_an_earlier_op_moot() {
+        let k = |v: &str| vec![v.as_bytes().to_vec()];
+        let mv = |a: &str, b: &str| ResidueOp::Rekey {
+            old_key: k(a),
+            new_key: k(b),
+            row: vec![],
+        };
+        let ops = vec![
+            ResidueOp::MaskedUpdate {
+                key: k("k"),
+                row: vec![],
+            },
+            mv("k", "j"),
+            mv("x", "y"),
+            mv("y", "z"),
+        ];
+        // masked k: k moves away. k -> j: nothing leaves j later. x -> y: y
+        // moves on. y -> z: the last op.
+        assert_eq!(deleted_later(&ops), vec![true, false, true, false]);
     }
 }
 

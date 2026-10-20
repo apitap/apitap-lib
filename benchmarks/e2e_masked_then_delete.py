@@ -6,7 +6,8 @@ When the same window then deletes that key, the missing row has lost
 nothing. A re-applied part of a window, from a group straddling a member's
 floor (K3), meets exactly that: the row is already gone, and the window
 holding "masked update k, delete k" was refused on every rerun (deep review
-D12).
+D12). A later move away from k takes the row too: "masked update k, move
+k -> j" and a move chain were refused the same way (deep review 2, N3).
 
 Proof, per destination (pg, my): bootstrap, remove row k at the destination
 (the state a re-applied window meets), then one source transaction updates k
@@ -92,6 +93,16 @@ def leg(which):
         s, d = fp_src(), fp_dst(which)
         assert s == d, f"[{which}] after masked-then-delete: source {s!r} vs destination {d!r}"
         print(f"  [{which}] masked update then delete of a row already gone: applied, equal")
+
+        # N3: the row already moved on, as a re-applied window finds it.
+        dst(which, f"UPDATE {T} SET id = 9, v = 1 WHERE id = 1")
+        src(f"BEGIN; UPDATE {T} SET v = 1 WHERE id = 1; UPDATE {T} SET id = 9 WHERE id = 1; COMMIT")
+        dst(which, f"UPDATE {T} SET id = 8, v = 0 WHERE id = 4")
+        src(f"BEGIN; UPDATE {T} SET id = 7 WHERE id = 4; UPDATE {T} SET id = 8 WHERE id = 7; COMMIT")
+        apitap.transfer(SRC, D, table=T, mode="log_based")
+        s, d = fp_src(), fp_dst(which)
+        assert s == d, f"[{which}] after masked-then-move and a move chain: source {s!r} vs destination {d!r}"
+        print(f"  [{which}] masked update then a move, and a move chain, over rows already moved: applied, equal")
 
         # The refusal stays for the case it exists for.
         dst(which, f"DELETE FROM {T} WHERE id = 3")
