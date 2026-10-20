@@ -830,6 +830,13 @@ async fn apply_unit(
     // residue tail below stays as-is (it deletes before it inserts, so no
     // same-version tie can arise).
     let insert_only = u.insert_only(dest_table, pk_cols).await;
+    // The table has the tombstone shape even where the apply is general (its
+    // sorting key is not the key, D9): 0.62.x wrote versions and tombstones
+    // into it, so a readback must take the newest live version, as the
+    // tombstone path does. Without FINAL it read an arbitrary one and could
+    // re-land a stale TOAST value (deep review 2, N2). A key the general path
+    // has rewritten keeps only its new row, so FINAL is right for both.
+    let versioned = insert_only || u.tombstone_shape(dest_table).await;
 
     if !insert_only && (!c.deletes.is_empty() || !c.upserts.is_empty()) {
         let kt = u.key_table_reset(dest_table, pk_cols).await?;
@@ -1054,7 +1061,7 @@ async fn apply_unit(
                     // read can hit a tombstone or an older version, and the
                     // patched re-insert would resurrect a stale value
                     // (review P1-1).
-                    let body = if insert_only {
+                    let body = if versioned {
                         u.read(&format!(
                             "SELECT {sel} FROM {ft} FINAL WHERE {pred} AND _apitap_deleted = 0 FORMAT TabSeparated"
                         ))
@@ -1183,7 +1190,7 @@ async fn apply_unit(
                         .map(|&i| ch_ident(&wal_cols[i]))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let body = if insert_only {
+                    let body = if versioned {
                         u.read(&format!(
                             "SELECT {sel} FROM {ft} FINAL WHERE {old_pred} AND _apitap_deleted = 0 FORMAT TabSeparated"
                         ))
@@ -1735,7 +1742,9 @@ mod store {
                 crate::progress::note(&format!(
                     "{table} is ReplacingMergeTree(_apitap_ver, _apitap_deleted) but its \
                      ORDER BY ({}) is not the key ({}): a tombstone would miss the row, so \
-                     it applies by delete-then-insert",
+                     it applies by delete-then-insert. If 0.62.x already applied to it, \
+                     a deleted key may still show and a key moved off its ORDER BY may \
+                     show twice: re-bootstrap the table to repair those",
                     sorting.join(", "),
                     pk.join(", ")
                 ));
@@ -2231,6 +2240,12 @@ mod store {
         /// catalog.
         pub(crate) async fn insert_only(&self, table: &str, pk: &[String]) -> bool {
             self.s.insert_only_for(table, pk).await
+        }
+
+        /// Whether the table has the tombstone engine shape, whatever path
+        /// its apply takes (see `insert_only_for`).
+        pub(crate) async fn tombstone_shape(&self, table: &str) -> bool {
+            self.s.detect_insert_only(table).await.0
         }
 
         /// A read the server refuses to let write.

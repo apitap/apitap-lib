@@ -240,6 +240,7 @@ LEGS = [
     leg("e2e_cdc_progress.py",     "a Postgres drain reports rows while it runs"),
     leg("e2e_ch_insert_only.py",   "a Replacing destination takes the tombstone path, FINAL exact"),
     leg("e2e_ch_tombstone_sort_key.py", "a Replacing destination whose ORDER BY is not the key never takes the tombstone path"),
+    leg("e2e_ch_tombstone_upgrade.py", "a table 0.62.x filled with versions reads back its newest one after the upgrade", {"wheel-0621"}),
     leg("e2e_text_source_order_by.py", "a CSV from GitHub lands in ClickHouse with order_by= on one of its columns"),
     leg("e2e_pg_ch_binary_types.py", "a PG→CH table binary pgoutput cannot render drains on text"),
     leg("e2e_read_pg_types.py",    "read() of PG types without a send decoder equals the server's ::text"),
@@ -440,6 +441,7 @@ def capabilities():
     need_wheel("wheel-0551", "APITAP_PY_0551", "0.55.1")
     need_wheel("wheel-0560", "APITAP_PY_0560", "0.56.0")
     need_wheel("wheel-0620", "APITAP_PY_0620", "0.62.0")
+    need_wheel("wheel-0621", "APITAP_PY_0621", "0.62.1")
 
     cpu = cgroup_cores()
     if cpu > 0.6:
