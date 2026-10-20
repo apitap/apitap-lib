@@ -753,6 +753,14 @@ pub(crate) async fn drain_binlog(
                     // `drain_tx` with a layout for it.
                     layout_for(sess, pool, &q).await?;
                     sess.st.maps.insert(map.table_id, map);
+                } else {
+                    // An id names the table its LATEST map gave it. The server
+                    // hands ids out again after a restart, so an untracked
+                    // table can take a tracked one's old id; left in place,
+                    // the old binding decoded the untracked table's rows as
+                    // the tracked one's and applied them there (deep review
+                    // D14, K8). Every rows event follows its own TABLE_MAP.
+                    sess.st.maps.remove(&map.table_id);
                 }
             }
             t if bl::is_rows(t) => {
