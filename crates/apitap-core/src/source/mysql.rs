@@ -595,6 +595,10 @@ enum MyTsv {
         bytes: u8,
         unsigned: bool,
     },
+    /// Binary YEAR (a 2-byte integer) → four digits. LOAD DATA reads a field
+    /// as a string, and YEAR maps the one-digit string `0` to 2000: the
+    /// legal zero year arrived as 2000 (deep review D29). `0000` stays 0.
+    Year,
     F32,
     F64,
     /// Already text on the wire (varchar/text/json/enum/set/decimal-as-text,
@@ -613,7 +617,8 @@ fn my_tsv(c: &ColumnPlan) -> MyTsv {
     let int = |bytes: u8| MyTsv::Int { bytes, unsigned };
     match c.udt.as_str() {
         "tinyint" => int(1),
-        "smallint" | "year" => int(2),
+        "smallint" => int(2),
+        "year" => MyTsv::Year,
         "mediumint" | "int" => int(4),
         "bigint" => int(8),
         "float" => MyTsv::F32,
@@ -660,6 +665,10 @@ fn tsv_write(enc: MyTsv, b: &[u8], out: &mut Vec<u8>) -> Result<()> {
                 _ => buf.format(u64::from_le_bytes(b.try_into().map_err(|_| bad_int())?)),
             };
             out.extend_from_slice(s.as_bytes());
+        }
+        MyTsv::Year => {
+            let y = u16::from_le_bytes(b.try_into().map_err(|_| bad_int())?);
+            w4(out, u32::from(y));
         }
         MyTsv::F32 => {
             let v = f32::from_le_bytes(b.try_into().map_err(|_| bad_int())?);
@@ -2012,6 +2021,14 @@ mod tests {
         let mut o = Vec::new();
         tsv_write(enc, b, &mut o).unwrap();
         String::from_utf8(o).unwrap()
+    }
+
+    /// D29: YEAR goes out as four digits, so the zero year stays 0000.
+    #[test]
+    fn a_year_is_four_digits() {
+        assert_eq!(tw(MyTsv::Year, &0u16.to_le_bytes()), "0000");
+        assert_eq!(tw(MyTsv::Year, &2026u16.to_le_bytes()), "2026");
+        assert_eq!(tw(MyTsv::Year, &1901u16.to_le_bytes()), "1901");
     }
 
     #[test]
