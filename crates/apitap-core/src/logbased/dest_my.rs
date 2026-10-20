@@ -229,7 +229,13 @@ async fn apply_unit(
             "load keys",
         )
         .await?;
-        u.no_warnings("key load").await?;
+        // The twin is a key SET for the DELETE join. Two keys that are one
+        // under the destination's collation ('Alice@X.com' -> 'alice@x.com'
+        // in a _ci column, a trailing space under PAD SPACE) are one row
+        // there too, and the second is skipped with 1062. The byte dedupe
+        // above cannot see that; refusing 1062 stopped the lane on every
+        // rerun (deep review 2, N4). Any other warning still refuses.
+        u.no_warnings_but("key load", &[1062]).await?;
         let join = pk_cols
             .iter()
             .map(|k| format!("t.{k} = d.{k}", k = my_ident(k)))
@@ -612,19 +618,36 @@ mod store {
         /// count costs one round-trip per load and turns that back into an
         /// error, quoting what the server said.
         pub(crate) async fn no_warnings(&mut self, what: &str) -> Result<()> {
-            let n: Option<u32> = self
-                .conn()
-                .query_first("SELECT @@warning_count")
-                .await
-                .map_err(|e| Error::Transfer(format!("log_based: mysql warning probe: {e}")))?;
-            if n.unwrap_or(0) == 0 {
-                return Ok(());
-            }
+            self.no_warnings_but(what, &[]).await
+        }
+
+        /// `no_warnings`, letting the codes in `allow` through. Only when every
+        /// warning was listed: SHOW WARNINGS stops at max_error_count, and a
+        /// warning nobody saw is not one that was allowed.
+        pub(crate) async fn no_warnings_but(&mut self, what: &str, allow: &[u32]) -> Result<()> {
+            // Diagnostic statements first, both of them: a SELECT clears the
+            // diagnostics area, and with `SELECT @@warning_count` asked first
+            // SHOW WARNINGS listed nothing (every refusal said "MySQL said:"
+            // and no more), so no code could be checked (N4).
             let rows: Vec<(String, u32, String)> = self
                 .conn()
                 .query("SHOW WARNINGS")
                 .await
                 .map_err(|e| Error::Transfer(format!("log_based: mysql SHOW WARNINGS: {e}")))?;
+            let n: Option<u32> = self
+                .conn()
+                .query_first("SHOW COUNT(*) WARNINGS")
+                .await
+                .map_err(|e| Error::Transfer(format!("log_based: mysql warning probe: {e}")))?;
+            if n.unwrap_or(0) == 0 {
+                return Ok(());
+            }
+            if !allow.is_empty()
+                && rows.len() as u32 == n.unwrap_or(0)
+                && rows.iter().all(|(_, code, _)| allow.contains(code))
+            {
+                return Ok(());
+            }
             let said = rows
                 .iter()
                 .take(3)

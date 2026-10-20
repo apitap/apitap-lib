@@ -280,6 +280,7 @@ LEGS = [
     leg("e2e_ice_toast_refetch.py",   "an Iceberg CDC drain refetches TOAST holes through the primary key", {"iceberg"}),
     leg("e2e_my_require_pk.py",       "a MySQL destination with sql_require_primary_key=ON takes every lane"),
     leg("e2e_my_del_reinsert.py",     "a key deleted and re-inserted in one window applies to a MySQL destination"),
+    leg("e2e_my_ci_key_change.py",   "a key change that only changes case never wedges a MySQL -> MySQL lane"),
     leg("e2e_pg_snapshot_idle.py",    "a parallel Postgres read survives idle_in_transaction_session_timeout"),
     leg("e2e_pg_cdc_snapshot_idle.py", "a Postgres CDC bootstrap survives idle_in_transaction_session_timeout"),
     leg("e2e_pg_char_key_residue.py", "a char(n) key on the Postgres CDC residue path matches its row"),
