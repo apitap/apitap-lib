@@ -1317,7 +1317,7 @@ impl S3Sink {
         // part files are ever deleted.
         let mut left = Vec::new();
         for s in stale {
-            if !fresh.contains(&s) && is_part_object(&s) && self.conn.delete(&s).await.is_err() {
+            if !fresh.contains(&s) && is_own_part(&dir, &s) && self.conn.delete(&s).await.is_err() {
                 left.push(s);
             }
         }
@@ -1329,6 +1329,17 @@ impl S3Sink {
         }
         Ok(())
     }
+}
+
+/// A part file of THIS table: a direct child of its directory `dir` (which
+/// ends in `/`) with apitap's part-file name. The listing is recursive, and a
+/// key deeper down belongs to someone else: another destination written
+/// under this table's directory (`<prefix>/events` + table `clicks` lands in
+/// `events/clicks/`), or another run's staging. A sweep that judged the
+/// basename alone deleted their published parts (deep review D25).
+pub(crate) fn is_own_part(dir: &str, key: &str) -> bool {
+    key.strip_prefix(dir)
+        .is_some_and(|rest| !rest.contains('/') && is_part_object(rest))
 }
 
 /// apitap's own part-file names — the ONLY things a stale-sweep may delete.
@@ -1562,6 +1573,23 @@ mod tests {
         assert!(!is_part_object("lake/events/part-3.parquet"));
         assert!(!is_part_object("lake/events/users-notes.parquet"));
         assert!(!is_part_object("lake/events/README.md"));
+        // D25: only a direct child of the table's own directory.
+        let g = part_generation();
+        let own = format!("lake/events/part-{g}-00003.parquet");
+        assert!(is_own_part("lake/events/", &own));
+        assert!(!is_own_part(
+            "lake/events/",
+            &format!("lake/events/clicks/part-{g}-00000.parquet")
+        ));
+        assert!(!is_own_part(
+            "lake/events/",
+            "lake/events/clicks__apitap_staging/tok/part-00000.parquet"
+        ));
+        assert!(!is_own_part(
+            "lake/events/",
+            "lake/other/part-00000.parquet"
+        ));
+        assert!(!is_own_part("lake/events/", "lake/events/README.md"));
     }
 
     #[test]

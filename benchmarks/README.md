@@ -681,6 +681,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_pg_hardening.pub --> `e2e_pg_hardening.py pub` | a Postgres replace keeps the destination in its FOR TABLE publication, column list and row filter included |
 | <!-- claim: leg.e2e_pg_hardening.nullcursor --> `e2e_pg_hardening.py nullcursor` | a parallel Postgres read over an integer cursor copies the rows whose cursor is NULL |
 | <!-- claim: leg.e2e_null_cursor_spans --> `e2e_null_cursor_spans.py` | a parallel MySQL read (parallel=4) over a nullable integer cursor copies the rows whose cursor is NULL into Postgres: 1000 rows, 900 with a cursor |
+| <!-- claim: leg.e2e_s3_nested_sweep --> `e2e_s3_nested_sweep.py` | a table published under another table's S3 directory (prefix `<p>/events`, table clicks) keeps every part and all 300 rows through two publishes of `events` at `<p>`, which keeps one generation of its own |
 | <!-- claim: leg.e2e_pg_hardening.negscale --> `e2e_pg_hardening.py negscale` | PG15+ numeric(5,-2) / numeric(2,5) land as Decimal(7,0) / Decimal(5,5), values exact |
 | <!-- claim: leg.e2e_pg_hardening.longname --> `e2e_pg_hardening.py longname` | a Postgres destination name past 63 bytes is refused, not silently cut |
 | <!-- claim: leg.e2e_pg_hardening.fkref --> `e2e_pg_hardening.py fkref` | a Postgres `replace` into a table another table references is refused before anything is copied |

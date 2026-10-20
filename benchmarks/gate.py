@@ -252,6 +252,7 @@ LEGS = [
     leg("e2e_ice_unsigned_cursor.py", "an Iceberg append on a BIGINT UNSIGNED cursor resumes after run 1", {"iceberg"}),
     leg("e2e_ice_late_commit.py",  "a failure after an ambiguous Iceberg commit never sweeps what a late commit lands", {"iceberg"}),
     leg("e2e_s3_publish_faults.py", "an S3 publish fault leaves a readable table and no lock", {"iceberg"}),
+    leg("e2e_s3_nested_sweep.py",    "an S3 publish sweeps only its own table directory, never one nested under it", {"iceberg"}),
     leg("e2e_my_replace_fk.py",    "a MySQL replace into an FK-referenced table is refused before the load"),
     leg("e2e_my_cdc_dests.py",     "MySQL CDC bytes and instants land as the source holds them, into Postgres", argv=["pg"]),
     leg("e2e_my_cdc_dests.py",     "MySQL CDC spells a DECIMAL as the bulk load does, into ClickHouse", argv=["ch"]),

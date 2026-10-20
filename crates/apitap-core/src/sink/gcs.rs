@@ -842,13 +842,9 @@ impl GcsSink {
                 }
                 // A previous format=parquet run of this table would otherwise
                 // stay live next to the new CSV forever.
-                for old in self
-                    .conn
-                    .list(&format!("{}{}/", self.conn.prefix, self.bare))
-                    .await
-                    .unwrap_or_default()
-                {
-                    if is_part_object(&old) {
+                let dir = format!("{}{}/", self.conn.prefix, self.bare);
+                for old in self.conn.list(&dir).await.unwrap_or_default() {
+                    if crate::sink::s3::is_own_part(&dir, &old) {
                         let _ = self.conn.delete(&old).await;
                     }
                 }
@@ -878,7 +874,7 @@ impl GcsSink {
                 let mut left = Vec::new();
                 for s in stale {
                     if !fresh.contains(&s)
-                        && is_part_object(&s)
+                        && crate::sink::s3::is_own_part(&dir, &s)
                         && self.conn.delete(&s).await.is_err()
                     {
                         left.push(s);
@@ -902,8 +898,9 @@ impl GcsSink {
     }
 }
 
-/// apitap's own part-file names (`part-NNNNN.parquet` under a table dir) —
-/// the ONLY things a stale-sweep may delete.
+/// apitap's own part-file names (`part-NNNNN.parquet` under a table dir).
+/// The sweeps ask `s3::is_own_part`, which also requires a direct child.
+#[cfg(test)]
 fn is_part_object(name: &str) -> bool {
     crate::sink::s3::is_part_object(name)
 }
