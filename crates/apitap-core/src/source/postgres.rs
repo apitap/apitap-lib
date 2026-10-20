@@ -416,7 +416,7 @@ impl Source for PgSource {
                     // (no span matched them) ride the last one (P2).
                     let ranges = spans(lo, hi, want);
                     let last = ranges.len() - 1;
-                    let nullable = plan.cursor_plan().is_none_or(|pc| pc.nullable);
+                    let nullable = plan.source_cursor_nullable();
                     for (k, (rlo, rhi)) in ranges.into_iter().enumerate() {
                         let range = span_range(&qcol, k == 0, k == last, rlo, rhi, nullable);
                         stmts.push(format!(

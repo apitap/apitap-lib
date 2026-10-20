@@ -1148,7 +1148,7 @@ impl Source for MySqlSource {
                         if let Some((lo, hi)) = cursor_bounds(Some(l), Some(h)) {
                             let ranges = spans(lo, hi, want);
                             let last = ranges.len() - 1;
-                            let nullable = plan.cursor_plan().is_none_or(|pc| pc.nullable);
+                            let nullable = plan.source_cursor_nullable();
                             for (k, (rlo, rhi)) in ranges.into_iter().enumerate() {
                                 let range =
                                     span_range(&qcol, k == 0, k == last, rlo, rhi, nullable);

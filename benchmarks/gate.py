@@ -319,6 +319,7 @@ LEGS = [
     leg("e2e_pg_hardening.py",       "a parallel Postgres read copies NULL-cursor rows", argv=["nullcursor"]),
     leg("e2e_pg_restore_ddl.py",     "a Postgres replace restores every DDL statement it can, even when one fails"),
     leg("e2e_null_cursor_spans.py",  "a parallel MySQL read copies NULL-cursor rows"),
+    leg("e2e_ch_null_cursor_parallel.py", "a parallel read into ClickHouse never drops NULL-cursor rows"),
     leg("e2e_pg_hardening.py",       "numeric with a negative or oversized scale lands in a Decimal that holds it", argv=["negscale"]),
     leg("e2e_pg_hardening.py",       "a Postgres destination name past 63 bytes is refused", argv=["longname"]),
     leg("e2e_pg_hardening.py",      "a Postgres replace into a referenced table is refused before the load", argv=["fkref"]),

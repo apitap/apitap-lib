@@ -84,6 +84,22 @@ impl TablePlan {
             .or(self.cursor_col.as_ref().filter(|pc| pc.name == c))
     }
 
+    /// Whether the SOURCE may hold a NULL in the cursor: the span planner's
+    /// question. A sink may rewrite `cols[i].nullable` for its own DDL and
+    /// encoder (ClickHouse orders by the cursor, so it forces it NOT NULL);
+    /// the spans then left `OR c IS NULL` off and a parallel read dropped
+    /// every NULL-cursor row from a green run (deep review 2, N6). The
+    /// pipeline keeps the source's column in `cursor_col` before the sink
+    /// sees the plan; unknown reads as nullable, the safe answer.
+    pub(crate) fn source_cursor_nullable(&self) -> bool {
+        let c = self.cursor.as_deref();
+        self.cursor_col
+            .as_ref()
+            .filter(|pc| Some(pc.name.as_str()) == c)
+            .or_else(|| self.cursor_plan())
+            .is_none_or(|pc| pc.nullable)
+    }
+
     /// The auto-detect rule: exactly one integer-PK column.
     pub(crate) fn single_int_pk(&self) -> Option<String> {
         let mut it = self.cols.iter().filter(|c| c.int_pk);
@@ -447,6 +463,37 @@ mod wm_tests {
             plan.cursor_plan().is_none(),
             "a different cursor is not the kept one"
         );
+    }
+
+    /// N6: the spans ask the SOURCE whether the cursor can be NULL, not the
+    /// flag a sink rewrote for its own DDL.
+    #[test]
+    fn the_spans_see_the_source_cursor_nullability() {
+        let mut plan = super::TablePlan {
+            engine: "postgres",
+            cols: vec![super::ColumnPlan {
+                name: "c".into(),
+                nullable: true,
+                int_pk: false,
+                native_ddl: None,
+                udt: "int4".into(),
+                precision: None,
+                scale: None,
+            }],
+            cursor: Some("c".into()),
+            pk_cols: vec![],
+            cursor_col: None,
+        };
+        // As the pipeline keeps it, then as the ClickHouse sink adjusts it.
+        plan.cursor_col = plan.cursor_plan().cloned();
+        plan.cols[0].nullable = false;
+        assert!(plan.source_cursor_nullable());
+        // No kept column: the plan's own flag, and no cursor at all is the
+        // safe answer, nullable.
+        plan.cursor_col = None;
+        assert!(!plan.source_cursor_nullable());
+        plan.cursor = Some("gone".into());
+        assert!(plan.source_cursor_nullable());
     }
 
     /// P2: numeric(5,-2) needs 7 integer digits; numeric(2,5) needs p >= s.

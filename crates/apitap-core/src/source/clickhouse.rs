@@ -659,7 +659,7 @@ impl crate::source::Source for ChSource {
                     };
                     let ranges = spans(lo, hi, want);
                     let last = ranges.len() - 1;
-                    let nullable = plan.cursor_plan().is_none_or(|pc| pc.nullable);
+                    let nullable = plan.source_cursor_nullable();
                     return Ok(ranges
                         .into_iter()
                         .enumerate()

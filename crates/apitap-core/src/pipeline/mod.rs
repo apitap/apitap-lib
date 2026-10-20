@@ -635,6 +635,11 @@ pub(crate) async fn run<S: Source, K: Sink, R: FnOnce(usize) -> usize>(
         Mode::Replace => plan.single_int_pk().or_else(|| plan.cursor.clone()),
         _ => plan.auto_cursor(),
     });
+    // The source's own view of the cursor, before the sink rewrites the
+    // column flags for its DDL (see `TablePlan::source_cursor_nullable`).
+    if plan.cursor_col.is_none() {
+        plan.cursor_col = plan.cursor_plan().cloned();
+    }
     sink.adjust_plan(&mut plan);
 
     // Incremental resolution: find the watermark in the DESTINATION (stateless — no
