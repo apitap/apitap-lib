@@ -980,7 +980,6 @@ async fn apply_unit(
         )));
     }
     let replay = !c.residue.is_empty() && u.journal_live(dest_table, id.start()).await?;
-    let dbg = std::env::var_os("APITAP_DEBUG").is_some();
     if dbg && !c.residue.is_empty() {
         eprintln!(
             "[residue] {dest_table} window {}..{} ops={} replay={replay}",
