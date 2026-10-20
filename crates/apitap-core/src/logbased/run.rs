@@ -1648,6 +1648,16 @@ async fn bootstrap_group(
     other_slots_report(src, slot, &tracked).await;
 
     let mut ws = Walsender::connect(src_url).await?;
+    // The startup pinned idle_in_transaction_session_timeout = 0 (N8); PG 17
+    // added transaction_timeout, which would kill the same idle holder, and
+    // an unknown startup GUC is FATAL before 17, so it is SET here.
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(src)
+        .await
+        .map_err(db_err)?;
+    if version >= 170_000 {
+        ws.simple_query("SET transaction_timeout = 0").await?;
+    }
     let rows = ws
         .simple_query(&format!(
             "CREATE_REPLICATION_SLOT \"{slot}\" LOGICAL pgoutput EXPORT_SNAPSHOT"

@@ -651,6 +651,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_require_pk --> `e2e_my_require_pk.py` | a MySQL destination with sql_require_primary_key=ON takes replace, append (keyed and key-less) and CDC |
 | <!-- claim: leg.e2e_my_del_reinsert --> `e2e_my_del_reinsert.py` | a key deleted and re-inserted in one CDC window applies to a MySQL destination instead of wedging the lane on Warning 1062 |
 | <!-- claim: leg.e2e_pg_snapshot_idle --> `e2e_pg_snapshot_idle.py` | a parallel Postgres read whose role has a 2 s idle_in_transaction_session_timeout keeps its exported snapshot and lands every row |
+| <!-- claim: leg.e2e_pg_cdc_snapshot_idle --> `e2e_pg_cdc_snapshot_idle.py` | a pg -> pg log_based first run of a two-table group (2M rows each) as a role with idle_in_transaction_session_timeout = 2 s lands both tables whole: the slot's exporting walsender is not killed mid-bootstrap |
 | <!-- claim: leg.e2e_pg_char_key_residue --> `e2e_pg_char_key_residue.py` | a masked update, and a masked update then delete, of a char(10) key apply on pg -> pg CDC instead of missing the blank-padded row |
 | <!-- claim: leg.e2e_masked_then_delete.pg --> `e2e_masked_then_delete.py pg` | a masked update whose key the same window deletes applies on a Postgres destination whose row is already gone; a masked update of a missing row the window keeps is still refused |
 | <!-- claim: leg.e2e_masked_then_delete.my --> `e2e_masked_then_delete.py my` | the same, into MySQL |

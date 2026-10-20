@@ -1086,6 +1086,15 @@ impl Walsender {
             // MySQL, Iceberg and BigQuery lanes refused every window (deep
             // review D33). The COPY plane dials through here too.
             ("bytea_output", "hex"),
+            // The CDC bootstrap's walsender exports the slot's snapshot and
+            // then sends nothing for the whole full load: idle in
+            // transaction to the server, killed by a role or database
+            // idle_in_transaction_session_timeout, and every later load or
+            // span failed "invalid snapshot identifier" (deep review 2, N8;
+            // D31 had fixed only the bulk read's holder). The GUC exists on
+            // every server pgoutput runs on; PG 17's transaction_timeout is
+            // set after connecting, where the version is known.
+            ("idle_in_transaction_session_timeout", "0"),
         ];
         if replication {
             params.push(("replication", "database"));
