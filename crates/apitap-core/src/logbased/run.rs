@@ -1319,7 +1319,9 @@ async fn run_group_mysql(
                     dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
                 }
                 let (su, du, r) = (su.clone(), du.clone(), run_c.clone());
+                let dest = dest.clone();
                 async move {
+                    let _turn = bootstrap_turn(&dest).await;
                     let rep =
                         Box::pin(crate::transfer_within(&r, &su, &du, &table_arg, &o2)).await?;
                     Ok((rep.rows, rep.parallel))
@@ -1578,6 +1580,26 @@ async fn existing_slots(src: &PgPool, names: &[&str]) -> Result<Vec<(String, boo
     Ok(rows)
 }
 
+/// One CPU-bound bootstrap full load at a time in this process. `slots=N`
+/// runs its groups on N threads, and on a first run every group
+/// bootstraps; each load sizes its pipes and chunks to the WHOLE memory
+/// limit, so N of them at once were each budgeted for the cage alone — the
+/// shape that OOM-killed the 30-table bootstrap (deep review D18). A group
+/// already loads its own tables one at a time; this extends that across
+/// groups. BigQuery's loads are I/O-bound jobs and keep their fan-out
+/// (`bootstrap_lanes`), so `None` for it.
+async fn bootstrap_turn(dest: &Dest) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    static TURN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    if matches!(dest, Dest::Bq(_)) {
+        return None;
+    }
+    Some(
+        TURN.acquire()
+            .await
+            .expect("the bootstrap turn is never closed"),
+    )
+}
+
 /// Bootstrap fan-out shared by `slots=N` groups: the destination's lane
 /// count divides by how many groups bootstrap at once, so the process keeps
 /// the documented memory ceiling no matter how many slots run in it (system
@@ -1675,6 +1697,7 @@ async fn bootstrap_group(
             o2.slots = None;
             strip_changelog_ddl(&mut o2);
             dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
+            let _turn = bootstrap_turn(dest).await;
             let r = Box::pin(crate::transfer_within(
                 run,
                 pinned_url,

@@ -130,6 +130,7 @@ LEGS = [
     leg("e2e_cdc_apply_orphan.py", "a drain that loses its source joins its apply before letting go",
         {"cpu>0.6"}, proves={"cdc.apply-joined-on-error": ("pg",)}),
     leg("e2e_slots.py",            "slots=N: each group holds its own tenure",
+    leg("e2e_slots_bootstrap_serial.py", "a slots=N first run bootstraps one table at a time across its groups"),
         proves={"slots.groups-independent": ("pg",)}),
     leg("e2e_my_liveness.py",      "a dead binlog peer is noticed"),
 
