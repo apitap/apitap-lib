@@ -414,8 +414,7 @@ impl crate::guard::GuardStore for ChGuard {
         } else {
             format!("DROP TABLE IF EXISTS {}", ch_ident(raw))
         };
-        self.ch
-            .exec(&sql)
+        drop_own(&self.ch, &sql)
             .await
             .map(|_| ())
             .map_err(|e| Error::Transfer(format!("drop {raw}: {e}")))
@@ -1233,10 +1232,11 @@ impl ChSink {
     /// for the next run's scan to name rather than failing a run that
     /// landed (or, for an append, re-landing it).
     async fn drop_staging_after_publish(&self) {
-        if let Err(e) = self
-            .ch
-            .exec(&format!("DROP TABLE IF EXISTS {}", self.staging_t))
-            .await
+        if let Err(e) = drop_own(
+            &self.ch,
+            &format!("DROP TABLE IF EXISTS {}", self.staging_t),
+        )
+        .await
         {
             crate::progress::warn(&format!(
                 "clickhouse: published, but dropping {} failed ({e}); the next run of \
@@ -1710,6 +1710,36 @@ impl ChSink {
             announced: std::sync::Mutex::new(None),
         })
     }
+}
+
+/// DROP one of apitap's OWN tables (staging, a shadow copy, the generation
+/// a swap retired, a run's artifacts) past `max_table_size_to_drop`. The
+/// server's 50 GB guard is for a user's accidental DROP; it made a replace
+/// of a big table unable to clean up after itself, and with the staging drop
+/// before the EXCHANGE, unable to publish at all (deep review D20). The
+/// setting is a query-level override on current servers (verified on 24.8:
+/// 1 refuses, 0 drops); a server or profile that refuses the SETTING gets the
+/// plain DROP, exactly as before.
+pub(crate) async fn drop_own(ch: &ChConn, sql: &str) -> Result<String> {
+    match ch
+        .exec(&format!("{sql} SETTINGS max_table_size_to_drop = 0"))
+        .await
+    {
+        Err(e) if setting_refused(&e.to_string()) => ch.exec(sql).await,
+        r => r,
+    }
+}
+
+/// The server refused a query-level setting itself, not the statement.
+fn setting_refused(msg: &str) -> bool {
+    [
+        "UNKNOWN_SETTING",
+        "Unknown setting",
+        "SETTING_CONSTRAINT_VIOLATION",
+        "READONLY",
+    ]
+    .iter()
+    .any(|k| msg.contains(k))
 }
 
 impl crate::sink::Sink for ChSink {
@@ -2339,10 +2369,11 @@ impl ChSink {
         // 0-row guard, every mode.
         if rows == 0 {
             let oc = self.ddl.on_cluster_clause();
-            let _ = self
-                .ch
-                .exec(&format!("DROP TABLE IF EXISTS {}{oc}", self.staging_t))
-                .await;
+            let _ = drop_own(
+                &self.ch,
+                &format!("DROP TABLE IF EXISTS {}{oc}", self.staging_t),
+            )
+            .await;
             return Ok(());
         }
         // CLUSTER BARRIER, and it is load-bearing. The INSERTs were spread
@@ -2453,10 +2484,11 @@ impl ChSink {
                             self.staging_t, self.final_t
                         ))
                         .await?;
-                    let _ = self
-                        .ch
-                        .exec(&format!("DROP TABLE IF EXISTS {}{oc}", self.staging_t))
-                        .await;
+                    let _ = drop_own(
+                        &self.ch,
+                        &format!("DROP TABLE IF EXISTS {}{oc}", self.staging_t),
+                    )
+                    .await;
                 } else if self.ddl.engine.is_some() {
                     // The final table needs the USER's engine, so a name swap with
                     // the MergeTree staging won't do: create the final with that
@@ -2514,10 +2546,8 @@ impl ChSink {
                         if self.ddl.is_replicated() && self.ddl.has_explicit_zk_path() {
                             // Backstop for a table created between prepare's check
                             // and now — don't leave the streamed staging behind.
-                            let _ = self
-                                .ch
-                                .exec(&format!("DROP TABLE {}", self.staging_t))
-                                .await;
+                            let _ =
+                                drop_own(&self.ch, &format!("DROP TABLE {}", self.staging_t)).await;
                             return Err(Error::InvalidInput(format!(
                                 "mode='replace' into the existing Replicated table \
                                  {} would need a second ZooKeeper path for the \
@@ -2553,9 +2583,11 @@ impl ChSink {
                                 self.staging_t
                             ))
                             .await?;
-                        self.ch
-                            .exec(&format!("DROP TABLE {}", self.staging_t))
-                            .await?;
+                        // The staging drop waits for the publish (`drop_after`):
+                        // here, before the EXCHANGE, a failure (staging still
+                        // holds every part: ATTACH FROM hard-links them) left the
+                        // destination unpublished and two artifacts behind (D20).
+                        drop_after = true;
                         // The exists check above ran on the CONNECTED host only;
                         // an ON CLUSTER EXCHANGE needs both names on EVERY host.
                         // The shell is a no-op where final already exists and gets
@@ -2575,7 +2607,7 @@ impl ChSink {
                         // silent skips, which is worse than a leftover. If the
                         // drop does fail, the next run refuses and names the
                         // object rather than collecting it on a guess.
-                        let _ = self.ch.exec(&format!("DROP TABLE {tmp}{oc}")).await;
+                        let _ = drop_own(&self.ch, &format!("DROP TABLE {tmp}{oc}")).await;
                     }
                 } else if flipped {
                     // Atomic claim (M-11): fails with TABLE_ALREADY_EXISTS when
