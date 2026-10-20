@@ -63,8 +63,12 @@ def main():
     assert r.returncode == 0, r.stderr
     ch_wipe()
     try:
+        # Over TCP: the image's entrypoint first runs a socket-only server to
+        # initialise the database, answers a socket ping from it, then
+        # restarts; a query in that gap fails with ERROR 2002.
         for _ in range(120):
-            if sh(["docker", "exec", NAME, "mysql", "-uroot", "-pbench", "-e", "SELECT 1"]).returncode == 0:
+            if sh(["docker", "exec", NAME, "mysql", "-h127.0.0.1", "-uroot", "-pbench",
+                   "-e", "SELECT 1"]).returncode == 0:
                 break
             time.sleep(1)
         assert my("SELECT @@lower_case_table_names") == "1"
