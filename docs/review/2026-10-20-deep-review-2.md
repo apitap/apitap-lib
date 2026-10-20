@@ -20,8 +20,8 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N3 / N14 | FIXED: a later move away from a key makes an earlier op on it moot | `4fc6d7c` | `e2e_masked_then_delete` pg, my (0.62.1: refused) |
 | N5 / N15 | FIXED: DROP DATABASE, ALTER TABLE IF EXISTS, EXCHANGE's WITH TABLE side, CONVERT, DISCARD/IMPORT TABLESPACE refuse | `2a58119` | `e2e_my_partition_ddl` (0.62.1: green, destination [9,1,2]) |
 | N4 / N13 | FIXED: the key twin's load lets 1062 through (and SHOW WARNINGS is read before the count) | `393f88a` | `e2e_my_ci_key_change` (0.62.1: key load refused) |
-| N7 | NEEDS DESIGN: the fix is persisting the source relation oid per member; the state row is a bare LSN that 0.55.1/0.56.0 also parse, so it needs a format or a side table | — | — |
-| N16 | NEEDS A DECISION: refusing RENAME onto a tracked name also stops every gh-ost/pt-osc cut-over | — | — |
+| N7 | IN PROGRESS (decided: a side table on the destination): persist each member's source relation oid | — | — |
+| N16 | FIXED (decided: refuse): RENAME onto or away from a tracked name stops the run, the gh-ost/pt-osc cut-over included, naming the re-bootstrap | `ece28c7` | `e2e_my_partition_ddl` (previous build: green, old rows kept) |
 | rest | OPEN: N10, N12, N17, N19-N25, N27-N29 | — | — |
 
 ## Fix verdicts
