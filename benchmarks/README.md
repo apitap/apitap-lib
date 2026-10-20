@@ -651,6 +651,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_my_require_pk --> `e2e_my_require_pk.py` | a MySQL destination with sql_require_primary_key=ON takes replace, append (keyed and key-less) and CDC |
 | <!-- claim: leg.e2e_my_del_reinsert --> `e2e_my_del_reinsert.py` | a key deleted and re-inserted in one CDC window applies to a MySQL destination instead of wedging the lane on Warning 1062 |
 | <!-- claim: leg.e2e_pg_snapshot_idle --> `e2e_pg_snapshot_idle.py` | a parallel Postgres read whose role has a 2 s idle_in_transaction_session_timeout keeps its exported snapshot and lands every row |
+| <!-- claim: leg.e2e_pg_char_key_residue --> `e2e_pg_char_key_residue.py` | a masked update, and a masked update then delete, of a char(10) key apply on pg -> pg CDC instead of missing the blank-padded row |
 | <!-- claim: leg.e2e_pg_other_slots --> `e2e_pg_other_slots.py` | a run names every other inactive apitap slot that publishes its tables, with what it retains and the statement that drops it |
 | <!-- claim: leg.e2e_my_auth_plugin --> `e2e_my_auth_plugin.py` | a MySQL user on an auth plugin apitap does not speak (MariaDB ed25519) is told which plugins work and the ALTER USER that switches |
 | <!-- claim: leg.e2e_my_lower_case_names --> `e2e_my_lower_case_names.py` | MySQL CDC on a lower_case_table_names=1 server follows a table named in mixed case |

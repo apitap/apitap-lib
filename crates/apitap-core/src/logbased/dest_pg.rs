@@ -231,8 +231,8 @@ async fn apply_unit(
     // The type WITHOUT its typmod: an explicit cast to varchar(n), char(n)
     // or bit(n) truncates silently, where the column's own assignment
     // refuses a value that does not fit — and the bulk lane refuses it. So
-    // character types cast to text and bit types to bit varying (their bare
-    // names mean char(1) and bit(1)); the column then applies its length.
+    // each type casts to its length-free spelling (`residue_cast`); the
+    // column then applies its length.
     let casts: std::collections::HashMap<String, String> = if c.residue.is_empty() && !raw_bytes {
         std::collections::HashMap::new()
     } else {
@@ -249,14 +249,7 @@ async fn apply_unit(
         .await
         .map_err(db_err)?;
         rows.into_iter()
-            .map(|(name, ty)| {
-                let ty = match ty.as_str() {
-                    "character" | "character varying" => "text".to_string(),
-                    "bit" => "bit varying".to_string(),
-                    _ => ty,
-                };
-                (name, ty)
-            })
+            .map(|(name, ty)| (name, residue_cast(&ty)))
             .collect()
     };
     let hex_col = |name: &str| raw_bytes && casts.get(name).is_some_and(|t| t == "bytea");
@@ -1162,5 +1155,45 @@ mod tests {
         assert_eq!(bind_of(&poison, false).as_deref(), Some("a'b\\c\n"));
         assert_eq!(bind_of(&Cell::Null, false), None);
         assert_eq!(bind_of(&Cell::UnchangedToast, false), None);
+    }
+}
+
+/// The length-free cast a residue placeholder takes for a column whose
+/// `format_type(atttypid, NULL)` is `ty`. Bare `character` and `bit` mean
+/// char(1) and bit(1), so they cannot be used as they are. A char(n) key
+/// casts to `bpchar`, not `text`: WAL ships it blank-padded, and
+/// `bpchar = text` resolves to texteq, which trims the column but not the
+/// value, so a padded key never matched: a silent no-op DELETE, and a
+/// masked update refused on every rerun (deep review D11). Arrays keep their
+/// brackets: `character[]` became `char(1)[]` and cut every element to one
+/// character.
+fn residue_cast(ty: &str) -> String {
+    let (base, dims) = match ty.find('[') {
+        Some(i) => ty.split_at(i),
+        None => (ty, ""),
+    };
+    let base = match base {
+        "character" => "bpchar",
+        "character varying" => "varchar",
+        "bit" => "bit varying",
+        other => other,
+    };
+    format!("{base}{dims}")
+}
+
+#[cfg(test)]
+mod residue_cast_tests {
+    use super::residue_cast;
+
+    #[test]
+    fn every_cast_is_length_free_and_keeps_blank_padding_semantics() {
+        assert_eq!(residue_cast("character"), "bpchar");
+        assert_eq!(residue_cast("character varying"), "varchar");
+        assert_eq!(residue_cast("bit"), "bit varying");
+        assert_eq!(residue_cast("character[]"), "bpchar[]");
+        assert_eq!(residue_cast("character varying[]"), "varchar[]");
+        assert_eq!(residue_cast("bit[]"), "bit varying[]");
+        assert_eq!(residue_cast("integer"), "integer");
+        assert_eq!(residue_cast("text[]"), "text[]");
     }
 }
