@@ -1108,7 +1108,8 @@ async fn run_group(
             }
         };
         let publication = format!("{slot_owned}_pub");
-        ensure_publication(&src, &publication, &qualified_all).await?;
+        let drained: Vec<&str> = have.iter().map(|c| c.qualified.as_str()).collect();
+        ensure_publication(&src, &publication, &qualified_all, &drained).await?;
         let slot = &slot_owned;
         if !have.is_empty() && have.len() != ctxs.len() {
             let missing: Vec<&str> = ctxs
@@ -2699,10 +2700,15 @@ async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
 /// Create the publication carrying EVERY member, or — when it already
 /// exists — verify each member's MEMBERSHIP and re-add the missing (a
 /// dropped-and-recreated source table silently leaves its publication).
+/// A missing member that has STATE (`drained`) is refused instead: its
+/// changes since it left were never published, and the DROP that removed it
+/// emitted nothing. Re-added and drained on, the destination kept the old
+/// table's rows and lost the new one's first changes (deep review D17).
 async fn ensure_publication(
     src: &PgPool,
     publication: &str,
     qualified_tables: &[&str],
+    drained: &[&str],
 ) -> Result<()> {
     let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_publication WHERE pubname = $1")
         .bind(publication)
@@ -2789,6 +2795,16 @@ async fn ensure_publication(
         .fetch_optional(src)
         .await
         .map_err(db_err)?;
+        if member.is_none() && drained.contains(qualified) {
+            return Err(Error::Transfer(format!(
+                "log_based: publication {publication} no longer carries {qualified}, \
+                 which this pipeline drains — the source table was dropped and \
+                 recreated, or removed from the publication. Its changes since then \
+                 were never published, and the old table's rows are still at the \
+                 destination. Re-bootstrap it: clear its _apitap_state row (and, for \
+                 a group, the group's rows and slot)"
+            )));
+        }
         if member.is_none() {
             sqlx::query(&format!(
                 "ALTER PUBLICATION {} ADD TABLE ONLY {}",
