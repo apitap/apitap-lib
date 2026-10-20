@@ -680,7 +680,9 @@ impl crate::sink::Sink for GcsSink {
         let mut delivered = Vec::new();
         let mut names = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
-            if self.conn.format == GcsFormat::Parquet && !parquet_col_ok(&c.udt, c.precision) {
+            if self.conn.format == GcsFormat::Parquet
+                && !parquet_col_ok(plan.engine, &c.udt, c.precision)
+            {
                 return Err(Error::InvalidInput(format!(
                     "column {} has type {} — the parquet lane can't encode it; \
                      cast it in a source view (e.g. {}::text) or use format=csv",

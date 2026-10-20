@@ -120,15 +120,21 @@ pub(crate) fn merge_key_ok(d: &Delivered) -> Result<()> {
 /// binary layout AND numerics must carry an exact ≤38-digit declaration
 /// (unconstrained NUMERIC rides as Float64 whose PG bytes are digit groups,
 /// and >38 digits exceed i128 — both fall back to the text lane).
-pub(crate) fn parquet_col_ok(udt: &str, precision: Option<i32>) -> bool {
-    if !parquet_decodable(udt) {
+pub(crate) fn parquet_col_ok(engine: &str, udt: &str, precision: Option<i32>) -> bool {
+    if !parquet_decodable(engine, udt) {
         return false;
     }
     !matches!(udt, "numeric" | "decimal") || matches!(precision, Some(p) if (1..=38).contains(&p))
 }
 
-pub(crate) fn parquet_decodable(udt: &str) -> bool {
-    matches!(
+/// Whether a column of `udt`, read from an `engine` source, decodes exactly
+/// from the typed binary stream. The MySQL spellings below are MySQL's
+/// DATA_TYPE vocabulary and mean nothing else: a Postgres `time` (time_send's
+/// int64 micros) or `"char"` (one raw byte) matched them and landed as raw
+/// bytes in a STRING column (deep review 2, N18). A non-MySQL source is
+/// judged by the Postgres names alone.
+pub(crate) fn parquet_decodable(engine: &str, udt: &str) -> bool {
+    let pg = matches!(
         udt,
         "int2"
             | "int4"
@@ -147,27 +153,31 @@ pub(crate) fn parquet_decodable(udt: &str) -> bool {
             | "varchar"
             | "bpchar"
             | "name"
+    );
+    pg || (engine == "mysql"
+        && matches!(
+            udt,
             // MySQL DATA_TYPE vocabulary — the delivered types are the same
-            // standard set (the MySQL reader encodes typed PgCopyBinary);
-            // only the udt SPELLINGS differ. binary/blob stay excluded.
-            | "tinyint"
-            | "smallint"
-            | "mediumint"
-            | "int"
-            | "bigint"
-            | "float"
-            | "double"
-            | "decimal"
-            | "datetime"
-            | "char"
-            | "tinytext"
-            | "mediumtext"
-            | "longtext"
-            | "enum"
-            | "set"
-            | "year"
-            | "time"
-    )
+            // standard set (the MySQL reader encodes typed PgCopyBinary); only
+            // the udt SPELLINGS differ. binary/blob stay excluded.
+            "tinyint"
+                | "smallint"
+                | "mediumint"
+                | "int"
+                | "bigint"
+                | "float"
+                | "double"
+                | "decimal"
+                | "datetime"
+                | "char"
+                | "tinytext"
+                | "mediumtext"
+                | "longtext"
+                | "enum"
+                | "set"
+                | "year"
+                | "time"
+        ))
 }
 
 // ============================================================================
@@ -1068,12 +1078,20 @@ mod tests {
 
     #[test]
     fn lane_gate_rejects_inexact_columns() {
-        assert!(parquet_col_ok("int8", None));
-        assert!(parquet_col_ok("numeric", Some(18)));
-        assert!(!parquet_col_ok("numeric", None)); // unconstrained -> Float64 bytes
-        assert!(!parquet_col_ok("numeric", Some(50))); // > i128 digits
-        assert!(!parquet_col_ok("bytea", None)); // raw bytes into STRING
-        assert!(!parquet_col_ok("inet", None));
+        assert!(parquet_col_ok("postgres", "int8", None));
+        assert!(parquet_col_ok("postgres", "numeric", Some(18)));
+        assert!(!parquet_col_ok("postgres", "numeric", None)); // unconstrained -> Float64 bytes
+        assert!(!parquet_col_ok("postgres", "numeric", Some(50))); // > i128 digits
+        assert!(!parquet_col_ok("postgres", "bytea", None)); // raw bytes into STRING
+        assert!(!parquet_col_ok("postgres", "inet", None));
+        // N18: the MySQL spellings belong to a MySQL source only. A Postgres
+        // `time` is int64 micros and `"char"` one raw byte on the wire.
+        assert!(!parquet_col_ok("postgres", "time", None));
+        assert!(!parquet_col_ok("postgres", "char", None));
+        assert!(!parquet_col_ok("github+api", "datetime", None));
+        assert!(parquet_col_ok("mysql", "time", None));
+        assert!(parquet_col_ok("mysql", "char", None));
+        assert!(parquet_col_ok("mysql", "varchar", None));
     }
 
     #[test]

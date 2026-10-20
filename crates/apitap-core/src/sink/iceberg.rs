@@ -1273,7 +1273,7 @@ impl crate::sink::Sink for IcebergSink {
         let mut names = Vec::new();
         let mut delivered = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
-            if !parquet_col_ok(&c.udt, c.precision) {
+            if !parquet_col_ok(plan.engine, &c.udt, c.precision) {
                 return Err(Error::InvalidInput(format!(
                     "column {} has type {} — the parquet lane can't encode it; \
                      cast it in a source view (e.g. {}::text)",

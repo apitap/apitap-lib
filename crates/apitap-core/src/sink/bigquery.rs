@@ -2780,7 +2780,7 @@ impl crate::sink::Sink for BqSink {
             WireFormat::PgCopyBinary => plan
                 .cols
                 .iter()
-                .all(|c| crate::wire::bqparquet::parquet_col_ok(&c.udt, c.precision)),
+                .all(|c| crate::wire::bqparquet::parquet_col_ok(plan.engine, &c.udt, c.precision)),
             _ => true,
         }
     }
@@ -2799,7 +2799,9 @@ impl crate::sink::Sink for BqSink {
         let mut names = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             check_col_name(&c.name)?;
-            if self.parquet_lane && !crate::wire::bqparquet::parquet_col_ok(&c.udt, c.precision) {
+            if self.parquet_lane
+                && !crate::wire::bqparquet::parquet_col_ok(plan.engine, &c.udt, c.precision)
+            {
                 return Err(Error::InvalidInput(format!(
                     "column {} has type {} — the binary lane can't decode it; \
                      cast it in a source view (e.g. {}::text)",
