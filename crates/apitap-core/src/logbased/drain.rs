@@ -19,6 +19,11 @@ use crate::wire::walsender::{WalEvent, Walsender};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Marks the drain error a binary session raises on a historic Relation it
+/// cannot render (D15); `run.rs` matches it to drain again on text.
+pub(crate) const BINARY_HISTORIC: &str =
+    "binary pgoutput cannot render a column type this stream still carries";
+
 /// How long a replication stream may say nothing before the drain treats it
 /// as a dead connection (system review 2026-10-07, G0.5). The client asks
 /// for a keepalive every half budget, so two minutes with no answer is
@@ -535,6 +540,24 @@ pub(crate) async fn drain(
                         let table = format!("{}.{}", r.namespace, r.name);
                         let layout = Layout::from_relation(&r, key_cols)?;
                         let tracked = layout.is_some();
+                        // D15: the binary decision read the CURRENT catalog,
+                        // but this Relation is the historic one — a column
+                        // altered from enum to text, or dropped, since these
+                        // changes were made. Its cells cannot be rendered;
+                        // the run restarts the drain on text (run.rs).
+                        if tracked && ws.stream_binary() {
+                            if let Some(c) = r
+                                .cols
+                                .iter()
+                                .find(|c| !crate::wire::pgbindec::renders(c.type_oid))
+                            {
+                                return Err(Error::Transfer(format!(
+                                    "log_based: {table}: {BINARY_HISTORIC} (column {} has type \
+                                     OID {} in the WAL being drained)",
+                                    c.name, c.type_oid
+                                )));
+                            }
+                        }
                         if let Some((want, dest)) = sess.expected.get(&table) {
                             if tracked && *want != r.rel_id {
                                 return Err(crate::logbased::run::recreated(

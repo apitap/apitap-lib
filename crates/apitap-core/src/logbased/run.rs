@@ -1190,7 +1190,7 @@ async fn run_group(
             check_source_rels(&dest, &ctxs).await?;
             let floors: Vec<u64> = wms.iter().map(|w| w.expect("all present").get()).collect();
             let wm = *floors.iter().min().expect("nonempty");
-            drain_group(
+            let first = drain_group(
                 src_url,
                 &src,
                 tenure.clone(),
@@ -1201,8 +1201,52 @@ async fn run_group(
                 floors,
                 opts.changelog,
                 budget_denom,
+                false,
             )
-            .await
+            .await;
+            match first {
+                // D15: the binary session met a historic column type it cannot
+                // render. Once more on text, from wherever each member now
+                // stands — the windows before the Relation have landed. Only
+                // when the binary choice was ours: a forced APITAP_PG_BINARY=1
+                // gets its error.
+                Err(Error::Transfer(m))
+                    if m.contains(crate::logbased::drain::BINARY_HISTORIC)
+                        && crate::wire::walsender::pg_binary_setting().is_none() =>
+                {
+                    crate::progress::note(&format!("{m} — draining this run on text instead"));
+                    let mut floors = Vec::with_capacity(ctxs.len());
+                    for c in &ctxs {
+                        let w = dest.read_state(&c.dest_table, &c.source_id).await?;
+                        floors.push(
+                            w.ok_or_else(|| {
+                                Error::Transfer(format!(
+                                    "log_based: {}: state row vanished during the run",
+                                    c.dest_table
+                                ))
+                            })?
+                            .get(),
+                        );
+                    }
+                    let wm = *floors.iter().min().expect("nonempty");
+                    wait_slot_inactive(&src, slot).await;
+                    drain_group(
+                        src_url,
+                        &src,
+                        tenure.clone(),
+                        slot,
+                        &publication,
+                        &ctxs,
+                        wm,
+                        floors,
+                        opts.changelog,
+                        budget_denom,
+                        true,
+                    )
+                    .await
+                }
+                r => r,
+            }
         }
     }
     .await;
@@ -1865,6 +1909,7 @@ async fn drain_group(
     floors: Vec<u64>,
     changelog: bool,
     budget_denom: usize,
+    text_only: bool,
 ) -> Result<Vec<(u64, usize)>> {
     // A SIGTERM from here on lands the window in flight instead of throwing it
     // away — see `crate::shutdown`. It is armed HERE and not at the entry point
@@ -1985,6 +2030,7 @@ async fn drain_group(
     // (M-7): one array/enum/domain column would fail every window.
     let want_binary = match crate::wire::walsender::pg_binary_setting() {
         Some(forced) => forced,
+        None if text_only => false,
         None => matches!(tenure.dest(), Dest::Ch(_)) && binary_renderable(src, ctxs).await,
     };
     ws.start_replication(slot, wm, publication, want_binary)
@@ -2799,6 +2845,25 @@ async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
 /// changes since it left were never published, and the DROP that removed it
 /// emitted nothing. Re-added and drained on, the destination kept the old
 /// table's rows and lost the new one's first changes (deep review D17).
+/// The walsender of a session that just ended releases its slot a moment
+/// after the socket closes; a drain started sooner is refused "already
+/// active". Bounded: past 15 s the next drain says so itself.
+async fn wait_slot_inactive(src: &PgPool, slot: &str) {
+    for _ in 0..75 {
+        let active: Option<bool> =
+            sqlx::query_scalar("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(slot)
+                .fetch_optional(src)
+                .await
+                .ok()
+                .flatten();
+        if active != Some(true) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Refuse a member whose source table is not the one it was bootstrapped
 /// from (N7). A DROP + CREATE (apitap's own Postgres replace, a migration)
 /// emits nothing into the slot, and putting the new table back into the
