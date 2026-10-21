@@ -309,14 +309,19 @@ impl DstScheme for ChTo {
     type Shared = ChConn;
     const BARE_DEST: bool = true;
     async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<ChSink> {
-        ChSink::connect(url, dest_table, cfg.ch_ddl.clone(), &cfg.run)
+        ChSink::connect(
+            url,
+            dest_table,
+            cfg.ch_ddl.clone().for_table(dest_table),
+            &cfg.run,
+        )
     }
     async fn shared(url: &str, _cfg: &SinkCfg) -> Result<ChConn> {
         // Parse once: the reqwest client inside ChConn is shared by every table.
         ChConn::parse(url)
     }
     fn bind(shared: ChConn, table: &str, cfg: &SinkCfg) -> Result<ChSink> {
-        ChSink::bind(shared, table, cfg.ch_ddl.clone(), &cfg.run)
+        ChSink::bind(shared, table, cfg.ch_ddl.clone().for_table(table), &cfg.run)
     }
 }
 struct MyTo;

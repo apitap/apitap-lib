@@ -1363,6 +1363,10 @@ pub struct ChDdl {
     pub engine: Option<String>,
     pub order_by: Option<String>,
     pub on_cluster: Option<String>,
+    /// A multi-table run's per-table `order_by` (`order_by={"t": "k"}`),
+    /// resolved for each table by `for_table`. Only the changelog rebuild
+    /// read it, so every bulk table fell back to the cursor or tuple() (N12).
+    pub order_by_per_table: std::collections::HashMap<String, String>,
 }
 
 /// An engine that merges rows sharing a sorting key on its own (Replacing,
@@ -1405,7 +1409,10 @@ impl ChDdl {
         dest_is_clickhouse: bool,
     ) -> Result<Self> {
         if !dest_is_clickhouse
-            && (opts.engine.is_some() || opts.order_by.is_some() || opts.on_cluster.is_some())
+            && (opts.engine.is_some()
+                || opts.order_by.is_some()
+                || !opts.order_by_per_table.is_empty()
+                || opts.on_cluster.is_some())
         {
             return Err(Error::InvalidInput(
                 "engine/order_by/on_cluster only apply to ClickHouse destinations".into(),
@@ -1431,7 +1438,22 @@ impl ChDdl {
             engine: opts.engine.clone(),
             order_by: opts.order_by.clone(),
             on_cluster: opts.on_cluster.clone(),
+            order_by_per_table: opts.order_by_per_table.clone(),
         })
+    }
+
+    /// The DDL for one table of a run: its own `order_by` entry, by the name
+    /// it was given or its bare name, over the run-wide one.
+    pub(crate) fn for_table(mut self, table: &str) -> Self {
+        let bare = table.rsplit_once('.').map_or(table, |(_, t)| t);
+        if let Some(ob) = self
+            .order_by_per_table
+            .get(table)
+            .or_else(|| self.order_by_per_table.get(bare))
+        {
+            self.order_by = Some(ob.clone());
+        }
+        self
     }
 
     fn validate(&self) -> Result<()> {
@@ -3431,6 +3453,31 @@ mod tests {
         // precision differences must NOT be smoothed over
         assert_ne!(ch_base_type("DateTime64(3)"), ch_base_type("DateTime64(6)"));
         assert_ne!(ch_base_type("Int32"), ch_base_type("Int64"));
+    }
+
+    /// N12: each table of a run takes its own order_by entry, by the name
+    /// it was given or its bare name; the rest keep the run-wide one.
+    #[test]
+    fn a_table_takes_its_own_order_by() {
+        let ddl = ChDdl {
+            order_by: Some("id".into()),
+            order_by_per_table: [
+                ("public.b".to_string(), "k".to_string()),
+                ("c".into(), "x, y".into()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ddl.clone().for_table("public.b").order_by.as_deref(),
+            Some("k")
+        );
+        assert_eq!(
+            ddl.clone().for_table("sales.c").order_by.as_deref(),
+            Some("x, y")
+        );
+        assert_eq!(ddl.for_table("a").order_by.as_deref(), Some("id"));
     }
 
     #[test]

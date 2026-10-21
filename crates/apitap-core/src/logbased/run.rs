@@ -1316,6 +1316,11 @@ async fn run_group_mysql(
                 // ORDER BY tuple(): every window's delete scanned the table, and
                 // a Replacing engine collapsed all rows toward one (D16).
                 if let Some(c) = ctxs.iter().find(|c| c.table_arg == table_arg) {
+                    if !opts.changelog {
+                        if let (_, Some(ob)) = ddl_for(opts, &c.table_arg, &c.qualified) {
+                            o2.order_by = Some(ob.to_string());
+                        }
+                    }
                     dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
                 }
                 let (su, du, r) = (su.clone(), du.clone(), run_c.clone());
@@ -1706,6 +1711,13 @@ async fn bootstrap_group(
             // it loudly if it leaks through.
             o2.slots = None;
             strip_changelog_ddl(&mut o2);
+            // A replica's own per-table order_by, before the default to the
+            // key (N12): the bootstrap read only the run-wide one.
+            if !opts.changelog {
+                if let (_, Some(ob)) = ddl_for(opts, &c.table_arg, &c.qualified) {
+                    o2.order_by = Some(ob.to_string());
+                }
+            }
             dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
             let _turn = bootstrap_turn(dest).await;
             let r = Box::pin(crate::transfer_within(
