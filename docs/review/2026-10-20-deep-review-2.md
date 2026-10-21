@@ -30,7 +30,8 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N21 | FIXED: mirrored CH staging is CREATE ... AS final (indexes and projections copied) | `5815ca7` | `e2e_ch_append_skip_index` (0.62.1: different secondary indices) |
 | N25 | FIXED: the VARCHAR key cap is 3072 bytes in the column's charset | `ced6cb8` | `e2e_my_latin1_long_key` (0.62.1: refused) |
 | N22 | FIXED: the MySQL loader session sets net_read_timeout = 3600 | `14bae51` | `e2e_my_slow_source` (0.62.1: Packets out of sync) |
-| rest | OPEN: N7 (in progress), N10, N23, N28, N29; N19 BLOCKED (BigQuery) | — | — |
+| N23 | FIXED: bounded varchars stay VARCHAR while the row has room (keys first), the rest become LONGTEXT | (this commit) | `e2e_my_wide_varchars` (0.62.1: ERROR 1118) |
+| rest | OPEN: N7 (in progress), N10, N28, N29; N19 BLOCKED (BigQuery) | — | — |
 
 ## Fix verdicts
 

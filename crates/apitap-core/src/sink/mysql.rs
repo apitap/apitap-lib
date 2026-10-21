@@ -39,7 +39,7 @@ use futures::SinkExt;
 use mysql_async::prelude::Queryable;
 use mysql_async::InfileData;
 use mysql_async::{Opts, OptsBuilder, Pool, SslOpts};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1177,19 +1177,50 @@ impl crate::sink::Sink for MySqlSink {
         } else {
             String::new()
         };
+        // A BOUNDED source string keeps its declared length as VARCHAR(n):
+        // it holds exactly what the source enforced and, unlike LONGTEXT, can
+        // be a key part. But a VARCHAR counts 4n + 2 bytes against MySQL's
+        // 65,535-byte row (utf8mb4), and two varchar(10000) columns, or five
+        // varchar(4000), failed the staging CREATE with ERROR 1118 on every
+        // run (deep review 2, N23). Keys always keep VARCHAR; the others keep
+        // it, in column order, while the row fits, and are LONGTEXT past that
+        // (a pointer in the row). Every other column is counted at 16 bytes.
+        let bounded =
+            |c: &crate::plan::ColumnPlan, lc: &crate::plan::LaneCol| -> Result<Option<u32>> {
+                if plan.engine == "mysql" || my_type_of(&lc.delivered, &c.name)? != "LONGTEXT" {
+                    return Ok(None);
+                }
+                Ok(bounded_char_len(c.native_ddl.as_deref()).filter(|n| *n <= 16383))
+            };
+        let mut as_varchar: HashSet<&str> = HashSet::new();
+        let mut row_bytes: u64 = 0;
+        let mut rest = Vec::new();
+        for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
+            match bounded(c, lc)? {
+                Some(n) if plan.pk_cols.contains(&c.name) => {
+                    row_bytes += 4 * u64::from(n) + 2;
+                    as_varchar.insert(c.name.as_str());
+                }
+                Some(n) => rest.push((c.name.as_str(), n)),
+                None => row_bytes += 16,
+            }
+        }
+        for (name, n) in rest {
+            if row_bytes + 4 * u64::from(n) + 2 <= 65_535 {
+                row_bytes += 4 * u64::from(n) + 2;
+                as_varchar.insert(name);
+            } else {
+                row_bytes += 16;
+            }
+        }
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             let ty = match (&c.native_ddl, plan.engine) {
                 (Some(native), "mysql") => native.clone(),
                 _ => {
                     let mut t = my_type_of(&lc.delivered, &c.name)?;
-                    // A BOUNDED source string keeps its declared length:
-                    // VARCHAR(n) holds exactly what the source enforced and —
-                    // unlike LONGTEXT — can be a key part.
-                    if t == "LONGTEXT" {
+                    if as_varchar.contains(c.name.as_str()) {
                         if let Some(n) = bounded_char_len(c.native_ddl.as_deref()) {
-                            if n <= 16383 {
-                                t = format!("VARCHAR({n})");
-                            }
+                            t = format!("VARCHAR({n})");
                         }
                     }
                     t
