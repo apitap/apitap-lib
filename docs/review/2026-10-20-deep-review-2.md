@@ -32,7 +32,8 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N22 | FIXED: the MySQL loader session sets net_read_timeout = 3600 | `14bae51` | `e2e_my_slow_source` (0.62.1: Packets out of sync) |
 | N23 | FIXED: bounded varchars stay VARCHAR while the row has room (keys first), the rest become LONGTEXT | (this commit) | `e2e_my_wide_varchars` (0.62.1: ERROR 1118) |
 | N10 | FIXED: a stream quiet for half the silence budget (30 s at most) sends a status with request_reply; only a server answering none for the budget is dead | (this commit) | `e2e_pg_quiet_stream` (0.62.1: silent for 4s), `e2e_half_open` still green |
-| rest | OPEN: N7 (in progress), N28, N29; N19 BLOCKED (BigQuery) | — | — |
+| N28 | FIXED: a varlen column past 1 GiB seals the batch whatever the byte target, so to_polars() never builds past i32 offsets | (this commit) | `e2e_to_polars_2gib_column` (0.62.1: past i32 offsets), unit `varlen_near_the_offset_limit_seals_an_unbounded_batch` |
+| rest | OPEN: N7 (in progress), N29; N19 BLOCKED (BigQuery) | — | — |
 
 ## Fix verdicts
 

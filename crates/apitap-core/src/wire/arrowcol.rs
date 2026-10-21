@@ -393,9 +393,20 @@ impl ColB {
 /// of SPANS (19-byte header, tuples, 0xFFFF trailer — then possibly the
 /// next span's header). One synthetic-stream worker feed is simply the
 /// one-span case. Seals a batch whenever ~`batch_bytes` accumulated.
+/// Where a varlen column seals its batch regardless of the byte target
+/// (N28). `to_polars()` asks for one unbounded batch per worker, and Arrow
+/// `utf8`/`binary` address only `i32::MAX` bytes: a worker holding more than
+/// 2 GiB of one text column was refused at seal, after the whole scan, at any
+/// memory size. Half the limit leaves one push of headroom — a COPY chunk,
+/// or the 64 rows the MySQL workers take between checks.
+const VARLEN_SEAL: usize = 1 << 30;
+
 pub struct BatchBuilder {
     cols: Vec<ColB>,
     batch_bytes: usize,
+    /// A varlen column's data past this seals the batch whatever
+    /// `batch_bytes` says ([`VARLEN_SEAL`]); a field so a test can lower it.
+    varlen_seal: usize,
     /// Rows in the current (unsealed) batch.
     rows: usize,
     rows_sealed: u64,
@@ -502,6 +513,7 @@ impl BatchBuilder {
         Self {
             cols: kinds.iter().map(|k| ColB::new(k, cap)).collect(),
             batch_bytes,
+            varlen_seal: VARLEN_SEAL,
             rows: 0,
             rows_sealed: 0,
             buf: Vec::with_capacity(64 << 10),
@@ -1209,10 +1221,25 @@ impl BatchBuilder {
         })
     }
 
-    /// A sealed batch, if the size threshold was crossed. Push decodes whole
-    /// tuples only, so any moment between push calls is a tuple boundary.
+    /// The largest varlen data buffer in the current batch.
+    fn varlen_max(&self) -> usize {
+        self.cols
+            .iter()
+            .map(|c| match c {
+                ColB::Utf8 { d, .. } | ColB::Bin { d, .. } => d.len(),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A sealed batch, if the size threshold was crossed — or if one varlen
+    /// column nears the i32 offset limit. Push decodes whole tuples only, so
+    /// any moment between push calls is a tuple boundary.
     pub fn take_ready(&mut self) -> Result<Option<ArrowBatch>> {
-        if self.rows == 0 || self.acc_bytes() < self.batch_bytes {
+        if self.rows == 0
+            || (self.acc_bytes() < self.batch_bytes && self.varlen_max() < self.varlen_seal)
+        {
             return Ok(None);
         }
         self.seal().map(Some)
@@ -1867,6 +1894,32 @@ mod tests {
         );
         // The real guard is not tripped by an ordinary batch.
         assert!(b.finish().unwrap().is_some());
+    }
+
+    /// One varlen column nearing the offset limit seals the batch even when
+    /// the byte target is unbounded (the `to_polars()` materialize path,
+    /// N28): every row lands, across batches, and none errors.
+    #[test]
+    fn varlen_near_the_offset_limit_seals_an_unbounded_batch() {
+        let mut b = BatchBuilder::new(vec![ArrowKind::Int64, ArrowKind::Utf8], usize::MAX >> 1);
+        b.varlen_seal = 25;
+        let mut sealed = Vec::new();
+        for i in 0..10 {
+            b.append_cell(0, CellVal::I64(i));
+            b.append_cell(1, CellVal::Str(b"0123456789"));
+            b.row_done();
+            if let Some(batch) = b.take_ready().unwrap() {
+                sealed.push(batch.rows);
+            }
+        }
+        if let Some(batch) = b.finish().unwrap() {
+            sealed.push(batch.rows);
+        }
+        assert_eq!(
+            sealed,
+            vec![3, 3, 3, 1],
+            "seals at the first row past 25 bytes"
+        );
     }
 
     /// The real-size proof: 2 GiB in one Utf8 column. Allocates ~2 GiB, so it
