@@ -19,7 +19,9 @@ Each fix below had a leg that failed on the build without it and passes with it;
 | D31 | FIXED: the holder sets `idle_in_transaction_session_timeout = 0` (and `transaction_timeout = 0` on PG 17+) | `1aadf13` | `e2e_pg_snapshot_idle` (pre-fix HEAD: "invalid snapshot identifier") |
 | D10 | FIXED after 0.62.0: a journal entry is keyed by its op's commit position (`pos\|n\|pred`, `ver = pos`), and an insert-only image takes this window's `_apitap_ver` at apply. The first leg proved nothing: `APITAP_DEBUG` traces showed attempt A was cut in the set phase, before any journal row existed; armed on the journal write it reproduces | `fdb51a3` (0.62.1) | `e2e_ch_journal_window` (0.62.0: "lost update: id=1 is 'a'") |
 | D3, D4, D8, D19 | BLOCKED: BigQuery, the bench service-account key is invalid | — | — |
-| other P1 | OPEN: all were already in 0.61.0, and the 0.63.0 work list | — | — |
+| D7, D9, D13, D14, D16, D17, D18, D20, D21, D22, D23, D24, D25, D26, D27, D29, D30, D32, D33 | FIXED for 0.63.0, each with its leg (D21: unit test only); D2, D9, D10, D12, D13, D17, D26, D31 were completed by deep review 2's N-items | `a031ee1`…`e991bc4` | see `2026-10-21-release-0.63.0.md` |
+| D15 | OPEN: the binary gate still reads the current catalog | — | — |
+| D28 | DEFERRED: needs a mock GitHub server to prove | — | — |
 
 ## Confirmed P0 and P1
 
