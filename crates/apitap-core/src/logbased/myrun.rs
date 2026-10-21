@@ -119,6 +119,7 @@ pub(crate) async fn resolve(
                  need an identity. Add a PK first."
             )));
         }
+        refuse_fk_cascade(pool, &db, &bare, &qualified).await?;
         let dest_table = if single {
             opts.dest_table.clone().unwrap_or_else(|| bare.clone())
         } else {
@@ -133,6 +134,43 @@ pub(crate) async fn resolve(
         });
     }
     Ok(out)
+}
+
+/// A tracked table that is the CHILD of a foreign key whose parent's delete
+/// or key update cascades, nulls or defaults it. InnoDB applies those inside
+/// the storage engine, and the binlog carries only the parent's row events:
+/// a parent delete left every cascaded-away child row at the destination,
+/// silently (deep review 2, N17). Refused, naming the constraint;
+/// `APITAP_MY_ALLOW_FK_CASCADE=1` is for a deployment that knows those
+/// parent changes never happen.
+async fn refuse_fk_cascade(pool: &MySqlPool, db: &str, bare: &str, qualified: &str) -> Result<()> {
+    if std::env::var("APITAP_MY_ALLOW_FK_CASCADE").is_ok_and(|v| v == "1") {
+        return Ok(());
+    }
+    let fks: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(constraint_name AS CHAR), CAST(referenced_table_name AS CHAR), \
+                CAST(delete_rule AS CHAR), CAST(update_rule AS CHAR) \
+         FROM information_schema.referential_constraints \
+         WHERE constraint_schema = ? AND table_name = ? \
+           AND (delete_rule IN ('CASCADE', 'SET NULL', 'SET DEFAULT') \
+             OR update_rule IN ('CASCADE', 'SET NULL', 'SET DEFAULT'))",
+    )
+    .bind(db)
+    .bind(bare)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::Transfer(format!("log_based: foreign keys of {qualified}: {e}")))?;
+    let Some((name, parent, del, upd)) = fks.first() else {
+        return Ok(());
+    };
+    Err(Error::InvalidInput(format!(
+        "log_based: {qualified} is the child of foreign key {name} (ON DELETE {del}, \
+         ON UPDATE {upd}) on {parent}: InnoDB applies those actions to {qualified} without \
+         writing them to the binlog, so its destination would keep rows the source \
+         removed. Use ON DELETE/UPDATE RESTRICT (or NO ACTION) and delete children \
+         explicitly, or set APITAP_MY_ALLOW_FK_CASCADE=1 if {parent}'s rows are never \
+         deleted or re-keyed"
+    )))
 }
 
 /// Open the control pool a MySQL CDC run needs (coordinates, schemas,
