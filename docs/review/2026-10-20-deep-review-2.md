@@ -31,7 +31,8 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N25 | FIXED: the VARCHAR key cap is 3072 bytes in the column's charset | `ced6cb8` | `e2e_my_latin1_long_key` (0.62.1: refused) |
 | N22 | FIXED: the MySQL loader session sets net_read_timeout = 3600 | `14bae51` | `e2e_my_slow_source` (0.62.1: Packets out of sync) |
 | N23 | FIXED: bounded varchars stay VARCHAR while the row has room (keys first), the rest become LONGTEXT | (this commit) | `e2e_my_wide_varchars` (0.62.1: ERROR 1118) |
-| rest | OPEN: N7 (in progress), N10, N28, N29; N19 BLOCKED (BigQuery) | — | — |
+| N10 | FIXED: a stream quiet for half the silence budget (30 s at most) sends a status with request_reply; only a server answering none for the budget is dead | (this commit) | `e2e_pg_quiet_stream` (0.62.1: silent for 4s), `e2e_half_open` still green |
+| rest | OPEN: N7 (in progress), N28, N29; N19 BLOCKED (BigQuery) | — | — |
 
 ## Fix verdicts
 

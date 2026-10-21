@@ -547,7 +547,11 @@ async fn scanner_carries_partial_frames_across_refills() {
     let mut held: Option<bytes::Bytes> = None;
     let mut expected_first: Vec<u8> = Vec::new();
     for (i, f) in frames.iter().enumerate() {
-        let (tag, body) = scan.next_raw(&mut rd).await.expect("frame");
+        let (tag, body) = scan
+            .next_raw(&mut rd)
+            .await
+            .expect("frame")
+            .expect("not quiet");
         assert_eq!(tag, b'd');
         assert_eq!(&body[..], &f[5..], "frame {i} not byte-exact");
         if i == 0 {
@@ -620,7 +624,11 @@ async fn scanner_grows_for_frames_beyond_the_window() {
         }
         server.shutdown().await.ok();
     });
-    let (tag, body) = scan.next_raw(&mut rd).await.expect("frame");
+    let (tag, body) = scan
+        .next_raw(&mut rd)
+        .await
+        .expect("frame")
+        .expect("not quiet");
     assert_eq!(tag, b'd');
     assert_eq!(body.len(), total - 5);
     assert_eq!(&body[..], &payload[..]);
@@ -629,7 +637,9 @@ async fn scanner_grows_for_frames_beyond_the_window() {
 
 /// The half-open guarantee rides the refill: a silent stream errors with the
 /// "silent for … half-open" message (the shape `e2e_half_open.py` greps),
-/// bounded by the same env knob the per-event timeout used.
+/// bounded by the same env knob the per-event timeout used — but only after
+/// the scanner has handed back quiet intervals for the caller to ping in
+/// (N10), and within the budget, not one budget per ping.
 #[tokio::test]
 async fn scanner_times_out_a_silent_stream() {
     std::env::set_var("APITAP_REPLICATION_SILENCE_SECS", "1");
@@ -637,7 +647,23 @@ async fn scanner_times_out_a_silent_stream() {
     let (r, _w) = client.into_split();
     let mut rd = tokio::io::BufReader::with_capacity(1 << 16, super::walsender::PgRead::Tcp(r));
     let mut scan = super::walsender::FrameScanner::new();
-    let got = scan.next_raw(&mut rd).await;
+    let t0 = std::time::Instant::now();
+    let mut quiet = 0;
+    let got = loop {
+        match scan.next_raw(&mut rd).await {
+            Ok(None) => quiet += 1,
+            other => break other,
+        }
+    };
+    assert!(
+        quiet >= 1,
+        "no ping interval was handed back before giving up"
+    );
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(1500),
+        "took {:?}",
+        t0.elapsed()
+    );
     let msg = format!("{:?}", got.expect_err("silent stream must error"));
     assert!(msg.contains("silent for"), "got: {msg}");
     assert!(msg.contains("half-open"), "got: {msg}");

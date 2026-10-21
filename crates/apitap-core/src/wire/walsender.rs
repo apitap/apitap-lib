@@ -76,6 +76,9 @@ pub(crate) struct Walsender {
     /// destination bodies) or text. A pre-14 server falls back to text and
     /// this stays false.
     stream_binary: bool,
+    /// The lsn the last standby status reported; a keepalive request
+    /// repeats it so a ping never confirms anything new.
+    reported: u64,
 }
 
 /// The CopyBoth read half, scanned synchronously over one owned window
@@ -93,10 +96,13 @@ pub(crate) struct FrameScanner {
     /// the consumer has not taken. Split-off frames keep the allocation
     /// alive by refcount, so handing slices out never invalidates them.
     win: bytes::BytesMut,
-    /// When the last refill returned bytes; the silence deadline is anchored
-    /// here, so the half-open budget costs one timer per refill.
-    last_refill: std::time::Instant,
+    /// When the current wait for bytes began; `None` while bytes flow. The
+    /// silence deadline is anchored here, across the pings sent inside it.
+    quiet_since: Option<std::time::Instant>,
     silence: std::time::Duration,
+    /// How long a read may wait before the caller asks the server for a
+    /// keepalive (N10): half the silence budget, at most 30 s.
+    ping: std::time::Duration,
     coalesce_us: u64,
 }
 
@@ -108,8 +114,9 @@ impl FrameScanner {
     pub(crate) fn new() -> Self {
         Self {
             win: bytes::BytesMut::with_capacity(SCAN_WINDOW),
-            last_refill: std::time::Instant::now(),
+            quiet_since: None,
             silence: crate::logbased::drain::silence_budget(),
+            ping: ping_interval(crate::logbased::drain::silence_budget()),
             coalesce_us: read_coalesce_us(),
         }
     }
@@ -146,8 +153,9 @@ impl FrameScanner {
     /// Refill the window: drain the BufReader's own buffer first (the
     /// startup handshake may have left bytes there), else one socket read
     /// into spare capacity. Bounded by the silence budget — the one timer
-    /// per refill that keeps the half-open guarantee (G0.5).
-    async fn refill(&mut self, rd: &mut BufReader<PgRead>) -> Result<()> {
+    /// per refill that keeps the half-open guarantee (G0.5). `false` when a
+    /// ping interval passed with nothing to read.
+    async fn refill(&mut self, rd: &mut BufReader<PgRead>) -> Result<bool> {
         // The pre-refill coalescing sleep stays: it lets one recv carry more
         // than the first arriving frame (L2, measured 2026-10-08). Only when
         // the window is empty — a carried partial frame is never delayed.
@@ -165,17 +173,18 @@ impl FrameScanner {
         };
         if buffered > 0 {
             rd.consume(buffered);
-            self.last_refill = std::time::Instant::now();
-            return Ok(());
+            self.quiet_since = None;
+            return Ok(true);
         }
         if self.win.capacity() == self.win.len() {
             self.win.reserve(SCAN_WINDOW);
         }
         let silent = || {
             Error::Transfer(format!(
-                "log_based: replication stream silent for {}s — the source's \
-                 keepalives stopped (half-open connection?); aborting at the \
-                 last committed watermark",
+                "log_based: replication stream silent for {}s — the source \
+                 answered no keepalive request (half-open connection?); \
+                 aborting at the last committed watermark \
+                 (APITAP_REPLICATION_SILENCE_SECS sets the budget)",
                 self.silence.as_secs()
             ))
         };
@@ -186,34 +195,58 @@ impl FrameScanner {
         // commit is enough, and follow then dies at the first slow apply. A
         // read parked for the whole budget still means a half-open socket,
         // which is the detection that matters.
-        let n = match tokio::time::timeout(self.silence, rd.get_mut().read_buf(&mut self.win)).await
-        {
-            Ok(r) => r.map_err(io_err)?,
-            Err(_) => return Err(silent()),
-        };
+        //
+        // The budget is not left to the server's own keepalives (N10): with
+        // wal_sender_timeout = 0 it sends none, past 240 s its pings are
+        // further apart than 120 s, and while it decodes WAL for tables we
+        // do not track it says nothing at all. Every ping interval of quiet
+        // returns `false`, the caller sends a status asking for a reply, and
+        // only a server that answers none of them for the budget is dead.
+        let since = *self.quiet_since.get_or_insert_with(std::time::Instant::now);
+        let left = self.silence.saturating_sub(since.elapsed());
+        if left.is_zero() {
+            return Err(silent());
+        }
+        let n =
+            match tokio::time::timeout(left.min(self.ping), rd.get_mut().read_buf(&mut self.win))
+                .await
+            {
+                Ok(r) => r.map_err(io_err)?,
+                Err(_) if since.elapsed() >= self.silence => return Err(silent()),
+                Err(_) => return Ok(false),
+            };
         if n == 0 {
             return Err(Error::Transfer(
                 "walsender: stream ended unexpectedly".into(),
             ));
         }
-        self.last_refill = std::time::Instant::now();
-        Ok(())
+        self.quiet_since = None;
+        Ok(true)
     }
 
-    /// The next raw frame, refilling as needed. Cancel-safe: a `read_buf`
-    /// future dropped by the silence timeout has consumed nothing, and a
-    /// timeout ends the whole run rather than resuming mid-frame.
+    /// The next raw frame, refilling as needed; `None` when the stream has
+    /// been quiet for a ping interval and the caller should ask the server
+    /// for a keepalive. Cancel-safe: a `read_buf` future dropped by a timeout
+    /// has consumed nothing, and the next call resumes the same frame.
     pub(crate) async fn next_raw(
         &mut self,
         rd: &mut BufReader<PgRead>,
-    ) -> Result<(u8, bytes::Bytes)> {
+    ) -> Result<Option<(u8, bytes::Bytes)>> {
         loop {
             if let Some(f) = self.step()? {
-                return Ok(f);
+                return Ok(Some(f));
             }
-            self.refill(rd).await?;
+            if !self.refill(rd).await? {
+                return Ok(None);
+            }
         }
     }
+}
+
+/// Half the silence budget, at most 30 s — the default wal_sender_timeout's
+/// own keepalive cadence.
+fn ping_interval(silence: std::time::Duration) -> std::time::Duration {
+    (silence / 2).min(std::time::Duration::from_secs(30))
 }
 
 /// Default pre-refill coalescing sleep: when the reader's buffer is empty,
@@ -1043,6 +1076,7 @@ impl Walsender {
             co_err: Vec::new(),
             scan: None,
             stream_binary: false,
+            reported: 0,
         };
         ws.startup(&ci, options, replication).await?;
         Ok(ws)
@@ -1722,10 +1756,18 @@ impl Walsender {
     pub(crate) async fn next_event(&mut self) -> Result<Option<WalEvent>> {
         assert!(self.copying, "next_event outside CopyBoth");
         loop {
-            let (tag, msg) = {
+            let next = {
                 let rd = self.rd.as_mut().expect("read half present in CopyBoth");
                 let scan = self.scan.as_mut().expect("scanner present in CopyBoth");
                 scan.next_raw(rd).await?
+            };
+            let Some((tag, msg)) = next else {
+                // Quiet for a ping interval: ask for a keepalive (N10). The
+                // lsn is the last one this session reported — nothing new is
+                // confirmed, and before any report it is InvalidXLogRecPtr,
+                // which the server takes as "no position".
+                self.standby_status(self.reported, true).await?;
+                continue;
             };
             match tag {
                 b'd' => {
@@ -1785,6 +1827,7 @@ impl Walsender {
     /// This is the ONLY thing that lets Postgres discard slot WAL; callers
     /// send it exactly once per run, after the destination commit.
     pub(crate) async fn standby_status(&mut self, lsn: u64, request_reply: bool) -> Result<()> {
+        self.reported = lsn;
         let now_us = chrono::Utc::now().timestamp_micros() - PG_EPOCH_OFFSET_US;
         let mut b = Vec::with_capacity(35);
         b.push(b'r');
@@ -1815,11 +1858,13 @@ impl Walsender {
         let mut err: Option<Error> = None;
         let drained = tokio::time::timeout(std::time::Duration::from_secs(DRAIN_SECS), async {
             loop {
-                let (tag, msg) = {
+                let next = {
                     let rd = self.rd.as_mut().expect("read half present in CopyBoth");
                     let scan = self.scan.as_mut().expect("scanner present in CopyBoth");
                     scan.next_raw(rd).await?
                 };
+                // A quiet interval here needs no ping: the 30 s bound ends it.
+                let Some((tag, msg)) = next else { continue };
                 match tag {
                     b'Z' => return Ok(()),
                     b'E' => err = Some(parse_error(&msg)),

@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// How long a replication stream may say nothing before the drain treats it
-/// as a dead connection (system review 2026-10-07, G0.5). Server keepalives
-/// arrive every `wal_sender_timeout / 2` — 30 s by default — so two silent
-/// minutes is unambiguous. `APITAP_REPLICATION_SILENCE_SECS` may lower it
+/// as a dead connection (system review 2026-10-07, G0.5). The client asks
+/// for a keepalive every half budget, so two minutes with no answer is
+/// unambiguous whatever the server's `wal_sender_timeout` (N10). `APITAP_REPLICATION_SILENCE_SECS` may lower it
 /// (tests) but not disable it: zero or junk falls back to the default.
 const REPLICATION_SILENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -325,10 +325,11 @@ pub(crate) async fn drain(
         }
         // The scanner owns the read half and bounds its own refills with the
         // silence budget — one timer per ~1 MiB refill, not per event (L1b).
-        // The server keepalives every ~wal_sender_timeout/2 (30 s by default)
-        // normally wake the refill; when they stop, the connection is dead
-        // (half-open socket, NAT rebind) and the scanner errors at the last
-        // committed watermark (system review 2026-10-07, G0.5).
+        // A quiet stream is asked for a keepalive every half budget (N10:
+        // the server's own cadence is wal_sender_timeout/2, none at all when
+        // it is 0); a server that answers none of them is dead (half-open
+        // socket, NAT rebind) and the scanner errors at the last committed
+        // watermark (system review 2026-10-07, G0.5).
         let t_ph = std::time::Instant::now();
         let ev = ws.next_event().await?;
         t_recv += t_ph.elapsed();
