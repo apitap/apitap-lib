@@ -649,6 +649,32 @@ impl PgSink {
             .map_err(|e| Error::Transfer(format!("dest lookup: {e}")))
     }
 
+    /// What an INSERT into the destination must respect (deep review 2,
+    /// N20): an identity column GENERATED ALWAYS refuses a value without
+    /// OVERRIDING SYSTEM VALUE, and a STORED generated column refuses any,
+    /// so it leaves the column list. A pre-created destination (pg_dump
+    /// --schema-only, a migration) has both; every append and merge staged
+    /// the whole delta and then failed at the INSERT. `attgenerated` is read
+    /// through to_jsonb so a PG 11 server, which has none, answers NULL.
+    async fn insert_shape(&self) -> Result<(bool, Vec<String>)> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT a.attname, a.attidentity::text, to_jsonb(a.*) ->> 'attgenerated' \
+             FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .bind(&self.final_t)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Transfer(format!("dest identity/generated columns: {e}")))?;
+        let overriding = rows.iter().any(|(_, id, _)| id == "a");
+        let generated = rows
+            .into_iter()
+            .filter(|(_, _, g)| g.as_deref() == Some("s"))
+            .map(|(n, _, _)| n)
+            .collect();
+        Ok((overriding, generated))
+    }
+
     /// Destination column names in ordinal order.
     async fn final_columns(&self) -> Result<Vec<String>> {
         sqlx::query_scalar::<_, String>(
@@ -1391,13 +1417,34 @@ impl PgSink {
                     .begin()
                     .await
                     .map_err(|e| Error::Transfer(format!("append begin: {e}")))?;
-                sqlx::query(&format!(
-                    "INSERT INTO {} SELECT * FROM {}",
-                    self.final_t, self.staging_t
-                ))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Transfer(format!("append insert: {e}")))?;
+                let (overriding, generated) = self.insert_shape().await?;
+                let sql = if !overriding && generated.is_empty() {
+                    format!(
+                        "INSERT INTO {} SELECT * FROM {}",
+                        self.final_t, self.staging_t
+                    )
+                } else {
+                    let cols = self
+                        .col_names
+                        .iter()
+                        .filter(|c| !generated.contains(c))
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let ovr = if overriding {
+                        " OVERRIDING SYSTEM VALUE"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "INSERT INTO {} ({cols}){ovr} SELECT {cols} FROM {}",
+                        self.final_t, self.staging_t
+                    )
+                };
+                sqlx::query(&sql)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Transfer(format!("append insert: {e}")))?;
                 if let Some(wm) = &staged_wm {
                     self.write_state(&mut tx, wm, mode, rows).await?;
                 }
@@ -1419,16 +1466,23 @@ impl PgSink {
                     .map(|k| quote_ident(k))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let (overriding, generated) = self.insert_shape().await?;
                 let cols = self
                     .col_names
                     .iter()
+                    .filter(|c| !generated.contains(c))
                     .map(|c| quote_ident(c))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let ovr = if overriding {
+                    " OVERRIDING SYSTEM VALUE"
+                } else {
+                    ""
+                };
                 let updates = self
                     .col_names
                     .iter()
-                    .filter(|c| !self.merge_keys.contains(c))
+                    .filter(|c| !self.merge_keys.contains(c) && !generated.contains(c))
                     .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -1453,7 +1507,7 @@ impl PgSink {
                     .await
                     .map_err(|e| Error::Transfer(format!("merge begin: {e}")))?;
                 sqlx::query(&format!(
-                    "INSERT INTO {} ({cols}) \
+                    "INSERT INTO {} ({cols}){ovr} \
                      SELECT DISTINCT ON ({keys}) {cols} FROM {} ORDER BY {order} \
                      ON CONFLICT ({keys}) {action}",
                     self.final_t, self.staging_t

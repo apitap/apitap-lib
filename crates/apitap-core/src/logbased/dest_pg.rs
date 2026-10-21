@@ -233,6 +233,28 @@ async fn apply_unit(
     // refuses a value that does not fit — and the bulk lane refuses it. So
     // each type casts to its length-free spelling (`residue_cast`); the
     // column then applies its length.
+    // An identity column GENERATED ALWAYS refuses the WAL's values unless the
+    // INSERT says OVERRIDING SYSTEM VALUE: a destination pre-created from the
+    // source's schema failed every window (deep review 2, N20). Asked only
+    // when this window inserts. pgoutput sends no generated column, so those
+    // never reach a column list here.
+    let ovr = if c.upserts.is_empty() && c.residue.is_empty() {
+        ""
+    } else {
+        let always: Option<bool> = sqlx::query_scalar(
+            "SELECT bool_or(a.attidentity = 'a') FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .bind(&ft)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        if always == Some(true) {
+            " OVERRIDING SYSTEM VALUE"
+        } else {
+            ""
+        }
+    };
     let casts: std::collections::HashMap<String, String> = if c.residue.is_empty() && !raw_bytes {
         std::collections::HashMap::new()
     } else {
@@ -344,9 +366,11 @@ async fn apply_unit(
         copy.finish().await.map_err(db_err)?;
         // No ON CONFLICT: the delete phase already removed every one of
         // these keys, so this is a straight bulk insert.
-        tx.execute(format!("INSERT INTO {ft} ({collist}) SELECT {collist} FROM _ap_up").as_str())
-            .await
-            .map_err(db_err)?;
+        tx.execute(
+            format!("INSERT INTO {ft} ({collist}){ovr} SELECT {collist} FROM _ap_up").as_str(),
+        )
+        .await
+        .map_err(db_err)?;
     }
 
     // Residue tail: serial, ordered (masked updates and their followers).
@@ -406,7 +430,7 @@ async fn apply_unit(
                     format!("DO UPDATE SET {updates}")
                 };
                 format!(
-                    "INSERT INTO {ft} ({collist}) VALUES ({vals}) \
+                    "INSERT INTO {ft} ({collist}){ovr} VALUES ({vals}) \
                      ON CONFLICT ({pklist}) {action}"
                 )
             }
