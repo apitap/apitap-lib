@@ -534,7 +534,7 @@ pub(crate) fn missing_row(
 
 /// Everything that holds a connection. See the module doc.
 mod store {
-    use super::{db_err, delete_state, state_table_in, upsert_state_tx};
+    use super::{db_err, delete_state, quote_ident, state_table_in, upsert_state_tx};
     use crate::error::{Error, Result};
     use crate::guard::GuardStore;
     use crate::lease::{no_longer_holds, Fence, LeaseStore, Watermark};
@@ -777,6 +777,75 @@ mod store {
             Ok(row.map(|(wm, cursor, mode)| {
                 crate::naming::StateRow::new(wm, Some(cursor), Some(mode))
             }))
+        }
+
+        /// The source relation oid this table was bootstrapped from (N7), if
+        /// one was recorded — see `run::check_source_rels`.
+        pub(crate) async fn source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<u32>> {
+            let parts = self.parts_of(dest_table);
+            let relid: Option<i64> = sqlx::query_scalar(&format!(
+                "SELECT relid FROM {}._apitap_source_rel WHERE dest_table = $1 AND source_id = $2",
+                quote_ident(&parts.schema)
+            ))
+            .bind(&parts.bare)
+            .bind(source_id)
+            .fetch_optional(&self.pool)
+            .await
+            .or_else(|e| match &e {
+                sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(None),
+                _ => Err(db_err(e)),
+            })?;
+            Ok(relid.and_then(|r| u32::try_from(r).ok()))
+        }
+
+        /// Record (or move) the source relation oid of one table. Outside
+        /// any unit, beside `_apitap_state` in the table's schema.
+        pub(crate) async fn set_source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+            relid: u32,
+        ) -> Result<()> {
+            let parts = self.parts_of(dest_table);
+            let t = format!("{}._apitap_source_rel", quote_ident(&parts.schema));
+            self.pool
+                .execute(
+                    format!(
+                        "CREATE TABLE IF NOT EXISTS {t} (\
+                           dest_table text NOT NULL, \
+                           source_id  text NOT NULL, \
+                           relid      bigint NOT NULL, \
+                           at         timestamptz NOT NULL DEFAULT now(), \
+                           PRIMARY KEY (dest_table, source_id))"
+                    )
+                    .as_str(),
+                )
+                .await
+                .map(|_| ())
+                .or_else(|e| match &e {
+                    // The same non-atomic IF NOT EXISTS as the state table.
+                    sqlx::Error::Database(d)
+                        if matches!(d.code().as_deref(), Some("42P07") | Some("23505")) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(db_err(e)),
+                })?;
+            sqlx::query(&format!(
+                "INSERT INTO {t} (dest_table, source_id, relid) VALUES ($1, $2, $3) \
+                 ON CONFLICT (dest_table, source_id) DO UPDATE SET relid = EXCLUDED.relid, at = now()"
+            ))
+            .bind(&parts.bare)
+            .bind(source_id)
+            .bind(i64::from(relid))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+            Ok(())
         }
 
         /// The schemas this run's keys can live in.

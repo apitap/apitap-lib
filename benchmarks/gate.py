@@ -319,6 +319,7 @@ LEGS = [
     leg("e2e_pg_residue_typmod.py",  "a Postgres CDC residue write never truncates a value to fit the column"),
     leg("e2e_pg_nonowner_drain.py",  "a Postgres CDC drain runs as a role that does not own the publication"),
     leg("e2e_pg_recreated_table.py", "a Postgres CDC drain refuses a tracked table that was dropped and recreated"),
+    leg("e2e_pg_replaced_hub.py",    "a CDC drain refuses a source table a replace swapped under it"),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),

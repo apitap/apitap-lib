@@ -34,7 +34,8 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N10 | FIXED: a stream quiet for half the silence budget (30 s at most) sends a status with request_reply; only a server answering none for the budget is dead | (this commit) | `e2e_pg_quiet_stream` (0.62.1: silent for 4s), `e2e_half_open` still green |
 | N28 | FIXED: a varlen column past 1 GiB seals the batch whatever the byte target, so to_polars() never builds past i32 offsets | (this commit) | `e2e_to_polars_2gib_column` (0.62.1: past i32 offsets), unit `varlen_near_the_offset_limit_seals_an_unbounded_batch` |
 | N29 | FIXED: to_parquet takes the engine's memory limit (APITAP_MEM_BUDGET, the process's own cgroup v2/v1) through `_apitap.mem_limit_bytes` | (this commit) | `e2e_to_parquet_budget` (0.62.1: 1 row group) |
-| rest | OPEN: N7 (in progress); N19 BLOCKED (BigQuery) | — | — |
+| N7 | FIXED: the source oid is recorded at bootstrap in `_apitap_source_rel` (pg, mysql, ch) or a table property (iceberg) and a moved oid is refused at admission; a Relation under a tracked name with another oid is refused in the stream. BigQuery records none yet (rig blocked): there the in-stream check is the only one | (this commit) | `e2e_pg_replaced_hub` (0.62.1: green over 1,2,3,12 vs hub 10,11,12) |
+| rest | N19 BLOCKED (BigQuery) | — | — |
 
 ## Fix verdicts
 

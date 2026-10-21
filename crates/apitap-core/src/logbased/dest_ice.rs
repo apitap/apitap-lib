@@ -493,6 +493,25 @@ mod store {
         ) -> Result<Option<crate::naming::StateRow>> {
             cdc_read_state(&self.conn, bare(dest_table), source_id).await
         }
+
+        /// The source relation oid this table was bootstrapped from (N7).
+        pub(crate) async fn source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<u32>> {
+            crate::sink::iceberg::cdc_source_rel(&self.conn, bare(dest_table), source_id).await
+        }
+
+        pub(crate) async fn set_source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+            relid: u32,
+        ) -> Result<()> {
+            crate::sink::iceberg::cdc_set_source_rel(&self.conn, bare(dest_table), source_id, relid)
+                .await
+        }
     }
 
     impl LeaseStore for IceStore {

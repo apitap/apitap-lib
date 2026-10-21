@@ -295,6 +295,29 @@ impl Dest {
         }
     }
 
+    /// The source relation oid this member was bootstrapped from, if the
+    /// destination recorded one (N7). BigQuery records none yet: there the
+    /// drain's in-stream check is the only one.
+    async fn source_rel(&self, dest_table: &str, source_id: &str) -> Result<Option<u32>> {
+        match self {
+            Dest::Pg(d) => d.store().source_rel(dest_table, source_id).await,
+            Dest::Ch(d) => d.store().source_rel(dest_table, source_id).await,
+            Dest::My(d) => d.store().source_rel(dest_table, source_id).await,
+            Dest::Ice(d) => d.store().source_rel(dest_table, source_id).await,
+            Dest::Bq(_) => Ok(None),
+        }
+    }
+
+    async fn set_source_rel(&self, dest_table: &str, source_id: &str, relid: u32) -> Result<()> {
+        match self {
+            Dest::Pg(d) => d.store().set_source_rel(dest_table, source_id, relid).await,
+            Dest::Ch(d) => d.store().set_source_rel(dest_table, source_id, relid).await,
+            Dest::My(d) => d.store().set_source_rel(dest_table, source_id, relid).await,
+            Dest::Ice(d) => d.store().set_source_rel(dest_table, source_id, relid).await,
+            Dest::Bq(_) => Ok(()),
+        }
+    }
+
     /// Once per table at run start, on a table that ALREADY has state: the
     /// destination's shape must match `changelog`. A fresh bootstrap builds the
     /// right shape by construction, and the apply path is too late — an empty
@@ -617,6 +640,8 @@ struct TableCtx {
     /// Per-table state key — the same identity a single-table run would use,
     /// so state stays discoverable regardless of grouping.
     source_id: String,
+    /// The table's `pg_class` oid when the run began (N7).
+    relid: u32,
 }
 
 /// Bytes of row data one drain window may buffer before it must apply.
@@ -995,8 +1020,8 @@ async fn run_group(
         // run a full load and written a watermark, so the run fails AFTER
         // moving data — and on a group, after some members committed. The
         // catalog answers this question before anything is touched.
-        let ident: Option<String> = sqlx::query_scalar(
-            "SELECT relreplident::text FROM pg_class c \
+        let probe: Option<(String, i64)> = sqlx::query_as(
+            "SELECT relreplident::text, c.oid::int8 FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND c.relname = $2",
         )
@@ -1005,6 +1030,10 @@ async fn run_group(
         .fetch_optional(&src)
         .await
         .map_err(|e| Error::Transfer(format!("log_based: replica identity probe: {e}")))?;
+        let (ident, relid) = match probe {
+            Some((i, oid)) => (Some(i), u32::try_from(oid).unwrap_or(0)),
+            None => (None, 0),
+        };
         if ident.as_deref() == Some("n") {
             return Err(Error::InvalidInput(format!(
                 "log_based: {qualified} has REPLICA IDENTITY NOTHING — its updates \
@@ -1024,6 +1053,7 @@ async fn run_group(
             dest_table,
             source_id: crate::pipeline::source_identity(src_url, t),
             pk_cols,
+            relid,
         });
     }
     {
@@ -1129,6 +1159,9 @@ async fn run_group(
         }
 
         if have.is_empty() {
+            // Stamped once the load landed (below): an Iceberg bootstrap
+            // creates the table it is written on.
+            //
             // The full load is a nested run (`transfer_within`): its own Swap
             // token names this run as parent, so its guard classifies our lock
             // and marker as `Found::Parent` and proceeds. The tenure — lock,
@@ -1137,7 +1170,7 @@ async fn run_group(
             // released them here and let the bulk lock cover the load, which
             // left the table free between the two and after the load, while
             // the drain still owned its slot and its watermark.)
-            bootstrap_group(
+            let r = bootstrap_group(
                 src_url,
                 dst_url,
                 opts,
@@ -1147,8 +1180,14 @@ async fn run_group(
                 &ctxs,
                 budget_denom,
             )
-            .await
+            .await?;
+            for c in &ctxs {
+                dest.set_source_rel(&c.dest_table, &c.source_id, c.relid)
+                    .await?;
+            }
+            Ok(r)
         } else {
+            check_source_rels(&dest, &ctxs).await?;
             let floors: Vec<u64> = wms.iter().map(|w| w.expect("all present").get()).collect();
             let wm = *floors.iter().min().expect("nonempty");
             drain_group(
@@ -1923,8 +1962,10 @@ async fn drain_group(
     let stop_line = cap.map_or(stop_line, |c| c.min(stop_line));
 
     let mut key_cols = HashMap::new();
+    let mut relids = HashMap::new();
     for c in ctxs {
         key_cols.insert(c.qualified.clone(), c.pk_cols.clone());
+        relids.insert(c.qualified.clone(), (c.relid, c.dest_table.clone()));
     }
 
     // Two windows are resident under overlap (one applying, one draining) —
@@ -1991,6 +2032,7 @@ async fn drain_group(
             wm,
             stop_line,
             &key_cols,
+            relids,
             budget,
             changelog,
             follow,
@@ -2067,6 +2109,7 @@ async fn drain_loop(
     wm: u64,
     stop_line: u64,
     key_cols: &HashMap<String, Vec<String>>,
+    relids: HashMap<String, (u32, String)>,
     budget: usize,
     changelog: bool,
     follow: Option<std::time::Instant>,
@@ -2076,7 +2119,7 @@ async fn drain_loop(
 ) -> Result<()> {
     let mut stop_line = stop_line;
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
-    let mut sess = DrainSession::default();
+    let mut sess = DrainSession::expecting(relids);
     let mut cur = wm;
     let mut windows = 0u32;
     // The windows sent to the applier and not yet confirmed, oldest first;
@@ -2756,6 +2799,40 @@ async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
 /// changes since it left were never published, and the DROP that removed it
 /// emitted nothing. Re-added and drained on, the destination kept the old
 /// table's rows and lost the new one's first changes (deep review D17).
+/// Refuse a member whose source table is not the one it was bootstrapped
+/// from (N7). A DROP + CREATE (apitap's own Postgres replace, a migration)
+/// emits nothing into the slot, and putting the new table back into the
+/// publication — which that replace does, for its downstream consumers —
+/// hid it from the membership check: the drain mapped the new oid onto the
+/// old table by name and went on, green, without the rows the new table was
+/// loaded with. A member with no record (bootstrapped before 0.63.0) is
+/// adopted as it is now.
+async fn check_source_rels(dest: &Dest, ctxs: &[TableCtx]) -> Result<()> {
+    for c in ctxs {
+        match dest.source_rel(&c.dest_table, &c.source_id).await? {
+            Some(was) if was != c.relid => {
+                return Err(recreated(&c.qualified, &c.dest_table, was, c.relid))
+            }
+            Some(_) => {}
+            None => {
+                dest.set_source_rel(&c.dest_table, &c.source_id, c.relid)
+                    .await?
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The refusal for a source table recreated under its own name.
+pub(crate) fn recreated(qualified: &str, dest_table: &str, a: u32, b: u32) -> Error {
+    Error::InvalidInput(format!(
+        "log_based: {qualified} is not the table {dest_table} was bootstrapped from \
+         (relation oids {a} and {b}) — it was dropped and recreated, and the rows \
+         the new table was loaded with never reached the slot. Re-bootstrap {dest_table}: \
+         clear its _apitap_state row and run again"
+    ))
+}
+
 async fn ensure_publication(
     src: &PgPool,
     publication: &str,
@@ -3340,6 +3417,7 @@ mod tests {
             dest_table: dest.into(),
             pk_cols: vec!["id".into()],
             source_id: "postgres://h:5432/db::public.t".into(),
+            relid: 0,
         };
         let (a, a_legacy) = slot_names(&[ctx("events")], true, "postgres://dst-a:5432/db");
         let (b, b_legacy) = slot_names(&[ctx("events")], true, "postgres://dst-b:5432/db");

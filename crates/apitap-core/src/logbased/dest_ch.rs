@@ -2028,6 +2028,66 @@ mod store {
             crate::sink::clickhouse::state_row_of(&body)
         }
 
+        /// The source relation oid this table was bootstrapped from (N7), if
+        /// one was recorded — see `run::check_source_rels`. `FINAL`: keyed on
+        /// exactly these two columns, so at most one row.
+        pub(crate) async fn source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<u32>> {
+            let body = match self
+                .ch
+                .read(&format!(
+                    "SELECT relid FROM `_apitap_source_rel` FINAL \
+                     WHERE dest_table = '{}' AND source_id = '{}' FORMAT TabSeparated",
+                    ch_str(dest_table),
+                    ch_str(source_id)
+                ))
+                .await
+            {
+                Ok(b) => b,
+                Err(Error::Transfer(m))
+                    if m.contains("UNKNOWN_TABLE") || m.contains("doesn't exist") =>
+                {
+                    return Ok(None)
+                }
+                Err(e) => return Err(e),
+            };
+            Ok(body.lines().next().and_then(|l| l.trim().parse().ok()))
+        }
+
+        /// Record (or move) the source relation oid of one table, beside
+        /// `_apitap_state` and as node-local as it is.
+        pub(crate) async fn set_source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+            relid: u32,
+        ) -> Result<()> {
+            let key = "\u{1}source_rel";
+            if !self.ensured.lock().unwrap().contains(key) {
+                self.ch
+                    .exec(
+                        "CREATE TABLE IF NOT EXISTS `_apitap_source_rel` (\
+                           dest_table String, source_id String, relid UInt32, \
+                           at DateTime64(6, 'UTC') DEFAULT now64(6)) \
+                         ENGINE = ReplacingMergeTree(at) ORDER BY (dest_table, source_id)",
+                    )
+                    .await?;
+                self.ensured.lock().unwrap().insert(key.to_string());
+            }
+            self.ch
+                .exec(&format!(
+                    "INSERT INTO `_apitap_source_rel` (dest_table, source_id, relid) \
+                     VALUES ('{}', '{}', {relid})",
+                    ch_str(dest_table),
+                    ch_str(source_id)
+                ))
+                .await
+                .map(|_| ())
+        }
+
         /// Ask ClickHouse itself whether these clauses resolve against the
         /// table's real columns. `SELECT <expr> FROM t LIMIT 0` reads no data
         /// and returns the same `UNKNOWN_IDENTIFIER` the CREATE would, so a

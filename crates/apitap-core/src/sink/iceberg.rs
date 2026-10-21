@@ -2155,6 +2155,51 @@ pub(crate) async fn cdc_set_watermark(
     }
 }
 
+/// The source relation oid a CDC table was bootstrapped from (N7) — on
+/// Iceberg, like the watermark, a table property.
+fn relid_prop_for(source_id: &str) -> String {
+    format!("apitap.source-relid.{source_id}")
+}
+
+pub(crate) async fn cdc_source_rel(
+    conn: &IcebergConn,
+    table: &str,
+    source_id: &str,
+) -> Result<Option<u32>> {
+    let Some(meta) = conn.load_table(table).await? else {
+        return Ok(None);
+    };
+    Ok(meta
+        .properties()
+        .get(&relid_prop_for(source_id))
+        .and_then(|v| v.parse().ok()))
+}
+
+pub(crate) async fn cdc_set_source_rel(
+    conn: &IcebergConn,
+    table: &str,
+    source_id: &str,
+    relid: u32,
+) -> Result<()> {
+    let meta = conn.load_table(table).await?.ok_or_else(|| {
+        Error::Transfer(format!(
+            "log_based: iceberg table '{table}' is GONE — dropped mid-run?"
+        ))
+    })?;
+    let updates = vec![TableUpdate::SetProperties {
+        updates: HashMap::from([(relid_prop_for(source_id), relid.to_string())]),
+    }];
+    let requirements = vec![TableRequirement::UuidMatch { uuid: meta.uuid() }];
+    match conn.commit_table(table, &requirements, &updates).await? {
+        CommitTry::Done => Ok(()),
+        CommitTry::Conflict => Err(Error::Transfer(format!(
+            "log_based: iceberg source-relid commit for '{table}' conflicted — \
+             was the table replaced by another writer?"
+        ))),
+        CommitTry::Unknown(e) => Err(e),
+    }
+}
+
 /// [`Delivered`] for a WAL column by its Postgres type OID — MUST agree with
 /// `delivered_of_udt` in the Postgres source (the bootstrap's full load built
 /// the table from it). NUMERIC is handled by the caller: its precision/scale

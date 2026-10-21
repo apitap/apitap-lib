@@ -830,6 +830,64 @@ mod store {
             };
             Ok(row.map(|(wm, cursor, mode)| crate::naming::StateRow::new(wm, cursor, mode)))
         }
+
+        /// The source relation oid this table was bootstrapped from (N7), if
+        /// one was recorded — see `run::check_source_rels`.
+        pub(crate) async fn source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+        ) -> Result<Option<u32>> {
+            let mut conn = self.shared.conn().await?;
+            match conn
+                .exec_first(
+                    format!(
+                        "SELECT relid FROM {} WHERE dest_table = ? AND source_id = ?",
+                        self.fq("_apitap_source_rel")
+                    ),
+                    (bare(dest_table), source_id),
+                )
+                .await
+            {
+                Ok(r) => Ok(r),
+                Err(mysql_async::Error::Server(e)) if e.code == 1146 => Ok(None),
+                Err(e) => Err(Error::Transfer(format!("log_based: mysql source rel: {e}"))),
+            }
+        }
+
+        /// Record (or move) the source relation oid of one table, beside
+        /// `_apitap_state`. Outside any unit: CREATE TABLE implicitly commits.
+        pub(crate) async fn set_source_rel(
+            &self,
+            dest_table: &str,
+            source_id: &str,
+            relid: u32,
+        ) -> Result<()> {
+            let fq = self.fq("_apitap_source_rel");
+            let err = |e: mysql_async::Error| {
+                Error::Transfer(format!("log_based: mysql source rel: {e}"))
+            };
+            let mut conn = self.shared.conn().await?;
+            conn.query_drop(format!(
+                "CREATE TABLE IF NOT EXISTS {fq} (\
+                   dest_table VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+                   source_id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, \
+                   relid BIGINT UNSIGNED NOT NULL, \
+                   PRIMARY KEY (dest_table, source_id)\
+                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            ))
+            .await
+            .map_err(err)?;
+            conn.exec_drop(
+                format!(
+                    "INSERT INTO {fq} (dest_table, source_id, relid) VALUES (?, ?, ?) \
+                     ON DUPLICATE KEY UPDATE relid = VALUES(relid)"
+                ),
+                (bare(dest_table), source_id, relid),
+            )
+            .await
+            .map_err(err)
+        }
     }
 
     impl LeaseStore for MyStore {

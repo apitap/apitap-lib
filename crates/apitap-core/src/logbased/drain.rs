@@ -133,9 +133,23 @@ pub(crate) struct DrainSession {
     /// drain starts. The memory it holds does not go anywhere, so the budget
     /// that is supposed to bound this process's RSS has to keep counting it.
     stream_bytes: usize,
+    /// Each tracked table's source oid when the run began, and its
+    /// destination, by "schema.table" (N7). A Relation under a tracked name
+    /// with any other oid is a table dropped and recreated inside the WAL
+    /// this session drains — before the run began (the WAL still holds the
+    /// old table's changes) or during a follow session — and is refused.
+    /// Empty in tests: no expectation, no check.
+    expected: HashMap<String, (u32, String)>,
 }
 
 impl DrainSession {
+    pub(crate) fn expecting(expected: HashMap<String, (u32, String)>) -> Self {
+        Self {
+            expected,
+            ..Self::default()
+        }
+    }
+
     /// Map a relation oid to its slot. A dropped-and-recreated table keeps
     /// its slot under a new oid; the old oid's entries were never removed, so
     /// DROP/CREATE churn grew both maps for the whole follow session (P2).
@@ -521,6 +535,13 @@ pub(crate) async fn drain(
                         let table = format!("{}.{}", r.namespace, r.name);
                         let layout = Layout::from_relation(&r, key_cols)?;
                         let tracked = layout.is_some();
+                        if let Some((want, dest)) = sess.expected.get(&table) {
+                            if tracked && *want != r.rel_id {
+                                return Err(crate::logbased::run::recreated(
+                                    &table, dest, r.rel_id, *want,
+                                ));
+                            }
+                        }
                         let slot = sess.rel_slot(&table, tracked)?;
                         if let Some(new) = layout {
                             // pgoutput re-sends a Relation on every relcache
