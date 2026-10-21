@@ -874,6 +874,78 @@ impl MySqlSink {
         )))
     }
 
+    /// A replace rebuilds the table from the source's columns and key, and
+    /// drops the old one with everything only the old one had: secondary
+    /// indexes, triggers, its own foreign keys, AUTO_INCREMENT, column
+    /// defaults, partitioning. That happened silently on every run (deep
+    /// review 2, N24); the ClickHouse sink refuses the same loss (M-29), and
+    /// so does this one now, naming each. The tables apitap creates have none.
+    async fn refuse_lossy_replace(&self) -> Result<()> {
+        let (db, t) = (sql_lit(&self.db), sql_lit(&self.bare));
+        let probes = [
+            (
+                "secondary index(es)",
+                format!(
+                    "SELECT GROUP_CONCAT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS \
+                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{t}' AND INDEX_NAME <> 'PRIMARY'"
+                ),
+            ),
+            (
+                "trigger(s)",
+                format!(
+                    "SELECT GROUP_CONCAT(TRIGGER_NAME) FROM information_schema.TRIGGERS \
+                     WHERE EVENT_OBJECT_SCHEMA = '{db}' AND EVENT_OBJECT_TABLE = '{t}'"
+                ),
+            ),
+            (
+                "foreign key(s)",
+                format!(
+                    "SELECT GROUP_CONCAT(CONSTRAINT_NAME) FROM information_schema.REFERENTIAL_CONSTRAINTS \
+                     WHERE CONSTRAINT_SCHEMA = '{db}' AND TABLE_NAME = '{t}'"
+                ),
+            ),
+            (
+                "AUTO_INCREMENT on",
+                format!(
+                    "SELECT GROUP_CONCAT(COLUMN_NAME) FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{t}' AND EXTRA LIKE '%auto_increment%'"
+                ),
+            ),
+            (
+                // MariaDB spells "no default" as the string 'NULL'.
+                "the DEFAULT of",
+                format!(
+                    "SELECT GROUP_CONCAT(COLUMN_NAME) FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{t}' \
+                       AND COLUMN_DEFAULT IS NOT NULL AND COLUMN_DEFAULT <> 'NULL'"
+                ),
+            ),
+            (
+                "partitioning",
+                format!(
+                    "SELECT GROUP_CONCAT(DISTINCT PARTITION_METHOD) FROM information_schema.PARTITIONS \
+                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{t}' AND PARTITION_NAME IS NOT NULL"
+                ),
+            ),
+        ];
+        let mut lost = Vec::new();
+        for (what, sql) in probes {
+            if let Some(names) = self.scalar(&sql).await? {
+                lost.push(format!("{what} {names}"));
+            }
+        }
+        if lost.is_empty() {
+            return Ok(());
+        }
+        Err(Error::InvalidInput(format!(
+            "mode='replace' would rebuild {} from the source's columns and key and drop {} \
+             with the old table. Nothing has been copied yet. Drop those from the table first, \
+             drop the table, or use mode='append' or 'merge', which keep the table",
+            self.bare,
+            lost.join("; ")
+        )))
+    }
+
     /// `sql_require_primary_key` is ON (MySQL 8.0.13+; MariaDB has no such
     /// variable and answers nothing).
     async fn requires_primary_key(&self) -> Result<bool> {
@@ -1063,6 +1135,7 @@ impl crate::sink::Sink for MySqlSink {
     ) -> Result<()> {
         if mode == Mode::Replace {
             self.refuse_referencing_fks().await?;
+            self.refuse_lossy_replace().await?;
         }
         // Same-engine transfers mirror the source column types verbatim
         // (`native_ddl`) so a swap yields a table identical to the source's;
