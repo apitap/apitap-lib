@@ -152,11 +152,12 @@ fn count_of(v: Option<String>) -> Result<u64> {
 }
 
 /// Whether a key column's DDL type is one MySQL cannot index whole: a TEXT
-/// or BLOB (any size) or JSON part, or a VARCHAR past 768 characters (the
-/// utf8mb4 3072-byte cap). Case-insensitive: a mysql -> mysql type is the
-/// source's own lowercase `varchar(1000)`, which the uppercase-only check
-/// never matched, so the staging DDL failed with the raw 1170/1071 error
-/// instead of this remedy (P2).
+/// or BLOB (any size) or JSON part, or a VARCHAR past InnoDB's 3072-byte
+/// key cap in its character set: 768 characters in utf8mb4 (the default),
+/// 1024 in utf8mb3, 3072 in latin1. Case-insensitive: a mysql -> mysql type
+/// is the source's own lowercase `varchar(1000)` (P2). Charset-aware: read as
+/// utf8mb4, a source's indexed latin1 `varchar(1000)` key was refused on
+/// every replace and bootstrap (deep review 2, N25).
 fn pk_unindexable(ty: &str) -> bool {
     let up = ty.trim().to_ascii_uppercase();
     let head = up
@@ -178,7 +179,22 @@ fn pk_unindexable(ty: &str) -> bool {
             | "MEDIUMBLOB"
             | "LONGBLOB"
             | "JSON"
-    ) || varchar_w.is_some_and(|n| n > 768)
+    ) || varchar_w.is_some_and(|n| n > 3072 / charset_width(&up))
+}
+
+/// Bytes per character of the `CHARACTER SET` a DDL type names (upper case),
+/// for the key-length cap; none named reads as utf8mb4.
+fn charset_width(up: &str) -> u32 {
+    let cs = up
+        .split_once("CHARACTER SET ")
+        .and_then(|(_, r)| r.split_whitespace().next())
+        .unwrap_or("UTF8MB4");
+    match cs {
+        "LATIN1" | "LATIN2" | "ASCII" | "BINARY" | "CP1250" | "CP1251" | "CP1252" => 1,
+        "UCS2" => 2,
+        "UTF8" | "UTF8MB3" => 3,
+        _ => 4,
+    }
 }
 
 /// The lease store, shared by both lanes — see `crate::lease`.
@@ -1892,9 +1908,18 @@ mod abort_tests {
             "int",
             "bigint unsigned",
             "char(36)",
+            // N25: the cap is in bytes, per character set.
+            "varchar(1000) CHARACTER SET latin1 COLLATE latin1_swedish_ci",
+            "varchar(1024) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci",
         ] {
             assert!(!super::pk_unindexable(t), "{t}");
         }
+        assert!(super::pk_unindexable(
+            "varchar(1025) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci"
+        ));
+        assert!(super::pk_unindexable(
+            "varchar(769) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+        ));
     }
 
     /// P2/T8: a COUNT answer that is not a number fails, it is not 0.
