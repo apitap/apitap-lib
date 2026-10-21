@@ -239,6 +239,7 @@ LEGS = [
     leg("e2e_two_destinations.py", "one source, two destinations: each resumes its own slot"),
     leg("e2e_cdc_progress.py",     "a Postgres drain reports rows while it runs"),
     leg("e2e_ch_insert_only.py",   "a Replacing destination takes the tombstone path, FINAL exact"),
+    leg("e2e_ch_append_skip_index.py", "a ClickHouse append lands in a table with a skip index and a projection"),
     leg("e2e_ch_tombstone_sort_key.py", "a Replacing destination whose ORDER BY is not the key never takes the tombstone path"),
     leg("e2e_ch_tombstone_upgrade.py", "a table 0.62.x filled with versions reads back its newest one after the upgrade", {"wheel-0621"}),
     leg("e2e_text_source_order_by.py", "a CSV from GitHub lands in ClickHouse with order_by= on one of its columns"),

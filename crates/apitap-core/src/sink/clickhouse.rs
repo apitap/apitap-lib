@@ -2061,6 +2061,20 @@ impl crate::sink::Sink for ChSink {
                     self.staging_t
                 ))
                 .await?;
+        } else if !self.dest_structure.is_empty() {
+            // Staging mirrors an existing destination for ATTACH PARTITION,
+            // which also refuses different skip indexes and projections:
+            // built from columns and keys alone, every append into a table
+            // with a bloom_filter index or a projection loaded the whole
+            // delta and then failed the attach (deep review 2, N21). `AS`
+            // copies the columns, indexes and projections; the engine stays
+            // a local MergeTree with the destination's keys.
+            self.ch
+                .exec(&format!(
+                    "CREATE TABLE {} AS {} ENGINE = MergeTree{primary_key} ORDER BY {order_by}",
+                    self.staging_t, self.final_t
+                ))
+                .await?;
         } else {
             self.ch
                 .exec(&format!(
