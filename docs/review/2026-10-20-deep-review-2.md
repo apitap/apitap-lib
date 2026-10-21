@@ -22,7 +22,15 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N4 / N13 | FIXED: the key twin's load lets 1062 through (and SHOW WARNINGS is read before the count) | `393f88a` | `e2e_my_ci_key_change` (0.62.1: key load refused) |
 | N7 | IN PROGRESS (decided: a side table on the destination): persist each member's source relation oid | — | — |
 | N16 | FIXED (decided: refuse): RENAME onto or away from a tracked name stops the run, the gh-ost/pt-osc cut-over included, naming the re-bootstrap | `ece28c7` | `e2e_my_partition_ddl` (previous build: green, old rows kept) |
-| rest | OPEN: N10, N12, N17, N19-N25, N27-N29 | — | — |
+| N17 | FIXED: a tracked child of a cascading FK is refused at resolve (APITAP_MY_ALLOW_FK_CASCADE=1 opts out) | `b27f617` | `e2e_my_fk_cascade` (0.62.1: green, cascaded rows kept) |
+| N27 | FIXED: the encoder refuses a NULL in a REQUIRED Iceberg field, bulk and CDC | `8164603` | `e2e_ice_required_null` (0.62.1: green append) |
+| N24 | FIXED: a MySQL replace that would drop indexes, triggers, FKs, AUTO_INCREMENT, defaults or partitioning is refused | `a327f36` | `e2e_my_lossy_replace` (0.62.1: index and trigger gone) |
+| N12 | FIXED: the per-table order_by dict reaches every bulk table and replica bootstrap | `c399c05` | `e2e_ch_order_by_per_table` (0.62.1: ('id', '')) |
+| N20 | FIXED: OVERRIDING SYSTEM VALUE for ALWAYS identities, generated columns left out (bulk and CDC) | `443fd3c` | `e2e_pg_identity_generated` (0.62.1: 428C9) |
+| N21 | FIXED: mirrored CH staging is CREATE ... AS final (indexes and projections copied) | `5815ca7` | `e2e_ch_append_skip_index` (0.62.1: different secondary indices) |
+| N25 | FIXED: the VARCHAR key cap is 3072 bytes in the column's charset | `ced6cb8` | `e2e_my_latin1_long_key` (0.62.1: refused) |
+| N22 | FIXED: the MySQL loader session sets net_read_timeout = 3600 | `14bae51` | `e2e_my_slow_source` (0.62.1: Packets out of sync) |
+| rest | OPEN: N7 (in progress), N10, N23, N28, N29; N19 BLOCKED (BigQuery) | — | — |
 
 ## Fix verdicts
 
