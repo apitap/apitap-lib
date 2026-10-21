@@ -1366,8 +1366,15 @@ impl crate::sink::Sink for MySqlSink {
 
         let mut conn = self.deadline_conn().await?;
         // UTC + relaxed integrity for the bulk load (staging carries no FKs anyway).
+        // net_read_timeout: the LOAD DATA opens before the source produces,
+        // and bytes move only at 4 MiB boundaries, so a slow or selective
+        // source (a delta scan over a big table, a rate-limited API) left the
+        // server waiting past its 30 s default: "Got timeout reading
+        // communication packets" on every run (deep review 2, N22). A client
+        // that dies still closes its socket; only a silent one waits this long.
         conn.query_drop(
-            "SET time_zone='+00:00', unique_checks=0, foreign_key_checks=0, sql_mode=''",
+            "SET time_zone='+00:00', unique_checks=0, foreign_key_checks=0, sql_mode='', \
+             net_read_timeout=3600",
         )
         .await
         .map_err(|e| Error::Transfer(format!("mysql loader session: {e}")))?;

@@ -272,6 +272,7 @@ LEGS = [
     leg("e2e_my_sink_warnings.py",    "a MySQL destination never publishes rows LOAD DATA dropped or changed"),
     leg("e2e_my_year_zero.py",       "a mysql -> mysql copy keeps the zero YEAR as 0000"),
     leg("e2e_my_latin1_long_key.py", "a mysql -> mysql replace copies a long latin1 key the source indexes fine"),
+    leg("e2e_my_slow_source.py",     "a MySQL load survives a source slower than net_read_timeout"),
     leg("e2e_pg_search_path.py",      "an unqualified Postgres destination stays in the schema it lives in"),
     leg("e2e_pg_parallel_snapshot.py", "a parallel Postgres read sees one table state"),
     leg("e2e_ch_body_cut.py",         "a ClickHouse 200 whose body never arrives fails the run"),
