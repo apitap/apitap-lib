@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from apitap._apitap import (
     LockedError,
     __version__,
+    mem_limit_bytes as _mem_limit_bytes,
     read as _read,
     request_stop,
     read_schema as _read_schema,
@@ -346,12 +347,16 @@ class Reader:
         except ImportError as e:
             raise ImportError("to_parquet() needs pyarrow — pip install pyarrow") from e
         if row_group_bytes is None:
-            try:
-                limit = int(open("/sys/fs/cgroup/memory.max").read().strip())
+            # The engine's own limit, not the root memory.max: on cgroup v1,
+            # --cgroupns=host, a systemd MemoryMax slice or APITAP_MEM_BUDGET
+            # that file is absent or "max", and a 256 MB box took 128 MB
+            # groups on top of the engine's full budget (N29).
+            limit = _mem_limit_bytes()
+            if limit is None:
+                row_group_bytes = 128 << 20
+            else:
                 cand = min(128 << 20, limit // 8)
                 row_group_bytes = cand if cand >= 64 << 20 else 0
-            except (OSError, ValueError):  # no cgroup v2 limit ("max" or absent)
-                row_group_bytes = 128 << 20
         reader = pa.RecordBatchReader.from_stream(self)
         rows = 0
         buf, buf_bytes = [], 0

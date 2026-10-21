@@ -53,6 +53,13 @@ pub use error::{Error, Result};
 pub use read::{read_schema, read_start, ArrowField, ReadHandle, ReadOptions};
 pub use wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, FinishedCol};
 
+/// The memory limit the engine sizes itself from — `APITAP_MEM_BUDGET`, then
+/// this process's own cgroup (v2, then v1) — or `None` when there is none.
+/// Exported so the Python shim sizes its buffers from the same number.
+pub fn mem_limit_bytes() -> Option<u64> {
+    pipeline::mem_limit_bytes()
+}
+
 /// How rows land in the destination table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {

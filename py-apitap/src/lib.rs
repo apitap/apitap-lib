@@ -529,9 +529,16 @@ fn request_stop() {
     apitap_core::shutdown::request();
 }
 
+/// The memory limit the engine sizes itself from, in bytes, or `None`.
+#[pyfunction]
+fn mem_limit_bytes() -> Option<u64> {
+    apitap_core::mem_limit_bytes()
+}
+
 #[pymodule]
 fn _apitap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(request_stop, m)?)?;
+    m.add_function(wrap_pyfunction!(mem_limit_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(transfer, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_many, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;

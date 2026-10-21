@@ -275,6 +275,7 @@ LEGS = [
     leg("e2e_my_slow_source.py",     "a MySQL load survives a source slower than net_read_timeout"),
     leg("e2e_my_wide_varchars.py",   "a pg -> mysql copy of wide varchars fits MySQL's row"),
     leg("e2e_pg_quiet_stream.py",    "a quiet replication stream is asked for a keepalive instead of being called dead"),
+    leg("e2e_to_parquet_budget.py",  "to_parquet sizes its row groups from the engine's memory limit"),
     leg("e2e_to_polars_2gib_column.py", "to_polars() reads a text column larger than 2 GiB"),
     leg("e2e_pg_search_path.py",      "an unqualified Postgres destination stays in the schema it lives in"),
     leg("e2e_pg_parallel_snapshot.py", "a parallel Postgres read sees one table state"),
