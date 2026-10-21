@@ -27,6 +27,17 @@ use crate::wire::rowbinary::{rb_type, Transcoder};
 use serde_json::Value;
 
 const API: &str = "https://api.github.com";
+
+/// The API root: `APITAP_GITHUB_API` (GitHub Enterprise Server's
+/// `https://<host>/api/v3`, or a test server), else api.github.com. Link
+/// headers are followed only on this root's host and scheme.
+fn api_base() -> String {
+    std::env::var("APITAP_GITHUB_API")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| API.to_string())
+}
 const PER_PAGE: u32 = 100;
 
 /* ------------------------------------------------------------------ entity spec */
@@ -522,7 +533,7 @@ impl GithubApiSource {
         self.meta
             .get_or_try_init(|| async {
                 self.send(
-                    format!("{API}/repos/{}/{}", self.owner, self.repo),
+                    format!("{}/repos/{}/{}", api_base(), self.owner, self.repo),
                     None,
                     "repo lookup",
                 )
@@ -536,8 +547,11 @@ impl GithubApiSource {
 
     fn first_page_url(&self, e: &Entity, since: Option<&str>) -> String {
         let mut url = format!(
-            "{API}/repos/{}/{}/{}?per_page={PER_PAGE}",
-            self.owner, self.repo, e.path
+            "{}/repos/{}/{}/{}?per_page={PER_PAGE}",
+            api_base(),
+            self.owner,
+            self.repo,
+            e.path
         );
         for (k, v) in e.query {
             url.push_str(&format!("&{k}={v}"));
@@ -605,7 +619,7 @@ fn link_next(link: &str) -> Option<String> {
         // header is followed only while it stays on the API host it was
         // addressed to.
         let next = reqwest::Url::parse(url).ok()?;
-        let api = reqwest::Url::parse(API).ok()?;
+        let api = reqwest::Url::parse(&api_base()).ok()?;
         if next.host_str()? != api.host_str()? {
             return None;
         }
