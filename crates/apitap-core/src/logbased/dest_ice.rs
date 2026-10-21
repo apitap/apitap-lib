@@ -182,6 +182,7 @@ async fn apply_unit(
             None,
             RowGroup::cdc_window(),
         )?;
+        enc.require(bound.field_required());
         let mut chunk = Vec::with_capacity(256 << 10);
         pgc::header(&mut chunk);
         let mut sent = 0u64;
@@ -372,6 +373,10 @@ mod store {
 
         pub(crate) fn field_ids(&self) -> &[i32] {
             &self.0.field_ids
+        }
+
+        pub(crate) fn field_required(&self) -> &[bool] {
+            &self.0.field_required
         }
     }
 

@@ -455,6 +455,9 @@ pub(crate) struct ParquetEncoder {
     // with the data file, row group by row group. Nothing survives a flush,
     // so a merge's memory is flat in the delta (I4).
     pub(crate) key_file: Option<KeyFile>,
+    /// Per column: the destination declares it REQUIRED, so a NULL refuses
+    /// the load (empty: every column optional, the tables apitap creates).
+    required: Vec<bool>,
 }
 
 /// A one-column parquet file written IN LOCKSTEP with the data file. Every
@@ -488,6 +491,12 @@ impl ParquetEncoder {
     /// streamed key companion ([`Self::key_file`]); a NULL in it is an error.
     /// `row_group`: the planner-priced bound the builders flush at (per row,
     /// not per input chunk).
+    /// The destination's REQUIRED fields, by column: a NULL in one fails
+    /// the load instead of landing under a NOT NULL (deep review 2, N27).
+    pub(crate) fn require(&mut self, required: &[bool]) {
+        self.required = required.to_vec();
+    }
+
     pub(crate) fn new_ext(
         names: Vec<String>,
         delivered: Vec<Delivered>,
@@ -570,6 +579,7 @@ impl ParquetEncoder {
             row_group,
             group_bytes: 0,
             key_file,
+            required: Vec::new(),
         };
         enc.open_writer()?;
         Ok(enc)
@@ -711,6 +721,15 @@ impl ParquetEncoder {
                          identify its row"
                             .into(),
                     ));
+                }
+                if self.required.get(i).copied().unwrap_or(false) {
+                    return Err(Error::InvalidInput(format!(
+                        "column '{}' is REQUIRED in the destination table and a source row \
+                         holds NULL in it — written anyway, readers would trust a NOT NULL \
+                         that does not hold. Fill the NULLs in a source view (COALESCE), or \
+                         make the column optional in the destination",
+                        self.schema.get_fields()[i].name()
+                    )));
                 }
                 self.defs[i].push(0);
                 self.group_bytes += 2; // the definition level vector's entry
@@ -1243,6 +1262,37 @@ mod tests {
     /// `KeyCap` retained every key until commit (~150 MB for the 2.1M keys of
     /// E2's OOM). The key file must mirror the data file: same row groups,
     /// same rows, and the key column's own schema.
+    /// N27: a NULL in a column the destination declares REQUIRED fails the
+    /// load and names the column; an optional one takes it.
+    #[test]
+    fn a_null_in_a_required_column_is_refused() {
+        let enc = || {
+            ParquetEncoder::new_ext(
+                vec!["id".into(), "amount".into()],
+                vec![
+                    Delivered::Int {
+                        bytes: 8,
+                        unsigned: false,
+                    },
+                    Delivered::Text,
+                ],
+                None,
+                None,
+                None,
+                RowGroup::Mib24,
+            )
+            .unwrap()
+        };
+        let stream = copy_stream(&[vec![Some(1i64.to_be_bytes().to_vec()), None]]);
+        let mut e = enc();
+        e.require(&[true, true]);
+        let err = e.push(&stream).unwrap_err().to_string();
+        assert!(err.contains("'amount' is REQUIRED"), "{err}");
+        let mut e = enc();
+        e.require(&[true, false]);
+        e.push(&stream).unwrap();
+    }
+
     #[test]
     fn merge_key_file_streams_per_row_group_and_retains_nothing() {
         use parquet::record::Field;

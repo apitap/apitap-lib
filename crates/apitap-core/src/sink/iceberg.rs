@@ -529,11 +529,14 @@ fn build_schema(names: &[String], delivered: &[Delivered]) -> Result<Schema> {
 /// Existing table: verify it matches what we deliver and return the table's
 /// own field id for each of OUR columns, in our column order — parquet field
 /// ids must be the TABLE's ids, whoever created it.
+/// The destination's field id for each source column, and whether the
+/// table declares that field REQUIRED (a foreign-written table can; the
+/// tables apitap creates never do). The encoder refuses a NULL there (N27).
 fn conform_ids(
     meta: &TableMetadata,
     names: &[String],
     delivered: &[Delivered],
-) -> Result<Vec<i32>> {
+) -> Result<(Vec<i32>, Vec<bool>)> {
     let schema = meta.current_schema();
     let theirs = schema.as_struct().fields();
     if theirs.len() != names.len() {
@@ -545,6 +548,7 @@ fn conform_ids(
         )));
     }
     let mut ids = Vec::with_capacity(names.len());
+    let mut required = Vec::with_capacity(names.len());
     for (n, d) in names.iter().zip(delivered.iter()) {
         let f = theirs.iter().find(|f| &f.name == n).ok_or_else(|| {
             Error::InvalidInput(format!(
@@ -561,8 +565,9 @@ fn conform_ids(
             )));
         }
         ids.push(f.id);
+        required.push(f.required);
     }
-    Ok(ids)
+    Ok((ids, required))
 }
 
 /// `s3://bucket/key…` (or s3a) → (bucket, key-without-leading-slash).
@@ -772,6 +777,7 @@ pub(crate) struct IcebergSink {
     /// The planner's rung for this run's parquet row groups.
     row_group: RowGroup,
     field_ids: Arc<Vec<i32>>,
+    field_required: Arc<Vec<bool>>,
     cursor: Option<(usize, bool)>,
     /// Merge only: (column index, table field id).
     merge_key: Option<(usize, i32)>,
@@ -802,6 +808,7 @@ impl IcebergSink {
             delivered: Arc::new(Vec::new()),
             row_group: shape.row_group,
             field_ids: Arc::new(Vec::new()),
+            field_required: Arc::new(Vec::new()),
             cursor: None,
             merge_key: None,
             source_id: None,
@@ -1305,7 +1312,7 @@ impl crate::sink::Sink for IcebergSink {
                 self.conn.create_table(&self.table, &schema).await?
             }
         };
-        let ids = conform_ids(&meta, &names, &delivered)?;
+        let (ids, required) = conform_ids(&meta, &names, &delivered)?;
         self.cursor = plan.cursor.as_ref().and_then(|cur| {
             names.iter().position(|n| n == cur).map(|i| {
                 // A whole-number decimal (a MySQL BIGINT UNSIGNED arrives as
@@ -1345,6 +1352,7 @@ impl crate::sink::Sink for IcebergSink {
         self.names = Arc::new(names);
         self.delivered = Arc::new(delivered);
         self.field_ids = Arc::new(ids);
+        self.field_required = Arc::new(required);
         Ok(())
     }
 
@@ -1369,7 +1377,7 @@ impl crate::sink::Sink for IcebergSink {
         } else {
             None
         };
-        let pq = ParquetEncoder::new_ext(
+        let mut pq = ParquetEncoder::new_ext(
             self.names.as_ref().clone(),
             self.delivered.as_ref().clone(),
             self.cursor,
@@ -1377,6 +1385,7 @@ impl crate::sink::Sink for IcebergSink {
             self.merge_key.map(|(i, _)| i),
             self.row_group,
         )?;
+        pq.require(&self.field_required);
         Ok(IcebergLoader {
             s3,
             path,
@@ -2191,6 +2200,7 @@ pub(crate) struct CdcBound {
     names: Vec<String>,
     pub(crate) delivered: Vec<Delivered>,
     pub(crate) field_ids: Vec<i32>,
+    pub(crate) field_required: Vec<bool>,
 }
 
 pub(crate) async fn cdc_bind(
@@ -2246,7 +2256,7 @@ pub(crate) async fn cdc_bind(
             })
         })
         .collect::<Result<_>>()?;
-    let field_ids = conform_ids(&meta, wal_cols, &delivered)?;
+    let (field_ids, field_required) = conform_ids(&meta, wal_cols, &delivered)?;
     let (s3, location, key_prefix) = storage_for(conn, &meta)?;
     Ok(CdcBound {
         conn: conn.clone(),
@@ -2258,6 +2268,7 @@ pub(crate) async fn cdc_bind(
         names: wal_cols.to_vec(),
         delivered,
         field_ids,
+        field_required,
     })
 }
 
