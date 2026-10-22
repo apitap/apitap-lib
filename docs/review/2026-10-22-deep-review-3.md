@@ -22,6 +22,7 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | R7 / R17 | FIXED: the key twin's load raises max_error_count to 65535 first, so SHOW WARNINGS lists every 1062 of a bulk case-only key change | (this commit) | `e2e_my_ci_key_change` (0.63.0: 2000 changes in one window refused, 1024 listed) |
 | R13 | FIXED: the drain also knows each tracked table by oid, and a tracked oid streaming under another name (renamed away, SET SCHEMA) stops the run | (this commit) | `e2e_pg_rename_away` (0.63.0: green, destination 1,2,4 vs source 1,2,3,4) |
 | R16 | FIXED: the 0.62.0 journal key is consulted only in the first residue window a run applies for the table, its rows are dropped after it, and a 0.62.0 image's version suffix is cut and re-stamped | (this commit) | `e2e_ch_journal_legacy_window` (0.63.0: lost update, id=1 'a') |
+| R32 | FIXED: a Postgres NUMERIC skips the read path's text cast only when it is delivered as Decimal; past 76 digits it reads as text | (this commit) | `e2e_read_huge_numeric` (0.63.0: "unexpected float8") |
 | rest | OPEN | — | — |
 
 ## Fix verdicts

@@ -138,7 +138,13 @@ fn column_kind(
     pc: &crate::plan::ColumnPlan,
 ) -> Option<ArrowKind> {
     let native = match dialect {
-        ReadDialect::Pg => pg_send_decodable(&pc.udt, pc.precision),
+        // A NUMERIC past Decimal's 76 digits is delivered as Float64, which
+        // its send form is not: a zero or a NaN (8 bytes) decoded as a tiny
+        // float, anything else failed the read (R32). It reads as text.
+        ReadDialect::Pg => {
+            pg_send_decodable(&pc.udt, pc.precision)
+                && (pc.udt != "numeric" || matches!(lc.delivered, Delivered::Decimal { .. }))
+        }
         ReadDialect::My => true,
     };
     arrow_kind(&lc.delivered).filter(|_| native)
