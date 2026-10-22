@@ -424,6 +424,10 @@ impl GithubApiSource {
                 "github+api url needs exactly owner/repo: github+api://<owner>/<repo>".into(),
             ));
         }
+        // The same GitHub-name check `github://` applies: an encoded `/` or a
+        // `..` reached other api.github.com paths with the user's token (P2).
+        crate::source::github::check_name("owner", &owner)?;
+        crate::source::github::check_name("repo", &repo)?;
         if let Some((k, _)) = u.query_pairs().next() {
             return Err(Error::InvalidInput(format!(
                 "unknown github+api url parameter '{k}' (auth goes in the GITHUB_TOKEN \
@@ -1203,6 +1207,30 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// P2: owner and repo are GitHub names here as in `github://` — an
+    /// encoded `/` or a `..` must not walk to another API path with the
+    /// user's token.
+    #[tokio::test]
+    async fn owner_and_repo_must_be_github_names() {
+        for bad in [
+            "github+api://o/x%2F..%2F..%2Fuser",
+            "github+api://o/a%20b",
+            "github+api://o/x%2e%2e",
+        ] {
+            let e = GithubApiSource::connect(bad)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{bad} was accepted"))
+                .to_string();
+            assert!(e.contains("not a GitHub name"), "{bad}: {e}");
+        }
+        assert!(
+            GithubApiSource::connect("github+api://apitap/apitap-lib.x_y")
+                .await
+                .is_ok()
+        );
+    }
+
     /// P2: paging stops at the cap and at a link back to the same page.
     #[test]
     fn paging_has_an_end() {

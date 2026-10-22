@@ -553,7 +553,7 @@ impl<L: Loader> PipeBody<L> for GhBody<'_> {
 /// GitHub's own owner and repo charset. The decoded name went into the API,
 /// trees and raw URLs as-is, so `x%2F..%2F..%2Fuser` walked to other
 /// api.github.com endpoints with the user's token (P2).
-fn check_name(what: &str, name: &str) -> Result<()> {
+pub(crate) fn check_name(what: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name != "."
         && name != ".."
