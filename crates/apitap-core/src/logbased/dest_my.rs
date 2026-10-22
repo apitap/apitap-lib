@@ -223,6 +223,7 @@ async fn apply_unit(
         for row in &c.upserts {
             push(&row_key_refs(row, pk_idx), &mut body)?;
         }
+        u.list_every_warning().await?;
         u.load(
             body,
             |id| load_sql(id, "_ap_del", pk_cols, &pk_oids),
@@ -619,6 +620,17 @@ mod store {
         /// error, quoting what the server said.
         pub(crate) async fn no_warnings(&mut self, what: &str) -> Result<()> {
             self.no_warnings_but(what, &[]).await
+        }
+
+        /// Make SHOW WARNINGS list as many warnings as the server allows
+        /// (max_error_count is 1024 on MySQL 8, 64 on MariaDB): the key load's
+        /// 1062 allowance needs every warning listed, and a bulk case-only
+        /// key normalisation collides more than the default (R7/R17).
+        pub(crate) async fn list_every_warning(&mut self) -> Result<()> {
+            self.conn()
+                .query_drop("SET SESSION max_error_count = 65535")
+                .await
+                .map_err(|e| Error::Transfer(format!("log_based: mysql max_error_count: {e}")))
         }
 
         /// `no_warnings`, letting the codes in `allow` through. Only when every
