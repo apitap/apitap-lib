@@ -102,7 +102,15 @@ impl ChDest {
     /// key-join delete probes the sorting key instead of scanning.
     pub(crate) fn tweak_bootstrap_opts(&self, o2: &mut crate::TransferOptions, pk_cols: &[String]) {
         if o2.order_by.is_none() {
-            o2.order_by = Some(pk_cols.join(", "));
+            // Quoted: a key is a column name, whatever MySQL or Postgres
+            // allow in one (R1).
+            o2.order_by = Some(
+                pk_cols
+                    .iter()
+                    .map(|c| ch_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
     }
 

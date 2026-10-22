@@ -323,6 +323,7 @@ LEGS = [
     leg("e2e_pg_binary_historic.py", "a ClickHouse CDC lane survives an enum column altered to text mid-backlog"),
     leg("e2e_github_crawl_moves.py", "a github+api crawl survives an issue updated while it is being read"),
     leg("e2e_pg_generated_cdc.py",   "a STORED generated column never lands NULL or stale through CDC", {"pg18"}),
+    leg("e2e_my_ch_odd_pk_names.py", "a MySQL -> ClickHouse CDC bootstrap orders by a key with any legal name"),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),

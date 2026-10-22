@@ -1511,7 +1511,37 @@ impl ChDdl {
             if ob.trim().is_empty() {
                 return Err(Error::InvalidInput("order_by is empty".into()));
             }
-            if let Some(bad) = ob
+            // Outside backticks: the whitelist. Inside: anything, as
+            // `ch_ident` quotes it (a CDC bootstrap orders by its key that
+            // way, so a key named `user$id` or `número` is legal; R1).
+            let mut bare = String::with_capacity(ob.len());
+            let mut it = ob.chars();
+            while let Some(c) = it.next() {
+                if c != '`' {
+                    bare.push(c);
+                    continue;
+                }
+                let mut closed = false;
+                while let Some(q) = it.next() {
+                    match q {
+                        '\\' => {
+                            it.next();
+                        }
+                        '`' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !closed {
+                    return Err(Error::InvalidInput(format!(
+                        "order_by has an unclosed backtick (got '{ob}')"
+                    )));
+                }
+                bare.push('x');
+            }
+            if let Some(bad) = bare
                 .chars()
                 .find(|c| !c.is_ascii_alphanumeric() && !"_,() ".contains(*c))
             {
@@ -1523,7 +1553,7 @@ impl ChDdl {
             // Balanced parens, or "id)" escapes the (order_by) wrapper and smuggles
             // arbitrary clauses into the CREATE.
             let mut depth: i64 = 0;
-            for c in ob.chars() {
+            for c in bare.chars() {
                 if c == '(' {
                     depth += 1;
                 }
@@ -1587,13 +1617,31 @@ impl ChDdl {
             }
             cur.clear();
         };
-        for c in txt.chars() {
+        let mut it = txt.chars();
+        while let Some(c) = it.next() {
             if c == '\'' {
                 in_quote = !in_quote;
                 cur.clear();
                 continue;
             }
             if in_quote {
+                continue;
+            }
+            if c == '`' {
+                // A backtick-quoted name (`ch_ident`'s spelling) is one
+                // identifier, whatever it holds.
+                push(&mut cur, &mut out);
+                let mut name = String::new();
+                while let Some(q) = it.next() {
+                    match q {
+                        '\\' => name.extend(it.next()),
+                        '`' => break,
+                        _ => name.push(q),
+                    }
+                }
+                if !name.is_empty() {
+                    out.insert(name);
+                }
                 continue;
             }
             if c.is_ascii_alphanumeric() || c == '_' {
@@ -3569,6 +3617,26 @@ mod tests {
             ..Default::default()
         };
         assert!(nested_ok.validate().is_ok());
+    }
+
+    #[test]
+    fn a_backtick_quoted_key_is_one_identifier() {
+        let ddl = ChDdl {
+            order_by: Some("`user$id`, `número`, `a\\`b`, plain".into()),
+            ..Default::default()
+        };
+        ddl.validate().expect("quoted names are legal in order_by");
+        let ids = ddl.referenced_idents();
+        for want in ["user$id", "número", "a`b", "plain"] {
+            assert!(ids.contains(want), "{want} not in {ids:?}");
+        }
+        for bad in ["`open", "a$b", "`x`) SETTINGS y=1 --"] {
+            let ddl = ChDdl {
+                order_by: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(ddl.validate().is_err(), "{bad} was accepted");
+        }
     }
 
     #[test]

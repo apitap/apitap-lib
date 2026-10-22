@@ -13,6 +13,7 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | # | status | commit | leg (RED on) |
 |---|---|---|---|
 | R21 | FIXED (decided: refuse, PG 18 publishes): a non-Postgres log_based destination refuses a generated column the WAL cannot carry (PG <= 17, or VIRTUAL), naming it; on PG 18 the publication is created with publish_generated_columns = stored, and one made without it is refused | (this commit) | `e2e_pg_generated_cdc` (0.63.0: total NULL on PG 16 and PG 18) |
+| R1 | FIXED: the bootstrap's default ORDER BY quotes each key column (`ch_ident`), and order_by accepts backtick-quoted names | (this commit) | `e2e_my_ch_odd_pk_names` (0.63.0: "unexpected character '$'") |
 | rest | OPEN | — | — |
 
 ## Fix verdicts
