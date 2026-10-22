@@ -145,12 +145,22 @@ pub(crate) struct DrainSession {
     /// old table's changes) or during a follow session — and is refused.
     /// Empty in tests: no expectation, no check.
     expected: HashMap<String, (u32, String)>,
+    /// The same, by oid (R13): pgoutput publishes by oid, so a tracked table
+    /// renamed away keeps streaming under its new name — read by name, its
+    /// changes went to an untracked slot and were dropped while the slot
+    /// was confirmed past them.
+    expected_oid: HashMap<u32, String>,
 }
 
 impl DrainSession {
     pub(crate) fn expecting(expected: HashMap<String, (u32, String)>) -> Self {
+        let expected_oid = expected
+            .iter()
+            .map(|(name, (oid, _))| (*oid, name.clone()))
+            .collect();
         Self {
             expected,
+            expected_oid,
             ..Self::default()
         }
     }
@@ -555,6 +565,18 @@ pub(crate) async fn drain(
                                     "log_based: {table}: {BINARY_HISTORIC} (column {} has type \
                                      OID {} in the WAL being drained)",
                                     c.name, c.type_oid
+                                )));
+                            }
+                        }
+                        if let Some(was) = sess.expected_oid.get(&r.rel_id) {
+                            if *was != table {
+                                let dest = sess.expected.get(was).map_or("", |(_, d)| d.as_str());
+                                return Err(Error::Transfer(format!(
+                                    "log_based: the tracked table {was} streams under the name \
+                                     {table} — it was renamed (or moved to another schema) \
+                                     while its changes were pending, and they cannot be told \
+                                     apart from another table's. Re-bootstrap {dest}: clear its \
+                                     _apitap_state row and run again"
                                 )));
                             }
                         }

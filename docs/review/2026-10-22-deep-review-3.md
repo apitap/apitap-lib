@@ -20,6 +20,7 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | R5 / R28 / R31 | FIXED: a Nullable ClickHouse source column the sink makes non-Nullable is selected as CAST(... AS <bare type>), so the stream carries no null flag and a real NULL fails the read | (this commit) | `e2e_ch_nullable_sort_col` (0.63.0: "span ended mid-row … the server aborted the query") |
 | R6, R8 / R20, R9, R19 | FIXED: data_ddl parses the statement with every comment out (executable comments kept); RENAME takes MariaDB's IF EXISTS and WAIT/NOWAIT, ALTER ... RENAME TO b names b; DISCARD/IMPORT PARTITION ... TABLESPACE, CONVERT TABLE's source and CREATE OR REPLACE DATABASE are refused; a TRUNCATE matches its tracked table without case on a lower_case_table_names server | (this commit) | `e2e_my_ddl_spellings` mysql, maria (0.63.0: each green), `e2e_my_lower_case_names` (0.63.0: truncated rows kept) |
 | R7 / R17 | FIXED: the key twin's load raises max_error_count to 65535 first, so SHOW WARNINGS lists every 1062 of a bulk case-only key change | (this commit) | `e2e_my_ci_key_change` (0.63.0: 2000 changes in one window refused, 1024 listed) |
+| R13 | FIXED: the drain also knows each tracked table by oid, and a tracked oid streaming under another name (renamed away, SET SCHEMA) stops the run | (this commit) | `e2e_pg_rename_away` (0.63.0: green, destination 1,2,4 vs source 1,2,3,4) |
 | rest | OPEN | — | — |
 
 ## Fix verdicts
