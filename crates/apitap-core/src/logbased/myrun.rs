@@ -240,7 +240,10 @@ where
         // (which rejects it loudly if it leaks through).
         o2.slots = None;
         // The changelog's clauses belong to the rebuild, not to the bulk load's
-        // table — see `run::strip_changelog_ddl`.
+        // table, and the per-table dicts are resolved by the caller — see
+        // `run::strip_changelog_ddl`.
+        o2.order_by_per_table.clear();
+        o2.partition_by_per_table.clear();
         if o2.changelog {
             o2.order_by = None;
             o2.partition_by = None;

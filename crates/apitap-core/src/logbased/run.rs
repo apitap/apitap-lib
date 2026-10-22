@@ -43,7 +43,15 @@ use std::sync::Arc;
 /// The bootstrap table is rebuilt seconds later anyway, so its own ORDER BY and
 /// PARTITION BY are throwaway: strip them here and let the rebuild apply the
 /// real ones.
+///
+/// The per-table dicts go too, in every mode (R3, R14): the caller resolves
+/// this member's own entry into `o2.order_by`, and the bulk leg re-resolving
+/// the dict put a changelog's clause (meta columns included) on the bulk
+/// table, and made every non-ClickHouse bootstrap refuse a dict it was
+/// documented to take. The rebuild reads them from the run's `opts`.
 fn strip_changelog_ddl(o2: &mut TransferOptions) {
+    o2.order_by_per_table.clear();
+    o2.partition_by_per_table.clear();
     if o2.changelog {
         o2.order_by = None;
         o2.partition_by = None;
