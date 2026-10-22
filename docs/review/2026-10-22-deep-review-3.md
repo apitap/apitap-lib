@@ -17,6 +17,7 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | R3 / R14 / R23 | FIXED: the bootstrap's bulk leg clears the per-table dicts (the member's entry is already resolved into order_by; the rebuild reads them from the run's opts) | (this commit) | `e2e_changelog_order_by_dict` pg, mysql (0.63.0: "Missing columns: '_apitap_seq' '_apitap_lsn'") |
 | R10 / R26, R11 / R27 | FIXED: the N24 probe skips the invisible key apitap adds (and the server's GIPK), and TIMESTAMP defaults when the server gives them implicitly (explicit_defaults_for_timestamp OFF) | (this commit) | `e2e_my_replace_twice` (0.63.0: both second replaces refused) |
 | R12 | FIXED: a Postgres or MySQL append onto rows with no state row, no siblings and a NULL cursor everywhere is refused, as on Iceberg; a Postgres merge still runs | (this commit) | `e2e_append_null_cursor` (0.63.0: pg 6 rows, every row twice; mysql 1062) |
+| R5 / R28 / R31 | FIXED: a Nullable ClickHouse source column the sink makes non-Nullable is selected as CAST(... AS <bare type>), so the stream carries no null flag and a real NULL fails the read | (this commit) | `e2e_ch_nullable_sort_col` (0.63.0: "span ended mid-row … the server aborted the query") |
 | rest | OPEN | — | — |
 
 ## Fix verdicts

@@ -548,6 +548,21 @@ impl crate::source::Source for ChSource {
                     };
                     format!("CAST({col} AS {full})")
                 };
+                // The sink made this column non-Nullable (cursor, order_by,
+                // engine args) while the source column is Nullable: a raw
+                // select ships the null-flag byte into a stream framed without
+                // it, and the rows land as shifted garbage (R5/R28/R31). The
+                // CAST to the bare type drops the flag, and a real NULL fails
+                // the read ("Cannot convert NULL value to non-Nullable type").
+                let src_nullable = c
+                    .native_ddl
+                    .as_deref()
+                    .is_some_and(crate::sink::clickhouse::ch_wrapped_nullable);
+                let select = if src_nullable && !c.nullable {
+                    format!("CAST({select} AS {target})")
+                } else {
+                    select
+                };
                 LaneCol {
                     delivered: d,
                     select,

@@ -1001,7 +1001,7 @@ fn ch_strip_wrappers(t: &str) -> &str {
 /// Column-level nullability regardless of wrapper order — ClickHouse spells the
 /// idiomatic form `LowCardinality(Nullable(T))` with Nullable INSIDE, and the
 /// RowBinary null-flag byte follows the Nullable, not the outermost wrapper.
-fn ch_wrapped_nullable(t: &str) -> bool {
+pub(crate) fn ch_wrapped_nullable(t: &str) -> bool {
     let mut t = t.trim();
     while let Some(rest) = t
         .strip_prefix("LowCardinality(")
