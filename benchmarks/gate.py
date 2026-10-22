@@ -321,6 +321,7 @@ LEGS = [
     leg("e2e_pg_recreated_table.py", "a Postgres CDC drain refuses a tracked table that was dropped and recreated"),
     leg("e2e_pg_replaced_hub.py",    "a CDC drain refuses a source table a replace swapped under it"),
     leg("e2e_pg_binary_historic.py", "a ClickHouse CDC lane survives an enum column altered to text mid-backlog"),
+    leg("e2e_github_crawl_moves.py", "a github+api crawl survives an issue updated while it is being read"),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),

@@ -545,7 +545,11 @@ impl GithubApiSource {
             .await
     }
 
-    fn first_page_url(&self, e: &Entity, since: Option<&str>) -> String {
+    /// `stable`: page by creation instead of by update (D28). An item updated
+    /// mid-crawl moves to the end of the updated order, and page-number
+    /// paging then skips the row it displaced and reads the moved one twice;
+    /// the created order does not move.
+    fn first_page_url(&self, e: &Entity, since: Option<&str>, stable: bool) -> String {
         let mut url = format!(
             "{}/repos/{}/{}/{}?per_page={PER_PAGE}",
             api_base(),
@@ -554,6 +558,11 @@ impl GithubApiSource {
             e.path
         );
         for (k, v) in e.query {
+            let v = if stable && *k == "sort" && *v == "updated" {
+                "created"
+            } else {
+                v
+            };
             url.push_str(&format!("&{k}={v}"));
         }
         if let Some(s) = since {
@@ -1040,11 +1049,39 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
         }
         let mut out: Vec<u8> = Vec::with_capacity(self.chunk + 64 * 1024);
         let mut rows: u64 = 0;
-        let mut url = self.src.first_page_url(e, since.as_deref());
+        // An incremental crawl (a cursor is tracked) pages by keyset (D28):
+        // each request asks `since=` the newest `updated_at` read so far, so
+        // an item updated mid-crawl leaves the part still to be read instead
+        // of shifting it. Items updated after the crawl began are left to the
+        // next run: the watermark then never passes a change this run did not
+        // read. A full crawl pages in creation order, which does not move.
+        let keyset = e.since && cursor_path.is_some() && e.query.contains(&("sort", "updated"));
+        let mut url = match (&since, keyset) {
+            (Some(s), true) => self.src.first_page_url(e, Some(s), false),
+            (None, true) => self
+                .src
+                .first_page_url(e, Some("1970-01-01T00:00:00Z"), false),
+            (s, false) => self.src.first_page_url(e, s.as_deref(), true),
+        };
         let mut pages = 0u64;
+        // Keyset state: the newest `updated_at` read, the ids read AT it (the
+        // next `since=` is inclusive and returns them again), and the crawl's
+        // start by the server's clock.
+        let mut ks_ts: Option<i64> = None;
+        let mut ks_ts_str = String::new();
+        let mut ks_ids: std::collections::HashSet<i64> = Default::default();
+        let mut t0: Option<i64> = None;
         loop {
             pages += 1;
             let resp = self.src.send(url.clone(), e.accept, e.name).await?;
+            if keyset && t0.is_none() {
+                t0 = resp
+                    .headers()
+                    .get("date")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
+                    .map(|d| d.timestamp_micros());
+            }
             let next = resp
                 .headers()
                 .get("link")
@@ -1058,7 +1095,30 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
                 Some(k) => body[k].as_array().cloned().unwrap_or_default(),
                 None => body.as_array().cloned().unwrap_or_default(),
             };
+            let page_from = ks_ts;
+            let mut past_t0 = false;
             for item in &items {
+                if keyset {
+                    let ts_str = item["updated_at"].as_str().unwrap_or_default();
+                    let ts = ts_micros(ts_str)?;
+                    // `Date` is whole seconds: an update in the crawl's first
+                    // second may follow its start, so that second is deferred.
+                    if t0.is_some_and(|t| ts >= t) {
+                        past_t0 = true;
+                        break;
+                    }
+                    let id = item["id"].as_i64().unwrap_or(i64::MIN);
+                    if Some(ts) == ks_ts {
+                        if !ks_ids.insert(id) {
+                            continue;
+                        }
+                    } else if ks_ts.map_or(true, |k| ts > k) {
+                        ks_ts = Some(ts);
+                        ks_ts_str = ts_str.to_string();
+                        ks_ids.clear();
+                        ks_ids.insert(id);
+                    }
+                }
                 if let Some(k) = e.drop_if_key {
                     if !item[k].is_null() {
                         continue;
@@ -1097,6 +1157,24 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
                         }
                     }
                 }
+            }
+            if keyset {
+                if past_t0 || items.is_empty() {
+                    break;
+                }
+                // The page moved the keyset on: ask again from there. A page
+                // all at one timestamp did not (more than a page of items
+                // share it): its own next link reads the rest of that tie.
+                let n = if ks_ts != page_from {
+                    Some(self.src.first_page_url(e, Some(&ks_ts_str), false))
+                } else {
+                    next
+                };
+                match next_page(e.name, &url, n, false, pages, max_pages())? {
+                    Some(n) => url = n,
+                    None => break,
+                }
+                continue;
             }
             match next_page(e.name, &url, next, items.is_empty(), pages, max_pages())? {
                 Some(n) => url = n,
