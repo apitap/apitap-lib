@@ -1649,6 +1649,12 @@ impl crate::sink::Sink for MySqlSink {
             .find(|c| c.name == cursor)
             .map(|c| crate::plan::is_numeric_udt(&c.udt))
             .unwrap_or(false);
+        // Append only: a merge's full read upserts by key and lands nothing twice.
+        if mode == Mode::Append && state_wm.is_none() && !siblings && data_wm.is_none() {
+            return Err(crate::sink::postgres::null_cursor_refusal(
+                &self.bare, cursor,
+            ));
+        }
         let watermark = crate::plan::resolve_watermark(
             state_wm,
             data_wm,

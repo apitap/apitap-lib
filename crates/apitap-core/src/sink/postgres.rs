@@ -1257,6 +1257,10 @@ impl crate::sink::Sink for PgSink {
                 (sib > 0, data)
             }
         };
+        // Append only: a merge's full read upserts by key and lands nothing twice.
+        if mode == Mode::Append && from_state.is_none() && !siblings && data_max.is_none() {
+            return Err(null_cursor_refusal(&self.final_t, cursor));
+        }
         let watermark = crate::plan::resolve_watermark(
             from_state,
             data_max,
@@ -1690,6 +1694,18 @@ impl Loader for PgCopyLoader {
         }
         cause
     }
+}
+
+/// A destination with rows, no state row and a NULL cursor in every row has
+/// no watermark — and "no watermark" is not "copy everything": that landed
+/// every row a second time on each run (deep review 3, R12; Iceberg's D22
+/// twin refuses the same way).
+pub(crate) fn null_cursor_refusal(table: &str, cursor: &str) -> Error {
+    Error::InvalidInput(format!(
+        "{table}: every row of the destination has a NULL '{cursor}', so there is no \
+         watermark to resume an append from — use a cursor the rows carry, or \
+         mode='replace'"
+    ))
 }
 
 #[cfg(test)]
