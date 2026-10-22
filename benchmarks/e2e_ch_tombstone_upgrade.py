@@ -58,8 +58,11 @@ def wipe():
     pg(f"DROP TABLE IF EXISTS {T}")
     ch(f"DROP VIEW IF EXISTS {T}__current")
     ch(f"DROP TABLE IF EXISTS {T}")
-    if ch("SELECT count() FROM system.tables WHERE database = 'default' AND name = '_apitap_state'") != "0":
-        ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table = '{T}' SETTINGS mutations_sync = 1")
+    # The source-oid record too: the bootstrap here runs on 0.62.1, which
+    # writes none, so a row an earlier run left would name a dead oid.
+    for meta in ("_apitap_state", "_apitap_source_rel"):
+        if ch(f"SELECT count() FROM system.tables WHERE database = 'default' AND name = '{meta}'") != "0":
+            ch(f"ALTER TABLE {meta} DELETE WHERE dest_table = '{T}' SETTINGS mutations_sync = 1")
 
 
 def body(v):
