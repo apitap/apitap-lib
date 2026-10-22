@@ -328,6 +328,8 @@ LEGS = [
     leg("e2e_my_replace_twice.py",   "a MySQL replace refuses only what the user added, never what apitap or the server did"),
     leg("e2e_append_null_cursor.py", "an append onto rows whose cursor is NULL everywhere never lands them twice"),
     leg("e2e_ch_nullable_sort_col.py", "a ch -> ch copy keyed on a Nullable source column lands exact, or fails on a NULL"),
+    leg("e2e_my_ddl_spellings.py",   "MySQL CDC refuses the row-removing DDL whatever way it is spelled", argv=["mysql"]),
+    leg("e2e_my_ddl_spellings.py",   "MariaDB CDC refuses the row-removing DDL whatever way it is spelled", {"mariadb"}, ["maria"]),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),

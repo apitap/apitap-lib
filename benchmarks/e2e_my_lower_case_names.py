@@ -78,6 +78,11 @@ def main():
         my("INSERT INTO Orders VALUES (3, 'c'); UPDATE Orders SET v = 'B' WHERE id = 2; DELETE FROM Orders WHERE id = 1")
         apitap.transfer(MY, CH, table=T, mode="log_based")
         agree("drain")
+        # R19: the statement's own spelling, in yet another case. The exact
+        # lookup took it for an untracked table and skipped the truncate.
+        my("TRUNCATE TABLE ORDERS; INSERT INTO Orders VALUES (9, 'z')")
+        apitap.transfer(MY, CH, table=T, mode="log_based")
+        agree("TRUNCATE spelled in another case")
     finally:
         sh(["docker", "rm", "-f", NAME])
         ch_wipe()

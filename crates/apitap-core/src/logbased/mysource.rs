@@ -944,9 +944,36 @@ pub(crate) async fn drain_binlog(
                     // `/* app */ TRUNCATE t` was classed DDL and then not
                     // recognised as a truncate here — skipped silently, the
                     // destination kept the rows (P2).
-                    let stmt = strip_leading_noise(head);
+                    let unc = strip_comments(head);
+                    let stmt = strip_leading_noise(&unc);
                     if starts_with_word(stmt, "truncate") {
-                        match truncate_target(stmt, &db) {
+                        // The statement spells the table as the user typed it;
+                        // on a lower_case_table_names=1/2 server `Orders` IS
+                        // the tracked `orders`, and the exact lookup skipped
+                        // its truncate silently (R19). On a case-sensitive
+                        // server they are two tables.
+                        let target = match truncate_target(stmt, &db) {
+                            Some(t) if !sess.tracked.contains_key(&t) => {
+                                let lctn: Option<i64> = sqlx::query_scalar(
+                                    "SELECT CAST(@@lower_case_table_names AS SIGNED)",
+                                )
+                                .fetch_one(pool)
+                                .await
+                                .ok();
+                                match lctn {
+                                    Some(n) if n != 0 => Some(
+                                        sess.tracked
+                                            .keys()
+                                            .find(|k| k.eq_ignore_ascii_case(&t))
+                                            .cloned()
+                                            .unwrap_or(t),
+                                    ),
+                                    _ => Some(t),
+                                }
+                            }
+                            other => other,
+                        };
+                        match target {
                             // `sess.tracked` is the authority on what this run
                             // follows. The first draft asked `collapsers` instead
                             // — and those are populated lazily, by the first ROWS
@@ -1203,6 +1230,86 @@ fn truncate_target(sql: &str, db: &str) -> Option<String> {
     })
 }
 
+/// A statement with every comment taken out, quotes respected (R6). An
+/// executable comment (`/*!50100 ...*/`, MariaDB `/*M!100100 ...*/`) is SQL
+/// the server runs, so its body stays; `/* .. */`, `-- ..` and `# ..` go.
+fn strip_comments(sql: &str) -> String {
+    let c: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == '\\' && q != '`' && i + 1 < c.len() {
+                out.push(c[i + 1]);
+                i += 2;
+                continue;
+            }
+            if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                out.push(ch);
+                i += 1;
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                let mut j = i + 2;
+                let exec = match (c.get(j), c.get(j + 1)) {
+                    (Some('!'), _) => {
+                        j += 1;
+                        true
+                    }
+                    (Some('M'), Some('!')) => {
+                        j += 2;
+                        true
+                    }
+                    _ => false,
+                };
+                if exec {
+                    while j < c.len() && c[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                }
+                let body = j;
+                while j + 1 < c.len() && !(c[j] == '*' && c[j + 1] == '/') {
+                    j += 1;
+                }
+                if exec {
+                    out.extend(&c[body..j.min(c.len())]);
+                }
+                out.push(' ');
+                i = (j + 2).min(c.len());
+            }
+            '-' if c.get(i + 1) == Some(&'-')
+                && c.get(i + 2).map_or(true, |x| x.is_whitespace()) =>
+            {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            '#' => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            _ => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// The tables a DDL statement removes or swaps rows of WITHOUT row events,
 /// with what it does (deep review D13). MySQL and MariaDB log every DDL as a
 /// QUERY, even under binlog_format=ROW, so a dropped partition's rows never
@@ -1217,7 +1324,11 @@ fn truncate_target(sql: &str, db: &str) -> Option<String> {
 /// table's rows, none of them sent as events. That includes the gh-ost and
 /// pt-osc cut-over; the refusal says so and names the re-bootstrap.
 fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
-    let mut s = strip_leading_noise(sql);
+    // Every comment out, not only the leading ones: gh-ost writes its
+    // cut-over as `rename /* gh-ost */ table ...`, and a comment between
+    // two words hid every statement below (R6).
+    let owned = strip_comments(sql);
+    let mut s = strip_leading_noise(&owned);
     let word = |s: &mut &str, w: &str| -> bool {
         if starts_with_word(s, w) {
             *s = s[w.len()..].trim_start();
@@ -1284,9 +1395,19 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
         if !word(&mut s, "table") && !word(&mut s, "tables") {
             return Vec::new();
         }
+        // MariaDB 10.5.2+: `RENAME TABLE IF EXISTS a TO b` (R8).
+        if word(&mut s, "if") {
+            word(&mut s, "exists");
+        }
         let mut out = Vec::new();
         loop {
             let Some(from) = name(&mut s) else { break };
+            // MariaDB: `a WAIT n TO b`, `a NOWAIT TO b` (R8).
+            if word(&mut s, "wait") {
+                let _ = name(&mut s);
+            } else {
+                word(&mut s, "nowait");
+            }
             if !word(&mut s, "to") {
                 break;
             }
@@ -1303,6 +1424,22 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
     if word(&mut s, "create") {
         if !(word(&mut s, "or") && word(&mut s, "replace")) {
             return Vec::new();
+        }
+        // MariaDB `CREATE OR REPLACE DATABASE d` drops every table of d first,
+        // with no row events, like DROP DATABASE (R9).
+        if word(&mut s, "database") || word(&mut s, "schema") {
+            let end = s
+                .find(|c: char| c.is_whitespace() || c == ';')
+                .unwrap_or(s.len());
+            let d: String = s[..end]
+                .chars()
+                .filter(|c| *c != '`' && *c != '"')
+                .collect();
+            return if d.is_empty() {
+                Vec::new()
+            } else {
+                vec![(format!("{d}.*"), "CREATE OR REPLACE DATABASE")]
+            };
         }
         word(&mut s, "temporary");
         if !word(&mut s, "table") {
@@ -1329,19 +1466,51 @@ fn data_ddl(sql: &str, db: &str) -> Vec<(String, &'static str)> {
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|w| !w.is_empty())
             .collect();
+        // `DISCARD|IMPORT [PARTITION p[, q]] TABLESPACE`: the per-partition
+        // form puts words between the two (R9).
+        for (i, w) in words.iter().enumerate() {
+            if matches!(*w, "discard" | "import") && words[i + 1..].contains(&"tablespace") {
+                let what = if *w == "discard" {
+                    "DISCARD TABLESPACE"
+                } else {
+                    "IMPORT TABLESPACE"
+                };
+                return vec![(t, what)];
+            }
+        }
+        // The table named right after `kw1 kw2` (in the statement's own
+        // spelling), for the forms that move rows into or out of a second
+        // table.
+        let after = |kw1: &str, kw2: &[&str]| -> Option<String> {
+            let toks: Vec<&str> = s.split_whitespace().collect();
+            let i = toks.iter().position(|w| w.eq_ignore_ascii_case(kw1))?;
+            let mut j = i + 1;
+            while j < toks.len() && kw2.iter().any(|k| toks[j].eq_ignore_ascii_case(k)) {
+                j += 1;
+            }
+            let mut rest = *toks.get(j)?;
+            name(&mut rest)
+        };
         for w in words.windows(2) {
             let what = match w {
                 ["drop", "partition"] => "DROP PARTITION",
                 ["truncate", "partition"] => "TRUNCATE PARTITION",
                 // MariaDB 10.7+: rows leave as a table, or arrive from one.
                 ["convert", "partition"] => "CONVERT PARTITION",
-                ["convert", "table"] => "CONVERT TABLE",
-                // The tablespace's rows vanish, or appear from a file.
-                ["discard", "tablespace"] => "DISCARD TABLESPACE",
-                ["import", "tablespace"] => "IMPORT TABLESPACE",
-                // `ALTER TABLE t RENAME [TO|AS] x`: t's rows leave the name (N16);
-                // `RENAME COLUMN|INDEX|KEY` only renames inside the table.
-                ["rename", w] if !matches!(*w, "column" | "index" | "key") => "RENAME TABLE",
+                // The converted table's rows leave it too (R9).
+                ["convert", "table"] => {
+                    let mut out = vec![(t.clone(), "CONVERT TABLE")];
+                    out.extend(after("convert", &["table"]).map(|x| (x, "CONVERT TABLE")));
+                    return out;
+                }
+                // `ALTER TABLE t RENAME [TO|AS] x`: t's rows leave the name (N16),
+                // and x now holds them (R8). `RENAME COLUMN|INDEX|KEY` only
+                // renames inside the table.
+                ["rename", w] if !matches!(*w, "column" | "index" | "key") => {
+                    let mut out = vec![(t.clone(), "RENAME TABLE")];
+                    out.extend(after("rename", &["to", "as"]).map(|x| (x, "RENAME TABLE")));
+                    return out;
+                }
                 ["exchange", "partition"] => {
                     // Both tables swap rows: the WITH TABLE side too (N5).
                     let mut out = vec![(t.clone(), "EXCHANGE PARTITION")];
@@ -1574,7 +1743,53 @@ mod query_verbs_tests {
         );
         assert_eq!(
             data_ddl("ALTER TABLE t RENAME TO t2", "app"),
-            t(&[("app.t", "RENAME TABLE")])
+            t(&[("app.t", "RENAME TABLE"), ("app.t2", "RENAME TABLE")])
+        );
+        // R6: a comment after the verb (gh-ost's own cut-over spelling).
+        assert_eq!(
+            data_ddl(
+                "rename /* gh-ost */ table app.t to app._t_del, app._t_gho to app.t",
+                "x"
+            ),
+            t(&[
+                ("app.t", "RENAME TABLE"),
+                ("app._t_del", "RENAME TABLE"),
+                ("app._t_gho", "RENAME TABLE"),
+                ("app.t", "RENAME TABLE")
+            ])
+        );
+        assert_eq!(
+            data_ddl(
+                "ALTER /* cron */ TABLE events -- nightly\n DROP PARTITION p1",
+                "app"
+            ),
+            t(&[("app.events", "DROP PARTITION")])
+        );
+        // An executable comment is SQL: its body counts.
+        assert_eq!(
+            data_ddl("ALTER TABLE events /*!50100 DROP PARTITION p1 */", "app"),
+            t(&[("app.events", "DROP PARTITION")])
+        );
+        // R8: MariaDB's IF EXISTS and WAIT/NOWAIT.
+        assert_eq!(
+            data_ddl(
+                "RENAME TABLE IF EXISTS events TO events_old, events_new TO events",
+                "app"
+            ),
+            t(&[
+                ("app.events", "RENAME TABLE"),
+                ("app.events_old", "RENAME TABLE"),
+                ("app.events_new", "RENAME TABLE"),
+                ("app.events", "RENAME TABLE")
+            ])
+        );
+        assert_eq!(
+            data_ddl("RENAME TABLE events WAIT 5 TO e1", "app"),
+            t(&[("app.events", "RENAME TABLE"), ("app.e1", "RENAME TABLE")])
+        );
+        assert_eq!(
+            data_ddl("RENAME TABLE events NOWAIT TO e1", "app"),
+            t(&[("app.events", "RENAME TABLE"), ("app.e1", "RENAME TABLE")])
         );
         assert!(data_ddl("ALTER TABLE t RENAME COLUMN a TO b", "app").is_empty());
         assert!(data_ddl("ALTER TABLE t RENAME INDEX i TO j", "app").is_empty());
@@ -1610,7 +1825,27 @@ mod query_verbs_tests {
                 "ALTER TABLE e CONVERT TABLE e_new TO PARTITION p9 VALUES LESS THAN (9)",
                 "app"
             ),
-            t(&[("app.e", "CONVERT TABLE")])
+            t(&[("app.e", "CONVERT TABLE"), ("app.e_new", "CONVERT TABLE")])
+        );
+        // R9: the per-partition tablespace forms, and MariaDB's
+        // CREATE OR REPLACE DATABASE.
+        assert_eq!(
+            data_ddl(
+                "ALTER TABLE events IMPORT PARTITION p2026_01 TABLESPACE",
+                "app"
+            ),
+            t(&[("app.events", "IMPORT TABLESPACE")])
+        );
+        assert_eq!(
+            data_ddl(
+                "ALTER TABLE events DISCARD PARTITION p1, p2 TABLESPACE",
+                "app"
+            ),
+            t(&[("app.events", "DISCARD TABLESPACE")])
+        );
+        assert_eq!(
+            data_ddl("CREATE OR REPLACE DATABASE shop", "app"),
+            t(&[("shop.*", "CREATE OR REPLACE DATABASE")])
         );
         assert_eq!(
             data_ddl("ALTER TABLE e IMPORT TABLESPACE", "app"),
