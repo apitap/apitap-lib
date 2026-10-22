@@ -322,6 +322,7 @@ LEGS = [
     leg("e2e_pg_replaced_hub.py",    "a CDC drain refuses a source table a replace swapped under it"),
     leg("e2e_pg_binary_historic.py", "a ClickHouse CDC lane survives an enum column altered to text mid-backlog"),
     leg("e2e_github_crawl_moves.py", "a github+api crawl survives an issue updated while it is being read"),
+    leg("e2e_pg_generated_cdc.py",   "a STORED generated column never lands NULL or stale through CDC", {"pg18"}),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),
@@ -438,6 +439,9 @@ def capabilities():
     need("tls-pg",     "apitap-tls-pg",        "the TLS-only Postgres")
     need("tls-my",     "apitap-tls-my",        "the TLS-only MySQL")
     need("iceberg",    "apitap-bench-icecat",  "the Iceberg REST catalog + MinIO")
+    need("pg18",       "apitap-bench-pg18",
+         "docker run -d --name apitap-bench-pg18 -p 127.0.0.1:5547:5432 -e POSTGRES_PASSWORD=bench "
+         "-e POSTGRES_DB=apitap_bench_src postgres:18-alpine -c wal_level=logical")
     if os.environ.get("BQ_SA"):
         have.add("bq")
     else:

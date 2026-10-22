@@ -995,6 +995,9 @@ async fn run_group(
         .fetch_one(&src)
         .await
         .map_err(db_err)?;
+    // Whether any member has a STORED generated column the publication must
+    // carry (R21, PostgreSQL 18).
+    let mut gencols = false;
     for t in tables {
         let (schema_name, bare, partitioned) = resolve_table(&src, t).await?;
         let qualified = format!("{schema_name}.{bare}");
@@ -1041,6 +1044,37 @@ async fn run_group(
                  WHICH row changed. Run: ALTER TABLE {qualified} REPLICA IDENTITY \
                  DEFAULT (or FULL), then re-run."
             )));
+        }
+        // R21: pgoutput sends a generated column only on PG 18, only STORED,
+        // and only when the publication asks for it. Elsewhere the bootstrap
+        // copied the column and every later change landed it NULL or stale;
+        // only a Postgres destination recomputes it.
+        if !matches!(*dest, Dest::Pg(_)) && server_num >= 120_000 {
+            let gen: Vec<(String, String)> = sqlx::query_as(
+                "SELECT attname::text, attgenerated::text FROM pg_attribute \
+                 WHERE attrelid = $1::oid AND attnum > 0 AND NOT attisdropped \
+                   AND attgenerated <> '' ORDER BY attnum",
+            )
+            .bind(i64::from(relid))
+            .fetch_all(&src)
+            .await
+            .map_err(db_err)?;
+            let unsent: Vec<&str> = gen
+                .iter()
+                .filter(|(_, g)| g != "s" || server_num < 180_000)
+                .map(|(n, _)| n.as_str())
+                .collect();
+            if !unsent.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "log_based: {qualified} has generated column(s) {} that the WAL never \
+                     carries (pgoutput publishes only STORED ones, from PostgreSQL 18), \
+                     so every change would land them NULL or stale at this destination. \
+                     Replicate to Postgres, upgrade the source to 18 (STORED columns), or \
+                     make them plain columns kept by a trigger",
+                    unsent.join(", ")
+                )));
+            }
+            gencols |= !gen.is_empty();
         }
         let dest_table = if single {
             opts.dest_table.clone().unwrap_or_else(|| bare.clone())
@@ -1139,7 +1173,7 @@ async fn run_group(
         };
         let publication = format!("{slot_owned}_pub");
         let drained: Vec<&str> = have.iter().map(|c| c.qualified.as_str()).collect();
-        ensure_publication(&src, &publication, &qualified_all, &drained).await?;
+        ensure_publication(&src, &publication, &qualified_all, &drained, gencols).await?;
         let slot = &slot_owned;
         if !have.is_empty() && have.len() != ctxs.len() {
             let missing: Vec<&str> = ctxs
@@ -2903,6 +2937,7 @@ async fn ensure_publication(
     publication: &str,
     qualified_tables: &[&str],
     drained: &[&str],
+    gencols: bool,
 ) -> Result<()> {
     let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_publication WHERE pubname = $1")
         .bind(publication)
@@ -2929,10 +2964,12 @@ async fn ensure_publication(
             .map(|q| format!("ONLY {}", quote_table(q)))
             .collect::<Vec<_>>()
             .join(", ");
-        let with = if viaroot {
-            " WITH (publish_via_partition_root = true)"
-        } else {
-            ""
+        let with = match (viaroot, gencols) {
+            (true, true) => {
+                " WITH (publish_via_partition_root = true, publish_generated_columns = stored)"
+            }
+            (true, false) => " WITH (publish_via_partition_root = true)",
+            (false, _) => "",
         };
         sqlx::query(&format!(
             "CREATE PUBLICATION {} FOR TABLE {list}{with}",
@@ -2976,6 +3013,26 @@ async fn ensure_publication(
         .execute(src)
         .await
         .map_err(db_err)?;
+    }
+    if gencols {
+        // A publication made without the option has already let changes
+        // through without the columns: the destination holds stale values,
+        // and turning it on now would hide that (R21).
+        let carried: Option<String> =
+            sqlx::query_scalar("SELECT pubgencols::text FROM pg_publication WHERE pubname = $1")
+                .bind(publication)
+                .fetch_optional(src)
+                .await
+                .map_err(db_err)?;
+        if carried.as_deref() != Some("s") {
+            return Err(Error::InvalidInput(format!(
+                "log_based: publication {publication} does not publish generated columns, \
+                 so the changes it already carried left them stale at the destination. \
+                 Re-bootstrap: clear the pipeline's _apitap_state rows, drop the slot and \
+                 DROP PUBLICATION {publication}; the next run creates it with \
+                 publish_generated_columns = stored"
+            )));
+        }
     }
     for qualified in qualified_tables {
         let (schema, bare) = qualified.split_once('.').unwrap_or(("public", qualified));
