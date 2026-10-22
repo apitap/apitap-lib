@@ -820,25 +820,40 @@ mod tests {
     /// 4. A panicking body is caught, aborts its own pipe, and still counts
     /// toward the crew's exit.
     enum PanicCrew {
-        Panic { alive: Arc<AtomicUsize> },
-        Spin { alive: Arc<AtomicUsize> },
+        Panic {
+            alive: Arc<AtomicUsize>,
+            panicked: Arc<std::sync::atomic::AtomicBool>,
+        },
+        Spin {
+            alive: Arc<AtomicUsize>,
+            panicked: Arc<std::sync::atomic::AtomicBool>,
+        },
     }
 
     impl PipeBody<FakeLoader> for PanicCrew {
         async fn run(self, pipe: &mut Pipe<FakeLoader>, spans: Spans) -> Result<Rows> {
             match self {
-                PanicCrew::Panic { alive } => {
+                PanicCrew::Panic { alive, panicked } => {
                     let _alive = Alive::new(&alive);
                     pipe.send(vec![0; 8]).await?;
+                    panicked.store(true, SeqCst);
                     panic!("kaboom");
                 }
-                PanicCrew::Spin { alive } => {
+                PanicCrew::Spin { alive, panicked } => {
                     let _alive = Alive::new(&alive);
-                    while let Some(_sql) = spans.next()? {
+                    // Take one span, then spin until the crew stops this body:
+                    // a spinner that drained every span finished its pipe
+                    // before the sibling's panic reached it, which made the
+                    // test fail on a fast box (a race in the test, not the
+                    // engine).
+                    let _ = spans.next()?;
+                    while !panicked.load(SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    loop {
                         pipe.send(vec![0; 8]).await?;
                         tokio::task::yield_now().await;
                     }
-                    Ok(Rows::FromLoader)
                 }
             }
         }
@@ -851,6 +866,7 @@ mod tests {
             .map(|i| FakeLoader::new(i, log.clone()))
             .collect::<Vec<_>>();
         let alive = Arc::new(AtomicUsize::new(0));
+        let panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stmts: Vec<String> = (0..64).map(|i| format!("span {i}")).collect();
 
         let res = Pipes::for_read(loaders)
@@ -858,10 +874,12 @@ mod tests {
                 if i == 2 {
                     PanicCrew::Panic {
                         alive: alive.clone(),
+                        panicked: panicked.clone(),
                     }
                 } else {
                     PanicCrew::Spin {
                         alive: alive.clone(),
+                        panicked: panicked.clone(),
                     }
                 }
             })
