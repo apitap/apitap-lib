@@ -331,6 +331,7 @@ LEGS = [
     leg("e2e_my_ddl_spellings.py",   "MySQL CDC refuses the row-removing DDL whatever way it is spelled", argv=["mysql"]),
     leg("e2e_my_ddl_spellings.py",   "MariaDB CDC refuses the row-removing DDL whatever way it is spelled", {"mariadb"}, ["maria"]),
     leg("e2e_pg_rename_away.py",     "a Postgres CDC drain never drops a tracked table's changes made under another name"),
+    leg("e2e_ch_journal_legacy_window.py", "a 0.62.0 residue journal key is only reused by the window it was written for", {"wheel-0620"}),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),

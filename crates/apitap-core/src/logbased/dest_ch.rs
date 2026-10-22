@@ -995,6 +995,11 @@ async fn apply_unit(
         )));
     }
     let replay = !c.residue.is_empty() && u.journal_live(dest_table, id.start()).await?;
+    // 0.62.0's key counts from the dead attempt's start, so it is good only
+    // in the first window this run applies for the table: a later window
+    // counting `1|pred` again took another op's image (R16). Its rows are
+    // dropped once that window has used them.
+    let legacy_ok = replay && u.first_residue_window(dest_table);
     if dbg && !c.residue.is_empty() {
         eprintln!(
             "[residue] {dest_table} window {}..{} ops={} replay={replay}",
@@ -1031,7 +1036,7 @@ async fn apply_unit(
                 let (jk, legacy_jk) = jkey(pos, &pred);
                 if replay {
                     let mut hit = u.journal_get(dest_table, &jk, id.start()).await?;
-                    let legacy = hit.is_none();
+                    let legacy = hit.is_none() && legacy_ok;
                     if legacy {
                         hit = u.journal_get(dest_table, &legacy_jk, id.start()).await?;
                     }
@@ -1043,14 +1048,14 @@ async fn apply_unit(
                     }
                     if let Some(mut img) = hit {
                         u.delete_owned(dest_table, &pred).await?;
+                        if legacy {
+                            strip_legacy_suffix(&mut img, wal_cols.len());
+                        }
                         let cols = if insert_only {
                             // The journal holds the image without its version:
                             // it lands at THIS window's end, never the dead
-                            // attempt's, which could outrank a later write. A
-                            // 0.62.0 image carries its version already.
-                            if !legacy {
-                                insert_only_suffix(&mut img, id.end(), false);
-                            }
+                            // attempt's, which could outrank a later write.
+                            insert_only_suffix(&mut img, id.end(), false);
                             insert_only_cols(wal_cols)
                         } else {
                             wal_cols.to_vec()
@@ -1166,7 +1171,7 @@ async fn apply_unit(
                 let (jk, legacy_jk) = jkey(pos, &old_pred);
                 if replay && !missing.is_empty() {
                     let mut hit = u.journal_get(dest_table, &jk, id.start()).await?;
-                    let legacy = hit.is_none();
+                    let legacy = hit.is_none() && legacy_ok;
                     if legacy {
                         hit = u.journal_get(dest_table, &legacy_jk, id.start()).await?;
                     }
@@ -1178,10 +1183,11 @@ async fn apply_unit(
                     }
                     if let Some(mut img) = hit {
                         u.delete_owned(dest_table, &old_pred).await?;
+                        if legacy {
+                            strip_legacy_suffix(&mut img, wal_cols.len());
+                        }
                         if insert_only {
-                            if !legacy {
-                                insert_only_suffix(&mut img, id.end(), false);
-                            }
+                            insert_only_suffix(&mut img, id.end(), false);
                             u.insert_owned(dest_table, &insert_only_cols(wal_cols), img)
                                 .await?;
                         } else {
@@ -1278,6 +1284,9 @@ async fn apply_unit(
             }
         }
     }
+    if legacy_ok {
+        u.drop_legacy_journal(dest_table).await?;
+    }
     if dbg {
         let total = t0.elapsed();
         eprintln!(
@@ -1353,6 +1362,27 @@ fn insert_only_cols(cols: &[String]) -> Vec<String> {
 /// takes that newline back first — appending after it made the pair a row of
 /// its own ("Line feed found where tab is expected", seen live in
 /// e2e_ch_insert_only).
+/// A 0.62.0 journal image of an insert-only table ends with the suffix that
+/// release wrote at the dead attempt's version (`\t<ver>\t<deleted>`): cut
+/// it, so the image is re-stamped at this window's end, and lands at all on
+/// a table that now takes the general path (R16). `ncols` is the WAL column
+/// count; an image with exactly two more fields carries the suffix.
+fn strip_legacy_suffix(img: &mut Vec<u8>, ncols: usize) {
+    if img.last() == Some(&b'\n') {
+        img.pop();
+    }
+    let tabs: Vec<usize> = img
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\t')
+        .map(|(i, _)| i)
+        .collect();
+    if tabs.len() + 1 == ncols + 2 {
+        img.truncate(tabs[tabs.len() - 2]);
+    }
+    img.push(b'\n');
+}
+
 fn insert_only_suffix(buf: &mut Vec<u8>, ver: u64, deleted: bool) {
     if buf.last() == Some(&b'\n') {
         buf.pop();
@@ -2446,6 +2476,23 @@ mod store {
         /// Whether an attempt at this window already journalled anything for
         /// `table` — i.e. this apply is a replay. Asked once per window, so a
         /// first attempt pays one cheap read and no per-op lookups.
+        /// True once per run per table: the first residue window this run
+        /// applies to it (R16).
+        pub(crate) fn first_residue_window(&self, table: &str) -> bool {
+            self.s.first_time(&format!("\u{1}jfirst\u{1}{table}"))
+        }
+
+        /// Drop the 0.62.0-keyed journal rows (`n|pred`; this release writes
+        /// `pos|n|pred`, and a pred starts with a backquoted column): past the
+        /// first window their count no longer names the op it did (R16).
+        pub(crate) async fn drop_legacy_journal(&mut self, table: &str) -> Result<()> {
+            let w = format!(
+                "dest_table = '{}' AND match(k, '^[0-9]+\\\\|`')",
+                ch_str(table)
+            );
+            self.delete_where(JOURNAL.trim_matches('`'), &w).await
+        }
+
         pub(crate) async fn journal_live(&mut self, table: &str, after: u64) -> Result<bool> {
             self.s.ensure_journal_table().await?;
             let body = self
