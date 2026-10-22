@@ -898,6 +898,18 @@ impl MySqlSink {
     /// so does this one now, naming each. The tables apitap creates have none.
     async fn refuse_lossy_replace(&self) -> Result<()> {
         let (db, t) = (sql_lit(&self.db), sql_lit(&self.bare));
+        // A server with explicit_defaults_for_timestamp OFF (MariaDB <= 10.9,
+        // MySQL 5.7) gives TIMESTAMP columns implicit defaults, on apitap's own
+        // staging too: such a default is the server's, not the user's (R11).
+        let implicit_ts = self
+            .scalar("SELECT IF(@@explicit_defaults_for_timestamp, NULL, 'off')")
+            .await?
+            .is_some();
+        let ts_skip = if implicit_ts {
+            " AND DATA_TYPE <> 'timestamp'"
+        } else {
+            ""
+        };
         let probes = [
             (
                 "secondary index(es)",
@@ -921,10 +933,14 @@ impl MySqlSink {
                 ),
             ),
             (
+                // Not the invisible key apitap adds under sql_require_primary_key,
+                // nor the server's own GIPK: both come back on the rebuilt table
+                // (R10).
                 "AUTO_INCREMENT on",
                 format!(
                     "SELECT GROUP_CONCAT(COLUMN_NAME) FROM information_schema.COLUMNS \
-                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{t}' AND EXTRA LIKE '%auto_increment%'"
+                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{t}' AND EXTRA LIKE '%auto_increment%' \
+                       AND NOT (COLUMN_NAME IN ('{INVISIBLE_KEY}', 'my_row_id') AND EXTRA LIKE '%INVISIBLE%')"
                 ),
             ),
             (
@@ -933,7 +949,7 @@ impl MySqlSink {
                 format!(
                     "SELECT GROUP_CONCAT(COLUMN_NAME) FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{t}' \
-                       AND COLUMN_DEFAULT IS NOT NULL AND COLUMN_DEFAULT <> 'NULL'"
+                       AND COLUMN_DEFAULT IS NOT NULL AND COLUMN_DEFAULT <> 'NULL'{ts_skip}"
                 ),
             ),
             (

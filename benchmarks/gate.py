@@ -325,6 +325,7 @@ LEGS = [
     leg("e2e_pg_generated_cdc.py",   "a STORED generated column never lands NULL or stale through CDC", {"pg18"}),
     leg("e2e_my_ch_odd_pk_names.py", "a MySQL -> ClickHouse CDC bootstrap orders by a key with any legal name"),
     leg("e2e_changelog_order_by_dict.py", "a changelog group takes a per-table order_by dict that names its meta columns"),
+    leg("e2e_my_replace_twice.py",   "a MySQL replace refuses only what the user added, never what apitap or the server did"),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
     leg("e2e_my_cdc_hardening.py",   "a commented MySQL TRUNCATE reaches the destination", argv=["truncate"]),
