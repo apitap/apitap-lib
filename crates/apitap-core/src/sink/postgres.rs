@@ -656,7 +656,7 @@ impl PgSink {
     /// --schema-only, a migration) has both; every append and merge staged
     /// the whole delta and then failed at the INSERT. `attgenerated` is read
     /// through to_jsonb so a PG 11 server, which has none, answers NULL.
-    async fn insert_shape(&self) -> Result<(bool, Vec<String>)> {
+    async fn insert_shape(&self) -> Result<(bool, Vec<String>, Vec<String>)> {
         let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT a.attname, a.attidentity::text, to_jsonb(a.*) ->> 'attgenerated' \
              FROM pg_attribute a \
@@ -667,12 +667,20 @@ impl PgSink {
         .await
         .map_err(|e| Error::Transfer(format!("dest identity/generated columns: {e}")))?;
         let overriding = rows.iter().any(|(_, id, _)| id == "a");
+        // ALWAYS identity columns can only be SET to DEFAULT: a merge's DO
+        // UPDATE leaves them out (R25).
+        let always = rows
+            .iter()
+            .filter(|(_, id, _)| id == "a")
+            .map(|(n, _, _)| n.clone())
+            .collect();
+        // STORED, and PostgreSQL 18's VIRTUAL (R25).
         let generated = rows
             .into_iter()
-            .filter(|(_, _, g)| g.as_deref() == Some("s"))
+            .filter(|(_, _, g)| matches!(g.as_deref(), Some("s") | Some("v")))
             .map(|(n, _, _)| n)
             .collect();
-        Ok((overriding, generated))
+        Ok((overriding, generated, always))
     }
 
     /// Destination column names in ordinal order.
@@ -1421,7 +1429,7 @@ impl PgSink {
                     .begin()
                     .await
                     .map_err(|e| Error::Transfer(format!("append begin: {e}")))?;
-                let (overriding, generated) = self.insert_shape().await?;
+                let (overriding, generated, _) = self.insert_shape().await?;
                 let sql = if !overriding && generated.is_empty() {
                     format!(
                         "INSERT INTO {} SELECT * FROM {}",
@@ -1470,7 +1478,7 @@ impl PgSink {
                     .map(|k| quote_ident(k))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let (overriding, generated) = self.insert_shape().await?;
+                let (overriding, generated, always) = self.insert_shape().await?;
                 let cols = self
                     .col_names
                     .iter()
@@ -1486,7 +1494,11 @@ impl PgSink {
                 let updates = self
                     .col_names
                     .iter()
-                    .filter(|c| !self.merge_keys.contains(c) && !generated.contains(c))
+                    .filter(|c| {
+                        !self.merge_keys.contains(c)
+                            && !generated.contains(c)
+                            && !always.contains(c)
+                    })
                     .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
                     .collect::<Vec<_>>()
                     .join(", ");

@@ -238,22 +238,27 @@ async fn apply_unit(
     // source's schema failed every window (deep review 2, N20). Asked only
     // when this window inserts. pgoutput sends no generated column, so those
     // never reach a column list here.
-    let ovr = if c.upserts.is_empty() && c.residue.is_empty() {
-        ""
+    //
+    // Those columns can only be SET to DEFAULT, too: a residue UPDATE or DO
+    // UPDATE naming one failed every window that held a masked update or an
+    // upsert (deep review 3, R25), so the SET lists leave them out.
+    let always: Vec<String> = if c.upserts.is_empty() && c.residue.is_empty() {
+        Vec::new()
     } else {
-        let always: Option<bool> = sqlx::query_scalar(
-            "SELECT bool_or(a.attidentity = 'a') FROM pg_attribute a \
-             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped",
+        sqlx::query_scalar(
+            "SELECT a.attname::text FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.attidentity = 'a'",
         )
         .bind(&ft)
-        .fetch_one(&mut **tx)
+        .fetch_all(&mut **tx)
         .await
-        .map_err(db_err)?;
-        if always == Some(true) {
-            " OVERRIDING SYSTEM VALUE"
-        } else {
-            ""
-        }
+        .map_err(db_err)?
+    };
+    let ovr = if always.is_empty() {
+        ""
+    } else {
+        " OVERRIDING SYSTEM VALUE"
     };
     let casts: std::collections::HashMap<String, String> = if c.residue.is_empty() && !raw_bytes {
         std::collections::HashMap::new()
@@ -388,7 +393,9 @@ async fn apply_unit(
                     .iter()
                     .zip(row.iter())
                     .filter(|(cname, cell)| {
-                        !matches!(cell, Cell::UnchangedToast) && !pk_cols.contains(cname)
+                        !matches!(cell, Cell::UnchangedToast)
+                            && !pk_cols.contains(cname)
+                            && !always.contains(cname)
                     })
                     .map(|(cname, cell)| {
                         binds.push(bind_of(cell, hex_col(cname)));
@@ -420,7 +427,7 @@ async fn apply_unit(
                     .join(", ");
                 let updates = wal_cols
                     .iter()
-                    .filter(|cname| !pk_cols.contains(cname))
+                    .filter(|cname| !pk_cols.contains(cname) && !always.contains(cname))
                     .map(|cname| format!("{q} = EXCLUDED.{q}", q = quote_ident(cname)))
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -454,7 +461,10 @@ async fn apply_unit(
                 let sets = wal_cols
                     .iter()
                     .zip(row.iter())
-                    .filter(|(_, cell)| !matches!(cell, Cell::UnchangedToast))
+                    .filter(|(cname, cell)| {
+                        !matches!(cell, Cell::UnchangedToast)
+                            && (pk_cols.contains(cname) || !always.contains(cname))
+                    })
                     .map(|(cname, cell)| {
                         binds.push(bind_of(cell, hex_col(cname)));
                         format!(
