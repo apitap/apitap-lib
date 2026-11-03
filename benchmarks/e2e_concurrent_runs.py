@@ -140,7 +140,12 @@ def reset(rows=400_000):
 
 # ---------------------------------------------------------------------------
 print("== leg 1+2: a second replace must refuse, and the first must survive ==")
-reset()
+# 2M rows, not the 400k default: staging EXISTING only proves A reached its
+# load — B must still find A mid-flight when B's own startup, probe and scan
+# have finished, and on a fast box A's remaining 400k rows land inside B's
+# startup. The load has to outlast the scan, and only size buys that
+# deterministically (the same lesson the comment below learned about timers).
+reset(2_000_000)
 results = {}
 
 
