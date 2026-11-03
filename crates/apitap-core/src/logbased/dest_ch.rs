@@ -2214,14 +2214,23 @@ mod store {
             // destination loss on green runs. Refused here, on the first
             // apply, with the only repair named (deep review 3, D16
             // finding 3 / R2). detect_insert_only already read both facts.
-            let (_, sorting, engine) = self.detect_insert_only(dest_table).await;
-            if super::unkeyed_collapsing(&sorting, &engine) {
+            let (_, sorting, engine_full) = self.detect_insert_only(dest_table).await;
+            // engine_full carries the whole DDL — and the no-arg engine
+            // renders WITHOUT its parentheses ("ReplacingMergeTree ORDER BY
+            // tuple() SETTINGS …", captured on 24.8) — so the family ends
+            // at the ORDER BY; collapses_by_key expects the engine alone.
+            let engine = engine_full
+                .split(" ORDER BY ")
+                .next()
+                .unwrap_or(engine_full.as_str());
+            if super::unkeyed_collapsing(&sorting, engine) {
                 return Err(Error::InvalidInput(format!(
                     "log_based: {dest_table} is {engine} over ORDER BY tuple() — a bootstrap \
                      from 0.62.x or earlier left it unkeyed, and ClickHouse's background merges \
                      collapse every row sharing the empty sorting key into one: the destination \
                      silently holds a fraction of the source while every run stays green. \
-                     Re-bootstrap {dest_table} (clear its _apitap_state row and run again), \
+                     Re-bootstrap {dest_table} (clear its _apitap_state row and run \
+                     again — with the engine= it was created with, if it had one), \
                      which rebuilds it ordered by its key"
                 )));
             }
@@ -3345,25 +3354,34 @@ mod tests {
     /// collapsing engine over an EMPTY sorting key (system.tables renders
     /// ORDER BY tuple() as ""). Harmless lookalikes stay allowed: plain
     /// MergeTree over tuple() (nothing collapses), a keyed collapsing
-    /// engine (the D9 note's business, not a refusal).
+    /// engine (the D9 note's business, not a refusal). The spellings are
+    /// `system.tables.engine_full` as 24.8 renders them, captured on the
+    /// bench server — the no-arg engine has NO parentheses, so the family
+    /// must be split off before the ORDER BY.
     #[test]
     fn unkeyed_collapsing_is_the_0_62_bootstrap_shape_alone() {
         use super::unkeyed_collapsing;
-        for engine in [
-            "ReplacingMergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192",
+        fn family(engine_full: &str) -> &str {
+            engine_full.split(" ORDER BY ").next().unwrap_or(engine_full)
+        }
+        for engine_full in [
+            "ReplacingMergeTree ORDER BY tuple() SETTINGS index_granularity = 8192",
             "ReplacingMergeTree(updated_at) ORDER BY tuple()",
             "ReplicatedReplacingMergeTree('/z', '{r}') ORDER BY tuple()",
             "SummingMergeTree(x) ORDER BY tuple()",
         ] {
-            assert!(unkeyed_collapsing(&[], engine), "{engine}");
+            assert!(unkeyed_collapsing(&[], family(engine_full)), "{engine_full}");
         }
         // A sorting key — any — means the engine collapses BY it, not
         // everything: allowed (insert_only_for decides the rest).
-        assert!(!unkeyed_collapsing(&["id".to_string()], "ReplacingMergeTree() ORDER BY id"));
+        assert!(!unkeyed_collapsing(
+            &["id".to_string()],
+            family("ReplacingMergeTree ORDER BY id")
+        ));
         // No sorting key but nothing collapses either: allowed, just
         // unsorted.
-        assert!(!unkeyed_collapsing(&[], "MergeTree() ORDER BY tuple()"));
-        assert!(!unkeyed_collapsing(&[], "ReplicatedMergeTree() ORDER BY tuple()"));
+        assert!(!unkeyed_collapsing(&[], family("MergeTree ORDER BY tuple()")));
+        assert!(!unkeyed_collapsing(&[], family("ReplicatedMergeTree ORDER BY tuple()")));
     }
 
     /// The insert-only shape rule (design §14, MASTER M-26): the engine's
