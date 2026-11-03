@@ -279,8 +279,9 @@ pub(crate) fn pg_binary_setting() -> Option<bool> {
     }
 }
 
-/// `APITAP_READ_COALESCE_US` (microseconds): unset = 500; `0`/`off` disables
-/// (the A/B control); junk falls back — a typo cannot silently change it.
+/// `APITAP_READ_COALESCE_US` (microseconds): unset = 5000 (the knee of the
+/// sweep above); `0`/`off` disables (the A/B control); junk falls back — a
+/// typo cannot silently change it.
 fn read_coalesce_us() -> u64 {
     match std::env::var("APITAP_READ_COALESCE_US") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,

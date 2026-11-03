@@ -59,7 +59,7 @@ df = apitap.read(src, table="public.orders").to_polars()                 # or .l
 | **DataFrames** | `apitap.read()` → polars, pyarrow, duckdb, pandas through the Arrow C stream protocol, zero-copy, no pyarrow dependency |
 | **Runtime** | CPython ≥ 3.9, one `abi3` wheel (`manylinux_x86_64`); the engine is Rust, nothing in the data path is Python |
 | **Memory** | bounded by *pipes × buffers*, planned from the container's cgroup limits — never by table size; a 256 MB container moves 100 GB |
-| **Version** | 0.59.0 — pin exactly while pre-1.0 (`apitap==0.59.0`) |
+| **Version** | 0.63.0 — pin exactly while pre-1.0 (`apitap==0.63.0`) |
 | **License** | MIT |
 
 ## Why apitap
@@ -440,7 +440,9 @@ between them can leave duplicate history under a new `_apitap_lsn`;
 Every one of these sentences is a row in the release gate's claim matrix,
 proved by a leg that asks the *server* what happened, not the exit code —
 including what a killed process leaves behind, produced on purpose against live
-databases. 0.59.0 shipped on **87 legs passed, 0 failed, 0 skipped**.
+databases. 0.63.0 shipped on **188 legs passed, 0 failed, 17 skipped** — every skip a
+capability the rig lacked (cloud credentials, a TLS container, an old
+wheel), named in the gate's output, because a skipped leg is a reported leg.
 
 ## Operating it
 
@@ -477,7 +479,7 @@ is off.
 | `APITAP_WINDOW_MAX_SECS` | `3600` | wall-clock cap on one window |
 | `APITAP_TX_BUF_BYTES` | 256 MiB | the one-transaction buffer cap behind the refusal |
 | `APITAP_REPLICATION_SILENCE_SECS` | `120` | silence budget on the replication socket (lower only) |
-| `APITAP_READ_LOWAT` | `64K` | receive watermark on the plain-TCP replication socket so one `recvfrom` carries a backlog chunk instead of ~5 KB (8–16× fewer syscalls, measured on 0.59.0); the reader waits at most 2 ms for it, so keepalives still flow; `0`/`off` disables (the A/B control) |
+| `APITAP_READ_COALESCE_US` | `5000` (µs) | how long the plain-TCP replication reader may wait for its window to fill before one `recvfrom` — epoll wakes on the first arrival, so each read otherwise carried ~5 KB; the 5 ms knee measured −6% CPU/change (the 0.59.0 `APITAP_READ_LOWAT` receive watermark was reverted: ET epoll parked the reader past `wal_sender_timeout`); a read that already has data is never delayed, so keepalives still flow; `0`/`off` disables (the A/B control) |
 | `APITAP_DECODE_WORKMEM` | server value | per-session `logical_decoding_work_mem`, ≤ 256 MiB |
 | `APITAP_CDC_APPLY_LANES` | auto (ClickHouse `min((mem−96 MiB)/20 MiB, 16·cores)` clamped 1–16; BigQuery ≤ 8; Postgres/MySQL 1) | concurrent table applies per window |
 | `APITAP_CH_MAX_BODY` | one request per pipe | cap each ClickHouse request body (`512K`, `64M`) for a proxy with a body limit |
