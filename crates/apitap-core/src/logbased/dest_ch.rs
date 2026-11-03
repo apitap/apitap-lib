@@ -1074,9 +1074,23 @@ async fn apply_unit(
                     // read can hit a tombstone or an older version, and the
                     // patched re-insert would resurrect a stale value
                     // (review P1-1).
+                    //
+                    // FINAL collapses by the table's SORTING key, not by the
+                    // key this predicate asks for: a 0.62.x apply on a
+                    // tombstone-shaped table whose ORDER BY is not the key
+                    // can have left one key live twice (the detection note
+                    // says re-bootstrap; the readback must survive it until
+                    // then). Both rows came back and lines().next() took
+                    // whichever the part scan reached first — a coin flip
+                    // that could re-land the stale value of the untouched
+                    // column. The readback names the row it wants — the
+                    // newest live version, the same rule the tombstone path
+                    // reads by — and the key-wide DELETE below sweeps the
+                    // duplicate either way (deep review 3, N2).
                     let body = if versioned {
                         u.read(&format!(
-                            "SELECT {sel} FROM {ft} FINAL WHERE {pred} AND _apitap_deleted = 0 FORMAT TabSeparated"
+                            "SELECT {sel} FROM {ft} FINAL WHERE {pred} AND _apitap_deleted = 0 \
+                             ORDER BY _apitap_ver DESC LIMIT 1 FORMAT TabSeparated"
                         ))
                         .await?
                     } else {
@@ -1204,9 +1218,15 @@ async fn apply_unit(
                         .map(|&i| ch_ident(&wal_cols[i]))
                         .collect::<Vec<_>>()
                         .join(", ");
+                    // Same two-live-rows rule as the masked readback above
+                    // (deep review 3, N2): FINAL keeps both rows of a key a
+                    // 0.62.x apply left twice on a non-key-ordered table, so
+                    // the re-key's old-key read takes the newest version
+                    // instead of the first line the scan happened to reach.
                     let body = if versioned {
                         u.read(&format!(
-                            "SELECT {sel} FROM {ft} FINAL WHERE {old_pred} AND _apitap_deleted = 0 FORMAT TabSeparated"
+                            "SELECT {sel} FROM {ft} FINAL WHERE {old_pred} AND _apitap_deleted = 0 \
+                             ORDER BY _apitap_ver DESC LIMIT 1 FORMAT TabSeparated"
                         ))
                         .await?
                     } else {
