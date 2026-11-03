@@ -8,8 +8,9 @@ and the tracked tables' later changes never landed, on green runs (deep
 review 3, R18). The deadline now waits for the end of any transaction.
 
 Proof (mysql -> ch, APITAP_MY_WINDOW_SECS=1): bootstrap a tracked table,
-then one ~2M-row transaction into an untracked table, then one tracked
-insert. Within three one-shot runs the tracked row must land.
+then one ~2M-row, 500-byte-padded transaction into an untracked table
+(over 1 GB of row events, more than a second to read even uncapped), then
+one tracked insert. Within three one-shot runs the tracked row must land.
 """
 import os
 import subprocess
@@ -56,14 +57,17 @@ def main():
     wipe()
     try:
         my(f"CREATE TABLE {T} (id int PRIMARY KEY, v varchar(10)); INSERT INTO {T} VALUES (1, 'a'); "
-           f"CREATE TABLE {U} (id int PRIMARY KEY, pad varchar(120))")
+           f"CREATE TABLE {U} (id int PRIMARY KEY, pad varchar(520))")
         r = run()
         assert r.returncode == 0, r.stderr[-800:]
-        # One transaction, ~2M rows of an untracked table: far more than one
-        # second of row events to read.
+        # One transaction, ~2M rows of a 500-byte-padded untracked table: a
+        # little over 1 GB of row events, far more than one second to read.
+        # Sized on an UNCAPPED 16-core rig, where 2M narrow rows streamed in
+        # under the 1 s deadline and the leg passed both ways — worthless: a
+        # 100-byte pad read through in ~0.9 s, a 500-byte one takes ~3.5 s.
         my(f"SET SESSION cte_max_recursion_depth = 3000000; START TRANSACTION; "
            f"INSERT INTO {U} WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000000) "
-           f"SELECT n, REPEAT('p', 100) FROM s; COMMIT")
+           f"SELECT n, REPEAT('p', 500) FROM s; COMMIT")
         my(f"INSERT INTO {T} VALUES (2, 'b')")
         for i in range(1, 4):
             r = run()
