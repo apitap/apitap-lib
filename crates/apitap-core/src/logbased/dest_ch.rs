@@ -2818,10 +2818,16 @@ mod store {
             self.s.note("rebuild");
             let tmp = artifact_ident_tok(table, Artifact::ChangelogTmp, ROOMY, &self.token);
             let (tq, ft) = (ch_ident(&tmp), ch_ident(table));
-            self.s
-                .ch
-                .exec(&format!("DROP TABLE IF EXISTS {tq}"))
-                .await?;
+            // drop_own on both: a stale {tmp} from a failed rebuild holds
+            // the RETIRED table, whole, and the post-swap drop drops this
+            // run's — either can sit past the server's max_table_size_to_drop
+            // (D20's finding 3: the plain DROP left them for the next run's
+            // sweep to collect).
+            crate::sink::clickhouse::drop_own(
+                &self.s.ch,
+                &format!("DROP TABLE IF EXISTS {tq}"),
+            )
+            .await?;
             self.s
                 .ch
                 .exec(&format!(
@@ -2847,7 +2853,9 @@ mod store {
             // Published: the old table under the run's name goes best-effort.
             // Failing here failed a window whose rebuild already landed
             // (MASTER review M-62); a leftover is named by the next scan.
-            if let Err(e) = self.s.ch.exec(&format!("DROP TABLE {tq}")).await {
+            if let Err(e) =
+                crate::sink::clickhouse::drop_own(&self.s.ch, &format!("DROP TABLE {tq}")).await
+            {
                 crate::progress::warn(&format!(
                     "clickhouse: rebuilt {table}, but dropping {tmp} failed ({e}); drop it by hand"
                 ));

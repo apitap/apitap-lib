@@ -169,7 +169,11 @@ async fn refuse_fk_cascade(pool: &MySqlPool, db: &str, bare: &str, qualified: &s
          writing them to the binlog, so its destination would keep rows the source \
          removed. Use ON DELETE/UPDATE RESTRICT (or NO ACTION) and delete children \
          explicitly, or set APITAP_MY_ALLOW_FK_CASCADE=1 if {parent}'s rows are never \
-         deleted or re-keyed"
+         deleted or re-keyed. And if the key was ADDED while a drain was already \
+         running, the rows it cascaded away in the meantime are missing at the \
+         destination and a plain re-run resumes past them: clear {qualified}'s \
+         _apitap_state row to re-bootstrap it (the admission check cannot see a \
+         key that appears mid-run; the binlog DDL arm is where that closes)"
     )))
 }
 
