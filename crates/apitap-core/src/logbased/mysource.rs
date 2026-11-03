@@ -573,6 +573,16 @@ pub(crate) async fn drain_binlog(
     // D-then-U exactly like the Postgres lane does.
     let mut changelogs: HashMap<String, Changes> = HashMap::new();
     let mut tx_buf: Vec<(Arc<str>, TxOp)> = Vec::new();
+    // A transaction is open, tracked OR NOT (deep review 3, R18): an
+    // untracked one's rows are skipped below and never enter `tx_buf`, so an
+    // empty `tx_buf` on its own cannot tell "between transactions" from
+    // "inside one that has nothing for us". The deadline breaking on that
+    // difference gained nothing — every scheduled run re-read the same bytes
+    // and broke again while the tracked tables' later changes sat behind
+    // them, on green runs — so the deadline and SIGTERM wait for the end of
+    // ANY transaction, and this flag is the fact for the transactions
+    // `tx_buf` cannot see.
+    let mut in_tx = false;
     let mut end_mark = start;
     let mut buf_bytes = 0usize;
     // The open transaction's bytes, capped like the Postgres lane's
@@ -596,7 +606,14 @@ pub(crate) async fn drain_binlog(
             // committing it and advancing the watermark past the lost head
             // (about once per 30 s window under steady writes). Mid-flight,
             // the deadline and SIGTERM defer to the COMMIT.
-            if tx_buf.is_empty() {
+            //
+            // That includes a transaction with nothing for us (R18): its
+            // rows never enter `tx_buf`, so `tx_buf.is_empty()` alone read
+            // "inside an untracked transaction" as "between transactions"
+            // and broke mid-stream with nothing gained — every run re-read
+            // the same bytes, green, and never reached the tracked changes
+            // behind them.
+            if tx_buf.is_empty() && !in_tx {
                 break;
             }
         }
@@ -817,11 +834,13 @@ pub(crate) async fn drain_binlog(
                     // Transaction opens: anything buffered from a torn
                     // previous attempt is stale.
                     tx_buf.clear();
+                    in_tx = true;
                 } else if verb == QueryVerb::Rollback {
                     // The transaction never happened. Left in the buffer, its
                     // rows were applied by whatever drained next — a DDL's
                     // implicit commit (MASTER M-39).
                     tx_buf.clear();
+                    in_tx = false;
                 } else if verb == QueryVerb::RollbackTo {
                     // Which of the buffered rows the savepoint undid is not in
                     // the event. Guessing either way is wrong data, so a
@@ -873,6 +892,7 @@ pub(crate) async fn drain_binlog(
                         &mut collapsers,
                         pack_pos(&sess.file, h.log_pos),
                     )?;
+                    in_tx = false;
                     end_mark = pack_pos(&sess.file, h.log_pos);
                     if end_mark >= stop_line {
                         break;
@@ -925,6 +945,8 @@ pub(crate) async fn drain_binlog(
                         &mut collapsers,
                         pack_pos(&sess.file, h.log_pos),
                     )?;
+                    // The implicit commit is a transaction boundary too.
+                    in_tx = false;
                     // A DDL may change any table's columns, and the QUERY
                     // event's `db` is the session's default database, not
                     // necessarily the altered table's (`ALTER TABLE other.t`),
@@ -1041,6 +1063,7 @@ pub(crate) async fn drain_binlog(
                     &mut collapsers,
                     pack_pos(&sess.file, h.log_pos),
                 )?;
+                in_tx = false;
                 end_mark = pack_pos(&sess.file, h.log_pos);
                 if end_mark >= stop_line {
                     break;
@@ -1054,6 +1077,7 @@ pub(crate) async fn drain_binlog(
                 // MariaDB opens a transaction with a GTID event — there is no
                 // `BEGIN` QUERY event to clear a torn attempt's leftovers.
                 tx_buf.clear();
+                in_tx = true;
             }
             t if bl::skippable(t) => {
                 // Heartbeats carry the live position: they let an idle

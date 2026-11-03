@@ -1565,7 +1565,7 @@ async fn run_group_mysql(
                     wm,
                     cap,
                     &seed,
-                    30,
+                    my_window_secs(),
                     budget,
                     opts.changelog,
                     win_tx,
@@ -2880,13 +2880,17 @@ async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
     Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
 }
 
-/// Create the publication carrying EVERY member, or — when it already
-/// exists — verify each member's MEMBERSHIP and re-add the missing (a
-/// dropped-and-recreated source table silently leaves its publication).
-/// A missing member that has STATE (`drained`) is refused instead: its
-/// changes since it left were never published, and the DROP that removed it
-/// emitted nothing. Re-added and drained on, the destination kept the old
-/// table's rows and lost the new one's first changes (deep review D17).
+/// A one-shot MySQL drain's window deadline: `APITAP_MY_WINDOW_SECS`,
+/// default 30. A knob for tests that need the deadline inside a large
+/// transaction without streaming 30 s of it.
+fn my_window_secs() -> u64 {
+    std::env::var("APITAP_MY_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(30)
+}
+
 /// The walsender of a session that just ended releases its slot a moment
 /// after the socket closes; a drain started sooner is refused "already
 /// active". Bounded: past 15 s the next drain says so itself.
@@ -2940,6 +2944,13 @@ pub(crate) fn recreated(qualified: &str, dest_table: &str, a: u32, b: u32) -> Er
     ))
 }
 
+/// Create the publication carrying EVERY member, or — when it already
+/// exists — verify each member's MEMBERSHIP and re-add the missing (a
+/// dropped-and-recreated source table silently leaves its publication).
+/// A missing member that has STATE (`drained`) is refused instead: its
+/// changes since it left were never published, and the DROP that removed it
+/// emitted nothing. Re-added and drained on, the destination kept the old
+/// table's rows and lost the new one's first changes (deep review D17).
 async fn ensure_publication(
     src: &PgPool,
     publication: &str,

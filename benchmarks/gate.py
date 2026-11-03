@@ -369,6 +369,7 @@ LEGS = [
     leg("e2e_ice_hardening.py",     "numeric(2,4) lands exact in Iceberg", argv=["numeric"]),
     leg("e2e_ice_hardening.py",  "an Iceberg commit refuses a schema evolved during the load", argv=["schema"]),
     leg("e2e_ice_hardening.py",  "an Iceberg table with a void-only partition spec takes appends", argv=["void"]),
+    leg("e2e_my_deadline_untracked_tx.py", "a one-shot MySQL drain gets past a large untracked transaction"),
 ]
 
 

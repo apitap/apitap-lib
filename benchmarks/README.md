@@ -778,6 +778,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_half_open --> `e2e_half_open.py` | a frozen source fails the drain inside its silence budget; the next run recovers every row |
 | <!-- claim: leg.e2e_two_destinations --> `e2e_two_destinations.py` | one source into two destinations: each bootstraps and resumes its own slot |
 | <!-- claim: leg.e2e_cdc_progress --> `e2e_cdc_progress.py` | a Postgres drain reports a non-zero count while it is still running |
+| <!-- claim: leg.e2e_my_deadline_untracked_tx --> `e2e_my_deadline_untracked_tx.py` | mysql -> ch with `APITAP_MY_WINDOW_SECS=1`: one ~2M-row transaction into an untracked table, then one tracked insert — within three one-shot runs the tracked row lands (deep review 3, R18: the deadline used to break mid-stream inside the untracked transaction, and every run re-read the same bytes, green, forever) |
 
 ## Multi-table on the tiny box — TPC-H, 10 × 1M rows, 256 MB / 0.5 CPU
 
