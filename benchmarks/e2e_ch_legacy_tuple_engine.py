@@ -5,21 +5,24 @@ ORDER BY tuple() — a composite or varchar key with no order_by fell back to
 the empty key. D16's fix shapes only NEW bootstraps, and a lane with state
 never re-bootstraps, so the upgraded lane drains straight into the damage:
 every row of the table shares the one (empty) sorting key, and the engine's
-own background merges fold them into one row per partition — silent
-destination loss on green runs, with no note at all for plain
-ReplacingMergeTree or ReplacingMergeTree(ver) (deep review 3, D16 finding 3
-/ R2).
+own merges fold them into one row — even the rebuild into this shape folds
+the table on the spot, which is the damage demonstrated live below — on
+green runs, with no note at all for plain ReplacingMergeTree or
+ReplacingMergeTree(ver) (deep review 3, D16 finding 3 / R2).
 
-The drain now refuses on the first apply, naming the only repair —
-re-bootstrap, which rebuilds the table ordered by its key.
+The drain now refuses on the first apply, before any window, naming the
+only repair. Harmless lookalikes stay allowed: plain MergeTree over
+tuple() collapses nothing, and a keyed collapsing engine is the D9 note's
+business.
 
-Proof (pg -> ch): bootstrap, rebuild the destination into the 0.62.x shape
-(plain ReplacingMergeTree over tuple()), change the source, and the drain
-must REFUSE with that remedy, its window still pending behind it. Two
-controls make the refusal mean the right thing: MergeTree over tuple()
-(same empty key, nothing collapses) drains fine, and ReplacingMergeTree
-ORDER BY id (a collapsing engine WITH a key) drains fine too — and the
-control run lands the change the refusal left pending.
+Proof (pg -> ch): bootstrap two rows, rebuild the destination into the
+0.62.x shape and watch it lose a row to its own part write (the damage,
+rig-proven), change the source, and the drain REFUSES with the remedy, its
+window still pending. Two controls make the refusal mean the right thing:
+MergeTree over tuple() drains and lands the pending change, and
+ReplacingMergeTree ORDER BY id applies an update. Then the refusal's own
+remedy is executed — clear the state row, re-bootstrap — and the
+destination is exact again, the folded row restored.
 """
 import os
 import subprocess
@@ -73,6 +76,11 @@ def rebuild(engine_and_order):
     ch(f"DROP TABLE {T}_leg")
 
 
+def rows():
+    return ch(f"SELECT arrayStringConcat(groupArray(concat(toString(id), ':', "
+              f"toString(v))), ',') FROM (SELECT id, v FROM {T} ORDER BY id)")
+
+
 def wipe():
     for pub in set(pg(f"SELECT pubname FROM pg_publication_tables WHERE tablename = '{T}'").split()):
         pg(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
@@ -91,33 +99,29 @@ def main():
         pg(f"CREATE TABLE {T} (id int PRIMARY KEY, v int)")
         pg(f"INSERT INTO {T} VALUES (1, 10), (2, 20)")
         r = drain()
-        case("the bootstrap lands both rows", r.returncode == 0
-             and ch(f"SELECT count() FROM {T}") == "2",
+        case("the bootstrap lands both rows", r.returncode == 0 and rows() == "1:10,2:20",
              (r.stdout + r.stderr).strip()[-300:])
 
         # The 0.62.x shape: a collapsing engine over the empty sorting key.
+        # The rebuild itself is the damage, live: the part write sorts by the
+        # empty key and folds both rows into one.
         rebuild("ReplacingMergeTree() ORDER BY tuple()")
-        engine = ch(f"SELECT engine_full FROM system.tables WHERE database = 'default' AND name = '{T}'")
-        case("(rig) the destination is ReplacingMergeTree over an empty sorting key",
-             "ReplacingMergeTree" in engine and ch(
-                 f"SELECT length(sorting_key) FROM system.tables "
-                 f"WHERE database = 'default' AND name = '{T}'") == "0", engine)
-
+        case("the 0.62.x shape folds the table by itself (the R2 damage, rig-proven)",
+             rows() == "1:10", rows())
         pg(f"INSERT INTO {T} VALUES (3, 30)")
         r = drain()
         err = (r.stdout + r.stderr)
         case("the drain REFUSES the collapsing engine over tuple()",
              r.returncode != 0 and "ORDER BY tuple()" in err and "Re-bootstrap" in err,
              err.strip().splitlines()[-1][:160] if err.strip() else "")
-        case("and nothing landed (the window stays pending)",
-             ch(f"SELECT count() FROM {T}") == "2")
+        case("and nothing landed (the window stays pending)", rows() == "1:10", rows())
 
         # Control 1: the same empty key on a plain MergeTree collapses
         # nothing — allowed, and the pending change lands through it.
         rebuild("MergeTree() ORDER BY tuple()")
         r = drain()
         case("control: MergeTree over tuple() drains, and lands the pending row",
-             r.returncode == 0 and ch(f"SELECT count() FROM {T}") == "3",
+             r.returncode == 0 and rows() == "1:10,3:30",
              (r.stdout + r.stderr).strip()[-200:] if r.returncode else "")
 
         # Control 2: a collapsing engine WITH its key — the D9 note's
@@ -126,12 +130,22 @@ def main():
         rebuild("ReplacingMergeTree() ORDER BY id")
         r = drain()
         case("control: ReplacingMergeTree ORDER BY id drains and applies",
-             r.returncode == 0 and ch(f"SELECT v FROM {T} WHERE id = 1") == "11",
+             r.returncode == 0 and rows() == "1:11,3:30",
              (r.stdout + r.stderr).strip()[-200:] if r.returncode else "")
+
+        # The refusal's remedy, executed: clear the state row, re-bootstrap
+        # with the engine the table was created with, and the folded row
+        # comes back — the destination exact again.
+        ch(f"ALTER TABLE _apitap_state DELETE WHERE dest_table = '{T}' SETTINGS mutations_sync = 1")
+        code = ("import apitap\n"
+                f"apitap.transfer({PG!r}, {CH!r}, table={T!r}, mode='log_based', "
+                "engine='ReplacingMergeTree')\n")
+        r = sh([sys.executable, "-c", code], timeout=300)
         want = pg(f"SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM {T}")
-        got = ch(f"SELECT arrayStringConcat(groupArray(concat(toString(id), ':', "
-                 f"toString(v))), ',') FROM (SELECT id, v FROM {T} ORDER BY id)")
-        case("the destination agrees with the source", got == want, f"{want} vs {got}")
+        case("the remedy repairs it: a re-bootstrap restores the folded row",
+             r.returncode == 0 and rows() == want,
+             f"{rows()} vs {want}; rc={r.returncode} "
+             + (r.stderr.strip().splitlines()[-1][:120] if r.returncode else ""))
     finally:
         wipe()
     print("\nCH LEGACY TUPLE ENGINE E2E: " + ("PASSED" if ok else "FAILED"))

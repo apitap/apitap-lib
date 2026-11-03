@@ -74,6 +74,7 @@ def wipe():
         pg(f"DROP PUBLICATION IF EXISTS {pub}")
     pg(f"DROP TABLE IF EXISTS {T}")
     ch(f"DROP TABLE IF EXISTS {T}")
+    ch(f"DROP TABLE IF EXISTS {T}_leg")
     ch(f"DROP TABLE IF EXISTS `{T}__apitap_cdc_del`")
     for meta in ("_apitap_state", "_apitap_residue_journal"):
         if ch(f"SELECT count() FROM system.tables WHERE database = 'default' AND name = '{meta}'") != "0":
@@ -94,7 +95,7 @@ def main():
 
         r = drain()
         case("the bootstrap lands both rows", r.returncode == 0
-             and ch(f"SELECT count() FROM {T} FINAL WHERE _apitap_deleted = 0") == "2",
+             and ch(f"SELECT count() FROM {T}") == "2",
              (r.stdout + r.stderr).strip()[-300:])
 
         # Rebuild the destination into the 0.62.x legacy shape: the tombstone
@@ -105,7 +106,8 @@ def main():
         ch(f"CREATE TABLE {T}_leg (id Int32, note Nullable(String), blob Nullable(String), "
            f"_apitap_ver UInt64 DEFAULT 0, _apitap_deleted UInt8 DEFAULT 0) "
            f"ENGINE = ReplacingMergeTree(_apitap_ver, _apitap_deleted) ORDER BY note "
-           f"AS SELECT id, note, blob FROM {T}")
+           f"SETTINGS allow_nullable_key = 1 "
+           f"AS SELECT id, note, blob, 0 AS _apitap_ver, 0 AS _apitap_deleted FROM {T}")
         ch(f"EXCHANGE TABLES {T} AND {T}_leg")
         ch(f"DROP TABLE {T}_leg")
         engine = ch(f"SELECT engine_full FROM system.tables WHERE database = 'default' AND name = '{T}'")
