@@ -411,7 +411,7 @@ pub async fn transfer(
         progress::Unit::Rows,
         0,
         |r: &TransferReport| r.rows,
-        pipeline::dispatch::single(src_url, dst_url, table, opts, None),
+        pipeline::dispatch::single(src_url, dst_url, table, opts, None, 1),
     )
     .await
 }
@@ -422,12 +422,18 @@ pub async fn transfer(
 /// it nor get deleted by it, and the drain keeps them for the whole first run.
 /// Not public: no `TransferOptions` field carries a parent, because the Python
 /// binding builds that struct by literal.
+///
+/// `mem_denom` divides the load's memory plan: a slots=N retry bootstraps
+/// this group while its siblings drain beside it in the same process, and
+/// the cage ceiling must hold for the sum (deep review 3, D18 finding 1).
+/// Every other caller passes 1.
 pub(crate) async fn transfer_within(
     parent: &naming::RunId,
     src_url: &str,
     dst_url: &str,
     table: &str,
     opts: &TransferOptions,
+    mem_denom: usize,
 ) -> Result<TransferReport> {
     if opts.mode == Mode::LogBased {
         return Err(Error::InvalidInput("a nested run is never a drain".into()));
@@ -444,7 +450,7 @@ pub(crate) async fn transfer_within(
         progress::Unit::Rows,
         0,
         |r: &TransferReport| r.rows,
-        pipeline::dispatch::single(src_url, dst_url, table, opts, Some(parent)),
+        pipeline::dispatch::single(src_url, dst_url, table, opts, Some(parent), mem_denom),
     )
     .await
 }

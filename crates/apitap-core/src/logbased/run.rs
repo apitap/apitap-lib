@@ -1229,6 +1229,10 @@ async fn run_group(
             }
             Ok(r)
         } else {
+            // Counted for the sibling that bootstraps beside us: the guard
+            // spans the whole drain, every exit, so a retry's bootstrap can
+            // divide its cage share by us (D18 finding 1).
+            let _draining = DrainingGuard::enter();
             check_source_rels(&dest, &ctxs).await?;
             let floors: Vec<u64> = wms.iter().map(|w| w.expect("all present").get()).collect();
             let wm = *floors.iter().min().expect("nonempty");
@@ -1452,8 +1456,11 @@ async fn run_group_mysql(
                 let dest = dest.clone();
                 async move {
                     let _turn = bootstrap_turn(&dest).await;
+                    // The MySQL lane is one group per process (slots is
+                    // Postgres-only), so nothing ever drains beside this
+                    // load: the share is undivided, by construction.
                     let rep =
-                        Box::pin(crate::transfer_within(&r, &su, &du, &table_arg, &o2)).await?;
+                        Box::pin(crate::transfer_within(&r, &su, &du, &table_arg, &o2, 1)).await?;
                     Ok((rep.rows, rep.parallel))
                 }
             })
@@ -1730,6 +1737,38 @@ async fn bootstrap_turn(dest: &Dest) -> Option<tokio::sync::SemaphorePermit<'sta
     )
 }
 
+/// Groups of THIS process currently on the drain side. A slots=N retry
+/// bootstraps one group while its N-1 siblings drain beside it, and the
+/// bootstrap's nested loads must share the cage with them; on a first run
+/// the siblings are parked on the bootstrap turn holding ~nothing, so
+/// nothing is divided away there (deep review 3, D18 finding 1).
+static DRAINING_GROUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn draining_groups() -> usize {
+    DRAINING_GROUPS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RAII membership of that count: a group is draining from its state read to
+/// the end of its drain, on every exit. A bootstrapping sibling reads the
+/// count per table, after its own slot creation, so a bootstrap that starts
+/// beside a drain sees it — the drain's state read happens a round trip
+/// after its own tenure while the bootstrap still has a slot to create.
+struct DrainingGuard;
+
+impl DrainingGuard {
+    fn enter() -> Self {
+        DRAINING_GROUPS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        DrainingGuard
+    }
+}
+
+impl Drop for DrainingGuard {
+    fn drop(&mut self) {
+        DRAINING_GROUPS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Bootstrap fan-out shared by `slots=N` groups: the destination's lane
 /// count divides by how many groups bootstrap at once, so the process keeps
 /// the documented memory ceiling no matter how many slots run in it (system
@@ -1845,12 +1884,19 @@ async fn bootstrap_group(
             }
             dest.tweak_bootstrap_opts(&mut o2, &c.pk_cols);
             let _turn = bootstrap_turn(dest).await;
+            // Read per table, after the turn: a sibling mid-drain when this
+            // group started is visible here, and this load shares the cage
+            // with it (D18 finding 1). A first run reads 0 — the siblings
+            // are waiting on the turn, not draining — so every load keeps
+            // the full single-table plan and nothing regresses.
+            let denom = 1 + draining_groups();
             let r = Box::pin(crate::transfer_within(
                 run,
                 pinned_url,
                 dst_url,
                 &c.table_arg,
                 &o2,
+                denom,
             ))
             .await?;
             Ok((r.rows, r.parallel))
@@ -3542,6 +3588,23 @@ mod tests {
         assert_eq!(bootstrap_lanes_for(2, 4), 1);
         assert_eq!(bootstrap_lanes_for(8, 3), 2);
         assert_eq!(bootstrap_lanes_for(0, 3), 1);
+    }
+
+    /// D18 finding 1: the count a retry's bootstrap divides its cage share
+    /// by. A group counts as draining from its state read to the end of its
+    /// drain, on every exit, and the count nests.
+    #[test]
+    fn the_draining_count_spans_the_drain_and_nests() {
+        assert_eq!(super::draining_groups(), 0);
+        let _g = super::DrainingGuard::enter();
+        assert_eq!(super::draining_groups(), 1);
+        {
+            let _g2 = super::DrainingGuard::enter();
+            assert_eq!(super::draining_groups(), 2);
+        }
+        assert_eq!(super::draining_groups(), 1);
+        drop(_g);
+        assert_eq!(super::draining_groups(), 0);
     }
 
     /// Two pipelines that share a source and a destination table NAME but

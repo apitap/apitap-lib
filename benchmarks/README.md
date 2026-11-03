@@ -780,6 +780,7 @@ guards something that once broke. Each one is its own claim, carried here:
 | <!-- claim: leg.e2e_cdc_progress --> `e2e_cdc_progress.py` | a Postgres drain reports a non-zero count while it is still running |
 | <!-- claim: leg.e2e_my_deadline_untracked_tx --> `e2e_my_deadline_untracked_tx.py` | mysql -> ch with `APITAP_MY_WINDOW_SECS=1`: one ~2M-row, 500-byte-padded transaction into an untracked table, then one tracked insert — within three one-shot runs the tracked row lands (deep review 3, R18: the deadline used to break mid-stream inside the untracked transaction, and every run re-read the same bytes, green, forever) |
 | <!-- claim: leg.e2e_ch_legacy_dup_readback --> `e2e_ch_legacy_dup_readback.py` | pg -> ch: a masked update on a 0.62.x-shaped destination (tombstone columns, ORDER BY not the key) whose key is live twice reads the NEWEST version back — not the first line the scan reached — and the duplicate leaves the window healed (deep review 3, N2: the readback was a coin flip that could re-land the stale TOAST value) |
+| <!-- claim: leg.e2e_slots_retry_budget --> `e2e_slots_retry_budget.py` | pg -> ch, slots=2, `APITAP_MEM_BUDGET=256M`: run 1's bootstrap plans the full cage (nothing drains beside it); the retry's re-bootstrap, with its sibling draining in the same process, plans the share — `mem_limit` halved on its own `[plan]` line, fewer pipes — and both tables land exact (deep review 3, D18: the retry used to load at the full single-table plan beside N-1 drains) |
 
 ## Multi-table on the tiny box — TPC-H, 10 × 1M rows, 256 MB / 0.5 CPU
 

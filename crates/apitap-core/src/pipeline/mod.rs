@@ -579,11 +579,33 @@ pub(crate) fn knobs(
     profile: &Profile,
     residency: PipeResidency,
 ) -> Result<PipeShape> {
+    knobs_denom(opts, profile, residency, 1)
+}
+
+/// [`knobs`] with the memory budget divided by `denom`: a slots=N retry's
+/// bootstrap loads whole tables while its N-1 sibling groups drain beside it
+/// in the same process, and the cage ceiling must hold for the SUM — so the
+/// nested load plans against its share exactly the way the drains divide
+/// their window bytes (deep review 3, D18 finding 1). `denom` = 1 is every
+/// other caller: a first-run slots=N bootstrap reads 0 draining siblings
+/// (they are parked on the bootstrap turn holding ~nothing) and keeps the
+/// full single-table plan. An uncapped process divides nothing — there is no
+/// cage to share — and an explicit `parallel` is never overridden, only its
+/// row groups are fitted to the share.
+pub(crate) fn knobs_denom(
+    opts: &TransferOptions,
+    profile: &Profile,
+    residency: PipeResidency,
+    denom: usize,
+) -> Result<PipeShape> {
     if opts.parallel == Some(0) {
         return Err(Error::InvalidInput("parallel must be at least 1".into()));
     }
     let pinned = opts.chunk_bytes.map(|c| c.max(64 * 1024));
-    let (cost, mem) = (PipeCost::transfer(residency), mem_limit_bytes());
+    let (cost, mem) = (
+        PipeCost::transfer(residency),
+        mem_limit_bytes().map(|m| m / (denom as u64).max(1)),
+    );
     let shape = match opts.parallel {
         Some(p) => explicit(p, pinned, mem, &cost),
         None => fit((profile.auto_parallel)(num_cpus::get()), pinned, mem, &cost),
@@ -1164,6 +1186,28 @@ mod tests {
         );
         assert_eq!(none, None);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// D18 finding 1: a bootstrap that shares the cage with draining
+    /// siblings plans against its SHARE. 200 MiB gives this profile 4 pipes
+    /// by the memory fit; half the budget gives it 1 — the share is priced
+    /// by the same planner, not a magic number.
+    #[test]
+    fn knobs_denom_plans_the_share_not_the_whole_cage() {
+        std::env::set_var("APITAP_MEM_BUDGET", "200M");
+        let prof = Profile {
+            auto_parallel: |c: usize| (c * 8).clamp(2, 32),
+            span_mult: 6,
+            table_pipe_cap: usize::MAX,
+        };
+        let o = TransferOptions::default();
+        let full = knobs_denom(&o, &prof, PipeResidency::STREAMING, 1).unwrap();
+        let share = knobs_denom(&o, &prof, PipeResidency::STREAMING, 2).unwrap();
+        std::env::remove_var("APITAP_MEM_BUDGET");
+        assert!(share.pipes < full.pipes, "full {full:?} vs share {share:?}");
+        let cost = PipeCost::transfer(PipeResidency::STREAMING);
+        assert!(share.model_peak(&cost) <= 100 << 20, "share peak {share:?}");
+        assert!(full.model_peak(&cost) > 100 << 20, "full peak {full:?}");
     }
 
     /// The CPU walk is the memory walk's rule: the SMALLEST quota on the path

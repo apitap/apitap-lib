@@ -423,13 +423,15 @@ async fn one<S: SrcScheme, D: DstScheme>(
     ch_ddl: ChDdl,
     started: std::time::Instant,
     parent: Option<&crate::naming::RunId>,
+    denom: usize,
 ) -> Result<TransferReport> {
     let dest_table = opts.dest_table.as_deref().unwrap_or(table);
     let source_id = super::source_identity(src_url, table);
-    let shape = super::knobs(
+    let shape = super::knobs_denom(
         opts,
         &profile,
         <D::Sink as crate::sink::Sink>::pipe_residency(opts.mode),
+        denom,
     )?;
     // One table can never use more pipes than the profile's per-table cap —
     // clamping HERE also sizes the connection pools honestly for single-stream
@@ -512,12 +514,12 @@ macro_rules! routes {
             s: &str, d: &str,
             src_url: &str, dst_url: &str, table: &str,
             opts: &TransferOptions, ch_ddl: ChDdl, started: std::time::Instant,
-            parent: Option<&crate::naming::RunId>,
+            parent: Option<&crate::naming::RunId>, denom: usize,
         ) -> Result<TransferReport> {
             match (s, d) {
                 $( ($sname, $dname) =>
                     one::<$S, $D>($prof, $ov, src_url, dst_url, table, opts, ch_ddl, started,
-                                  parent).await, )+
+                                  parent, denom).await, )+
                 (s, d) => Err(unsupported(s, d)),
             }
         }
@@ -630,13 +632,14 @@ pub(crate) async fn single(
     table: &str,
     opts: &TransferOptions,
     parent: Option<&crate::naming::RunId>,
+    denom: usize,
 ) -> Result<TransferReport> {
     let started = std::time::Instant::now();
     let src_scheme = norm(src_url.split("://").next().unwrap_or(""));
     let dst_scheme = norm(dst_url.split("://").next().unwrap_or(""));
     let ch_ddl = ChDdl::from_opts(opts, dst_scheme == "clickhouse")?;
     route_single(
-        src_scheme, dst_scheme, src_url, dst_url, table, opts, ch_ddl, started, parent,
+        src_scheme, dst_scheme, src_url, dst_url, table, opts, ch_ddl, started, parent, denom,
     )
     .await
 }
