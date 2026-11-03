@@ -1372,7 +1372,7 @@ pub struct ChDdl {
 /// An engine that merges rows sharing a sorting key on its own (Replacing,
 /// Summing, Aggregating, Collapsing, VersionedCollapsing, Graphite), plain or
 /// Replicated/Shared.
-fn collapses_by_key(engine: &str) -> bool {
+pub(crate) fn collapses_by_key(engine: &str) -> bool {
     let family = engine.split('(').next().unwrap_or("").trim();
     let family = family
         .strip_prefix("Replicated")

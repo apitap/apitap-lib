@@ -372,6 +372,7 @@ LEGS = [
     leg("e2e_my_deadline_untracked_tx.py", "a one-shot MySQL drain gets past a large untracked transaction"),
     leg("e2e_ch_legacy_dup_readback.py", "a masked readback on a 0.62.x-shaped table takes the newest live version"),
     leg("e2e_slots_retry_budget.py", "a slots=N retry's bootstrap plans its share of the cage beside the draining siblings"),
+    leg("e2e_ch_legacy_tuple_engine.py", "a drain refuses a collapsing engine left ORDER BY tuple() by a 0.62.x bootstrap"),
 ]
 
 

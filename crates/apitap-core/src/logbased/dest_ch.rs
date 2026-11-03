@@ -1476,7 +1476,7 @@ mod store {
         /// `_apitap_deleted` takes the tombstone path instead of
         /// delete-then-insert. One catalog round trip per table, cached:
         /// the engine shape and the sorting key's columns.
-        insert_only: Mutex<HashMap<String, (bool, Vec<String>)>>,
+        insert_only: Mutex<HashMap<String, (bool, Vec<String>, String)>>,
         /// The verdict an apply reached for a table, shape AND sorting key
         /// against the replica identity (deep review D9). The parallel gate
         /// reads it; a table not applied yet is not proven insert-only.
@@ -1776,7 +1776,7 @@ mod store {
         /// tenant change left two rows (deep review D9). Such a table applies
         /// by delete-then-insert, which addresses rows by the key.
         pub(crate) async fn insert_only_for(&self, table: &str, pk: &[String]) -> bool {
-            let (shape, sorting) = self.detect_insert_only(table).await;
+            let (shape, sorting, _) = self.detect_insert_only(table).await;
             let keyed = {
                 let mut a: Vec<&str> = sorting.iter().map(String::as_str).collect();
                 let mut b: Vec<&str> = pk.iter().map(String::as_str).collect();
@@ -1813,8 +1813,11 @@ mod store {
         /// Insert-only detection (design §14): one catalog round trip per
         /// table per run. Any failure — unknown table, old server without
         /// `system.columns`, transport — reads as "not insert-only", which is
-        /// exactly today's behaviour.
-        async fn detect_insert_only(&self, table: &str) -> (bool, Vec<String>) {
+        /// exactly today's behaviour. The engine spelling rides along for the
+        /// apply-time collapse check (`precheck_mode`): a lane's table is not
+        /// insert-only and still must not be a collapsing engine over an
+        /// empty sorting key.
+        async fn detect_insert_only(&self, table: &str) -> (bool, Vec<String>, String) {
             if let Some(v) = self.insert_only.lock().unwrap().get(table) {
                 return v.clone();
             }
@@ -1852,6 +1855,7 @@ mod store {
             let v = (
                 super::is_insert_only_shape(engine, has_ver, has_deleted),
                 sorting,
+                engine.to_string(),
             );
             self.insert_only
                 .lock()
@@ -2200,7 +2204,28 @@ mod store {
                     c = ch_str(CL_OP),
                 ))
                 .await?;
-            is_shape_ok(has.trim() != "0", changelog, "ClickHouse", dest_table)
+            is_shape_ok(has.trim() != "0", changelog, "ClickHouse", dest_table)?;
+            // A 0.62.x bootstrap could leave a Replacing-family destination
+            // ORDER BY tuple() — D16's ORDER BY fix only shapes NEW
+            // bootstraps, and a lane with state never re-bootstraps, so the
+            // upgraded lane drains straight into the damage. An empty
+            // sorting key means every row of the table shares it and the
+            // engine's own background merges collapse them into one: silent
+            // destination loss on green runs. Refused here, on the first
+            // apply, with the only repair named (deep review 3, D16
+            // finding 3 / R2). detect_insert_only already read both facts.
+            let (_, sorting, engine) = self.detect_insert_only(dest_table).await;
+            if super::unkeyed_collapsing(&sorting, &engine) {
+                return Err(Error::InvalidInput(format!(
+                    "log_based: {dest_table} is {engine} over ORDER BY tuple() — a bootstrap \
+                     from 0.62.x or earlier left it unkeyed, and ClickHouse's background merges \
+                     collapse every row sharing the empty sorting key into one: the destination \
+                     silently holds a fraction of the source while every run stays green. \
+                     Re-bootstrap {dest_table} (clear its _apitap_state row and run again), \
+                     which rebuilds it ordered by its key"
+                )));
+            }
+            Ok(())
         }
 
         /// Pin (or re-pin, with the deadline carried so far) the unit's time
@@ -3167,6 +3192,17 @@ pub(crate) fn is_shape_ok(
     }
 }
 
+/// A table whose engine collapses rows sharing a sorting key, with NO sorting
+/// key at all: `ORDER BY tuple()` (system.tables reports it as an empty
+/// string). Every row of the table then shares the one key, and the engine's
+/// own merges fold them into one row per partition — the 0.62.x-bootstrap
+/// shape a drain must refuse instead of feeding (deep review 3, D16
+/// finding 3 / R2). `ORDER BY tuple()` on a plain MergeTree is harmless and
+/// stays allowed; a keyed collapsing engine is the D9 note's business.
+fn unkeyed_collapsing(sorting: &[String], engine: &str) -> bool {
+    sorting.is_empty() && crate::sink::clickhouse::collapses_by_key(engine)
+}
+
 /// The Nullable form of an existing column type for the changelog rebuild, or
 /// `None` when the column must be left exactly as it is.
 ///
@@ -3305,6 +3341,31 @@ fn render_residue_row(
 
 #[cfg(test)]
 mod tests {
+    /// D16 finding 3 / R2: the 0.62.x-bootstrap shape a drain refuses — a
+    /// collapsing engine over an EMPTY sorting key (system.tables renders
+    /// ORDER BY tuple() as ""). Harmless lookalikes stay allowed: plain
+    /// MergeTree over tuple() (nothing collapses), a keyed collapsing
+    /// engine (the D9 note's business, not a refusal).
+    #[test]
+    fn unkeyed_collapsing_is_the_0_62_bootstrap_shape_alone() {
+        use super::unkeyed_collapsing;
+        for engine in [
+            "ReplacingMergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192",
+            "ReplacingMergeTree(updated_at) ORDER BY tuple()",
+            "ReplicatedReplacingMergeTree('/z', '{r}') ORDER BY tuple()",
+            "SummingMergeTree(x) ORDER BY tuple()",
+        ] {
+            assert!(unkeyed_collapsing(&[], engine), "{engine}");
+        }
+        // A sorting key — any — means the engine collapses BY it, not
+        // everything: allowed (insert_only_for decides the rest).
+        assert!(!unkeyed_collapsing(&["id".to_string()], "ReplacingMergeTree() ORDER BY id"));
+        // No sorting key but nothing collapses either: allowed, just
+        // unsorted.
+        assert!(!unkeyed_collapsing(&[], "MergeTree() ORDER BY tuple()"));
+        assert!(!unkeyed_collapsing(&[], "ReplicatedMergeTree() ORDER BY tuple()"));
+    }
+
     /// The insert-only shape rule (design §14, MASTER M-26): the engine's
     /// version and is_deleted arguments must BE the bookkeeping pair. The
     /// spellings are `system.tables.engine_full` as ClickHouse 24.8 renders
