@@ -1354,6 +1354,14 @@ async fn run_group_mysql(
     // the rows those watermarks described are gone). A marker written up here
     // would be deleted by the bootstrap that follows it, and the next run
     // would adopt whatever server it found — measured exactly that way.
+    //
+    // resolve_names first: the marker read below is the lane's EARLIEST
+    // parts-asking call (dest_pg's state table lives in each member's
+    // resolved schema), and parts_of asserts every member is resolved before
+    // its first lease key. The check landed between the two and panicked the
+    // MySQL -> Postgres lane on a bare name (deep review 3's gate leg).
+    let members: Vec<String> = ctxs.iter().map(|c| c.dest_table.clone()).collect();
+    dest.resolve_names(&members).await?;
     let server = mysource::server_identity(&pool).await?;
     let mut adopt: Vec<(String, String)> = Vec::new();
     for c in &ctxs {
@@ -1397,10 +1405,9 @@ async fn run_group_mysql(
     }
 
     // THE TENURE — the MySQL twin of the Postgres path above, for the same
-    // reason and with the same artifact.
+    // reason and with the same artifact. (resolve_names already ran, above
+    // the server-identity check — this lane's earliest parts ask.)
     let run = crate::naming::RunId::mint_drain(&crate::pipeline::source_origin(src_url));
-    let members: Vec<String> = ctxs.iter().map(|c| c.dest_table.clone()).collect();
-    dest.resolve_names(&members).await?;
     let tenure = Arc::new(Tenure::acquire(dest.clone(), &members, run).await?);
 
     // Everything from here is inside one arm so the tenure is given back on
