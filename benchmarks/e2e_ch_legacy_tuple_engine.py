@@ -104,24 +104,27 @@ def main():
 
         # The 0.62.x shape: a collapsing engine over the empty sorting key.
         # The rebuild itself is the damage, live: the part write sorts by the
-        # empty key and folds both rows into one.
+        # empty key and folds both rows into one — WHICH row survives is
+        # arbitrary (the CTAS SELECT has no ORDER BY, so the part's row order
+        # is the scan's), and the leg must not pin it, only the fold.
         rebuild("ReplacingMergeTree() ORDER BY tuple()")
+        folded = rows()
         case("the 0.62.x shape folds the table by itself (the R2 damage, rig-proven)",
-             rows() == "1:10", rows())
+             folded in ("1:10", "2:20"), folded)
         pg(f"INSERT INTO {T} VALUES (3, 30)")
         r = drain()
         err = (r.stdout + r.stderr)
         case("the drain REFUSES the collapsing engine over tuple()",
              r.returncode != 0 and "ORDER BY tuple()" in err and "Re-bootstrap" in err,
              err.strip().splitlines()[-1][:160] if err.strip() else "")
-        case("and nothing landed (the window stays pending)", rows() == "1:10", rows())
+        case("and nothing landed (the window stays pending)", rows() == folded, rows())
 
         # Control 1: the same empty key on a plain MergeTree collapses
         # nothing — allowed, and the pending change lands through it.
         rebuild("MergeTree() ORDER BY tuple()")
         r = drain()
         case("control: MergeTree over tuple() drains, and lands the pending row",
-             r.returncode == 0 and rows() == "1:10,3:30",
+             r.returncode == 0 and rows() == f"{folded},3:30",
              (r.stdout + r.stderr).strip()[-200:] if r.returncode else "")
 
         # Control 2: a collapsing engine WITH its key — the D9 note's
@@ -130,7 +133,7 @@ def main():
         rebuild("ReplacingMergeTree() ORDER BY id")
         r = drain()
         case("control: ReplacingMergeTree ORDER BY id drains and applies",
-             r.returncode == 0 and rows() == "1:11,3:30",
+             r.returncode == 0 and ch(f"SELECT v FROM {T} WHERE id = 1") == "11",
              (r.stdout + r.stderr).strip()[-200:] if r.returncode else "")
 
         # The refusal's remedy, executed: clear the state row, re-bootstrap
