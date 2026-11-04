@@ -428,8 +428,19 @@ def one_run():
     threading.Thread(target=pump, daemon=True).start()
 
     if not _rig.wait_for(lambda: len(copy_pids()) >= PARALLEL, 30, 0.05):
+        # 30 s of 0.05 s polls cannot miss pipes that lived through an
+        # 11 s load: "never saw N backends" far more often means the child
+        # died before opening them (a destination blip) than a fast rig.
+        # Kill it and say WHICH, with its own last words as evidence.
         child.kill()
-        _rig.rig_fail(f"rig too fast: never saw {PARALLEL} COPY OUT backends")
+        child.wait(timeout=10)
+        tail = (child.stderr.read() or "").strip().splitlines()[-3:]
+        _rig.rig_fail(
+            f"never saw {PARALLEL} COPY OUT backends in 30 s — the rig being "
+            f"too fast cannot explain that (the load runs ~11 s); the child "
+            f"most likely failed before opening its pipes. its stderr tail: "
+            f"{tail if tail else '(empty)'}"
+        )
     if ENGINE == "bq":
         # The run must have begun on the destination before the kill. The
         # spec asks for a RUNNING LOAD job; measured on both wheels, this
