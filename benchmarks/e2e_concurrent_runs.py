@@ -319,7 +319,9 @@ print("== leg 5: the refusal is a catchable TYPE, not a message to regex ==")
 # The overlap is GATED the same way leg 1 gates it — B starts only once A has a
 # staging table. That is not the test being soft on itself: an ungated start is
 # a different scenario with a different answer, and leg 6 is where it lives.
-reset(rows=400_000)
+# 2M rows for the same reason as leg 1: A must still be RUNNING when B's
+# startup and scan complete, and 400k lands inside them on a fast box.
+reset(2_000_000)
 probe = f"""
 import apitap, threading, time, subprocess
 assert issubclass(apitap.LockedError, RuntimeError), "must stay catchable as RuntimeError"
@@ -371,7 +373,9 @@ print("== leg 6: two runs starting in the SAME INSTANT ==")
 # what it costs is the other branch: when each run sees the other, BOTH yield,
 # and nothing is written at all. That is the documented trade, and it is why the
 # destination is checked as "whole or untouched" rather than "whole".
-reset(rows=400_000)
+# 2M rows: "never two winners" needs the two runs to actually meet, and two
+# simultaneous 400k loads can straddle each other's startup on a fast box.
+reset(2_000_000)
 want = src(f"SELECT count(*) FROM {T}")
 burst = f"""
 import apitap, threading
