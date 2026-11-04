@@ -59,7 +59,7 @@ df = apitap.read(src, table="public.orders").to_polars()                 # or .l
 | **DataFrames** | `apitap.read()` → polars, pyarrow, duckdb, pandas through the Arrow C stream protocol, zero-copy, no pyarrow dependency |
 | **Runtime** | CPython ≥ 3.9, one `abi3` wheel (`manylinux_x86_64`); the engine is Rust, nothing in the data path is Python |
 | **Memory** | bounded by *pipes × buffers*, planned from the container's cgroup limits — never by table size; a 256 MB container moves 100 GB |
-| **Version** | 0.63.0 — pin exactly while pre-1.0 (`apitap==0.63.0`) |
+| **Version** | 0.64.0 — pin exactly while pre-1.0 (`apitap==0.64.0`) |
 | **License** | MIT |
 
 ## Why apitap
