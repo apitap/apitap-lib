@@ -549,14 +549,22 @@ apitap.transfer(
   JSON-typed columns — the text is valid JSON; `PARSE_JSON` works on read);
   exotic types (arrays, ranges, `inet`, …) are rejected loudly — cast them
   in a source view. The CSV lane keeps the JSON column type.
-- **Types** (Postgres route): int2/4/8 → INT64; `boolean` → INT64 0/1;
+- **Types** (Postgres route): int2/4/8 → INT64; `boolean` → BOOL;
   float4/8 → FLOAT64; `numeric(p,s)` → NUMERIC or BIGNUMERIC by precision
   (values are shipped as strings, so they stay EXACT — no double round-trip);
-  unconstrained `numeric` → BIGNUMERIC (a value beyond its 38.38 digits fails
-  the load loudly); `date` → DATE; `timestamptz` → TIMESTAMP; `timestamp` →
-  DATETIME; `json`/`jsonb` → JSON; `uuid`, `text`, and everything else
-  (including `bytea`, as its hex form) → STRING. Explicit schema — nothing is
+  unconstrained `numeric` → BIGNUMERIC, exact (a value beyond its 38
+  fractional digits is refused, never rounded); `bytea` → BYTES; `date` →
+  DATE; `timestamptz` → TIMESTAMP; `timestamp` → DATETIME; `json`/`jsonb`,
+  `uuid`, `text` and everything else → STRING. The type depends on the
+  source column only, never on the lane a run happened to take. MySQL's
+  `binary`/`varbinary`/`blob`/`bit` → BYTES. Explicit schema — nothing is
   inferred. `?location=EU` pins the location when apitap creates the dataset.
+- **Tables made before 0.65.0** keep their column types on append: a
+  `boolean` an older release made INT64, a `bytea` it made STRING (its
+  `\x`-hex text) and an unconstrained `numeric` it made FLOAT64 stay that way
+  — the text lane fills them as before, and a binary-lane run that cannot is
+  refused naming the remedy. A `mode="replace"` rebuilds the table with the
+  0.65.0 types.
 - **Incremental**: `mode="append"` with the `_apitap_state` watermark table in
   the dataset, exactly like the other destinations. The state MERGE runs right
   after the copy job commits (BigQuery has no cross-statement transaction);

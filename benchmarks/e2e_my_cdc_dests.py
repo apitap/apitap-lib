@@ -204,7 +204,139 @@ def main_ch():
     print("✓ MySQL CDC into ClickHouse: a DECIMAL is spelled the same by the bulk load and the binlog")
 
 
+# ── BigQuery (D8) ───────────────────────────────────────────────────────────
+# MySQL's binary columns land BYTES in BigQuery from 0.65.0 (0.64.0 refused
+# them at the bootstrap). The CDC apply read every BYTES cell as Postgres's
+# `\x`-hex text (FROM_HEX(SUBSTR(c, 3))), while the MySQL lane ships raw
+# bytes: BIT(1) 0x01 would land as empty bytes, silently, and bytes that are
+# not UTF-8 would wedge the lane. Every binary cell is digest-checked.
+TB, TBK, TBC = "mycdc_bq_bin", "mycdc_bq_binkey", "mycdc_bq_bin_cl"
+BQ_ROW = {
+    TB: "ARRAY_TO_STRING([CAST(id AS STRING), IFNULL(UPPER(TO_HEX(b)), 'N'), IFNULL(UPPER(TO_HEX(bn)), 'N'), "
+        "IFNULL(UPPER(TO_HEX(bt)), 'N'), IFNULL(UPPER(TO_HEX(vb)), 'N'), "
+        "IFNULL(UPPER(TO_HEX(CAST(t AS BYTES))), 'N')], '|')",
+    TBK: "ARRAY_TO_STRING([UPPER(TO_HEX(k)), IFNULL(UPPER(TO_HEX(b)), 'N'), CAST(v AS STRING)], '|')",
+}
+BQ_ROW[TBC] = BQ_ROW[TB]
+MY_BQ_ROW = {
+    TB: "CONCAT_WS('|', id, IFNULL(HEX(b), 'N'), IFNULL(HEX(bn), 'N'), IFNULL(LPAD(HEX(bt), 2, '0'), 'N'), "
+        "IFNULL(HEX(vb), 'N'), IFNULL(HEX(t), 'N'))",
+    TBK: MY_ROW[TK],
+}
+MY_BQ_ROW[TBC] = MY_BQ_ROW[TB]
+
+
+def bq_env():
+    import os
+    import requests
+    from google.oauth2 import service_account
+    import google.auth.transport.requests as gt
+    project = os.environ.get("BQ_PROJECT", "apitap")
+    ds = os.environ.get("BQ_DATASET", "apitap_cdc_e2e")
+    creds = service_account.Credentials.from_service_account_file(
+        os.environ["BQ_SA"], scopes=["https://www.googleapis.com/auth/bigquery"])
+
+    def bq(sql):
+        creds.refresh(gt.Request())
+        r = requests.post(
+            f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/queries",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            json={"query": sql, "useLegacySql": False, "timeoutMs": 120000, "location": "US"})
+        j = r.json()
+        if r.status_code >= 400 or j.get("jobComplete") is False:
+            raise RuntimeError(f"BQ query failed: {j.get('error', j)}")
+        return [[c.get("v") for c in row.get("f", [])] for row in j.get("rows", [])]
+    url = f"bigquery://{project}/{ds}?credentials={os.environ['BQ_SA']}"
+    return bq, ds, url
+
+
+def main_bq():
+    bq, ds, url = bq_env()
+
+    def bq_wipe():
+        for t in (TB, TBK, TBC):
+            my(f"DROP TABLE IF EXISTS {t}")
+            try:
+                bq(f"DROP VIEW IF EXISTS `{ds}.{t}__current`")
+            except Exception:
+                pass
+            for x in (t, f"{t}__apitap_cl", f"{t}__apitap_cdc"):
+                try:
+                    bq(f"DROP TABLE IF EXISTS `{ds}.{x}`")
+                except Exception:
+                    pass
+            for st in ("_apitap_state", "_apitap_cdc_pending"):
+                try:
+                    bq(f"DELETE FROM `{ds}.{st}` WHERE dest_table = '{t}'")
+                except Exception:
+                    pass
+
+    def bq_agree(table, stage):
+        rel = f"{table}__current" if table == TBC else table
+        s = sorted(my(f"SELECT {MY_BQ_ROW[table]} FROM {table}").splitlines())
+        d = sorted(r[0] for r in bq(f"SELECT {BQ_ROW[table]} FROM `{ds}.{rel}`"))
+        if s != d:
+            only_s = sorted(set(s) - set(d))[:5]
+            only_d = sorted(set(d) - set(s))[:5]
+            raise AssertionError(f"{table} {stage}: source {len(s)} rows vs BigQuery {len(d)}\n"
+                                 f"  source only: {only_s}\n  BigQuery only: {only_d}")
+        h = hashlib.sha256("\n".join(s).encode()).hexdigest()[:12]
+        print(f"  {table} {stage}: {len(s)} rows, digest {h} on both sides", flush=True)
+
+    def bq_drain(t):
+        return apitap.transfer(MY, url, table=t, mode="log_based", changelog=(t == TBC))
+
+    bq_wipe()
+    try:
+        for t in (TB, TBC):
+            my(f"CREATE TABLE {t} (id int PRIMARY KEY, b blob, bn binary(4), bt bit(1), vb varbinary(16), t text)")
+            my(f"INSERT INTO {t} SELECT n, UNHEX(LPAD(HEX(n), 4, '0')), UNHEX('0A0B0C0D'), b'1', UNHEX('41'), "
+               f"CONCAT('row ', n) FROM (SELECT 1 n UNION SELECT 2 UNION SELECT 3 UNION SELECT 4) s")
+        my(f"CREATE TABLE {TBK} (k binary(16) PRIMARY KEY, b blob, v int)")
+        my(f"INSERT INTO {TBK} VALUES (UNHEX('00112233445566778899AABBCCDDEE00'), UNHEX('00'), 1), "
+           f"(UNHEX('FF112233445566778899AABBCCDDEEFF'), UNHEX('5C313031'), 2), "
+           f"(UNHEX('01000000000000000000000000000000'), NULL, 3)")
+        # 0.65.0 opened the bulk lane for MySQL's binary columns into BigQuery
+        # (BYTES); 0.64.0 refused them at the bootstrap. A refusal now fails.
+        bq_drain(TB)
+        bq_agree(TB, "after the bootstrap")
+        for t in (TBK, TBC):
+            bq_drain(t)
+            bq_agree(t, "after the bootstrap")
+
+        # Hostile bytes through the binlog: NUL, invalid UTF-8, a `\101` escape,
+        # BIT 0 and 1 (0x01 is what decoded to empty bytes).
+        for t in (TB, TBC):
+            my(f"INSERT INTO {t} VALUES "
+               f"(10, UNHEX('00'), UNHEX('00000001'), b'0', UNHEX('FF00'), 'nul'), "
+               f"(11, UNHEX('5C313031'), UNHEX('5C783030'), b'1', UNHEX('5C'), 'esc'), "
+               f"(12, UNHEX('090A0D5C'), UNHEX('FFFEFDFC'), b'1', UNHEX(''), 'tabs'), "
+               f"(13, NULL, NULL, NULL, NULL, NULL)")
+            my(f"UPDATE {t} SET b = UNHEX('C328') WHERE id = 2")
+            my(f"UPDATE {t} SET id = 102, b = UNHEX('00FF00') WHERE id = 3")
+            my(f"DELETE FROM {t} WHERE id = 4")
+        my(f"UPDATE {TBK} SET b = UNHEX('FF'), v = 10 WHERE k = UNHEX('00112233445566778899AABBCCDDEE00')")
+        my(f"UPDATE {TBK} SET k = UNHEX('00000000000000000000000000000000') "
+           f"WHERE k = UNHEX('FF112233445566778899AABBCCDDEEFF')")
+        my(f"DELETE FROM {TBK} WHERE k = UNHEX('01000000000000000000000000000000')")
+        my(f"INSERT INTO {TBK} VALUES (UNHEX('0A090D5C000000000000000000000000'), UNHEX('5C783431'), 4)")
+        for t in (TB, TBK, TBC):
+            bq_drain(t)
+            bq_agree(t, "after drain 1")
+
+        for t in (TB, TBC):
+            my(f"UPDATE {t} SET vb = UNHEX('80'), bt = b'0' WHERE id IN (1, 10, 11)")
+            my(f"DELETE FROM {t} WHERE id = 12")
+        my(f"UPDATE {TBK} SET v = v + 1")
+        for t in (TB, TBK, TBC):
+            bq_drain(t)
+            bq_agree(t, "after drain 2")
+    finally:
+        bq_wipe()
+    print("✓ MySQL CDC into BigQuery: binary cells land BYTES as the source holds them (replica and changelog)")
+
+
 if __name__ == "__main__":
     dest = sys.argv[1:]
-    assert dest in (["pg"], ["ch"]), "usage: e2e_my_cdc_dests.py pg|ch"
-    main_pg() if dest == ["pg"] else main_ch()
+    assert dest in (["pg"], ["ch"], ["bq"]), "usage: e2e_my_cdc_dests.py pg|ch|bq"
+    {"pg": main_pg, "ch": main_ch, "bq": main_bq}[dest[0]]()

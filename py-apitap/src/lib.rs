@@ -221,6 +221,7 @@ fn transfer(
         changelog,
         slots,
         slots_auto,
+        publish_empty: false,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
     let out = py.detach(|| {
@@ -299,6 +300,7 @@ fn transfer_many(
         changelog,
         slots,
         slots_auto,
+        publish_empty: false,
     };
     let cdc = matches!(opts.mode, apitap_core::Mode::LogBased);
     let out = py.detach(|| {

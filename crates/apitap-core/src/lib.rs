@@ -268,6 +268,13 @@ pub struct TransferOptions {
     /// per ~0.25 core, clamped to the table count and 8). Measured basis:
     /// 0.5 core -> 2 slots delivered 2.96M changes/min (§14.9).
     pub slots_auto: bool,
+    /// Internal, set only by a log_based bootstrap's full load: a Replace that
+    /// read 0 rows still publishes an EMPTY destination table (D4). The 0-row
+    /// guard keeps a bulk replace from wiping a destination on an empty read;
+    /// a CDC bootstrap is the opposite case, because every later window needs
+    /// the target to exist and a re-bootstrap must not keep stale rows.
+    #[doc(hidden)]
+    pub publish_empty: bool,
 }
 
 impl Default for TransferOptions {
@@ -288,6 +295,7 @@ impl Default for TransferOptions {
             partition_by_per_table: std::collections::HashMap::new(),
             order_by_per_table: std::collections::HashMap::new(),
             changelog: false,
+            publish_empty: false,
         }
     }
 }

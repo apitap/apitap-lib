@@ -71,9 +71,10 @@ def pg(sql):
 
 
 # The digest both sides must agree on: id|v|big|flag(1/0)|blob, NULLs as <N>,
-# ordered by id. The bulk bootstrap stored pg boolean as INT64 (1/0) and pg
-# bytea as STRING in its WAL '\xHEX' text form — the CDC path must reproduce
-# both exactly, so the ground truth renders bytea the same way ('\x'||hex).
+# ordered by id. A pg boolean is BOOL in BigQuery from 0.65.0 on (N19; an
+# older bootstrap on the text lane made it INT64), so the flag is read as 1/0
+# whichever it is. A pg bytea is BYTES from 0.65.0 (STRING in its WAL
+# '\xHEX' text form before); both sides render it as that '\x'||hex text.
 def pg_digest():
     rows = pg(
         "SELECT id, COALESCE(v,'<N>'), COALESCE(big,'<N>'), "
@@ -85,11 +86,16 @@ def pg_digest():
 
 
 def bq_digest():
+    # A bytea is BYTES from 0.65.0 (STRING `\\x`-hex text before): read as the
+    # same `\\x`-hex text either way.
+    ty = bq(f"SELECT data_type FROM `{PROJECT}.{DATASET}`.INFORMATION_SCHEMA.COLUMNS "
+            f"WHERE table_name = '{T}' AND column_name = 'blob'")
+    blob = ("CONCAT('\\\\x', LOWER(TO_HEX(blob)))" if ty and ty[0][0] == "BYTES" else "blob")
     rows = bq(
         "SELECT STRING_AGG(line, '\\n' ORDER BY id) FROM ("
         "SELECT id, CONCAT(CAST(id AS STRING), '|', IFNULL(v,'<N>'), '|', "
-        "IFNULL(big,'<N>'), '|', IFNULL(CAST(flag AS STRING),'<N>'), "
-        "'|', IFNULL(blob,'<N>'), '|', IFNULL(CAST(UNIX_SECONDS(ts) AS STRING),'<N>')) AS line "
+        "IFNULL(big,'<N>'), '|', IFNULL(CAST(CAST(flag AS INT64) AS STRING),'<N>'), "
+        f"'|', IFNULL({blob},'<N>'), '|', IFNULL(CAST(UNIX_SECONDS(ts) AS STRING),'<N>')) AS line "
         f"FROM `{PROJECT}.{DATASET}.{T}`)")
     return (rows[0][0] if rows and rows[0] and rows[0][0] else "")
 

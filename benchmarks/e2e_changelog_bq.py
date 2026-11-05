@@ -417,7 +417,8 @@ ok &= current_matches("after-toast")
 print("== BOOL PK + untouched BYTEA: the masked readback is typed, not a rendering ==")
 # The same window as above, on the two spellings the readback used to get
 # wrong. A BOOLEAN key: the WAL spells it `t`/`f` and the destination stores
-# it INTEGER 1/0, so the old CAST(col AS STRING) = '<text>' predicate matched
+# it BOOL (INTEGER 1/0 before 0.65.0, N19 — read here as an INT64 either way),
+# so the old CAST(col AS STRING) = '<text>' predicate matched
 # no row, the window was refused torn and the drain wedged. A BYTES column:
 # the old readback selected CAST(blob AS STRING) — BigQuery's UTF-8 reading
 # of raw bytes — while the apply's cast is FROM_HEX(SUBSTR(c, 3)).
@@ -452,9 +453,9 @@ except Exception as e:
     print(f"   ✗ the drain refused a BOOL key's masked BYTES readback: {e}")
     ok = False
 want = hashlib.sha256(b"\xde\xad\xbe\xef" * (BL // 4)).hexdigest()
-newest = bq(f"SELECT TO_HEX(SHA256(blob)) FROM `{DS}.{TB}` WHERE g = 1 AND _apitap_op='U' "
+newest = bq(f"SELECT TO_HEX(SHA256(blob)) FROM `{DS}.{TB}` WHERE CAST(g AS INT64) = 1 AND _apitap_op='U' "
             f"ORDER BY _apitap_lsn DESC, _apitap_seq DESC LIMIT 1")
-cur = bq(f"SELECT TO_HEX(SHA256(blob)) FROM `{DS}.{TB}__current` WHERE g = 1")
+cur = bq(f"SELECT TO_HEX(SHA256(blob)) FROM `{DS}.{TB}__current` WHERE CAST(g AS INT64) = 1")
 good = (bool(newest) and newest[0][0] == want) and (bool(cur) and cur[0][0] == want)
 print(f"   {'✓' if good else '✗'} the masked U record's blob is the raw bytes: U "
       f"{newest[0][0] if newest else '<none>'}, __current {cur[0][0] if cur else '<none>'} "

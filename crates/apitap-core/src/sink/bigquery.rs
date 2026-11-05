@@ -98,6 +98,9 @@ pub(crate) struct BqConn {
     /// Where this connection's jobs run: `location` when the URL names one,
     /// else the dataset's own, asked once (see `job_location`).
     job_loc: Arc<tokio::sync::OnceCell<String>>,
+    /// The project refused a DML statement (a sandbox / free-tier project):
+    /// state rows go back to load jobs for the rest of this connection (D19).
+    dml_refused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Vet one BigQuery identifier before it is pasted between backticks.
@@ -214,6 +217,7 @@ impl BqConn {
             dataset,
             location,
             job_loc: Arc::new(tokio::sync::OnceCell::new()),
+            dml_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -380,6 +384,14 @@ impl BqConn {
     }
 
     /// Run a standard-SQL query and return rows as text cells (None = NULL).
+    ///
+    /// Every page (D3). jobs.query and getQueryResults answer at most ~10 MB
+    /// per response; past that the answer is jobComplete=true, a pageToken and
+    /// SOME of the rows. A changelog window's masked readback is routinely
+    /// past it, and a first-page-only reader made every key beyond the page
+    /// look absent — "the window is torn" on every run. The pages are followed
+    /// to the end and the count is checked against totalRows, so an answer cut
+    /// short is an error, never a smaller result.
     async fn query(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         let mut body = json!({
             "query": sql, "useLegacySql": false, "timeoutMs": 60_000,
@@ -387,41 +399,105 @@ impl BqConn {
         if let Some(loc) = &self.location {
             body["location"] = json!(loc);
         }
-        let v = self
+        let mut v = self
             .api(
                 reqwest::Method::POST,
                 format!("{BQ_BASE}/projects/{}/queries", self.project),
                 Some(&body),
             )
             .await?;
-        if v["jobComplete"].as_bool() != Some(true) {
-            // One long-poll retry via getQueryResults; queries here are tiny.
-            let job_id = v["jobReference"]["jobId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let loc = v["jobReference"]["location"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let v2 = self
-                .api(
-                    reqwest::Method::GET,
-                    format!(
-                        "{BQ_BASE}/projects/{}/queries/{job_id}?timeoutMs=60000&location={loc}",
-                        self.project
-                    ),
-                    None,
-                )
-                .await?;
-            if v2["jobComplete"].as_bool() != Some(true) {
+        let job_id = v["jobReference"]["jobId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let loc = v["jobReference"]["location"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let results = |token: Option<&str>| {
+            let mut url = format!(
+                "{BQ_BASE}/projects/{}/queries/{}?timeoutMs=60000&location={}",
+                self.project,
+                crate::sink::s3::enc_seg(&job_id),
+                crate::sink::s3::enc_seg(&loc),
+            );
+            if let Some(t) = token {
+                url.push_str(&format!("&pageToken={}", crate::sink::s3::enc_seg(t)));
+            }
+            url
+        };
+        // Each getQueryResults long-polls up to 60 s; a query that is still
+        // running after five of them is not one of this crate's reads.
+        let mut waits = 0;
+        while v["jobComplete"].as_bool() != Some(true) {
+            waits += 1;
+            if waits > 5 || job_id.is_empty() {
                 return Err(Error::Transfer(format!(
                     "bigquery query did not complete in time: {sql}"
                 )));
             }
-            return Ok(rows_of(&v2));
+            v = self
+                .api(reqwest::Method::GET, results(None), None)
+                .await?;
         }
-        Ok(rows_of(&v))
+        let total = v["totalRows"].as_str().and_then(|s| s.parse::<usize>().ok());
+        let mut rows = rows_of(&v);
+        let mut token = v["pageToken"].as_str().map(str::to_string);
+        while let Some(t) = token {
+            let page = self
+                .api(reqwest::Method::GET, results(Some(&t)), None)
+                .await?;
+            let more = rows_of(&page);
+            token = page["pageToken"].as_str().map(str::to_string);
+            if more.is_empty() && token.is_some() {
+                return Err(Error::Transfer(format!(
+                    "bigquery query result: an empty page with another page after it: {sql}"
+                )));
+            }
+            rows.extend(more);
+        }
+        if let Some(total) = total {
+            if rows.len() != total {
+                return Err(Error::Transfer(format!(
+                    "bigquery query result cut short: {} of {total} rows read: {sql}",
+                    rows.len()
+                )));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Append bulk state rows to `_apitap_state` (D19), as ONE DML INSERT.
+    ///
+    /// Each was its own load job, and every table of a dataset writes its
+    /// state into this one table: BigQuery allows 1,500 table modifications
+    /// per table per day and five metadata updates per ten seconds, so 70
+    /// tables synced hourly (or 6 every five minutes) ran out by the
+    /// evening, and many tables finishing together exhausted the retries —
+    /// each time AFTER the copy job had committed the data. DML statements
+    /// do not count toward the daily modifications, and are not held to the
+    /// five-per-ten-seconds rate (BigQuery quotas page). The INSERT is one
+    /// statement, so a barrier and its state row still commit together.
+    ///
+    /// A sandbox project refuses DML; there the rows go as a load job, as
+    /// before, and the refusal is remembered for the rest of the connection.
+    pub(crate) async fn append_state(&self, ndjson: Vec<u8>) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if !self.dml_refused.load(Ordering::Relaxed) {
+            match self.cdc_script(&state_insert_sql(&self.state_fq(), &ndjson)?).await {
+                Ok(()) => return Ok(()),
+                Err(Error::Transfer(m)) if dml_unavailable(&m) => {
+                    self.dml_refused.store(true, Ordering::Relaxed);
+                    crate::progress::note(
+                        "_apitap_state: this project refuses DML (sandbox / no billing) — \
+                         state rows are written with load jobs, which count toward \
+                         BigQuery's 1,500 table modifications per day",
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.load_rows(STATE_TABLE, ndjson).await
     }
 
     /// Load a handful of NDJSON rows into `table` with one multipart load job.
@@ -1022,6 +1098,56 @@ fn is_conflict(m: &str) -> bool {
 /// were escaped, control characters were not: a raw newline is "Unclosed
 /// string literal", so a text key holding one made the readback / MERGE
 /// script fail on every replay of the window (P2, R2-26 L1).
+/// Whether a failed statement says the project cannot run DML at all (the
+/// BigQuery sandbox / a project without billing), as opposed to this
+/// statement failing.
+fn dml_unavailable(m: &str) -> bool {
+    m.contains("billingNotEnabled")
+        || m.contains("DML queries are not allowed in the free tier")
+        || m.contains("Billing has not been enabled")
+}
+
+/// The NDJSON state rows `state_row` renders, as one INSERT into `fq`.
+/// Every value is a literal of the column's own type; a missing field is
+/// NULL, as the load job reads it.
+fn state_insert_sql(fq: &str, ndjson: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(ndjson)
+        .map_err(|_| Error::Transfer("bigquery state rows: not UTF-8".into()))?;
+    let mut tuples = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: Value = serde_json::from_str(line)
+            .map_err(|e| Error::Transfer(format!("bigquery state row: {e}")))?;
+        let s = |k: &str| match v[k].as_str() {
+            Some(x) => format!("'{}'", sql_str(x)),
+            None => "NULL".to_string(),
+        };
+        let rows = match &v["last_rows"] {
+            Value::Number(n) => n.to_string(),
+            _ => "NULL".to_string(),
+        };
+        let at = match v["synced_at"].as_str() {
+            Some(x) => format!("TIMESTAMP '{}'", sql_str(x)),
+            None => "NULL".to_string(),
+        };
+        tuples.push(format!(
+            "({}, {}, {}, {}, {}, {rows}, {at})",
+            s("dest_table"),
+            s("source_id"),
+            s("cursor_col"),
+            s("watermark"),
+            s("mode"),
+        ));
+    }
+    if tuples.is_empty() {
+        return Err(Error::Transfer("bigquery state rows: none to write".into()));
+    }
+    Ok(format!(
+        "INSERT INTO {fq} (dest_table, source_id, cursor_col, watermark, mode, last_rows, synced_at) \
+         VALUES {}",
+        tuples.join(", ")
+    ))
+}
+
 pub(crate) fn sql_str(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1424,6 +1550,89 @@ mod retry_tests {
 // ============================================================================
 // Types: what the TSV lane delivers → BigQuery standard SQL types
 // ============================================================================
+
+/// A binary source column: a Postgres `bytea`, or MySQL's BINARY, VARBINARY,
+/// BLOB family and BIT. All land BYTES in BigQuery from 0.65.0. By engine:
+/// a Postgres `bit` is a bit string, not bytes, and MySQL's `geometry` is
+/// not read as bytes at all.
+fn bq_bytes_col(engine: &str, c: &crate::plan::ColumnPlan) -> bool {
+    match engine {
+        "postgres" => c.udt == "bytea",
+        "mysql" => matches!(
+            c.udt.as_str(),
+            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" | "bit"
+        ),
+        _ => false,
+    }
+}
+
+/// The binary (parquet) lane's gate for BigQuery: the shared one, plus binary
+/// columns, which it writes as BYTE_ARRAY (BigQuery BYTES). The shared gate
+/// keeps them out for the other parquet sinks.
+fn bq_parquet_col_ok(engine: &str, c: &crate::plan::ColumnPlan) -> bool {
+    crate::wire::bqparquet::parquet_col_ok(engine, &c.udt, c.precision) || bq_bytes_col(engine, c)
+}
+
+/// A Postgres `numeric` declared without a precision.
+fn unconstrained_numeric(c: &crate::plan::ColumnPlan) -> bool {
+    c.udt == "numeric" && c.precision.is_none()
+}
+
+/// The columns of `plan` passing `pick` that `meta` (a tables.get answer)
+/// declares as one of `types` — the legacy spellings an existing target keeps.
+fn held_as(
+    meta: &Value,
+    plan: &TablePlan,
+    types: &[&str],
+    pick: impl Fn(&crate::plan::ColumnPlan) -> bool,
+) -> std::collections::HashSet<String> {
+    let typed: std::collections::HashSet<&str> = meta["schema"]["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["type"].as_str().is_some_and(|t| types.contains(&t)))
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    plan.cols
+        .iter()
+        .filter(|c| pick(c) && typed.contains(c.name.as_str()))
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// The binary columns of `plan` that `meta` declares as STRING — what the
+/// text lane created for a Postgres `bytea` before 0.65.0.
+fn bytes_cols_held_as_string(meta: &Value, plan: &TablePlan) -> std::collections::HashSet<String> {
+    let str_cols: std::collections::HashSet<&str> = meta["schema"]["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["type"].as_str() == Some("STRING"))
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    plan.cols
+        .iter()
+        .filter(|c| bq_bytes_col(plan.engine, c) && str_cols.contains(c.name.as_str()))
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// The Postgres `bool` columns of `plan` that `meta` (a tables.get answer)
+/// declares as an integer — what the TSV lane created before N19.
+fn bool_cols_held_as_int(meta: &Value, plan: &TablePlan) -> std::collections::HashSet<String> {
+    let int_cols: std::collections::HashSet<&str> = meta["schema"]["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| matches!(f["type"].as_str(), Some("INTEGER" | "INT64")))
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    plan.cols
+        .iter()
+        .filter(|c| c.udt == "bool" && int_cols.contains(c.name.as_str()))
+        .map(|c| c.name.clone())
+        .collect()
+}
 
 fn bq_type_of(d: &Delivered) -> &'static str {
     match d {
@@ -2081,6 +2290,18 @@ pub(crate) struct BqSink {
     /// the staged watermark without a billed query against staging.
     cursor_track: Option<(usize, bool)>,
     staged_wm: Arc<std::sync::Mutex<Option<String>>>,
+    /// A 0-row Replace still publishes an empty table (D4): set for a
+    /// log_based bootstrap's load, never for a user's bulk replace.
+    pub(crate) publish_empty: bool,
+    /// Postgres `bool` columns an EXISTING target holds as INT64 (N19): the
+    /// TSV lane used to create them that way. Read by `dest_state`.
+    bool_as_int: std::collections::HashSet<String>,
+    /// Binary columns an EXISTING target holds as STRING: before 0.65.0 a
+    /// Postgres `bytea` landed as its `\\x`-hex text. Read by `dest_state`.
+    bytes_as_string: std::collections::HashSet<String>,
+    /// Unconstrained Postgres `numeric` columns an EXISTING target holds as
+    /// FLOAT64 — what every release before 0.65.0 created. Read by `dest_state`.
+    num_as_float: std::collections::HashSet<String>,
 }
 
 impl BqSink {
@@ -2155,11 +2376,65 @@ impl BqSink {
             mode_str: "replace",
             cursor_track: None,
             staged_wm: Arc::new(std::sync::Mutex::new(None)),
+            publish_empty: false,
+            bool_as_int: std::collections::HashSet::new(),
+            bytes_as_string: std::collections::HashSet::new(),
+            num_as_float: std::collections::HashSet::new(),
         })
     }
 
     fn fq(&self, table: &str) -> String {
         format!("`{}.{}.{table}`", self.conn.project, self.conn.dataset)
+    }
+
+    /// A column's BigQuery type. One per SOURCE type, whichever lane runs
+    /// (N19): the TSV lane delivers a Postgres `bool` as 0/1 and the parquet
+    /// lane as a boolean, and the lane flips with the pipe count — so the
+    /// table was INT64 on a small worker and BOOL on a big one, an append
+    /// across the two failed and a replace retyped the column. A `bool` is
+    /// BOOL (BigQuery's CSV reader takes 1/0 for one). A target an older
+    /// release already made INT64 keeps INT64 on the TSV lane; the parquet
+    /// lane cannot fill it and says how to realign.
+    fn col_type(
+        &self,
+        engine: &str,
+        c: &crate::plan::ColumnPlan,
+        d: &Delivered,
+    ) -> Result<&'static str> {
+        if engine == "postgres" && unconstrained_numeric(c) {
+            // BIGNUMERIC, exact: the value travels as its decimal text and
+            // BigQuery parses it. 0.64.0 typed it from the delivery, FLOAT64,
+            // and 99999999999999999.99 landed as 1e+17 with no error.
+            return Ok(if self.num_as_float.contains(&c.name) {
+                "FLOAT64"
+            } else {
+                "BIGNUMERIC"
+            });
+        }
+        if bq_bytes_col(engine, c) {
+            // BYTES on either lane; a target an older release made STRING
+            // keeps its `\\x`-hex text (`lane_ok` holds it to the text lane).
+            return Ok(if self.bytes_as_string.contains(&c.name) {
+                "STRING"
+            } else {
+                "BYTES"
+            });
+        }
+        if c.udt != "bool" {
+            return Ok(bq_type_of(d));
+        }
+        if !self.bool_as_int.contains(&c.name) {
+            return Ok("BOOL");
+        }
+        if self.parquet_lane {
+            return Err(Error::InvalidInput(format!(
+                "column {} is a boolean the destination holds as INT64 (an older apitap \
+                 created it on the text lane), and this run's binary lane writes BOOL — run \
+                 once with mode='replace' to make it BOOL, or parallel<=3 to keep the text lane",
+                c.name
+            )));
+        }
+        Ok("INT64")
     }
 
     /// Collect dead staging tables and refuse live peers.
@@ -2264,8 +2539,8 @@ impl BqSink {
         line
     }
 
-    /// Append this run's state row. The state table is APPEND-ONLY (load jobs
-    /// only — DML is rejected on sandbox/free-tier projects); readers take the
+    /// Append this run's state row. The state table is APPEND-ONLY (an INSERT,
+    /// or a load job where DML is refused — see `append_state`); readers take the
     /// newest row per (dest_table, source_id), and a replace writes a `*`
     /// barrier row that invalidates everything older.
     async fn write_state(&self, watermark: &str, rows: u64) -> Result<()> {
@@ -2275,13 +2550,13 @@ impl BqSink {
         self.ensure_state_table().await?;
         let now = self.server_now().await?;
         let row = self.state_row(now, &source_id, Some(watermark), self.mode_str, rows, 0);
-        self.conn.load_rows(STATE_TABLE, row.into_bytes()).await
+        self.conn.append_state(row.into_bytes()).await
     }
 
     /// Replace's barrier and (when a cursor is tracked) this run's own state
-    /// row land in ONE load job: a BigQuery load commits atomically, so there
-    /// is no window where the barrier exists without the state row (or vice
-    /// versa), and it halves the per-run load count on `_apitap_state`.
+    /// row land in ONE statement (or one load job): either commits atomically,
+    /// so there is no window where the barrier exists without the state row
+    /// (or vice versa).
     async fn write_barrier_and_state(&self, watermark: Option<&str>, rows: u64) -> Result<()> {
         self.ensure_state_table().await?;
         let now = self.server_now().await?;
@@ -2289,7 +2564,7 @@ impl BqSink {
         if let (Some(sid), Some(wm)) = (self.source_id.as_deref(), watermark) {
             lines.push_str(&self.state_row(now, sid, Some(wm), self.mode_str, rows, 0));
         }
-        self.conn.load_rows(STATE_TABLE, lines.into_bytes()).await
+        self.conn.append_state(lines.into_bytes()).await
     }
 
     /// `MAX(cursor)` of `table` as text, `None` when the table has no rows.
@@ -2777,10 +3052,12 @@ impl crate::sink::Sink for BqSink {
         match format {
             // Every column must decode exactly from PG binary — otherwise the
             // whole table falls through to the text lane instead of erroring.
-            WireFormat::PgCopyBinary => plan
-                .cols
-                .iter()
-                .all(|c| crate::wire::bqparquet::parquet_col_ok(plan.engine, &c.udt, c.precision)),
+            // A legacy STRING binary column holds hex text, which only the
+            // text lane writes; raw bytes must never land in it.
+            WireFormat::PgCopyBinary => {
+                self.bytes_as_string.is_empty()
+                    && plan.cols.iter().all(|c| bq_parquet_col_ok(plan.engine, c))
+            }
             _ => true,
         }
     }
@@ -2799,20 +3076,27 @@ impl crate::sink::Sink for BqSink {
         let mut names = Vec::new();
         for (c, lc) in plan.cols.iter().zip(lane.cols.iter()) {
             check_col_name(&c.name)?;
-            if self.parquet_lane
-                && !crate::wire::bqparquet::parquet_col_ok(plan.engine, &c.udt, c.precision)
-            {
+            if self.parquet_lane && !bq_parquet_col_ok(plan.engine, c) {
                 return Err(Error::InvalidInput(format!(
                     "column {} has type {} — the binary lane can't decode it; \
                      cast it in a source view (e.g. {}::text)",
                     c.name, c.udt, c.name
                 )));
             }
+            let ty = self.col_type(plan.engine, c, &lc.delivered)?;
             fields.push(json!({
-                "name": c.name, "type": bq_type_of(&lc.delivered), "mode": "NULLABLE",
+                "name": c.name, "type": ty, "mode": "NULLABLE",
             }));
             names.push(c.name.clone());
-            delivered.push(lc.delivered.clone());
+            // The text lane delivers a `bytea` as its `\\x`-hex text; bound
+            // for BYTES, the CSV writer turns that into the base64 BigQuery's
+            // CSV reader takes.
+            delivered.push(match ty {
+                "BYTES" => Delivered::Bytes,
+                // The decimal text as the source rendered it, digit for digit.
+                "BIGNUMERIC" if unconstrained_numeric(c) => Delivered::Decimal { p: 0, s: 0 },
+                _ => lc.delivered.clone(),
+            });
         }
         self.names = names;
         // No blind sweep any more. Deleting every table under the staging
@@ -2938,6 +3222,11 @@ impl crate::sink::Sink for BqSink {
                  run once with mode='replace' to realign the schema"
             )));
         }
+        self.bool_as_int = bool_cols_held_as_int(&meta, plan);
+        self.bytes_as_string = bytes_cols_held_as_string(&meta, plan);
+        self.num_as_float = held_as(&meta, plan, &["FLOAT", "FLOAT64"], |c| {
+            plan.engine == "postgres" && unconstrained_numeric(c)
+        });
         // An emptied table cannot carry a watermark — resync must work. Query
         // MAX(cursor) directly (table metadata like numRows can lag behind jobs);
         // NULL means empty (or an all-NULL cursor, same conclusion).
@@ -3070,11 +3359,39 @@ impl crate::sink::Sink for BqSink {
 }
 
 impl BqSink {
+    /// The destination, replaced by an empty table with this run's columns
+    /// (the schema `prepare` built for the load jobs).
+    async fn publish_empty_target(&self) -> Result<()> {
+        let fields = self.job_config["configuration"]["load"]["schema"]["fields"].clone();
+        if !fields.is_array() {
+            return Err(Error::Transfer(format!(
+                "bigquery: no schema to publish an empty {} with (internal: prepare did not run)",
+                self.final_table
+            )));
+        }
+        if self.conn.table_get(&self.final_table).await?.is_some() {
+            self.conn.table_delete(&self.final_table).await?;
+        }
+        self.conn.table_create(&self.final_table, &fields).await
+    }
+
     async fn finalize_inner(&self, rows: u64, mode: Mode) -> Result<()> {
         let stagings: Vec<String> = self.staging_registry.lock().expect("registry lock").clone();
         if rows == 0 {
             for t in &stagings {
                 self.conn.table_delete(t).await?;
+            }
+            // D4: a log_based bootstrap of an empty source. The 0-row guard
+            // left no target at all, so every later window failed "target
+            // does not exist" forever; and a re-bootstrap from a now-empty
+            // source kept the old rows under a fresh watermark. The bootstrap
+            // is a Replace, so it lands what the source holds: nothing, in a
+            // table with the source's columns.
+            if self.publish_empty && mode == Mode::Replace {
+                self.publish_empty_target().await?;
+                if self.conn.table_get(STATE_TABLE).await?.is_some() || self.source_id.is_some() {
+                    self.write_barrier_and_state(None, 0).await?;
+                }
             }
             return Ok(());
         }
@@ -3135,6 +3452,55 @@ impl BqSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.65.0: binary columns are BYTES on BigQuery's parquet lane too — a
+    /// Postgres `bytea` and MySQL's binary family, judged by engine (a
+    /// Postgres `bit` is a bit string; MySQL `geometry` is not bytes) — and
+    /// the gate the S3/GCS/Iceberg parquet sinks share is left as it was.
+    #[test]
+    fn binary_columns_ride_the_bigquery_parquet_lane() {
+        let col = |udt: &str| crate::plan::ColumnPlan {
+            name: "c".into(),
+            nullable: true,
+            int_pk: false,
+            native_ddl: None,
+            udt: udt.into(),
+            precision: None,
+            scale: None,
+        };
+        for udt in ["binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "bit"] {
+            assert!(super::bq_bytes_col("mysql", &col(udt)), "{udt}");
+            assert!(super::bq_parquet_col_ok("mysql", &col(udt)), "{udt}");
+        }
+        assert!(super::bq_bytes_col("postgres", &col("bytea")));
+        assert!(super::bq_parquet_col_ok("postgres", &col("bytea")));
+        assert!(!super::bq_bytes_col("postgres", &col("bit")));
+        assert!(!super::bq_bytes_col("mysql", &col("geometry")));
+        assert!(!super::bq_parquet_col_ok("mysql", &col("geometry")));
+        assert!(!super::bq_bytes_col("github+api", &col("bytea")));
+        // The shared gate is unchanged.
+        assert!(!crate::wire::bqparquet::parquet_col_ok("postgres", "bytea", None));
+        assert!(!crate::wire::bqparquet::parquet_col_ok("mysql", "blob", None));
+    }
+
+    /// D19: the state rows a load job carried, as one INSERT with the same
+    /// values — a missing field NULL, the count a number, the stamp a
+    /// TIMESTAMP — and a sandbox's DML refusal is told from a failed statement.
+    #[test]
+    fn state_rows_become_one_insert() {
+        let nd = concat!(
+            r#"{"dest_table":"t","source_id":"*","mode":"replace-barrier","last_rows":0,"synced_at":"2026-11-05T01:02:03.000004Z"}"#,
+            "\n",
+            r#"{"dest_table":"t","source_id":"pg:x","mode":"append","last_rows":12,"watermark":"o'k","cursor_col":"id","synced_at":"2026-11-05T01:02:03.001004Z"}"#,
+            "\n"
+        );
+        let sql = super::state_insert_sql("`p.d._apitap_state`", nd.as_bytes()).unwrap();
+        assert!(sql.starts_with("INSERT INTO `p.d._apitap_state` (dest_table, source_id"), "{sql}");
+        assert!(sql.contains("('t', '*', NULL, NULL, 'replace-barrier', 0, TIMESTAMP '2026-11-05T01:02:03.000004Z')"), "{sql}");
+        assert!(sql.contains("('t', 'pg:x', 'id', 'o\\'k', 'append', 12, TIMESTAMP '2026-11-05T01:02:03.001004Z')"), "{sql}");
+        assert!(super::dml_unavailable(r#"{"reason":"billingNotEnabled","message":"Billing has not been enabled for this project."}"#));
+        assert!(!super::dml_unavailable("Syntax error: Unexpected identifier"));
+    }
 
     /// P2/R2-26 L2: a 308's Range is what the session kept.
     #[test]

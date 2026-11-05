@@ -364,8 +364,10 @@ impl Dest {
     /// Destination-specific knobs for the bootstrap's full load.
     fn tweak_bootstrap_opts(&self, o2: &mut TransferOptions, pk_cols: &[String]) {
         match self {
-            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) | Dest::Bq(_) => {}
+            Dest::Pg(_) | Dest::My(_) | Dest::Ice(_) => {}
             Dest::Ch(d) => d.tweak_bootstrap_opts(o2, pk_cols),
+            // An empty source still needs its target (D4).
+            Dest::Bq(_) => o2.publish_empty = true,
         }
     }
 

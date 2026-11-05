@@ -610,14 +610,14 @@ listed rides as text):
 | `int2` · `int4` · `int8` | `Int16` · `Int32` · `Int64` | `SMALLINT` · `INT` · `BIGINT` | `INT64` | `long` |
 | `float4` · `float8` | `Float32` · `Float64` | `FLOAT` · `DOUBLE` | `FLOAT64` | `float` · `double` |
 | `numeric(p,s)`, p ≤ 38 | `Decimal(p,s)` | `DECIMAL(p,s)` (≤ 65,30) | `NUMERIC` / `BIGNUMERIC` | `decimal(p,s)` |
-| `numeric` unconstrained | `Float64` | `DOUBLE` (range-checked) | `BIGNUMERIC` | text lane |
-| `bool` | `UInt8` | `TINYINT(1)` | `BOOL` | `boolean` |
+| `numeric` unconstrained | `Float64` | `DOUBLE` (range-checked) | `BIGNUMERIC`, exact (FLOAT64 before 0.65.0) | text lane |
+| `bool` | `UInt8` | `TINYINT(1)` | `BOOL` (INT64 on the text lane before 0.65.0) | `boolean` |
 | `date` | `Date32` | `DATE` | `DATE` | `date` |
 | `timestamp` · `timestamptz` | `DateTime64(6)` · `DateTime64(6,'UTC')` | `DATETIME(6)` (UTC session) | `DATETIME` · `TIMESTAMP` | `timestamp` · `timestamptz` |
 | `uuid` | `UUID` | `CHAR(36)` | `STRING` | `string` |
 | `text` · `varchar(n)` · `bpchar` · `json` | `String` | `LONGTEXT` · `VARCHAR(n)` | `STRING` | `string` |
 | `jsonb` | `String` | `JSON` | `STRING` | `string` |
-| `bytea` | `String` | `LONGBLOB` (via HEX) | `BYTES` | `binary` |
+| `bytea` | `String` holding the `\x`-hex text | `LONGBLOB` (via HEX) | `BYTES` (STRING `\x`-hex text before 0.65.0) | `binary` |
 
 **MySQL source:** `tinyint`…`bigint` → ClickHouse `Int8`…`Int64` /
 `UInt8`…`UInt64` for `unsigned`; → Postgres `smallint`/`int`/`bigint` widened for
@@ -625,7 +625,8 @@ listed rides as text):
 `Decimal`, larger → `String` on ClickHouse; `numeric` on Postgres up to
 `DECIMAL(65)`). `datetime` → `DateTime64(6)` / `timestamp`; `timestamp` →
 `DateTime64(6,'UTC')` / `timestamptz` (sessions run UTC). `json` → `String` /
-`jsonb`; `enum`/`set`/`time` → text; `binary`/`blob`/`bit` → `String` / `bytea`.
+`jsonb`; `enum`/`set`/`time` → text; `binary`/`blob`/`bit` → `String` (the bytes) / `bytea` /
+BigQuery `BYTES` (refused before 0.65.0).
 Same-engine routes (pg → pg, my → my) mirror the source DDL verbatim, charset
 and collation included.
 

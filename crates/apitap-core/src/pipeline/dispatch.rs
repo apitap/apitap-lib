@@ -155,6 +155,9 @@ struct SinkCfg {
     /// operator looking at a listing can see which staging objects belong
     /// together. See `crate::naming::RunId`.
     run: crate::naming::RunId,
+    /// BigQuery only: publish an empty destination on a 0-row Replace — a
+    /// log_based bootstrap's load (D4, `TransferOptions::publish_empty`).
+    publish_empty: bool,
 }
 /// The run identity every bulk transfer mints, from the source ORIGIN.
 ///
@@ -396,7 +399,9 @@ impl DstScheme for BqTo {
     type Shared = BqConn;
     const BARE_DEST: bool = true;
     async fn connect(url: &str, dest_table: &str, cfg: &SinkCfg) -> Result<BqSink> {
-        BqSink::connect(url, dest_table, cfg.shape, &cfg.run).await
+        let mut s = BqSink::connect(url, dest_table, cfg.shape, &cfg.run).await?;
+        s.publish_empty = cfg.publish_empty;
+        Ok(s)
     }
     async fn shared(url: &str, _cfg: &SinkCfg) -> Result<BqConn> {
         // Authenticate once (JWT sign + OAuth round-trip live in parse) — a
@@ -406,7 +411,9 @@ impl DstScheme for BqTo {
     fn bind(shared: BqConn, table: &str, cfg: &SinkCfg) -> Result<BqSink> {
         // BigQuery has no schema qualifiers — land `public.events` as `events`.
         let bare = table.rsplit_once('.').map_or(table, |(_, b)| b);
-        BqSink::bind(shared, bare, cfg.shape, &cfg.run)
+        let mut s = BqSink::bind(shared, bare, cfg.shape, &cfg.run)?;
+        s.publish_empty = cfg.publish_empty;
+        Ok(s)
     }
 }
 
@@ -450,6 +457,7 @@ async fn one<S: SrcScheme, D: DstScheme>(
             Some(p) => mint_run_within(opts.mode, src_url, p)?,
             None => mint_run(opts.mode, src_url)?,
         },
+        publish_empty: opts.publish_empty,
     };
     let src = S::connect(src_url, shape.pipes + 1).await?;
     let sink = D::connect(dst_url, dest_table, &cfg).await?;
@@ -491,6 +499,7 @@ async fn many<S: SrcScheme, D: DstScheme>(
         ch_ddl,
         shape,
         run: mint_run(opts.mode, src_url)?,
+        publish_empty: opts.publish_empty,
     };
     let src = S::connect(src_url, budget + 8).await?;
     let jobs = jobs_for(&src, &sel, D::BARE_DEST).await?;

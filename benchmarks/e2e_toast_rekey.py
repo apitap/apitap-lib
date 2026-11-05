@@ -66,6 +66,7 @@ Rig: `apitap-bench-pg-src` on :5544 (source, always), and as destinations
 DESTS=chreplay or DESTS=bq.
 """
 import os
+import re
 import subprocess
 import sys
 import time
@@ -529,11 +530,11 @@ def run_replica_bq():
         for _ in range(20):
             rows = _rig.bq(
                 "SELECT state, IFNULL(error_result.reason, ''), "
-                f"CAST(STRPOS(query, 'LEFT JOIN {fq} F') > 0 AS STRING) "
+                f"CAST(REGEXP_CONTAINS(query, r'LEFT JOIN {re.escape(fq)} (F|_apitap_f)\\b') AS STRING) "
                 "FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_USER "
                 f"WHERE creation_time > TIMESTAMP '{t0}' AND parent_job_id IS NULL "
                 "AND job_type = 'QUERY' AND STARTS_WITH(query, 'BEGIN TRANSACTION') "
-                f"AND STRPOS(query, 'MERGE {fq} T') > 0 ORDER BY creation_time")
+                f"AND REGEXP_CONTAINS(query, r'MERGE {re.escape(fq)} (T|_apitap_t)\\b') ORDER BY creation_time")
             if len(rows) >= want and all(r[0] == "DONE" for r in rows):
                 break
             time.sleep(3)

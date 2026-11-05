@@ -35,7 +35,7 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | N28 | FIXED: a varlen column past 1 GiB seals the batch whatever the byte target, so to_polars() never builds past i32 offsets | (this commit) | `e2e_to_polars_2gib_column` (0.62.1: past i32 offsets), unit `varlen_near_the_offset_limit_seals_an_unbounded_batch` |
 | N29 | FIXED: to_parquet takes the engine's memory limit (APITAP_MEM_BUDGET, the process's own cgroup v2/v1) through `_apitap.mem_limit_bytes` | (this commit) | `e2e_to_parquet_budget` (0.62.1: 1 row group) |
 | N7 | FIXED: the source oid is recorded at bootstrap in `_apitap_source_rel` (pg, mysql, ch) or a table property (iceberg) and a moved oid is refused at admission; a Relation under a tracked name with another oid is refused in the stream. BigQuery records none yet (rig blocked): there the in-stream check is the only one | (this commit) | `e2e_pg_replaced_hub` (0.62.1: green over 1,2,3,12 vs hub 10,11,12) |
-| rest | N19 BLOCKED (BigQuery) | — | — |
+| N19 | FIXED for 0.65.0: a Postgres boolean is BOOL in BigQuery whichever lane runs; a target an older release made INT64 keeps INT64 on the text lane and the binary lane refuses it naming the remedy | (0.65.0) | `e2e_bq_bool_lanes` (0.64.0: INT64 on 2 pipes, the 8-pipe append failed on the copy job) |
 
 ## Fix verdicts
 

@@ -387,11 +387,12 @@ async fn changelog_bootstrap_unit(
     };
     // BigQuery clusters on at most 4 columns, and only on plain column
     // references — hence the PK prefix rather than ClickHouse's key tuple.
+    // The default skips key columns BigQuery cannot cluster on (R22): a
+    // float, bytes or unconstrained-numeric key made every bootstrap fail.
     let cluster = match order_by {
         Some(spec) => bq_cluster_list(spec, &types0)?,
-        None => pk_cols
+        None => default_cluster_keys(pk_cols, &types0)
             .iter()
-            .take(4)
             .map(|c| format!("`{c}`"))
             .collect::<Vec<_>>()
             .join(", "),
@@ -448,17 +449,37 @@ async fn changelog_bootstrap_unit(
 /// previous version would resurrect. BigQuery has no row-value comparison,
 /// so the pair test is spelled out.
 async fn ensure_current_view(u: &mut BqUnit<'_>, table: &str, pk_cols: &[String]) -> Result<()> {
-    let sql = current_view_sql(&u.fq(&format!("{table}__current")), &u.fq(table), pk_cols);
+    let types = match u.table_get(table).await? {
+        Some(meta) => column_types(&meta)?,
+        None => std::collections::HashMap::new(),
+    };
+    let sql = current_view_sql(&u.fq(&format!("{table}__current")), &u.fq(table), pk_cols, &types);
     u.ddl(&sql).await
 }
 
-fn current_view_sql(v: &str, t: &str, pk_cols: &[String]) -> String {
+fn current_view_sql(
+    v: &str,
+    t: &str,
+    pk_cols: &[String],
+    types: &std::collections::HashMap<String, String>,
+) -> String {
     // Every alias is `_apitap_`-prefixed and the PARTITION BY is qualified:
     // a table whose PK is called `s` or `l` would otherwise make the range
     // variables ambiguous and the view refuse to create.
+    //
+    // BigQuery refuses to partition a window by a FLOAT64 (R22): a float key
+    // partitions by its round-trip text instead — 17 significant digits name
+    // one double exactly — with 0 and -0 one key, as Postgres compares them.
     let keys_q = pk_cols
         .iter()
-        .map(|c| format!("_apitap_s.`{c}`"))
+        .map(|c| {
+            let col = format!("_apitap_s.`{c}`");
+            if types.get(c).map(String::as_str) == Some("FLOAT64") {
+                format!("IF({col} = 0, '0', FORMAT('%.17g', {col}))")
+            } else {
+                col
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -747,10 +768,11 @@ fn read_base_sqls(
         }
         let mut fields = vec![format!("{slot} AS _apitap_k")];
         for (j, name) in cast.pk.iter().enumerate() {
-            let txt = std::str::from_utf8(&k[j])
-                .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+            let txt = staged_text(&k[j], cast.hex[cast.pk_pos[j]], || {
+                "log_based: non-UTF8 key value".into()
+            })?;
             let (oid, ty) = &cast.typed[cast.pk_pos[j]];
-            let lit = format!("'{}'", sql_str(txt));
+            let lit = format!("'{}'", sql_str(&txt));
             fields.push(format!(
                 "{} AS _apitap_k{j}",
                 cast_expr_of(&lit, name, *oid, ty)?
@@ -917,6 +939,16 @@ async fn stage_changelog(
     // as NULL would silently blank the column for every reader of
     // `__current`. One extra query per window, only when a mask is present.
     let patched = if c.masked {
+        // A readback cell is already `\x`-hex text, so a hex column must never
+        // be patched from one — and never is: the MySQL lane (the only one
+        // staging raw bytes) refuses every binlog_row_image but FULL, so it
+        // carries no masked cell.
+        if cast.hex.iter().any(|&h| h) {
+            return Err(Error::Transfer(format!(
+                "log_based changelog: {table}: a masked cell on a raw-bytes (MySQL) lane — \
+                 internal invariant broken (binlog_row_image must be FULL)"
+            )));
+        }
         let (keys, cols) = c.mask_plan();
         let base = if keys.is_empty() || cols.is_empty() {
             std::collections::HashMap::new()
@@ -937,7 +969,7 @@ async fn stage_changelog(
         .skip(range.start)
     {
         let row = patched.get(&i).or(ev.row.as_ref());
-        push_change(&mut ndjson, wal_cols, row, ev.op.code(), plan.seq_of(i))?;
+        push_change(&mut ndjson, wal_cols, row, ev.op.code(), plan.seq_of(i), &cast.hex)?;
     }
     u.load(table, &cast.staging_fields_changelog(), ndjson)
         .await?;
@@ -991,17 +1023,19 @@ async fn cluster_target(
     if std::env::var("APITAP_BQ_CLUSTER").as_deref() == Ok("0") || rows < CLUSTER_MIN_ROWS {
         return Ok(());
     }
-    let keys: Vec<&String> = pk_cols.iter().take(4).collect();
+    let Some(meta) = u.table_get(table).await? else {
+        return Ok(());
+    };
+    let types = column_types(&meta)?;
+    let keys = default_cluster_keys(pk_cols, &types);
     if keys.is_empty() {
         return Ok(());
     }
-    if let Some(meta) = u.table_get(table).await? {
-        if let Some(cur) = meta["clustering"]["fields"].as_array() {
-            let cur: Vec<&str> = cur.iter().filter_map(|f| f.as_str()).collect();
-            let want: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-            if cur == want {
-                return Ok(());
-            }
+    if let Some(cur) = meta["clustering"]["fields"].as_array() {
+        let cur: Vec<&str> = cur.iter().filter_map(|f| f.as_str()).collect();
+        let want: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        if cur == want {
+            return Ok(());
         }
     }
     let cl = keys
@@ -1035,7 +1069,13 @@ async fn stage(
     let (c, l) = (w.body(), w.layout());
     let (wal_cols, oids, pk_cols) = (l.cols(), l.oids(), l.key_cols());
     for name in wal_cols {
-        if name == OP_COL || name == MASK_COL || name.starts_with(FROM_PREFIX) {
+        // The MERGE aliases too: BigQuery resolves a bare `t = …` in its SET
+        // to an alias of that name, case-insensitively, before any column.
+        if name == OP_COL
+            || name == MASK_COL
+            || name.starts_with(FROM_PREFIX)
+            || MERGE_ALIASES.contains(&name.to_ascii_lowercase().as_str())
+        {
             return Err(Error::InvalidInput(format!(
                 "log_based: source column '{name}' collides with a reserved BigQuery \
                  CDC staging column — rename it at the source or alias it in a view"
@@ -1071,11 +1111,14 @@ async fn stage(
     // there on the target, not at its new key.
     let resolved = resolve_window(w);
     let moved = resolved.any_moved_mask();
+    let key_hex: Vec<bool> = plan.pk_pos.iter().map(|&i| plan.hex[i]).collect();
     let mut ndjson: Vec<u8> = Vec::new();
     let mut staged = 0u64;
     for (key, image) in resolved.rows() {
         match image {
-            Image::Row(cells) => push_upsert(&mut ndjson, wal_cols, cells, None, None)?,
+            Image::Row(cells) => {
+                push_upsert(&mut ndjson, wal_cols, cells, None, None, &plan.hex, &key_hex)?
+            }
             Image::Masked { row, moved_from } => {
                 let mask: String = row
                     .iter()
@@ -1087,9 +1130,9 @@ async fn stage(
                         }
                     })
                     .collect();
-                push_upsert(&mut ndjson, wal_cols, row, Some(&mask), moved_from)?;
+                push_upsert(&mut ndjson, wal_cols, row, Some(&mask), moved_from, &plan.hex, &key_hex)?;
             }
-            Image::Delete => push_delete(&mut ndjson, pk_cols, key)?,
+            Image::Delete => push_delete(&mut ndjson, pk_cols, key, &key_hex)?,
         }
         staged += 1;
     }
@@ -1145,6 +1188,12 @@ struct ApplyPlan {
     /// For each key column, its index in `cols` — the `typed` entry the
     /// readback's predicate casts its WAL text through.
     pk_pos: Vec<usize>,
+    /// Per column: the cell arrives as RAW bytes and is staged as `\x` + hex
+    /// (D8). The MySQL lane (every OID 0) ships BINARY/VARBINARY/BLOB/BIT
+    /// cells as their bytes, while the BYTES cast and the masked readback
+    /// both speak Postgres's `\x`-hex: staged as text, `0x01` decoded to
+    /// empty bytes and anything not UTF-8 wedged the lane.
+    hex: Vec<bool>,
 }
 
 impl ApplyPlan {
@@ -1175,7 +1224,7 @@ impl ApplyPlan {
             // OID 0 (MySQL binlog) falls straight through to the target-type cast.
             let oid = oids.get(i).copied().unwrap_or(0);
             cast.push(cast_expr(name, oid, ty)?);
-            cast_s.push(cast_expr_of(&format!("S.`{name}`"), name, oid, ty)?);
+            cast_s.push(cast_expr_of(&format!("_apitap_s.`{name}`"), name, oid, ty)?);
             typed.push((oid, ty.clone()));
         }
         // A key column is one of the window's columns (the layout keys by
@@ -1190,10 +1239,12 @@ impl ApplyPlan {
                 )));
             };
             let (oid, ty) = &typed[i];
-            let from = cast_expr_of(&format!("S.`{}`", from_col(j)), k, *oid, ty)?;
-            from_on.push(format!("F.`{k}` = {from}"));
+            let from = cast_expr_of(&format!("_apitap_s.`{}`", from_col(j)), k, *oid, ty)?;
+            from_on.push(format!("_apitap_f.`{k}` = {from}"));
             pk_pos.push(i);
         }
+        let raw_bytes = !oids.is_empty() && oids.iter().all(|&o| o == 0);
+        let hex = typed.iter().map(|(_, ty)| raw_bytes && ty == "BYTES").collect();
         Ok(Self {
             cols: wal_cols.to_vec(),
             cast,
@@ -1202,6 +1253,7 @@ impl ApplyPlan {
             pk: pk_cols.to_vec(),
             typed,
             pk_pos,
+            hex,
         })
     }
 
@@ -1273,7 +1325,7 @@ impl ApplyPlan {
         let on = self
             .pk
             .iter()
-            .map(|c| format!("T.{0} = S.{0}", bt(c)))
+            .map(|c| format!("_apitap_t.{0} = _apitap_s.{0}", bt(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
         let non_pk: Vec<&String> = self.cols.iter().filter(|c| !self.pk.contains(c)).collect();
@@ -1282,7 +1334,7 @@ impl ApplyPlan {
             .map(|c| {
                 let pos = self.cols.iter().position(|x| &x == c).expect("col") + 1;
                 format!(
-                    "    {c} = IF(S.{mask} IS NULL OR SUBSTR(S.{mask}, {pos}, 1) = '0', S.{c}, T.{c})",
+                    "    {c} = IF(_apitap_s.{mask} IS NULL OR SUBSTR(_apitap_s.{mask}, {pos}, 1) = '0', _apitap_s.{c}, _apitap_t.{c})",
                     c = bt(c),
                     mask = MASK_COL,
                 )
@@ -1298,27 +1350,27 @@ impl ApplyPlan {
         let insert_vals = self
             .cols
             .iter()
-            .map(|c| format!("S.{}", bt(c)))
+            .map(|c| format!("_apitap_s.{}", bt(c)))
             .collect::<Vec<_>>()
             .join(", ");
 
         let mut merge = String::new();
         merge.push_str(&format!(
-            "MERGE {} T\nUSING (\n{}) S\nON {}\n",
+            "MERGE {} _apitap_t\nUSING (\n{}) _apitap_s\nON {}\n",
             target_fq, source, on
         ));
         merge.push_str(&format!(
-            "WHEN MATCHED AND S.{OP_COL} = 'D' THEN\n  DELETE\n"
+            "WHEN MATCHED AND _apitap_s.{OP_COL} = 'D' THEN\n  DELETE\n"
         ));
         if !non_pk.is_empty() {
             merge.push_str(&format!("WHEN MATCHED THEN\n  UPDATE SET\n{set}\n"));
         }
         merge.push_str(&format!(
-            "WHEN NOT MATCHED BY TARGET AND S.{OP_COL} = 'U' AND S.{MASK_COL} IS NULL THEN\n  \
+            "WHEN NOT MATCHED BY TARGET AND _apitap_s.{OP_COL} = 'U' AND _apitap_s.{MASK_COL} IS NULL THEN\n  \
              INSERT ({insert_cols}) VALUES ({insert_vals})\n"
         ));
         merge.push_str(&format!(
-            "WHEN NOT MATCHED BY TARGET AND S.{OP_COL} = 'U' THEN\n  INSERT ({first}) VALUES \
+            "WHEN NOT MATCHED BY TARGET AND _apitap_s.{OP_COL} = 'U' THEN\n  INSERT ({first}) VALUES \
              (ERROR('log_based: masked update for a row missing at the BigQuery target — \
              window replay out of order?'))\n",
             first = bt(&self.cols[0]),
@@ -1345,7 +1397,7 @@ impl ApplyPlan {
     /// window on every run and wedged the group. A row at neither
     /// key still fails loudly, in the plain form's NOT MATCHED arm.
     fn moved_source(&self, target_fq: &str, staging_fq: &str) -> String {
-        let found = format!("F.`{}` IS NOT NULL", self.pk[0]);
+        let found = format!("_apitap_f.`{}` IS NOT NULL", self.pk[0]);
         let cols: Vec<String> = self
             .cols
             .iter()
@@ -1353,20 +1405,26 @@ impl ApplyPlan {
             .enumerate()
             .map(|(i, (c, cast))| {
                 format!(
-                    "    IF({found} AND SUBSTR(S.{MASK_COL}, {pos}, 1) = '1', F.`{c}`,\n       \
+                    "    IF({found} AND SUBSTR(_apitap_s.{MASK_COL}, {pos}, 1) = '1', _apitap_f.`{c}`,\n       \
                      {cast}) AS `{c}`",
                     pos = i + 1,
                 )
             })
             .collect();
         format!(
-            "  SELECT S.{OP_COL},\n    IF({found}, NULL, S.{MASK_COL}) AS {MASK_COL},\n{}\n  \
-             FROM {staging_fq} S\n  LEFT JOIN {target_fq} F\n    ON {}\n",
+            "  SELECT _apitap_s.{OP_COL},\n    IF({found}, NULL, _apitap_s.{MASK_COL}) AS {MASK_COL},\n{}\n  \
+             FROM {staging_fq} _apitap_s\n  LEFT JOIN {target_fq} _apitap_f\n    ON {}\n",
             cols.join(",\n"),
             self.from_on.join(" AND "),
         )
     }
 }
+
+/// The MERGE's table aliases. They were `T`, `S` and `F` before 0.65.0, and
+/// BigQuery read a column named `t` in `UPDATE SET t = …` as the whole target
+/// row (`UPDATE ... SET does not support updating the entire row`): every
+/// window of such a table failed. A source column may not take one of these.
+const MERGE_ALIASES: [&str; 3] = ["_apitap_t", "_apitap_s", "_apitap_f"];
 
 const BOOL_OID: u32 = 16;
 
@@ -1530,6 +1588,8 @@ fn push_upsert(
     cells: &[Cell],
     mask: Option<&str>,
     from: Option<&Key>,
+    hex: &[bool],
+    key_hex: &[bool],
 ) -> Result<()> {
     let mut obj = Map::new();
     obj.insert(OP_COL.to_string(), json!("U"));
@@ -1537,8 +1597,9 @@ fn push_upsert(
         obj.insert(MASK_COL.to_string(), json!(m));
     }
     for (j, part) in from.into_iter().flatten().enumerate() {
-        let s = std::str::from_utf8(part)
-            .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+        let s = staged_text(part, key_hex.get(j).copied().unwrap_or(false), || {
+            "log_based: non-UTF8 key value".into()
+        })?;
         obj.insert(from_col(j), json!(s));
     }
     for (i, cell) in cells.iter().enumerate() {
@@ -1548,12 +1609,12 @@ fn push_upsert(
             // target value for masked ones.
             Cell::Null | Cell::UnchangedToast => {}
             Cell::Text(t) => {
-                let s = std::str::from_utf8(t).map_err(|_| {
-                    Error::Transfer(format!(
+                let s = staged_text(t, hex.get(i).copied().unwrap_or(false), || {
+                    format!(
                         "log_based: column '{}' is not valid UTF-8 — a SQL_ASCII source can't \
                          land in BigQuery (which is UTF-8 only)",
                         cols[i]
-                    ))
+                    )
                 })?;
                 obj.insert(cols[i].clone(), json!(s));
             }
@@ -1579,6 +1640,7 @@ fn push_change(
     row: Option<&crate::wire::pgoutput::Tuple>,
     op: &str,
     seq: u32,
+    hex: &[bool],
 ) -> Result<()> {
     use crate::wire::pgoutput::Cellv;
     let mut obj = Map::new();
@@ -1588,11 +1650,11 @@ fn push_change(
         for (i, name) in cols.iter().enumerate() {
             match row.get(i) {
                 Some(Cellv::Text(t)) => {
-                    let s = std::str::from_utf8(t).map_err(|_| {
-                        Error::Transfer(format!(
+                    let s = staged_text(t, hex.get(i).copied().unwrap_or(false), || {
+                        format!(
                             "log_based: column '{name}' is not valid UTF-8 — a SQL_ASCII \
                              source can't land in BigQuery (which is UTF-8 only)"
-                        ))
+                        )
                     })?;
                     obj.insert(name.clone(), json!(s));
                 }
@@ -1610,6 +1672,36 @@ fn push_change(
 /// an expression. Validated against the target's real columns and re-quoted
 /// here rather than interpolated: `cdc_script` runs a multi-statement script,
 /// so a `;` in this value would chain statements of the caller's choosing.
+/// Whether BigQuery can CLUSTER BY a column of this (canonical) type.
+fn bq_clusterable(ty: &str) -> bool {
+    matches!(
+        ty,
+        "STRING"
+            | "INT64"
+            | "NUMERIC"
+            | "BIGNUMERIC"
+            | "DATE"
+            | "DATETIME"
+            | "TIMESTAMP"
+            | "BOOL"
+            | "GEOGRAPHY"
+    ) || ty.starts_with("RANGE")
+}
+
+/// The default clustering: the key's columns BigQuery can cluster on, at
+/// most four, in key order (R22). Clustering is an optimisation; a key with
+/// none of those types is simply not clustered.
+fn default_cluster_keys<'a>(
+    pk_cols: &'a [String],
+    types: &std::collections::HashMap<String, String>,
+) -> Vec<&'a String> {
+    pk_cols
+        .iter()
+        .filter(|c| types.get(c.as_str()).is_some_and(|t| bq_clusterable(t)))
+        .take(4)
+        .collect()
+}
+
 fn bq_cluster_list(
     spec: &str,
     types: &std::collections::HashMap<String, String>,
@@ -1620,11 +1712,18 @@ fn bq_cluster_list(
         if name.is_empty() {
             continue;
         }
-        if !types.contains_key(name) {
+        let Some(ty) = types.get(name) else {
             return Err(Error::InvalidInput(format!(
                 "log_based changelog: order_by='{spec}' — BigQuery clusters on COLUMN \
                  NAMES, and '{name}' is not a column of the target. Give up to four of \
                  its own columns, comma-separated (expressions are ClickHouse-only)"
+            )));
+        };
+        if !bq_clusterable(ty) {
+            return Err(Error::InvalidInput(format!(
+                "log_based changelog: order_by='{spec}' — '{name}' is {ty}, and BigQuery \
+                 clusters only on STRING, INT64, NUMERIC, BIGNUMERIC, DATE, DATETIME, \
+                 TIMESTAMP, BOOL or GEOGRAPHY columns. Name other columns"
             )));
         }
         out.push(format!("`{name}`"));
@@ -1710,12 +1809,29 @@ fn changelog_select_list(meta: &Value) -> Result<String> {
     Ok(out.join(", "))
 }
 
-fn push_delete(out: &mut Vec<u8>, pk_cols: &[String], key: &Key) -> Result<()> {
+/// A cell's staging text: the WAL's own text, or (`hex`, D8) its raw bytes
+/// as the `\x` + lowercase hex the BYTES cast reads.
+fn staged_text<'a>(bytes: &'a [u8], hex: bool, what: impl FnOnce() -> String) -> Result<std::borrow::Cow<'a, str>> {
+    if hex {
+        let mut s = String::with_capacity(2 + 2 * bytes.len());
+        s.push_str("\\x");
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        return Ok(std::borrow::Cow::Owned(s));
+    }
+    std::str::from_utf8(bytes)
+        .map(std::borrow::Cow::Borrowed)
+        .map_err(|_| Error::Transfer(what()))
+}
+
+fn push_delete(out: &mut Vec<u8>, pk_cols: &[String], key: &Key, key_hex: &[bool]) -> Result<()> {
     let mut obj = Map::new();
     obj.insert(OP_COL.to_string(), json!("D"));
     for (j, col) in pk_cols.iter().enumerate() {
-        let s = std::str::from_utf8(&key[j])
-            .map_err(|_| Error::Transfer("log_based: non-UTF8 key value".into()))?;
+        let s = staged_text(&key[j], key_hex.get(j).copied().unwrap_or(false), || {
+            "log_based: non-UTF8 key value".into()
+        })?;
         obj.insert(col.clone(), json!(s));
     }
     serde_json::to_writer(&mut *out, &Value::Object(obj))
@@ -2818,12 +2934,12 @@ mod tests {
         let plan = ApplyPlan::build("orders", &wal, &[23, 25, 16], &pk, &ty).unwrap();
         let stg = "`proj.ds.orders_0000000l000abcd__apitap_cdc`";
         let sql = plan.merge_sql("`proj.ds.orders`", stg, false, false);
-        assert!(sql.contains("MERGE `proj.ds.orders` T"), "{sql}");
+        assert!(sql.contains("MERGE `proj.ds.orders` _apitap_t"), "{sql}");
         assert!(sql.contains(&format!("FROM {stg}")), "{sql}");
-        assert!(sql.contains("ON T.`id` = S.`id`"), "{sql}");
+        assert!(sql.contains("ON _apitap_t.`id` = _apitap_s.`id`"), "{sql}");
         // PK is never in the UPDATE SET; both non-PK columns are.
-        assert!(sql.contains("SUBSTR(S._apitap_mask, 2, 1)"), "{sql}"); // v at pos 2
-        assert!(sql.contains("SUBSTR(S._apitap_mask, 3, 1)"), "{sql}"); // flag at pos 3
+        assert!(sql.contains("SUBSTR(_apitap_s._apitap_mask, 2, 1)"), "{sql}"); // v at pos 2
+        assert!(sql.contains("SUBSTR(_apitap_s._apitap_mask, 3, 1)"), "{sql}"); // flag at pos 3
         assert!(!sql.contains("`id` = IF"), "PK must not be updated: {sql}");
         assert!(
             !sql.contains("NOT MATCHED BY SOURCE"),
@@ -2852,7 +2968,7 @@ mod tests {
             !sql.contains("UPDATE SET"),
             "no non-PK cols → no UPDATE clause: {sql}"
         );
-        assert!(sql.contains("ON T.`a` = S.`a` AND T.`b` = S.`b`"), "{sql}");
+        assert!(sql.contains("ON _apitap_t.`a` = _apitap_s.`a` AND _apitap_t.`b` = _apitap_s.`b`"), "{sql}");
     }
 
     #[test]
@@ -2865,6 +2981,8 @@ mod tests {
             &[Cell::Text("7".into()), Cell::Null, Cell::UnchangedToast],
             Some("001"),
             None,
+            &[],
+            &[],
         )
         .unwrap();
         let line = String::from_utf8(out).unwrap();
@@ -2878,26 +2996,46 @@ mod tests {
     /// The MERGE 0.56.0 wrote, captured from that tree (`merge_sql` of this
     /// plan before the moved form existed). A window with no moved masked row
     /// must still get exactly this: the moved form costs a target read.
-    const PLAIN_MERGE: &str = "MERGE `p.d.t` T
+    const PLAIN_MERGE: &str = "MERGE `p.d.t` _apitap_t
 USING (
   SELECT _apitap_op, _apitap_mask,
     CAST(`id` AS INT64) AS `id`,
     `v` AS `v`,
     CASE WHEN `flag` IS NULL THEN NULL WHEN `flag` IN ('t','true','TRUE','1') THEN 1 WHEN `flag` IN ('f','false','FALSE','0') THEN 0 ELSE ERROR(FORMAT('log_based: bad bool text %s for column flag', `flag`)) END AS `flag`
   FROM `p.d.t_stg`
-) S
-ON T.`id` = S.`id`
-WHEN MATCHED AND S._apitap_op = 'D' THEN
+) _apitap_s
+ON _apitap_t.`id` = _apitap_s.`id`
+WHEN MATCHED AND _apitap_s._apitap_op = 'D' THEN
   DELETE
 WHEN MATCHED THEN
   UPDATE SET
-    `v` = IF(S._apitap_mask IS NULL OR SUBSTR(S._apitap_mask, 2, 1) = '0', S.`v`, T.`v`),
-    `flag` = IF(S._apitap_mask IS NULL OR SUBSTR(S._apitap_mask, 3, 1) = '0', S.`flag`, T.`flag`)
-WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' AND S._apitap_mask IS NULL THEN
-  INSERT (`id`, `v`, `flag`) VALUES (S.`id`, S.`v`, S.`flag`)
-WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
+    `v` = IF(_apitap_s._apitap_mask IS NULL OR SUBSTR(_apitap_s._apitap_mask, 2, 1) = '0', _apitap_s.`v`, _apitap_t.`v`),
+    `flag` = IF(_apitap_s._apitap_mask IS NULL OR SUBSTR(_apitap_s._apitap_mask, 3, 1) = '0', _apitap_s.`flag`, _apitap_t.`flag`)
+WHEN NOT MATCHED BY TARGET AND _apitap_s._apitap_op = 'U' AND _apitap_s._apitap_mask IS NULL THEN
+  INSERT (`id`, `v`, `flag`) VALUES (_apitap_s.`id`, _apitap_s.`v`, _apitap_s.`flag`)
+WHEN NOT MATCHED BY TARGET AND _apitap_s._apitap_op = 'U' THEN
   INSERT (`id`) VALUES (ERROR('log_based: masked update for a row missing at the BigQuery target — window replay out of order?'))
 ";
+
+    /// A column named like an old alias (`t`, `s`, `f`) is just a column: the
+    /// MERGE names its target, source and old-key row by reserved aliases.
+    #[test]
+    fn merge_aliases_never_shadow_a_column() {
+        let wal = vec!["id".to_string(), "t".to_string(), "s".to_string(), "f".to_string()];
+        let ty = types(&[("id", "INT64"), ("t", "STRING"), ("s", "STRING"), ("f", "STRING")]);
+        let plan = ApplyPlan::build("x", &wal, &[23, 25, 25, 25], &["id".to_string()], &ty).unwrap();
+        for moved in [false, true] {
+            let m = plan.merge_sql("`p.d.x`", "`p.d.x_stg`", false, moved);
+            assert!(m.starts_with("MERGE `p.d.x` _apitap_t\n"), "{m}");
+            assert!(m.contains("    `t` = IF("), "{m}");
+            for bare in [" T\n", ") S\n", " S\n", " F\n", " T.", "(S.", " F."] {
+                assert!(!m.contains(bare), "{bare:?} in {m}");
+            }
+        }
+        for name in ["_apitap_t", "_APITAP_S"] {
+            assert!(MERGE_ALIASES.contains(&name.to_ascii_lowercase().as_str()));
+        }
+    }
 
     /// C3: `UPDATE t SET id = 9 WHERE id = 1` with an untouched TOASTed body
     /// stages key 9 masked, and key 9 has no target row: 0.56.0's MERGE sent
@@ -2921,16 +3059,16 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
 
         let m = plan.merge_sql(t, stg, false, true);
         assert!(
-            m.contains("  FROM `p.d.t_stg` S\n  LEFT JOIN `p.d.t` F\n    ON F.`id` = CAST(S.`_apitap_from_0` AS INT64)\n) S\n"),
+            m.contains("  FROM `p.d.t_stg` _apitap_s\n  LEFT JOIN `p.d.t` _apitap_f\n    ON _apitap_f.`id` = CAST(_apitap_s.`_apitap_from_0` AS INT64)\n) _apitap_s\n"),
             "the old key, joined and cast as the key column is: {m}"
         );
         assert!(
-            m.contains("  SELECT S._apitap_op,\n    IF(F.`id` IS NOT NULL, NULL, S._apitap_mask) AS _apitap_mask,\n"),
+            m.contains("  SELECT _apitap_s._apitap_op,\n    IF(_apitap_f.`id` IS NOT NULL, NULL, _apitap_s._apitap_mask) AS _apitap_mask,\n"),
             "a row found at its old key leaves whole, without its mask: {m}"
         );
         assert!(
             m.contains(
-                "    IF(F.`id` IS NOT NULL AND SUBSTR(S._apitap_mask, 2, 1) = '1', F.`v`,\n       S.`v`) AS `v`,\n"
+                "    IF(_apitap_f.`id` IS NOT NULL AND SUBSTR(_apitap_s._apitap_mask, 2, 1) = '1', _apitap_f.`v`,\n       _apitap_s.`v`) AS `v`,\n"
             ),
             "a hole of a row found at its old key comes from there: {m}"
         );
@@ -2943,15 +3081,15 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
             "no error for an empty old key: {m}"
         );
         assert!(
-            !m.contains("IF(S.`_apitap_from_0` IS NOT NULL, NULL"),
+            !m.contains("IF(_apitap_s.`_apitap_from_0` IS NOT NULL, NULL"),
             "a mask is dropped only where F was found: {m}"
         );
         assert!(
-            m.contains("       CASE WHEN S.`flag` IS NULL THEN NULL WHEN S.`flag` IN ('t','true','TRUE','1') THEN 1"),
+            m.contains("       CASE WHEN _apitap_s.`flag` IS NULL THEN NULL WHEN _apitap_s.`flag` IN ('t','true','TRUE','1') THEN 1"),
             "every other cell is cast exactly as the plain form casts it: {m}"
         );
         // From the ON on, the two forms are one MERGE.
-        let from_on = |s: &str| s[s.find(") S\nON ").expect("ON")..].to_string();
+        let from_on = |s: &str| s[s.find(") _apitap_s\nON ").expect("ON")..].to_string();
         assert_eq!(from_on(&m), from_on(PLAIN_MERGE));
 
         // A composite key joins on every part, each by its own type.
@@ -2962,7 +3100,7 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
         let m2 = plan2.merge_sql("`p.d.j`", "`p.d.j_stg`", false, true);
         assert!(
             m2.contains(
-                "ON F.`a` = CAST(S.`_apitap_from_0` AS INT64) AND F.`b` = S.`_apitap_from_1`\n"
+                "ON _apitap_f.`a` = CAST(_apitap_s.`_apitap_from_0` AS INT64) AND _apitap_f.`b` = _apitap_s.`_apitap_from_1`\n"
             ),
             "{m2}"
         );
@@ -2999,6 +3137,8 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
             ],
             Some("001"),
             Some(&old),
+            &[],
+            &[],
         )
         .unwrap();
         push_upsert(
@@ -3011,6 +3151,8 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
             ],
             Some("001"),
             None,
+            &[],
+            &[],
         )
         .unwrap();
         let lines = String::from_utf8(out).unwrap();
@@ -3026,10 +3168,75 @@ WHEN NOT MATCHED BY TARGET AND S._apitap_op = 'U' THEN
     #[test]
     fn delete_carries_only_pk() {
         let mut out = Vec::new();
-        push_delete(&mut out, &["id".to_string()], &vec![b"42".to_vec()]).unwrap();
+        push_delete(&mut out, &["id".to_string()], &vec![b"42".to_vec()], &[]).unwrap();
         let line = String::from_utf8(out).unwrap();
         assert!(line.contains("\"_apitap_op\":\"D\""), "{line}");
         assert!(line.contains("\"id\":\"42\""), "{line}");
+    }
+
+    /// R22: the default clustering skips key columns BigQuery cannot
+    /// cluster on; an explicit order_by naming one is refused by name.
+    #[test]
+    fn clustering_skips_unclusterable_keys() {
+        let types: std::collections::HashMap<String, String> = [
+            ("f", "FLOAT64"),
+            ("b", "BYTES"),
+            ("id", "INT64"),
+            ("s", "STRING"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        let pk: Vec<String> = ["f", "b", "id", "s"].iter().map(|s| s.to_string()).collect();
+        let keys: Vec<&str> = default_cluster_keys(&pk, &types).iter().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["id", "s"]);
+        assert!(default_cluster_keys(&pk[..2], &types).is_empty());
+        let e = bq_cluster_list("id, f", &types).unwrap_err().to_string();
+        assert!(e.contains("'f' is FLOAT64"), "{e}");
+        assert_eq!(bq_cluster_list("s,id", &types).unwrap(), "`s`, `id`");
+    }
+
+    /// D8: a MySQL-lane (OID 0) cell bound for a BYTES column is staged as
+    /// the `\x`-hex the BYTES cast reads — 0x01 and bytes that are not UTF-8
+    /// included — and its key too; a STRING column keeps the cell's text.
+    #[test]
+    fn raw_bytes_cells_are_staged_as_wal_hex() {
+        let cols = vec!["k".to_string(), "b".to_string(), "s".to_string()];
+        let types: std::collections::HashMap<String, String> = [
+            ("k", "BYTES"),
+            ("b", "BYTES"),
+            ("s", "STRING"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        let plan = ApplyPlan::build("t", &cols, &[0, 0, 0], &["k".to_string()], &types).unwrap();
+        assert_eq!(plan.hex, vec![true, true, false]);
+        let key_hex: Vec<bool> = plan.pk_pos.iter().map(|&i| plan.hex[i]).collect();
+        let mut out = Vec::new();
+        push_upsert(
+            &mut out,
+            &cols,
+            &[
+                Cell::Text(vec![0xff, 0x00].into()),
+                Cell::Text(vec![0x01].into()),
+                Cell::Text("plain".into()),
+            ],
+            None,
+            None,
+            &plan.hex,
+            &key_hex,
+        )
+        .unwrap();
+        push_delete(&mut out, &["k".to_string()], &vec![vec![0xfe]], &key_hex).unwrap();
+        let lines = String::from_utf8(out).unwrap();
+        assert!(lines.contains(r#""k":"\\xff00""#), "{lines}");
+        assert!(lines.contains(r#""b":"\\x01""#), "{lines}");
+        assert!(lines.contains(r#""s":"plain""#), "{lines}");
+        assert!(lines.contains(r#""k":"\\xfe""#), "{lines}");
+        // A Postgres lane (real OIDs) stages its WAL text as it is.
+        let pg = ApplyPlan::build("t", &cols, &[17, 17, 25], &["k".to_string()], &types).unwrap();
+        assert_eq!(pg.hex, vec![false, false, false]);
     }
 
     /// Each batch is one BigQuery transaction. A changelog table's INSERT and

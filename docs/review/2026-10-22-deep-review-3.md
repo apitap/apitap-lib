@@ -24,7 +24,8 @@ Each fix had a leg that failed on the build without it and passes with it; legs 
 | R16 | FIXED: the 0.62.0 journal key is consulted only in the first residue window a run applies for the table, its rows are dropped after it, and a 0.62.0 image's version suffix is cut and re-stamped | (this commit) | `e2e_ch_journal_legacy_window` (0.63.0: lost update, id=1 'a') |
 | R32 | FIXED: a Postgres NUMERIC skips the read path's text cast only when it is delivered as Decimal; past 76 digits it reads as text | (this commit) | `e2e_read_huge_numeric` (0.63.0: "unexpected float8") |
 | R25 | FIXED: ALWAYS identity columns leave every SET / DO UPDATE list (bulk merge and the CDC residue), and VIRTUAL generated columns are filtered like STORED | (this commit) | `e2e_pg_identity_nonkey` (0.63.0: "column seq can only be updated to DEFAULT"; PG 18 "cannot insert a non-DEFAULT value into column total") |
-| rest | OPEN | — | — |
+| R22 | FIXED for 0.65.0: the default clustering keeps only the key columns BigQuery can cluster (none → unclustered); an explicit order_by naming one is refused by name and type; the `__current` view partitions a FLOAT64 key by its round-trip text | (0.65.0) | `e2e_bq_cluster_keys` (0.64.0: "CLUSTER BY expression may not be a floating point type") |
+| rest | OPEN: R4, R15, R24, R29, R30 (not in the 0.64.0 wave) | — | — |
 
 ## Fix verdicts
 
