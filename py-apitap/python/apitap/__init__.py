@@ -145,6 +145,11 @@ class Reader:
     def __arrow_c_stream__(self, requested_schema=None):
         return self._start(False).__arrow_c_stream__(requested_schema)
 
+    def __arrow_c_schema__(self):
+        # DuckDB binds by the schema, then opens the stream once; without
+        # this it opened the one-shot stream twice and the scan was refused.
+        return self._start(False).__arrow_c_schema__()
+
     @property
     def columns(self):
         return self._start(False).columns()

@@ -333,6 +333,31 @@ fn transfer_many(
 }
 
 static STREAM_NAME: &CStr = c"arrow_array_stream";
+static SCHEMA_NAME: &CStr = c"arrow_schema";
+
+/// # Safety
+/// CPython calls this once, GIL held, when a capsule from
+/// `PgRead::__arrow_c_schema__` is collected; its pointer is the boxed
+/// `ArrowSchema` handed to `PyCapsule_New`. A consumer that imported the
+/// schema moved it out and left `release = None`, so only an unconsumed
+/// schema is released here.
+unsafe extern "C" fn schema_capsule_destructor(cap: *mut pyo3::ffi::PyObject) {
+    // SAFETY: live capsule, GIL held, per the contract above.
+    let p = unsafe { pyo3::ffi::PyCapsule_GetPointer(cap, SCHEMA_NAME.as_ptr()) };
+    if p.is_null() {
+        // SAFETY: GIL held.
+        unsafe { pyo3::ffi::PyErr_Clear() };
+        return;
+    }
+    let schema = p as *mut capsule::ArrowSchema;
+    // SAFETY: the capsule owns this box and this runs once.
+    unsafe {
+        if let Some(rel) = (*schema).release {
+            rel(schema);
+        }
+        drop(Box::from_raw(schema));
+    }
+}
 
 /// # Safety
 /// CPython calls this exactly once, with the GIL held, when the capsule this
@@ -390,6 +415,54 @@ impl PgRead {
                 Some(stream_capsule_destructor),
             );
             if cap.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            Ok(pyo3::Bound::from_owned_ptr(py, cap).unbind())
+        }
+    }
+
+    /// The stream's schema as an `arrow_schema` capsule, WITHOUT handing out
+    /// the stream. DuckDB binds a PyCapsule object by its schema first: with
+    /// no `__arrow_c_schema__` it opened the stream once for the schema alone
+    /// and again for the scan, and the one-shot stream refused the scan
+    /// ("read stream already consumed"). With it, DuckDB asks this, then
+    /// opens the stream exactly once.
+    fn __arrow_c_schema__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let stream = self
+            .stream
+            .ok_or_else(|| PyRuntimeError::new_err("read stream already consumed"))?
+            as *mut capsule::ArrowArrayStream;
+        let out = Box::into_raw(Box::new(capsule::ArrowSchema {
+            format: std::ptr::null(),
+            name: std::ptr::null(),
+            metadata: std::ptr::null(),
+            flags: 0,
+            n_children: 0,
+            children: std::ptr::null_mut(),
+            dictionary: std::ptr::null_mut(),
+            release: None,
+            private_data: std::ptr::null_mut(),
+        }));
+        // SAFETY: `stream` is the live stream this object still owns (it is
+        // only taken by `__arrow_c_stream__`), and `get_schema` writes a fresh,
+        // independently released schema into `out` without touching the
+        // stream's batches. `&self` under the GIL: nothing else uses it now.
+        unsafe {
+            let get = (*stream).get_schema.expect("get_schema");
+            if get(stream, out) != 0 {
+                drop(Box::from_raw(out));
+                return Err(PyRuntimeError::new_err("read stream: schema export failed"));
+            }
+            let cap = pyo3::ffi::PyCapsule_New(
+                out as *mut std::ffi::c_void,
+                SCHEMA_NAME.as_ptr(),
+                Some(schema_capsule_destructor),
+            );
+            if cap.is_null() {
+                if let Some(rel) = (*out).release {
+                    rel(out);
+                }
+                drop(Box::from_raw(out));
                 return Err(PyErr::fetch(py));
             }
             Ok(pyo3::Bound::from_owned_ptr(py, cap).unbind())
