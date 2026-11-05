@@ -182,15 +182,24 @@ pub(crate) async fn start(src_url: &str, table: &str, opts: &ReadOptions) -> Res
     // §8 lists the oddity).
     let shape = pipeline::knobs(&topts, &profile, crate::sink::PipeResidency::STREAMING)?;
     let (chunk, mut parallel) = (shape.chunk, shape.pipes);
-    if opts.parallel.is_none() {
-        if let Some(m) = pipeline::mem_limit_bytes() {
-            parallel = pipeline::fit(
-                pipeline::READ_PIPE_CAP,
-                Some(chunk),
-                Some(m),
-                &pipeline::PipeCost::READ,
-            )
-            .pipes;
+    if let Some(m) = pipeline::mem_limit_bytes() {
+        match opts.parallel {
+            None => {
+                parallel = pipeline::fit(
+                    pipeline::READ_PIPE_CAP,
+                    Some(chunk),
+                    Some(m),
+                    &pipeline::PipeCost::READ,
+                )
+                .pipes;
+            }
+            Some(p) => {
+                let (fits, note) = clamp_explicit_read(p, chunk, m);
+                if let Some(n) = note {
+                    crate::progress::note(&n);
+                }
+                parallel = fits;
+            }
         }
     }
 
@@ -214,6 +223,60 @@ pub(crate) async fn start(src_url: &str, table: &str, opts: &ReadOptions) -> Res
             }
         }
     }
+}
+
+/// `read(where=...)`: exactly one SQL expression in the source's dialect,
+/// returned in the parser's canonical rendering. It is spliced as `AND (w)`
+/// into every span statement, so text that closes that parenthesis
+/// (`1=1) OR (1=1`), a second statement, or a trailing token would widen
+/// every span to the whole table and repeat rows; all of it is refused here.
+fn user_where(dialect: ReadDialect, w: &str) -> Result<String> {
+    use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
+    use sqlparser::parser::Parser;
+    use sqlparser::tokenizer::Token;
+    let (pg, my) = (PostgreSqlDialect {}, MySqlDialect {});
+    let d: &dyn Dialect = match dialect {
+        ReadDialect::Pg => &pg,
+        ReadDialect::My => &my,
+    };
+    let bad = |why: String| {
+        Error::InvalidInput(format!(
+            "read: where= must be one SQL expression in the source's dialect ({why}): {w}"
+        ))
+    };
+    let mut p = Parser::new(d).try_with_sql(w).map_err(|e| bad(e.to_string()))?;
+    let expr = p.parse_expr().map_err(|e| bad(e.to_string()))?;
+    let next = p.peek_token().token;
+    if next != Token::EOF {
+        return Err(bad(format!("unexpected `{next}` after the expression")));
+    }
+    Ok(expr.to_string())
+}
+
+/// The read pipes `mem` bytes hold, by the same swept price the automatic pick
+/// uses: apitap.sql() fits its probe scan to what its build structure leaves.
+pub(crate) fn read_pipes_for(mem: u64) -> usize {
+    pipeline::fit(pipeline::READ_PIPE_CAP, Some(4 << 20), Some(mem), &pipeline::PipeCost::READ).pipes
+}
+
+/// An explicit `parallel=` past what the memory limit holds is clamped, with a
+/// note. It was honoured as asked, and the OOM killer ended the process
+/// instead: a 64 MiB cage read with `parallel=6` or `8` died on the spot,
+/// while the planner's own pick for that cage (2 pipes) ran. The price is the
+/// same swept read calibration the automatic pick uses.
+fn clamp_explicit_read(asked: usize, chunk: usize, mem: u64) -> (usize, Option<String>) {
+    let fits = pipeline::fit(asked, Some(chunk), Some(mem), &pipeline::PipeCost::READ).pipes;
+    if fits >= asked {
+        return (asked, None);
+    }
+    (
+        fits,
+        Some(format!(
+            "read: parallel={asked} does not fit the {} MiB memory limit; reading with {fits} \
+             pipe(s) (a larger limit, or APITAP_MEM_BUDGET in a shared container, allows more)",
+            mem >> 20
+        )),
+    )
 }
 
 /// Everything [`start`] resolves before workers move: the probed plan, the
@@ -253,7 +316,15 @@ async fn plan_read<S: Source>(
     // gains an AND, so the server filters and the decoders only see
     // survivors. The client-side filter still runs — bandwidth, never
     // correctness.
-    lane.push_where = opts.push_where.clone();
+    let user = opts
+        .where_sql
+        .as_deref()
+        .map(|w| user_where(dialect, w))
+        .transpose()?;
+    lane.push_where = match (user, opts.push_where.clone()) {
+        (Some(u), Some(p)) => Some(format!("({u}) AND ({p})")),
+        (u, p) => u.or(p),
+    };
 
     // Column projection (the lazy plugin pushes polars' with_columns here):
     // the SELECT list narrows, so the server serializes and this side decodes
@@ -537,4 +608,50 @@ mod tests {
     }
     // The read lane's pipe calibration moved to pipeline::tests (T7), where the
     // one `fit` every lane uses is tested.
+
+    /// where=: one expression passes in canonical form; anything that could
+    /// escape the `AND (w)` it is spliced into is refused.
+    #[test]
+    fn user_where_is_exactly_one_expression() {
+        use super::{user_where, ReadDialect};
+        assert_eq!(
+            user_where(ReadDialect::Pg, "l_shipdate > DATE '1995-03-15'").unwrap(),
+            "l_shipdate > DATE '1995-03-15'"
+        );
+        assert_eq!(
+            user_where(ReadDialect::My, "o_orderdate < '1995-03-15' AND o_orderkey <= 30140291").unwrap(),
+            "o_orderdate < '1995-03-15' AND o_orderkey <= 30140291"
+        );
+        assert!(user_where(ReadDialect::Pg, "a = 1 OR b = 2").is_ok());
+        for bad in [
+            "1=1) OR (1=1",
+            "a = 1; DROP TABLE t",
+            "a = 1 b",
+            "",
+            "a = 1 --",
+            "(a = 1",
+        ] {
+            let e = user_where(ReadDialect::Pg, bad);
+            assert!(e.is_err() || bad == "a = 1 --", "{bad:?} must be refused, got {e:?}");
+        }
+        // A trailing comment is no token: it parses, and the rendering drops it,
+        // so nothing after the expression reaches the span statement.
+        assert_eq!(user_where(ReadDialect::Pg, "a = 1 --").unwrap(), "a = 1");
+    }
+
+    /// An explicit parallel the limit holds runs as asked, silently; one past
+    /// it runs at the planner's fit for that limit, with a note naming both.
+    #[test]
+    fn explicit_parallel_is_clamped_to_the_memory_limit() {
+        const MB: u64 = 1 << 20;
+        assert_eq!(super::clamp_explicit_read(2, 4 << 20, 256 * MB), (2, None));
+        assert_eq!(super::clamp_explicit_read(8, 4 << 20, 256 * MB), (8, None));
+        let (n, note) = super::clamp_explicit_read(8, 4 << 20, 64 * MB);
+        assert_eq!(n, 2, "the swept 64 MiB fit");
+        let note = note.expect("a clamp says so");
+        assert!(note.contains("parallel=8") && note.contains("64 MiB") && note.contains("2 pipe"), "{note}");
+        // Past the automatic cap (8) is not a clamp in itself: a big limit
+        // holds 16 explicit pipes.
+        assert_eq!(super::clamp_explicit_read(16, 4 << 20, 1024 * MB).0, 16);
+    }
 }

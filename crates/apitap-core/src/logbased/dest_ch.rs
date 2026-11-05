@@ -877,7 +877,7 @@ async fn apply_unit(
     let t_clear = t0.elapsed();
 
     if insert_only {
-        let ver = id.end();
+        let ver = id.ver();
         if !c.upserts.is_empty() {
             let mut buf = Vec::with_capacity(4 << 20);
             match &rb_types {
@@ -1055,7 +1055,7 @@ async fn apply_unit(
                             // The journal holds the image without its version:
                             // it lands at THIS window's end, never the dead
                             // attempt's, which could outrank a later write.
-                            insert_only_suffix(&mut img, id.end(), false);
+                            insert_only_suffix(&mut img, id.ver(), false);
                             insert_only_cols(wal_cols)
                         } else {
                             wal_cols.to_vec()
@@ -1129,7 +1129,7 @@ async fn apply_unit(
                 u.journal_put(dest_table, &jk, &buf, pos, id.start())
                     .await?;
                 if insert_only {
-                    insert_only_suffix(&mut buf, id.end(), false);
+                    insert_only_suffix(&mut buf, id.ver(), false);
                 }
                 u.delete_owned(dest_table, &pred).await?;
                 if insert_only {
@@ -1153,7 +1153,7 @@ async fn apply_unit(
                     render_ch_row_cells(row, oids, &mut buf)?;
                 }
                 if insert_only {
-                    insert_only_suffix(&mut buf, id.end(), false);
+                    insert_only_suffix(&mut buf, id.ver(), false);
                     u.insert_owned(dest_table, &insert_only_cols(wal_cols), buf)
                         .await?;
                 } else {
@@ -1201,7 +1201,7 @@ async fn apply_unit(
                             strip_legacy_suffix(&mut img, wal_cols.len());
                         }
                         if insert_only {
-                            insert_only_suffix(&mut img, id.end(), false);
+                            insert_only_suffix(&mut img, id.ver(), false);
                             u.insert_owned(dest_table, &insert_only_cols(wal_cols), img)
                                 .await?;
                         } else {
@@ -1279,7 +1279,7 @@ async fn apply_unit(
                         .await?;
                 }
                 if insert_only {
-                    insert_only_suffix(&mut buf, id.end(), false);
+                    insert_only_suffix(&mut buf, id.ver(), false);
                 }
                 u.delete_owned(dest_table, &old_pred).await?;
                 // Replay-idempotent (review round 2 R2-4): a replayed window

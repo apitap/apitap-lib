@@ -492,7 +492,8 @@ impl Drop for PgRead {
 /// Start a parallel Arrow read; setup errors surface here as normal Python
 /// exceptions, before any stream exists.
 #[pyfunction]
-#[pyo3(signature = (src, table=None, *, cursor=None, parallel=None, query=None, materialize=false, columns=None, push_where=None))]
+#[pyo3(signature = (src, table=None, *, cursor=None, parallel=None, query=None, materialize=false, columns=None, push_where=None, where_sql=None))]
+#[allow(clippy::too_many_arguments)]
 fn read(
     py: Python<'_>,
     src: String,
@@ -503,6 +504,7 @@ fn read(
     materialize: bool,
     columns: Option<Vec<String>>,
     push_where: Option<String>,
+    where_sql: Option<String>,
 ) -> PyResult<PgRead> {
     let table = table.unwrap_or_default();
     let opts = apitap_core::ReadOptions {
@@ -514,12 +516,38 @@ fn read(
         batch_bytes: materialize.then_some(usize::MAX >> 1),
         columns,
         push_where,
+        where_sql,
     };
     let handle = py
         .detach(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
         .map_err(|e| match e {
             e => to_py(e),
         })?;
+    let names = handle.schema.iter().map(|f| f.name.clone()).collect();
+    let stream = capsule::new_stream(handle) as usize;
+    Ok(PgRead {
+        stream: Some(stream),
+        names,
+    })
+}
+
+/// apitap.sql(): a join + aggregate across databases, run in Rust; the
+/// answer comes back as the same Arrow stream `read` returns.
+#[pyfunction]
+#[pyo3(signature = (query, sources))]
+fn sql(
+    py: Python<'_>,
+    query: String,
+    sources: std::collections::HashMap<String, String>,
+) -> PyResult<PgRead> {
+    let handle = py
+        .detach(|| {
+            rt().block_on(async {
+                let r = apitap_core::sql_run(&query, &sources).await?;
+                Ok::<_, apitap_core::Error>(apitap_core::ReadHandle::ready(r.schema, vec![r.batch]))
+            })
+        })
+        .map_err(to_py)?;
     let names = handle.schema.iter().map(|f| f.name.clone()).collect();
     let stream = capsule::new_stream(handle) as usize;
     Ok(PgRead {
@@ -617,6 +645,7 @@ fn _apitap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(transfer, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_many, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;
+    m.add_function(wrap_pyfunction!(sql, m)?)?;
     m.add_function(wrap_pyfunction!(read_schema, m)?)?;
     m.add_class::<PgRead>()?;
     m.add("LockedError", m.py().get_type::<LockedError>())?;

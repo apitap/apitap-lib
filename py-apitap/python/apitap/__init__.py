@@ -25,6 +25,7 @@ from apitap._apitap import (
     __version__,
     mem_limit_bytes as _mem_limit_bytes,
     read as _read,
+    sql as _sql,
     request_stop,
     read_schema as _read_schema,
     transfer as _transfer,
@@ -33,6 +34,7 @@ from apitap._apitap import (
 
 __all__ = [
     "read",
+    "sql",
     "Reader",
     "transfer",
     "request_stop",
@@ -126,8 +128,9 @@ class Reader:
     frame (cheaper than giving up parallel read bandwidth).
     """
 
-    def __init__(self, src, table, cursor, parallel, query, columns=None):
+    def __init__(self, src, table, cursor, parallel, query, columns=None, where=None):
         self._args = (src, table, cursor, parallel, query, columns)
+        self._where = where
         self._native = None
 
     def _start(self, materialize: bool):
@@ -139,7 +142,7 @@ class Reader:
             src, table, cursor, parallel, query, columns = self._args
             self._native = _read(src, table, cursor=cursor, parallel=parallel,
                                  query=query, materialize=materialize,
-                                 columns=columns)
+                                 columns=columns, where_sql=self._where)
         return self._native
 
     def __arrow_c_stream__(self, requested_schema=None):
@@ -211,6 +214,7 @@ class Reader:
                 "fresh apitap.read(...) for it"
             )
         src, table, cursor, parallel, query, _ = self._args
+        where_user = self._where
 
         def dtype(tag):
             if tag.startswith("decimal:"):
@@ -278,9 +282,11 @@ class Reader:
             )
 
             def batches(push):
+                # where= decides the result, so it rides every attempt;
+                # only the lazy translation (push) is optional.
                 native = _read(src, table, cursor=cursor, parallel=parallel,
                                query=query, materialize=False, columns=cols,
-                               push_where=push)
+                               push_where=push, where_sql=where_user)
                 return iter(pa.RecordBatchReader.from_stream(native))
 
             # A pushed predicate the server rejects (a type it will not
@@ -565,6 +571,56 @@ def _predicate_sql(predicate, allowed, str_cols, float_cols, float32_cols, bool_
         return None
 
 
+class SqlResult:
+    """The answer of :func:`sql`: an Arrow stream. ``to_polars()``, or hand it to
+    DuckDB, polars or pyarrow directly (``__arrow_c_stream__``)."""
+
+    def __init__(self, native):
+        self._native = native
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        return self._native.__arrow_c_stream__(requested_schema)
+
+    def __arrow_c_schema__(self):
+        return self._native.__arrow_c_schema__()
+
+    @property
+    def columns(self):
+        return self._native.columns()
+
+    def to_polars(self):
+        try:
+            import polars as pl
+        except ImportError as e:
+            raise ImportError("to_polars() needs polars — pip install polars") from e
+        return pl.DataFrame(self)
+
+
+def sql(query: str, *, sources: dict[str, str]) -> SqlResult:
+    """Join and aggregate tables of different databases in one SQL statement.
+
+    The engine is apitap's own, in Rust: each table's filters and columns are
+    pushed into its own server, the join key's range is intersected and pushed
+    into both, the GROUP BY table becomes a compact key map, and the other
+    table streams past it into the aggregates — no joined row is ever built,
+    so a 5 GB × 5 GB join runs in a 256 MB container::
+
+        apitap.sql(
+            "SELECT o_orderpriority, SUM(l_extendedprice * (1 - l_discount)) AS revenue "
+            "FROM pg.lineitem l JOIN my.orders o ON l.l_orderkey = o.o_orderkey "
+            "WHERE l.l_shipdate > DATE '1995-03-15' GROUP BY 1 ORDER BY 1",
+            sources={"pg": "postgres://…", "my": "mysql://…"},
+        ).to_polars()
+
+    v1 runs one table, or two joined ``INNER JOIN … ON a.k = b.k`` on one
+    integer key, with ``WHERE`` conjuncts that each name one table, ``GROUP
+    BY`` columns of one table, and ``SUM``/``COUNT``/``MIN``/``MAX``/``AVG``
+    over the other table's columns; anything else is refused before a row is
+    read, naming what is not supported.
+    """
+    return SqlResult(_sql(query, dict(sources)))
+
+
 def read(
     src: str,
     table: str | None = None,
@@ -573,6 +629,7 @@ def read(
     parallel: int | None = None,
     query: str | None = None,
     columns: list[str] | None = None,
+    where: str | None = None,
 ) -> Reader:
     """Read a Postgres or MySQL table straight into a DataFrame, at wire speed.
 
@@ -597,6 +654,10 @@ def read(
         query: Raw SQL instead of a table (coming next — refused loudly today).
         columns: Read only these columns, in this order (default: all).
             ``.lazy()`` fills this automatically from the query's projection.
+        where: A row filter in the source's own SQL, run by the server
+            (``"l_shipdate > DATE '1995-03-15'"``). It must be one SQL
+            expression; anything else is refused before a row is read.
+            ``.lazy()`` filters still push down on top of it.
     """
     if (table is None) == (query is None):
         raise ValueError("pass exactly one of table=…, query=…")
@@ -604,7 +665,7 @@ def read(
         raise ValueError(
             "read: query= lands next — pass table= (and optionally cursor=) today"
         )
-    return Reader(src, table, cursor, parallel, query, columns)
+    return Reader(src, table, cursor, parallel, query, columns, where)
 
 
 def _split_ddl(value, name):

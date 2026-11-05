@@ -27,11 +27,56 @@ use std::sync::Mutex;
 pub(crate) struct WindowId {
     start: u64,
     end: u64,
+    /// How far the window moves the destination: the version its rows carry
+    /// and what an already-applied member is compared with. It is `end` for
+    /// every window but a spilled transaction's chunk, which holds the
+    /// watermark at the last complete commit (`end`) while its rows move on.
+    ver: u64,
 }
 
 impl WindowId {
     pub(crate) fn new(start: u64, end: u64) -> Self {
-        Self { start, end }
+        Self {
+            start,
+            end,
+            ver: end,
+        }
+    }
+
+    /// Chunk `k` (from 0) of a spilled transaction drained from watermark
+    /// `held`, committing at `commit`: it starts and is versioned at
+    /// `held + 1 + k` and leaves the watermark at `held`; the last chunk
+    /// (`last`) is versioned and watermarked at `commit`. Distinct starts keep
+    /// each chunk its own stamp (the residue journal and the replay rule key
+    /// on the start), and `held + 1 + k < commit` because a transaction's WAL
+    /// span is far larger than its chunk count; past it the chunk is refused.
+    pub(crate) fn chunk(held: u64, commit: u64, k: u64, last: bool) -> crate::error::Result<Self> {
+        let at = held.saturating_add(1).saturating_add(k);
+        if at >= commit {
+            return Err(crate::error::Error::Transfer(format!(
+                "log_based: spilled transaction chunk {k} would be versioned at {at}, not below \
+                 its commit {commit} — invariant broken"
+            )));
+        }
+        Ok(if last {
+            Self {
+                start: at,
+                end: commit,
+                ver: commit,
+            }
+        } else {
+            Self {
+                start: at,
+                end: held,
+                ver: at,
+            }
+        })
+    }
+
+    /// The row version and the progress a member is compared with (`end`
+    /// except for a spilled chunk, see [`WindowId::chunk`]).
+    pub(crate) fn ver(&self) -> u64 {
+        self.ver
     }
 
     /// The watermark every apply of this window hands its unit's close.

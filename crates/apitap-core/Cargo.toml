@@ -71,6 +71,10 @@ jsonwebtoken = "9"
 # Incremental RFC-4180 parsing for the CSV-file sources (GitHub); zero-dep
 # push parser, records stream through a bounded buffer.
 csv-core = "0.1"
+# SQL parsing: read(where=...) is checked to be exactly one expression in the
+# source dialect, and apitap.sql() plans from the same AST. Default features keep
+# recursive-protection, so hostile nesting cannot overflow the stack.
+sqlparser = { version = "0.55", features = ["visitor"] }
 # zlib-rs backend: ~2-4x faster than the default miniz_oxide at the same
 # ratio — the gzip leg is the CPU wall on small cores (BigQuery route).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

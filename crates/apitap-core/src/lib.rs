@@ -46,11 +46,13 @@ mod read_impl;
 pub mod shutdown;
 mod sink;
 mod source;
+mod sql;
 mod urlerr;
 mod wire;
 
 pub use error::{Error, Result};
 pub use read::{read_schema, read_start, ArrowField, ReadHandle, ReadOptions};
+pub use sql::{run as sql_run, SqlResult};
 pub use wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, FinishedCol};
 
 /// The memory limit the engine sizes itself from — `APITAP_MEM_BUDGET`, then

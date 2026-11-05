@@ -65,7 +65,8 @@ fn streams_too_big(open: usize, bytes: usize, limit: usize) -> Error {
          changes together (APITAP_TX_BUF_BYTES = {} MiB) — each stays buffered until it \
          commits, and continuing would OOM. Commit or split the long transactions on the \
          source, or raise APITAP_TX_BUF_BYTES (bytes, or a K/M/G suffix) if this process \
-         really has that much memory. The watermark is untouched: the next run re-reads them.",
+         really has that much memory. The watermark is untouched: the next run re-reads them. \
+         (A changelog=True lane cannot spill a transaction to disk yet; replica lanes do.)",
         bytes >> 20,
         limit >> 20
     ))
@@ -77,7 +78,8 @@ pub(crate) fn tx_too_big(table: &str, bytes: usize, limit: usize) -> Error {
          (APITAP_TX_BUF_BYTES = {} MiB) — the source ships a transaction whole, so it \
          cannot land in parts, and continuing would OOM. Split the write on the \
          source, or raise APITAP_TX_BUF_BYTES (bytes, or a K/M/G suffix) if this \
-         process really has that much memory. The watermark is untouched: the next run re-reads the transaction.",
+         process really has that much memory. The watermark is untouched: the next run re-reads the transaction. \
+         (A changelog=True lane cannot spill a transaction to disk yet; replica lanes do.)",
         bytes >> 20,
         limit >> 20
     ))
@@ -138,6 +140,16 @@ pub(crate) struct DrainSession {
     /// drain starts. The memory it holds does not go anywhere, so the budget
     /// that is supposed to bound this process's RSS has to keep counting it.
     stream_bytes: usize,
+    /// Streamed transactions past `APITAP_TX_BUF_BYTES`, their ops so far on
+    /// local disk by xid (A2); `streams` keeps only what arrived since the
+    /// last spill. Before 0.66 the drain refused here.
+    stream_spill: HashMap<u32, crate::logbased::spill::SpillFile>,
+    /// Subtransactions of a spilled stream rolled back after their rows went
+    /// to disk: the replay skips them.
+    stream_aborted: HashMap<u32, std::collections::HashSet<u32>>,
+    /// A committed spilled transaction, replayed in window-sized chunks by the
+    /// next drains before the stream is read again.
+    replay: Option<Replay>,
     /// Each tracked table's source oid when the run began, and its
     /// destination, by "schema.table" (N7). A Relation under a tracked name
     /// with any other oid is a table dropped and recreated inside the WAL
@@ -207,6 +219,130 @@ impl DrainSession {
         self.slots[usize::from(slot)].tracked = tracked;
         Ok(slot)
     }
+}
+
+/// A committed transaction whose ops went to disk (A2), replayed in chunks:
+/// the file front to back, then the ops that were still in memory, skipping
+/// rolled-back subtransactions. Each drain takes one window-sized chunk, so a
+/// transaction of any size is applied with the window budget's memory.
+pub(crate) struct Replay {
+    file: Option<crate::logbased::spill::SpillReader>,
+    tail: std::vec::IntoIter<(u16, StreamOp, u32)>,
+    aborted: std::collections::HashSet<u32>,
+    commit: u64,
+    /// Chunks already handed out.
+    k: u64,
+}
+
+impl Replay {
+    fn new(
+        file: Option<crate::logbased::spill::SpillReader>,
+        tail: Vec<(u16, StreamOp, u32)>,
+        aborted: std::collections::HashSet<u32>,
+        commit: u64,
+    ) -> Self {
+        Self {
+            file,
+            tail: tail.into_iter(),
+            aborted,
+            commit,
+            k: 0,
+        }
+    }
+
+    fn next_op(&mut self) -> Result<Option<(u16, StreamOp)>> {
+        loop {
+            let next = match self.file.as_mut() {
+                Some(f) => match f.next_op()? {
+                    Some(op) => Some(op),
+                    None => {
+                        self.file = None;
+                        self.tail.next()
+                    }
+                },
+                None => self.tail.next(),
+            };
+            match next {
+                None => return Ok(None),
+                Some((_, _, sub)) if self.aborted.contains(&sub) => continue,
+                Some((t, op, _)) => return Ok(Some((t, op))),
+            }
+        }
+    }
+}
+
+/// A streamed op lands in its stream's buffer; past `limit` every open
+/// stream's buffer moves to its spill file (A2). changelog=True still refuses:
+/// its replay rule cannot yet tell a transaction's chunks from re-drains of
+/// one window.
+fn stream_push(
+    sess: &mut DrainSession,
+    x: u32,
+    op: (u16, StreamOp, u32),
+    n: usize,
+    limit: usize,
+    changelog: bool,
+) -> Result<()> {
+    sess.stream_bytes += n;
+    open_stream(sess, x)?.push(op);
+    if sess.stream_bytes <= limit {
+        return Ok(());
+    }
+    if changelog {
+        return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, limit));
+    }
+    for (xid, ops) in sess.streams.iter_mut() {
+        if ops.is_empty() {
+            continue;
+        }
+        let f = match sess.stream_spill.entry(*xid) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(crate::logbased::spill::SpillFile::create()?)
+            }
+        };
+        for (t, o, sub) in ops.drain(..) {
+            f.push(t, &o, sub)?;
+        }
+    }
+    sess.stream_bytes = 0;
+    Ok(())
+}
+
+/// A non-streamed transaction's op lands in `tx_buf`; past `limit` the buffer
+/// moves to the transaction's spill file (A2). changelog=True still refuses.
+/// `acct` is (this transaction's bytes, the window's buffered bytes).
+#[allow(clippy::too_many_arguments)]
+fn tx_push(
+    sess: &DrainSession,
+    tx_buf: &mut TxOps,
+    tx_spill: &mut Option<crate::logbased::spill::SpillFile>,
+    acct: &mut (&mut usize, &mut usize),
+    op: (u16, StreamOp),
+    n: usize,
+    limit: usize,
+    changelog: bool,
+) -> Result<()> {
+    *acct.0 += n;
+    *acct.1 += n;
+    let t = op.0;
+    tx_buf.push(op);
+    if *acct.0 <= limit {
+        return Ok(());
+    }
+    if changelog {
+        return Err(tx_too_big(&sess.slots[usize::from(t)].table, *acct.0, limit));
+    }
+    if tx_spill.is_none() {
+        *tx_spill = Some(crate::logbased::spill::SpillFile::create()?);
+    }
+    let f = tx_spill.as_mut().expect("spill just ensured");
+    for (t, o) in tx_buf.drain(..) {
+        f.push(t, &o, 0)?;
+    }
+    *acct.1 = acct.1.saturating_sub(*acct.0);
+    *acct.0 = 0;
+    Ok(())
 }
 
 /// Truthful residency: a buffered row pins its WHOLE frame plus the range
@@ -281,6 +417,9 @@ pub(crate) async fn drain(
     // if the drain aborts mid-transaction. `tx_bytes` is the current
     // transaction's own charge against the hard cap (system review G0.1).
     let mut tx_buf: TxOps = Vec::new();
+    // The current transaction's ops past `tx_limit`, on disk (A2): replayed
+    // in window-sized chunks after its commit instead of refused.
+    let mut tx_spill: Option<crate::logbased::spill::SpillFile> = None;
     let mut tx_bytes = 0usize;
     let tx_limit = tx_buf_limit();
     let mut end_lsn = start_lsn;
@@ -308,6 +447,45 @@ pub(crate) async fn drain(
 
     // The transaction the previous window stopped short of opens this one,
     // under the layout its Relation announced.
+    // A spilled transaction committed: hand out its next chunk and read
+    // nothing from the stream until the last one is out (A2). The status
+    // keeps the walsender session alive while no socket read happens.
+    if let Some(mut rp) = sess.replay.take() {
+        ws.standby_status(*applied.borrow(), false).await?;
+        let mut done = false;
+        loop {
+            match rp.next_op()? {
+                None => {
+                    done = true;
+                    break;
+                }
+                Some(op) => {
+                    buf_bytes += op_bytes(&op.1);
+                    flush_ops(std::iter::once(op), sess, &mut collapsers, &mut changelogs, changelog, rp.commit)?;
+                    if buf_bytes >= max_buf_bytes {
+                        break;
+                    }
+                }
+            }
+        }
+        let id = WindowId::chunk(start_lsn, rp.commit, rp.k, done)?;
+        if dbg_stream {
+            eprintln!(
+                "[log_based] spilled transaction: chunk {} {}..{} ver {}{}",
+                rp.k,
+                id.start(),
+                id.end(),
+                id.ver(),
+                if done { " (last)" } else { "" }
+            );
+        }
+        if !done {
+            rp.k += 1;
+            sess.replay = Some(rp);
+        }
+        return seal_outcome(sess, collapsers, changelogs, changelog, id, true, keep_binary);
+    }
+
     let mut carried_to_stop = false;
     if let Some((ops, e)) = sess.carry.take() {
         buf_bytes += ops.iter().map(|(_, o)| op_bytes(o)).sum::<usize>();
@@ -442,9 +620,19 @@ pub(crate) async fn drain(
                 match msg {
                     PgoMessage::Begin { .. } => {
                         tx_buf.clear();
+                        tx_spill = None;
                         tx_bytes = 0;
                     }
                     PgoMessage::Commit { end_lsn: e, .. } => {
+                        if let Some(f) = tx_spill.take() {
+                            // A spilled transaction replays from the next
+                            // window on, in chunks; this one ends at the
+                            // previous commit.
+                            let tail: Vec<_> = tx_buf.drain(..).map(|(t, o)| (t, o, 0)).collect();
+                            sess.replay = Some(Replay::new(Some(f.into_reader()?), tail, Default::default(), e));
+                            hit_budget = true;
+                            break;
+                        }
                         if relayout {
                             // The window ends at the previous commit; this one
                             // opens the next, whose bodies take the new layout.
@@ -483,6 +671,15 @@ pub(crate) async fn drain(
                         // window's collapsers, so the charge moves with them.
                         let n: usize = ops.iter().map(|(_, o, _)| op_bytes(o)).sum();
                         sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                        if let Some(f) = sess.stream_spill.remove(&xid) {
+                            // Spilled (A2): its head is on disk, `ops` is the
+                            // tail still in memory. It replays from the next
+                            // window on; this window ends at the last commit.
+                            let aborted = sess.stream_aborted.remove(&xid).unwrap_or_default();
+                            sess.replay = Some(Replay::new(Some(f.into_reader()?), ops, aborted, e));
+                            hit_budget = true;
+                            break;
+                        }
                         let ops = ops.into_iter().map(|(t, o, _)| (t, o));
                         if relayout {
                             sess.carry = Some((ops.collect(), e));
@@ -517,6 +714,15 @@ pub(crate) async fn drain(
                         // rollback — silently, watermark and all; the second
                         // refused the window, which was safe but stopped runs for
                         // rollbacks in traffic apitap does not even replicate.
+                        // A spilled stream's head is on disk: the whole
+                        // transaction's abort deletes it, a subtransaction's
+                        // is remembered and skipped when the file replays.
+                        if sub_xid == xid {
+                            sess.stream_spill.remove(&xid);
+                            sess.stream_aborted.remove(&xid);
+                        } else if sess.stream_spill.contains_key(&xid) {
+                            sess.stream_aborted.entry(xid).or_default().insert(sub_xid);
+                        }
                         if let Some(ops) = sess.streams.get_mut(&xid) {
                             let before = ops.len();
                             let freed: usize = ops
@@ -610,28 +816,17 @@ pub(crate) async fn drain(
                             let n = cells_bytes(&new);
                             let op = StreamOp::Insert(new);
                             match in_stream {
-                                Some(x) => {
-                                    sess.stream_bytes += n;
-                                    if sess.stream_bytes > tx_limit {
-                                        return Err(streams_too_big(
-                                            sess.streams.len(),
-                                            sess.stream_bytes,
-                                            tx_limit,
-                                        ));
-                                    }
-                                    open_stream(sess, x)?.push((t, op, sub.unwrap_or(x)));
-                                }
+                                Some(x) => stream_push(
+                                    sess,
+                                    x,
+                                    (t, op, sub.unwrap_or(x)),
+                                    n,
+                                    tx_limit,
+                                    changelog,
+                                )?,
                                 None => {
-                                    buf_bytes += n;
-                                    tx_bytes += n;
-                                    if tx_bytes > tx_limit {
-                                        return Err(tx_too_big(
-                                            &sess.slots[usize::from(t)].table,
-                                            tx_bytes,
-                                            tx_limit,
-                                        ));
-                                    }
-                                    tx_buf.push((t, op));
+                                    let mut acct = (&mut tx_bytes, &mut buf_bytes);
+                                    tx_push(sess, &mut tx_buf, &mut tx_spill, &mut acct, (t, op), n, tx_limit, changelog)?
                                 }
                             }
                         }
@@ -644,28 +839,17 @@ pub(crate) async fn drain(
                             let n = cells_bytes(&new) + old.as_ref().map_or(0, cells_bytes);
                             let op = StreamOp::Update(old, new, old_full);
                             match in_stream {
-                                Some(x) => {
-                                    sess.stream_bytes += n;
-                                    if sess.stream_bytes > tx_limit {
-                                        return Err(streams_too_big(
-                                            sess.streams.len(),
-                                            sess.stream_bytes,
-                                            tx_limit,
-                                        ));
-                                    }
-                                    open_stream(sess, x)?.push((t, op, sub.unwrap_or(x)));
-                                }
+                                Some(x) => stream_push(
+                                    sess,
+                                    x,
+                                    (t, op, sub.unwrap_or(x)),
+                                    n,
+                                    tx_limit,
+                                    changelog,
+                                )?,
                                 None => {
-                                    buf_bytes += n;
-                                    tx_bytes += n;
-                                    if tx_bytes > tx_limit {
-                                        return Err(tx_too_big(
-                                            &sess.slots[usize::from(t)].table,
-                                            tx_bytes,
-                                            tx_limit,
-                                        ));
-                                    }
-                                    tx_buf.push((t, op));
+                                    let mut acct = (&mut tx_bytes, &mut buf_bytes);
+                                    tx_push(sess, &mut tx_buf, &mut tx_spill, &mut acct, (t, op), n, tx_limit, changelog)?
                                 }
                             }
                         }
@@ -676,28 +860,17 @@ pub(crate) async fn drain(
                             let n = cells_bytes(&old.tuple);
                             let op = StreamOp::Delete(old.tuple);
                             match in_stream {
-                                Some(x) => {
-                                    sess.stream_bytes += n;
-                                    if sess.stream_bytes > tx_limit {
-                                        return Err(streams_too_big(
-                                            sess.streams.len(),
-                                            sess.stream_bytes,
-                                            tx_limit,
-                                        ));
-                                    }
-                                    open_stream(sess, x)?.push((t, op, sub.unwrap_or(x)));
-                                }
+                                Some(x) => stream_push(
+                                    sess,
+                                    x,
+                                    (t, op, sub.unwrap_or(x)),
+                                    n,
+                                    tx_limit,
+                                    changelog,
+                                )?,
                                 None => {
-                                    buf_bytes += n;
-                                    tx_bytes += n;
-                                    if tx_bytes > tx_limit {
-                                        return Err(tx_too_big(
-                                            &sess.slots[usize::from(t)].table,
-                                            tx_bytes,
-                                            tx_limit,
-                                        ));
-                                    }
-                                    tx_buf.push((t, op));
+                                    let mut acct = (&mut tx_bytes, &mut buf_bytes);
+                                    tx_push(sess, &mut tx_buf, &mut tx_spill, &mut acct, (t, op), n, tx_limit, changelog)?
                                 }
                             }
                         }
@@ -722,10 +895,43 @@ pub(crate) async fn drain(
     }
 
     let t_seal = std::time::Instant::now();
-    // The window's bodies leave by table name (the destinations speak
-    // names); the dense slots are the drain's internal form. One String per
-    // active table at the seal is nothing next to the per-op hashing the
-    // slots removed from the window.
+    let outcome = seal_outcome(
+        sess,
+        collapsers,
+        changelogs,
+        changelog,
+        WindowId::new(start_lsn, end_lsn),
+        hit_budget,
+        keep_binary,
+    )?;
+    if dbg_stream {
+        eprintln!("[events] decoded={decoded} collapsed={}", outcome.events());
+        let t_seal = t_seal.elapsed();
+        eprintln!(
+            "[drain] recv={:.2}s decode={:.2}s flush={:.2}s seal={:.3}s total={:.2}s",
+            t_recv.as_secs_f64(),
+            t_dec.as_secs_f64(),
+            t_flush.as_secs_f64(),
+            t_seal.as_secs_f64(),
+            (t_recv + t_dec + t_flush + t_seal).as_secs_f64(),
+        );
+    }
+    Ok(outcome)
+}
+
+/// The window's bodies leave by table name (the destinations speak names);
+/// the dense slots are the drain's internal form. One String per active table
+/// at the seal is nothing next to the per-op hashing the slots removed from
+/// the window.
+fn seal_outcome(
+    sess: &DrainSession,
+    mut collapsers: Vec<Option<Collapser>>,
+    mut changelogs: Vec<Option<Changes>>,
+    changelog: bool,
+    id: WindowId,
+    hit_budget: bool,
+    binary: bool,
+) -> Result<DrainOutcome> {
     let collapsers: HashMap<String, Collapser> = sess
         .slots
         .iter()
@@ -748,25 +954,12 @@ pub(crate) async fn drain(
                 .map(|c| (st.table.to_string(), c))
         })
         .collect();
-    let outcome = DrainOutcome {
+    Ok(DrainOutcome {
         bodies: Bodies::seal(changelog, collapsers, changelogs)?,
-        id: WindowId::new(start_lsn, end_lsn),
+        id,
         hit_budget,
-        binary: keep_binary,
-    };
-    if dbg_stream {
-        eprintln!("[events] decoded={decoded} collapsed={}", outcome.events());
-        let t_seal = t_seal.elapsed();
-        eprintln!(
-            "[drain] recv={:.2}s decode={:.2}s flush={:.2}s seal={:.3}s total={:.2}s",
-            t_recv.as_secs_f64(),
-            t_dec.as_secs_f64(),
-            t_flush.as_secs_f64(),
-            t_seal.as_secs_f64(),
-            (t_recv + t_dec + t_flush + t_seal).as_secs_f64(),
-        );
-    }
-    Ok(outcome)
+        binary,
+    })
 }
 
 /// The layout a table's first op of the window builds its body with.

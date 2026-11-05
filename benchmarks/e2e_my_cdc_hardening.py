@@ -8,9 +8,10 @@ server:
            gtid_mode=ON.)
   truncate `/* app */ TRUNCATE TABLE t` was classed DDL and then not seen as
            a truncate: skipped silently, the destination kept the rows.
-  txcap    one MySQL transaction buffered without bound (the Postgres lane
-           caps it at APITAP_TX_BUF_BYTES): a big UPDATE OOM-looped. It is
-           now refused naming the table, and the watermark stays.
+  txcap    one MySQL transaction buffered without bound: a big UPDATE
+           OOM-looped. Through 0.65.0 it was refused at APITAP_TX_BUF_BYTES;
+           from 0.66 it spills to disk and lands whole in chunks (a
+           changelog=True lane still refuses, watermark kept).
   state    `_apitap_state` keys compared under the server's _ci collation:
            Postgres tables "Orders" and "orders" appended into one MySQL
            database shared one state row.
@@ -114,31 +115,52 @@ def truncate():
 
 
 def txcap():
+    """One transaction past the cap spills to disk and lands whole (A2); a
+    changelog=True lane still refuses it naming the table and the watermark
+    stays."""
     t = "my_tx_cap"
+    n = 10000
     mysql("apitap-bench-my", f"DROP TABLE IF EXISTS {t}")
     ch_wipe(t)
+    ch_wipe(t + "_cl")
+    seed = (f"SET SESSION cte_max_recursion_depth = {n + 1}; "
+            f"INSERT INTO {t} WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < {n}) "
+            f"SELECT x, REPEAT('a', 200) FROM g")
+    digest = "SELECT MD5(GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id SEPARATOR ','))"
     try:
-        mysql("apitap-bench-my", f"CREATE TABLE {t} (id int PRIMARY KEY, v varchar(200)); "
-              f"INSERT INTO {t} WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 1000) "
-              f"SELECT x, REPEAT('a', 200) FROM g")
+        mysql("apitap-bench-my", f"CREATE TABLE {t} (id int PRIMARY KEY, v varchar(200)); {seed}")
+        mysql("apitap-bench-my", "SET SESSION group_concat_max_len = 1 << 30")
         apitap.transfer(MY, CH, table=t, mode="log_based")
-        before = state_rows(t)
-        mysql("apitap-bench-my", f"UPDATE {t} SET v = REPEAT('b', 200)")       # ~800 KB in one transaction
+        apitap.transfer(MY, CH, table=t, dest_table=t + "_cl", mode="log_based", changelog=True)
+        # ~5 MB in one transaction: every row rewritten, 500 new, 300 gone.
+        mysql("apitap-bench-my", f"BEGIN; UPDATE {t} SET v = REPEAT('b', 200); "
+              f"INSERT INTO {t} SELECT id + {n}, 'new' FROM {t} WHERE id <= 500; "
+              f"DELETE FROM {t} WHERE id % 33 = 0; COMMIT;")
+        env = dict(os.environ, APITAP_TX_BUF_BYTES="256K", APITAP_CDC_WINDOW_BYTES=str(1 << 20),
+                   APITAP_DEBUG="1")
         code = f"import apitap\napitap.transfer({MY!r}, {CH!r}, table={t!r}, mode='log_based')\n"
-        r = sh([sys.executable, "-c", code], env=dict(os.environ, APITAP_TX_BUF_BYTES="256K"))
-        assert r.returncode != 0 and "one transaction" in r.stderr and t in r.stderr, \
-            (f"a transaction past the cap must be refused naming the table (exit {r.returncode}, "
-             f"watermark before {before}, now {state_rows(t)}):"
-             f"\n{r.stderr[-1500:]}")
-        after = state_rows(t)
-        assert after == before, f"the watermark must stay: {before} -> {after}"
-        r = sh([sys.executable, "-c", code])
-        assert r.returncode == 0, r.stderr[-500:]
-        assert ch(f"SELECT countIf(v LIKE 'b%') FROM {t}") == "1000", "with the default cap it lands"
-        print("  an 800 KB transaction under a 256 KB cap: refused naming the table, watermark kept; lands at the default")
+        r = sh([sys.executable, "-c", code], env=env)
+        chunks = [l for l in r.stderr.splitlines() if "spilled transaction: chunk" in l]
+        assert r.returncode == 0, f"a transaction past the cap must land (exit {r.returncode}):\n{r.stderr[-1500:]}"
+        assert len(chunks) >= 2 and "(last)" in chunks[-1], f"replayed in chunks: {chunks}"
+        want = mysql("apitap-bench-my", f"SET SESSION group_concat_max_len = 1 << 30; {digest} FROM {t}")
+        got = ch(f"SELECT lower(hex(MD5(arrayStringConcat(groupArray(s), ',')))) FROM "
+                 f"(SELECT concat(toString(id), ':', v) AS s FROM {t} ORDER BY id)")
+        assert got == want, f"the destination equals the source: dest {got} source {want}"
+        before = state_rows(t + "_cl")
+        code = (f"import apitap\napitap.transfer({MY!r}, {CH!r}, table={t!r}, dest_table={t + '_cl'!r}, "
+                f"mode='log_based', changelog=True)\n")
+        r = sh([sys.executable, "-c", code], env=env)
+        assert r.returncode != 0 and "one transaction" in r.stderr and t in r.stderr \
+            and "changelog=True" in r.stderr, f"changelog still refuses naming why:\n{r.stderr[-1500:]}"
+        assert state_rows(t + "_cl") == before, "the changelog lane's watermark stays"
+        print(f"  a ~5 MB transaction under a 256 KB cap: {len(chunks)} chunks, destination equals the source; "
+              "changelog=True still refuses, watermark kept")
     finally:
         mysql("apitap-bench-my", f"DROP TABLE IF EXISTS {t}")
         ch_wipe(t)
+        ch_wipe(t + "_cl")
+        ch(f"DROP TABLE IF EXISTS {t}_cl__current")
 
 
 def state():

@@ -514,6 +514,82 @@ pub(crate) struct MySession {
     /// (binlog_checksum=NONE when it was written), as its FORMAT_DESCRIPTION
     /// said. Per file, not per server: the setting can change between files.
     pub no_checksum: bool,
+    /// A committed transaction whose ops went to disk past
+    /// `APITAP_TX_BUF_BYTES` (A2), replayed in window-sized chunks by the next
+    /// drains before the binlog is read again.
+    pub replay: Option<MyReplay>,
+}
+
+/// A spilled MySQL transaction being replayed: the file front to back, then
+/// the ops still in memory at its commit. The file records tables by their
+/// index in `names`.
+pub(crate) struct MyReplay {
+    file: Option<crate::logbased::spill::SpillReader>,
+    tail: std::vec::IntoIter<(Arc<str>, TxOp)>,
+    names: Vec<Arc<str>>,
+    commit: u64,
+    k: u64,
+}
+
+impl MyReplay {
+    fn next_op(&mut self) -> Result<Option<(Arc<str>, TxOp)>> {
+        if let Some(f) = self.file.as_mut() {
+            match f.next_op()? {
+                Some((slot, op, _)) => {
+                    let t = self.names.get(usize::from(slot)).cloned().ok_or_else(|| {
+                        Error::Transfer(format!("log_based: transaction spill names table #{slot}, unknown"))
+                    })?;
+                    return Ok(Some((t, from_stream(op))));
+                }
+                None => self.file = None,
+            }
+        }
+        Ok(self.tail.next())
+    }
+}
+
+/// The open transaction's spill: the file and the tables its records index.
+type TxSpill = (crate::logbased::spill::SpillFile, Vec<Arc<str>>);
+
+fn to_stream(op: TxOp) -> crate::logbased::drain::StreamOp {
+    use crate::logbased::drain::StreamOp as S;
+    match op {
+        TxOp::Insert(t) => S::Insert(t),
+        TxOp::Update(old, new) => S::Update(old, new, false),
+        TxOp::Delete(t) => S::Delete(t),
+        TxOp::Truncate => S::Truncate,
+    }
+}
+
+fn from_stream(op: crate::logbased::drain::StreamOp) -> TxOp {
+    use crate::logbased::drain::StreamOp as S;
+    match op {
+        S::Insert(t) => TxOp::Insert(t),
+        S::Update(old, new, _) => TxOp::Update(old, new),
+        S::Delete(t) => TxOp::Delete(t),
+        S::Truncate => TxOp::Truncate,
+    }
+}
+
+/// Move the open transaction's buffered ops to its spill file (A2).
+fn spill_tx(tx_buf: &mut Vec<(Arc<str>, TxOp)>, spill: &mut Option<TxSpill>) -> Result<()> {
+    if spill.is_none() {
+        *spill = Some((crate::logbased::spill::SpillFile::create()?, Vec::new()));
+    }
+    let (f, names) = spill.as_mut().expect("spill just ensured");
+    for (t, op) in tx_buf.drain(..) {
+        let slot = match names.iter().position(|n| *n == t) {
+            Some(i) => i,
+            None => {
+                names.push(t);
+                names.len() - 1
+            }
+        };
+        let slot = u16::try_from(slot)
+            .map_err(|_| Error::Transfer("log_based: one transaction past 65535 tables".into()))?;
+        f.push(slot, &to_stream(op), 0)?;
+    }
+    Ok(())
 }
 
 /// The layout of tracked table `q`: cached, else from the schema cache, else
@@ -593,6 +669,56 @@ pub(crate) async fn drain_binlog(
     let tx_limit = crate::logbased::drain::tx_buf_limit();
     let mut tx_bytes = 0usize;
     let mut hit_budget = false;
+    // The open transaction's ops past `tx_limit`, on disk (A2).
+    let mut tx_spill: Option<TxSpill> = None;
+
+    // A spilled transaction committed: hand out its next chunk and read
+    // nothing from the binlog until the last one is out (A2).
+    if let Some(mut rp) = sess.replay.take() {
+        let mut chunk: Vec<(Arc<str>, TxOp)> = Vec::new();
+        let mut done = false;
+        loop {
+            match rp.next_op()? {
+                None => {
+                    done = true;
+                    break;
+                }
+                Some(op) => {
+                    buf_bytes += match &op.1 {
+                        TxOp::Insert(t) | TxOp::Delete(t) => cells_bytes(t),
+                        TxOp::Update(o, n) => cells_bytes(n) + o.as_ref().map_or(0, cells_bytes),
+                        TxOp::Truncate => 0,
+                    };
+                    chunk.push(op);
+                    if buf_bytes >= max_buf_bytes {
+                        break;
+                    }
+                }
+            }
+        }
+        drain_tx(&mut chunk, changelog, &sess.layouts, &mut changelogs, &mut collapsers, rp.commit)?;
+        let id = WindowId::chunk(start, rp.commit, rp.k, done)?;
+        if std::env::var("APITAP_DEBUG").is_ok() {
+            eprintln!(
+                "[log_based] spilled transaction: chunk {} {}..{} ver {}{}",
+                rp.k,
+                id.start(),
+                id.end(),
+                id.ver(),
+                if done { " (last)" } else { "" }
+            );
+        }
+        if !done {
+            rp.k += 1;
+            sess.replay = Some(rp);
+        }
+        return Ok(DrainOutcome {
+            binary: false,
+            bodies: Bodies::seal(changelog, collapsers, changelogs)?,
+            id,
+            hit_budget: true,
+        });
+    }
 
     loop {
         if std::time::Instant::now() > deadline || crate::shutdown::requested() {
@@ -823,7 +949,12 @@ pub(crate) async fn drain_binlog(
                 }
                 tx_bytes += buf_bytes - before;
                 if tx_bytes > tx_limit {
-                    return Err(crate::logbased::drain::tx_too_big(&q, tx_bytes, tx_limit));
+                    if changelog {
+                        return Err(crate::logbased::drain::tx_too_big(&q, tx_bytes, tx_limit));
+                    }
+                    spill_tx(&mut tx_buf, &mut tx_spill)?;
+                    buf_bytes = buf_bytes.saturating_sub(tx_bytes);
+                    tx_bytes = 0;
                 }
             }
             bl::TYPE_QUERY => {
@@ -834,18 +965,20 @@ pub(crate) async fn drain_binlog(
                     // Transaction opens: anything buffered from a torn
                     // previous attempt is stale.
                     tx_buf.clear();
+                    tx_spill = None;
                     in_tx = true;
                 } else if verb == QueryVerb::Rollback {
                     // The transaction never happened. Left in the buffer, its
                     // rows were applied by whatever drained next — a DDL's
                     // implicit commit (MASTER M-39).
                     tx_buf.clear();
+                    tx_spill = None;
                     in_tx = false;
                 } else if verb == QueryVerb::RollbackTo {
                     // Which of the buffered rows the savepoint undid is not in
                     // the event. Guessing either way is wrong data, so a
                     // partial rollback over tracked changes stops the run.
-                    if !tx_buf.is_empty() {
+                    if !tx_buf.is_empty() || tx_spill.is_some() {
                         return Err(Error::Transfer(format!(
                             "binlog: a transaction touching a tracked table rolled back \
                              to a savepoint ({head:?}) at {}:{} — the binlog does not say \
@@ -884,6 +1017,20 @@ pub(crate) async fn drain_binlog(
                     // next GTID event cleared the buffer before it was drained
                     // (the rows vanished silently) and MySQL held them until the
                     // next XID (system review 2026-10-07, R1).
+                    if let Some((f, names)) = tx_spill.take() {
+                        // Spilled (A2): it replays from the next window on, in
+                        // chunks; this window ends at the previous commit.
+                        let tail: Vec<_> = tx_buf.drain(..).collect();
+                        sess.replay = Some(MyReplay {
+                            file: Some(f.into_reader()?),
+                            tail: tail.into_iter(),
+                            names,
+                            commit: pack_pos(&sess.file, h.log_pos),
+                            k: 0,
+                        });
+                        hit_budget = true;
+                        break;
+                    }
                     drain_tx(
                         &mut tx_buf,
                         changelog,
@@ -937,6 +1084,21 @@ pub(crate) async fn drain_binlog(
                     // Anything already buffered belongs to the transaction this
                     // DDL implicitly committed, so it lands FIRST, under the
                     // layouts it was decoded against.
+                    if tx_spill.is_some() {
+                        // Its head is on disk and would replay after this DDL
+                        // dropped the layouts it was decoded against.
+                        return Err(Error::Transfer(format!(
+                            "binlog: a transaction past APITAP_TX_BUF_BYTES ({} MiB) was \
+                             committed implicitly by a DDL ({}) at {}:{} — its spilled rows \
+                             cannot replay under the layouts the DDL changes. Raise \
+                             APITAP_TX_BUF_BYTES so it fits in memory, or COMMIT before the DDL \
+                             on the source",
+                            tx_limit >> 20,
+                            crate::sink::char_excerpt(head, 120),
+                            sess.file,
+                            h.log_pos
+                        )));
+                    }
                     drain_tx(
                         &mut tx_buf,
                         changelog,
@@ -1055,6 +1217,20 @@ pub(crate) async fn drain_binlog(
             bl::TYPE_XID => {
                 // Commit boundary: the buffered ops become real, and the
                 // watermark advances to the position AFTER this event.
+                if let Some((f, names)) = tx_spill.take() {
+                    // Spilled (A2): it replays from the next window on, in
+                    // chunks; this window ends at the previous commit.
+                    let tail: Vec<_> = tx_buf.drain(..).collect();
+                    sess.replay = Some(MyReplay {
+                        file: Some(f.into_reader()?),
+                        tail: tail.into_iter(),
+                        names,
+                        commit: pack_pos(&sess.file, h.log_pos),
+                        k: 0,
+                    });
+                    hit_budget = true;
+                    break;
+                }
                 drain_tx(
                     &mut tx_buf,
                     changelog,
@@ -1077,6 +1253,7 @@ pub(crate) async fn drain_binlog(
                 // MariaDB opens a transaction with a GTID event — there is no
                 // `BEGIN` QUERY event to clear a torn attempt's leftovers.
                 tx_buf.clear();
+                tx_spill = None;
                 in_tx = true;
             }
             t if bl::skippable(t) => {

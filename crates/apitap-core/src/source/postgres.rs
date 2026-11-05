@@ -72,6 +72,11 @@ pub(crate) struct PgSource {
 }
 
 impl PgSource {
+    /// The pool, for apitap.sql()'s key-range probe.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub(crate) async fn connect(url: &str, max_conns: usize) -> Result<Self> {
         // The snapshot rides an internal URL param so it can cross the
         // scheme-dispatch boundary without widening every trait; it is

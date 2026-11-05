@@ -2264,6 +2264,7 @@ async fn drain_loop(
     let dbg = std::env::var("APITAP_DEBUG").is_ok();
     let mut sess = DrainSession::expecting(relids);
     let mut cur = wm;
+    let mut cur_ver = wm;
     let mut windows = 0u32;
     // The windows sent to the applier and not yet confirmed, oldest first;
     // `depth` bounds them so the drain runs ahead of the applies instead of
@@ -2309,11 +2310,17 @@ async fn drain_loop(
             );
         }
         let end = outcome.id.end();
+        let ver = outcome.id.ver();
         let hit = outcome.hit_budget;
-        if end > cur && win_tx.send(outcome).await.is_err() {
+        // A window is sent when it moves the destination, which is `end` for
+        // every window but a spilled transaction's chunk: that one holds the
+        // watermark (`end` == `cur`) while its rows move on (`ver`), and was
+        // dropped here when only `end` was compared.
+        if ver > cur_ver && win_tx.send(outcome).await.is_err() {
             // Apply task died — its JoinHandle carries the real error.
             break;
         }
+        cur_ver = cur_ver.max(ver);
         if end > cur {
             pending.push_back(end);
             cur = end;
@@ -2791,7 +2798,7 @@ async fn apply_member(
     src: Option<&PgPool>,
     floor: u64,
 ) -> Result<u64> {
-    if o.id.end() <= floor {
+    if o.id.ver() <= floor {
         return Ok(0);
     }
     let dest = t.dest();
@@ -2824,7 +2831,7 @@ async fn apply_member_pending(
 ) -> Result<(u64, Option<Watermark>, u64)> {
     // Already past this window (M-55): nothing applied, no mark — its stored
     // watermark stays where it is rather than moving back to this window's.
-    if o.id.end() <= floor {
+    if o.id.ver() <= floor {
         return Ok((0, None, u64::MAX));
     }
     let mut h = t.open(&[dest_table]).await?;

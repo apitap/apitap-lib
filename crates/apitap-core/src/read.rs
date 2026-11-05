@@ -34,6 +34,13 @@ pub struct ReadOptions {
     /// translator, never raw user text; the client-side filter still runs,
     /// so this is bandwidth, never correctness.
     pub push_where: Option<String>,
+    /// The caller's own row predicate (`read(where=...)`), in the source's
+    /// SQL. Unlike `push_where` it decides the result, so it is never dropped:
+    /// it is parsed as exactly one expression in the source dialect, rendered
+    /// back in canonical form and ANDed into every span statement. Text that
+    /// is not one expression (`1=1) OR (1=1`, a second statement) is refused,
+    /// because it would escape the span's own range and repeat rows.
+    pub where_sql: Option<String>,
 }
 
 /// One column of the result schema.
@@ -96,6 +103,42 @@ impl ReadHandle {
                     ))
                 }
             }
+        }
+    }
+
+    /// Async pull, for consumers already on the runtime (apitap.sql()).
+    pub(crate) async fn recv(&mut self) -> Result<Option<ArrowBatch>> {
+        match self.rx.recv().await {
+            Some(Ok(b)) => Ok(Some(b)),
+            Some(Err(e)) => {
+                self.supervisor.abort();
+                Err(e)
+            }
+            None => {
+                if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                    Ok(None)
+                } else {
+                    Err(Error::Transfer(
+                        "read: stream ended before the scan completed".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// A finished result as a stream: the batches are already here, so the
+    /// supervisor has nothing to watch. Must be called on the runtime.
+    pub fn ready(schema: Vec<ArrowField>, batches: Vec<ArrowBatch>) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(batches.len().max(1));
+        for b in batches {
+            tx.try_send(Ok(b)).expect("channel sized to the batches");
+        }
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        Self {
+            schema,
+            rx,
+            supervisor: tokio::spawn(async {}),
+            completed,
         }
     }
 

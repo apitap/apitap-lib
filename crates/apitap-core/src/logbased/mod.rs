@@ -16,4 +16,5 @@ pub(crate) mod replay;
 pub(crate) mod resolve;
 pub(crate) mod rowtext;
 pub(crate) mod run;
+pub(crate) mod spill;
 pub(crate) mod window;

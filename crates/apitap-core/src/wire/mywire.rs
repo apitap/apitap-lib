@@ -882,6 +882,11 @@ impl MyWire {
         let ns = heartbeat_secs.max(1) * 1_000_000_000;
         self.exec(&format!("SET @master_heartbeat_period = {ns}"))
             .await?;
+        // A spilled transaction replays in chunks with no read of this socket
+        // in between (A2); at the default 60 s the server ended a dump whose
+        // writes stayed blocked that long, and the next run re-read the same
+        // transaction into the same stall.
+        self.exec("SET SESSION net_write_timeout = 3600").await?;
         self.seq = 0;
         let mut cmd = Vec::with_capacity(11 + file.len());
         cmd.push(0x12); // COM_BINLOG_DUMP
