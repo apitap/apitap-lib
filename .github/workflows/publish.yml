@@ -10,13 +10,14 @@ on:
 jobs:
   # The wheel is abi3 built once on a NEW Python — nothing else ever imports it
   # on 3.9, so the floor claim must be proven here before anything publishes.
+  # Runs inside the official python:3.9 image, not setup-python: from
+  # 2026-10-19 ubuntu-latest is Ubuntu 26.04, which setup-python has no 3.9
+  # build for, and that failed the v0.64.0 publish before anything shipped.
   smoke-py39:
     runs-on: ubuntu-latest
+    container: python:3.9-slim
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
       - name: Wheel imports on the oldest supported Python
         run: |
           pip install dist/*.whl
