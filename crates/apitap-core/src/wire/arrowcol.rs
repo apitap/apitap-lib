@@ -71,7 +71,7 @@ pub fn arrow_kind(d: &Delivered) -> Option<ArrowKind> {
 
 /// One sealed column, buffers in Arrow C layout (validity bitmap LSB-first;
 /// utf8/binary carry i32 offsets starting at 0).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FinishedCol {
     I16 {
         validity: Option<Vec<u8>>,
@@ -121,6 +121,32 @@ pub struct ArrowBatch {
     pub cols: Vec<FinishedCol>,
 }
 
+impl ArrowBatch {
+    /// The bytes its columns hold (their buffers' capacities).
+    pub fn bytes(&self) -> usize {
+        fn v<T>(x: &[T], cap: usize) -> usize {
+            let _ = x;
+            cap * std::mem::size_of::<T>()
+        }
+        let bm = |b: &Option<Vec<u8>>| b.as_ref().map_or(0, Vec::capacity);
+        self.cols
+            .iter()
+            .map(|c| match c {
+                FinishedCol::I16 { validity, data } => bm(validity) + v(data, data.capacity()),
+                FinishedCol::I32 { validity, data } => bm(validity) + v(data, data.capacity()),
+                FinishedCol::I64 { validity, data } => bm(validity) + v(data, data.capacity()),
+                FinishedCol::F32 { validity, data } => bm(validity) + v(data, data.capacity()),
+                FinishedCol::F64 { validity, data } => bm(validity) + v(data, data.capacity()),
+                FinishedCol::Bool { validity, data } => bm(validity) + data.capacity(),
+                FinishedCol::Dec128 { validity, data } => bm(validity) + v(data, data.capacity()),
+                FinishedCol::Utf8 { validity, offsets, data } | FinishedCol::Bin { validity, offsets, data } => bm(validity) + 4 * offsets.capacity() + data.capacity(),
+                #[allow(unreachable_patterns)]
+                _ => 0,
+            })
+            .sum()
+    }
+}
+
 // ============================================================================
 // Column builders
 // ============================================================================
@@ -145,6 +171,44 @@ fn push_bit(bm: &mut Vec<u8>, row: usize, on: bool) {
     }
     if on {
         *bm.last_mut().expect("byte pushed above") |= 1 << (row % 8);
+    }
+}
+
+/// `b` onto `d`. A short value (most text cells: codes, names, flags) is
+/// copied with two overlapping loads and stores instead of a call into
+/// libc's memcpy, which costs more than the copy at these lengths.
+#[inline(always)]
+fn put_bytes(d: &mut Vec<u8>, b: &[u8]) {
+    let n = b.len();
+    if n > 16 || n == 0 {
+        d.extend_from_slice(b);
+        return;
+    }
+    d.reserve(n);
+    let at = d.len();
+    // SAFETY: `reserve` made room for `n` bytes past `at`; every load reads
+    // inside `b` and every store writes inside `d[at..at + n]` (the two
+    // halves overlap when `n` is not a whole width), then the length covers
+    // exactly the bytes written.
+    unsafe {
+        let src = b.as_ptr();
+        let dst = d.as_mut_ptr().add(at);
+        if n >= 8 {
+            let lo = std::ptr::read_unaligned(src as *const u64);
+            let hi = std::ptr::read_unaligned(src.add(n - 8) as *const u64);
+            std::ptr::write_unaligned(dst as *mut u64, lo);
+            std::ptr::write_unaligned(dst.add(n - 8) as *mut u64, hi);
+        } else if n >= 4 {
+            let lo = std::ptr::read_unaligned(src as *const u32);
+            let hi = std::ptr::read_unaligned(src.add(n - 4) as *const u32);
+            std::ptr::write_unaligned(dst as *mut u32, lo);
+            std::ptr::write_unaligned(dst.add(n - 4) as *mut u32, hi);
+        } else {
+            *dst = *src;
+            *dst.add(n / 2) = *src.add(n / 2);
+            *dst.add(n - 1) = *src.add(n - 1);
+        }
+        d.set_len(at + n);
     }
 }
 
@@ -385,6 +449,63 @@ impl ColB {
     }
 }
 
+/// A row gate the decoder applies before it decodes a row (apitap.sql()'s
+/// join): an integer column's value must be among `bits`, a set over
+/// [lo, lo + 64 * bits.len()). A row whose key is NULL or not in the set is
+/// dropped while it is still bytes, so its other columns (the NUMERIC ones
+/// the probe would decode for nothing) are never decoded. The consumer
+/// checks every row it gets again: a gate moves work, never the answer.
+#[derive(Debug)]
+pub struct KeyGate {
+    /// The column, by its place in the read (the builder's column).
+    pub col: usize,
+    lo: i64,
+    bits: Vec<u64>,
+}
+
+impl KeyGate {
+    /// An empty gate over keys [lo, hi]; `None` for an empty or inverted range.
+    pub fn new(col: usize, lo: i64, hi: i64) -> Option<KeyGate> {
+        let span = u64::try_from(hi as i128 - lo as i128 + 1).ok().filter(|&n| n > 0)?;
+        let words = usize::try_from(span.div_ceil(64)).ok()?;
+        Some(KeyGate { col, lo, bits: vec![0; words] })
+    }
+
+    /// Bytes a gate over this many keys holds.
+    pub fn bytes_for(span: u64) -> u64 {
+        span.div_ceil(64) * 8
+    }
+
+    #[inline]
+    fn slot(&self, k: i64) -> Option<usize> {
+        let i = u64::try_from(k as i128 - self.lo as i128).ok()?;
+        let i = usize::try_from(i).ok()?;
+        (i >> 6 < self.bits.len()).then_some(i)
+    }
+
+    /// Let key `k` through (a key outside the range is ignored).
+    pub fn set(&mut self, k: i64) {
+        if let Some(i) = self.slot(k) {
+            self.bits[i >> 6] |= 1 << (i & 63);
+        }
+    }
+
+    #[inline]
+    pub fn has(&self, k: i64) -> bool {
+        self.slot(k).is_some_and(|i| self.bits[i >> 6] >> (i & 63) & 1 == 1)
+    }
+
+    pub fn bytes(&self) -> u64 {
+        8 * self.bits.len() as u64
+    }
+
+    /// The share of the range it lets through.
+    pub fn density(&self) -> f64 {
+        let ones: u64 = self.bits.iter().map(|w| u64::from(w.count_ones())).sum();
+        ones as f64 / (64 * self.bits.len()).max(1) as f64
+    }
+}
+
 // ============================================================================
 // Streaming builder: COPY-binary chunks in → sealed ArrowBatches out
 // ============================================================================
@@ -428,6 +549,17 @@ pub struct BatchBuilder {
     /// current CopyData message — 0 means the next bytes are a 5-byte
     /// message header.
     fr_left: usize,
+    /// Row gates ([`KeyGate`]), all of which a row must pass to be decoded.
+    gates: Vec<std::sync::Arc<KeyGate>>,
+    /// Rows the gates dropped.
+    gated: u64,
+    /// The highest column a gate reads (the framed skip walks to it only).
+    gate_max: usize,
+    /// Framed tuples seen to end exactly at their CopyData message's end
+    /// (Postgres sends a row per message; the protocol does not promise it).
+    one_row_msgs: u32,
+    /// A message held more than a row: no message is skipped whole again.
+    multi_row: bool,
 }
 
 /// One decoded cell for the row-major append surface
@@ -522,6 +654,146 @@ impl BatchBuilder {
             st_len: vec![0; kinds.len() * ST_K],
             st_rows: 0,
             fr_left: 0,
+            gates: Vec::new(),
+            gated: 0,
+            gate_max: 0,
+            one_row_msgs: 0,
+            multi_row: false,
+        }
+    }
+
+    /// Gate the rows this builder decodes ([`KeyGate`]): a gate over a
+    /// column that is not an integer one is left out.
+    pub fn set_gates(&mut self, gates: &[std::sync::Arc<KeyGate>]) {
+        self.gates = gates
+            .iter()
+            .filter(|g| matches!(self.cols.get(g.col), Some(ColB::I16 { .. } | ColB::I32 { .. } | ColB::I64 { .. })))
+            .cloned()
+            .collect();
+        self.gate_max = self.gates.iter().map(|g| g.col).max().unwrap_or(0);
+    }
+
+    /// Framed mode: whether the tuple at `pos` (its message whole in `win`,
+    /// `left` bytes) fails a gate, read off the fields up to the last gated
+    /// one only. `None` when that cannot be told cheaply (the staging then
+    /// walks the tuple as ever and the decode's gate decides).
+    #[inline]
+    fn gate_skips(&self, win: &[u8], pos: usize, left: usize) -> Option<bool> {
+        let pe = pos + left;
+        let mut o = pos + 2;
+        for c in 0..=self.gate_max {
+            let len = i32::from_be_bytes(win.get(o..o + 4)?.try_into().ok()?);
+            o += 4;
+            let f = if len == -1 {
+                None
+            } else {
+                let l = usize::try_from(len).ok()?;
+                if o + l > pe {
+                    return None;
+                }
+                let f = &win[o..o + l];
+                o += l;
+                Some(f)
+            };
+            for g in &self.gates {
+                if g.col != c {
+                    continue;
+                }
+                let v = match f {
+                    None => return Some(true),
+                    Some(f) => match f.len() {
+                        2 => i64::from(i16::from_be_bytes([f[0], f[1]])),
+                        4 => i64::from(i32::from_be_bytes([f[0], f[1], f[2], f[3]])),
+                        8 => i64::from_be_bytes([f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]]),
+                        _ => return None,
+                    },
+                };
+                if !g.has(v) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    /// Rows the gates dropped so far.
+    pub fn gated(&self) -> u64 {
+        self.gated
+    }
+
+    /// The gates over the staged micro-batch: the rows they drop leave the
+    /// staging (each column's (offset, len) list closes up), so the decode
+    /// below sees only the rows that passed.
+    fn gate_staged(&mut self, data: &[u8]) {
+        let n = self.st_rows;
+        let mut keep = [true; ST_K];
+        let mut m = n;
+        for g in &self.gates {
+            let base = g.col * ST_K;
+            for k in 0..n {
+                if !keep[k] {
+                    continue;
+                }
+                let len = self.st_len[base + k];
+                let off = self.st_off[base + k] as usize;
+                let v = match (len, data.get(off..off + len.max(0) as usize)) {
+                    (-1, _) => None,
+                    (2, Some(f)) => Some(i64::from(i16::from_be_bytes([f[0], f[1]]))),
+                    (4, Some(f)) => Some(i64::from(i32::from_be_bytes([f[0], f[1], f[2], f[3]]))),
+                    (8, Some(f)) => Some(i64::from_be_bytes([f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]])),
+                    // A width the decode refuses: kept, for it to say so.
+                    _ => continue,
+                };
+                if !v.is_some_and(|v| g.has(v)) {
+                    keep[k] = false;
+                    m -= 1;
+                }
+            }
+        }
+        if m == n {
+            return;
+        }
+        for c in 0..self.cols.len() {
+            let base = c * ST_K;
+            let mut j = 0;
+            for k in 0..n {
+                if keep[k] {
+                    self.st_off[base + j] = self.st_off[base + k];
+                    self.st_len[base + j] = self.st_len[base + k];
+                    j += 1;
+                }
+            }
+        }
+        self.gated += (n - m) as u64;
+        self.st_rows = m;
+    }
+
+    /// [`Self::append_cell`] of an `i64`, the column's own kind matched
+    /// once (the hot lanes call this per cell; a `CellVal` is a 32-byte
+    /// value matched again against the column).
+    #[inline]
+    pub fn append_i64(&mut self, c: usize, x: i64) {
+        let r = self.rows;
+        match &mut self.cols[c] {
+            ColB::I64 { v, d } => {
+                d.push(x);
+                mark(v, r, true);
+            }
+            _ => self.append_cell(c, CellVal::I64(x)),
+        }
+    }
+
+    /// [`Self::append_cell`] of a text value, as [`Self::append_i64`].
+    #[inline]
+    pub fn append_str(&mut self, c: usize, b: &[u8]) {
+        let r = self.rows;
+        match &mut self.cols[c] {
+            ColB::Utf8 { v, off, d } => {
+                put_bytes(d, b);
+                off.push(d.len() as i32);
+                mark(v, r, true);
+            }
+            _ => self.append_cell(c, CellVal::Str(b)),
         }
     }
 
@@ -573,12 +845,12 @@ impl BatchBuilder {
                 mark(v, r, true);
             }
             (ColB::Utf8 { v, off, d }, CellVal::Str(b)) => {
-                d.extend_from_slice(b);
+                put_bytes(d, b);
                 off.push(d.len() as i32);
                 mark(v, r, true);
             }
             (ColB::Bin { v, off, d }, CellVal::Bin(b)) => {
-                d.extend_from_slice(b);
+                put_bytes(d, b);
                 off.push(d.len() as i32);
                 mark(v, r, true);
             }
@@ -899,6 +1171,18 @@ impl BatchBuilder {
                     "pg binary COPY: tuple has {nc} fields, expected {ncols}"
                 )));
             }
+            // A gated read past its first rows, each its own message: a row
+            // a gate drops is skipped by its message's length, its fields
+            // past the gated ones never walked (the walk was most of a
+            // gated probe's CPU: TPC-H Q8 kept 121K of 60M rows).
+            if !self.gates.is_empty() && !self.multi_row && self.one_row_msgs >= 64 && pos + self.fr_left <= win.len() {
+                if let Some(true) = self.gate_skips(win, pos, self.fr_left) {
+                    pos += self.fr_left;
+                    self.fr_left = 0;
+                    self.gated += 1;
+                    continue;
+                }
+            }
             let k = self.st_rows;
             let mut o = pos + 2;
             for c in 0..ncols {
@@ -940,6 +1224,11 @@ impl BatchBuilder {
             self.fr_left -= o - pos;
             pos = o;
             self.st_rows += 1;
+            if self.fr_left == 0 {
+                self.one_row_msgs = self.one_row_msgs.saturating_add(1);
+            } else {
+                self.multi_row = true;
+            }
         }
         Ok((pos, StageStopF::Full))
     }
@@ -950,6 +1239,12 @@ impl BatchBuilder {
     /// proved every (offset, len) against `data.len()`.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn decode_staged(&mut self, data: &[u8]) -> Result<()> {
+        if !self.gates.is_empty() {
+            self.gate_staged(data);
+            if self.st_rows == 0 {
+                return Ok(());
+            }
+        }
         let n = self.st_rows;
         let row0 = self.rows;
         for (c, col) in self.cols.iter_mut().enumerate() {
@@ -1268,6 +1563,23 @@ impl BatchBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The short copy lays down what `extend_from_slice` does, for every
+    /// length either side of its widths, onto a vector at any length.
+    #[test]
+    fn put_bytes_equals_extend() {
+        let src: Vec<u8> = (0..40u8).map(|x| x.wrapping_mul(37).wrapping_add(11)).collect();
+        for pre in [0usize, 1, 7, 15] {
+            for n in 0..=40 {
+                let mut want = vec![0xAAu8; pre];
+                let mut got = want.clone();
+                want.extend_from_slice(&src[40 - n..]);
+                put_bytes(&mut got, &src[40 - n..]);
+                put_bytes(&mut got, &[]);
+                assert_eq!(got, want, "pre {pre}, n {n}");
+            }
+        }
+    }
     use crate::wire::pgcopy;
 
     /// GOLDEN cross-check: the row-major append surface must produce the
@@ -1583,6 +1895,52 @@ mod tests {
         }
     }
 
+    /// A gated builder decodes only the rows whose key the gate holds: a
+    /// NULL key, a key outside the range and a key not set are all dropped,
+    /// and the rows that pass keep their other columns intact, across
+    /// micro-batches (200 rows = four of them).
+    #[test]
+    fn a_gate_drops_rows_before_they_decode() {
+        let mut g = KeyGate::new(0, 10, 300).unwrap();
+        for k in [10, 77, 150, 151, 299, 300] {
+            g.set(k);
+        }
+        g.set(5); // outside: ignored
+        assert!(!g.has(5) && g.has(10) && g.has(300) && !g.has(301) && !g.has(11));
+        // Six keys of the 320 the five words cover.
+        assert!((g.density() - 6.0 / 320.0).abs() < 1e-12);
+        let mut b = BatchBuilder::new(vec![ArrowKind::Int64, ArrowKind::Utf8], usize::MAX >> 1);
+        b.set_gates(&[std::sync::Arc::new(g)]);
+        let mut s = Vec::new();
+        pgcopy::header(&mut s);
+        for i in 0..400i64 {
+            pgcopy::tuple_start(2, &mut s);
+            if i == 150 {
+                pgcopy::null_field(&mut s);
+            } else {
+                pgcopy::field(&i.to_be_bytes(), &mut s);
+            }
+            pgcopy::field(format!("v{i}").as_bytes(), &mut s);
+        }
+        pgcopy::trailer(&mut s);
+        b.push(&s).unwrap();
+        let out = b.finish().unwrap().expect("rows passed");
+        assert_eq!(b.gated(), 395);
+        match (&out.cols[0], &out.cols[1]) {
+            (FinishedCol::I64 { data, .. }, FinishedCol::Utf8 { offsets, data: t, .. }) => {
+                assert_eq!(data, &[10, 77, 151, 299, 300]);
+                let txt: Vec<&[u8]> = (0..5).map(|r| &t[offsets[r] as usize..offsets[r + 1] as usize]).collect();
+                assert_eq!(txt, vec![&b"v10"[..], b"v77", b"v151", b"v299", b"v300"]);
+            }
+            _ => panic!("kinds"),
+        }
+        // A gate over a text column is left out: every row decodes.
+        let mut b = BatchBuilder::new(vec![ArrowKind::Int64, ArrowKind::Utf8], usize::MAX >> 1);
+        b.set_gates(&[std::sync::Arc::new(KeyGate::new(1, 0, 1).unwrap())]);
+        b.push(&s).unwrap();
+        assert_eq!(b.finish().unwrap().unwrap().rows, 400);
+    }
+
     #[test]
     fn seals_at_the_byte_threshold_and_counts_add_up() {
         // 20 bytes/row (8 i64 + 8 text + 4 offset) + the 4-byte offsets
@@ -1749,6 +2107,84 @@ mod tests {
         out.push(b'd');
         out.extend(((payload.len() + 4) as u32).to_be_bytes());
         out.extend_from_slice(payload);
+    }
+
+    /// Push a framed stream through in windows of `grow` bytes; the batch.
+    fn drive_framed(b: &mut BatchBuilder, wire: &[u8], grow: usize) -> ArrowBatch {
+        let (mut lo, mut hi) = (0usize, 0usize);
+        loop {
+            if hi < wire.len() {
+                hi = (hi + grow).min(wire.len());
+            }
+            let (consumed, stop) = b.push_framed(&wire[lo..hi]).unwrap();
+            lo += consumed;
+            match stop {
+                FramedPush::NeedMore if lo == wire.len() => break,
+                FramedPush::NeedMore => {}
+                FramedPush::Control => break,
+                FramedPush::Straddle(_) => panic!("no straddles here"),
+            }
+        }
+        b.finish().unwrap().expect("rows")
+    }
+
+    /// A gated framed read skips the rows its gate drops by their message's
+    /// length once a row per message is seen (the gate on the SECOND column:
+    /// the skip reads past the first), and a stream that packs two rows in a
+    /// message is never skipped by message, so no row is lost.
+    #[test]
+    fn framed_gate_skips_whole_messages_and_never_loses_a_packed_row() {
+        let keep = [3i64, 100, 250, 299];
+        let gate = || {
+            let mut g = KeyGate::new(1, 0, 400).unwrap();
+            keep.iter().for_each(|&k| g.set(k));
+            std::sync::Arc::new(g)
+        };
+        let tuple = |i: i64| {
+            let mut t = Vec::new();
+            pgcopy::tuple_start(2, &mut t);
+            pgcopy::field(format!("name-{i}").as_bytes(), &mut t);
+            if i == 100 + 1 {
+                pgcopy::null_field(&mut t);
+            } else {
+                pgcopy::field(&i.to_be_bytes(), &mut t);
+            }
+            t
+        };
+        for packed in [false, true] {
+            let mut hdr = Vec::new();
+            pgcopy::header(&mut hdr);
+            let mut wire = Vec::new();
+            dmsg(&hdr, &mut wire);
+            let mut i = 0i64;
+            while i < 300 {
+                let mut m = tuple(i);
+                if packed {
+                    m.extend(tuple(i + 1));
+                    i += 1;
+                }
+                dmsg(&m, &mut wire);
+                i += 1;
+            }
+            let mut tr = Vec::new();
+            pgcopy::trailer(&mut tr);
+            dmsg(&tr, &mut wire);
+            wire.extend_from_slice(b"Cxxxx");
+            for grow in [7usize, 1000, wire.len()] {
+                let mut b = BatchBuilder::new(vec![ArrowKind::Utf8, ArrowKind::Int64], 1 << 20);
+                b.set_gates(&[gate()]);
+                let out = drive_framed(&mut b, &wire, grow);
+                assert_eq!(b.gated(), 296, "packed={packed} grow={grow}");
+                match (&out.cols[0], &out.cols[1]) {
+                    (FinishedCol::Utf8 { offsets, data: t, .. }, FinishedCol::I64 { data, .. }) => {
+                        assert_eq!(data, &keep, "packed={packed} grow={grow}");
+                        let a = &t[offsets[3] as usize..offsets[4] as usize];
+                        assert_eq!(a, b"name-299");
+                    }
+                    _ => panic!("kinds"),
+                }
+            }
+        }
     }
 
     #[test]

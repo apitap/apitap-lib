@@ -741,7 +741,11 @@ mod tests {
             .collect::<Vec<_>>();
         let alive = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(None));
-        let stmts: Vec<String> = (0..16).map(|i| format!("span {i}")).collect();
+        // 400 spans, as the test above: with 16 the three spinning pipes
+        // (five spans each, a yield apiece) could drain the queue before the
+        // cancel reached them on a loaded host, failing `remaining() > 0`
+        // for a reason that is not the engine's.
+        let stmts: Vec<String> = (0..400).map(|i| format!("span {i}")).collect();
 
         let res = Pipes::for_read(loaders)
             .run(stmts, |i| {
@@ -1144,7 +1148,7 @@ mod tests {
     /// RED (mutation: add `tokio::spawn` or a `WorkQueue` pop to any listed
     /// file): the matching assert names that file; on the pre-rewire tree the
     /// production text of every database source contains one.
-    const WATCHED: [(&str, &str); 11] = [
+    const WATCHED: [(&str, &str); 12] = [
         ("source/mod.rs", include_str!("source/mod.rs")),
         ("source/postgres.rs", include_str!("source/postgres.rs")),
         ("source/mysql.rs", include_str!("source/mysql.rs")),
@@ -1152,6 +1156,7 @@ mod tests {
         ("source/csvfile.rs", include_str!("source/csvfile.rs")),
         ("source/github.rs", include_str!("source/github.rs")),
         ("source/gsheets.rs", include_str!("source/gsheets.rs")),
+        ("source/sqlresult.rs", include_str!("source/sqlresult.rs")),
         ("source/github_api.rs", include_str!("source/github_api.rs")),
         ("pipeline/mod.rs", include_str!("pipeline/mod.rs")),
         ("pipeline/dispatch.rs", include_str!("pipeline/dispatch.rs")),

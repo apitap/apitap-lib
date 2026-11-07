@@ -1090,6 +1090,19 @@ fn bounded_char_len(native: Option<&str>) -> Option<u32> {
     rest.strip_suffix(')')?.parse().ok()
 }
 
+/// The MySQL type of a bounded source string: Postgres `character(n)` is
+/// fixed-width (blank-padded, its trailing spaces never count), so it lands
+/// as `CHAR(n)`, which MySQL also stores without the padding and compares
+/// the same way; as `VARCHAR(n)` the padding was data, and under a NO PAD
+/// collation (MySQL 8's default) `'AIR       ' = 'AIR'` was false.
+fn bounded_my_type(native: Option<&str>, n: u32) -> String {
+    if n <= 255 && native.is_some_and(|x| x.starts_with("character(")) {
+        format!("CHAR({n})")
+    } else {
+        format!("VARCHAR({n})")
+    }
+}
+
 /// MySQL column type for a lane delivery when the source has no MySQL DDL to
 /// mirror (a non-MySQL source feeding this sink). Only the deliveries a wired
 /// route actually produces are mapped; anything new fails loudly here rather
@@ -1236,7 +1249,7 @@ impl crate::sink::Sink for MySqlSink {
                     let mut t = my_type_of(&lc.delivered, &c.name)?;
                     if as_varchar.contains(c.name.as_str()) {
                         if let Some(n) = bounded_char_len(c.native_ddl.as_deref()) {
-                            t = format!("VARCHAR({n})");
+                            t = bounded_my_type(c.native_ddl.as_deref(), n);
                         }
                     }
                     t
@@ -2128,5 +2141,15 @@ mod ssl_default_tests {
         // remote, explicitly required: TLS, and again not a defaulted one.
         assert!(ssl_of("mysql://u:p@prod-host/db?ssl-mode=required"));
         assert!(!defaulted("mysql://u:p@prod-host/db?ssl-mode=required"));
+    }
+}
+
+#[cfg(test)]
+mod char_type_tests {
+    #[test]
+    fn a_postgres_character_lands_as_char_and_varchar_as_varchar() {
+        assert_eq!(super::bounded_my_type(Some("character(10)"), 10), "CHAR(10)");
+        assert_eq!(super::bounded_my_type(Some("character varying(10)"), 10), "VARCHAR(10)");
+        assert_eq!(super::bounded_my_type(Some("character(300)"), 300), "VARCHAR(300)", "past CHAR's 255");
     }
 }

@@ -26,6 +26,8 @@ from apitap._apitap import (
     mem_limit_bytes as _mem_limit_bytes,
     read as _read,
     sql as _sql,
+    sql_into as _sql_into,
+    sql_live as _sql_live,
     request_stop,
     read_schema as _read_schema,
     transfer as _transfer,
@@ -596,7 +598,8 @@ class SqlResult:
         return pl.DataFrame(self)
 
 
-def sql(query: str, *, sources: dict[str, str]) -> SqlResult:
+def sql(query: str, *, sources: dict[str, str], dest: str | None = None,
+        table: str | None = None, mode: str | None = None):
     """Join and aggregate tables of different databases in one SQL statement.
 
     The engine is apitap's own, in Rust: each table's filters and columns are
@@ -617,7 +620,37 @@ def sql(query: str, *, sources: dict[str, str]) -> SqlResult:
     BY`` columns of one table, and ``SUM``/``COUNT``/``MIN``/``MAX``/``AVG``
     over the other table's columns; anything else is refused before a row is
     read, naming what is not supported.
+
+    With ``dest=`` and ``table=`` the answer lands in that destination instead,
+    through the same path :func:`transfer` takes (typed columns, staging,
+    atomic swap), and a :class:`TransferReport` comes back::
+
+        apitap.sql(QUERY, sources={...}, dest="clickhouse://…/analytics",
+                   table="revenue_by_priority")
+
+    With ``mode="log_based"`` as well, the answer is an incremental view: the
+    first run reads the table once at a replication slot's snapshot, and every
+    later run moves the answer by the changes since the last one, with no
+    re-read. v1 keeps a view over one Postgres table (``REPLICA IDENTITY
+    FULL``) with ``SUM``/``COUNT``/``AVG``; ``MIN``/``MAX`` are refused. The
+    view's state lives in ``APITAP_STATE_DIR`` (default ``~/.apitap/views``)::
+
+        apitap.sql("SELECT status, COUNT(*), SUM(amount) FROM pg.orders GROUP BY 1",
+                   sources={"pg": PG}, dest=CH, table="orders_by_status",
+                   mode="log_based")
     """
+    if (dest is None) != (table is None):
+        raise ValueError("sql(): pass dest= and table= together")
+    if mode not in (None, "replace", "log_based"):
+        raise ValueError(f"sql(): mode={mode!r}: use 'log_based' for an incremental view, or leave it out")
+    if mode == "log_based":
+        if dest is None:
+            raise ValueError("sql(mode='log_based') keeps a view in a destination: pass dest= and table=")
+        rows, elapsed_ms, used = _sql_live(query, dict(sources), dest, table)
+        return TransferReport(rows=rows, elapsed_ms=elapsed_ms, parallel=used)
+    if dest is not None:
+        rows, elapsed_ms, used = _sql_into(query, dict(sources), dest, table)
+        return TransferReport(rows=rows, elapsed_ms=elapsed_ms, parallel=used)
     return SqlResult(_sql(query, dict(sources)))
 
 

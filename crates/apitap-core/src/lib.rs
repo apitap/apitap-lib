@@ -52,7 +52,7 @@ mod wire;
 
 pub use error::{Error, Result};
 pub use read::{read_schema, read_start, ArrowField, ReadHandle, ReadOptions};
-pub use sql::{run as sql_run, SqlResult};
+pub use sql::{run as sql_run, run_into as sql_run_into, run_live as sql_run_live, SqlResult};
 pub use wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, FinishedCol};
 
 /// The memory limit the engine sizes itself from — `APITAP_MEM_BUDGET`, then
@@ -60,6 +60,45 @@ pub use wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, FinishedCol};
 /// Exported so the Python shim sizes its buffers from the same number.
 pub fn mem_limit_bytes() -> Option<u64> {
     pipeline::mem_limit_bytes()
+}
+
+/// Hand the allocator's free memory back to the kernel. glibc keeps what a
+/// phase freed in its arenas, and the cgroup still counts it: between the
+/// phases of a join (dimensions loaded, a build, a probe) that kept TPC-H Q9
+/// at ~240 MB in a 256 MB cage until its second probe was OOM-killed.
+pub(crate) fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only returns free pages; it takes no pointers.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// One-time allocator sizing to the CPU this process may use, called when the
+/// module loads (before threads take arenas). glibc gives a process up to 8
+/// malloc arenas per core it SEES — a 0.5-core container on a 16-core host
+/// sees 16, so every worker thread gets an arena of its own, each trimmed
+/// back to the kernel and faulted (zeroed) in again apart. Capping them to
+/// the quota (twice its cores, at least 4) measured ~1 s of CPU off a 20 GB
+/// view bootstrap at 0.5 core, peak memory no higher; with more cores the
+/// cap rises with them, and with no quota glibc's own choice stands.
+pub fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // glibc's malloc.h: M_ARENA_MAX.
+        const M_ARENA_MAX: libc::c_int = -8;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if let Some(c) = pipeline::cpu_limit_cores() {
+                let n = ((c.ceil() as libc::c_int) * 2).max(4);
+                // SAFETY: mallopt only sets a tunable; it is thread-safe and
+                // takes no pointers.
+                unsafe {
+                    libc::mallopt(M_ARENA_MAX, n);
+                }
+            }
+        });
+    }
 }
 
 /// How rows land in the destination table.

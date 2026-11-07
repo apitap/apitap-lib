@@ -517,6 +517,9 @@ fn read(
         columns,
         push_where,
         where_sql,
+        computed: Vec::new(),
+        max_spans: None,
+        gates: Vec::new(),
     };
     let handle = py
         .detach(|| rt().block_on(apitap_core::read_start(&src, &table, &opts)))
@@ -554,6 +557,48 @@ fn sql(
         stream: Some(stream),
         names,
     })
+}
+
+/// apitap.sql(..., dest=...): the answer lands in `dst` as `table` through the
+/// ordinary transfer. Returns (rows, elapsed_ms, parallel) like `transfer`.
+#[pyfunction]
+#[pyo3(signature = (query, sources, dst, table))]
+fn sql_into(
+    py: Python<'_>,
+    query: String,
+    sources: std::collections::HashMap<String, String>,
+    dst: String,
+    table: String,
+) -> PyResult<(u64, u64, usize)> {
+    let opts = apitap_core::TransferOptions {
+        mode: apitap_core::Mode::Replace,
+        ..Default::default()
+    };
+    let r = py
+        .detach(|| rt().block_on(apitap_core::sql_run_into(&query, &sources, &dst, &table, &opts)))
+        .map_err(to_py)?;
+    Ok((r.rows, r.elapsed_ms, r.parallel))
+}
+
+/// `apitap.sql(..., dest=, mode="log_based")`: the incremental view, kept
+/// by the source's change stream. Returns (rows, elapsed_ms, parallel).
+#[pyfunction]
+#[pyo3(signature = (query, sources, dst, table))]
+fn sql_live(
+    py: Python<'_>,
+    query: String,
+    sources: std::collections::HashMap<String, String>,
+    dst: String,
+    table: String,
+) -> PyResult<(u64, u64, usize)> {
+    let opts = apitap_core::TransferOptions {
+        mode: apitap_core::Mode::Replace,
+        ..Default::default()
+    };
+    let r = py
+        .detach(|| rt().block_on(apitap_core::sql_run_live(&query, &sources, &dst, &table, &opts)))
+        .map_err(to_py)?;
+    Ok((r.rows, r.elapsed_ms, r.parallel))
 }
 
 /// Schema-only probe: (name, dtype-tag, nullable) per column, no workers
@@ -640,12 +685,15 @@ fn mem_limit_bytes() -> Option<u64> {
 
 #[pymodule]
 fn _apitap(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    apitap_core::tune_allocator();
     m.add_function(wrap_pyfunction!(request_stop, m)?)?;
     m.add_function(wrap_pyfunction!(mem_limit_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(transfer, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_many, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;
     m.add_function(wrap_pyfunction!(sql, m)?)?;
+    m.add_function(wrap_pyfunction!(sql_into, m)?)?;
+    m.add_function(wrap_pyfunction!(sql_live, m)?)?;
     m.add_function(wrap_pyfunction!(read_schema, m)?)?;
     m.add_class::<PgRead>()?;
     m.add("LockedError", m.py().get_type::<LockedError>())?;

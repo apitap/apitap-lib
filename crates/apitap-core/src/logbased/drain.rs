@@ -162,6 +162,9 @@ pub(crate) struct DrainSession {
     /// changes went to an untracked slot and were dropped while the slot
     /// was confirmed past them.
     expected_oid: HashMap<u32, String>,
+    /// Incremental views: changelog bodies also keep each update's old image
+    /// (`Changes::olds`).
+    pub(crate) keep_old: bool,
 }
 
 impl DrainSession {
@@ -994,7 +997,8 @@ fn flush_ops(
                 changelogs.resize_with(i + 1, || None);
             }
             if changelogs[i].is_none() {
-                changelogs[i] = Some(Changes::new(layout_of(&sess.layouts, table)?));
+                let l = layout_of(&sess.layouts, table)?;
+                changelogs[i] = Some(if sess.keep_old { Changes::with_old(l) } else { Changes::new(l) });
             }
             let c = changelogs[i].as_mut().expect("changelog just ensured");
             match op {

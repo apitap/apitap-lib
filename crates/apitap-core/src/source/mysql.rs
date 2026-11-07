@@ -779,6 +779,78 @@ pub(crate) struct MySqlSource {
     pool: MySqlPool,
     /// Kept for the raw read plane's own worker connections.
     url: std::sync::Arc<str>,
+    /// A snapshot group the read's workers take their connections from
+    /// (`__apitap_my_snapshot=` on the URL), instead of connecting.
+    snap: Option<String>,
+}
+
+/// Per-row fetch/decode/send timers in the read workers. Their own switch,
+/// not APITAP_DEBUG: two clock reads a row were ~20% of a 0.5-core read,
+/// so a debug run measured a different program.
+fn row_timers() -> bool {
+    std::env::var_os("APITAP_DEBUG_ROWTIME").is_some()
+}
+
+/// URL parameter naming a group of raw connections already inside one
+/// consistent snapshot (see [`snapshot_group`]).
+pub(crate) const SNAPSHOT_PARAM: &str = "__apitap_my_snapshot";
+
+type Groups = std::sync::Mutex<std::collections::HashMap<String, Vec<MyWire>>>;
+static SNAPSHOT_GROUPS: std::sync::LazyLock<Groups> = std::sync::LazyLock::new(Default::default);
+
+/// Park `conns` (each inside `START TRANSACTION WITH CONSISTENT SNAPSHOT`,
+/// all opened under one FLUSH TABLES WITH READ LOCK, so they see the same
+/// instant) under `token`: a read of a URL carrying `__apitap_my_snapshot=
+/// <token>` runs its workers on them, MySQL having no snapshot export the
+/// way Postgres does. Dropping the guard closes what the read left.
+pub(crate) fn snapshot_group(token: &str, conns: Vec<MyWire>) -> SnapshotGroup {
+    SNAPSHOT_GROUPS.lock().expect("snapshot groups").insert(token.to_string(), conns);
+    SnapshotGroup(token.to_string())
+}
+
+pub(crate) struct SnapshotGroup(String);
+
+impl Drop for SnapshotGroup {
+    fn drop(&mut self) {
+        if let Ok(mut g) = SNAPSHOT_GROUPS.lock() {
+            g.remove(&self.0);
+        }
+    }
+}
+
+fn take_snapshot_conn(token: &str) -> Result<MyWire> {
+    SNAPSHOT_GROUPS
+        .lock()
+        .expect("snapshot groups")
+        .get_mut(token)
+        .and_then(Vec::pop)
+        .ok_or_else(|| Error::Transfer(format!("mysql snapshot group {token}: no connection left for a read worker")))
+}
+
+/// The URL without `__apitap_my_snapshot=`, and its value.
+fn split_snapshot(url: &str) -> (String, Option<String>) {
+    let Ok(mut u) = reqwest::Url::parse(url) else { return (url.to_string(), None) };
+    let mut token = None;
+    let rest: Vec<(String, String)> = u
+        .query_pairs()
+        .filter_map(|(k, v)| {
+            if k == SNAPSHOT_PARAM {
+                token = Some(v.to_string());
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect();
+    if token.is_none() {
+        return (url.to_string(), None);
+    }
+    if rest.is_empty() {
+        u.set_query(None);
+    } else {
+        u.query_pairs_mut().clear().extend_pairs(rest);
+    }
+    (u.to_string(), token)
 }
 
 impl MySqlSource {
@@ -790,6 +862,8 @@ impl MySqlSource {
     pub(crate) async fn connect(url: &str, max_conns: usize) -> Result<Self> {
         // Before the pool: sqlx would accept `ssl-mode=verify_ca`, the raw
         // plane cannot express it, and the read path uses both.
+        let (url, snap) = split_snapshot(url);
+        let url = url.as_str();
         crate::wire::mywire::check_ssl_mode(url)?;
         // TLS by default off-loopback, the same rule the MySQL DESTINATION
         // follows since 0.55.1 and the CDC lanes adopted with it (P0-4). The
@@ -824,6 +898,7 @@ impl MySqlSource {
         Ok(Self {
             pool,
             url: url.into(),
+            snap,
         })
     }
 }
@@ -1301,7 +1376,7 @@ async fn row_worker<L: Loader>(
     chunk: usize,
 ) -> Result<Rows> {
     use futures::TryStreamExt;
-    let dbg = std::env::var("APITAP_DEBUG").is_ok();
+    let dbg = row_timers();
     let (mut t_fetch, mut t_enc, mut t_send) = (
         std::time::Duration::ZERO,
         std::time::Duration::ZERO,
@@ -1434,7 +1509,7 @@ async fn raw_transfer_worker<L: Loader>(
     pipe: &mut Pipe<L>,
     chunk: usize,
 ) -> Result<Rows> {
-    let dbg = std::env::var("APITAP_DEBUG").is_ok();
+    let dbg = row_timers();
     let (mut t_fetch, mut t_enc, mut t_send) = (
         std::time::Duration::ZERO,
         std::time::Duration::ZERO,
@@ -1566,8 +1641,8 @@ impl MySqlSource {
         // the whole read. Anything it can't do (TLS demanded, cold sha2
         // auth cache, exotic plugin) rides sqlx — never a hard failure.
         // APITAP_MY_RAW=0 forces the sqlx lane for A/B.
-        let mut raw = !std::env::var("APITAP_MY_RAW").is_ok_and(|v| v == "0");
-        if raw {
+        let mut raw = self.snap.is_some() || !std::env::var("APITAP_MY_RAW").is_ok_and(|v| v == "0");
+        if raw && self.snap.is_none() {
             match MyWire::connect(&self.url).await {
                 Ok(w) => w.quit().await,
                 Err(e) => {
@@ -1584,6 +1659,7 @@ impl MySqlSource {
                 if raw {
                     ArrowBody::Raw {
                         url: self.url.clone(),
+                        snap: self.snap.clone(),
                         encs: encs.clone(),
                         bb,
                         tx: tx.clone(),
@@ -1615,6 +1691,7 @@ enum ArrowBody {
     },
     Raw {
         url: std::sync::Arc<str>,
+        snap: Option<String>,
         encs: std::sync::Arc<Vec<MyAr>>,
         bb: BatchBuilder,
         tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
@@ -1627,8 +1704,8 @@ impl crate::pipe::SpanBody for ArrowBody {
             ArrowBody::Row { pool, encs, bb, tx } => {
                 arrow_row_worker(pool, spans, encs, bb, tx).await
             }
-            ArrowBody::Raw { url, encs, bb, tx } => {
-                raw_arrow_worker(url, spans, encs, bb, tx).await
+            ArrowBody::Raw { url, snap, encs, bb, tx } => {
+                raw_arrow_worker(url, snap, spans, encs, bb, tx).await
             }
         }
     }
@@ -1695,8 +1772,14 @@ fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
             bb.append_cell(i, CellVal::Null);
             Ok(())
         }
+        // The common kinds straight into their columns; the rest through
+        // the general cell.
         Some(b) => {
-            bb.append_cell(i, ar_cell(b, encs[i])?);
+            match encs[i] {
+                MyAr::I64 => bb.append_i64(i, i64::from_le_bytes(le::<8>(b)?)),
+                MyAr::Str => bb.append_str(i, b),
+                enc => bb.append_cell(i, ar_cell(b, enc)?),
+            }
             Ok(())
         }
     })
@@ -1706,20 +1789,19 @@ fn walk_raw_row(p: &[u8], encs: &[MyAr], bb: &mut BatchBuilder) -> Result<()> {
 /// walked in place from the socket buffer into the column builders.
 async fn raw_arrow_worker(
     url: std::sync::Arc<str>,
+    snap: Option<String>,
     spans: Spans,
     encs: std::sync::Arc<Vec<MyAr>>,
     mut bb: BatchBuilder,
     tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
 ) -> Result<u64> {
-    let dbg = std::env::var_os("APITAP_DEBUG").is_some();
-    let (mut t_fetch, mut t_dec, mut t_send) = (
-        std::time::Duration::ZERO,
-        std::time::Duration::ZERO,
-        std::time::Duration::ZERO,
-    );
+    let dbg = row_timers();
+    let (mut t_dec, mut t_send) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     let cancelled = || Error::Transfer("read cancelled by consumer".into());
-    let mut w = MyWire::connect(&url).await?;
-    let mut since_seal = 0u32;
+    let mut w = match &snap {
+        Some(t) => take_snapshot_conn(t)?,
+        None => MyWire::connect(&url).await?,
+    };
     while let Some(sql) = spans.next()? {
         let (sid, ncols) = w.prepare(&sql).await?;
         if ncols != encs.len() {
@@ -1730,28 +1812,29 @@ async fn raw_arrow_worker(
         }
         w.execute(sid).await?;
         loop {
+            // Every row the socket buffer holds, decoded in one pass; the
+            // batch is sealed between passes (a pass is at most the 1 MiB
+            // read buffer, so a batch overshoots its size by that at most).
             let tf = dbg.then(std::time::Instant::now);
-            let row = w.next_row().await?;
+            let more = w
+                .rows_buffered(|p| {
+                    walk_raw_row(p, &encs, &mut bb)?;
+                    bb.row_done();
+                    Ok(())
+                })
+                .await?;
             if let Some(tf) = tf {
-                t_fetch += tf.elapsed();
+                t_dec += tf.elapsed();
             }
-            let Some(p) = row else { break };
-            let td = dbg.then(std::time::Instant::now);
-            walk_raw_row(p, &encs, &mut bb)?;
-            bb.row_done();
-            if let Some(td) = td {
-                t_dec += td.elapsed();
-            }
-            since_seal += 1;
-            if since_seal >= 64 {
-                since_seal = 0;
-                if let Some(batch) = bb.take_ready()? {
-                    let ts = dbg.then(std::time::Instant::now);
-                    tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
-                    if let Some(ts) = ts {
-                        t_send += ts.elapsed();
-                    }
+            if let Some(batch) = bb.take_ready()? {
+                let ts = dbg.then(std::time::Instant::now);
+                tx.send(Ok(batch)).await.map_err(|_| cancelled())?;
+                if let Some(ts) = ts {
+                    t_send += ts.elapsed();
                 }
+            }
+            if !more {
+                break;
             }
         }
         w.stmt_close(sid).await?;
@@ -1761,8 +1844,7 @@ async fn raw_arrow_worker(
     }
     if dbg {
         eprintln!(
-            "[my raw worker] fetch(wire)={:.1}s decode(cpu)={:.1}s send(backpressure)={:.1}s",
-            t_fetch.as_secs_f64(),
+            "[my raw worker] wire+decode={:.1}s send(backpressure)={:.1}s",
             t_dec.as_secs_f64(),
             t_send.as_secs_f64()
         );
@@ -1782,7 +1864,7 @@ async fn arrow_row_worker(
     tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
 ) -> Result<u64> {
     use futures::TryStreamExt;
-    let dbg = std::env::var_os("APITAP_DEBUG").is_some();
+    let dbg = row_timers();
     let (mut t_fetch, mut t_dec, mut t_send) = (
         std::time::Duration::ZERO,
         std::time::Duration::ZERO,

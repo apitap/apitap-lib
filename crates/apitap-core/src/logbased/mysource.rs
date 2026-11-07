@@ -514,6 +514,9 @@ pub(crate) struct MySession {
     /// (binlog_checksum=NONE when it was written), as its FORMAT_DESCRIPTION
     /// said. Per file, not per server: the setting can change between files.
     pub no_checksum: bool,
+    /// Incremental views: changelog bodies also keep each update's old
+    /// image (`Changes::olds`).
+    pub keep_old: bool,
     /// A committed transaction whose ops went to disk past
     /// `APITAP_TX_BUF_BYTES` (A2), replayed in window-sized chunks by the next
     /// drains before the binlog is read again.
@@ -696,7 +699,7 @@ pub(crate) async fn drain_binlog(
                 }
             }
         }
-        drain_tx(&mut chunk, changelog, &sess.layouts, &mut changelogs, &mut collapsers, rp.commit)?;
+        drain_tx(&mut chunk, changelog, sess.keep_old, &sess.layouts, &mut changelogs, &mut collapsers, rp.commit)?;
         let id = WindowId::chunk(start, rp.commit, rp.k, done)?;
         if std::env::var("APITAP_DEBUG").is_ok() {
             eprintln!(
@@ -1034,6 +1037,7 @@ pub(crate) async fn drain_binlog(
                     drain_tx(
                         &mut tx_buf,
                         changelog,
+                        sess.keep_old,
                         &sess.layouts,
                         &mut changelogs,
                         &mut collapsers,
@@ -1102,6 +1106,7 @@ pub(crate) async fn drain_binlog(
                     drain_tx(
                         &mut tx_buf,
                         changelog,
+                        sess.keep_old,
                         &sess.layouts,
                         &mut changelogs,
                         &mut collapsers,
@@ -1177,6 +1182,7 @@ pub(crate) async fn drain_binlog(
                                 drain_tx(
                                     &mut tx_buf,
                                     changelog,
+                                    sess.keep_old,
                                     &sess.layouts,
                                     &mut changelogs,
                                     &mut collapsers,
@@ -1234,6 +1240,7 @@ pub(crate) async fn drain_binlog(
                 drain_tx(
                     &mut tx_buf,
                     changelog,
+                    sess.keep_old,
                     &sess.layouts,
                     &mut changelogs,
                     &mut collapsers,
@@ -1352,6 +1359,7 @@ fn non_utf8_string_columns<'a>(
 fn drain_tx(
     tx_buf: &mut Vec<(Arc<str>, TxOp)>,
     changelog: bool,
+    keep_old: bool,
     layouts: &HashMap<String, Arc<Layout>>,
     changelogs: &mut HashMap<String, Changes>,
     collapsers: &mut HashMap<String, Collapser>,
@@ -1367,7 +1375,8 @@ fn drain_tx(
     for (table, op) in tx_buf.drain(..) {
         if changelog {
             if !changelogs.contains_key(table.as_ref()) {
-                changelogs.insert(table.to_string(), Changes::new(layout_of(&table)?));
+                let l = layout_of(&table)?;
+                changelogs.insert(table.to_string(), if keep_old { Changes::with_old(l) } else { Changes::new(l) });
             }
             let c = changelogs
                 .get_mut(table.as_ref())
@@ -2199,6 +2208,7 @@ mod truncate_tests {
         drain_tx(
             &mut buf,
             false,
+            false,
             &layouts,
             &mut HashMap::new(),
             &mut collapsers,
@@ -2222,6 +2232,7 @@ mod truncate_tests {
         drain_tx(
             &mut buf,
             true,
+            false,
             &layouts,
             &mut changelogs,
             &mut HashMap::new(),
@@ -2248,6 +2259,7 @@ mod truncate_tests {
             let e = drain_tx(
                 &mut buf,
                 changelog,
+                false,
                 &layouts,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -2277,6 +2289,7 @@ mod truncate_tests {
         ];
         drain_tx(
             &mut buf,
+            false,
             false,
             &layouts,
             &mut HashMap::new(),

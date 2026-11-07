@@ -450,6 +450,10 @@ async fn tls_upgrade(
     };
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| Error::Transfer(format!("mysql tls servername: {e}")))?;
+    // rustls pulls ciphertext 4 KiB at a time: straight off the socket that
+    // was one recvmsg per 4 KiB (~200K of them for a 34M-row read). Read
+    // through a buffer, it is one per 256 KiB.
+    let tcp = tokio::io::BufStream::with_capacity(256 << 10, 16 << 10, tcp);
     let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
         .connect(name, tcp)
         .await
@@ -844,6 +848,63 @@ impl MyWire {
             self.read_packet().await?;
         }
         Ok(())
+    }
+
+    /// The rows already buffered, each handed to `each` in place: one
+    /// synchronous pass over every whole packet in the read buffer instead
+    /// of two awaited reads and a copy per row (a row of a 34M-row read is
+    /// ~25 bytes, so the per-packet overhead was most of its cost). A packet
+    /// cut by the buffer's end, or a 16 MiB continuation, goes the
+    /// [`next_row`] way. `Ok(false)` at the end of the resultset.
+    pub(crate) async fn rows_buffered(&mut self, mut each: impl FnMut(&[u8]) -> Result<()>) -> Result<bool> {
+        use tokio::io::AsyncBufReadExt as _;
+        let deprecate_eof = self.deprecate_eof;
+        let mut seq = self.seq;
+        let mut at = 0usize;
+        let mut end = false;
+        {
+            let buf = self.rd.fill_buf().await.map_err(io_err)?;
+            if buf.is_empty() {
+                return Err(io_err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)));
+            }
+            while buf.len() - at >= 4 {
+                let len = u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], 0]) as usize;
+                if len >= 0xFF_FFFF || buf.len() - at - 4 < len {
+                    break;
+                }
+                if buf[at + 3] != seq {
+                    return Err(desync("packet sequence"));
+                }
+                let p = &buf[at + 4..at + 4 + len];
+                match p.first() {
+                    Some(0x00) => each(p)?,
+                    Some(0xFF) => return Err(parse_err(&p[1..])),
+                    Some(0xFE) if deprecate_eof || p.len() <= 5 => end = true,
+                    _ => return Err(desync("row packet header")),
+                }
+                seq = seq.wrapping_add(1);
+                at += 4 + len;
+                if end {
+                    break;
+                }
+            }
+        }
+        self.seq = seq;
+        self.rd.consume(at);
+        if end {
+            return Ok(false);
+        }
+        if at == 0 {
+            // Not one whole packet buffered: read the next the long way.
+            return match self.next_row().await? {
+                Some(p) => {
+                    each(p)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
+        Ok(true)
     }
 
     /// Next binary row payload, `None` at end of the resultset.

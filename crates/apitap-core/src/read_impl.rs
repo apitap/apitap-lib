@@ -16,7 +16,10 @@ use crate::pipeline::{self, Profile};
 use crate::plan::{Delivered, WireFormat};
 use crate::read::{ArrowField, ReadHandle, ReadOptions};
 use crate::sink::Loader;
-use crate::source::{mysql::MySqlSource, postgres::PgSource, Source};
+use crate::source::{
+    github::GithubSource, github_api::GithubApiSource, gsheets::GsheetsSource, mysql::MySqlSource,
+    postgres::PgSource, Source,
+};
 use crate::wire::arrowcol::{arrow_kind, ArrowBatch, ArrowKind, BatchBuilder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -49,6 +52,11 @@ fn tune_allocator() {}
 enum ReadDialect {
     Pg,
     My,
+    /// A non-database source (`github://` CSV, `github+api://`, `gsheets://`):
+    /// one stream, no server to filter, columns as the source types them.
+    Gh,
+    GhApi,
+    Gs,
 }
 
 fn read_dialect(src_url: &str) -> Result<ReadDialect> {
@@ -56,9 +64,12 @@ fn read_dialect(src_url: &str) -> Result<ReadDialect> {
     match scheme {
         "postgres" | "postgresql" => Ok(ReadDialect::Pg),
         "mysql" => Ok(ReadDialect::My),
+        "github" => Ok(ReadDialect::Gh),
+        "github+api" => Ok(ReadDialect::GhApi),
+        "gsheets" => Ok(ReadDialect::Gs),
         _ => Err(Error::InvalidInput(format!(
-            "read: unsupported source scheme '{scheme}' — postgres:// and \
-             mysql:// today"
+            "read: unsupported source scheme '{scheme}' — postgres://, mysql://, \
+             github://, github+api:// and gsheets:// today"
         ))),
     }
 }
@@ -73,6 +84,11 @@ pub(crate) async fn schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>
         ReadDialect::My => {
             schema_with(MySqlSource::connect(src_url, 1).await?, table, dialect).await
         }
+        ReadDialect::Gh => schema_with(GithubSource::connect(src_url).await?, table, dialect).await,
+        ReadDialect::GhApi => {
+            schema_with(GithubApiSource::connect(src_url).await?, table, dialect).await
+        }
+        ReadDialect::Gs => schema_with(GsheetsSource::connect(src_url).await?, table, dialect).await,
     }
 }
 
@@ -98,6 +114,7 @@ async fn schema_with<S: Source>(
                 kind: kind.unwrap_or(ArrowKind::Utf8),
                 nullable: pc.nullable,
                 rewritten: read_as_text(kind, &pc.udt),
+                padded: padded_text(kind, &pc.udt),
             }
         })
         .collect())
@@ -108,6 +125,12 @@ async fn schema_with<S: Source>(
 /// is not plain text (MySQL json arrives as UTF-8 bytes but compares as
 /// JSON). A pushed-down predicate on it would be judged by the server on the
 /// native value (MASTER M-46).
+/// Fixed-width text whose compares ignore trailing spaces
+/// ([`ArrowField::padded`]).
+fn padded_text(kind: Option<ArrowKind>, udt: &str) -> bool {
+    matches!(kind, Some(ArrowKind::Utf8)) && matches!(udt.to_ascii_lowercase().as_str(), "bpchar" | "char")
+}
+
 fn read_as_text(kind: Option<ArrowKind>, udt: &str) -> bool {
     match kind {
         None => true,
@@ -145,7 +168,7 @@ fn column_kind(
             pg_send_decodable(&pc.udt, pc.precision)
                 && (pc.udt != "numeric" || matches!(lc.delivered, Delivered::Decimal { .. }))
         }
-        ReadDialect::My => true,
+        ReadDialect::My | ReadDialect::Gh | ReadDialect::GhApi | ReadDialect::Gs => true,
     };
     arrow_kind(&lc.delivered).filter(|_| native)
 }
@@ -222,6 +245,22 @@ pub(crate) async fn start(src_url: &str, table: &str, opts: &ReadOptions) -> Res
                 Ok(launch_my_arrow(src, rp))
             }
         }
+        // One stream each: the API or the file serves a table front to back.
+        ReadDialect::Gh => {
+            let src = GithubSource::connect(src_url).await?;
+            let rp = plan_read(&src, dialect, table, opts, 1).await?;
+            Ok(launch_loaders(src, rp, chunk))
+        }
+        ReadDialect::GhApi => {
+            let src = GithubApiSource::connect(src_url).await?;
+            let rp = plan_read(&src, dialect, table, opts, 1).await?;
+            Ok(launch_loaders(src, rp, chunk))
+        }
+        ReadDialect::Gs => {
+            let src = GsheetsSource::connect(src_url).await?;
+            let rp = plan_read(&src, dialect, table, opts, 1).await?;
+            Ok(launch_loaders(src, rp, chunk))
+        }
     }
 }
 
@@ -238,6 +277,13 @@ fn user_where(dialect: ReadDialect, w: &str) -> Result<String> {
     let d: &dyn Dialect = match dialect {
         ReadDialect::Pg => &pg,
         ReadDialect::My => &my,
+        ReadDialect::Gh | ReadDialect::GhApi | ReadDialect::Gs => {
+            return Err(Error::InvalidInput(
+                "read: where= needs a source with a SQL server (postgres://, mysql://); \
+                 filter github/gsheets rows with .lazy() or apitap.sql()"
+                    .into(),
+            ))
+        }
     };
     let bad = |why: String| {
         Error::InvalidInput(format!(
@@ -291,6 +337,7 @@ struct ReadPlan {
     used: usize,
     cap: usize,
     batch_bytes: usize,
+    gates: Vec<std::sync::Arc<crate::wire::arrowcol::KeyGate>>,
 }
 
 async fn plan_read<S: Source>(
@@ -326,6 +373,35 @@ async fn plan_read<S: Source>(
         (u, p) => u.or(p),
     };
 
+    // github:// and gsheets:// frame a row's cells by position, so a narrowed
+    // plan would shift values into the wrong columns with no error.
+    if opts.columns.is_some() && matches!(dialect, ReadDialect::Gh | ReadDialect::Gs) {
+        return Err(Error::InvalidInput(
+            "read: columns= is not supported for github:// and gsheets:// sources yet; \
+             read every column"
+                .into(),
+        ));
+    }
+    if !opts.computed.is_empty() {
+        if dialect != ReadDialect::Pg {
+            return Err(Error::InvalidInput("read: computed columns are Postgres-only".into()));
+        }
+        for (name, sql) in &opts.computed {
+            plan.cols.push(crate::plan::ColumnPlan {
+                name: name.clone(),
+                nullable: true,
+                int_pk: false,
+                native_ddl: None,
+                udt: "int8".into(),
+                precision: None,
+                scale: None,
+            });
+            lane.cols.push(crate::plan::LaneCol {
+                delivered: Delivered::Int { bytes: 8, unsigned: false },
+                select: format!("({sql})::int8"),
+            });
+        }
+    }
     // Column projection (the lazy plugin pushes polars' with_columns here):
     // the SELECT list narrows, so the server serializes and this side decodes
     // ONLY what the query touches — requested order preserved. plan.cols
@@ -376,6 +452,15 @@ async fn plan_read<S: Source>(
                         pc.precision = None;
                         pc.scale = None;
                     }
+                    // json/uuid cells of these sources arrive in their binary
+                    // send form, which a text column would carry corrupted.
+                    ReadDialect::Gh | ReadDialect::GhApi | ReadDialect::Gs => {
+                        return Err(Error::InvalidInput(format!(
+                            "read: column {} ({}) of {table} cannot be read as Arrow yet; \
+                             leave it out of columns=",
+                            pc.name, pc.udt
+                        )));
+                    }
                 }
                 lc.delivered = Delivered::Text;
                 ArrowKind::Utf8
@@ -387,10 +472,12 @@ async fn plan_read<S: Source>(
             kind,
             nullable: pc.nullable,
             rewritten,
+            padded: padded_text(Some(kind), &pc.udt),
         });
     }
 
     let want = if parallel > 1 { parallel * 6 } else { 1 };
+    let want = opts.max_spans.map_or(want, |m| want.min(m.max(1)));
     let stmts = src.span_stmts(table, &plan, &lane, want, None).await?;
     let used = parallel.min(stmts.len()).max(1);
 
@@ -438,6 +525,7 @@ async fn plan_read<S: Source>(
         used,
         cap,
         batch_bytes,
+        gates: opts.gates.clone(),
     })
 }
 
@@ -453,14 +541,15 @@ fn launch_loaders<S: Source + 'static>(src: S, rp: ReadPlan, chunk: usize) -> Re
         used,
         cap,
         batch_bytes,
+        gates,
     } = rp;
     let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);
     let completed = Arc::new(AtomicBool::new(false));
     let loaders: Vec<ArrowLoader> = (0..used)
-        .map(|_| ArrowLoader {
-            b: BatchBuilder::new(kinds.clone(), batch_bytes),
-            tx: tx.clone(),
-            spare: None,
+        .map(|_| {
+            let mut b = BatchBuilder::new(kinds.clone(), batch_bytes);
+            b.set_gates(&gates);
+            ArrowLoader { b, tx: tx.clone(), spare: None }
         })
         .collect();
 

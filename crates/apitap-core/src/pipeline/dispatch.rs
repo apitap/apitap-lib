@@ -21,6 +21,7 @@ use crate::source::clickhouse::ChSource;
 use crate::source::github::GithubSource;
 use crate::source::github_api::GithubApiSource;
 use crate::source::gsheets::GsheetsSource;
+use crate::source::sqlresult::SqlResultSource;
 use crate::source::mysql::MySqlSource;
 use crate::source::postgres::PgSource;
 use crate::{MultiReport, TransferOptions, TransferReport};
@@ -249,6 +250,14 @@ impl SrcScheme for GsFrom {
     type Src = GsheetsSource;
     async fn connect(url: &str, _pool: usize) -> Result<GsheetsSource> {
         GsheetsSource::connect(url).await
+    }
+}
+/// `apitap.sql(..., dest=...)`'s computed answer (`apitap-sql://<token>`).
+struct SqlFrom;
+impl SrcScheme for SqlFrom {
+    type Src = SqlResultSource;
+    async fn connect(url: &str, _pool: usize) -> Result<SqlResultSource> {
+        SqlResultSource::connect(url).await
     }
 }
 struct GhApiFrom;
@@ -594,6 +603,13 @@ routes! {
     "github"   -> "s3"         : GhFrom => S3To, GITHUB, pg_overlap = false;
     "github"   -> "iceberg"    : GhFrom => IceTo, GITHUB, pg_overlap = false;
     "clickhouse" -> "clickhouse": ChFrom => ChTo, CH_CH, pg_overlap = false;
+    "apitap-sql" -> "postgres"  : SqlFrom => PgTo, GSHEETS, pg_overlap = false;
+    "apitap-sql" -> "clickhouse": SqlFrom => ChTo, GSHEETS, pg_overlap = false;
+    "apitap-sql" -> "mysql"     : SqlFrom => MyTo, GSHEETS, pg_overlap = false;
+    "apitap-sql" -> "bigquery"  : SqlFrom => BqTo, GSHEETS, pg_overlap = false;
+    "apitap-sql" -> "gcs"       : SqlFrom => GcsTo, GSHEETS, pg_overlap = false;
+    "apitap-sql" -> "s3"        : SqlFrom => S3To, GSHEETS, pg_overlap = false;
+    "apitap-sql" -> "iceberg"   : SqlFrom => IceTo, GSHEETS, pg_overlap = false;
 }
 
 /// Pairs consciously NOT in the table, each with its reason — the completeness
@@ -879,6 +895,7 @@ mod tests {
             "github",
             "github+api",
             "clickhouse",
+            "apitap-sql",
         ];
         const DESTS: &[&str] = &[
             "postgres",

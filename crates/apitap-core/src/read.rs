@@ -41,6 +41,21 @@ pub struct ReadOptions {
     /// is not one expression (`1=1) OR (1=1`, a second statement) is refused,
     /// because it would escape the span's own range and repeat rows.
     pub where_sql: Option<String>,
+    /// Computed columns, Postgres only: (name, SQL expression yielding an
+    /// `int8`). Each becomes a column of the read, selectable by name in
+    /// `columns`. apitap.sql() ships an aggregate's argument this way, scaled
+    /// to an exact integer, instead of the numeric columns it is made of.
+    pub computed: Vec<(String, String)>,
+    /// At most this many span statements (default: 6 per pipe, for skew).
+    /// apitap.sql()'s key filter rides every statement, so it asks for one
+    /// statement per pipe.
+    pub max_spans: Option<usize>,
+    /// Row gates the decoder applies (apitap.sql()'s join keys): a row
+    /// whose gate column misses its set is dropped before its other columns
+    /// decode. Column places are the read's. The consumer still checks every
+    /// row, so a gate is work saved, never the answer; lanes that do not
+    /// decode COPY binary ignore it.
+    pub gates: Vec<std::sync::Arc<crate::wire::arrowcol::KeyGate>>,
 }
 
 /// One column of the result schema.
@@ -54,6 +69,9 @@ pub struct ArrowField {
     /// the server's native value, not the string the reader sees, so the
     /// lazy pushdown must not cross the wire with it (MASTER M-46).
     pub rewritten: bool,
+    /// Fixed-width text (Postgres `bpchar`, MySQL `CHAR`): its compares
+    /// ignore trailing spaces, as the server's do. VARCHAR and TEXT keep them.
+    pub padded: bool,
 }
 
 /// The running read: a schema and a pull side. `next_batch` blocks the
@@ -121,6 +139,26 @@ impl ReadHandle {
                     Err(Error::Transfer(
                         "read: stream ended before the scan completed".into(),
                     ))
+                }
+            }
+        }
+    }
+
+    /// Non-blocking pull: `None` = nothing ready yet, `Some(None)` = clean end.
+    pub(crate) fn try_recv(&mut self) -> Result<Option<Option<ArrowBatch>>> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match self.rx.try_recv() {
+            Ok(Ok(b)) => Ok(Some(Some(b))),
+            Ok(Err(e)) => {
+                self.supervisor.abort();
+                Err(e)
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                    Ok(Some(None))
+                } else {
+                    Err(Error::Transfer("read: stream ended before the scan completed".into()))
                 }
             }
         }

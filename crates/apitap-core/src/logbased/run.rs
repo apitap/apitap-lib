@@ -1585,6 +1585,7 @@ async fn run_group_mysql(
                     budget,
                     opts.changelog,
                     win_tx,
+                    false,
                 )
                 .await
                 .map(|_| ())
@@ -2896,7 +2897,7 @@ fn db_err(e: sqlx::Error) -> Error {
     Error::Transfer(format!("log_based: {e}"))
 }
 
-async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String, bool)> {
+pub(crate) async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String, bool)> {
     // Quoted part by part — the spelling the bootstrap's bulk read uses
     // (`quote_ident_path`). Raw, `public.MyTable` case-folded to
     // `public.mytable`: the drain tracked a different table than the
@@ -2927,7 +2928,7 @@ async fn resolve_table(src: &PgPool, table: &str) -> Result<(String, String, boo
 /// which were read as key columns (MASTER M-60). `indkey` is an int2vector,
 /// subscripted from 0, so the key attributes are positions below
 /// `indnkeyatts`.
-async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
+pub(crate) async fn pk_columns(src: &PgPool, qualified: &str) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT a.attname FROM pg_index i \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \

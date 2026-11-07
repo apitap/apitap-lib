@@ -17,6 +17,7 @@ pub(crate) mod github_api;
 pub(crate) mod gsheets;
 pub(crate) mod mysql;
 pub(crate) mod postgres;
+pub(crate) mod sqlresult;
 
 pub(crate) trait Source: Sized + Send + Sync {
     /// Probe the table: columns, native types, PK facts. Must work on empty tables.

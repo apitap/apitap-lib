@@ -441,11 +441,32 @@ pub(crate) fn numeric_to_scaled_i128_raw(f: &[u8]) -> Result<(i128, i32)> {
                 let exp10 = (weight - nd as i32 + 1) * 4 + dscale;
                 if (-26..=26).contains(&exp10) {
                     let v = if exp10 >= 0 {
-                        acc as i128 * POW10[exp10 as usize]
+                        // acc < 10^12: times up to 10^6 stays in u64.
+                        match exp10 {
+                            0 => i128::from(acc),
+                            1 => i128::from(acc * 10),
+                            2 => i128::from(acc * 100),
+                            3 => i128::from(acc * 1000),
+                            4..=6 => i128::from(acc * 10u64.pow(exp10 as u32)),
+                            _ => acc as i128 * POW10[exp10 as usize],
+                        }
                     } else {
                         // acc >= 0 here, so one division by 10^k is bit-identical
                         // to the general path's k successive divisions by 10.
-                        acc as i128 / POW10[(-exp10) as usize]
+                        // acc < 10^12 fits u64: a hardware divide, not the
+                        // software 128-bit one (5% of a 32M-row read's CPU);
+                        // past 10^19 the quotient is 0 either way.
+                        // Constant divisors (multiply and shift, not a
+                        // divide) for the shifts base-10000 groups leave.
+                        let k = (-exp10) as usize;
+                        i128::from(match k {
+                            1 => acc / 10,
+                            2 => acc / 100,
+                            3 => acc / 1000,
+                            4 => acc / 10_000,
+                            5..=19 => acc / 10u64.pow(k as u32),
+                            _ => 0,
+                        })
                     };
                     return Ok((if sign == 0x4000 { -v } else { v }, dscale));
                 }

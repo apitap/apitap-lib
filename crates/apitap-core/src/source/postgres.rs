@@ -552,6 +552,49 @@ impl Source for PgSource {
     }
 }
 
+/// One snapshot held open across several reads of one server (apitap.sql's
+/// passes): readers pin themselves to `id` through the URL's
+/// `__apitap_snapshot=` param, and the snapshot lives until `close`.
+pub(crate) struct HeldSnapshot {
+    pub(crate) id: std::sync::Arc<str>,
+    conn: sqlx::PgConnection,
+}
+
+impl HeldSnapshot {
+    pub(crate) async fn open(url: &str) -> Result<Self> {
+        let src = PgSource::connect(url, 1).await?;
+        let (id, conn) = export_snapshot(&src.pool).await?;
+        Ok(Self { id, conn })
+    }
+
+    pub(crate) async fn close(self) {
+        use sqlx::Connection as _;
+        let _ = self.conn.close().await;
+    }
+}
+
+impl PgSource {
+    /// One row of `q`, read in the pinned snapshot when the URL carried one.
+    pub(crate) async fn fetch_one_pinned<T>(&self, q: &str) -> std::result::Result<T, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    {
+        use sqlx::Executor as _;
+        let Some(snap) = &self.snapshot else {
+            return sqlx::query_as::<_, T>(q).fetch_one(&self.pool).await;
+        };
+        let mut c = self.pool.acquire().await?;
+        c.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await?;
+        let r = async {
+            c.execute(format!("SET TRANSACTION SNAPSHOT '{}'", snap.replace('\'', "''")).as_str()).await?;
+            sqlx::query_as::<_, T>(q).fetch_one(&mut *c).await
+        }
+        .await;
+        c.execute("COMMIT").await?;
+        r
+    }
+}
+
 /// A snapshot every span of one read can pin itself to, and the connection
 /// that keeps it alive: an exported snapshot lives only as long as the
 /// transaction that exported it.

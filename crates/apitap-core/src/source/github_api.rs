@@ -713,9 +713,9 @@ fn mysql_datetime(micros: i64) -> Result<String> {
 /// Encode one API object as a MySQL LOAD DATA text row (\t fields, \N NULLs,
 /// [`crate::wire::mytsv`] escapes). An empty string stays '' — distinct from
 /// NULL, unlike the all-text sources.
-fn encode_row_tsv(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
+fn encode_row_tsv(e: &Entity, proj: &[usize], item: &Value, out: &mut Vec<u8>) -> Result<()> {
     let mut itoa = itoa::Buffer::new();
-    for (i, col) in e.cols.iter().enumerate() {
+    for (i, col) in proj.iter().map(|&c| &e.cols[c]).enumerate() {
         if i > 0 {
             out.push(b'\t');
         }
@@ -772,9 +772,9 @@ fn encode_row_tsv(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
 }
 
 /// Encode one API object as a PgCopyBinary tuple.
-fn encode_row(e: &Entity, item: &Value, out: &mut Vec<u8>) -> Result<()> {
-    pgc::tuple_start(e.cols.len(), out);
-    for col in e.cols {
+fn encode_row(e: &Entity, proj: &[usize], item: &Value, out: &mut Vec<u8>) -> Result<()> {
+    pgc::tuple_start(proj.len(), out);
+    for col in proj.iter().map(|&c| &e.cols[c]) {
         match col.ex {
             Ex::Raw => pgc::jsonb_field(strip_json_nul(item.to_string()).as_bytes(), out),
             Ex::I64(p) => match walk(item, p).as_i64() {
@@ -1015,6 +1015,19 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
         // RowBinary lane: run the pgcopy stream through the same transcoder the
         // Postgres source uses — one encoder, every destination.
         let tsv_lane = self.lane.format == WireFormat::MyTsv;
+        // The lane's columns, in its order: a read() that projects (apitap.sql
+        // reads three of twelve) gets exactly those, where every row used to
+        // carry the whole entity and the reader refused the tuple.
+        let proj: Vec<usize> = self
+            .lane
+            .cols
+            .iter()
+            .map(|lc| {
+                e.cols.iter().position(|c| c.name == lc.select).ok_or_else(|| {
+                    Error::InvalidInput(format!("github+api {}: no column {}", e.name, lc.select))
+                })
+            })
+            .collect::<Result<_>>()?;
         let mut xcode = match self.lane.format {
             WireFormat::PgCopyBinary | WireFormat::MyTsv => None,
             WireFormat::RowBinary => {
@@ -1139,9 +1152,9 @@ impl<L: Loader> PipeBody<L> for GhApiBody<'_> {
                     }
                 }
                 if tsv_lane {
-                    encode_row_tsv(e, item, &mut pg)?;
+                    encode_row_tsv(e, &proj, item, &mut pg)?;
                 } else {
-                    encode_row(e, item, &mut pg)?;
+                    encode_row(e, &proj, item, &mut pg)?;
                 }
                 rows += 1;
                 if pg.len() >= self.chunk {
@@ -1308,7 +1321,7 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        encode_row(e, &item, &mut out).unwrap();
+        encode_row(e, &(0..e.cols.len()).collect::<Vec<_>>(), &item, &mut out).unwrap();
         // 12 columns: 2-byte count then per-field frames; spot the count.
         assert_eq!(&out[..2], &(12i16).to_be_bytes());
         // A PR-flavored object carries "pull_request" — the caller drops it.

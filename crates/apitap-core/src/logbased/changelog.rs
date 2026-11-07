@@ -70,6 +70,10 @@ pub(crate) struct Changes {
     /// them before writing. Tracked here so the overwhelmingly common window —
     /// no TOAST at all — pays nothing for the machinery below.
     pub masked: bool,
+    /// Incremental views (`sql::live`) only: per event, the OLD image an
+    /// update replaced when its key did not move (a key move carries it as
+    /// its own `D`). `None` on the changelog lane, which pays nothing.
+    pub olds: Option<Vec<Option<Tuple>>>,
     /// The table's columns: its keys decide where a re-key moved a row from
     /// and which row a masked cell belongs to, and the sealed window carries
     /// it to the applies.
@@ -82,7 +86,21 @@ impl Changes {
             events: Vec::new(),
             count: 0,
             masked: false,
+            olds: None,
             layout,
+        }
+    }
+
+    /// A body that also keeps each update's old image (`olds`).
+    pub(crate) fn with_old(layout: Arc<Layout>) -> Self {
+        Self { olds: Some(Vec::new()), ..Self::new(layout) }
+    }
+
+    /// Push an event and, on a view body, its old image.
+    fn push(&mut self, c: Change, old: Option<Tuple>) {
+        self.events.push(c);
+        if let Some(o) = &mut self.olds {
+            o.push(old);
         }
     }
 
@@ -102,11 +120,14 @@ impl Changes {
     pub(crate) fn insert(&mut self, row: Tuple) {
         self.count += 1;
         self.note_mask(&row);
-        self.events.push(Change {
-            op: ChangeOp::Insert,
-            row: Some(row),
-            moved_from: None,
-        });
+        self.push(
+            Change {
+                op: ChangeOp::Insert,
+                row: Some(row),
+                moved_from: None,
+            },
+            None,
+        );
     }
 
     /// An update lands as ONE `U` carrying the new image. A PK-changing update
@@ -129,28 +150,39 @@ impl Changes {
         if let Some(old) = old {
             let from = key_of(old, pk_idx);
             if from != key_of(&row, pk_idx) {
-                self.events.push(Change {
-                    op: ChangeOp::Delete,
-                    row: Some(old.clone()),
-                    moved_from: None,
-                });
+                self.push(
+                    Change {
+                        op: ChangeOp::Delete,
+                        row: Some(old.clone()),
+                        moved_from: None,
+                    },
+                    None,
+                );
                 moved_from = Some(Box::new(from));
             }
         }
-        self.events.push(Change {
-            op: ChangeOp::Update,
-            row: Some(row),
-            moved_from,
-        });
+        // The old image rides with the U only when no D carried it.
+        let old_img = if moved_from.is_none() && self.olds.is_some() { old.cloned() } else { None };
+        self.push(
+            Change {
+                op: ChangeOp::Update,
+                row: Some(row),
+                moved_from,
+            },
+            old_img,
+        );
     }
 
     pub(crate) fn delete(&mut self, old: Tuple) {
         self.count += 1;
-        self.events.push(Change {
-            op: ChangeOp::Delete,
-            row: Some(old),
-            moved_from: None,
-        });
+        self.push(
+            Change {
+                op: ChangeOp::Delete,
+                row: Some(old),
+                moved_from: None,
+            },
+            None,
+        );
     }
 
     /// Which keys carry a masked cell, and the union of the columns they are
@@ -304,11 +336,14 @@ impl Changes {
     /// row of that table older than the truncate as gone.
     pub(crate) fn truncate(&mut self) {
         self.count += 1;
-        self.events.push(Change {
-            op: ChangeOp::Truncate,
-            row: None,
-            moved_from: None,
-        });
+        self.push(
+            Change {
+                op: ChangeOp::Truncate,
+                row: None,
+                moved_from: None,
+            },
+            None,
+        );
     }
 }
 

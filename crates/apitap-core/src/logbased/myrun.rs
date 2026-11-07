@@ -281,6 +281,8 @@ pub(crate) async fn drain_windows(
     max_buf_bytes: usize,
     changelog: bool,
     win_tx: tokio::sync::mpsc::Sender<DrainOutcome>,
+    // Incremental views: keep each update's old image (`Changes::olds`).
+    keep_old: bool,
 ) -> Result<u64> {
     mysource::precheck(pool).await?;
     let (live_file, live_pos) = master_position(pool).await?;
@@ -387,6 +389,7 @@ pub(crate) async fn drain_windows(
             .iter()
             .map(|c| (c.qualified.clone(), c.pk_cols.clone()))
             .collect::<HashMap<_, _>>(),
+        keep_old,
         ..Default::default()
     };
 
