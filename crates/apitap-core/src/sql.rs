@@ -765,41 +765,75 @@ enum Lit {
 }
 
 /// How a text column compares: trailing spaces ignored (`pad`), case
-/// folded (`ci`). MySQL's `_ai_ci` accent folding is not done: `'é' = 'e'`
-/// holds there and not here.
+/// folded (`ci`), accents folded (`ai`: MySQL's `_ai_ci` and `general_ci`,
+/// `'é' = 'e'`), as the column's server compares.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 struct Coll {
     pad: bool,
     ci: bool,
+    ai: bool,
 }
 
 impl Coll {
     fn of(f: &ArrowField) -> Coll {
-        Coll { pad: f.padded, ci: f.ci }
+        Coll { pad: f.padded, ci: f.ci, ai: f.ai }
     }
 
     fn plain(self) -> bool {
         !self.pad && !self.ci
     }
 
-    /// `t` against `y` under this collation.
-    fn cmp(self, t: &[u8], y: &[u8]) -> std::cmp::Ordering {
-        let (t, y) = if self.pad { (t.trim_ascii_end(), y.trim_ascii_end()) } else { (t, y) };
+    /// The bytes two values are equal by under this collation: padding off,
+    /// case folded, accents and the letters UCA weighs as base letters
+    /// (`ß` = `ss`, `æ` = `ae`, `ø` = `o`, …) folded. ASCII folds in place.
+    fn fold<'a>(self, t: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        use std::borrow::Cow;
+        let t = if self.pad { t.trim_ascii_end() } else { t };
         if !self.ci {
-            return t.cmp(y);
+            return Cow::Borrowed(t);
         }
-        if t.is_ascii() && y.is_ascii() {
-            return t.iter().map(u8::to_ascii_lowercase).cmp(y.iter().map(u8::to_ascii_lowercase));
+        if t.is_ascii() {
+            return if t.iter().any(u8::is_ascii_uppercase) { Cow::Owned(t.to_ascii_lowercase()) } else { Cow::Borrowed(t) };
         }
-        let lo = |b: &[u8]| String::from_utf8_lossy(b).to_lowercase();
-        lo(t).cmp(&lo(y))
+        let s = String::from_utf8_lossy(t);
+        if !self.ai {
+            return Cow::Owned(s.to_lowercase().into_bytes());
+        }
+        use unicode_normalization::char::is_combining_mark;
+        use unicode_normalization::UnicodeNormalization as _;
+        let mut out = String::with_capacity(s.len());
+        for c in s.nfkd().filter(|c| !is_combining_mark(*c)) {
+            match c {
+                'ß' | 'ẞ' => out.push_str("ss"),
+                'æ' | 'Æ' => out.push_str("ae"),
+                'œ' | 'Œ' => out.push_str("oe"),
+                'ø' | 'Ø' => out.push('o'),
+                'đ' | 'Đ' => out.push('d'),
+                'ł' | 'Ł' => out.push('l'),
+                'ħ' | 'Ħ' => out.push('h'),
+                'ı' => out.push('i'),
+                c => out.extend(c.to_lowercase()),
+            }
+        }
+        Cow::Owned(out.into_bytes())
     }
 
-    /// The value a LIKE matches: padding off, case folded (the pattern was
-    /// folded at plan time).
+    /// `t` against `y` under this collation.
+    fn cmp(self, t: &[u8], y: &[u8]) -> std::cmp::Ordering {
+        if self.plain() {
+            return t.cmp(y);
+        }
+        self.fold(t).cmp(&self.fold(y))
+    }
+
+    /// The value a LIKE matches (the pattern was folded the same way at
+    /// plan time).
     fn like_text<'a>(self, t: &'a [u8]) -> Option<std::borrow::Cow<'a, str>> {
-        let t = std::str::from_utf8(if self.pad { t.trim_ascii_end() } else { t }).ok()?;
-        Some(if self.ci && t.chars().any(char::is_uppercase) { std::borrow::Cow::Owned(t.to_lowercase()) } else { std::borrow::Cow::Borrowed(t) })
+        use std::borrow::Cow;
+        match self.fold(t) {
+            Cow::Borrowed(b) => std::str::from_utf8(b).ok().map(Cow::Borrowed),
+            Cow::Owned(v) => String::from_utf8(v).ok().map(Cow::Owned),
+        }
     }
 }
 
@@ -974,7 +1008,8 @@ fn pexpr(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
                 Value::SingleQuotedString(pt) => {
                     let c = col(sides, expr)?.ok_or_else(no)?;
                     let co = Coll::of(&sides[s].schema[sides[s].read[c]]);
-                    PExpr::Like(c, if co.ci { pt.to_lowercase() } else { pt.clone() }, *negated, co)
+                    let pt = if co.ci { String::from_utf8_lossy(&Coll { pad: false, ..co }.fold(pt.as_bytes())).into_owned() } else { pt.clone() };
+                    PExpr::Like(c, pt, *negated, co)
                 }
                 _ => return Err(no()),
             },
@@ -1526,6 +1561,62 @@ fn strip(p: &Plan, g: Groups, a: Vec<Acc>, h: Vec<bool>) -> Result<(Groups, Vec<
     }
 }
 
+/// Groups whose GROUP BY text is equal under its column's collation, as
+/// one: a MySQL `_ci` column's 'Brazil' and 'BRAZIL' are one group there, and
+/// the answer shows the first value the group met (MySQL shows one of them).
+/// Groups are few next to rows, so the fold runs here, not per row.
+fn collate(p: &Plan, g: Groups, a: Vec<Acc>, h: Vec<bool>) -> Result<(Groups, Vec<Acc>, Vec<bool>)> {
+    let keep = p.keys.is_some().then_some(h.as_slice());
+    Ok(collated(p, &g, &a, keep)?.unwrap_or((g, a, h)))
+}
+
+/// [`collate`] over borrowed groups (`keep`: the groups that are rows;
+/// `None`: all); `None` when no GROUP BY column folds.
+fn collated(p: &Plan, g: &Groups, a: &[Acc], keep: Option<&[bool]>) -> Result<Option<(Groups, Vec<Acc>, Vec<bool>)>> {
+    let folds: Vec<(usize, Coll)> = p
+        .gcoll
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.plain())
+        .filter_map(|(gi, &c)| Some((match &p.star { Some(st) => st.gpos_rt[gi]?, None => gi }, c)))
+        .collect();
+    if folds.is_empty() {
+        return Ok(None);
+    }
+    let na = p.aggs.len();
+    let mut rep: HashMap<(usize, Vec<u8>), Vec<u8>> = HashMap::new();
+    let (mut ng, mut nacc, mut nhit) = (Groups::default(), Vec::<Acc>::new(), Vec::<bool>::new());
+    let mut kb = Vec::new();
+    for (gi, k) in g.keys.iter().enumerate() {
+        if keep.is_some_and(|h| !h.get(gi).copied().unwrap_or(false)) {
+            continue;
+        }
+        kb.clear();
+        for (i, (t, v)) in group_fields(k).into_iter().enumerate() {
+            kb.push(t);
+            if t == 0 {
+                continue;
+            }
+            let v: Vec<u8> = match folds.iter().find(|x| x.0 == i) {
+                Some(&(_, c)) if t == 5 => rep.entry((i, c.fold(v).into_owned())).or_insert_with(|| v.to_vec()).clone(),
+                _ => v.to_vec(),
+            };
+            kb.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            kb.extend_from_slice(&v);
+        }
+        let to = ng.id(&kb)? as usize;
+        if nacc.len() < (to + 1) * na {
+            nacc.resize((to + 1) * na, Acc::None);
+            nhit.resize(to + 1, false);
+        }
+        nhit[to] = true;
+        for (i, ag) in p.aggs.iter().enumerate() {
+            merge_acc(&mut nacc[to * na + i], a[gi * na + i], ag.f)?;
+        }
+    }
+    Ok(Some((ng, nacc, nhit)))
+}
+
 fn fold(a: &mut Acc, f: AggFn, ty: Option<Ty>, v: Num) -> Result<()> {
     if f == AggFn::CountStar {
         if let Acc::N(n) = a {
@@ -1608,6 +1699,9 @@ struct Plan {
     /// row's flag bit (`None`: no build condition) and the probe row's
     /// condition (`None`: none); a match passes when one branch holds on both.
     orx: Vec<(Option<u32>, Option<PExpr>)>,
+    /// Each GROUP BY column's collation: groups equal under it are one
+    /// (`collate`), and ORDER BY compares by it.
+    gcoll: Vec<Coll>,
 }
 
 /// Conditions over the GROUP BY columns: each read position is a GROUP BY
@@ -1764,7 +1858,7 @@ fn vexpr(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<VExpr
             let i = match sides[1].schema.iter().position(|f| f.name == name) {
                 Some(i) => i,
                 None => {
-                    sides[1].schema.push(ArrowField { name, kind: k, nullable: true, rewritten: false, padded: false, ci: false });
+                    sides[1].schema.push(ArrowField { name, kind: k, nullable: true, rewritten: false, padded: false, ci: false, ai: false });
                     let i = sides[1].schema.len() - 1;
                     sides[1].lookups.push((i, s, c));
                     i
@@ -2481,6 +2575,8 @@ fn plan_with(
     if aggs.is_empty() {
         return Err(unsupported("a query without aggregates (v1 runs join + aggregate)"));
     }
+    // Each GROUP BY column's collation (before a star layout reorders sides).
+    let gcoll: Vec<Coll> = group_cols.iter().map(|&(s, c)| Coll::of(&sides[s].schema[c])).collect();
     let group_side = match (group_cols.first(), &star_tree) {
         (_, Some(_)) => 0,
         (Some(g), None) => g.0,
@@ -2608,7 +2704,7 @@ fn plan_with(
             schema: group_cols
                 .iter()
                 .enumerate()
-                .map(|(i, &(s, c))| ArrowField { name: format!("__g{i}"), kind: sides[s].schema[c].kind, nullable: true, rewritten: false, padded: sides[s].schema[c].padded, ci: sides[s].schema[c].ci })
+                .map(|(i, &(s, c))| ArrowField { name: format!("__g{i}"), kind: sides[s].schema[c].kind, nullable: true, rewritten: false, padded: sides[s].schema[c].padded, ci: sides[s].schema[c].ci, ai: sides[s].schema[c].ai })
                 .collect(),
             read: Vec::new(),
             conj: Vec::new(),
@@ -2677,7 +2773,7 @@ fn plan_with(
         let bcol = sides[bs].read[bk];
         group_cols.iter().any(|&(s, c)| s == bs && c == bcol)
     });
-    Ok(Plan { sides, keys, group_side, groups, agg_side, aggs, out, order, limit, star, key_groups, residual, orx })
+    Ok(Plan { sides, keys, group_side, groups, agg_side, aggs, out, order, limit, star, key_groups, residual, orx, gcoll })
 }
 
 /// `FROM (SELECT exprs AS a, … FROM … WHERE …) AS t` with no GROUP BY,
@@ -2778,7 +2874,7 @@ fn years_to_virtual(sides: &mut [Side], e: &mut Expr) -> Result<()> {
             }
             let name = format!("__year_{}", side.schema[c.1].name);
             if !side.schema.iter().any(|f| f.name == name) {
-                side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int32, nullable: true, rewritten: false, padded: false, ci: false });
+                side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int32, nullable: true, rewritten: false, padded: false, ci: false, ai: false });
                 let vi = side.schema.len() - 1;
                 side.virt.push((vi, c.1));
                 side.want(c.1);
@@ -3786,7 +3882,7 @@ fn rewrite_args(p: &mut Plan) -> bool {
     for (i, (a, sq)) in p.aggs.iter_mut().zip(sqls).enumerate() {
         let Some((sql, sc)) = sq else { continue };
         let name = format!("_apitap_a{i}");
-        side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int64, nullable: true, rewritten: false, padded: false, ci: false });
+        side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int64, nullable: true, rewritten: false, padded: false, ci: false, ai: false });
         side.read.push(side.schema.len() - 1);
         side.computed.push((name, sql));
         let col = VExpr::Col(side.read.len() - 1, ArrowKind::Int64);
@@ -4587,6 +4683,7 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
                         groups = combine(&groups, std::mem::take(&mut cgroups))?;
                     }
                     let (g, a, h) = strip(&p, std::mem::take(&mut groups), std::mem::take(&mut accs), std::mem::take(&mut hit))?;
+                    let (g, a, h) = collate(&p, g, a, h)?;
                     retain(&p, &g, &a, &h, &mut kept)?;
                 } else {
                     (groups, accs, hit) = (Groups::default(), Vec::new(), Vec::new());
@@ -4681,7 +4778,7 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
     // the groups are a pass's own).
     if !p.key_groups {
         let (g, a, h) = strip(&p, std::mem::take(&mut groups), std::mem::take(&mut accs), std::mem::take(&mut hit))?;
-        (groups, accs, hit) = (g, a, h);
+        (groups, accs, hit) = collate(&p, g, a, h)?;
     }
     // A star plan's late GROUP BY columns, for the answer's rows only.
     if let Some(st) = p.star.as_ref().filter(|st| !st.late.is_empty()) {
@@ -4860,7 +4957,7 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
                     2 => K::F(f64::from_le_bytes(b.try_into().unwrap_or([0; 8]))),
                     3 => K::I(i128::from_le_bytes(b.try_into().unwrap_or([0; 16]))),
                     4 => K::I(i128::from(b[0])),
-                    5 => K::B(b.to_vec()),
+                    5 => K::B(p.gcoll.get(*g).map_or_else(|| b.to_vec(), |c| c.fold(b).into_owned())),
                     _ => K::Null,
                 }
             }
@@ -5013,7 +5110,7 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
             }
         };
         cols.push(col);
-        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: false, ci: false });
+        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: false, ci: false, ai: false });
     }
     Ok(SqlResult { schema, batch: ArrowBatch { rows: rows.len(), cols } })
 }
@@ -5023,7 +5120,7 @@ mod tests {
     use super::*;
 
     fn f(name: &str, kind: ArrowKind) -> ArrowField {
-        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false }
+        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false }
     }
 
     fn schemas() -> impl FnMut(&str, &str) -> Result<Vec<ArrowField>> {
@@ -5110,6 +5207,29 @@ mod tests {
         let big = 1i128 << 60;
         let accs = [Acc::D(big), Acc::N(1), Acc::D(big + 1), Acc::N(1)];
         assert_eq!(order_rows(&p, &g, &accs, None, false), vec![1, 0]);
+    }
+
+    /// GROUP BY a MySQL `_ai_ci` column: values equal under it are one group,
+    /// shown as the first value met, its aggregates merged; ORDER BY folds.
+    #[test]
+    fn groups_equal_under_the_collation_are_one() {
+        let mut p = plan(Q, &srcs(), &mut schemas()).unwrap();
+        p.gcoll = vec![Coll { ci: true, ai: true, ..Coll::default() }];
+        let mut g = Groups::default();
+        for t in ["Brazil", "banana", "BRAZIL", "Brésil", "bresil", "Apple"] {
+            let mut k = vec![5u8];
+            k.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            k.extend_from_slice(t.as_bytes());
+            g.id(&k).unwrap();
+        }
+        let accs: Vec<Acc> = (1..=6u64).flat_map(|n| [Acc::D(i128::from(n)), Acc::N(n)]).collect();
+        let (g2, a2, h2) = collate(&p, g, accs, vec![true; 6]).unwrap();
+        let names: Vec<String> = g2.keys.iter().map(|k| String::from_utf8(group_fields(k)[0].1.to_vec()).unwrap()).collect();
+        assert_eq!(names, ["Brazil", "banana", "Brésil", "Apple"]);
+        assert!(matches!(a2[1], Acc::N(4)), "Brazil + BRAZIL counted 1 + 3");
+        assert!(matches!(a2[5], Acc::N(9)), "Brésil + bresil counted 4 + 5");
+        // ORDER BY 1 under the collation: Apple, banana, Brazil, Brésil.
+        assert_eq!(order_rows(&p, &g2, &a2, Some(&h2), false), vec![3, 1, 0, 2]);
     }
 
     /// The headline query plans as designed: the GROUP BY side builds, the
@@ -5563,7 +5683,7 @@ mod tests {
     fn local_predicates_fold_and_pad() {
         assert!(matches!(lit(&sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {}).try_with_sql("1 + 10").unwrap().parse_expr().unwrap()), Some(Lit::Num(x)) if x == 11.0));
         let b = ArrowBatch { rows: 1, cols: vec![FinishedCol::Utf8 { validity: None, offsets: vec![0, 10], data: b"AIR       ".to_vec() }] };
-        let pad = Coll { pad: true, ci: false };
+        let pad = Coll { pad: true, ..Coll::default() };
         let pe = PExpr::In(0, vec![Lit::Coll("AIR".into(), pad), Lit::Coll("AIR REG".into(), pad)], false);
         assert_eq!(peval(&pe, &b, 0, &[None]), Some(true), "CHAR(10) 'AIR' padded equals 'AIR'");
         let pe = PExpr::In(0, vec![Lit::Str("AIR".into())], false);
@@ -5571,7 +5691,7 @@ mod tests {
         assert_eq!(peval(&PExpr::Like(0, "%R".into(), false, pad), &b, 0, &[None]), Some(true), "CHAR LIKE ignores the padding");
         assert_eq!(peval(&PExpr::Like(0, "%R".into(), false, Coll::default()), &b, 0, &[None]), Some(false), "VARCHAR LIKE does not");
         // A MySQL _ci column: case folds in =, <, IN and LIKE.
-        let ci = Coll { pad: false, ci: true };
+        let ci = Coll { ci: true, ..Coll::default() };
         let b = ArrowBatch { rows: 1, cols: vec![FinishedCol::Utf8 { validity: None, offsets: vec![0, 6], data: b"BRAZIL".to_vec() }] };
         assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Coll("brazil".into(), ci)), &b, 0, &[None]), Some(true));
         assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Str("brazil".into())), &b, 0, &[None]), Some(false), "a case-sensitive column does not fold");
@@ -5579,6 +5699,12 @@ mod tests {
         assert_eq!(peval(&PExpr::Like(0, "bra%".into(), false, ci), &b, 0, &[None]), Some(true));
         let b = ArrowBatch { rows: 1, cols: vec![FinishedCol::Utf8 { validity: None, offsets: vec![0, "ÉCOLE".len() as i32], data: "ÉCOLE".as_bytes().to_vec() }] };
         assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Coll("école".into(), ci)), &b, 0, &[None]), Some(true), "non-ASCII case folds too");
+        assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Coll("ecole".into(), ci)), &b, 0, &[None]), Some(false), "_as_ci keeps accents");
+        let ai = Coll { ci: true, ai: true, ..Coll::default() };
+        assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Coll("ecole".into(), ai)), &b, 0, &[None]), Some(true), "_ai_ci: 'ÉCOLE' = 'ecole'");
+        assert_eq!(ai.cmp("Straße".as_bytes(), b"STRASSE"), std::cmp::Ordering::Equal, "ß weighs as ss");
+        assert_eq!(ai.cmp("Ærø".as_bytes(), b"aero"), std::cmp::Ordering::Equal);
+        assert_eq!(peval(&PExpr::Like(0, "%cole".into(), false, ai), &b, 0, &[None]), Some(true), "LIKE folds accents too");
     }
 
     /// TPC-H Q9: lineitem streams (it joins the most tables), orders builds

@@ -43,6 +43,7 @@ foldhash = "0.2"
 # HashTable: apitap.sql()'s groups index their keys once (a HashMap held each
 # key twice). 0.15 is already in the tree.
 hashbrown = { version = "0.15", default-features = false }
+unicode-normalization = "0.1"
 # SigV4 signing for the s3:// sink — all three already compiled via sqlx.
 sha2 = "0.10"
 crc32fast = "1"

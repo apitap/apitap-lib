@@ -935,6 +935,10 @@ impl View {
             return result(&self.p, &self.st.groups, &accs, None);
         }
         let keep: Vec<bool> = self.st.rn.iter().map(|&n| n > 0).collect();
+        // Groups equal under a GROUP BY column's collation are one row.
+        if let Some((g, a, h)) = super::collated(&self.p, &self.st.groups, &accs, Some(&keep))? {
+            return result(&self.p, &g, &a, Some(&h));
+        }
         result(&self.p, &self.st.groups, &accs, Some(&keep))
     }
 
@@ -2428,7 +2432,7 @@ mod tests {
     use super::*;
 
     fn f(name: &str, kind: ArrowKind) -> ArrowField {
-        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false }
+        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false }
     }
 
     fn schemas() -> impl FnMut(&str, &str) -> Result<Vec<ArrowField>> {

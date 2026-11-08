@@ -123,8 +123,16 @@ Status 2026-11-08 (p69/p70):
   exact, peak ≤ 205 MB; T0 14.4 s, T2 59.6 s / 203 MB, T3 13.6 s.
 - **MySQL collations.** `ArrowField::ci` (`_ci`) and PAD SPACE (`padded`, all but 0900/nopad) come
   from the probed `COLLATE`; locally evaluated compares and LIKE fold case (ASCII fast path,
-  Unicode lowercase otherwise). Accent folding (`_ai_`) is not emulated. e2e_sql_join case 11: an
-  OR across tables on a utf8mb4_0900_ai_ci column — RED on p72 (1,818 vs 6,365 rows), GREEN now.
-  GROUP BY on a `_ci` column still groups bytewise.
+  Unicode lowercase otherwise). e2e_sql_join case 11: an OR across tables on a utf8mb4_0900_ai_ci
+  column — RED on p72 (1,818 vs 6,365 rows), GREEN now.
+- **Accents and GROUP BY under a collation (p76/p77).** `ArrowField::ai` (every `_ci` but
+  `_as_ci`): `Coll::fold` = padding off, NFKD, combining marks dropped, lowercase, and the letters
+  UCA weighs as base letters (`ß`→ss, `æ`→ae, `œ`→oe, `ø`→o, `đ`→d, `ł`→l, `ħ`→h). GROUP BY on
+  such a column: groups equal under the fold are merged after the passes (`collate`, over groups,
+  not rows), shown as the first value met; ORDER BY compares folded; live views merge the same way
+  in `answer`. e2e_sql_join case 12 (MySQL decides each value's group): 'Brazil' = 'BRAZIL',
+  'Brésil' = 'bresil', 'brazil ' apart (0900 is NO PAD) — 6 groups on p75 (RED), MySQL's 4 now.
+  TPC-H 0.5c 342.7 s, 12/12 exact. Not emulated: the full UCA beyond those letters (e.g.
+  ligatures other than æ/œ, Hangul/CJK weights), and text join keys compare bytewise.
 - **Flaky `the_cause_wins_even_when_its_abort_is_slowest`** — 400 spans (16 let the spinning
   pipes drain the queue before the cancel reached them on a loaded host).

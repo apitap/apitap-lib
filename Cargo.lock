@@ -167,6 +167,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "unicode-normalization",
  "uuid",
  "webpki-roots 1.0.8",
 ]

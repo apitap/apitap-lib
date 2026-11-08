@@ -33,6 +33,9 @@ container. apitap.sql() runs the join + aggregate itself:
      with no matching row do not appear as COUNT 0 rows
   11 an OR across both tables, checked per matched row, compares the MySQL
      utf8mb4_0900_ai_ci column case-insensitively, as MySQL does
+  12 GROUP BY a utf8mb4_0900_ai_ci column whose values differ by case and
+     accent makes MySQL's groups ('Brazil' = 'BRAZIL', 'Brésil' = 'bresil',
+     'brazil ' apart: NO PAD), each count equal to the server's grouping
 """
 import os
 import subprocess
@@ -69,6 +72,7 @@ def pg(sql):
 
 def my(sql):
     o = subprocess.run(["docker", "exec", "apitap-bench-my", "mysql", "-uroot", "-pbench", "-N", "-B",
+                        "--default-character-set=utf8mb4",
                         "bench", "-e", sql], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if o.returncode:
         raise RuntimeError(o.stderr)
@@ -217,6 +221,39 @@ def main():
         got = rows(apitap.sql(q11, sources=SRC))
         case("11: a case-insensitive MySQL column compares case-insensitively in an OR across tables",
              coll.endswith("_ci") and got == [tuple(want11)] and want11[0] > 100, f"{coll}: got {got} want {want11}")
+
+        # 12: GROUP BY a MySQL utf8mb4_0900_ai_ci column whose values differ by
+        # case and accent: MySQL makes them one group ('Brazil' = 'BRAZIL',
+        # 'Brésil' = 'bresil'); 0900 is NO PAD, so 'brazil ' stays its own.
+        # MySQL itself says which value belongs to which group.
+        TC = "sql_coll"
+        names = ["Brazil", "BRAZIL", "brazil ", "Brésil", "bresil", "Peru"]
+        my(f"DROP TABLE IF EXISTS {TC}; CREATE TABLE {TC} (o_orderkey bigint PRIMARY KEY, o_country varchar(20)) "
+           f"CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci; SET SESSION cte_max_recursion_depth = 4000; "
+           f"INSERT INTO {TC} WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2500) "
+           f"SELECT n, ELT(1 + n % 6, {', '.join(repr(x) for x in names)}) FROM s")
+        try:
+            group_of = {}
+            # Per row (DISTINCT would fold 'Brazil' and 'BRAZIL' itself).
+            for line in my(f"SELECT CONCAT('[', t.o_country, ']'), CONCAT('[', (SELECT r.v FROM (SELECT o_country v FROM {TC} "
+                           f"GROUP BY o_country) r WHERE r.v = t.o_country), ']') FROM {TC} t").splitlines():
+                v, rep = line.split("\t")
+                group_of[v[1:-1]] = rep[1:-1]
+            country = {int(k): v[1:-1] for k, v in (l.split("\t") for l in
+                       my(f"SELECT o_orderkey, CONCAT('[', o_country, ']') FROM {TC}").splitlines())}
+            want12 = defaultdict(int)
+            for line in pg(f"SELECT l_orderkey FROM {TL} WHERE l_orderkey IS NOT NULL").splitlines():
+                if int(line) in country:
+                    want12[group_of[country[int(line)]]] += 1
+            q12 = (f"SELECT o_country, COUNT(*) AS n FROM pg.{TL} l JOIN my.{TC} o ON l.l_orderkey = o.o_orderkey "
+                   f"GROUP BY 1 ORDER BY 1")
+            got12 = rows(apitap.sql(q12, sources=SRC))
+            got_by_group = {group_of.get(v, f"?{v}"): n for v, n in got12}
+            case("12: GROUP BY a case/accent-insensitive MySQL column groups as MySQL does",
+                 len(want12) == 4 and got_by_group == dict(want12) and len(got12) == 4,
+                 f"got {got12} want {dict(want12)}")
+        finally:
+            my(f"DROP TABLE IF EXISTS {TC}")
 
         # 9: with the opt-in pushdown (APITAP_SQL_PUSH_ARGS=1) the probe's
         # argument is computed by Postgres as one scaled int8; a cube of

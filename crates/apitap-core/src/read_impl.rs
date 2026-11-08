@@ -116,6 +116,7 @@ async fn schema_with<S: Source>(
                 rewritten: read_as_text(kind, &pc.udt),
                 padded: padded_text(kind, &pc.udt, pc.native_ddl.as_deref()),
                 ci: ci_text(kind, pc.native_ddl.as_deref()),
+                ai: ai_text(kind, pc.native_ddl.as_deref()),
             }
         })
         .collect())
@@ -138,6 +139,11 @@ fn padded_text(kind: Option<ArrowKind>, udt: &str, native: Option<&str>) -> bool
     }
     matches!(udt.to_ascii_lowercase().as_str(), "bpchar" | "char")
         || collation_of(native).is_some_and(|c| !c.contains("0900") && !c.contains("nopad") && c != "binary")
+}
+
+/// Text under an accent-insensitive collation ([`ArrowField::ai`]).
+fn ai_text(kind: Option<ArrowKind>, native: Option<&str>) -> bool {
+    ci_text(kind, native) && collation_of(native).is_some_and(|c| !c.contains("_as_"))
 }
 
 /// Text under a case-insensitive collation ([`ArrowField::ci`]).
@@ -488,6 +494,7 @@ async fn plan_read<S: Source>(
             rewritten,
             padded: padded_text(Some(kind), &pc.udt, pc.native_ddl.as_deref()),
             ci: ci_text(Some(kind), pc.native_ddl.as_deref()),
+            ai: ai_text(Some(kind), pc.native_ddl.as_deref()),
         });
     }
 
@@ -703,6 +710,8 @@ mod tests {
         let ddl = |c: &str| Some(format!("varchar(10) CHARACTER SET utf8mb4 COLLATE {c}"));
         assert!(!super::padded_text(u, "varchar", ddl("utf8mb4_0900_ai_ci").as_deref()), "0900 is NO PAD");
         assert!(super::ci_text(u, ddl("utf8mb4_0900_ai_ci").as_deref()));
+        assert!(super::ai_text(u, ddl("utf8mb4_0900_ai_ci").as_deref()) && super::ai_text(u, ddl("utf8mb4_general_ci").as_deref()));
+        assert!(super::ci_text(u, ddl("utf8mb4_0900_as_ci").as_deref()) && !super::ai_text(u, ddl("utf8mb4_0900_as_ci").as_deref()));
         assert!(super::padded_text(u, "varchar", ddl("utf8mb4_general_ci").as_deref()), "general_ci is PAD SPACE");
         assert!(!super::ci_text(u, ddl("utf8mb4_bin").as_deref()), "_bin is case-sensitive");
         assert!(!super::padded_text(u, "varchar", ddl("utf8mb4_unicode_520_nopad_ci").as_deref()));

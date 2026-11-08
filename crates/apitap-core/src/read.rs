@@ -77,6 +77,8 @@ pub struct ArrowField {
     /// Text under a case-insensitive collation (MySQL `_ci`): its compares
     /// fold case, as the server's do.
     pub ci: bool,
+    /// And accent-insensitive (every MySQL `_ci` but `_as_ci`): `'é' = 'e'`.
+    pub ai: bool,
 }
 
 /// The running read: a schema and a pull side. `next_batch` blocks the
