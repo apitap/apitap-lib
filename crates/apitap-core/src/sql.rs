@@ -87,8 +87,9 @@ struct Side {
     /// key (`VExpr::CaseB`).
     flags: Vec<PExpr>,
     /// Columns computed here, never asked of the server: (schema index of
-    /// the virtual column, schema index of the column it is the year of).
-    virt: Vec<(usize, usize)>,
+    /// the virtual column, schema index of the column it is computed from,
+    /// how).
+    virt: Vec<(usize, usize, Virt)>,
     /// A star plan's fact table: dimensions' columns its aggregates read
     /// (TPC-H Q9's `ps_supplycost`), filled per probe row from their
     /// payloads — (schema index here, dimension's side, its column).
@@ -113,6 +114,15 @@ impl Side {
             }
         }
     }
+}
+
+/// How a virtual column is computed from its base column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Virt {
+    /// `EXTRACT(YEAR FROM col)`.
+    Year,
+    /// `SUBSTRING(col FROM from FOR len)`: characters, 1-based.
+    Substr(i64, Option<i64>),
 }
 
 /// A typed scalar expression over one side's read columns.
@@ -757,6 +767,10 @@ fn like_bytes(t: &[u8], p: &[u8]) -> bool {
 #[derive(Clone, Debug)]
 enum Lit {
     Num(f64),
+    /// A number written with a fraction (`1772627.2087`): mantissa and
+    /// scale, so a decimal column compares with it exactly (TPC-H Q15's
+    /// `total_revenue = MAX(total_revenue)`).
+    Dec(i128, i8),
     Str(String),
     /// A string compared under the column's collation
     /// ([`ArrowField::padded`], [`ArrowField::ci`]).
@@ -862,9 +876,17 @@ fn cv<'a>(c: &'a FinishedCol, r: usize, ty: Option<Ty>) -> Cv<'a> {
 fn peval(e: &PExpr, b: &ArrowBatch, r: usize, tys: &[Option<Ty>]) -> Option<bool> {
     use std::cmp::Ordering as O;
     let cmp = |i: usize, l: &Lit| -> Option<O> {
+        if let (Lit::Dec(m, ls), FinishedCol::Dec128 { validity, data }, Some(Ty::Dec(cs))) = (l, &b.cols[i], tys[i]) {
+            if !valid(validity, r) {
+                return None;
+            }
+            return dec_cmp(data[r], cs, *m, *ls);
+        }
         match (cv(&b.cols[i], r, tys[i]), l) {
             (Cv::Null, _) => None,
             (Cv::Num(x), Lit::Num(y)) => x.partial_cmp(y),
+            (Cv::Num(x), Lit::Dec(m, ls)) => x.partial_cmp(&(*m as f64 / pow10f(*ls))),
+            (Cv::Text(t), Lit::Dec(m, ls)) => std::str::from_utf8(t).ok()?.trim().parse::<f64>().ok()?.partial_cmp(&(*m as f64 / pow10f(*ls))),
             // Trailing spaces count for VARCHAR and TEXT, not for CHAR(n)
             // (PG's bpchar): TPC-H's l_shipmode arrives padded.
             (Cv::Text(t), Lit::Str(y)) => Some(t.cmp(y.as_bytes())),
@@ -924,22 +946,49 @@ fn peval(e: &PExpr, b: &ArrowBatch, r: usize, tys: &[Option<Ty>]) -> Option<bool
     }
 }
 
+/// `a / 10^sa` against `b / 10^sb`, exactly (`None` past i128).
+fn dec_cmp(a: i128, sa: i8, b: i128, sb: i8) -> Option<std::cmp::Ordering> {
+    let up = |v: i128, by: i8| -> Option<i128> { (0..by).try_fold(v, |x, _| x.checked_mul(10)) };
+    let s = sa.max(sb);
+    Some(up(a, s - sa)?.cmp(&up(b, s - sb)?))
+}
+
+impl Lit {
+    /// The literal as a float, when it is a number.
+    fn num(&self) -> Option<f64> {
+        match self {
+            Lit::Num(f) => Some(*f),
+            Lit::Dec(m, s) => Some(*m as f64 / pow10f(*s)),
+            _ => None,
+        }
+    }
+}
+
+/// A numeric literal's digits as (mantissa, scale), when it has a fraction
+/// and fits.
+fn dec_lit(n: &str) -> Option<Lit> {
+    let (i, f) = n.split_once('.')?;
+    if f.is_empty() || f.len() > 30 || !i.bytes().chain(f.bytes()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let m: i128 = format!("{i}{f}").parse().ok()?;
+    Some(Lit::Dec(m, i8::try_from(f.len()).ok()?))
+}
+
 fn lit(e: &Expr) -> Option<Lit> {
     match e {
         // Arithmetic of numbers, folded (TPC-H Q19's `1 + 10`).
         Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide) => {
-            match (lit(left)?, lit(right)?) {
-                (Lit::Num(a), Lit::Num(b)) => Some(Lit::Num(match op {
-                    BinaryOperator::Plus => a + b,
-                    BinaryOperator::Minus => a - b,
-                    BinaryOperator::Multiply => a * b,
-                    _ => a / b,
-                })),
-                _ => None,
-            }
+            let (a, b) = (lit(left)?.num()?, lit(right)?.num()?);
+            Some(Lit::Num(match op {
+                BinaryOperator::Plus => a + b,
+                BinaryOperator::Minus => a - b,
+                BinaryOperator::Multiply => a * b,
+                _ => a / b,
+            }))
         }
         Expr::Value(v) => match &v.value {
-            Value::Number(n, _) => n.parse::<f64>().ok().map(Lit::Num),
+            Value::Number(n, _) => dec_lit(n).or_else(|| n.parse::<f64>().ok().map(Lit::Num)),
             Value::SingleQuotedString(t) => Some(Lit::Str(t.clone())),
             Value::Boolean(x) => Some(Lit::Bool(*x)),
             _ => None,
@@ -950,6 +999,7 @@ fn lit(e: &Expr) -> Option<Lit> {
         },
         Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match lit(expr)? {
             Lit::Num(f) => Some(Lit::Num(-f)),
+            Lit::Dec(m, s) => Some(Lit::Dec(-m, s)),
             _ => None,
         },
         Expr::Nested(x) => lit(x),
@@ -1188,6 +1238,55 @@ fn encode_group(c: &FinishedCol, r: usize, kb: &mut Vec<u8>) {
     }
 }
 
+/// Group keys end to end in one buffer: a key costs its bytes and a 4-byte
+/// offset, not a box of its own (a pointer, a length and the allocator's
+/// rounding and header: ~30 bytes more per group at 2M+ groups).
+#[derive(Default)]
+struct KeyArena {
+    data: Vec<u8>,
+    /// End of each key in `data`.
+    ends: Vec<u32>,
+}
+
+impl KeyArena {
+    #[inline]
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    fn push(&mut self, k: &[u8]) -> Result<()> {
+        self.data.extend_from_slice(k);
+        self.ends.push(u32::try_from(self.data.len()).map_err(|_| bad("group keys past 4 GiB"))?);
+        Ok(())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        (0..self.len()).map(move |i| &self[i])
+    }
+}
+
+impl std::ops::Index<usize> for KeyArena {
+    type Output = [u8];
+    #[inline]
+    fn index(&self, i: usize) -> &[u8] {
+        let a = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        &self.data[a..self.ends[i] as usize]
+    }
+}
+
+impl<'a> IntoIterator for &'a KeyArena {
+    type Item = &'a [u8];
+    type IntoIter = Box<dyn Iterator<Item = &'a [u8]> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
 /// Group ids by encoded group key, and each group's first row's key bytes.
 /// The index holds group ids, not keys: each key is held once, in `keys`
 /// (a map from key to id held it twice, and TPC-H Q3's 1.5M groups took
@@ -1196,7 +1295,7 @@ fn encode_group(c: &FinishedCol, r: usize, kb: &mut Vec<u8>) {
 struct Groups {
     ids: hashbrown::HashTable<u32>,
     hasher: foldhash::fast::RandomState,
-    keys: Vec<Box<[u8]>>,
+    keys: KeyArena,
     /// What the keys hold, priced: each key's bytes, its box (pointer and
     /// allocator rounding), its list slot and index entry with their slack.
     bytes: u64,
@@ -1213,20 +1312,20 @@ impl Groups {
         use std::hash::BuildHasher as _;
         let Groups { ids, hasher, keys, bytes } = self;
         if keys.len() <= GROUPS_LINEAR {
-            if let Some(i) = keys.iter().position(|k| **k == *kb) {
+            if let Some(i) = keys.iter().position(|k| k == kb) {
                 return Ok(i as u32);
             }
         }
         let h = hasher.hash_one(kb);
         if keys.len() > GROUPS_LINEAR {
-            if let Some(&g) = ids.find(h, |&g| *keys[g as usize] == *kb) {
+            if let Some(&g) = ids.find(h, |&g| keys[g as usize] == *kb) {
                 return Ok(g);
             }
         }
         let g = u32::try_from(keys.len()).map_err(|_| bad("more than 4 billion groups"))?;
-        *bytes += kb.len() as u64 + 64;
-        keys.push(kb.into());
-        ids.insert_unique(h, g, |&x| hasher.hash_one(&*keys[x as usize]));
+        *bytes += kb.len() as u64 + 24;
+        keys.push(kb)?;
+        ids.insert_unique(h, g, |&x| hasher.hash_one(&keys[x as usize]));
         Ok(g)
     }
 }
@@ -1702,6 +1801,8 @@ struct Plan {
     /// Each GROUP BY column's collation: groups equal under it are one
     /// (`collate`), and ORDER BY compares by it.
     gcoll: Vec<Coll>,
+    /// HAVING: (aggregate, op, number) per conjunct, all must hold.
+    having: Vec<(usize, star::Op, VExpr)>,
 }
 
 /// Conditions over the GROUP BY columns: each read position is a GROUP BY
@@ -1823,7 +1924,9 @@ fn conjuncts(e: &Expr, out: &mut Vec<Expr>) {
             conjuncts(left, out);
             conjuncts(right, out);
         }
-        Expr::Nested(x) if matches!(**x, Expr::BinaryOp { op: BinaryOperator::And, .. }) => conjuncts(x, out),
+        // Any parenthesised conjunct: `(NOT EXISTS (…))` from a rewrite's
+        // `and_of` must still be seen as the EXISTS it is.
+        Expr::Nested(x) => conjuncts(x, out),
         _ => out.push(e.clone()),
     }
 }
@@ -2099,7 +2202,9 @@ fn aggregate(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<O
 }
 
 mod live;
+pub(crate) mod mem;
 mod semi;
+mod stage;
 mod star;
 mod view;
 pub use live::run_live;
@@ -2136,8 +2241,8 @@ fn plan_with(
         }
         None => sel,
     };
-    if sel.distinct.is_some() || sel.having.is_some() || sel.top.is_some() || sel.prewhere.is_some() {
-        return Err(unsupported("DISTINCT, HAVING, TOP or PREWHERE"));
+    if sel.distinct.is_some() || sel.top.is_some() || sel.prewhere.is_some() {
+        return Err(unsupported("DISTINCT, TOP or PREWHERE"));
     }
     if sel.from.is_empty() {
         return Err(unsupported("a SELECT without FROM"));
@@ -2167,7 +2272,7 @@ fn plan_with(
             Dialect::Pg
         } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
             Dialect::My
-        } else if ["github://", "github+api://", "gsheets://"].iter().any(|p| url.starts_with(p)) {
+        } else if ["github://", "github+api://", "gsheets://", mem::SCHEME].iter().any(|p| url.starts_with(p)) {
             Dialect::Other
         } else {
             return Err(unsupported(format!(
@@ -2239,15 +2344,36 @@ fn plan_with(
         let implied = implied_filters(&sides, &pool)?;
         pool.extend(implied);
     }
-    // Equalities of two tables' columns join them; the rest filter.
+    // Equalities of two tables' columns join them; other comparisons of two
+    // tables' columns are checks of the joined row; the rest filter.
     let mut eqs: Vec<(star::Col, star::Col)> = Vec::new();
+    let mut cmps: Vec<(star::Col, star::Col, star::Op)> = Vec::new();
     let mut filters = Vec::new();
     for c in pool {
+        if let Expr::BinaryOp { left, op, right } = &c {
+            if let Some(o) = star::Op::of(op).filter(|o| *o != star::Op::Eq) {
+                if let (Some(a), Some(b)) = (column_of(&sides, left)?, column_of(&sides, right)?) {
+                    if a.0 != b.0 {
+                        cmps.push((a, b, o));
+                        continue;
+                    }
+                }
+            }
+        }
         if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = &c {
             if let (Some(a), Some(b)) = (column_of(&sides, left)?, column_of(&sides, right)?) {
                 if a.0 != b.0 {
+                    let keyable = |s: usize, k: usize| matches!(sides[s].schema[k].kind, ArrowKind::Int16 | ArrowKind::Int32 | ArrowKind::Int64 | ArrowKind::Utf8);
+                    // A DECIMAL equality (TPC-H Q2's `ps_supplycost =` the
+                    // staged MIN) is not a key to join by: it is checked on
+                    // the row the integer keys joined, as `<` would be.
+                    let dec = |s: usize, k: usize| matches!(sides[s].schema[k].kind, ArrowKind::Decimal { .. });
+                    if dec(a.0, a.1) && dec(b.0, b.1) {
+                        cmps.push((a, b, star::Op::Eq));
+                        continue;
+                    }
                     for (s, k) in [a, b] {
-                        if !matches!(sides[s].schema[k].kind, ArrowKind::Int16 | ArrowKind::Int32 | ArrowKind::Int64 | ArrowKind::Utf8) {
+                        if !keyable(s, k) {
                             return Err(unsupported(format!(
                                 "a join key that is not an integer ({}.{} is {:?})",
                                 sides[s].name, sides[s].schema[k].name, sides[s].schema[k].kind
@@ -2296,8 +2422,10 @@ fn plan_with(
         1 if !eqs.is_empty() => return Err(bad("an equality of two columns of one table")),
         1 => {}
         2 if eqs.is_empty() => return Err(unsupported("two tables with no join condition (a.k = b.k)")),
-        2 if eqs.len() > 1 => return Err(unsupported("two tables joined on more than one equality")),
-        2 if !two_sided => {}
+        // Two tables joined on one equality, nothing else of both compared:
+        // the two-table plan. Otherwise the star plan, which checks the
+        // other equalities and comparisons on the joined row.
+        2 if !two_sided && eqs.len() == 1 && cmps.is_empty() => {}
         _ => {
             // The fact table: the one the aggregates name.
             let mut agg_tables = Vec::new();
@@ -2312,9 +2440,15 @@ fn plan_with(
                 o.dedup();
                 o.len()
             };
+            let mut est = Vec::with_capacity(n);
+            for sd in &sides {
+                est.push(rows(&sd.url, &sd.table)?);
+            }
             let p = match agg_tables.as_slice() {
                 [p] => *p,
-                [] => 0,
+                // Only COUNT(*) (or nothing, a staged plan's hidden count):
+                // the largest table streams, by the row estimates.
+                [] => (0..n).max_by(|&a, &b| est[a].unwrap_or(-1.0).partial_cmp(&est[b].unwrap_or(-1.0)).unwrap_or(std::cmp::Ordering::Equal).then(b.cmp(&a))).unwrap_or(0),
                 many => *many.iter().max_by_key(|&&t| (degree(t), std::cmp::Reverse(t))).expect("several"),
             };
             // The GROUP BY tables (P's join key stands for its partner's).
@@ -2336,10 +2470,6 @@ fn plan_with(
             // range by key range; what is held whole should be small): TPC-H
             // Q9 builds orders, not supplier, though supplier's part holds
             // more tables.
-            let mut est = Vec::with_capacity(n);
-            for sd in &sides {
-                est.push(rows(&sd.url, &sd.table)?);
-            }
             let mut found: Option<star::Tree> = None;
             let mut any: Option<star::Tree> = None;
             let size = |t: &star::Tree| (est[t.b].unwrap_or(-1.0), t.build.iter().filter(|&&x| x).count());
@@ -2379,6 +2509,7 @@ fn plan_with(
                 parent,
                 build,
                 checks: t.checks.into_iter().map(|(a, b)| (rm(a), rm(b))).collect(),
+                cmps: cmps.iter().map(|&(a, b, o)| (rm(a), rm(b), o)).collect(),
                 parent2,
                 filters: t.filters.iter().map(|&(d, c, e)| (at(d), c, at(e))).collect(),
             });
@@ -2424,7 +2555,62 @@ fn plan_with(
                 // The correlation (EXISTS): inner.k = outer.k; the rest is
                 // the inner table's own WHERE.
                 let mut corr: Option<((usize, usize), usize)> = None;
+                let mut ne: Option<((usize, usize), usize, star::Op)> = None;
                 for x in ic {
+                    // inner.c <> outer.c (or < > <= >=): decided per key by
+                    // the inner rows' least and greatest c (`Semi::cmp`).
+                    if let Expr::BinaryOp { left, op, right } = &x {
+                        if let Some(o) = star::Op::of(op).filter(|o| *o != star::Op::Eq) {
+                            let (li, ri) = (column_of(&inner, left).ok().flatten(), column_of(&inner, right).ok().flatten());
+                            let (lo, ro) = (column_of(&sides, left).ok().flatten(), column_of(&sides, right).ok().flatten());
+                            let hit = match (li, ri, lo, ro) {
+                                (Some(i), None, _, Some(oc)) => Some((oc, i.1, o)),
+                                (None, Some(i), Some(oc), _) => Some((oc, i.1, o.flip())),
+                                _ => None,
+                            };
+                            if let Some(h) = hit {
+                                if ne.replace(h).is_some() {
+                                    return Err(no("more than one comparison with the outer table"));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // A subquery of the subquery's own table: its keys narrow
+                    // the subquery's rows (a staged plan's narrowing).
+                    if let Expr::InSubquery { expr: ie, subquery: nq, negated: nneg } = &x {
+                        let SetExpr::Select(ns) = nq.body.as_ref() else { return Err(no("a nested subquery that is not a plain SELECT")) };
+                        let [nf] = ns.from.as_slice() else { return Err(no("a nested subquery not over one table")) };
+                        if !nf.joins.is_empty() || ns.having.is_some() || !matches!(&ns.group_by, GroupByExpr::Expressions(es, _) if es.is_empty()) {
+                            return Err(no("a nested subquery with a join, GROUP BY or HAVING"));
+                        }
+                        let mut nsd = Vec::new();
+                        add(&nf.relation, &mut nsd)?;
+                        if let Some(w) = &ns.selection {
+                            let mut nc = Vec::new();
+                            conjuncts(w, &mut nc);
+                            for y in nc {
+                                if nsd[0].dialect == Dialect::Other {
+                                    let pe = pexpr(&mut nsd, 0, &y)?;
+                                    nsd[0].local.push(pe);
+                                } else {
+                                    let r = render_for(&nsd, 0, &y)?;
+                                    nsd[0].conj.push(r);
+                                    nsd[0].conj_src.push(y);
+                                }
+                            }
+                        }
+                        let [SelectItem::UnnamedExpr(pe) | SelectItem::ExprWithAlias { expr: pe, .. }] = ns.projection.as_slice() else {
+                            return Err(no("a nested subquery not selecting one column"));
+                        };
+                        let nk = column_of(&nsd, pe)?.ok_or_else(|| no("a nested subquery selecting an expression"))?.1;
+                        let oc = column_of(&inner, ie)?.ok_or_else(|| no("a nested IN of an expression"))?.1;
+                        let key = nsd[0].want(nk);
+                        let col = inner[0].want(oc);
+                        let side = nsd.remove(0);
+                        inner[0].semis.push(semi::Semi { col, anti: *nneg, not_in: *nneg, sub: semi::Sub { side, key, having: None }, set: Default::default(), cmp: None });
+                        continue;
+                    }
                     if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = &x {
                         // A name the inner table lacks is the outer's.
                         let (li, ri) = (column_of(&inner, left).ok().flatten(), column_of(&inner, right).ok().flatten());
@@ -2441,9 +2627,14 @@ fn plan_with(
                             continue;
                         }
                     }
-                    let r = render_for(&inner, 0, &x)?;
-                    inner[0].conj.push(r);
-                    inner[0].conj_src.push(x.clone());
+                    if inner[0].dialect == Dialect::Other {
+                        let pe = pexpr(&mut inner, 0, &x)?;
+                        inner[0].local.push(pe);
+                    } else {
+                        let r = render_for(&inner, 0, &x)?;
+                        inner[0].conj.push(r);
+                        inner[0].conj_src.push(x.clone());
+                    }
                 }
                 let (outer, ikey) = match (outer_e, corr) {
                     (None, Some((o, i))) => (o, i),
@@ -2485,6 +2676,20 @@ fn plan_with(
                     }
                     _ => return Err(no("a GROUP BY other than its key, or a HAVING other than aggregate-compares-number")),
                 };
+                let cmp = match ne {
+                    None => None,
+                    Some((oc, ic, op)) => {
+                        if oc.0 != outer.0 || having.is_some() {
+                            return Err(no("a comparison with a table other than the correlated one, or beside a HAVING"));
+                        }
+                        for (sd, k) in [(&sides[oc.0], oc.1), (&inner[0], ic)] {
+                            if !matches!(sd.schema[k].kind, ArrowKind::Int16 | ArrowKind::Int32 | ArrowKind::Int64) {
+                                return Err(no(&format!("{}.{} compared with the outer table is not an integer", sd.name, sd.schema[k].name)));
+                            }
+                        }
+                        Some((sides[oc.0].want(oc.1), inner[0].want(ic), op))
+                    }
+                };
                 let key = inner[0].want(ikey);
                 let col = sides[outer.0].want(outer.1);
                 let side = inner.remove(0);
@@ -2494,6 +2699,7 @@ fn plan_with(
                     not_in: neg && outer_e.is_some(),
                     sub: semi::Sub { side, key, having },
                     set: Default::default(),
+                    cmp,
                 });
                 continue;
             }
@@ -2574,6 +2780,39 @@ fn plan_with(
     }
     if aggs.is_empty() {
         return Err(unsupported("a query without aggregates (v1 runs join + aggregate)"));
+    }
+    // HAVING: a conjunction of `aggregate op number`, filtered on the final
+    // groups (`order_rows`) — a staged plan's grouping keeps only the groups
+    // that pass (TPC-H Q11 sf10: 2M groups, a few thousand kept).
+    let mut having = Vec::new();
+    if let Some(h) = &sel.having {
+        let mut hc = Vec::new();
+        conjuncts(h, &mut hc);
+        for c in hc {
+            let no = || unsupported(format!("the HAVING condition {c} (v1 takes aggregate op number)"));
+            let Expr::BinaryOp { left, op, right } = &c else { return Err(no()) };
+            let o = star::Op::of(op).ok_or_else(no)?;
+            let (ae, le, o) = match (number_lit(left), number_lit(right)) {
+                (None, Some(v)) => (left, v, o),
+                (Some(v), None) => (right, v, o.flip()),
+                _ => return Err(no()),
+            };
+            // The SELECT's own aggregate when it is the same (Q11's
+            // `value`): one accumulator a group, not two.
+            let same = items.iter().zip(&out).find_map(|((e, _), (_, oc))| match oc {
+                OutCol::Agg(i) if e.to_string() == ae.to_string() => Some(*i),
+                _ => None,
+            });
+            let i = match same {
+                Some(i) => i,
+                None => {
+                    let a = aggregate(&mut sides, ae, &mut agg_side)?.ok_or_else(no)?;
+                    aggs.push(a);
+                    aggs.len() - 1
+                }
+            };
+            having.push((i, o, le));
+        }
     }
     // Each GROUP BY column's collation (before a star layout reorders sides).
     let gcoll: Vec<Coll> = group_cols.iter().map(|&(s, c)| Coll::of(&sides[s].schema[c])).collect();
@@ -2773,7 +3012,7 @@ fn plan_with(
         let bcol = sides[bs].read[bk];
         group_cols.iter().any(|&(s, c)| s == bs && c == bcol)
     });
-    Ok(Plan { sides, keys, group_side, groups, agg_side, aggs, out, order, limit, star, key_groups, residual, orx, gcoll })
+    Ok(Plan { sides, keys, group_side, groups, agg_side, aggs, out, order, limit, star, key_groups, residual, orx, gcoll, having })
 }
 
 /// `FROM (SELECT exprs AS a, … FROM … WHERE …) AS t` with no GROUP BY,
@@ -2851,6 +3090,50 @@ fn flatten(sel: &sqlparser::ast::Select) -> Result<Option<sqlparser::ast::Select
 fn years_to_virtual(sides: &mut [Side], e: &mut Expr) -> Result<()> {
     let mut err = None;
     let _ = sqlparser::ast::visit_expressions_mut(e, |x| {
+        // SUBSTRING(col FROM a FOR b), a and b integer literals: a virtual
+        // text column of col's table (TPC-H Q22's country code).
+        if let Expr::Substring { expr, substring_from, substring_for, .. } = x {
+            let int = |e: &Option<Box<Expr>>| -> std::result::Result<Option<i64>, ()> {
+                match e.as_deref() {
+                    None => Ok(None),
+                    Some(e) => match lit(e) {
+                        Some(Lit::Num(v)) if v.fract() == 0.0 && v.abs() < 1e9 => Ok(Some(v as i64)),
+                        _ => Err(()),
+                    },
+                }
+            };
+            let (Ok(from), Ok(len)) = (int(substring_from), int(substring_for)) else {
+                err = Some(unsupported("SUBSTRING with a start or length that is not an integer literal"));
+                return std::ops::ControlFlow::Break(());
+            };
+            let c = match column_of(sides, expr) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    err = Some(unsupported("SUBSTRING of an expression (a column only)"));
+                    return std::ops::ControlFlow::Break(());
+                }
+                Err(e) => {
+                    err = Some(e);
+                    return std::ops::ControlFlow::Break(());
+                }
+            };
+            let side = &mut sides[c.0];
+            let base = side.schema[c.1].clone();
+            if base.kind != ArrowKind::Utf8 {
+                err = Some(unsupported(format!("SUBSTRING of the {:?} column {}", base.kind, base.name)));
+                return std::ops::ControlFlow::Break(());
+            }
+            let from = from.unwrap_or(1);
+            let name = format!("__substr_{}_{}_{}", base.name, from, len.map_or("end".to_string(), |l| l.to_string()));
+            if !side.schema.iter().any(|f| f.name == name) {
+                side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Utf8, nullable: true, rewritten: false, padded: base.padded, ci: base.ci, ai: base.ai });
+                let vi = side.schema.len() - 1;
+                side.virt.push((vi, c.1, Virt::Substr(from, len)));
+                side.want(c.1);
+            }
+            *x = Expr::CompoundIdentifier(vec![Ident::new(side.name.clone()), Ident::new(name)]);
+            return std::ops::ControlFlow::Continue(());
+        }
         if let Expr::Extract { field, expr, .. } = x {
             if !matches!(field, sqlparser::ast::DateTimeField::Year) {
                 err = Some(unsupported(format!("EXTRACT({field}) (YEAR only)")));
@@ -2876,7 +3159,7 @@ fn years_to_virtual(sides: &mut [Side], e: &mut Expr) -> Result<()> {
             if !side.schema.iter().any(|f| f.name == name) {
                 side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int32, nullable: true, rewritten: false, padded: false, ci: false, ai: false });
                 let vi = side.schema.len() - 1;
-                side.virt.push((vi, c.1));
+                side.virt.push((vi, c.1, Virt::Year));
                 side.want(c.1);
             }
             *x = Expr::CompoundIdentifier(vec![Ident::new(side.name.clone()), Ident::new(name)]);
@@ -3520,6 +3803,8 @@ enum Slot {
     Year(usize, bool),
     /// A dimension's value the probe fills (NULL here).
     Lookup,
+    /// `SUBSTRING` of the source batch's text column `i`.
+    Substr(usize, i64, Option<i64>),
 }
 
 /// Year of a day count from 1970-01-01 (Hinnant's civil_from_days).
@@ -3552,12 +3837,51 @@ fn year_col(c: &FinishedCol, ts: bool) -> FinishedCol {
     }
 }
 
+/// SQL `SUBSTRING(t FROM from FOR len)` of each value: characters, 1-based;
+/// a start before 1 eats into the length, as the standard has it.
+fn substr_col(c: &FinishedCol, from: i64, len: Option<i64>) -> FinishedCol {
+    let FinishedCol::Utf8 { validity, offsets, data } = c else {
+        let n = match c {
+            FinishedCol::I32 { data, .. } => data.len(),
+            FinishedCol::I64 { data, .. } => data.len(),
+            _ => 0,
+        };
+        return FinishedCol::Utf8 { validity: Some(vec![0; n.div_ceil(8)]), offsets: vec![0; n + 1], data: Vec::new() };
+    };
+    let mut out = Vec::with_capacity(data.len() / 2);
+    let mut offs = Vec::with_capacity(offsets.len());
+    offs.push(0i32);
+    let (skip, take) = substr_bounds(from, len);
+    for w in offsets.windows(2) {
+        let t = std::str::from_utf8(&data[w[0] as usize..w[1] as usize]).unwrap_or("");
+        let mut it = t.char_indices().skip(skip);
+        if let Some((a, _)) = it.next() {
+            let b = match take {
+                Some(0) => a,
+                Some(n) => t[a..].char_indices().nth(n).map_or(t.len(), |(i, _)| a + i),
+                None => t.len(),
+            };
+            out.extend_from_slice(&t.as_bytes()[a..b]);
+        }
+        offs.push(out.len() as i32);
+    }
+    FinishedCol::Utf8 { validity: validity.clone(), offsets: offs, data: out }
+}
+
+/// Characters skipped and taken (`None`: to the end) by `SUBSTRING(… FROM
+/// from FOR len)`.
+fn substr_bounds(from: i64, len: Option<i64>) -> (usize, Option<usize>) {
+    let skip = usize::try_from(from - 1).unwrap_or(0);
+    let take = len.map(|l| usize::try_from(l + from.min(1) - 1).unwrap_or(0));
+    (skip, take)
+}
+
 impl Rows {
     fn of(h: ReadHandle, side: &Side) -> Rows {
         if side.virt.is_empty() && side.lookups.is_empty() {
             return Rows { h, slots: None };
         }
-        let virt_of = |c: usize| side.virt.iter().find(|v| v.0 == c).map(|v| v.1);
+        let virt_of = |c: usize| side.virt.iter().find(|v| v.0 == c).map(|v| (v.1, v.2));
         let lookup = |c: usize| side.lookups.iter().any(|v| v.0 == c);
         let src: Vec<usize> = side.read.iter().copied().filter(|&c| virt_of(c).is_none() && !lookup(c)).collect();
         let slots = side
@@ -3566,9 +3890,12 @@ impl Rows {
             .map(|&c| match virt_of(c) {
                 None if lookup(c) => Slot::Lookup,
                 None => Slot::Src(src.iter().position(|&x| x == c).expect("a source column")),
-                Some(base) => {
-                    let ts = matches!(side.schema[base].kind, ArrowKind::TimestampUtc | ArrowKind::TimestampNaive);
-                    Slot::Year(src.iter().position(|&x| x == base).expect("a virtual column's base is read"), ts)
+                Some((base, how)) => {
+                    let at = src.iter().position(|&x| x == base).expect("a virtual column's base is read");
+                    match how {
+                        Virt::Year => Slot::Year(at, matches!(side.schema[base].kind, ArrowKind::TimestampUtc | ArrowKind::TimestampNaive)),
+                        Virt::Substr(from, len) => Slot::Substr(at, from, len),
+                    }
                 }
             })
             .collect();
@@ -3579,6 +3906,7 @@ impl Rows {
         let Some(sl) = &self.slots else { return b };
         let years: Vec<Option<FinishedCol>> = sl.iter().map(|s| match *s {
             Slot::Year(i, ts) => Some(year_col(&b.cols[i], ts)),
+            Slot::Substr(i, from, len) => Some(substr_col(&b.cols[i], from, len)),
             Slot::Lookup => Some(FinishedCol::I64 { validity: Some(vec![0; b.rows.div_ceil(8)]), data: vec![0; b.rows] }),
             Slot::Src(_) => None,
         }).collect();
@@ -3588,7 +3916,7 @@ impl Rows {
             .zip(years)
             .map(|(s, y)| match *s {
                 Slot::Src(i) => src[i].take().unwrap_or_else(|| FinishedCol::I32 { validity: None, data: Vec::new() }),
-                Slot::Year(..) | Slot::Lookup => y.expect("computed"),
+                Slot::Year(..) | Slot::Lookup | Slot::Substr(..) => y.expect("computed"),
             })
             .collect();
         ArrowBatch { rows: b.rows, cols }
@@ -3896,6 +4224,208 @@ fn rewrite_args(p: &mut Plan) -> bool {
 
 /// Run `query` against `sources` (name → URL).
 pub async fn run(query: &str, sources: &HashMap<String, String>) -> Result<SqlResult> {
+    stage::run(query, sources).await
+}
+
+/// One SELECT the engine answers in one pass (`stage` splits the others).
+pub(crate) async fn run_one(query: &str, sources: &HashMap<String, String>) -> Result<SqlResult> {
+    match run_engine(query, sources).await {
+        Err(e) if e.to_string().contains(GROUPS_OVER) => {
+            if dbg() {
+                eprintln!("[sql] {e}; the query runs again in partitions of a GROUP BY column");
+            }
+            partitioned(query, sources, e).await
+        }
+        r => r,
+    }
+}
+
+/// Marks the error a GROUP BY raises past [`group_budget`]: `run_one` answers
+/// the query again in parts instead.
+const GROUPS_OVER: &str = "groups past their memory budget";
+
+/// The bytes a GROUP BY's groups may hold (keys, index, accumulators):
+/// `APITAP_SQL_GROUP_BYTES` (a test lever), else an eighth of the memory
+/// limit, else 512 MiB. An eighth: the finalize copies the groups up to
+/// three times (`combine`, `strip`, `collate`), and a key-range pass holds
+/// its own groups beside the kept ones (TPC-H Q13/Q16 sf10 died at a quarter).
+fn group_budget() -> u64 {
+    if let Some(b) = std::env::var("APITAP_SQL_GROUP_BYTES")
+        .ok()
+        .and_then(|v| crate::logbased::run::parse_size(&v))
+        .filter(|b| *b > 0)
+    {
+        return b;
+    }
+    crate::pipeline::mem_limit_bytes().map_or(512 << 20, |m| m / 8)
+}
+
+fn groups_bytes(g: &Groups, accs: usize, hit: usize) -> u64 {
+    g.bytes + g.ids.capacity() as u64 * 5 + (accs * std::mem::size_of::<Acc>()) as u64 + hit as u64
+}
+
+fn groups_check(g: &Groups, accs: usize, hit: usize) -> Result<()> {
+    let b = groups_bytes(g, accs, hit);
+    let budget = group_budget();
+    if b > budget {
+        return Err(bad(format!("{} groups ({b} B): {GROUPS_OVER} ({budget} B)", g.keys.len())));
+    }
+    Ok(())
+}
+
+/// A query whose groups outgrew [`group_budget`], answered in N parts by a
+/// GROUP BY column of integers (`ABS(col % N) = i`, NULLs in part 0): the
+/// parts' groups are disjoint, so their rows are the answer's, ordered and
+/// limited here. N doubles while a part is still too large. Each part reads
+/// its tables again: memory bounded, at the price of N scans.
+async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Error) -> Result<SqlResult> {
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, query).map_err(|e| bad(format!("parse: {e}")))?;
+    let [Statement::Query(q)] = stmts.as_slice() else { return Err(first) };
+    let SetExpr::Select(sel) = q.body.as_ref() else { return Err(first) };
+    let GroupByExpr::Expressions(gby, _) = &sel.group_by else { return Err(first) };
+    let cands: Vec<Expr> = gby.iter().filter(|e| matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))).cloned().collect();
+    let names: Vec<String> = sel
+        .projection
+        .iter()
+        .enumerate()
+        .map(|(i, it)| match it {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+            SelectItem::UnnamedExpr(e) => e.to_string(),
+            _ => format!("_{i}"),
+        })
+        .collect();
+    let exprs: Vec<String> = sel
+        .projection
+        .iter()
+        .map(|it| match it {
+            SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => expr.to_string(),
+            _ => String::new(),
+        })
+        .collect();
+    let mut last = first;
+    'cand: for col in cands {
+        let mut n = 4u32;
+        'size: while n <= 64 {
+            let mut out: Option<SqlResult> = None;
+            for i in 0..n {
+                let mut q2 = (**q).clone();
+                q2.order_by = None;
+                q2.limit = None;
+                let SetExpr::Select(s2) = q2.body.as_mut() else { unreachable!() };
+                let part = if i == 0 { format!("(ABS({col} % {n}) = 0 OR {col} IS NULL)") } else { format!("ABS({col} % {n}) = {i}") };
+                let pe = sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {})
+                    .try_with_sql(&part)
+                    .and_then(|mut x| x.parse_expr())
+                    .map_err(|e| bad(format!("parse: {e}")))?;
+                s2.selection = Some(match s2.selection.take() {
+                    Some(w) => Expr::BinaryOp { left: Box::new(Expr::Nested(Box::new(w))), op: BinaryOperator::And, right: Box::new(pe) },
+                    None => pe,
+                });
+                match run_engine(&q2.to_string(), sources).await {
+                    Ok(r) => {
+                        out = Some(match out.take() {
+                            None => r,
+                            Some(mut a) => {
+                                a.batch = mem::concat(&a.batch, &r.batch)?;
+                                a
+                            }
+                        });
+                    }
+                    Err(e) if e.to_string().contains(GROUPS_OVER) => {
+                        last = e;
+                        n *= 2;
+                        continue 'size;
+                    }
+                    Err(e) => {
+                        last = e;
+                        continue 'cand;
+                    }
+                }
+            }
+            let mut r = out.ok_or_else(|| bad("no parts"))?;
+            if dbg() {
+                eprintln!("[sql] answered in {n} parts by {col}: {} rows", r.batch.rows);
+            }
+            order_limit(&mut r, q, &names, &exprs)?;
+            return Ok(r);
+        }
+    }
+    Err(last)
+}
+
+/// ORDER BY (an output's alias, its expression or its ordinal) and LIMIT
+/// over rows put together from parts. NULLs last ascending, first
+/// descending, as the engine orders them.
+fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], exprs: &[String]) -> Result<()> {
+    use std::cmp::Ordering as O;
+    let mut keys: Vec<(usize, bool)> = Vec::new();
+    if let Some(ob) = &q.order_by {
+        let sqlparser::ast::OrderByKind::Expressions(es) = &ob.kind else { return Err(unsupported("ORDER BY ALL")) };
+        for o in es {
+            let t = o.expr.to_string();
+            let at = match &o.expr {
+                Expr::Value(v) => match &v.value {
+                    Value::Number(n, _) => n.parse::<usize>().ok().and_then(|i| i.checked_sub(1)),
+                    _ => None,
+                },
+                _ => names.iter().position(|n| n.eq_ignore_ascii_case(&t)).or_else(|| exprs.iter().position(|x| *x == t)),
+            }
+            .ok_or_else(|| unsupported(format!("ORDER BY {t} over a query answered in parts")))?;
+            keys.push((at, o.options.asc != Some(false)));
+        }
+    }
+    let rows = r.batch.rows;
+    let mut idx: Vec<usize> = (0..rows).collect();
+    if !keys.is_empty() {
+        let valid = |c: &FinishedCol, i: usize| -> bool {
+            let v = match c {
+                FinishedCol::I16 { validity, .. } | FinishedCol::I32 { validity, .. } | FinishedCol::I64 { validity, .. } | FinishedCol::F32 { validity, .. } | FinishedCol::F64 { validity, .. } | FinishedCol::Dec128 { validity, .. } | FinishedCol::Bool { validity, .. } | FinishedCol::Utf8 { validity, .. } | FinishedCol::Bin { validity, .. } => validity,
+            };
+            v.as_ref().is_none_or(|b| b[i / 8] & (1 << (i % 8)) != 0)
+        };
+        let cmp1 = |c: &FinishedCol, a: usize, b: usize| -> O {
+            match (valid(c, a), valid(c, b)) {
+                (false, false) => return O::Equal,
+                (false, true) => return O::Greater,
+                (true, false) => return O::Less,
+                _ => {}
+            }
+            match c {
+                FinishedCol::I16 { data, .. } => data[a].cmp(&data[b]),
+                FinishedCol::I32 { data, .. } => data[a].cmp(&data[b]),
+                FinishedCol::I64 { data, .. } => data[a].cmp(&data[b]),
+                FinishedCol::F32 { data, .. } => data[a].partial_cmp(&data[b]).unwrap_or(O::Equal),
+                FinishedCol::F64 { data, .. } => data[a].partial_cmp(&data[b]).unwrap_or(O::Equal),
+                FinishedCol::Dec128 { data, .. } => data[a].cmp(&data[b]),
+                FinishedCol::Bool { data, .. } => (data[a / 8] >> (a % 8) & 1).cmp(&(data[b / 8] >> (b % 8) & 1)),
+                FinishedCol::Utf8 { offsets, data, .. } | FinishedCol::Bin { offsets, data, .. } => {
+                    data[offsets[a] as usize..offsets[a + 1] as usize].cmp(&data[offsets[b] as usize..offsets[b + 1] as usize])
+                }
+            }
+        };
+        let cols = &r.batch.cols;
+        idx.sort_by(|&a, &b| {
+            for &(c, asc) in &keys {
+                let o = cmp1(&cols[c], a, b);
+                let o = if asc { o } else { o.reverse() };
+                if o != O::Equal {
+                    return o;
+                }
+            }
+            a.cmp(&b)
+        });
+    }
+    if let Some(l) = &q.limit {
+        let l: usize = l.to_string().parse().map_err(|_| unsupported(format!("LIMIT {l}")))?;
+        idx.truncate(l);
+    }
+    if !keys.is_empty() || idx.len() != rows {
+        r.batch = mem::take_rows(&r.batch, &idx);
+    }
+    Ok(())
+}
+
+async fn run_engine(query: &str, sources: &HashMap<String, String>) -> Result<SqlResult> {
     let t0 = std::time::Instant::now();
     let mut p = plan_probed(query, sources).await?;
     if !pushdown_args(&mut p) {
@@ -3958,6 +4488,9 @@ async fn plan_probed(query: &str, sources: &HashMap<String, String>) -> Result<P
 /// A table's row count as its server's catalog estimates it (`None`: no
 /// SQL server, or no answer — the planner then goes by shape alone).
 async fn row_estimate(url: &str, table: &str) -> Option<f64> {
+    if mem::is_mem(url) {
+        return mem::rows(url, table);
+    }
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         let src = crate::source::postgres::PgSource::connect(url, 1).await.ok()?;
         let r: (f64,) = sqlx::query_as("SELECT GREATEST(reltuples, 0)::float8 FROM pg_class WHERE oid = $1::regclass")
@@ -4472,13 +5005,20 @@ async fn join_pass(
             .map(|k| group_fields(k).last().map_or(0, |f| i64::from_le_bytes(f.1.try_into().unwrap_or([0; 8])) as u64))
             .collect()
     });
+    let pg = p.star.as_ref().is_some_and(|st| !st.pgroup.is_empty());
     for mut b in held_back {
         probed += b.rows as u64;
         matched += fold_probe(p, &ptys, pkey, &mut b, |k| map.look(k), ng, accs, hit, sx, gflags.as_deref(), Some(&mut *cgroups))?;
+        if pg {
+            groups_check(cgroups, accs.len(), hit.len())?;
+        }
     }
     while let Some(mut b) = h.recv().await? {
         probed += b.rows as u64;
         matched += fold_probe(p, &ptys, pkey, &mut b, |k| map.look(k), ng, accs, hit, sx, gflags.as_deref(), Some(&mut *cgroups))?;
+        if pg {
+            groups_check(cgroups, accs.len(), hit.len())?;
+        }
     }
     drop(h);
     crate::trim_heap();
@@ -4746,6 +5286,7 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
         // map is asked (a GROUP BY of a few groups asks it a few times).
         let mut seen: Vec<(Vec<u8>, usize)> = Vec::new();
         while let Some(b) = h.recv().await? {
+            groups_check(&groups, accs.len(), 0)?;
             let cols = arg_cols(&p, &b);
             for r in 0..b.rows {
                 if !local_ok(&p.sides[s], &tys, &b, r) {
@@ -4835,6 +5376,86 @@ fn nth_field(key: &[u8], n: usize) -> Option<(u8, &[u8])> {
     None
 }
 
+/// A numeric literal of a HAVING (`-` allowed, parentheses too).
+fn number_lit(e: &Expr) -> Option<VExpr> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => number(n).ok(),
+            _ => None,
+        },
+        Expr::Nested(x) => number_lit(x),
+        Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Minus, expr } => match number_lit(expr)? {
+            VExpr::Int(i) => Some(VExpr::Int(-i)),
+            VExpr::Dec(v, s) => Some(VExpr::Dec(-v, s)),
+            VExpr::Float(f) => Some(VExpr::Float(-f)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// One HAVING conjunct on a group's accumulator: exact for integer and
+/// decimal aggregates, by floats for the rest; NULL fails.
+fn having_ok(acc: Acc, ag: &Agg, op: star::Op, v: &VExpr) -> bool {
+    use std::cmp::Ordering as O;
+    let (lv, ls) = match v {
+        VExpr::Int(i) => (Some(i128::from(*i)), 0i8),
+        VExpr::Dec(m, s) => (Some(*m), *s),
+        _ => (None, 0),
+    };
+    let fl = match v {
+        VExpr::Int(i) => *i as f64,
+        VExpr::Dec(m, s) => *m as f64 / pow10f(*s),
+        VExpr::Float(f) => *f,
+        _ => return false,
+    };
+    let ord = match acc {
+        Acc::None if matches!(ag.f, AggFn::Count | AggFn::CountStar) => lv.and_then(|l| dec_cmp(0, 0, l, ls)).or_else(|| 0f64.partial_cmp(&fl)),
+        Acc::None => None,
+        Acc::I(x) => lv.and_then(|l| dec_cmp(i128::from(x), 0, l, ls)).or_else(|| (x as f64).partial_cmp(&fl)),
+        Acc::N(n) => lv.and_then(|l| dec_cmp(i128::from(n), 0, l, ls)).or_else(|| (n as f64).partial_cmp(&fl)),
+        Acc::D(x) => {
+            let sc = match ag.ty {
+                Some(Ty::Dec(s)) => s,
+                _ => 0,
+            };
+            lv.and_then(|l| dec_cmp(x, sc, l, ls)).or_else(|| (x as f64 / pow10f(sc)).partial_cmp(&fl))
+        }
+        Acc::F(x) => x.partial_cmp(&fl),
+        Acc::Avg(s, n) => (s / n as f64).partial_cmp(&fl),
+    };
+    let Some(ord) = ord else { return false };
+    match op {
+        star::Op::Eq => ord == O::Equal,
+        star::Op::Ne => ord != O::Equal,
+        star::Op::Lt => ord == O::Less,
+        star::Op::Le => ord != O::Greater,
+        star::Op::Gt => ord == O::Greater,
+        star::Op::Ge => ord != O::Less,
+    }
+}
+
+/// Field `at` of a group key, without listing the others.
+fn group_field(key: &[u8], at: usize) -> (u8, &[u8]) {
+    let mut i = 0;
+    let mut f = 0;
+    while i < key.len() {
+        let tag = key[i];
+        i += 1;
+        let n = if tag == 0 { 0 } else {
+            let n = u32::from_le_bytes(key[i..i + 4].try_into().expect("4 bytes")) as usize;
+            i += 4;
+            n
+        };
+        if f == at {
+            return (tag, &key[i..i + n]);
+        }
+        i += n;
+        f += 1;
+    }
+    (0, &key[0..0])
+}
+
 fn group_fields(key: &[u8]) -> Vec<(u8, &[u8])> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -4887,6 +5508,12 @@ fn retain(p: &Plan, groups: &Groups, accs: &[Acc], hit: &[bool], kept: &mut (Gro
         }
         kept.1[g * na..(g + 1) * na].copy_from_slice(&accs[r * na..(r + 1) * na]);
         kept.2[g] = true;
+        if p.limit.is_none() && g % 65536 == 65535 {
+            groups_check(&kept.0, kept.1.len(), kept.2.len())?;
+        }
+    }
+    if p.limit.is_none() {
+        groups_check(&kept.0, kept.1.len(), kept.2.len())?;
     }
     if let Some(l) = p.limit {
         if kept.0.keys.len() > 2 * l.max(64) {
@@ -4912,7 +5539,6 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
     let ng = groups.keys.len();
     // Row order.
     let mut rows: Vec<usize> = (0..ng).filter(|&g| keep.is_none_or(|k| k.get(g) == Some(&true))).collect();
-    let fields: Vec<Vec<(u8, &[u8])>> = groups.keys.iter().map(|k| group_fields(k)).collect();
     // A GROUP BY column's field in the key (a star plan lays them out by
     // table; `built`: the key as the passes build it, late columns not in).
     let fi = |g: usize| match &p.star {
@@ -4921,7 +5547,10 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
         None => g,
     };
     if let Some(res) = &p.residual {
-        rows.retain(|&r| res.ok(&fields[r], &fi));
+        rows.retain(|&r| res.ok(&group_fields(&groups.keys[r]), &fi));
+    }
+    if !p.having.is_empty() {
+        rows.retain(|&r| p.having.iter().all(|(a, op, v)| having_ok(accs[r * na + a], &p.aggs[*a], *op, v)));
     }
     // A sort value: exact for integers and decimals (scaled i128, one scale
     // per column; f64 dropped digits past 2^53 and tied distinct sums),
@@ -4951,7 +5580,7 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
     let val = |r: usize, c: usize| -> K {
         match &p.out[c].1 {
             OutCol::Group(g) => {
-                let (t, b) = fields[r][fi(*g)];
+                let (t, b) = group_field(&groups.keys[r], fi(*g));
                 match t {
                     1 => K::I(i64::from_le_bytes(b.try_into().unwrap_or([0; 8])) as i128),
                     2 => K::F(f64::from_le_bytes(b.try_into().unwrap_or([0; 8]))),
@@ -5031,29 +5660,59 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
         })
         .collect();
     let rows = order_rows(p, groups, accs, keep, false);
-    let fields: Vec<Vec<(u8, &[u8])>> = groups.keys.iter().map(|k| group_fields(k)).collect();
     // A GROUP BY column's field in the key (a star plan lays them out by table).
     let fi = |g: usize| p.star.as_ref().map_or(g, |st| st.gpos[g]);
     let mut cols = Vec::new();
     let mut schema = Vec::new();
     for (c, (name, oc)) in p.out.iter().enumerate() {
-        let mut o = ColOut { valid: Vec::new(), i64s: Vec::new(), f64s: Vec::new(), d128: Vec::new(), strs: Vec::new() };
+        // Only the vector this column's kind reads is filled: five per row
+        // (an empty Vec among them) cost ~57 bytes a cell, and 2M groups of
+        // a staged GROUP BY died in the 256 MiB cage here (TPC-H Q11 sf10).
+        let k = kinds[c];
+        let (wi, wf, wd, ws) = match k {
+            ArrowKind::Float32 | ArrowKind::Float64 => (false, true, false, false),
+            ArrowKind::Decimal { .. } => (false, false, true, false),
+            ArrowKind::Bool | ArrowKind::Utf8 | ArrowKind::Binary => (false, false, false, true),
+            _ => (true, false, false, false),
+        };
+        let mut o = ColOut {
+            valid: Vec::with_capacity(rows.len()),
+            i64s: Vec::with_capacity(if wi { rows.len() } else { 0 }),
+            f64s: Vec::with_capacity(if wf { rows.len() } else { 0 }),
+            d128: Vec::with_capacity(if wd { rows.len() } else { 0 }),
+            strs: Vec::new(),
+        };
+        let push = |o: &mut ColOut, ok: bool, i: i64, f: f64, d: i128, st: Option<&[u8]>| {
+            o.valid.push(ok);
+            if wi {
+                o.i64s.push(i);
+            }
+            if wf {
+                o.f64s.push(f);
+            }
+            if wd {
+                o.d128.push(d);
+            }
+            if ws {
+                o.strs.push(st.map(<[u8]>::to_vec).unwrap_or_default());
+            }
+        };
         for &r in &rows {
             match oc {
                 OutCol::Group(g) => {
-                    let (t, b) = fields[r][fi(*g)];
-                    o.valid.push(t != 0);
-                    o.i64s.push(if t == 1 { i64::from_le_bytes(b.try_into().unwrap_or([0; 8])) } else { 0 });
-                    o.f64s.push(if t == 2 { f64::from_le_bytes(b.try_into().unwrap_or([0; 8])) } else { 0.0 });
-                    o.d128.push(if t == 3 { i128::from_le_bytes(b.try_into().unwrap_or([0; 16])) } else { 0 });
-                    o.strs.push(if t == 5 || t == 4 { b.to_vec() } else { Vec::new() });
+                    let (t, b) = group_field(&groups.keys[r], fi(*g));
+                    push(
+                        &mut o,
+                        t != 0,
+                        if t == 1 { i64::from_le_bytes(b.try_into().unwrap_or([0; 8])) } else { 0 },
+                        if t == 2 { f64::from_le_bytes(b.try_into().unwrap_or([0; 8])) } else { 0.0 },
+                        if t == 3 { i128::from_le_bytes(b.try_into().unwrap_or([0; 16])) } else { 0 },
+                        (t == 5 || t == 4).then_some(b),
+                    );
                 }
                 OutCol::Expr(x) => {
                     let v = oeval(x, &accs[r * na..(r + 1) * na], &p.aggs);
-                    o.valid.push(v.is_some());
-                    o.i64s.push(0);
-                    o.f64s.push(v.unwrap_or(0.0));
-                    o.d128.push(0);
+                    push(&mut o, v.is_some(), 0, v.unwrap_or(0.0), 0, None);
                 }
                 OutCol::Agg(a) => {
                     let acc = accs[r * na + a];
@@ -5069,14 +5728,10 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
                     };
                     // AVG of a decimal: the sum was folded as f64 of the
                     // scaled value already (`as_f64`).
-                    o.valid.push(ok);
-                    o.i64s.push(i);
-                    o.f64s.push(f);
-                    o.d128.push(d);
+                    push(&mut o, ok, i, f, d, None);
                 }
             }
         }
-        let k = kinds[c];
         let validity = bitmap(&o.valid);
         let col = match k {
             ArrowKind::Int16 => FinishedCol::I16 { validity, data: o.i64s.iter().map(|&x| x as i16).collect() },
@@ -5741,13 +6396,38 @@ mod tests {
     }
 
     /// What v1 cannot run is refused before any read, naming it.
+    /// HAVING `aggregate op number` is planned (a hidden aggregate when the
+    /// SELECT lacks it) and compared exactly on decimals.
+    #[test]
+    fn having_filters_final_groups_exactly() {
+        let p = plan(
+            "SELECT o_orderpriority, COUNT(*) FROM my.orders GROUP BY o_orderpriority HAVING SUM(o_shippriority) >= 2 AND COUNT(*) > 1",
+            &srcs(),
+            &mut schemas(),
+        )
+        .unwrap();
+        assert_eq!(p.having.len(), 2);
+        assert_eq!(p.aggs.len(), 2, "the SUM is hidden; the HAVING COUNT(*) is the SELECT's");
+        assert_eq!(p.having[1].0, 0, "COUNT(*) reuses the SELECT's accumulator");
+        let dec = Agg { f: AggFn::Sum, arg: None, ty: Some(Ty::Dec(2)) };
+        // 1000.01 > 1000.005 by its last digit; f64 alone would say so too,
+        // but 10^20 + 1 vs 10^20 it would not.
+        assert!(having_ok(Acc::D(100001), &dec, star::Op::Gt, &VExpr::Dec(1000005, 3)));
+        assert!(!having_ok(Acc::D(100000), &dec, star::Op::Gt, &VExpr::Dec(1000005, 3)));
+        assert!(having_ok(Acc::D(10i128.pow(22) + 1), &dec, star::Op::Gt, &VExpr::Dec(10i128.pow(20), 0)));
+        assert!(!having_ok(Acc::None, &dec, star::Op::Gt, &VExpr::Int(0)), "NULL fails");
+        let cnt = Agg { f: AggFn::CountStar, arg: None, ty: None };
+        assert!(having_ok(Acc::None, &cnt, star::Op::Eq, &VExpr::Int(0)), "an empty COUNT is 0");
+        assert!(plan("SELECT o_orderpriority, COUNT(*) FROM my.orders GROUP BY o_orderpriority HAVING COUNT(*) > o_shippriority", &srcs(), &mut schemas()).is_err());
+    }
+
     #[test]
     fn unsupported_shapes_are_refused_by_name() {
         for (q, want) in [
             ("SELECT * FROM pg.lineitem", "SELECT *"),
             ("SELECT l_orderkey FROM pg.lineitem", "neither aggregated nor in GROUP BY"),
             ("SELECT COUNT(*) FROM pg.lineitem l LEFT JOIN my.orders o ON l.l_orderkey = o.o_orderkey", "INNER JOIN"),
-            ("SELECT COUNT(*) FROM pg.lineitem l JOIN my.orders o ON l.l_orderkey = o.o_orderkey WHERE l.l_discount > o.o_orderkey", "names more than one table"),
+            ("SELECT COUNT(*) FROM pg.lineitem l JOIN my.orders o ON l.l_orderkey = o.o_orderkey WHERE l.l_discount + 1 > o.o_orderkey", "names more than one table"),
             ("SELECT COUNT(*) FROM xx.lineitem", "not in sources="),
             ("SELECT COUNT(*) FROM pg.lineitem; DROP TABLE x", "exactly one SELECT"),
         ] {

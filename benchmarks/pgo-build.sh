@@ -30,7 +30,7 @@ rm -f benchmarks/wheels/*.whl 2>/dev/null || true
 docker run --rm -v "$REPO":/io -v apitap-bench-cargo:/root/.cargo/registry \
     -e RUSTFLAGS="-Cprofile-generate=/pgodata" \
     ghcr.io/pyo3/maturin build --release -m py-apitap/Cargo.toml -o benchmarks/wheels
-printf 'FROM python:3.12-slim\nCOPY *.whl /tmp/\nRUN pip install --no-cache-dir /tmp/*.whl pyarrow\n' \
+printf 'FROM python:3.12-slim\nCOPY *.whl /tmp/\nRUN pip install --no-cache-dir /tmp/*.whl pyarrow duckdb polars\n' \
     | docker build -q -t apitap-pgo:inst -f- benchmarks/wheels
 
 echo "== 2/3 training (all routes, 1M) =="
@@ -197,6 +197,16 @@ docker run --rm --network=host \
 import apitap
 apitap.transfer('$MY', 'postgresql://postgres:bench@127.0.0.1:5545/apitap_bench_dst', table='pgo_cdc', mode='log_based')"
 docker exec apitap-bench-pg-dst psql -U postgres -d apitap_bench_dst -Atc "DROP TABLE IF EXISTS pgo_cdc; DELETE FROM _apitap_state WHERE dest_table='pgo_cdc';" >/dev/null
+
+# 0.67: apitap.sql() — star joins, semi-joins, staged plans (mem:// stages,
+# decorrelated subqueries, LEFT JOIN, COUNT DISTINCT) and the incremental
+# view's bootstrap + window are hot branches no transfer() runs. All 22 TPC-H
+# queries twice at sf 0.1 across Postgres + MySQL, then one view cycle; the
+# script loads and drops its own tables through DuckDB (no docker inside).
+docker run --rm --network=host \
+    -v "$REPO/pgo-data":/pgodata -e LLVM_PROFILE_FILE=/pgodata/apitap-%m-%p.profraw \
+    -v "$REPO/benchmarks":/bench:ro \
+    apitap-pgo:inst python /bench/pgo_train_sql.py 0.1
 
 echo "== 3/3 merge + optimized build =="
 docker run --rm -v "$REPO":/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c \

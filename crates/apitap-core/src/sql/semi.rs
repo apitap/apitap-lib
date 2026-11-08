@@ -13,6 +13,9 @@ pub(super) struct KeySet {
     bits: Vec<u64>,
     hash: Option<std::collections::HashSet<i64, foldhash::fast::RandomState>>,
     null: bool,
+    /// Per key, the least and greatest value of the compared column (a
+    /// correlation `inner.c <> outer.c`, `Semi::cmp`).
+    mm: Option<HashMap<i64, (i64, i64), foldhash::fast::RandomState>>,
 }
 
 /// Key ranges this wide are a bitmap (64 MiB at the cap).
@@ -23,9 +26,9 @@ impl KeySet {
         match kr {
             Kr::Known(lo, hi) if u64::try_from(hi as i128 - lo as i128 + 1).is_ok_and(|n| n <= BITS_MAX) => {
                 let n = (hi as i128 - lo as i128 + 1) as usize;
-                KeySet { lo, bits: vec![0; n.div_ceil(64)], hash: None, null: false }
+                KeySet { lo, bits: vec![0; n.div_ceil(64)], hash: None, null: false, mm: None }
             }
-            _ => KeySet { lo: 0, bits: Vec::new(), hash: Some(Default::default()), null: false },
+            _ => KeySet { lo: 0, bits: Vec::new(), hash: Some(Default::default()), null: false, mm: None },
         }
     }
 
@@ -85,6 +88,12 @@ pub(super) struct Semi {
     pub not_in: bool,
     pub sub: Sub,
     pub set: Arc<OnceLock<KeySet>>,
+    /// A second correlation that is not an equality (TPC-H Q21's
+    /// `l2.l_suppkey <> l1.l_suppkey`): (read position of the outer column,
+    /// read position of the inner one, the comparison as `inner op outer`).
+    /// Each key keeps its inner rows' least and greatest value, which
+    /// decide it: a row with `c <> v` exists unless every c is v.
+    pub cmp: Option<(usize, usize, star::Op)>,
 }
 
 impl Semi {
@@ -94,7 +103,21 @@ impl Semi {
         let set = self.set.get().expect("a subquery's keys are read before the rows");
         match key_at(&b.cols[self.col], r) {
             Ok(Some(k)) => {
-                let h = set.has(k);
+                let h = match (&self.cmp, &set.mm) {
+                    (Some((oc, _, op)), Some(mm)) => match (mm.get(&k), key_at(&b.cols[*oc], r)) {
+                        (Some(&(lo, hi)), Ok(Some(v))) => match op {
+                            star::Op::Ne => !(lo == v && hi == v),
+                            star::Op::Lt => lo < v,
+                            star::Op::Le => lo <= v,
+                            star::Op::Gt => hi > v,
+                            star::Op::Ge => hi >= v,
+                            // Equalities are the key's, never here.
+                            star::Op::Eq => false,
+                        },
+                        _ => false,
+                    },
+                    _ => set.has(k),
+                };
                 if self.not_in && !h && set.null {
                     false
                 } else {
@@ -200,11 +223,29 @@ impl Sums {
 /// the build budget, so the answer is exact whatever order the table is
 /// stored in and memory stays what the budget gives.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-async fn keys(sub: &Sub, not_in: bool) -> Result<KeySet> {
+async fn keys(sub: &Sub, not_in: bool, cmp: Option<usize>) -> Result<KeySet> {
     let kname = sub.side.schema[sub.side.read[sub.key]].name.clone();
     let (kr, parts) = key_range_of(sub.side.dialect, sub.side.name.clone(), sub.side.url.clone(), sub.side.table.clone(), kname.clone()).await?;
     let mut set = KeySet::over(kr);
     let tys = side_tys(&sub.side);
+    if let Some(ic) = cmp {
+        let mut mm: HashMap<i64, (i64, i64), foldhash::fast::RandomState> = HashMap::default();
+        let mut rd = open(&sub.side, None, None).await?;
+        while let Some(b) = rd.recv().await? {
+            for r in 0..b.rows {
+                if !local_ok(&sub.side, &tys, &b, r) {
+                    continue;
+                }
+                let (Some(k), Some(v)) = (key_at(&b.cols[sub.key], r)?, key_at(&b.cols[ic], r)?) else { continue };
+                mm.entry(k).and_modify(|e| *e = (e.0.min(v), e.1.max(v))).or_insert((v, v));
+            }
+        }
+        if dbg() {
+            eprintln!("[sql] subquery over {}: {} keys with their least and greatest {}", sub.side.name, mm.len(), sub.side.schema[sub.side.read[ic]].name);
+        }
+        set.mm = Some(mm);
+        return Ok(set);
+    }
     let Some(h) = &sub.having else {
         let mut rd = open(&sub.side, None, None).await?;
         while let Some(b) = rd.recv().await? {
@@ -356,15 +397,26 @@ pub(super) async fn load(p: &Plan) -> Result<()> {
         all.extend(st.dims.iter().flat_map(|d| d.side.semis.iter()));
     }
     for s in all {
+        load_one(s).await?;
+    }
+    Ok(())
+}
+
+/// One subquery's keys, its own subqueries' (which narrow it) first.
+fn load_one(s: &Semi) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + '_>> {
+    Box::pin(async move {
+        for n in &s.sub.side.semis {
+            load_one(n).await?;
+        }
         if s.set.get().is_none() {
-            let set = keys(&s.sub, s.not_in).await?;
+            let set = keys(&s.sub, s.not_in, s.cmp.map(|c| c.1)).await?;
             if dbg() {
                 eprintln!("[sql] subquery over {}: keys read", s.sub.side.name);
             }
             let _ = s.set.set(set);
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

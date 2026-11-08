@@ -603,7 +603,10 @@ mod store {
             let sql = sql_of(id);
             if let Err(e) = self.conn().query_drop(&sql).await {
                 self.shared.forget_infile(id);
-                return Err(my_err(what)(e));
+                return Err(Error::Transfer(format!(
+                    "log_based: mysql {what}: {}",
+                    crate::sink::mysql::infile_remedy(&e.to_string())
+                )));
             }
             Ok(())
         }

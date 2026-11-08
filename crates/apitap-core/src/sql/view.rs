@@ -629,6 +629,9 @@ impl View {
         if p.out.iter().any(|o| matches!(o.1, OutCol::Expr(_))) {
             return Err(unsupported("mode=\"log_based\" with arithmetic over aggregates in SELECT (a run without mode= takes it)"));
         }
+        if !p.having.is_empty() {
+            return Err(unsupported("mode=\"log_based\" with HAVING (a run without mode= takes it)"));
+        }
         if !p.orx.is_empty() {
             return Err(unsupported("mode=\"log_based\" with an OR over both tables (a run without mode= takes it)"));
         }

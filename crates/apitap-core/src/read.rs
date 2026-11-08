@@ -207,9 +207,15 @@ impl Drop for ReadHandle {
 /// emit for this table. The polars lazy plugin registers this up front and
 /// starts the real read later with the query's projection pushed down.
 pub async fn read_schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>> {
+    if crate::sql::mem::is_mem(src_url) {
+        return crate::sql::mem::schema(src_url, table);
+    }
     crate::read_impl::schema(src_url, table).await
 }
 
 pub async fn read_start(src_url: &str, table: &str, opts: &ReadOptions) -> Result<ReadHandle> {
+    if crate::sql::mem::is_mem(src_url) {
+        return crate::sql::mem::start(src_url, table, opts);
+    }
     crate::read_impl::start(src_url, table, opts).await
 }

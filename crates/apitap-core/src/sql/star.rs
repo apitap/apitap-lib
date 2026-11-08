@@ -11,6 +11,108 @@
 
 use super::*;
 
+/// A comparison between two fields of a joined row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Op {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Op {
+    pub(super) fn of(op: &BinaryOperator) -> Option<Op> {
+        Some(match op {
+            BinaryOperator::Eq => Op::Eq,
+            BinaryOperator::NotEq => Op::Ne,
+            BinaryOperator::Lt => Op::Lt,
+            BinaryOperator::LtEq => Op::Le,
+            BinaryOperator::Gt => Op::Gt,
+            BinaryOperator::GtEq => Op::Ge,
+            _ => return None,
+        })
+    }
+
+    /// The same comparison with its operands swapped.
+    pub(super) fn flip(self) -> Op {
+        match self {
+            Op::Lt => Op::Gt,
+            Op::Le => Op::Ge,
+            Op::Gt => Op::Lt,
+            Op::Ge => Op::Le,
+            o => o,
+        }
+    }
+}
+
+/// A check of two fields: the operator, and each field's decimal scale (0
+/// when not a decimal), so `l_quantity < 0.2 * AVG(l_quantity)` compares
+/// numbers, not bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Cmp {
+    pub op: Op,
+    pub sa: i8,
+    pub sb: i8,
+}
+
+impl Cmp {
+    const EQ: Cmp = Cmp { op: Op::Eq, sa: 0, sb: 0 };
+}
+
+/// Two encoded fields compared by their values (`None`: a NULL, or kinds
+/// that do not compare).
+fn cmp_fields(a: (u8, &[u8]), sa: i8, b: (u8, &[u8]), sb: i8) -> Option<std::cmp::Ordering> {
+    let int = |x: &[u8]| x.try_into().ok().map(i64::from_le_bytes);
+    let dec = |x: &[u8]| x.try_into().ok().map(i128::from_le_bytes);
+    let flt = |x: &[u8]| x.try_into().ok().map(f64::from_le_bytes);
+    // Exact numbers as (mantissa, scale); floats as floats.
+    let exact = |t: u8, x: &[u8], s: i8| -> Option<(i128, i8)> {
+        match t {
+            1 => int(x).map(|v| (i128::from(v), 0)),
+            3 => dec(x).map(|v| (v, s)),
+            _ => None,
+        }
+    };
+    let float = |t: u8, x: &[u8], s: i8| -> Option<f64> {
+        match t {
+            1 => int(x).map(|v| v as f64),
+            2 => flt(x),
+            3 => dec(x).map(|v| v as f64 / pow10f(s)),
+            _ => None,
+        }
+    };
+    match (a.0, b.0) {
+        (0, _) | (_, 0) => None,
+        (5, 5) | (4, 4) => Some(a.1.cmp(b.1)),
+        _ => match (exact(a.0, a.1, sa), exact(b.0, b.1, sb)) {
+            (Some((x, xs)), Some((y, ys))) => dec_cmp(x, xs, y, ys),
+            _ => float(a.0, a.1, sa)?.partial_cmp(&float(b.0, b.1, sb)?),
+        },
+    }
+}
+
+/// Whether two fields pass `c`.
+#[inline]
+fn check(a: (u8, &[u8]), b: (u8, &[u8]), c: Cmp) -> bool {
+    if c.op == Op::Eq && c.sa == c.sb && a.0 == b.0 {
+        return same(a, b);
+    }
+    use std::cmp::Ordering as O;
+    match cmp_fields(a, c.sa, b, c.sb) {
+        None => false,
+        Some(o) => match c.op {
+            Op::Eq => o == O::Equal,
+            Op::Ne => o != O::Equal,
+            Op::Lt => o == O::Less,
+            Op::Le => o != O::Greater,
+            Op::Gt => o == O::Greater,
+            Op::Ge => o != O::Less,
+        },
+    }
+}
+
 /// What a dimension hangs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Up {
@@ -77,10 +179,10 @@ pub(super) struct Star {
     /// or a value a probe-side check needs).
     pub keep: Vec<bool>,
     /// Build fields compared on the build row; probe fields on the probe row.
-    pub local_b: Vec<(usize, usize)>,
-    pub local_p: Vec<(usize, usize)>,
-    /// (field of the kept group key, probe field) that must be equal.
-    pub cross: Vec<(usize, usize)>,
+    pub local_b: Vec<(usize, usize, Cmp)>,
+    pub local_p: Vec<(usize, usize, Cmp)>,
+    /// (field of the kept group key, probe field) that must pass the check.
+    pub cross: Vec<(usize, usize, Cmp)>,
     /// Per GROUP BY column: its field among the group key's GROUP BY fields
     /// (the key once the check fields are merged away), and its kind.
     pub gpos: Vec<usize>,
@@ -140,6 +242,8 @@ pub(super) struct Tree {
     pub build: Vec<bool>,
     /// Column pairs that must be equal past the tree's own edges.
     pub checks: Vec<(Col, Col)>,
+    /// Column pairs of two tables the WHERE compares (`l_quantity < v`).
+    pub cmps: Vec<(Col, Col, Op)>,
     /// Per table joined by two columns: (its second key column, the parent's
     /// partner) — TPC-H's partsupp on (partkey, suppkey).
     pub parent2: Vec<Option<(usize, usize)>>,
@@ -267,7 +371,7 @@ pub(super) fn tree(n: usize, p: usize, b: usize, eqs: &[(Col, Col)]) -> Option<T
             }
         }
     }
-    Some(Tree { b, p, main, parent, build, checks, parent2, filters })
+    Some(Tree { b, p, main, parent, build, checks, cmps: Vec::new(), parent2, filters })
 }
 
 /// Where a field's value comes from.
@@ -314,20 +418,25 @@ pub(super) fn layout(sides: &mut Vec<Side>, t: &Tree, group_cols: &[Col], may_de
         LocalP,
         Cross,
     }
+    let scale_of = |x: Col| match sides[x.0].schema[x.1].kind {
+        ArrowKind::Decimal { s, .. } => s,
+        _ => 0,
+    };
     let mut chk = Vec::new();
-    for &(a, b) in &t.checks {
-        let (a, b, k) = match (t.build[a.0], t.build[b.0]) {
-            (true, true) => (a, b, K::LocalB),
-            (false, false) => (a, b, K::LocalP),
-            (true, false) => (a, b, K::Cross),
-            (false, true) => (b, a, K::Cross),
+    for (a, b, op) in t.checks.iter().map(|&(a, b)| (a, b, Op::Eq)).chain(t.cmps.iter().copied()) {
+        let (a, b, k, op) = match (t.build[a.0], t.build[b.0]) {
+            (true, true) => (a, b, K::LocalB, op),
+            (false, false) => (a, b, K::LocalP, op),
+            (true, false) => (a, b, K::Cross, op),
+            (false, true) => (b, a, K::Cross, op.flip()),
         };
         for x in [a, b] {
             if !own[x.0].iter().any(|f| f.0 == x.1 && f.1.is_none()) {
                 own[x.0].push((x.1, None, Src::Row));
             }
         }
-        chk.push((a, b, k));
+        let c = if op == Op::Eq && scale_of(a) == scale_of(b) { Cmp::EQ } else { Cmp { op, sa: scale_of(a), sb: scale_of(b) } };
+        chk.push((a, b, k, c));
     }
     // A dimension whose key is grouped: the key from the FK, first; its
     // other GROUP BY columns late when they may be.
@@ -432,9 +541,9 @@ pub(super) fn layout(sides: &mut Vec<Side>, t: &Tree, group_cols: &[Col], may_de
             (at, pi, sides[d].schema[c].kind)
         })
         .collect();
-    let local_b = chk.iter().filter(|c| c.2 == K::LocalB).map(|c| (pos(&bflat, c.0), pos(&bflat, c.1))).collect();
-    let local_p = chk.iter().filter(|c| c.2 == K::LocalP).map(|c| (pos(&pflat, c.0), pos(&pflat, c.1))).collect();
-    let cross = chk.iter().filter(|c| c.2 == K::Cross).map(|c| (kept_ix[pos(&bflat, c.0)], pos(&pflat, c.1))).collect();
+    let local_b = chk.iter().filter(|c| c.2 == K::LocalB).map(|c| (pos(&bflat, c.0), pos(&bflat, c.1), c.3)).collect();
+    let local_p = chk.iter().filter(|c| c.2 == K::LocalP).map(|c| (pos(&pflat, c.0), pos(&pflat, c.1), c.3)).collect();
+    let cross = chk.iter().filter(|c| c.2 == K::Cross).map(|c| (kept_ix[pos(&bflat, c.0)], pos(&pflat, c.1), c.3)).collect();
     // The late reads' projections, before the dimensions' own wants.
     let mut late = Vec::new();
     for x in 2..n {
@@ -928,7 +1037,7 @@ fn same(a: (u8, &[u8]), b: (u8, &[u8])) -> bool {
 /// A part's row flattened into `full`: its own fields, then each child
 /// dimension's payload; `false` when a dimension holds no row for it or a
 /// check within the part fails.
-fn row(fields: &[usize], kids: &[usize], local: &[(usize, usize)], st: &Star, maps: &[DimMap], b: &ArrowBatch, r: usize, full: &mut Vec<u8>) -> Result<bool> {
+fn row(fields: &[usize], kids: &[usize], local: &[(usize, usize, Cmp)], st: &Star, maps: &[DimMap], b: &ArrowBatch, r: usize, full: &mut Vec<u8>) -> Result<bool> {
     // The dimensions first, the direct ones before the searched ones: a row
     // that joins no dimension row is dropped by one load, before any field
     // of it is encoded (TPC-H Q9's partsupp search ran for every lineitem
@@ -970,7 +1079,7 @@ fn row(fields: &[usize], kids: &[usize], local: &[(usize, usize)], st: &Star, ma
     }
     if !local.is_empty() {
         let f = group_fields(full);
-        if local.iter().any(|&(x, y)| !same(f[x], f[y])) {
+        if local.iter().any(|&(x, y, c)| !check(f[x], f[y], c)) {
             return Ok(false);
         }
     }
@@ -979,7 +1088,7 @@ fn row(fields: &[usize], kids: &[usize], local: &[(usize, usize)], st: &Star, ma
 
 /// [`row`] for a part with more dimensions than it holds on the stack.
 #[allow(clippy::too_many_arguments)]
-fn row_slow(fields: &[usize], kids: &[usize], local: &[(usize, usize)], st: &Star, maps: &[DimMap], b: &ArrowBatch, r: usize, full: &mut Vec<u8>) -> Result<bool> {
+fn row_slow(fields: &[usize], kids: &[usize], local: &[(usize, usize, Cmp)], st: &Star, maps: &[DimMap], b: &ArrowBatch, r: usize, full: &mut Vec<u8>) -> Result<bool> {
     full.clear();
     for &f in fields {
         encode_group(&b.cols[f], r, full);
@@ -1006,7 +1115,7 @@ fn row_slow(fields: &[usize], kids: &[usize], local: &[(usize, usize)], st: &Sta
     }
     if !local.is_empty() {
         let f = group_fields(full);
-        if local.iter().any(|&(x, y)| !same(f[x], f[y])) {
+        if local.iter().any(|&(x, y, c)| !check(f[x], f[y], c)) {
             return Ok(false);
         }
     }
@@ -1039,14 +1148,14 @@ pub(super) fn probe_row(st: &Star, maps: &[DimMap], b: &ArrowBatch, r: usize, pv
 }
 
 /// Each group's kept fields the probe-side checks compare against.
-pub(super) fn cross_values(st: &Star, keys: &[Box<[u8]>]) -> Vec<Vec<(u8, Vec<u8>)>> {
+pub(super) fn cross_values(st: &Star, keys: &KeyArena) -> Vec<Vec<(u8, Vec<u8>)>> {
     if st.cross.is_empty() {
         return Vec::new();
     }
     keys.iter()
         .map(|k| {
             let f = group_fields(k);
-            st.cross.iter().map(|&(g, _)| (f[g].0, f[g].1.to_vec())).collect()
+            st.cross.iter().map(|&(g, _, _)| (f[g].0, f[g].1.to_vec())).collect()
         })
         .collect()
 }
@@ -1055,9 +1164,9 @@ pub(super) fn cross_values(st: &Star, keys: &[Box<[u8]>]) -> Vec<Vec<(u8, Vec<u8
 /// row's fields).
 #[inline]
 pub(super) fn cross_ok(st: &Star, gcross: &[Vec<(u8, Vec<u8>)>], g: u32, pf: &[(u8, &[u8])]) -> bool {
-    st.cross.iter().enumerate().all(|(j, &(_, pi))| {
+    st.cross.iter().enumerate().all(|(j, &(_, pi, c))| {
         let v = &gcross[g as usize][j];
-        same((v.0, &v.1), pf[pi])
+        check((v.0, &v.1), pf[pi], c)
     })
 }
 
@@ -1068,7 +1177,7 @@ pub(super) fn cross_ok(st: &Star, gcross: &[Vec<(u8, Vec<u8>)>], g: u32, pf: &[(
 pub(super) async fn read_late(st: &Star, groups: Groups, accs: Vec<Acc>, na: usize, rows: &[usize]) -> Result<(Groups, Vec<Acc>, Vec<bool>)> {
     // The answer's rows only, before the read: the other groups (hundreds of
     // thousands under a LIMIT 20) are let go, so the read has their memory.
-    let keys: Vec<Box<[u8]>> = rows.iter().map(|&r| groups.keys[r].clone()).collect();
+    let keys: Vec<Box<[u8]>> = rows.iter().map(|&r| Box::<[u8]>::from(&groups.keys[r])).collect();
     let racc: Vec<Acc> = rows.iter().flat_map(|&r| accs[r * na..(r + 1) * na].iter().copied()).collect();
     drop(groups);
     drop(accs);

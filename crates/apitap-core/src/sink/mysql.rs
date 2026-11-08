@@ -1442,11 +1442,20 @@ impl crate::sink::Sink for MySqlSink {
         // the LOAD DATA. Needed because closing the stream does NOT abort it
         // (see `MySqlLoader::abort`): without this id an aborted load COMMITS
         // its partial rows into staging.
-        let conn_id: u64 = conn
-            .query_first::<u64, _>("SELECT CONNECTION_ID()")
+        //
+        // `@@GLOBAL.local_infile` in the same round-trip: MySQL 8.0+ ships it
+        // OFF, and the refused LOAD DATA used to leave the producer blocked on
+        // a full channel nobody would ever read — a transfer that hung with no
+        // error (2026-11-08, lab_my on stock mysql:8.4). Refused here, by name.
+        let (conn_id, infile): (u64, Option<i64>) = conn
+            .query_first::<(u64, Option<i64>), _>("SELECT CONNECTION_ID(), @@GLOBAL.local_infile")
             .await
             .map_err(|e| Error::Transfer(format!("mysql loader connection id: {e}")))?
             .ok_or_else(|| Error::Transfer("mysql loader got no CONNECTION_ID()".into()))?;
+        if infile == Some(0) {
+            self.registry.lock().expect("infile registry").remove(&id);
+            return Err(Error::Transfer(LOCAL_INFILE_OFF.into()));
+        }
 
         // The task keeps its connection until finish/abort RELEASES it. It
         // went back to the pool the moment the LOAD DATA ended, so an abort
@@ -1455,11 +1464,17 @@ impl crate::sink::Sink for MySqlSink {
         // the connection to the pool; `false` (an abort) closes it, so a KILL
         // that landed on it idle cannot reach whoever would take it next.
         let (release, released) = tokio::sync::oneshot::channel::<bool>();
+        let reg = self.registry.clone();
         let join = pipe::JoinOnce::new(tokio::spawn(async move {
             let r: Result<u64> = async {
-                conn.query_drop(&load_sql)
-                    .await
-                    .map_err(|e| Error::Transfer(format!("LOAD DATA: {e}")))?;
+                if let Err(e) = conn.query_drop(&load_sql).await {
+                    // Refused before the server asked for the file: the
+                    // stream is still registered, and the producer would
+                    // block on its full channel forever. Dropping it makes
+                    // the next `send` fail, and `send` reports THIS error.
+                    reg.lock().expect("infile registry").remove(&id);
+                    return Err(Error::Transfer(format!("LOAD DATA: {}", infile_remedy(&e.to_string()))));
+                }
                 let loaded = conn.affected_rows();
                 // LOCAL implies IGNORE: a duplicate key (1062), a truncated or
                 // clipped value (1265/1264), a bad date (1292) — under the
@@ -1856,6 +1871,22 @@ pub(crate) struct MySqlLoader {
 /// the KILL is what stops the server's, and one without the other is survivable.
 const KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Why a LOAD DATA LOCAL is refused on a stock MySQL 8.0+, and the fix.
+pub(crate) const LOCAL_INFILE_OFF: &str = "the MySQL destination has local_infile=OFF (the MySQL 8.0+ \
+     default), and apitap loads with LOAD DATA LOCAL INFILE. Turn it on with \
+     `SET PERSIST local_infile = 1` (or `local_infile=1` under [mysqld]) as an admin";
+
+/// A server error, with the remedy when it is the local_infile refusal
+/// (3948 "Loading local data is disabled", 1148 on older servers).
+pub(crate) fn infile_remedy(e: &str) -> String {
+    let l = e.to_ascii_lowercase();
+    if l.contains("local data is disabled") || l.contains("error 3948") || l.contains("error 1148") {
+        format!("{e} — {LOCAL_INFILE_OFF}")
+    } else {
+        e.to_string()
+    }
+}
+
 /// The invisible key a key-less staging table gets under
 /// sql_require_primary_key=ON (MASTER M-52). Never part of a plan's columns.
 const INVISIBLE_KEY: &str = "_apitap_rowid";
@@ -1887,10 +1918,16 @@ impl MySqlLoader {
 
 impl Loader for MySqlLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
-        self.tx
-            .send(Msg::Buf(Bytes::from(buf)))
-            .await
-            .map_err(|_| Error::Transfer("mysql LOAD DATA stream closed early".into()))
+        if self.tx.send(Msg::Buf(Bytes::from(buf))).await.is_ok() {
+            return Ok(());
+        }
+        // The load ended under us (refused, killed, a lost connection): its
+        // own error is the one worth reporting, not "stream closed".
+        match self.join.join().await {
+            Some(Ok(Err(e))) => Err(e),
+            Some(Err(e)) => Err(Error::Transfer(format!("mysql loader join: {e}"))),
+            _ => Err(Error::Transfer("mysql LOAD DATA stream closed early".into())),
+        }
     }
 
     async fn finish(mut self) -> Result<u64> {
@@ -1960,6 +1997,15 @@ impl Loader for MySqlLoader {
 }
 #[cfg(test)]
 mod abort_tests {
+
+    /// The local_infile refusal carries its remedy; other errors pass as-is.
+    #[test]
+    fn local_infile_refusal_names_the_fix() {
+        let e = "ERROR 3948 (42000): Loading local data is disabled; this must be enabled on both the client and server sides";
+        assert!(super::infile_remedy(e).contains("SET PERSIST local_infile = 1"));
+        assert!(super::infile_remedy("ERROR 1148 (42000): The used command is not allowed with this MySQL version").contains("local_infile"));
+        assert_eq!(super::infile_remedy("ERROR 1062 (23000): Duplicate entry '1' for key 'PRIMARY'"), "ERROR 1062 (23000): Duplicate entry '1' for key 'PRIMARY'");
+    }
 
     /// P2: TEXT/BLOB keys and wide VARCHARs are caught whatever their case.
     #[test]
