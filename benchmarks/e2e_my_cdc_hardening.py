@@ -77,8 +77,11 @@ def tagged():
     assert r.returncode == 0, r.stderr
     ch_wipe(t)
     try:
+        # Over TCP, not the socket: the entrypoint's init server answers on the
+        # socket (--skip-networking) and then restarts, which failed CREATE TABLE.
         for _ in range(120):
-            if sh(["docker", "exec", name, "mysql", "-uroot", "-pbench", "-e", "SELECT 1"]).returncode == 0:
+            if sh(["docker", "exec", name, "mysql", "-uroot", "-pbench", "-h127.0.0.1",
+                   "-e", "SELECT 1"]).returncode == 0:
                 break
             time.sleep(1)
         mysql(name, f"CREATE TABLE {t} (id int PRIMARY KEY, v varchar(10)); INSERT INTO {t} VALUES (1, 'a')")

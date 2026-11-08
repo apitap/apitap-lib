@@ -615,11 +615,17 @@ def sql(query: str, *, sources: dict[str, str], dest: str | None = None,
             sources={"pg": "postgres://…", "my": "mysql://…"},
         ).to_polars()
 
-    v1 runs one table, or two joined ``INNER JOIN … ON a.k = b.k`` on one
-    integer key, with ``WHERE`` conjuncts that each name one table, ``GROUP
-    BY`` columns of one table, and ``SUM``/``COUNT``/``MIN``/``MAX``/``AVG``
-    over the other table's columns; anything else is refused before a row is
-    read, naming what is not supported.
+    It runs one table, two tables joined on an integer key, or a star of three
+    or more (every other table joined by its key, single or two-column, to a
+    table already joined), with per-table ``WHERE`` conditions pushed to each
+    server, an ``OR`` across tables, ``IN``/``EXISTS`` subqueries (``HAVING``
+    over the subquery's key included), ``CASE`` over one table, ``EXTRACT(YEAR
+    FROM col)``, derived tables, ``GROUP BY`` columns of any joined table and
+    ``SUM``/``COUNT``/``MIN``/``MAX``/``AVG`` with exact decimals. Outer joins,
+    correlated subqueries, ``SELECT *`` and anything else are refused before a
+    row is read, naming what is not supported. Every read of one Postgres
+    server runs in one snapshot; text compares and ``GROUP BY`` follow each
+    column's collation (MySQL ``_ci``/``_ai_ci``, ``CHAR`` padding).
 
     With ``dest=`` and ``table=`` the answer lands in that destination instead,
     through the same path :func:`transfer` takes (typed columns, staging,
@@ -631,8 +637,9 @@ def sql(query: str, *, sources: dict[str, str], dest: str | None = None,
     With ``mode="log_based"`` as well, the answer is an incremental view: the
     first run reads the table once at a replication slot's snapshot, and every
     later run moves the answer by the changes since the last one, with no
-    re-read. v1 keeps a view over one Postgres table (``REPLICA IDENTITY
-    FULL``) with ``SUM``/``COUNT``/``AVG``; ``MIN``/``MAX`` are refused. The
+    re-read. A view is kept over one Postgres table or a Postgres × MySQL join
+    (Postgres tables need ``REPLICA IDENTITY FULL``) with
+    ``SUM``/``COUNT``/``AVG``; ``MIN``/``MAX`` are refused. The
     view's state lives in ``APITAP_STATE_DIR`` (default ``~/.apitap/views``)::
 
         apitap.sql("SELECT status, COUNT(*), SUM(amount) FROM pg.orders GROUP BY 1",
