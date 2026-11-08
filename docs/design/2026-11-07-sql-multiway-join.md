@@ -114,7 +114,17 @@ Status 2026-11-08 (p69/p70):
 - **T0 regression — fixed** (p72): the probe pipe cap now tiers by the tightest gate's density
   (≤ 1/16: 8 pipes, ≤ 1/8: 6, held ≤ 96 MB both; `GATED_SCAN_PIPES`). T0 gates to 0.121 and got 2
   pipes (24.7 s); now 6: 14.5–15.7 s, peak 143 MB. TPC-H 0.5c unchanged (354.9 s, 12/12 exact,
-  peak ≤ 210 MB). `APITAP_SQL_PROBE_PIPES=n` forces the probe's pipes for measuring. Lead: with
-  debug on, Q3 at 4 forced pipes ran 38.9 s vs ~45 s at its default 8 — measure without debug.
+  peak ≤ 210 MB). `APITAP_SQL_PROBE_PIPES=n` forces the probe's pipes for measuring.
+- **Probe pipe floor (p75).** Without debug, forcing 4 probe pipes showed the memory model gave
+  gated probes 2-3 pipes (Q3/Q8 3, Q10 2) and an ungated MySQL probe beside a small map 2 (Q12, 25%
+  CPU). Now: at least 4 when the tightest gate is ≤ 1/8 or the map ≤ 32 MiB (`PROBE_MIN_PIPES`),
+  and a gated (≤ 1/8) probe beside ≤ 112 MiB gets 4 even where the memory model said fewer. A heavy
+  decode beside a large map keeps 2 (T2 at 4 pipes peaked 243 MB). TPC-H 0.5c 355.7 → 337.7 s, all
+  exact, peak ≤ 205 MB; T0 14.4 s, T2 59.6 s / 203 MB, T3 13.6 s.
+- **MySQL collations.** `ArrowField::ci` (`_ci`) and PAD SPACE (`padded`, all but 0900/nopad) come
+  from the probed `COLLATE`; locally evaluated compares and LIKE fold case (ASCII fast path,
+  Unicode lowercase otherwise). Accent folding (`_ai_`) is not emulated. e2e_sql_join case 11: an
+  OR across tables on a utf8mb4_0900_ai_ci column — RED on p72 (1,818 vs 6,365 rows), GREEN now.
+  GROUP BY on a `_ci` column still groups bytewise.
 - **Flaky `the_cause_wins_even_when_its_abort_is_slowest`** — 400 spans (16 let the spinning
   pipes drain the queue before the cancel reached them on a loaded host).

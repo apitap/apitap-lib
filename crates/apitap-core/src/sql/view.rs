@@ -2428,7 +2428,7 @@ mod tests {
     use super::*;
 
     fn f(name: &str, kind: ArrowKind) -> ArrowField {
-        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false }
+        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false }
     }
 
     fn schemas() -> impl FnMut(&str, &str) -> Result<Vec<ArrowField>> {

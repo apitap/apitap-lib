@@ -31,6 +31,8 @@ container. apitap.sql() runs the join + aggregate itself:
      answer equals the servers'
   8  an inner join emits only the groups some row matched: GROUP BY-side groups
      with no matching row do not appear as COUNT 0 rows
+  11 an OR across both tables, checked per matched row, compares the MySQL
+     utf8mb4_0900_ai_ci column case-insensitively, as MySQL does
 """
 import os
 import subprocess
@@ -194,6 +196,27 @@ def main():
         got = [(str(d), n) for d, n in rows(apitap.sql(q8, sources=SRC))]
         case("8: an inner join emits no group that nothing matched", got == want8 and 0 < len(want8) < 200,
              f"{len(got)} groups vs {len(want8)}, first {got[:2]} want {want8[:2]}")
+
+        # 11: an OR across both tables is checked here, per matched row; the
+        # MySQL column is utf8mb4_0900_ai_ci, so '1-prio' is '1-PRIO' there and
+        # must be here too (it was compared bytewise and the branch kept none).
+        coll = my(f"SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+                  f"AND TABLE_NAME = '{TO}' AND COLUMN_NAME = 'o_orderpriority'")
+        prio = {int(k): p for k, p in (l.split("\t") for l in my(f"SELECT o_orderkey, o_orderpriority FROM {TO}").splitlines())}
+        want11 = [0, Decimal(0)]
+        for line in pg(f"SELECT l_orderkey, l_extendedprice, l_discount FROM {TL} "
+                       f"WHERE l_orderkey IS NOT NULL AND l_extendedprice IS NOT NULL").splitlines():
+            k, price, disc = line.split("|")
+            pr = prio.get(int(k), "").lower()
+            if (pr == "1-prio" and Decimal(disc) > Decimal("0.05")) or (pr == "2-prio" and Decimal(disc) < Decimal("0.02")):
+                want11[0] += 1
+                want11[1] += Decimal(price)
+        q11 = (f"SELECT COUNT(*) AS n, SUM(l_extendedprice) AS s FROM pg.{TL} l JOIN my.{TO} o ON l.l_orderkey = o.o_orderkey "
+               f"WHERE (o.o_orderpriority = '1-prio' AND l.l_discount > 0.05) "
+               f"OR (o.o_orderpriority = '2-PRIO' AND l.l_discount < 0.02)")
+        got = rows(apitap.sql(q11, sources=SRC))
+        case("11: a case-insensitive MySQL column compares case-insensitively in an OR across tables",
+             coll.endswith("_ci") and got == [tuple(want11)] and want11[0] > 100, f"{coll}: got {got} want {want11}")
 
         # 9: with the opt-in pushdown (APITAP_SQL_PUSH_ARGS=1) the probe's
         # argument is computed by Postgres as one scaled int8; a cube of

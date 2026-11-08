@@ -114,7 +114,8 @@ async fn schema_with<S: Source>(
                 kind: kind.unwrap_or(ArrowKind::Utf8),
                 nullable: pc.nullable,
                 rewritten: read_as_text(kind, &pc.udt),
-                padded: padded_text(kind, &pc.udt),
+                padded: padded_text(kind, &pc.udt, pc.native_ddl.as_deref()),
+                ci: ci_text(kind, pc.native_ddl.as_deref()),
             }
         })
         .collect())
@@ -125,10 +126,23 @@ async fn schema_with<S: Source>(
 /// is not plain text (MySQL json arrives as UTF-8 bytes but compares as
 /// JSON). A pushed-down predicate on it would be judged by the server on the
 /// native value (MASTER M-46).
-/// Fixed-width text whose compares ignore trailing spaces
-/// ([`ArrowField::padded`]).
-fn padded_text(kind: Option<ArrowKind>, udt: &str) -> bool {
-    matches!(kind, Some(ArrowKind::Utf8)) && matches!(udt.to_ascii_lowercase().as_str(), "bpchar" | "char")
+/// The collation a MySQL column's DDL names (`… COLLATE utf8mb4_0900_ai_ci`).
+fn collation_of(native: Option<&str>) -> Option<String> {
+    native?.rsplit_once(" COLLATE ").map(|(_, c)| c.trim().to_ascii_lowercase())
+}
+
+/// Text whose compares ignore trailing spaces ([`ArrowField::padded`]).
+fn padded_text(kind: Option<ArrowKind>, udt: &str, native: Option<&str>) -> bool {
+    if !matches!(kind, Some(ArrowKind::Utf8)) {
+        return false;
+    }
+    matches!(udt.to_ascii_lowercase().as_str(), "bpchar" | "char")
+        || collation_of(native).is_some_and(|c| !c.contains("0900") && !c.contains("nopad") && c != "binary")
+}
+
+/// Text under a case-insensitive collation ([`ArrowField::ci`]).
+fn ci_text(kind: Option<ArrowKind>, native: Option<&str>) -> bool {
+    matches!(kind, Some(ArrowKind::Utf8)) && collation_of(native).is_some_and(|c| c.ends_with("_ci"))
 }
 
 fn read_as_text(kind: Option<ArrowKind>, udt: &str) -> bool {
@@ -472,7 +486,8 @@ async fn plan_read<S: Source>(
             kind,
             nullable: pc.nullable,
             rewritten,
-            padded: padded_text(Some(kind), &pc.udt),
+            padded: padded_text(Some(kind), &pc.udt, pc.native_ddl.as_deref()),
+            ci: ci_text(Some(kind), pc.native_ddl.as_deref()),
         });
     }
 
@@ -681,6 +696,21 @@ fn pg_send_decodable(udt: &str, precision: Option<i32>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collations_set_padded_and_ci() {
+        use crate::wire::arrowcol::ArrowKind;
+        let u = Some(ArrowKind::Utf8);
+        let ddl = |c: &str| Some(format!("varchar(10) CHARACTER SET utf8mb4 COLLATE {c}"));
+        assert!(!super::padded_text(u, "varchar", ddl("utf8mb4_0900_ai_ci").as_deref()), "0900 is NO PAD");
+        assert!(super::ci_text(u, ddl("utf8mb4_0900_ai_ci").as_deref()));
+        assert!(super::padded_text(u, "varchar", ddl("utf8mb4_general_ci").as_deref()), "general_ci is PAD SPACE");
+        assert!(!super::ci_text(u, ddl("utf8mb4_bin").as_deref()), "_bin is case-sensitive");
+        assert!(!super::padded_text(u, "varchar", ddl("utf8mb4_unicode_520_nopad_ci").as_deref()));
+        assert!(super::padded_text(u, "bpchar", Some("character(10)")), "Postgres CHAR");
+        assert!(!super::padded_text(u, "varchar", Some("character varying(10)")) && !super::ci_text(u, Some("character varying(10)")));
+        assert!(!super::ci_text(Some(ArrowKind::Int64), ddl("utf8mb4_0900_ai_ci").as_deref()));
+    }
+
 
     #[test]
     fn only_send_decodable_pg_udts_skip_the_text_cast() {

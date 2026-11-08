@@ -69,9 +69,14 @@ pub struct ArrowField {
     /// the server's native value, not the string the reader sees, so the
     /// lazy pushdown must not cross the wire with it (MASTER M-46).
     pub rewritten: bool,
-    /// Fixed-width text (Postgres `bpchar`, MySQL `CHAR`): its compares
-    /// ignore trailing spaces, as the server's do. VARCHAR and TEXT keep them.
+    /// Text whose compares ignore trailing spaces, as the server's do:
+    /// fixed-width (Postgres `bpchar`, MySQL `CHAR`) or under a MySQL PAD
+    /// SPACE collation (all but the 0900 and `nopad` ones). Postgres VARCHAR
+    /// and TEXT keep them.
     pub padded: bool,
+    /// Text under a case-insensitive collation (MySQL `_ci`): its compares
+    /// fold case, as the server's do.
+    pub ci: bool,
 }
 
 /// The running read: a schema and a pull side. `next_batch` blocks the

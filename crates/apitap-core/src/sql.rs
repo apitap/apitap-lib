@@ -689,9 +689,10 @@ enum PExpr {
     /// (read position, operator, literal).
     Cmp(usize, BinaryOperator, Lit),
     In(usize, Vec<Lit>, bool),
-    /// (read position, pattern, negated, padded column): `%` any run, `_`
-    /// one character; a CHAR(n) value's trailing spaces are not matched.
-    Like(usize, String, bool, bool),
+    /// (read position, pattern, negated, the column's collation): `%` any
+    /// run, `_` one character; a CHAR(n) value's trailing spaces are not
+    /// matched, a `_ci` column's case is folded (the pattern's at plan time).
+    Like(usize, String, bool, Coll),
 }
 
 /// SQL LIKE of `t` against `pat` (`%` any run, `_` one character), by
@@ -757,10 +758,49 @@ fn like_bytes(t: &[u8], p: &[u8]) -> bool {
 enum Lit {
     Num(f64),
     Str(String),
-    /// A string compared with fixed-width text ([`ArrowField::padded`]):
-    /// trailing spaces on either side do not count.
-    Pad(String),
+    /// A string compared under the column's collation
+    /// ([`ArrowField::padded`], [`ArrowField::ci`]).
+    Coll(String, Coll),
     Bool(bool),
+}
+
+/// How a text column compares: trailing spaces ignored (`pad`), case
+/// folded (`ci`). MySQL's `_ai_ci` accent folding is not done: `'é' = 'e'`
+/// holds there and not here.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+struct Coll {
+    pad: bool,
+    ci: bool,
+}
+
+impl Coll {
+    fn of(f: &ArrowField) -> Coll {
+        Coll { pad: f.padded, ci: f.ci }
+    }
+
+    fn plain(self) -> bool {
+        !self.pad && !self.ci
+    }
+
+    /// `t` against `y` under this collation.
+    fn cmp(self, t: &[u8], y: &[u8]) -> std::cmp::Ordering {
+        let (t, y) = if self.pad { (t.trim_ascii_end(), y.trim_ascii_end()) } else { (t, y) };
+        if !self.ci {
+            return t.cmp(y);
+        }
+        if t.is_ascii() && y.is_ascii() {
+            return t.iter().map(u8::to_ascii_lowercase).cmp(y.iter().map(u8::to_ascii_lowercase));
+        }
+        let lo = |b: &[u8]| String::from_utf8_lossy(b).to_lowercase();
+        lo(t).cmp(&lo(y))
+    }
+
+    /// The value a LIKE matches: padding off, case folded (the pattern was
+    /// folded at plan time).
+    fn like_text<'a>(self, t: &'a [u8]) -> Option<std::borrow::Cow<'a, str>> {
+        let t = std::str::from_utf8(if self.pad { t.trim_ascii_end() } else { t }).ok()?;
+        Some(if self.ci && t.chars().any(char::is_uppercase) { std::borrow::Cow::Owned(t.to_lowercase()) } else { std::borrow::Cow::Borrowed(t) })
+    }
 }
 
 /// The cell as a comparable value: text, number or bool.
@@ -794,7 +834,7 @@ fn peval(e: &PExpr, b: &ArrowBatch, r: usize, tys: &[Option<Ty>]) -> Option<bool
             // Trailing spaces count for VARCHAR and TEXT, not for CHAR(n)
             // (PG's bpchar): TPC-H's l_shipmode arrives padded.
             (Cv::Text(t), Lit::Str(y)) => Some(t.cmp(y.as_bytes())),
-            (Cv::Text(t), Lit::Pad(y)) => Some(t.trim_ascii_end().cmp(y.as_bytes().trim_ascii_end())),
+            (Cv::Text(t), Lit::Coll(y, c)) => Some(c.cmp(t, y.as_bytes())),
             (Cv::Text(t), Lit::Num(y)) => std::str::from_utf8(t).ok()?.trim().parse::<f64>().ok()?.partial_cmp(y),
             (Cv::Bool(x), Lit::Bool(y)) => Some(x.cmp(y)),
             (Cv::Text(t), Lit::Bool(y)) => Some(matches!(t, b"true" | b"t" | b"1").cmp(y)),
@@ -828,8 +868,8 @@ fn peval(e: &PExpr, b: &ArrowBatch, r: usize, tys: &[Option<Ty>]) -> Option<bool
                 _ => o != O::Less,
             })
         }
-        PExpr::Like(i, pat, neg, pad) => match cv(&b.cols[*i], r, tys[*i]) {
-            Cv::Text(t) => Some(like(std::str::from_utf8(if *pad { t.trim_ascii_end() } else { t }).ok()?, pat) != *neg),
+        PExpr::Like(i, pat, neg, c) => match cv(&b.cols[*i], r, tys[*i]) {
+            Cv::Text(t) => Some(like(&c.like_text(t)?, pat) != *neg),
             _ => None,
         },
         PExpr::In(i, ls, neg) => {
@@ -912,10 +952,9 @@ fn pexpr(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
         })
     };
     let side_name = sides[s].name.clone();
-    // A string literal against fixed-width text compares without trailing
-    // spaces (`Lit::Pad`).
+    // A string literal compares under its column's collation (`Lit::Coll`).
     let padl = |sides: &[Side], c: usize, l: Lit| match l {
-        Lit::Str(t) if sides[s].schema[sides[s].read[c]].padded => Lit::Pad(t),
+        Lit::Str(t) if !Coll::of(&sides[s].schema[sides[s].read[c]]).plain() => Lit::Coll(t, Coll::of(&sides[s].schema[sides[s].read[c]])),
         l => l,
     };
     let no = || unsupported(format!("the WHERE condition {e} on {side_name} (comparisons of a column with a literal, IN, IS NULL, AND/OR/NOT)"));
@@ -934,7 +973,8 @@ fn pexpr(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
             Expr::Value(v) => match &v.value {
                 Value::SingleQuotedString(pt) => {
                     let c = col(sides, expr)?.ok_or_else(no)?;
-                    PExpr::Like(c, pt.clone(), *negated, sides[s].schema[sides[s].read[c]].padded)
+                    let co = Coll::of(&sides[s].schema[sides[s].read[c]]);
+                    PExpr::Like(c, if co.ci { pt.to_lowercase() } else { pt.clone() }, *negated, co)
                 }
                 _ => return Err(no()),
             },
@@ -1006,7 +1046,7 @@ impl PExpr {
             PExpr::IsNull(i, n) => PExpr::IsNull(f(*i), *n),
             PExpr::Cmp(i, o, l) => PExpr::Cmp(f(*i), o.clone(), l.clone()),
             PExpr::In(i, ls, n) => PExpr::In(f(*i), ls.clone(), *n),
-            PExpr::Like(i, pt, n, pad) => PExpr::Like(f(*i), pt.clone(), *n, *pad),
+            PExpr::Like(i, pt, n, c) => PExpr::Like(f(*i), pt.clone(), *n, *c),
         }
     }
 }
@@ -1724,7 +1764,7 @@ fn vexpr(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<VExpr
             let i = match sides[1].schema.iter().position(|f| f.name == name) {
                 Some(i) => i,
                 None => {
-                    sides[1].schema.push(ArrowField { name, kind: k, nullable: true, rewritten: false, padded: false });
+                    sides[1].schema.push(ArrowField { name, kind: k, nullable: true, rewritten: false, padded: false, ci: false });
                     let i = sides[1].schema.len() - 1;
                     sides[1].lookups.push((i, s, c));
                     i
@@ -2568,7 +2608,7 @@ fn plan_with(
             schema: group_cols
                 .iter()
                 .enumerate()
-                .map(|(i, &(s, c))| ArrowField { name: format!("__g{i}"), kind: sides[s].schema[c].kind, nullable: true, rewritten: false, padded: sides[s].schema[c].padded })
+                .map(|(i, &(s, c))| ArrowField { name: format!("__g{i}"), kind: sides[s].schema[c].kind, nullable: true, rewritten: false, padded: sides[s].schema[c].padded, ci: sides[s].schema[c].ci })
                 .collect(),
             read: Vec::new(),
             conj: Vec::new(),
@@ -2738,7 +2778,7 @@ fn years_to_virtual(sides: &mut [Side], e: &mut Expr) -> Result<()> {
             }
             let name = format!("__year_{}", side.schema[c.1].name);
             if !side.schema.iter().any(|f| f.name == name) {
-                side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int32, nullable: true, rewritten: false, padded: false });
+                side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int32, nullable: true, rewritten: false, padded: false, ci: false });
                 let vi = side.schema.len() - 1;
                 side.virt.push((vi, c.1));
                 side.want(c.1);
@@ -3513,7 +3553,14 @@ async fn open_gated(side: &Side, extra: Option<String>, parallel: Option<usize>,
 /// left still bounds it (`read_pipes_for`); a large map keeps the kernel's
 /// socket memory in mind (five pipes beside 57 MiB were OOM-killed).
 fn probe_pipe_cap(cores: f64, side: &Side, held: u64, density: f64) -> usize {
-    let cap = ((cores.ceil() as usize) * 2).max(2);
+    // At least four when the decode is light (a gate to an eighth) or the
+    // map small: under a core such a probe waits on the server more than it
+    // decodes (TPC-H Q12 at 0.5 core: 25% CPU at 2 pipes, 14.7 s → 11.7 s
+    // at 4; Q10 30.1 → 23.3 s). A heavy decode beside a large map keeps two:
+    // the T2 join (a quarter through, 64 MiB held) peaked at 243 MB of 256
+    // at four.
+    let floor = if density <= 1.0 / 8.0 || held <= 32 << 20 { PROBE_MIN_PIPES } else { 2 };
+    let cap = ((cores.ceil() as usize) * 2).max(floor);
     if (!side.conj.is_empty() && held <= 48 << 20) || (density <= 1.0 / 16.0 && held <= 96 << 20) {
         cap.max(SERVER_SCAN_PIPES)
     } else if density <= 1.0 / 8.0 && held <= 96 << 20 {
@@ -3525,6 +3572,10 @@ fn probe_pipe_cap(cores: f64, side: &Side, held: u64, density: f64) -> usize {
         cap
     }
 }
+
+/// The fewest pipes a probe's CPU cap allows ([`probe_pipe_cap`]); the
+/// memory left still bounds it, except for a gated probe (below).
+const PROBE_MIN_PIPES: usize = 4;
 
 /// Scans a probe gated to an eighth of its keys runs at once
 /// ([`probe_pipe_cap`]).
@@ -3735,7 +3786,7 @@ fn rewrite_args(p: &mut Plan) -> bool {
     for (i, (a, sq)) in p.aggs.iter_mut().zip(sqls).enumerate() {
         let Some((sql, sc)) = sq else { continue };
         let name = format!("_apitap_a{i}");
-        side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int64, nullable: true, rewritten: false, padded: false });
+        side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int64, nullable: true, rewritten: false, padded: false, ci: false });
         side.read.push(side.schema.len() - 1);
         side.computed.push((name, sql));
         let col = VExpr::Col(side.read.len() - 1, ArrowKind::Int64);
@@ -4270,6 +4321,13 @@ async fn join_pass(
     if let Some(c) = crate::pipeline::cpu_limit_cores() {
         let cap = probe_pipe_cap(c, &p.sides[ps], held, gate_density(&gates));
         parallel = Some(parallel.map_or(cap, |p| p.min(cap)));
+    }
+    // A probe gated to an eighth decodes an eighth: the memory model prices
+    // each pipe at a whole decode and gave TPC-H Q3/Q8/Q10 two or three
+    // pipes beside 88-101 MiB; at four they peaked at 174-198 MB of 256 and
+    // ran 12-23% faster.
+    if gate_density(&gates) <= 1.0 / 8.0 && held <= 112 << 20 {
+        parallel = parallel.map(|n| n.max(PROBE_MIN_PIPES));
     }
     // (APITAP_SQL_PROBE_PIPES=n: the probe's pipes, for measuring the rule.)
     if let Some(n) = std::env::var("APITAP_SQL_PROBE_PIPES").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
@@ -4955,7 +5013,7 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
             }
         };
         cols.push(col);
-        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: false });
+        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: false, ci: false });
     }
     Ok(SqlResult { schema, batch: ArrowBatch { rows: rows.len(), cols } })
 }
@@ -4965,7 +5023,7 @@ mod tests {
     use super::*;
 
     fn f(name: &str, kind: ArrowKind) -> ArrowField {
-        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false }
+        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false }
     }
 
     fn schemas() -> impl FnMut(&str, &str) -> Result<Vec<ArrowField>> {
@@ -5505,12 +5563,22 @@ mod tests {
     fn local_predicates_fold_and_pad() {
         assert!(matches!(lit(&sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {}).try_with_sql("1 + 10").unwrap().parse_expr().unwrap()), Some(Lit::Num(x)) if x == 11.0));
         let b = ArrowBatch { rows: 1, cols: vec![FinishedCol::Utf8 { validity: None, offsets: vec![0, 10], data: b"AIR       ".to_vec() }] };
-        let pe = PExpr::In(0, vec![Lit::Pad("AIR".into()), Lit::Pad("AIR REG".into())], false);
+        let pad = Coll { pad: true, ci: false };
+        let pe = PExpr::In(0, vec![Lit::Coll("AIR".into(), pad), Lit::Coll("AIR REG".into(), pad)], false);
         assert_eq!(peval(&pe, &b, 0, &[None]), Some(true), "CHAR(10) 'AIR' padded equals 'AIR'");
         let pe = PExpr::In(0, vec![Lit::Str("AIR".into())], false);
         assert_eq!(peval(&pe, &b, 0, &[None]), Some(false), "VARCHAR 'AIR       ' is not 'AIR'");
-        assert_eq!(peval(&PExpr::Like(0, "%R".into(), false, true), &b, 0, &[None]), Some(true), "CHAR LIKE ignores the padding");
-        assert_eq!(peval(&PExpr::Like(0, "%R".into(), false, false), &b, 0, &[None]), Some(false), "VARCHAR LIKE does not");
+        assert_eq!(peval(&PExpr::Like(0, "%R".into(), false, pad), &b, 0, &[None]), Some(true), "CHAR LIKE ignores the padding");
+        assert_eq!(peval(&PExpr::Like(0, "%R".into(), false, Coll::default()), &b, 0, &[None]), Some(false), "VARCHAR LIKE does not");
+        // A MySQL _ci column: case folds in =, <, IN and LIKE.
+        let ci = Coll { pad: false, ci: true };
+        let b = ArrowBatch { rows: 1, cols: vec![FinishedCol::Utf8 { validity: None, offsets: vec![0, 6], data: b"BRAZIL".to_vec() }] };
+        assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Coll("brazil".into(), ci)), &b, 0, &[None]), Some(true));
+        assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Str("brazil".into())), &b, 0, &[None]), Some(false), "a case-sensitive column does not fold");
+        assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Lt, Lit::Coll("canada".into(), ci)), &b, 0, &[None]), Some(true));
+        assert_eq!(peval(&PExpr::Like(0, "bra%".into(), false, ci), &b, 0, &[None]), Some(true));
+        let b = ArrowBatch { rows: 1, cols: vec![FinishedCol::Utf8 { validity: None, offsets: vec![0, "ÉCOLE".len() as i32], data: "ÉCOLE".as_bytes().to_vec() }] };
+        assert_eq!(peval(&PExpr::Cmp(0, BinaryOperator::Eq, Lit::Coll("école".into(), ci)), &b, 0, &[None]), Some(true), "non-ASCII case folds too");
     }
 
     /// TPC-H Q9: lineitem streams (it joins the most tables), orders builds
