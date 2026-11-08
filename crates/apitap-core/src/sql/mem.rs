@@ -54,34 +54,167 @@ fn stage_budget() -> u64 {
 impl MemTable {
     /// A stage of `batch`: written to disk chunk by chunk past the budget.
     pub(crate) fn new(schema: Vec<ArrowField>, batch: ArrowBatch) -> Result<MemTable> {
-        let rows = batch.rows;
-        if (batch.bytes() as u64) <= stage_budget() {
-            return Ok(MemTable { schema, rows, chunks: Chunks::Mem(batch) });
+        let mut w = Writer::new(schema);
+        w.push(batch)?;
+        w.finish()
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Each chunk in order, every column, read one at a time.
+    pub(crate) fn for_each(&self, f: &mut dyn FnMut(ArrowBatch) -> Result<()>) -> Result<()> {
+        match &self.chunks {
+            Chunks::Mem(b) if b.rows == 0 => Ok(()),
+            Chunks::Mem(b) => f(ArrowBatch { rows: b.rows, cols: b.cols.clone() }),
+            Chunks::Disk(path, at) => {
+                use std::io::{Read as _, Seek as _};
+                let io = |e: std::io::Error| Error::Transfer(format!("sql: stage file {}: {e}", path.display()));
+                let mut file = std::fs::File::open(path).map_err(io)?;
+                let all: Vec<usize> = (0..self.schema.len()).collect();
+                let mut buf = Vec::new();
+                for &(off, len) in at {
+                    buf.resize(len as usize, 0);
+                    file.seek(std::io::SeekFrom::Start(off)).and_then(|_| file.read_exact(&mut buf)).map_err(io)?;
+                    f(decode(&buf, &all)?)?;
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// The whole stage as one batch (a final answer the caller asked for).
+    pub(crate) fn into_batch(mut self) -> Result<ArrowBatch> {
+        if let Chunks::Mem(b) = &mut self.chunks {
+            return Ok(std::mem::replace(b, ArrowBatch { rows: 0, cols: Vec::new() }));
+        }
+        let mut parts = Vec::new();
+        self.for_each(&mut |b| {
+            parts.push(b);
+            Ok(())
+        })?;
+        concat_all(&parts.iter().collect::<Vec<_>>())
+    }
+}
+
+/// A stage written a batch at a time (a query answered in parts, a LEFT
+/// JOIN's two halves): in memory up to [`stage_budget`], then chunks on
+/// disk, so the whole never sits in memory (TPC-H Q13 sf10: 9.9M groups
+/// in 16 parts died concatenating them).
+pub(crate) struct Writer {
+    schema: Vec<ArrowField>,
+    rows: usize,
+    mem: Vec<ArrowBatch>,
+    mem_bytes: u64,
+    budget: u64,
+    like: Option<Vec<FinishedCol>>,
+    disk: Option<Spill>,
+}
+
+struct Spill {
+    path: std::path::PathBuf,
+    file: std::io::BufWriter<std::fs::File>,
+    at: Vec<(u64, u64)>,
+    off: u64,
+    buf: Vec<u8>,
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Some(s) = &self.disk {
+            let _ = std::fs::remove_file(&s.path);
+        }
+    }
+}
+
+impl Writer {
+    pub(crate) fn new(schema: Vec<ArrowField>) -> Writer {
+        Writer { schema, rows: 0, mem: Vec::new(), mem_bytes: 0, budget: stage_budget(), like: None, disk: None }
+    }
+
+    /// Straight to disk (a join's spilled probe rows, several at once).
+    pub(crate) fn on_disk(schema: Vec<ArrowField>) -> Writer {
+        let mut w = Writer::new(schema);
+        w.budget = 0;
+        w
+    }
+
+    /// Empty columns of the variants written so far (`None` before any).
+    pub(crate) fn like(&self) -> Option<&[FinishedCol]> {
+        self.like.as_deref()
+    }
+
+    pub(crate) fn push(&mut self, b: ArrowBatch) -> Result<()> {
+        if self.like.is_none() {
+            self.like = Some(b.cols.iter().map(empty_like).collect());
+        } else if b.rows == 0 {
+            return Ok(());
+        }
+        if b.cols.len() != self.schema.len() {
+            return Err(Error::InvalidInput("sql: internal: a stage part differs in columns".into()));
+        }
+        self.rows += b.rows;
+        if self.disk.is_none() {
+            self.mem_bytes += b.bytes() as u64;
+            self.mem.push(b);
+            if self.mem_bytes <= self.budget {
+                return Ok(());
+            }
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!("apitap-stage-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+            let file = std::fs::File::create(&path).map_err(|e| Error::Transfer(format!("sql: stage file {}: {e}", path.display())))?;
+            self.disk = Some(Spill { path, file: std::io::BufWriter::new(file), at: Vec::new(), off: 0, buf: Vec::new() });
+            self.mem_bytes = 0;
+            for b in std::mem::take(&mut self.mem) {
+                self.write(&b)?;
+            }
+            return Ok(());
+        }
+        self.write(&b)
+    }
+
+    fn write(&mut self, b: &ArrowBatch) -> Result<()> {
         use std::io::Write as _;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!("apitap-stage-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-        let io = |e: std::io::Error| Error::Transfer(format!("sql: stage file {}: {e}", path.display()));
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).map_err(io)?);
-        let mut at = Vec::new();
-        let mut off = 0u64;
-        let mut buf = Vec::new();
+        let s = self.disk.as_mut().expect("spilling");
+        let io = |e: std::io::Error| Error::Transfer(format!("sql: stage file {}: {e}", s.path.display()));
         let mut r = 0;
-        while r < rows {
-            let n = CHUNK.min(rows - r);
-            let idx: Vec<usize> = (r..r + n).collect();
-            let c = take_rows(&batch, &idx);
-            buf.clear();
-            encode(&c, &mut buf);
-            f.write_all(&buf).map_err(io)?;
-            at.push((off, buf.len() as u64));
-            off += buf.len() as u64;
+        while r < b.rows {
+            let n = CHUNK.min(b.rows - r);
+            s.buf.clear();
+            if r == 0 && n == b.rows {
+                encode(b, &mut s.buf);
+            } else {
+                let idx: Vec<usize> = (r..r + n).collect();
+                encode(&take_rows(b, &idx), &mut s.buf);
+            }
+            s.file.write_all(&s.buf).map_err(io)?;
+            s.at.push((s.off, s.buf.len() as u64));
+            s.off += s.buf.len() as u64;
             r += n;
         }
-        f.flush().map_err(io)?;
-        drop(batch);
-        Ok(MemTable { schema, rows, chunks: Chunks::Disk(path, at) })
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<MemTable> {
+        let schema = std::mem::take(&mut self.schema);
+        let rows = self.rows;
+        if let Some(mut s) = self.disk.take() {
+            use std::io::Write as _;
+            if let Err(e) = s.file.flush() {
+                let _ = std::fs::remove_file(&s.path);
+                return Err(Error::Transfer(format!("sql: stage file {}: {e}", s.path.display())));
+            }
+            return Ok(MemTable { schema, rows, chunks: Chunks::Disk(s.path, s.at) });
+        }
+        let parts = std::mem::take(&mut self.mem);
+        let batch = match parts.len() {
+            0 => ArrowBatch { rows: 0, cols: self.like.take().unwrap_or_default() },
+            1 => parts.into_iter().next().expect("one part"),
+            _ => concat_all(&parts.iter().collect::<Vec<_>>())?,
+        };
+        Ok(MemTable { schema, rows, chunks: Chunks::Mem(batch) })
     }
 }
 
@@ -417,7 +550,13 @@ pub(crate) fn repeat(b: &ArrowBatch, counts: &[usize], limit: Option<usize>) -> 
         }
         rows += n;
     }
-    for c in &mut cols {
+    tidy(&mut cols, rows);
+    ArrowBatch { rows, cols }
+}
+
+/// Bitmaps sized to `rows` (validity `None` when every row is valid).
+fn tidy(cols: &mut [FinishedCol], rows: usize) {
+    for c in cols.iter_mut() {
         let v = match c {
             FinishedCol::I16 { validity, .. }
             | FinishedCol::I32 { validity, .. }
@@ -437,12 +576,11 @@ pub(crate) fn repeat(b: &ArrowBatch, counts: &[usize], limit: Option<usize>) -> 
             }
         }
     }
-    for c in &mut cols {
+    for c in cols.iter_mut() {
         if let FinishedCol::Bool { data, .. } = c {
             data.resize(rows.div_ceil(8), 0);
         }
     }
-    ArrowBatch { rows, cols }
 }
 
 /// `n` zeros in `like`'s variant (a COUNT over no rows).
@@ -473,7 +611,6 @@ pub(crate) fn nulls_like(like: &FinishedCol, n: usize) -> FinishedCol {
     }
 }
 
-/// `a`'s rows then `b`'s, column by column (the same variants).
 /// The rows `idx` of `b`, in that order.
 pub(crate) fn take_rows(b: &ArrowBatch, idx: &[usize]) -> ArrowBatch {
     let mut cols: Vec<FinishedCol> = b.cols.iter().map(empty_like).collect();
@@ -486,31 +623,28 @@ pub(crate) fn take_rows(b: &ArrowBatch, idx: &[usize]) -> ArrowBatch {
     ArrowBatch { rows: idx.len(), cols }
 }
 
-pub(crate) fn concat(a: &ArrowBatch, b: &ArrowBatch) -> Result<ArrowBatch> {
-    if a.cols.len() != b.cols.len() {
-        return Err(Error::InvalidInput("sql: internal: concatenated parts differ in columns".into()));
+/// The batches' rows one after another (the same column variants).
+pub(crate) fn concat_all(bs: &[&ArrowBatch]) -> Result<ArrowBatch> {
+    let Some(first) = bs.first() else { return Err(Error::InvalidInput("sql: internal: nothing to concatenate".into())) };
+    let mut cols: Vec<FinishedCol> = first.cols.iter().map(empty_like).collect();
+    let mut rows = 0usize;
+    for b in bs {
+        if b.cols.len() != cols.len() {
+            return Err(Error::InvalidInput("sql: internal: concatenated parts differ in columns".into()));
+        }
+        for (o, c) in cols.iter_mut().zip(&b.cols) {
+            if std::mem::discriminant(o) != std::mem::discriminant(c) {
+                return Err(Error::InvalidInput("sql: internal: concatenated parts differ in column types".into()));
+            }
+            let mut at = rows;
+            for r in 0..b.rows {
+                push_rep(o, c, r, 1, &mut at);
+            }
+        }
+        rows += b.rows;
     }
-    let mut ones = vec![1usize; a.rows];
-    ones.extend(std::iter::repeat_n(1usize, b.rows));
-    let mut cols = Vec::with_capacity(a.cols.len());
-    for (x, y) in a.cols.iter().zip(&b.cols) {
-        if std::mem::discriminant(x) != std::mem::discriminant(y) {
-            return Err(Error::InvalidInput("sql: internal: concatenated parts differ in column types".into()));
-        }
-        let mut o = empty_like(x);
-        let mut at = 0usize;
-        for r in 0..a.rows {
-            push_rep(&mut o, x, r, 1, &mut at);
-        }
-        for r in 0..b.rows {
-            push_rep(&mut o, y, r, 1, &mut at);
-        }
-        cols.push(o);
-    }
-    let mut out = ArrowBatch { rows: a.rows + b.rows, cols };
-    // Normalise the bitmaps the way `repeat` does.
-    out = repeat(&out, &ones[..out.rows], None);
-    Ok(out)
+    tidy(&mut cols, rows);
+    Ok(ArrowBatch { rows, cols })
 }
 
 #[cfg(test)]
@@ -545,5 +679,54 @@ mod tests {
             FinishedCol::I64 { validity: None, data: vec![i64::MIN, 0, i64::MAX] },
         ]);
         assert!(decode(&w[..w.len() - 1], &all).is_err(), "a torn chunk is an error");
+    }
+
+    fn part(from: i64, n: usize) -> ArrowBatch {
+        let keys: Vec<i64> = (from..from + n as i64).collect();
+        let mut off = vec![0i32];
+        let mut data = Vec::new();
+        for k in &keys {
+            data.extend_from_slice(format!("k{k}").as_bytes());
+            off.push(data.len() as i32);
+        }
+        ArrowBatch { rows: n, cols: vec![FinishedCol::I64 { validity: None, data: keys }, FinishedCol::Utf8 { validity: None, offsets: off, data }] }
+    }
+
+    /// Parts written past the budget land on disk and read back as the
+    /// rows written, in order; under it they stay one batch in memory.
+    #[test]
+    fn stage_writer_spills_parts_in_order() {
+        let schema = vec![
+            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
+            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
+        ];
+        let want = concat_all(&[&part(0, 3), &part(3, 0), &part(3, 70000), &part(70003, 5)]).unwrap();
+        for budget in [u64::MAX, 1024] {
+            let mut w = Writer::new(schema.clone());
+            w.budget = budget;
+            for p in [part(0, 3), part(3, 0), part(3, 70000), part(70003, 5)] {
+                w.push(p).unwrap();
+            }
+            assert_eq!(w.like().unwrap().len(), 2);
+            let t = w.finish().unwrap();
+            assert_eq!(t.rows(), 70008);
+            let disk = matches!(&t.chunks, Chunks::Disk(..));
+            assert_eq!(disk, budget == 1024, "budget {budget}");
+            let path = match &t.chunks {
+                Chunks::Disk(p, _) => Some(p.clone()),
+                Chunks::Mem(_) => None,
+            };
+            let mut n = 0;
+            t.for_each(&mut |b| {
+                n += b.rows;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(n, 70008);
+            assert_eq!(t.into_batch().unwrap(), want, "budget {budget}");
+            if let Some(p) = path {
+                assert!(!p.exists(), "the stage file goes with its table");
+            }
+        }
     }
 }

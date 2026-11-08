@@ -351,11 +351,16 @@ fn literal(r: &SqlResult) -> Result<Expr> {
 }
 
 impl Stager {
-    fn put(&mut self, hint: &str, r: SqlResult) -> Result<String> {
+    fn put(&mut self, hint: &str, r: Answer) -> Result<String> {
         self.n += 1;
         let name = format!("st{}_{}", self.n, hint.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(24).collect::<String>());
-        self.run.put(&name, mem::MemTable::new(r.schema, r.batch)?);
+        self.run.put(&name, r.into_table()?);
         Ok(name)
+    }
+
+    /// The answer as rows (a scalar subquery, the query's own answer).
+    async fn answer(&mut self, q: Query) -> Result<SqlResult> {
+        self.answer_out(q).await?.into_result()
     }
 
     /// The column names of the table `tf` names, probed once.
@@ -480,7 +485,8 @@ impl Stager {
     }
 
     /// The answer of `q`, its parts staged as needed.
-    fn answer(&mut self, q: Query) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SqlResult>> + '_>> {
+    /// The answer, left a stage table when it came in parts.
+    fn answer_out(&mut self, q: Query) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Answer>> + '_>> {
         Box::pin(async move {
             let mut q = q;
             if let Some(w) = q.with.take() {
@@ -490,8 +496,8 @@ impl Stager {
                 for cte in w.cte_tables {
                     let mut cq = *cte.query;
                     self.point_ctes(&mut cq);
-                    let mut r = self.answer(cq).await?;
-                    rename(&mut r, &cte.alias)?;
+                    let mut r = self.answer_out(cq).await?;
+                    rename(r.schema_mut(), &cte.alias)?;
                     let st = self.put(&cte.alias.name.value, r)?;
                     self.ctes.insert(cte.alias.name.value.to_ascii_lowercase(), st);
                 }
@@ -538,10 +544,13 @@ impl Stager {
             }
             let text = out.to_string();
             if super::dbg() {
-                eprintln!("[sql] stage query: {text}");
+                eprintln!("[sql] stage query ({} MiB resident, {} anon): {text}", semi::rss_bytes().unwrap_or(0) >> 20, semi::anon_bytes().unwrap_or(0) >> 20);
+            }
+            if post.repeat.is_none() {
+                return super::run_one_out(&text, &self.sources).await;
             }
             let r = super::run_one(&text, &self.sources).await?;
-            apply(r, post)
+            apply(r, post).map(Answer::Rows)
         })
     }
 
@@ -560,10 +569,10 @@ impl Stager {
             for tf in rels {
                 let TableFactor::Derived { subquery, alias, .. } = tf else { continue };
                 if stage_derived {
-                    let mut r = self.answer((**subquery).clone()).await?;
+                    let mut r = self.answer_out((**subquery).clone()).await?;
                     let nm = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| "derived".into());
                     if let Some(a) = alias.as_ref() {
-                        rename(&mut r, a)?;
+                        rename(r.schema_mut(), a)?;
                     }
                     let st = self.put(&nm, r)?;
                     *tf = TableFactor::Table {
@@ -621,15 +630,16 @@ impl Stager {
                 joins.push((tf, eqs));
                 continue;
             }
-            let r = self.answer(q).await?;
             if is_in {
-                if r.schema.len() != 1 {
+                let r = self.answer_out(q).await?;
+                if r.schema().len() != 1 {
                     return Err(bad("an IN subquery must return one column"));
                 }
-                let col = r.schema[0].name.clone();
+                let col = r.schema()[0].name.clone();
                 let st = self.put("in", r)?;
                 keys.insert(text, parse_query(&format!("SELECT {col} FROM {STAGE_SRC}.{st}"))?);
             } else {
+                let r = self.answer(q).await?;
                 done.insert(text, literal(&r)?);
             }
         }
@@ -754,7 +764,7 @@ impl Stager {
                     let from = sel.from.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
                     let wh = if rest.is_empty() { String::new() } else { format!(" WHERE {}", rest.join(" AND ")) };
                     let q = parse_query(&format!("SELECT {ok} AS __k, COUNT(*) AS __n FROM {from}{wh} GROUP BY {ok}"))?;
-                    let r = self.answer(q).await?;
+                    let r = self.answer_out(q).await?;
                     let st = self.put("keys", r)?;
                     magic.insert(mtext, st.clone());
                     st
@@ -946,7 +956,7 @@ impl Stager {
             if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh.join(" AND ")) },
             gby.join(", ")
         );
-        let r = self.answer(parse_query(&text)?).await?;
+        let r = self.answer_out(parse_query(&text)?).await?;
         let st = self.put("corr", r)?;
         self.n += 1;
         let alias = format!("__sq{}", self.n);
@@ -997,7 +1007,7 @@ impl Stager {
     /// (TPC-H Q13): the inner join's groups, and P's rows without a match
     /// (`NOT EXISTS`) grouped with N's values NULL: COUNT(n…) 0, COUNT(*)
     /// their rows, any other aggregate of N NULL.
-    async fn left_join(&mut self, sel: &Select, order_by: &Option<sqlparser::ast::OrderBy>, limit: &Option<Expr>) -> Result<Option<SqlResult>> {
+    async fn left_join(&mut self, sel: &Select, order_by: &Option<sqlparser::ast::OrderBy>, limit: &Option<Expr>) -> Result<Option<Answer>> {
         let mut lj = None;
         for (fi, f) in sel.from.iter().enumerate() {
             for (ji, j) in f.joins.iter().enumerate() {
@@ -1097,7 +1107,7 @@ impl Stager {
         let mut inner = sel.clone();
         inner.from[0].joins[0].join_operator = JoinOperator::Join(JoinConstraint::On(on.clone()));
         inner.projection = exprs.iter().zip(&names).map(|(e, n)| SelectItem::ExprWithAlias { expr: e.clone(), alias: Ident::new(n.clone()) }).collect();
-        let a = self.answer(Query { body: Box::new(SetExpr::Select(Box::new(inner))), ..empty_query() }).await?;
+        let a = self.answer_out(Query { body: Box::new(SetExpr::Select(Box::new(inner))), ..empty_query() }).await?;
         // The unmatched rows of P, grouped.
         let mut sub_where = vec![format!("{nk} = {pk}")];
         sub_where.extend(ncond.iter().map(|c| c.to_string()));
@@ -1109,34 +1119,39 @@ impl Stager {
         let gl = gby.iter().map(|g| g.to_string()).collect::<Vec<_>>();
         let gsel = gl.iter().enumerate().map(|(i, g)| format!("{g} AS __g{i}")).collect::<Vec<_>>().join(", ");
         let bq = parse_query(&format!("SELECT {gsel}, COUNT(*) AS __cnt FROM {pt} WHERE {wh} GROUP BY {}", gl.join(", ")))?;
-        let b = self.answer(bq).await?;
-        let cnt = b.schema.len() - 1;
-        let mut cols = Vec::new();
-        for (k, f) in fills.iter().enumerate() {
-            let like = &a.batch.cols[k];
-            cols.push(match f {
-                Fill::Group(g) => b.batch.cols[*g].clone(),
-                Fill::Rows => b.batch.cols[cnt].clone(),
-                Fill::Zero => mem::zeros_like(like, b.batch.rows),
-                Fill::Null => mem::nulls_like(like, b.batch.rows),
-            });
-        }
-        let bb = ArrowBatch { rows: b.batch.rows, cols };
-        let batch = mem::concat(&a.batch, &bb)?;
-        let mut r = SqlResult { schema: a.schema, batch };
+        let b = self.answer_out(bq).await?;
+        let cnt = b.schema().len() - 1;
+        // Both halves into one stage table, a batch at a time (TPC-H Q13
+        // sf10: 6.6M matched and 3.3M unmatched customers).
+        let mut w = mem::Writer::new(a.schema().to_vec());
+        a.for_each(&mut |x| w.push(x))?;
+        let like: Vec<FinishedCol> = w.like().ok_or_else(|| bad("internal: the LEFT JOIN's matched half has no columns"))?.to_vec();
+        b.for_each(&mut |mut x| {
+            let mut cols = Vec::new();
+            for (k, f) in fills.iter().enumerate() {
+                cols.push(match f {
+                    Fill::Group(g) => std::mem::replace(&mut x.cols[*g], mem::zeros_like(&like[k], 0)),
+                    Fill::Rows => std::mem::replace(&mut x.cols[cnt], mem::zeros_like(&like[k], 0)),
+                    Fill::Zero => mem::zeros_like(&like[k], x.rows),
+                    Fill::Null => mem::nulls_like(&like[k], x.rows),
+                });
+            }
+            w.push(ArrowBatch { rows: x.rows, cols })
+        })?;
+        let mut r = Answer::Table(w.finish()?);
         if order_by.is_some() || limit.is_some() {
             let st = self.put("leftjoin", r)?;
             let order = order_by.as_ref().map(|o| format!(" {}", rewrite_order(o, &exprs, &names))).unwrap_or_default();
             let lim = limit.as_ref().map(|l| format!(" LIMIT {l}")).unwrap_or_default();
             let cols = names.iter().map(|n| quote_ident(n)).collect::<Vec<_>>().join(", ");
-            r = self.answer(parse_query(&format!("SELECT {cols} FROM {STAGE_SRC}.{st}{order}{lim}"))?).await?;
+            r = self.answer_out(parse_query(&format!("SELECT {cols} FROM {STAGE_SRC}.{st}{order}{lim}"))?).await?;
         }
         Ok(Some(r))
     }
 
     /// `HAVING h`: the grouping staged (h's aggregates as hidden columns),
     /// then the stage filtered by h.
-    async fn having(&mut self, mut sel: Select, order_by: Option<sqlparser::ast::OrderBy>, limit: Option<Expr>) -> Result<SqlResult> {
+    async fn having(&mut self, mut sel: Select, order_by: Option<sqlparser::ast::OrderBy>, limit: Option<Expr>) -> Result<Answer> {
         let h = sel.having.take().expect("HAVING");
         let names: Vec<String> = sel.projection.iter().enumerate().map(|(i, it)| item_name(it, i)).collect();
         let exprs: Vec<Expr> = sel.projection.iter().map(|it| item_expr(it).cloned()).collect::<Result<_>>()?;
@@ -1165,17 +1180,17 @@ impl Stager {
             .chain(hidden.iter().map(|(n, e)| SelectItem::ExprWithAlias { expr: e.clone(), alias: Ident::new(n.clone()) }))
             .collect();
         let inner = Query { body: Box::new(SetExpr::Select(Box::new(sel))), ..empty_query() };
-        let r = self.answer(inner).await?;
+        let r = self.answer_out(inner).await?;
         let st = self.put("having", r)?;
         let order = order_by.map(|o| format!(" {}", rewrite_order(&o, &exprs, &names))).unwrap_or_default();
         let lim = limit.map(|l| format!(" LIMIT {l}")).unwrap_or_default();
         let cols = names.iter().map(|n| quote_ident(n)).collect::<Vec<_>>().join(", ");
         let q = parse_query(&format!("SELECT {cols} FROM {STAGE_SRC}.{st} WHERE {h2}{order}{lim}"))?;
-        self.answer(q).await
+        self.answer_out(q).await
     }
 
     /// `COUNT(DISTINCT x) … GROUP BY g`: (g, x) staged, then counted per g.
-    async fn count_distinct(&mut self, sel: Select, order_by: Option<sqlparser::ast::OrderBy>, limit: Option<Expr>) -> Result<SqlResult> {
+    async fn count_distinct(&mut self, sel: Select, order_by: Option<sqlparser::ast::OrderBy>, limit: Option<Expr>) -> Result<Answer> {
         let names: Vec<String> = sel.projection.iter().enumerate().map(|(i, it)| item_name(it, i)).collect();
         let exprs: Vec<Expr> = sel.projection.iter().map(|it| item_expr(it).cloned()).collect::<Result<_>>()?;
         let mut arg: Option<Expr> = None;
@@ -1233,7 +1248,7 @@ impl Stager {
             Some(w) => Expr::BinaryOp { left: Box::new(Expr::Nested(Box::new(w))), op: BinaryOperator::And, right: Box::new(notnull) },
             None => notnull,
         });
-        let r = self.answer(Query { body: Box::new(SetExpr::Select(Box::new(s1))), ..empty_query() }).await?;
+        let r = self.answer_out(Query { body: Box::new(SetExpr::Select(Box::new(s1))), ..empty_query() }).await?;
         let st = self.put("distinct", r)?;
         let mut items = Vec::new();
         for (e, n) in exprs.iter().zip(&names) {
@@ -1252,7 +1267,7 @@ impl Stager {
         let order = order_by.map(|o| format!(" {}", rewrite_order(&o, &exprs, &names))).unwrap_or_default();
         let lim = limit.map(|l| format!(" LIMIT {l}")).unwrap_or_default();
         let q = parse_query(&format!("SELECT {} FROM {STAGE_SRC}.{st}{group}{order}{lim}", items.join(", ")))?;
-        self.answer(q).await
+        self.answer_out(q).await
     }
 }
 
@@ -1296,14 +1311,14 @@ fn empty_query() -> Query {
 }
 
 /// A stage's columns named by its alias's column list (`AS t (a, b)`).
-fn rename(r: &mut SqlResult, a: &TableAlias) -> Result<()> {
+fn rename(schema: &mut [ArrowField], a: &TableAlias) -> Result<()> {
     if a.columns.is_empty() {
         return Ok(());
     }
-    if a.columns.len() != r.schema.len() {
-        return Err(bad(format!("{} names {} columns, its query gives {}", a.name, a.columns.len(), r.schema.len())));
+    if a.columns.len() != schema.len() {
+        return Err(bad(format!("{} names {} columns, its query gives {}", a.name, a.columns.len(), schema.len())));
     }
-    for (f, c) in r.schema.iter_mut().zip(&a.columns) {
+    for (f, c) in schema.iter_mut().zip(&a.columns) {
         f.name = c.name.value.clone();
     }
     Ok(())

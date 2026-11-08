@@ -8,14 +8,18 @@ use std::sync::{Arc, OnceLock};
 
 /// The keys a subquery gave (and whether a NULL was among them).
 #[derive(Clone, Default)]
+/// Shared, not copied, by the subqueries that read the same keys (`sig`).
 pub(super) struct KeySet {
     lo: i64,
-    bits: Vec<u64>,
-    hash: Option<std::collections::HashSet<i64, foldhash::fast::RandomState>>,
+    bits: Arc<Vec<u64>>,
+    hash: Option<Arc<std::collections::HashSet<i64, foldhash::fast::RandomState>>>,
     null: bool,
     /// Per key, the least and greatest value of the compared column (a
     /// correlation `inner.c <> outer.c`, `Semi::cmp`).
-    mm: Option<HashMap<i64, (i64, i64), foldhash::fast::RandomState>>,
+    mm: Option<Arc<HashMap<i64, (i64, i64), foldhash::fast::RandomState>>>,
+    /// The bitmap widens to the keys as they come (no range asked of the
+    /// server first), a hash set past [`BITS_MAX`].
+    grow: bool,
 }
 
 /// Key ranges this wide are a bitmap (64 MiB at the cap).
@@ -26,10 +30,43 @@ impl KeySet {
         match kr {
             Kr::Known(lo, hi) if u64::try_from(hi as i128 - lo as i128 + 1).is_ok_and(|n| n <= BITS_MAX) => {
                 let n = (hi as i128 - lo as i128 + 1) as usize;
-                KeySet { lo, bits: vec![0; n.div_ceil(64)], hash: None, null: false, mm: None }
+                KeySet { lo, bits: Arc::new(vec![0; n.div_ceil(64)]), hash: None, null: false, mm: None, grow: false }
             }
-            _ => KeySet { lo: 0, bits: Vec::new(), hash: Some(Default::default()), null: false, mm: None },
+            _ => KeySet { lo: 0, bits: Arc::new(Vec::new()), hash: Some(Default::default()), null: false, mm: None, grow: false },
         }
+    }
+
+    /// A set whose bitmap covers the keys it is given: a subquery's key
+    /// range asked of its server is a full scan when no index leads the key
+    /// (TPC-H Q13's o_custkey: MIN/MAX over 69M MySQL rows, 30 s, twice).
+    fn growing() -> KeySet {
+        KeySet { lo: 0, bits: Arc::new(Vec::new()), hash: None, null: false, mm: None, grow: true }
+    }
+
+    /// Widen the bitmap to hold `k`: at least double, toward `k`, on 64-key
+    /// words; past [`BITS_MAX`] keys wide, a hash set of the keys so far.
+    fn widen(&mut self, k: i64) {
+        let words = self.bits.len() as i128;
+        let kw = (k as i128).div_euclid(64);
+        let (lo_w, hi_w) = if words == 0 { (kw, kw + 1) } else { ((self.lo as i128).div_euclid(64), (self.lo as i128).div_euclid(64) + words) };
+        let grow = words.max(1024);
+        let (nlo, nhi) = if kw < lo_w { ((kw).min(lo_w - grow), hi_w) } else { (lo_w, (kw + 1).max(hi_w + grow)) };
+        let fits = (nhi - nlo) * 64 <= BITS_MAX as i128 && nlo * 64 >= i64::MIN as i128 && nhi * 64 <= i64::MAX as i128;
+        if !fits {
+            let mut h: std::collections::HashSet<i64, foldhash::fast::RandomState> = Default::default();
+            self.for_each_key(|x| {
+                h.insert(x);
+            });
+            self.hash = Some(Arc::new(h));
+            self.bits = Arc::new(Vec::new());
+            self.lo = 0;
+            return;
+        }
+        let mut v = vec![0u64; (nhi - nlo) as usize];
+        let at = (lo_w - nlo) as usize;
+        v[at..at + words as usize].copy_from_slice(&self.bits);
+        self.bits = Arc::new(v);
+        self.lo = (nlo * 64) as i64;
     }
 
     fn slot(&self, k: i64) -> Option<usize> {
@@ -38,16 +75,41 @@ impl KeySet {
     }
 
     fn insert(&mut self, k: i64) -> Result<()> {
+        // Unshared while it is read (`keys` owns it until it is done).
         match &mut self.hash {
             Some(h) => {
-                h.insert(k);
+                Arc::make_mut(h).insert(k);
             }
             None => {
-                let i = self.slot(k).ok_or_else(|| bad("a subquery key past the range its server gave"))?;
-                self.bits[i / 64] |= 1 << (i % 64);
+                let i = match self.slot(k) {
+                    Some(i) => i,
+                    None if self.grow => {
+                        self.widen(k);
+                        return self.insert(k);
+                    }
+                    None => return Err(bad("a subquery key past the range its server gave")),
+                };
+                Arc::make_mut(&mut self.bits)[i / 64] |= 1 << (i % 64);
             }
         }
         Ok(())
+    }
+
+    /// Every key (not the NULL), in no order.
+    fn for_each_key(&self, mut f: impl FnMut(i64)) {
+        match &self.hash {
+            Some(h) => h.iter().for_each(|&k| f(k)),
+            None => {
+                for (w, &bits) in self.bits.iter().enumerate() {
+                    let mut b = bits;
+                    while b != 0 {
+                        let i = b.trailing_zeros() as usize;
+                        f(self.lo + (w * 64 + i) as i64);
+                        b &= b - 1;
+                    }
+                }
+            }
+        }
     }
 
     #[inline]
@@ -225,12 +287,49 @@ impl Sums {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn keys(sub: &Sub, not_in: bool, cmp: Option<usize>) -> Result<KeySet> {
     let kname = sub.side.schema[sub.side.read[sub.key]].name.clone();
-    let (kr, parts) = key_range_of(sub.side.dialect, sub.side.name.clone(), sub.side.url.clone(), sub.side.table.clone(), kname.clone()).await?;
-    let mut set = KeySet::over(kr);
+    // Only a HAVING's groups need the key range up front (its passes split
+    // it); a plain set widens to its keys as they come.
+    let (kr, parts) = if sub.having.is_some() {
+        key_range_of(sub.side.dialect, sub.side.name.clone(), sub.side.url.clone(), sub.side.table.clone(), kname.clone()).await?
+    } else {
+        (Kr::Unknown, Vec::new())
+    };
+    let mut set = if sub.having.is_some() { KeySet::over(kr) } else { KeySet::growing() };
     let tys = side_tys(&sub.side);
+    // Pipes for what the memory leaves beside what the process holds now
+    // (the sets read before this one among it): an automatic pick prices
+    // the whole cgroup as free, and TPC-H Q21 sf10 was OOM-killed reading
+    // l3's least and greatest l_suppkey per order beside l2's.
+    // The decoder's gate: the keys of the subqueries narrowing this one
+    // (TPC-H Q21's l2 and l3 by the 700K orders of l1's magic set, of 15M):
+    // a row they drop is one `local_ok` would drop, before it decodes.
+    let gates = narrowing_gates(&sub.side);
+    let density = gate_density(&gates);
+    let free_pipes = || -> Option<usize> {
+        let m = crate::pipeline::mem_limit_bytes()?;
+        let held = rss_bytes().unwrap_or(m / 4);
+        let mut n = crate::read_impl::read_pipes_for(m.saturating_sub(held + PROBE_HEADROOM));
+        // As a probe's: no more pipes than the cores decode (Q21 sf10 at
+        // four beside 93 MiB was OOM-killed, the sockets' kernel memory
+        // charged to the cage too).
+        if let Some(c) = crate::pipeline::cpu_limit_cores() {
+            n = n.min(probe_pipe_cap(c, &sub.side, held, density));
+        }
+        let n = n.clamp(1, SERVER_SCAN_PIPES);
+        if dbg() {
+            eprintln!(
+                "[sql] subquery over {}: {n} pipe(s), {} MiB held ({} anon) of {} MiB, gate density {density:.3}",
+                sub.side.name,
+                held >> 20,
+                anon_bytes().unwrap_or(0) >> 20,
+                m >> 20
+            );
+        }
+        Some(n)
+    };
     if let Some(ic) = cmp {
         let mut mm: HashMap<i64, (i64, i64), foldhash::fast::RandomState> = HashMap::default();
-        let mut rd = open(&sub.side, None, None).await?;
+        let mut rd = open_gated(&sub.side, None, free_pipes(), None, gates.clone()).await?;
         while let Some(b) = rd.recv().await? {
             for r in 0..b.rows {
                 if !local_ok(&sub.side, &tys, &b, r) {
@@ -243,11 +342,11 @@ async fn keys(sub: &Sub, not_in: bool, cmp: Option<usize>) -> Result<KeySet> {
         if dbg() {
             eprintln!("[sql] subquery over {}: {} keys with their least and greatest {}", sub.side.name, mm.len(), sub.side.schema[sub.side.read[ic]].name);
         }
-        set.mm = Some(mm);
+        set.mm = Some(Arc::new(mm));
         return Ok(set);
     }
     let Some(h) = &sub.having else {
-        let mut rd = open(&sub.side, None, None).await?;
+        let mut rd = open_gated(&sub.side, None, free_pipes(), None, gates.clone()).await?;
         while let Some(b) = rd.recv().await? {
             for r in 0..b.rows {
                 if !local_ok(&sub.side, &tys, &b, r) {
@@ -389,6 +488,43 @@ async fn keys(sub: &Sub, not_in: bool, cmp: Option<usize>) -> Result<KeySet> {
     Ok(set)
 }
 
+/// Gates over `side`'s key columns from its loaded `IN` / `EXISTS` key
+/// sets (not NOT, not a comparison's: those keep rows a gate would drop).
+fn narrowing_gates(side: &Side) -> Vec<Arc<KeyGate>> {
+    let mut out = Vec::new();
+    for n in &side.semis {
+        if n.anti || n.not_in || n.cmp.is_some() {
+            continue;
+        }
+        let Some(set) = n.set.get() else { continue };
+        let (mut lo, mut hi, mut cnt) = (i64::MAX, i64::MIN, 0u64);
+        set.for_each_key(|k| {
+            lo = lo.min(k);
+            hi = hi.max(k);
+            cnt += 1;
+        });
+        if cnt == 0 {
+            continue;
+        }
+        out.extend(gate_of(side, n.col, lo, hi, cnt, |g| set.for_each_key(|k| g.set(k))));
+    }
+    out
+}
+
+/// The process's resident bytes (`/proc/self/statm`), where there is one.
+pub(super) fn rss_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
+}
+
+/// The anonymous part of [`rss_bytes`] (heap, stacks), for the debug lines.
+pub(super) fn anon_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: u64 = s.lines().find_map(|l| l.strip_prefix("RssAnon:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kb << 10)
+}
+
 /// Every subquery of the plan read into its key set, before any row of the
 /// tables they filter.
 pub(super) async fn load(p: &Plan) -> Result<()> {
@@ -396,10 +532,19 @@ pub(super) async fn load(p: &Plan) -> Result<()> {
     if let Some(st) = &p.star {
         all.extend(st.dims.iter().flat_map(|d| d.side.semis.iter()));
     }
-    for s in all {
-        load_one(s).await?;
+    let go = async {
+        for s in all {
+            load_one(s).await?;
+        }
+        Ok(())
+    };
+    // The same keys read once per plan (TPC-H Q21: l2's and l3's narrowing
+    // set), or once per query answered in parts, whose scope is outside.
+    if KEY_CACHE.try_with(|_| ()).is_ok() {
+        go.await
+    } else {
+        KEY_CACHE.scope(std::cell::RefCell::new(HashMap::new()), go).await
     }
-    Ok(())
 }
 
 /// One subquery's keys, its own subqueries' (which narrow it) first.
@@ -409,9 +554,23 @@ fn load_one(s: &Semi) -> std::pin::Pin<Box<dyn std::future::Future<Output = Resu
             load_one(n).await?;
         }
         if s.set.get().is_none() {
+            let sig = sig(s);
+            if let Some(set) = sig.as_ref().and_then(|k| KEY_CACHE.try_with(|c| c.borrow().get(k).cloned()).ok().flatten()) {
+                if dbg() {
+                    eprintln!("[sql] subquery over {}: keys from an earlier part", s.sub.side.name);
+                }
+                let _ = s.set.set(set);
+                return Ok(());
+            }
             let set = keys(&s.sub, s.not_in, s.cmp.map(|c| c.1)).await?;
+            // The read's buffers back to the system before the next read
+            // prices its pipes by what the process holds.
+            crate::trim_heap();
             if dbg() {
                 eprintln!("[sql] subquery over {}: keys read", s.sub.side.name);
+            }
+            if let Some(k) = sig {
+                let _ = KEY_CACHE.try_with(|c| c.borrow_mut().insert(k, set.clone()));
             }
             let _ = s.set.set(set);
         }
@@ -419,9 +578,76 @@ fn load_one(s: &Semi) -> std::pin::Pin<Box<dyn std::future::Future<Output = Resu
     })
 }
 
+tokio::task_local! {
+    /// Under one statement (`run_one_out`), its runs and its parts
+    /// (`partitioned`): the key sets read once, kept for a run again or the
+    /// next part, whose subqueries are the same (TPC-H Q13 sf10: 8 parts
+    /// each read 69M orders' keys again, 45 s each).
+    pub(super) static KEY_CACHE: std::cell::RefCell<HashMap<String, KeySet>>;
+}
+
+/// What makes two subqueries' key sets the same: the table, what is read,
+/// the conditions, the key, the comparison and the subqueries narrowing it.
+/// `None` (never shared) for a HAVING.
+pub(super) fn sig(s: &Semi) -> Option<String> {
+    let sub = &s.sub;
+    if sub.having.is_some() {
+        return None;
+    }
+    let side = &sub.side;
+    let cols: Vec<&str> = side.read.iter().map(|&c| side.schema[c].name.as_str()).collect();
+    let mut out = format!(
+        "{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}",
+        super::url_sig(&side.url),
+        side.table,
+        cols,
+        side.conj,
+        side.conj_src.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+        sub.key,
+        s.cmp.map(|c| c.1),
+        s.not_in
+    );
+    for n in &side.semis {
+        out.push('[');
+        out.push_str(&sig(n)?);
+        out.push(']');
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A set read with no key range first widens its bitmap both ways as
+    /// keys come in any order, and turns into a hash set past the cap,
+    /// every key kept and no other.
+    #[test]
+    fn growing_key_set_holds_every_key() {
+        let keys: Vec<i64> = vec![5_000_000, 3, -70_000, 4_999_999, 64, 63, -1, 0, 1 << 20, 12_345_678, -64, 2_000_001];
+        let mut s = KeySet::growing();
+        for &k in &keys {
+            s.insert(k).unwrap();
+        }
+        assert!(s.hash.is_none(), "a narrow span stays a bitmap");
+        for &k in &keys {
+            assert!(s.has(k), "key {k}");
+        }
+        for k in [2, 65, -2, -65, 5_000_001, 12_345_677, i64::MAX, i64::MIN] {
+            assert!(!s.has(k), "not a key: {k}");
+        }
+        let mut n = 0;
+        s.for_each_key(|_| n += 1);
+        assert_eq!(n, keys.len());
+        // Past the cap: a hash set of the same keys.
+        s.insert(i64::MAX - 1).unwrap();
+        s.insert(i64::MIN + 1).unwrap();
+        assert!(s.hash.is_some(), "a span past BITS_MAX is a hash set");
+        for &k in keys.iter().chain(&[i64::MAX - 1, i64::MIN + 1]) {
+            assert!(s.has(k), "key {k} after the switch");
+        }
+        assert!(!s.has(2));
+    }
 
     /// The i64 sums widen to i128 the moment one does not fit, every sum
     /// already made carried over exactly; past 38 digits is refused.

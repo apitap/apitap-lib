@@ -703,6 +703,9 @@ enum PExpr {
     /// run, `_` one character; a CHAR(n) value's trailing spaces are not
     /// matched, a `_ci` column's case is folded (the pattern's at plan time).
     Like(usize, String, bool, Coll),
+    /// `ABS(col % n) = i` over an integer column: the part filter a query
+    /// answered in parts (`partitioned`) adds, here for a stage table.
+    Part(usize, i64, i64),
 }
 
 /// SQL LIKE of `t` against `pat` (`%` any run, `_` one character), by
@@ -924,6 +927,7 @@ fn peval(e: &PExpr, b: &ArrowBatch, r: usize, tys: &[Option<Ty>]) -> Option<bool
                 _ => o != O::Less,
             })
         }
+        PExpr::Part(i, n, k) => key_at(&b.cols[*i], r).ok().flatten().map(|v| (v % *n).abs() == *k),
         PExpr::Like(i, pat, neg, c) => match cv(&b.cols[*i], r, tys[*i]) {
             Cv::Text(t) => Some(like(&c.like_text(t)?, pat) != *neg),
             _ => None,
@@ -1027,6 +1031,24 @@ fn days_from_text(t: &str) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
+/// `ABS(x % n) = k` (integers `n > 0`, `k`): x, n, k.
+fn part_of<'a>(left: &'a Expr, right: &Expr) -> Option<(&'a Expr, i64, i64)> {
+    let k = right.to_string().parse::<i64>().ok()?;
+    let Expr::Function(f) = left else { return None };
+    if !f.name.to_string().eq_ignore_ascii_case("abs") {
+        return None;
+    }
+    let FunctionArguments::List(l) = &f.args else { return None };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(a))] = l.args.as_slice() else { return None };
+    let a = match a {
+        Expr::Nested(x) => x.as_ref(),
+        x => x,
+    };
+    let Expr::BinaryOp { left: x, op: BinaryOperator::Modulo, right: n } = a else { return None };
+    let n = n.to_string().parse::<i64>().ok().filter(|n| *n > 0)?;
+    Some((x.as_ref(), n, k))
+}
+
 /// Compile a conjunct of side `s` for per-row evaluation.
 fn pexpr(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
     let col = |sides: &mut [Side], x: &Expr| -> Result<Option<usize>> {
@@ -1080,6 +1102,10 @@ fn pexpr(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
             let ls = list.iter().map(lit).collect::<Option<Vec<_>>>().ok_or_else(no)?;
             PExpr::In(c, ls.into_iter().map(|l| padl(sides, c, l)).collect(), *negated)
         }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } if part_of(left, right).is_some() => {
+            let (x, n, k) = part_of(left, right).expect("matched");
+            PExpr::Part(col(sides, x)?.ok_or_else(no)?, n, k)
+        }
         Expr::BinaryOp { left, op, right }
             if matches!(
                 op,
@@ -1114,7 +1140,7 @@ impl PExpr {
                 c.cols(out);
             }
             PExpr::Not(a) => a.cols(out),
-            PExpr::IsNull(i, _) | PExpr::Cmp(i, ..) | PExpr::In(i, ..) | PExpr::Like(i, ..) => {
+            PExpr::IsNull(i, _) | PExpr::Cmp(i, ..) | PExpr::In(i, ..) | PExpr::Like(i, ..) | PExpr::Part(i, ..) => {
                 if !out.contains(i) {
                     out.push(*i);
                 }
@@ -1132,6 +1158,7 @@ impl PExpr {
             PExpr::Cmp(i, o, l) => PExpr::Cmp(f(*i), o.clone(), l.clone()),
             PExpr::In(i, ls, n) => PExpr::In(f(*i), ls.clone(), *n),
             PExpr::Like(i, pt, n, c) => PExpr::Like(f(*i), pt.clone(), *n, *c),
+            PExpr::Part(i, n, k) => PExpr::Part(f(*i), *n, *k),
         }
     }
 }
@@ -1241,7 +1268,7 @@ fn encode_group(c: &FinishedCol, r: usize, kb: &mut Vec<u8>) {
 /// Group keys end to end in one buffer: a key costs its bytes and a 4-byte
 /// offset, not a box of its own (a pointer, a length and the allocator's
 /// rounding and header: ~30 bytes more per group at 2M+ groups).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct KeyArena {
     data: Vec<u8>,
     /// End of each key in `data`.
@@ -1291,7 +1318,7 @@ impl<'a> IntoIterator for &'a KeyArena {
 /// The index holds group ids, not keys: each key is held once, in `keys`
 /// (a map from key to id held it twice, and TPC-H Q3's 1.5M groups took
 /// four passes for it).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Groups {
     ids: hashbrown::HashTable<u32>,
     hasher: foldhash::fast::RandomState,
@@ -4229,14 +4256,161 @@ pub async fn run(query: &str, sources: &HashMap<String, String>) -> Result<SqlRe
 
 /// One SELECT the engine answers in one pass (`stage` splits the others).
 pub(crate) async fn run_one(query: &str, sources: &HashMap<String, String>) -> Result<SqlResult> {
-    match run_engine(query, sources).await {
+    run_one_out(query, sources).await?.into_result()
+}
+
+/// An answer: rows here, or a stage table a query answered in parts
+/// wrote (on disk past its budget) for a later stage to read.
+pub(crate) enum Answer {
+    Rows(SqlResult),
+    Table(mem::MemTable),
+}
+
+impl Answer {
+    pub(crate) fn schema(&self) -> &[ArrowField] {
+        match self {
+            Answer::Rows(r) => &r.schema,
+            Answer::Table(t) => &t.schema,
+        }
+    }
+
+    pub(crate) fn schema_mut(&mut self) -> &mut Vec<ArrowField> {
+        match self {
+            Answer::Rows(r) => &mut r.schema,
+            Answer::Table(t) => &mut t.schema,
+        }
+    }
+
+    pub(crate) fn into_result(self) -> Result<SqlResult> {
+        match self {
+            Answer::Rows(r) => Ok(r),
+            Answer::Table(t) => {
+                let schema = t.schema.clone();
+                Ok(SqlResult { schema, batch: t.into_batch()? })
+            }
+        }
+    }
+
+    pub(crate) fn into_table(self) -> Result<mem::MemTable> {
+        match self {
+            Answer::Rows(r) => mem::MemTable::new(r.schema, r.batch),
+            Answer::Table(t) => Ok(t),
+        }
+    }
+
+    /// Each batch in order, one at a time.
+    pub(crate) fn for_each(self, f: &mut dyn FnMut(ArrowBatch) -> Result<()>) -> Result<()> {
+        match self {
+            Answer::Rows(r) => f(r.batch),
+            Answer::Table(t) => t.for_each(f),
+        }
+    }
+}
+
+/// A build [`join_pass`] made under [`partitioned`], kept for the next part:
+/// the build side's statement is the same in every part when the part's
+/// column is the probe side's (TPC-H Q16 sf10 read part_10g, 7.6 s, in each
+/// of its 16 parts). Keyed by [`build_sig`]; one entry, the last build.
+struct CachedBuild {
+    sig: String,
+    map: std::rc::Rc<BuildMap>,
+    groups: Groups,
+    lo: i64,
+    hi: i64,
+}
+
+tokio::task_local! {
+    static BUILD_CACHE: std::cell::RefCell<Option<CachedBuild>>;
+}
+
+/// A URL without the snapshot [`pin_snapshots`] gave it: each part pins its
+/// own, and the build is the same table's.
+pub(super) fn url_sig(u: &str) -> &str {
+    u.split_once("__apitap_snapshot=").map_or(u, |(a, _)| a)
+}
+
+/// What a join's build reads and keeps, over keys [lo, hi]: two builds with
+/// the same signature hold the same map and groups. A star plan only with no
+/// dimensions to read (the shape a GROUP BY on probe-side columns takes,
+/// TPC-H Q16's ps_suppkey) and its build layout in the signature. `None`: a
+/// star plan's dimensions or late reads, a GROUP BY on the join key (the
+/// groups are the pass's), or a subquery whose keys have no signature.
+fn build_sig(p: &Plan, k: &[(usize, usize); 2], names: &[String], lo: i64, hi: i64) -> Option<String> {
+    if p.key_groups || p.star.as_ref().is_some_and(|st| !st.dims.is_empty() || !st.late.is_empty()) {
+        return None;
+    }
+    let star = p.star.as_ref().map(|st| format!("{:?}|{:?}|{:?}|{:?}|{:?}", st.bfields, st.bkids, st.keep, st.gpos, st.pgroup));
+    let s = &p.sides[p.group_side];
+    let mut out = format!(
+        "{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{star:?}|{lo}|{hi}",
+        url_sig(&s.url),
+        s.table,
+        s.read,
+        s.conj,
+        s.local,
+        s.flags,
+        s.virt,
+        s.computed,
+        p.groups,
+        s.whole,
+        k,
+        names
+    );
+    for sm in &s.semis {
+        out.push('[');
+        out.push_str(&semi::sig(sm)?);
+        out.push(']');
+    }
+    Some(out)
+}
+
+tokio::task_local! {
+    /// Under [`run_one_out`]: the stage table key-range passes write their
+    /// final rows to as each ends (`execute`), when no ORDER BY or LIMIT
+    /// needs them together.
+    static PASS_SINK: std::cell::RefCell<Option<mem::Writer>>;
+}
+
+/// [`run_one`], an answer written in parts (passes, partitions) left as
+/// their stage table.
+pub(crate) async fn run_one_out(query: &str, sources: &HashMap<String, String>) -> Result<Answer> {
+    // The subqueries' key sets live as long as the plan that read them; held
+    // here they outlive a run that broke the group budget, and its parts
+    // take them instead of reading them again (TPC-H Q13 sf10: the anti
+    // join's 69M orders keys, read by the first run and again by the parts).
+    if semi::KEY_CACHE.try_with(|_| ()).is_ok() {
+        run_one_keyed(query, sources).await
+    } else {
+        semi::KEY_CACHE.scope(std::cell::RefCell::new(HashMap::new()), run_one_keyed(query, sources)).await
+    }
+}
+
+async fn run_one_keyed(query: &str, sources: &HashMap<String, String>) -> Result<Answer> {
+    let (r, w) = PASS_SINK
+        .scope(std::cell::RefCell::new(None), async {
+            let r = run_engine(query, sources).await;
+            (r, PASS_SINK.with(|w| w.borrow_mut().take()))
+        })
+        .await;
+    let r = match (r, w) {
+        (Ok(r), Some(mut w)) => {
+            w.push(r.batch)?;
+            let t = w.finish()?;
+            if dbg() {
+                eprintln!("[sql] passes streamed to a stage table: {} rows", t.rows());
+            }
+            return Ok(Answer::Table(t));
+        }
+        (r, _) => r,
+    };
+    match r {
         Err(e) if e.to_string().contains(GROUPS_OVER) => {
             if dbg() {
                 eprintln!("[sql] {e}; the query runs again in partitions of a GROUP BY column");
             }
             partitioned(query, sources, e).await
         }
-        r => r,
+        r => r.map(Answer::Rows),
     }
 }
 
@@ -4278,7 +4452,7 @@ fn groups_check(g: &Groups, accs: usize, hit: usize) -> Result<()> {
 /// parts' groups are disjoint, so their rows are the answer's, ordered and
 /// limited here. N doubles while a part is still too large. Each part reads
 /// its tables again: memory bounded, at the price of N scans.
-async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Error) -> Result<SqlResult> {
+async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Error) -> Result<Answer> {
     let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, query).map_err(|e| bad(format!("parse: {e}")))?;
     let [Statement::Query(q)] = stmts.as_slice() else { return Err(first) };
     let SetExpr::Select(sel) = q.body.as_ref() else { return Err(first) };
@@ -4302,13 +4476,71 @@ async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Erro
             _ => String::new(),
         })
         .collect();
+    // Integer columns only: a text column's `%` is the server's to coerce
+    // (MySQL takes 'Brand#45' as 0, every row in part 0: TPC-H Q16 sf10
+    // spent 300 s on p_brand and p_type before ps_suppkey). The finest
+    // last: a GROUP BY lists its coarse columns first, as Q16 does.
+    let p = plan_probed(query, sources).await?;
+    // A GROUP BY by an output's alias parts by the output's expression
+    // (TPC-H Q15's `GROUP BY supplier_no`, `l_suppkey AS supplier_no`).
+    let output = |c: &Expr| -> Option<usize> {
+        let t = c.to_string();
+        exprs.iter().position(|e| *e == t).or_else(|| names.iter().position(|n| n.eq_ignore_ascii_case(&t)))
+    };
+    let int_col = |c: &Expr| -> bool {
+        let Some(i) = output(c) else { return false };
+        let Some((_, OutCol::Group(g))) = p.out.get(i) else { return false };
+        let kind = match &p.star {
+            Some(st) => st.gkind[*g],
+            None => {
+                let gs = &p.sides[p.group_side];
+                gs.schema[gs.read[p.groups[*g]]].kind
+            }
+        };
+        matches!(kind, ArrowKind::Int16 | ArrowKind::Int32 | ArrowKind::Int64)
+    };
+    let cands: Vec<Expr> = cands
+        .into_iter()
+        .rev()
+        .filter(|c| int_col(c))
+        .map(|c| match output(&c) {
+            Some(i) if exprs[i] != c.to_string() => sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {})
+                .try_with_sql(&exprs[i])
+                .and_then(|mut x| x.parse_expr())
+                .unwrap_or(c),
+            _ => c,
+        })
+        .collect();
+    drop(p);
+    if dbg() {
+        eprintln!("[sql] part columns: {}", cands.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
+    }
+    let go = BUILD_CACHE.scope(std::cell::RefCell::new(None), parts(sources, q, cands, &names, &exprs, first));
+    if semi::KEY_CACHE.try_with(|_| ()).is_ok() {
+        go.await
+    } else {
+        semi::KEY_CACHE.scope(std::cell::RefCell::new(HashMap::new()), go).await
+    }
+}
+
+/// [`partitioned`]'s parts, by each candidate column in turn.
+async fn parts(
+    sources: &HashMap<String, String>,
+    q: &sqlparser::ast::Query,
+    cands: Vec<Expr>,
+    names: &[String],
+    exprs: &[String],
+    first: Error,
+) -> Result<Answer> {
     let mut last = first;
     'cand: for col in cands {
         let mut n = 4u32;
         'size: while n <= 64 {
-            let mut out: Option<SqlResult> = None;
+            // The parts go to a stage table as they come (on disk past
+            // its budget): the whole answer is never in memory twice.
+            let mut out: Option<mem::Writer> = None;
             for i in 0..n {
-                let mut q2 = (**q).clone();
+                let mut q2 = q.clone();
                 q2.order_by = None;
                 q2.limit = None;
                 let SetExpr::Select(s2) = q2.body.as_mut() else { unreachable!() };
@@ -4323,13 +4555,8 @@ async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Erro
                 });
                 match run_engine(&q2.to_string(), sources).await {
                     Ok(r) => {
-                        out = Some(match out.take() {
-                            None => r,
-                            Some(mut a) => {
-                                a.batch = mem::concat(&a.batch, &r.batch)?;
-                                a
-                            }
-                        });
+                        let w = out.get_or_insert_with(|| mem::Writer::new(r.schema.clone()));
+                        w.push(r.batch)?;
                     }
                     Err(e) if e.to_string().contains(GROUPS_OVER) => {
                         last = e;
@@ -4342,12 +4569,17 @@ async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Erro
                     }
                 }
             }
-            let mut r = out.ok_or_else(|| bad("no parts"))?;
+            let t = out.ok_or_else(|| bad("no parts"))?.finish()?;
             if dbg() {
-                eprintln!("[sql] answered in {n} parts by {col}: {} rows", r.batch.rows);
+                eprintln!("[sql] answered in {n} parts by {col}: {} rows", t.rows());
             }
-            order_limit(&mut r, q, &names, &exprs)?;
-            return Ok(r);
+            if q.order_by.is_none() && q.limit.is_none() {
+                return Ok(Answer::Table(t));
+            }
+            let schema = t.schema.clone();
+            let mut r = SqlResult { schema, batch: t.into_batch()? };
+            order_limit(&mut r, q, names, exprs)?;
+            return Ok(Answer::Rows(r));
         }
     }
     Err(last)
@@ -4548,6 +4780,17 @@ struct PassCtx<'a> {
     /// A build that outgrew the budget: what the whole range would have
     /// cost, projected from the keys it had reached (0: none).
     over: std::cell::Cell<f64>,
+    /// The key ranges still to come after this pass.
+    rest: &'a [(i64, i64)],
+    /// Grace spill: probe rows an earlier pass read for a later range, on
+    /// disk under that range.
+    spill: &'a std::cell::RefCell<Vec<((i64, i64), mem::MemTable)>>,
+}
+
+/// `APITAP_SQL_GRACE=0` turns the grace spill off (every pass reads its
+/// probe range from the server again).
+fn grace_on() -> bool {
+    std::env::var("APITAP_SQL_GRACE").map_or(true, |v| v.trim() != "0")
 }
 
 /// Bytes a build over keys [lo, hi] holds once `pairs` (capacity, not
@@ -4626,6 +4869,30 @@ async fn join_pass(
     // the budget got (the spans read in key order, so about that far).
     let mut maxk = i64::MIN;
     let mut full = Vec::new();
+    // An earlier part's build of the same statement (`BUILD_CACHE`): its map
+    // and groups, over the range it narrowed to. Another signature's entry
+    // goes before this build holds its own memory beside it. Only a build
+    // that starts with no groups (a run's first pass): a later pass's group
+    // ids carry on from the passes before it.
+    let bsig = BUILD_CACHE.try_with(|_| ()).ok().filter(|_| groups.keys.len() == 0).and_then(|_| build_sig(p, &c.k, c.names, lo, hi));
+    let cached: Option<std::rc::Rc<BuildMap>> = bsig.as_ref().and_then(|sg| {
+        BUILD_CACHE
+            .with(|x| {
+                let mut x = x.borrow_mut();
+                match x.as_ref() {
+                    Some(e) if e.sig == *sg => Some((std::rc::Rc::clone(&e.map), e.groups.clone(), e.lo, e.hi)),
+                    _ => {
+                        *x = None;
+                        None
+                    }
+                }
+            })
+            .map(|(m, g, a, b)| {
+                *groups = g;
+                (lo, hi) = (a, b);
+                m
+            })
+    });
     // Unique keys under 255 groups over a known range (the common shape: a
     // primary key grouped by a low-cardinality column) fill the direct array
     // as they stream, with no (key, group) pair staged: the build holds the
@@ -4636,7 +4903,9 @@ async fn join_pass(
     let base = lo;
     let span = u64::try_from(hi as i128 - lo as i128 + 1).unwrap_or(u64::MAX);
     let finite = (lo, hi) != (i64::MIN, i64::MAX);
-    let mut direct: Option<Vec<u8>> = if pending.is_some() {
+    let mut direct: Option<Vec<u8>> = if cached.is_some() {
+        None
+    } else if pending.is_some() {
         finite.then(Vec::new)
     } else {
         (finite && span <= DIRECT_MAX && span <= c.budget).then(|| vec![u8::MAX; span as usize])
@@ -4659,7 +4928,7 @@ async fn join_pass(
     let mut cur = lo;
     // The probe read started beside the build's last statement (`Pre`).
     let mut pre: Option<Pre> = None;
-    loop {
+    while cached.is_none() {
         // The probe side's range, the moment it is there (or now, when the
         // array would otherwise outgrow its cap before knowing its end).
         if let Some(f) = pending.as_mut() {
@@ -4812,7 +5081,15 @@ async fn join_pass(
             let cost = match &direct {
                 Some(a) => a.len() as u64,
                 None => build_cost(pairs.capacity(), pairs.len(), groups.keys.len(), lo, hi),
-            } + if p.key_groups { groups.bytes } else { 0 };
+            } + if p.key_groups {
+                // A pass's groups and their accumulators, all held through
+                // its probe (TPC-H Q13 sf10 priced the keys alone, and the
+                // 64 MiB of accumulators beside them left the probe of 69M
+                // orders one pipe).
+                groups.bytes + groups.keys.len() as u64 * (na * std::mem::size_of::<Acc>() + 1) as u64
+            } else {
+                0
+            };
             if cost > c.budget {
                 if early.as_ref().is_some_and(|e| e.next > 0) {
                     return Err(bad(format!(
@@ -4848,15 +5125,21 @@ async fn join_pass(
     }
     *range = (lo, hi);
     let between = |s: usize| between_of(s, lo, hi);
-    let map = match direct {
-        Some(a) => BuildMap { map: KeyMap::Direct8(base, a), multi: None },
-        None => build_map(&mut pairs, groups.keys.len()),
+    let reused = cached.is_some();
+    let map = match cached {
+        Some(m) => m,
+        None => std::rc::Rc::new(match direct {
+            Some(a) => BuildMap { map: KeyMap::Direct8(base, a), multi: None },
+            None => build_map(&mut pairs, groups.keys.len()),
+        }),
     };
     let nkeys = match &map.map {
         KeyMap::Direct8(_, a) if dbg() => a.iter().filter(|&&x| x != u8::MAX).count(),
         _ => pairs.len(),
     };
-    if dbg() {
+    if dbg() && reused {
+        eprintln!("[sql] build {} [{lo}..{hi}]: an earlier part's, {} ({} MiB)", p.sides[bs].name, map.label(), map.bytes() >> 20);
+    } else if dbg() {
         eprintln!(
             "[sql] build {} [{lo}..{hi}]: {} keys, {} groups, {} ({} MiB) in {:.1}s cpu={:.2}s",
             p.sides[bs].name,
@@ -4870,6 +5153,16 @@ async fn join_pass(
     }
     drop(pairs);
     crate::trim_heap();
+    // Kept for the next part while it is small beside the budget: between
+    // parts it is held through this part's finalize too.
+    if let (Some(sg), false) = (bsig, reused) {
+        if map.bytes() + groups.bytes <= c.budget / 4 {
+            BUILD_CACHE.with(|x| *x.borrow_mut() = Some(CachedBuild { sig: sg, map: std::rc::Rc::clone(&map), groups: groups.clone(), lo, hi }));
+            if dbg() {
+                eprintln!("[sql] build {} kept for the next part", p.sides[bs].name);
+            }
+        }
+    }
     // With probe-side GROUP BY fields the accumulators are the combined
     // groups' (grown as the probe meets them).
     if !p.star.as_ref().is_some_and(|st| !st.pgroup.is_empty()) {
@@ -4902,9 +5195,36 @@ async fn join_pass(
     // build holds. The rows it drops would have missed the map here; the
     // probe below still looks every row up, so the filter moves bytes, never
     // the answer.
+    // Grace spill (the grace hash join): with key ranges still to come, the
+    // probe is read once for all of them and the rows of the later ranges
+    // go to disk, each under its range; their passes read the disk, not the
+    // server again (TPC-H Q13 sf10: six passes each scanned 69M orders on
+    // the server, 60-80 s apiece). A pass whose rows an earlier one spilled
+    // reads them, and spills on for the ranges a split left inside them.
+    let src = {
+        let i = c.spill.borrow().iter().position(|(r, _)| r.0 <= lo && hi <= r.1);
+        i.map(|i| c.spill.borrow_mut().remove(i))
+    };
+    let mut others: Vec<(i64, i64)> = if grace_on() {
+        c.rest.iter().copied().filter(|r| r.0 > hi && src.as_ref().is_none_or(|(s, _)| s.0 <= r.0 && r.1 <= s.1)).collect()
+    } else {
+        Vec::new()
+    };
+    others.sort_unstable();
+    let cover_hi = others.iter().map(|r| r.1).fold(hi, i64::max);
+    let plain = others.is_empty() && src.is_none();
+    if dbg() && !plain {
+        eprintln!(
+            "[sql] probe {} [{lo}..{hi}]: {}{}",
+            p.sides[ps].name,
+            if src.is_some() { "rows from disk" } else { "read up to the last range" },
+            if others.is_empty() { String::new() } else { format!(", {} later range(s) spilled to disk", others.len()) }
+        );
+    }
     let pkey_name = pcol.clone();
     let span = u64::try_from(hi as i128 - lo as i128 + 1).unwrap_or(u64::MAX);
-    let filter = (p.sides[ps].dialect == Dialect::Pg
+    let filter = (plain
+        && p.sides[ps].dialect == Dialect::Pg
         && (lo, hi) != (i64::MIN, i64::MAX)
         && span <= KEY_FILTER_MAX_KEYS
         && (map.keys() as u64) * 2 < span
@@ -4930,7 +5250,7 @@ async fn join_pass(
     // and the probe dimensions' keys. A probe row they drop is one the fold
     // would drop, before its other columns decode.
     let mut gates = Vec::new();
-    if filter.is_none() {
+    if filter.is_none() && plain {
         gates.extend(gate_of(&p.sides[ps], pkey, lo, hi, map.keys() as u64, |g| map.for_each_key(|k| g.set(k))));
         if let Some(st) = &p.star {
             let of: Vec<(usize, &star::DimMap)> = st.pkids.iter().filter(|&&k| st.dims[k].key2.is_none()).map(|&k| (st.dims[k].fk, &c.dims[k])).collect();
@@ -4978,20 +5298,24 @@ async fn join_pass(
         }
     }
     // A pass over part of the keys scans the pages they lie in.
-    let extra = if filter.is_some() { between(ps) } else { probe_extra(p, ps, &between_of, c.parts, lo, hi) };
+    let extra = if filter.is_some() { between(ps) } else { probe_extra(p, ps, &between_of, c.parts, lo, cover_hi) };
     if dbg() && extra.as_deref().is_some_and(|x| x.contains("ctid")) {
         eprintln!("[sql] probe pass [{lo}..{hi}] scans {}", extra.as_deref().unwrap_or(""));
     }
     // The read started beside the build (its filter is this one: the pass
     // and the probe range were final then), or a fresh one.
-    let (mut h, held_back) = match pre.take().filter(|_| filter.is_none()) {
-        Some(x) => {
-            if dbg() {
-                eprintln!("[sql] probe {} began beside the build: {} batch(es), {} MiB held", p.sides[ps].name, x.buf.len(), x.bytes >> 20);
+    let (mut h, held_back) = if src.is_some() {
+        (None, Vec::new())
+    } else {
+        match pre.take().filter(|_| filter.is_none() && plain) {
+            Some(x) => {
+                if dbg() {
+                    eprintln!("[sql] probe {} began beside the build: {} batch(es), {} MiB held", p.sides[ps].name, x.buf.len(), x.bytes >> 20);
+                }
+                (Some(x.rows), x.buf)
             }
-            (x.rows, x.buf)
+            None => (Some(open_gated(&p.sides[ps], extra, parallel, filter, gates).await?), Vec::new()),
         }
-        None => (open_gated(&p.sides[ps], extra, parallel, filter, gates).await?, Vec::new()),
     };
     let (mut probed, mut matched) = (0u64, 0u64);
     let gcross = p.star.as_ref().map(|st| star::cross_values(st, &groups.keys)).unwrap_or_default();
@@ -5006,21 +5330,69 @@ async fn join_pass(
             .collect()
     });
     let pg = p.star.as_ref().is_some_and(|st| !st.pgroup.is_empty());
-    for mut b in held_back {
+    // The later ranges' writers (made on their first row), and the routing
+    // of a batch's rows to them: a row of this range stays, a NULL key
+    // matches nothing anywhere.
+    let mut writers: Vec<((i64, i64), Option<mem::Writer>)> = others.iter().map(|r| (*r, None)).collect();
+    let mut route = |b: &ArrowBatch| -> Result<()> {
+        if writers.is_empty() {
+            return Ok(());
+        }
+        let mut idx: Vec<Vec<usize>> = vec![Vec::new(); writers.len()];
+        for r in 0..b.rows {
+            let Some(k) = key_at(&b.cols[pkey], r)? else { continue };
+            if (lo..=hi).contains(&k) {
+                continue;
+            }
+            let i = writers.partition_point(|(g, _)| g.1 < k);
+            if i < writers.len() && writers[i].0 .0 <= k {
+                idx[i].push(r);
+            }
+        }
+        for (i, ix) in idx.iter().enumerate() {
+            if ix.is_empty() {
+                continue;
+            }
+            let w = writers[i].1.get_or_insert_with(|| mem::Writer::on_disk(vec![p.sides[ps].schema[0].clone(); b.cols.len()]));
+            w.push(mem::take_rows(b, ix))?;
+        }
+        Ok(())
+    };
+    let mut step = |b: &mut ArrowBatch| -> Result<()> {
         probed += b.rows as u64;
-        matched += fold_probe(p, &ptys, pkey, &mut b, |k| map.look(k), ng, accs, hit, sx, gflags.as_deref(), Some(&mut *cgroups))?;
+        matched += fold_probe(p, &ptys, pkey, b, |k| map.look(k), ng, accs, hit, sx, gflags.as_deref(), Some(&mut *cgroups))?;
         if pg {
             groups_check(cgroups, accs.len(), hit.len())?;
         }
+        Ok(())
+    };
+    for mut b in held_back {
+        route(&b)?;
+        step(&mut b)?;
     }
-    while let Some(mut b) = h.recv().await? {
-        probed += b.rows as u64;
-        matched += fold_probe(p, &ptys, pkey, &mut b, |k| map.look(k), ng, accs, hit, sx, gflags.as_deref(), Some(&mut *cgroups))?;
-        if pg {
-            groups_check(cgroups, accs.len(), hit.len())?;
+    if let Some(h) = h.as_mut() {
+        while let Some(mut b) = h.recv().await? {
+            route(&b)?;
+            step(&mut b)?;
         }
     }
     drop(h);
+    if let Some((_, t)) = src {
+        t.for_each(&mut |mut b| {
+            route(&b)?;
+            step(&mut b)
+        })?;
+    }
+    drop(step);
+    drop(route);
+    for (r, w) in writers {
+        // A range no row fell in is spilled empty: its pass reads nothing.
+        let t = match w {
+            Some(w) => w.finish()?,
+            None => mem::Writer::on_disk(Vec::new()).finish()?,
+        };
+        c.spill.borrow_mut().push((r, t));
+    }
     crate::trim_heap();
     if dbg() {
         eprintln!(
@@ -5210,10 +5582,21 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
         // Groups per key range (`key_groups`): the answer so far.
         let mut kept: (Groups, Vec<Acc>, Vec<bool>) = (Groups::default(), Vec::new(), Vec::new());
         let pgroup = p.star.as_ref().is_some_and(|st| !st.pgroup.is_empty());
+        // Unordered and unlimited, under `run_one_out`: each pass's rows go
+        // straight to a stage table (TPC-H Q13 sf10: 9.9M customers' groups
+        // kept across the passes broke the group budget, and the query ran
+        // again in 16 parts, each reading 69M orders).
+        let stream = p.key_groups
+            && p.order.is_empty()
+            && p.limit.is_none()
+            && p.star.as_ref().is_none_or(|st| st.late.is_empty())
+            && PASS_SINK.try_with(|_| ()).is_ok();
         let mut todo = vec![(lo, hi)];
+        let spill = std::cell::RefCell::new(Vec::new());
         let mut passes = 0u32;
         while let Some(mut rg) = todo.pop() {
-            let ctx = PassCtx { p: &p, parts: &probe_parts, dims: &dims, k, names: &key_names, budget, t0, over: std::cell::Cell::new(0.0) };
+            let rest = todo.clone();
+            let ctx = PassCtx { p: &p, parts: &probe_parts, dims: &dims, k, names: &key_names, budget, t0, over: std::cell::Cell::new(0.0), rest: &rest, spill: &spill };
             let done = join_pass(&ctx, &mut rg, &mut pending, &mut groups, &mut cgroups, &mut kb, &mut accs, &mut hit).await?;
             if p.key_groups {
                 // This pass's groups are final: the rows the answer can
@@ -5224,18 +5607,40 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
                     }
                     let (g, a, h) = strip(&p, std::mem::take(&mut groups), std::mem::take(&mut accs), std::mem::take(&mut hit))?;
                     let (g, a, h) = collate(&p, g, a, h)?;
-                    retain(&p, &g, &a, &h, &mut kept)?;
+                    if stream {
+                        let r = result(&p, &g, &a, Some(&h))?;
+                        PASS_SINK.with(|w| -> Result<()> {
+                            let mut w = w.borrow_mut();
+                            w.get_or_insert_with(|| mem::Writer::new(r.schema.clone())).push(r.batch)
+                        })?;
+                    } else {
+                        retain(&p, &g, &a, &h, &mut kept)?;
+                    }
                 } else {
                     (groups, accs, hit) = (Groups::default(), Vec::new(), Vec::new());
                     cgroups = Groups::default();
                 }
             }
-            if let Some(f) = pending.take() {
-                // The pass stopped before the probe side's range arrived.
-                if let Kr::Known(x, y) = intersect(Kr::Known(rg.0, rg.1), f.await?.0) {
-                    rg = (rg.0.max(x), y);
-                } else {
-                    rg = (1, 0);
+            if let Some(mut f) = pending.take() {
+                // The pass stopped before the probe side's range arrived. A
+                // range still running after a second is a full scan (a key
+                // no index leads: TPC-H Q13's o_custkey, 69M MySQL rows, 30 s
+                // of MIN/MAX); the next passes go on without it and narrow
+                // when it comes.
+                match tokio::time::timeout(std::time::Duration::from_secs(1), f.as_mut()).await {
+                    Ok(r) => {
+                        if let Kr::Known(x, y) = intersect(Kr::Known(rg.0, rg.1), r?.0) {
+                            rg = (rg.0.max(x), y);
+                        } else {
+                            rg = (1, 0);
+                        }
+                    }
+                    Err(_) => {
+                        if dbg() {
+                            eprintln!("[sql] the probe side's range is still running at {:.1}s: the passes go on without it", t0.elapsed().as_secs_f64());
+                        }
+                        pending = Some(f);
+                    }
                 }
             }
             let (a, b) = rg;
@@ -6331,6 +6736,27 @@ mod tests {
         // lineitem's: the shipmode and shipinstruct every branch shares come
         // out as plain filters, beside the OR of its quantity ranges.
         assert_eq!(p.sides[p.agg_side].conj.len(), 3, "lineitem's too");
+    }
+
+    /// The part filter `ABS(x % n) = k` evaluates locally (a stage table
+    /// has no server to send it to): negatives by their absolute
+    /// remainder, a NULL unknown.
+    #[test]
+    fn part_filter_evaluates_locally() {
+        let e: Expr = sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {})
+            .try_with_sql("ABS(t.x % 4) = 1")
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+        let Expr::BinaryOp { left, right, .. } = &e else { panic!() };
+        let (x, n, k) = part_of(left, right).expect("a part filter");
+        assert_eq!((x.to_string().as_str(), n, k), ("t.x", 4, 1));
+        assert!(part_of(left, &Expr::Value(Value::Boolean(true).into())).is_none());
+        let b = ArrowBatch { rows: 4, cols: vec![FinishedCol::I64 { validity: Some(vec![0b0111]), data: vec![5, -7, 8, 1] }] };
+        let pe = PExpr::Part(0, 4, 1);
+        let got: Vec<Option<bool>> = (0..4).map(|r| peval(&pe, &b, r, &[Some(Ty::Int)])).collect();
+        assert_eq!(got, vec![Some(true), Some(false), Some(false), None]);
+        assert_eq!(peval(&PExpr::Part(0, 4, 3), &b, 1, &[Some(Ty::Int)]), Some(true), "-7 % 4 = -3, ABS 3");
     }
 
     /// Folded constants, BETWEEN, and trailing spaces in text compares.

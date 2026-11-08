@@ -10,10 +10,16 @@ same data, held in DuckDB itself.
 A query apitap refuses is reported as REFUSED (and fails the leg unless it
 is listed in ALLOWED_REFUSALS); a wrong answer always fails.
 
+Then the same queries again under budgets small enough to force the paths
+a large query takes in a small cage (CONFIGS): stages on disk and GROUP BYs
+answered in parts (Q15's parts by an output alias), and joins in many key
+ranges whose later ranges' probe rows are spilled to disk (grace).
+
 Usage: e2e_sql_tpch.py [sf] [q,q,...]
 """
 
 import decimal
+import os
 import re
 import sys
 import time
@@ -32,6 +38,17 @@ PREFIX = "tpch_"
 
 # Queries not answered yet; the list shrinks as 0.67 lands.
 ALLOWED_REFUSALS = set()
+
+# (label, env, only these queries, skip these). Q9's dimensions alone pass a
+# 64K build budget (a refusal by design), so the grace run leaves it out; at
+# 4K a part's fixed cost passes Q16's group budget, so that run is Q15's.
+CONFIGS = [
+    ("default", {}, None, set()),
+    ("stages on disk, groups in parts", {"APITAP_SQL_STAGE_BYTES": "1K", "APITAP_SQL_GROUP_BYTES": "8K"}, None, set()),
+    ("GROUP BY an alias in parts", {"APITAP_SQL_GROUP_BYTES": "4K"}, {15}, set()),
+    ("key ranges, grace spill", {"APITAP_SQL_BUILD_BYTES": "64K"}, None, {9}),
+]
+KNOBS = sorted({k for _, env, _, _ in CONFIGS for k in env})
 
 
 def load(con, sf):
@@ -118,27 +135,37 @@ def main():
     load(con, sf)
     print(f"  TPC-H sf={sf} loaded into Postgres + MySQL in {time.time() - t0:.1f}s")
     queries = con.execute("SELECT query_nr, query FROM tpch_queries() ORDER BY 1").fetchall()
+    truths = {n: [tuple(r) for r in con.execute(q).fetchall()] for n, q in queries if not only or n in only}
     bad, refused = [], []
-    for n, q in queries:
-        if only and n not in only:
-            continue
-        truth = [tuple(r) for r in con.execute(q).fetchall()]
-        t1 = time.time()
-        try:
-            got = [tuple(r) for r in apitap.sql(pointed(q), sources={"pg": PG, "my": MY}).to_polars().rows()]
-        except Exception as e:  # noqa: BLE001 — a refusal is reported, not raised
-            msg = str(e).splitlines()[0][:160]
-            refused.append(n)
-            print(f"  Q{n:<2} REFUSED  {msg}")
-            continue
-        ok = same(sorted(map(lambda r: tuple(map(norm, r)), got), key=repr),
-                  sorted(map(lambda r: tuple(map(norm, r)), truth), key=repr))
-        print(f"  Q{n:<2} {'OK      ' if ok else 'WRONG   '} {len(got)} rows {time.time() - t1:.2f}s")
-        if not ok:
-            bad.append(n)
-            print(f"      apitap {got[:3]}")
-            print(f"      duckdb {truth[:3]}")
-    unexpected = [n for n in refused if n not in ALLOWED_REFUSALS]
+    # A query list on the command line runs the default budgets only.
+    for label, env, cfg_only, skip in CONFIGS if not only else CONFIGS[:1]:
+        for k in KNOBS:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        print(f"  == {label}" + (f" ({', '.join(f'{k}={v}' for k, v in env.items())})" if env else ""))
+        tag = "" if not env else f" [{label}]"
+        for n, q in queries:
+            if (only and n not in only) or (cfg_only and n not in cfg_only) or n in skip:
+                continue
+            truth = truths[n]
+            t1 = time.time()
+            try:
+                got = [tuple(r) for r in apitap.sql(pointed(q), sources={"pg": PG, "my": MY}).to_polars().rows()]
+            except Exception as e:  # noqa: BLE001 — a refusal is reported, not raised
+                msg = str(e).splitlines()[0][:160]
+                refused.append(f"{n}{tag}")
+                print(f"  Q{n:<2} REFUSED  {msg}")
+                continue
+            ok = same(sorted(map(lambda r: tuple(map(norm, r)), got), key=repr),
+                      sorted(map(lambda r: tuple(map(norm, r)), truth), key=repr))
+            print(f"  Q{n:<2} {'OK      ' if ok else 'WRONG   '} {len(got)} rows {time.time() - t1:.2f}s")
+            if not ok:
+                bad.append(f"{n}{tag}")
+                print(f"      apitap {got[:3]}")
+                print(f"      duckdb {truth[:3]}")
+    for k in KNOBS:
+        os.environ.pop(k, None)
+    unexpected = [n for n in refused if n.split(" ")[0] not in {str(x) for x in ALLOWED_REFUSALS}]
     print(f"  wrong: {bad or 'none'}; refused: {refused or 'none'}")
     if bad or unexpected:
         print("SQL TPCH E2E: FAILED")
