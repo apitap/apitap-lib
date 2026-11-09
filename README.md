@@ -7,8 +7,8 @@ wire formats — binary `COPY`, RowBinary, `LOAD DATA`, logical replication, the
 MySQL binlog — through its own Rust wire clients, moves tables over parallel
 range pipes, publishes them with atomic swaps, and keeps memory flat no matter
 how big the table is. The Python package is a thin binding in the spirit of
-Polars: one call, no daemon, no local state files. It is the open-source engine
-behind apitap cloud (apitap.dev).
+Polars: one call, no daemon, no local state files. Docs and a public sandbox
+are at apitap.dev.
 
 ```bash
 pip install apitap
@@ -837,5 +837,4 @@ ledgers with raw logs, the failure-mode catalogue, the CDC design and the
 
 ## License
 
-MIT. The managed cloud — scheduling, always-on per-tenant workers, monitoring,
-a UI — is apitap.dev.
+MIT.
