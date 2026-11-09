@@ -543,6 +543,11 @@ impl Stager {
                 return Err(unsupported("DISTINCT with aggregates"));
             }
             let text = out.to_string();
+            // What the stage before freed goes back first: the next reads
+            // price their pipes by what the process holds (TPC-H Q13 sf10
+            // began its anti join at 89 MiB anonymous, 2 pipes, 56 s; at
+            // 20 MiB, 6 pipes, 20 s).
+            crate::trim_heap();
             if super::dbg() {
                 eprintln!("[sql] stage query ({} MiB resident, {} anon): {text}", semi::rss_bytes().unwrap_or(0) >> 20, semi::anon_bytes().unwrap_or(0) >> 20);
             }

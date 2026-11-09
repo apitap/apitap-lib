@@ -4320,7 +4320,11 @@ struct CachedBuild {
 }
 
 tokio::task_local! {
-    static BUILD_CACHE: std::cell::RefCell<Option<CachedBuild>>;
+    /// (kept past the join: under `partitioned`; the entry), scoped by
+    /// [`run_one_out`]: a first run that broke the group budget hands its
+    /// build to the parts, a run that did not drops it when its join ends,
+    /// before its groups finalize.
+    static BUILD_CACHE: std::cell::RefCell<(bool, Option<CachedBuild>)>;
 }
 
 /// A URL without the snapshot [`pin_snapshots`] gave it: each part pins its
@@ -4378,10 +4382,11 @@ pub(crate) async fn run_one_out(query: &str, sources: &HashMap<String, String>) 
     // here they outlive a run that broke the group budget, and its parts
     // take them instead of reading them again (TPC-H Q13 sf10: the anti
     // join's 69M orders keys, read by the first run and again by the parts).
+    let go = BUILD_CACHE.scope(std::cell::RefCell::new((false, None)), run_one_keyed(query, sources));
     if semi::KEY_CACHE.try_with(|_| ()).is_ok() {
-        run_one_keyed(query, sources).await
+        go.await
     } else {
-        semi::KEY_CACHE.scope(std::cell::RefCell::new(HashMap::new()), run_one_keyed(query, sources)).await
+        semi::KEY_CACHE.scope(std::cell::RefCell::new(HashMap::new()), go).await
     }
 }
 
@@ -4515,7 +4520,13 @@ async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Erro
     if dbg() {
         eprintln!("[sql] part columns: {}", cands.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
     }
-    let go = BUILD_CACHE.scope(std::cell::RefCell::new(None), parts(sources, q, cands, &names, &exprs, first));
+    let go = async {
+        if BUILD_CACHE.try_with(|x| x.borrow_mut().0 = true).is_ok() {
+            parts(sources, q, cands, &names, &exprs, first).await
+        } else {
+            BUILD_CACHE.scope(std::cell::RefCell::new((true, None)), parts(sources, q, cands, &names, &exprs, first)).await
+        }
+    };
     if semi::KEY_CACHE.try_with(|_| ()).is_ok() {
         go.await
     } else {
@@ -4879,10 +4890,10 @@ async fn join_pass(
         BUILD_CACHE
             .with(|x| {
                 let mut x = x.borrow_mut();
-                match x.as_ref() {
+                match x.1.as_ref() {
                     Some(e) if e.sig == *sg => Some((std::rc::Rc::clone(&e.map), e.groups.clone(), e.lo, e.hi)),
                     _ => {
-                        *x = None;
+                        x.1 = None;
                         None
                     }
                 }
@@ -5157,7 +5168,7 @@ async fn join_pass(
     // parts it is held through this part's finalize too.
     if let (Some(sg), false) = (bsig, reused) {
         if map.bytes() + groups.bytes <= c.budget / 4 {
-            BUILD_CACHE.with(|x| *x.borrow_mut() = Some(CachedBuild { sig: sg, map: std::rc::Rc::clone(&map), groups: groups.clone(), lo, hi }));
+            BUILD_CACHE.with(|x| x.borrow_mut().1 = Some(CachedBuild { sig: sg, map: std::rc::Rc::clone(&map), groups: groups.clone(), lo, hi }));
             if dbg() {
                 eprintln!("[sql] build {} kept for the next part", p.sides[bs].name);
             }
@@ -5657,7 +5668,15 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
                     // sized at 85% broke the budget again. At least two.
                     let proj = ctx.over.get();
                     let span = b as i128 - a as i128 + 1;
-                    let n = ((proj / (0.6 * budget.max(1) as f64)).ceil() as i128).clamp(2, 64).min(span);
+                    // Under the grace spill at 40%: the ranges after the
+                    // first read the disk, so one more costs a build's
+                    // statement, and the first range's probe reads the whole
+                    // side from its server with the pipes a smaller build
+                    // leaves (TPC-H Q13 sf10: ranges of 990K customers held
+                    // 68 MiB and read 69M orders on 2 pipes in 70 s; of 550K,
+                    // 38 MiB and 6 pipes, 47 s).
+                    let share = if grace_on() { 0.4 } else { 0.6 };
+                    let n = ((proj / (share * budget.max(1) as f64)).ceil() as i128).clamp(2, 64).min(span);
                     if dbg() {
                         eprintln!("[sql] build of {a}..{b} past {budget} B (whole range ~{} B): {n} ranges", proj as u64);
                     }
@@ -5677,6 +5696,12 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
         if dbg() {
             eprintln!("[sql] join done in {passes} pass(es)");
         }
+        let _ = BUILD_CACHE.try_with(|x| {
+            let mut x = x.borrow_mut();
+            if !x.0 {
+                x.1 = None;
+            }
+        });
         if p.key_groups {
             (groups, accs, hit) = kept;
         } else if pgroup {
