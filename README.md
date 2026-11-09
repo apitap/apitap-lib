@@ -65,11 +65,11 @@ apitap.sql("""SELECT o_orderpriority, SUM(l_extendedprice * (1 - l_discount)) AS
 | **Sources** | `postgres://` · `mysql://` (MySQL 8.x, MariaDB) · `clickhouse://` · `gsheets://` · `github://` (repo CSVs as tables) · `github+api://` (issues, PRs, commits… as typed tables) |
 | **Destinations** | `postgres://` · `mysql://` · `clickhouse://` · `bigquery://` · `gcs://` · `s3://` (AWS, MinIO, R2, any S3-compatible store) · `iceberg://` (REST catalogs with bearer auth) |
 | **Modes** | `replace` (default, atomic swap) · `append` · `merge` (Postgres, Iceberg) · `log_based` batch CDC from Postgres and MySQL/MariaDB into Postgres, ClickHouse, MySQL, BigQuery, Iceberg |
-| **SQL** | `apitap.sql()` joins and aggregates tables of different databases (TPC-H Q3–Q10, Q12, Q14, Q18, Q19 across Postgres × MySQL) in apitap's own Rust engine, exact, in a 256 MB container; into a DataFrame, a destination, or an incremental view |
+| **SQL** | `apitap.sql()` joins and aggregates tables of different databases (all 22 TPC-H queries across Postgres × MySQL: CTEs, correlated subqueries, HAVING, LEFT JOIN) in apitap's own Rust engine, exact, in a 256 MB container; into a DataFrame (streamed), a destination, or an incremental view |
 | **DataFrames** | `apitap.read()` → polars, pyarrow, duckdb, pandas through the Arrow C stream protocol, zero-copy, no pyarrow dependency |
 | **Runtime** | CPython ≥ 3.9, one `abi3` wheel (`manylinux_x86_64`); the engine is Rust, nothing in the data path is Python |
 | **Memory** | bounded by *pipes × buffers*, planned from the container's cgroup limits — never by table size; a 256 MB container moves 100 GB |
-| **Version** | 0.66.0 — pin exactly while pre-1.0 (`apitap==0.66.0`) |
+| **Version** | 0.67.0 — pin exactly while pre-1.0 (`apitap==0.67.0`) |
 | **License** | MIT |
 
 ## Why apitap
@@ -410,7 +410,8 @@ apitap.sql(query, *, sources, dest=None, table=None, mode=None) -> SqlResult | T
 
 `sources` names each database (`{"pg": "postgres://…", "my": "mysql://…"}`);
 the query calls tables `name.table`. Without `dest=` the answer is a
-`SqlResult` (an Arrow stream: `.to_polars()`, or hand it to DuckDB / pyarrow);
+`SqlResult` (an Arrow stream read a chunk at a time: `.to_polars()`, or hand
+it to DuckDB / pyarrow);
 with `dest=` and `table=` it lands in any destination through the ordinary
 transfer path (typed, staged, atomic swap) and a `TransferReport` comes back;
 with `mode="log_based"` as well it is an **incremental view** (below).
@@ -427,12 +428,16 @@ table already joined. Then:
 | subqueries | `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS (SELECT …)`, including `IN (SELECT k … GROUP BY k HAVING SUM/COUNT/AVG(…) > x)` (TPC-H Q18) |
 | expressions | arithmetic in aggregates, `CASE WHEN … THEN … END` over one table, `EXTRACT(YEAR FROM col)`, derived tables `FROM (SELECT … ) AS t` without GROUP BY |
 | aggregates | `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `AVG`; decimals exact (i128, digit for digit), integer overflow widened, floats f64 |
-| result | `GROUP BY` (columns of any joined table), `ORDER BY` (exact for decimals), `LIMIT` |
+| result | `GROUP BY` (columns of any joined table), `ORDER BY` (exact for decimals), `LIMIT`, `HAVING`, `COUNT(DISTINCT col)`, a plain `SELECT` with no aggregate |
+| staged | `WITH` (CTEs, nested), derived tables with GROUP BY, scalar subqueries, correlated scalar subqueries used as a NULL-rejecting comparison (TPC-H Q2, Q17, Q20, Q22), `EXISTS` comparing two tables' columns (Q21), `LEFT JOIN … GROUP BY` the preserved table's key with `COUNT(*)` or aggregates of a joined-table column (Q13) |
 
-Refused before a row is read, naming the piece: `SELECT *`, outer joins,
-`UNION`/`WITH`/window functions, correlated subqueries (TPC-H Q2, Q11, Q13,
-Q15, Q16, Q17, Q20, Q21, Q22 — next release), a `WHERE` comparing two tables'
-columns other than the join, joins on non-integer keys.
+Refused before a row is read, naming the piece: `SELECT *`, `UNION`, window
+functions, `WITH RECURSIVE`, `OFFSET`/`FETCH`/`LIMIT BY` at any depth, right
+and full outer joins, a `LEFT JOIN` grouped coarser than its key or with
+`HAVING`/`DISTINCT` or an aggregate over an expression of the joined table, a
+correlated subquery in any other place, a CTE shadowing another, a timestamp
+scalar subquery used as a literal, a `WHERE` comparing two tables' columns
+other than the join, joins on non-integer keys.
 
 **How it runs.** Each server only scans and sends: its table's conditions and
 columns go into its own `SELECT`, never a join, aggregate or another table's
@@ -443,12 +448,21 @@ over parallel pipes, and the decoder drops rows whose key the map lacks before
 decoding their other columns. Aggregates fold as rows arrive — no joined row is
 ever built. A build past its memory budget (40% of the cgroup limit) splits into
 key-range passes; on a Postgres table stored in key order each pass scans only
-the pages its keys lie in.
+the pages its keys lie in, and a MySQL table without a leading index on the key
+is read once and its rows spilled to disk by range (grace) instead of re-read.
+Groups past an eighth of the limit are answered in parts of a `GROUP BY`
+column. A query the engine cannot answer in one pass (CTEs, subqueries,
+`HAVING`, `COUNT(DISTINCT)`, `LEFT JOIN`) runs as stages: each inner answer is a
+stage table, held in memory up to a sixteenth of the limit for all stages
+together, then written to disk in chunks of at most 8 MiB and read back a chunk
+at a time. The final answer leaves the same way, so a 5.7M-row answer reaches
+DuckDB or a `dest=` table at 244 MB peak.
 
 **Consistency and semantics.** Every read of one Postgres server in a query —
-passes, page spans, dimension and late reads, subqueries — runs in **one
-exported snapshot**, so an UPDATE committing mid-query never loses or doubles a
-row. Text compares follow the column's collation: Postgres `CHAR(n)` ignores
+passes, page spans, dimension and late reads, subqueries, every stage — runs
+in **one exported snapshot** for the whole statement, so an UPDATE committing
+mid-query never loses or doubles a row. MySQL sources take no snapshot: a
+statement reading one MySQL table twice can see two states. Text compares follow the column's collation: Postgres `CHAR(n)` ignores
 trailing spaces, VARCHAR/TEXT do not; a MySQL `_ci` column compares
 case-insensitively, `_ai_ci` / `general_ci` also accent-insensitively
 (`'Brésil' = 'bresil'`), PAD SPACE collations ignore trailing spaces, and a
@@ -465,28 +479,46 @@ Postgres table, or a Postgres × MySQL join; `SUM`/`COUNT`/`AVG`
 need `REPLICA IDENTITY FULL`. State lives in `APITAP_STATE_DIR` (default
 `~/.apitap/views`), bucketed on disk with a SHA-256 per block.
 
-**Measured: TPC-H SF10 across two databases**, 0.5 vCPU / 256 MB container
-(`--cpus=0.5 --memory=256m`, swap off). lineitem, partsupp and customer in
-PostgreSQL; orders, part, supplier, nation and region in MySQL. Every answer
-equal to DuckDB's, digit for digit. *Floor* = the same inputs read alone, same
-columns and filters, no join — what the two servers take to send them.
+**Measured: TPC-H across two databases, a 10g seed** (not standard SF10:
+lineitem 60.3M, partsupp 52.8M, customer 9.9M rows on Postgres; orders 69.9M,
+part 13.1M, supplier 0.65M on MySQL; about 29 GB), 0.5 vCPU / 256 MB container
+(`--cpus=0.5 --memory=256m`, swap off), the 0.67.0 release wheel, one run each.
+lineitem, partsupp and customer in PostgreSQL; orders, part, supplier, nation
+and region in MySQL. All 22 answers equal DuckDB's (decimals digit for digit;
+Q1's float `AVG` columns to the last digits of summation order).
 
-| query | wall | peak | floor | | query | wall | peak | floor |
+| query | wall | CPU | peak | | query | wall | CPU | peak |
 |---|---|---|---|---|---|---|---|---|
-| Q3 | 41.2 s | 175 MB | 20.3 s | | Q9 | 72.8 s | 191 MB | 48.1 s |
-| Q4 | 14.7 s | 126 MB | 11.8 s | | Q10 | 24.8 s | 206 MB | 14.0 s |
-| Q5 | 29.9 s | 138 MB | 26.3 s | | Q12 | 13.1 s | 106 MB | 16.3 s |
-| Q6 | 3.4 s | 51 MB | 3.0 s | | Q14 | 12.3 s | 160 MB | 5.6 s |
-| Q7 | 25.6 s | 165 MB | 18.3 s | | Q18 | 57.5 s | 222 MB | 37.9 s |
-| Q8 | 35.6 s | 140 MB | 28.7 s | | Q19 | 11.8 s | 52 MB | 8.3 s |
+| Q1 | 62.2 s | 31.1 s | 200 MB | | Q12 | 12.8 s | 3.5 s | 98 MB |
+| Q2 | 30.7 s | 11.8 s | 130 MB | | Q13 | 171.6 s | 71.8 s | 259 MB |
+| Q3 | 39.8 s | 12.8 s | 162 MB | | Q14 | 12.6 s | 5.2 s | 165 MB |
+| Q4 | 13.2 s | 3.9 s | 116 MB | | Q15 | 20.2 s | 6.1 s | 113 MB |
+| Q5 | 33.4 s | 12.0 s | 123 MB | | Q16 | 82.7 s | 30.4 s | 150 MB |
+| Q6 | 3.8 s | 1.0 s | 50 MB | | Q17 | 29.4 s | 10.9 s | 179 MB |
+| Q7 | 24.7 s | 10.2 s | 176 MB | | Q18 | 55.7 s | 19.4 s | 219 MB |
+| Q8 | 36.8 s | 14.4 s | 148 MB | | Q19 | 11.3 s | 3.3 s | 53 MB |
+| Q9 | 77.4 s | 26.7 s | 189 MB | | Q20 | 16.7 s | 6.5 s | 149 MB |
+| Q10 | 24.9 s | 8.1 s | 156 MB | | Q21 | 103.2 s | 32.0 s | 175 MB |
+| Q11 | 55.0 s | 22.7 s | 147 MB | | Q22 | 16.8 s | 7.6 s | 90 MB |
 
-Total 342.7 s at 0.5 vCPU (the first exact build of this engine: 568 s).
-With more room the same calls take 184.5 s at 2 vCPU / 2 GB and 165.7 s at
-8 vCPU / 8 GB: past two cores the two source servers' scans (one shared disk on
-the test host) are the limit, not apitap (1–1.5 cores busy). *What these do not
-show:* no other engine was run under the same cap (DuckDB, the truth, ran with
-4 GB); the servers did no join or aggregate work for apitap; queries that need
-correlated subqueries are not in the table because they are refused.
+Total 934.9 s of wall and 351.4 s of CPU for all 22; no query passed 259 MB
+(the cgroup peak, page cache included). The twelve 0.66.0 ran (Q3–Q10, Q12, Q14,
+Q18, Q19) take 346.4 s against 0.66.0's 342.7 s; side by side on one host the
+two releases are within each query's run-to-run spread. Q13 (a LEFT JOIN of
+9.9M customers to 69.9M orders, grouped twice) is the slowest at 171.6 s. A
+plain SELECT of 5.7M rows streamed into DuckDB finishes in 225 s inside the same
+cage. *What these do not show:* no other engine was run under the same cap
+(DuckDB, the truth, ran with more memory); the servers did no join or aggregate
+work for apitap; this is not standard SF10, and no bounded-memory claim is made
+at larger scales (Q9 at SF50 was not run to completion).
+
+**Limits.** An answer read into a Python list (`.to_polars()`, `fetchall`) is
+bounded by Python's objects, not the engine: past roughly 500K wide rows in
+256 MB, stream it to DuckDB/pyarrow or land it with `dest=`. A Postgres view or
+partitioned table as the large side is re-read per key-range pass (no page
+spans). MySQL sources take no snapshot. A process killed mid-query (SIGKILL) or
+a stream held open to interpreter exit can leave stage files in the temp
+directory. `dest=` with a 0-row answer creates no table.
 
 **Opt-in levers** (off by default because they move work onto the source):
 `APITAP_SQL_KEY_FILTER=1` sends a selective build's keys to Postgres as a
@@ -593,6 +625,9 @@ is off.
 | `APITAP_PG_BINARY` | auto | binary `pgoutput`: on by default for ClickHouse lanes whose every column type has a binary renderer (else text); `1` forces on, `0` forces off |
 | `APITAP_STATE_DIR` | `~/.apitap/views` | where `apitap.sql(mode="log_based")` keeps each view's state |
 | `APITAP_SQL_BUILD_BYTES` | 40% of the memory limit | the bytes an `apitap.sql()` key map may hold before the join splits into key-range passes |
+| `APITAP_SQL_GROUP_BYTES` | 1/8 of the memory limit | the bytes an `apitap.sql()` GROUP BY may hold before it is answered in parts of a GROUP BY column |
+| `APITAP_SQL_STAGE_BYTES` | 1/16 of the memory limit | the bytes all of a statement's stage tables (and a streamed answer) hold in memory together before they go to disk |
+| `APITAP_SQL_GRACE` | `1` | `0` = a key-range pass re-reads its probe range from the server instead of the grace spill to disk |
 | `APITAP_SQL_SNAPSHOT` | `1` | `0` = each `apitap.sql()` statement in its own snapshot (rows an UPDATE moves mid-query can be lost) |
 | `APITAP_SQL_KEY_FILTER` / `APITAP_SQL_PUSH_ARGS` | `0` | opt-in work on the source: a key bitmap filter / the aggregate argument computed by Postgres |
 | `APITAP_SQL_VIEW_PG_AGG` | `0` | `1` lets an incremental view's first run aggregate the non-GROUP BY Postgres side on its server |
@@ -760,8 +795,10 @@ and collation included.
       with the box (measured today: 1.90M/min catch-up)
 - [x] `apitap.sql()`: joins and aggregates across databases in Rust, exact, one
       snapshot per Postgres server, incremental views over Postgres × MySQL
-- [ ] `apitap.sql()`: correlated subqueries and outer joins (TPC-H Q2, Q11,
-      Q13, Q15–Q17, Q20–Q22); incremental views over three or more tables
+- [x] `apitap.sql()`: all 22 TPC-H queries (CTEs, correlated subqueries,
+      HAVING, COUNT(DISTINCT), LEFT JOIN by key), answers streamed
+- [ ] `apitap.sql()`: incremental views over three or more tables; window
+      functions, UNION, outer joins beyond LEFT JOIN by key
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
 - [ ] Snowflake destination
 - [ ] aarch64 and macOS wheels, plus an sdist

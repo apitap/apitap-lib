@@ -30,7 +30,7 @@ rm -f benchmarks/wheels/*.whl 2>/dev/null || true
 docker run --rm -v "$REPO":/io -v apitap-bench-cargo:/root/.cargo/registry \
     -e RUSTFLAGS="-Cprofile-generate=/pgodata" \
     ghcr.io/pyo3/maturin build --release -m py-apitap/Cargo.toml -o benchmarks/wheels
-printf 'FROM python:3.12-slim\nCOPY *.whl /tmp/\nRUN pip install --no-cache-dir /tmp/*.whl pyarrow duckdb polars\n' \
+printf 'FROM python:3.12-slim\nCOPY *.whl /tmp/\nRUN pip install --no-cache-dir /tmp/*.whl pyarrow duckdb==1.5.5 polars\n' \
     | docker build -q -t apitap-pgo:inst -f- benchmarks/wheels
 
 echo "== 2/3 training (all routes, 1M) =="

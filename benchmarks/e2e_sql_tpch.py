@@ -67,7 +67,10 @@ def load(con, sf):
           "orders": "o_orderkey", "part": "p_partkey", "supplier": "s_suppkey", "nation": "n_nationkey",
           "region": "r_regionkey"}
     for t in ON_PG:
-        con.execute(f"CALL postgres_execute('pgw', 'ALTER TABLE {PREFIX}{t} ADD PRIMARY KEY ({pk[t]}); ANALYZE {PREFIX}{t}')")
+        # One statement per call: newer DuckDB prepares the text, and a
+        # prepared statement takes one command.
+        con.execute(f"CALL postgres_execute('pgw', 'ALTER TABLE {PREFIX}{t} ADD PRIMARY KEY ({pk[t]})')")
+        con.execute(f"CALL postgres_execute('pgw', 'ANALYZE {PREFIX}{t}')")
     for t in ON_MY:
         con.execute(f"CALL mysql_execute('myw', 'ALTER TABLE {PREFIX}{t} ADD PRIMARY KEY ({pk[t]})')")
         con.execute(f"CALL mysql_execute('myw', 'ANALYZE TABLE {PREFIX}{t}')")

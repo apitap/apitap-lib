@@ -621,11 +621,20 @@ def sql(query: str, *, sources: dict[str, str], dest: str | None = None,
     server, an ``OR`` across tables, ``IN``/``EXISTS`` subqueries (``HAVING``
     over the subquery's key included), ``CASE`` over one table, ``EXTRACT(YEAR
     FROM col)``, derived tables, ``GROUP BY`` columns of any joined table and
-    ``SUM``/``COUNT``/``MIN``/``MAX``/``AVG`` with exact decimals. Outer joins,
-    correlated subqueries, ``SELECT *`` and anything else are refused before a
-    row is read, naming what is not supported. Every read of one Postgres
-    server runs in one snapshot; text compares and ``GROUP BY`` follow each
-    column's collation (MySQL ``_ci``/``_ai_ci``, ``CHAR`` padding).
+    ``SUM``/``COUNT``/``MIN``/``MAX``/``AVG`` with exact decimals, ``HAVING``,
+    ``COUNT(DISTINCT …)`` and a plain ``SELECT`` with no aggregate. ``WITH``
+    (CTEs), scalar and correlated scalar subqueries (as a comparison operand)
+    and a ``LEFT JOIN`` grouped by the preserved table's key run as stages:
+    each inner answer held in memory up to a sixteenth of the memory limit,
+    then on disk. ``SELECT *``, ``UNION``, window functions, ``OFFSET``/``FETCH``
+    and anything else are refused before a row is read, naming what is not
+    supported. Every read of one Postgres server runs in one snapshot for the
+    whole statement (MySQL sources take none); text compares and ``GROUP BY``
+    follow each column's collation (MySQL ``_ci``/``_ai_ci``, ``CHAR`` padding).
+
+    The answer is streamed a chunk at a time: hand a large one to DuckDB or
+    pyarrow, or land it with ``dest=``; ``.to_polars()`` and a Python list
+    hold all of it.
 
     With ``dest=`` and ``table=`` the answer lands in that destination instead,
     through the same path :func:`transfer` takes (typed columns, staging,

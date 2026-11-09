@@ -168,7 +168,11 @@ def setup():
     con.execute("INSTALL postgres; LOAD postgres; INSTALL mysql; LOAD mysql;")
     con.execute(f"ATTACH '{PG_DUCK}' AS pgw (TYPE postgres)")
     con.execute(f"ATTACH '{MY_DUCK}' AS myw (TYPE mysql)")
-    con.execute("CALL postgres_execute('pgw', ?)", [PG_SETUP])
+    # One statement per call: newer DuckDB prepares the text, and a prepared
+    # statement takes one command (the setup holds no ';' inside a literal).
+    for stmt in (x.strip() for x in PG_SETUP.split(";")):
+        if stmt:
+            con.execute("CALL postgres_execute('pgw', ?)", [stmt])
     for s in MY_SETUP:
         con.execute("CALL mysql_execute('myw', ?)", [s])
     con.close()

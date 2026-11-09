@@ -40,10 +40,13 @@ def main():
     state = tempfile.mkdtemp(prefix="apitap-pgo-view-")
     os.environ["APITAP_STATE_DIR"] = state
     kw = dict(sources={"pg": h.PG, "my": h.MY}, dest=PGD, table="pgo_view", mode="log_based")
+    # A view moves by each change's old and new image.
+    con.execute("CALL postgres_execute('pgw', 'ALTER TABLE tpch_lineitem REPLICA IDENTITY FULL')")
     try:
         apitap.sql(VIEW, **kw)
         con.execute("CALL postgres_execute('pgw', 'UPDATE tpch_lineitem SET l_quantity = l_quantity + 1 "
-                    "WHERE l_orderkey % 7 = 0; DELETE FROM tpch_lineitem WHERE l_orderkey % 11 = 0')")
+                    "WHERE l_orderkey % 7 = 0')")
+        con.execute("CALL postgres_execute('pgw', 'DELETE FROM tpch_lineitem WHERE l_orderkey % 11 = 0')")
         con.execute("CALL mysql_execute('myw', 'UPDATE tpch_orders SET o_orderpriority = ''1-URGENT'' "
                     "WHERE o_orderkey % 5 = 0')")
         apitap.sql(VIEW, **kw)
