@@ -26,7 +26,8 @@ PG_DUCK = "host=127.0.0.1 port=5544 dbname=apitap_bench_src user=postgres passwo
 MY_DUCK = "host=127.0.0.1 port=3307 database=bench user=root password=bench"
 
 PG_SETUP = """
-DROP TABLE IF EXISTS shp_c, shp_o, shp_t6, shp_s6, shp_cust, shp_ord, shp_dx, shp_tt, shp_ut, shp_nl, shp_lk, shp_dt, shp_tz, shp_g1, shp_g2, shp_lo, shp_g3, shp_g4;
+DROP TABLE IF EXISTS shp_c, shp_o, shp_t6, shp_s6, shp_cust, shp_ord, shp_dx, shp_tt, shp_ut, shp_nl, shp_lk, shp_dt, shp_tz, shp_g1, shp_g2, shp_lo, shp_g3, shp_g4, shp_xa;
+CREATE TABLE shp_xa(k int, d date, n int, t text); INSERT INTO shp_xa VALUES (1,'2024-01-01',1,'abc'),(2,'2024-01-02',2,'ABC'),(3,'2024-01-03',3,'abc'),(4,'2024-01-04',4,'ABC');
 CREATE TABLE shp_g3(id bigint primary key, grp int); INSERT INTO shp_g3 SELECT i::bigint * 1000003, 100000 + i FROM generate_series(1, 5000) i;
 CREATE TABLE shp_g4(gid bigint); INSERT INTO shp_g4 SELECT (1 + i % 5000)::bigint * 1000003 FROM generate_series(1, 20000) i; ANALYZE shp_g3;
 CREATE TABLE shp_lo(o_id int, oc_id int, st text); INSERT INTO shp_lo VALUES (10,1,'F'),(11,1,'O'),(12,3,NULL),(13,3,'F');
@@ -49,7 +50,10 @@ ANALYZE shp_cust; ANALYZE shp_ord;
 """
 
 MY_SETUP = [
-    "DROP TABLE IF EXISTS shp_n, shp_ci",
+    "DROP TABLE IF EXISTS shp_n, shp_ci, shp_xb",
+    "CREATE TABLE shp_xb(k int primary key, ts datetime, dd date, s varchar(10) COLLATE utf8mb4_0900_ai_ci, c varchar(10))",
+    "INSERT INTO shp_xb VALUES (1,'2024-01-02 12:00:00','2024-01-02','abc','1'),(2,'2024-01-02 12:00:00','2024-01-02','abc','2'),"
+    "(3,'2024-01-02 12:00:00','2024-01-02','abc','3'),(4,'2024-01-02 12:00:00','2024-01-02','abc','4')",
     "CREATE TABLE shp_n(n varchar(10) COLLATE utf8mb4_general_ci)",
     "INSERT INTO shp_n VALUES ('a'),('A')",
     "CREATE TABLE shp_ci(id int primary key, name varchar(10) COLLATE utf8mb4_general_ci, v int)",
@@ -159,6 +163,19 @@ CASES = [
     ("in_fetch", "SELECT a FROM pg.shp_t6 WHERE a IN (SELECT x FROM pg.shp_s6 FETCH FIRST 1 ROWS ONLY)", REFUSED, "FETCH", False, {}),
     ("exists_offset", "SELECT a FROM pg.shp_t6 t WHERE EXISTS (SELECT s.x FROM pg.shp_s6 s WHERE s.x = t.a OFFSET 1)",
      REFUSED, "OFFSET", False, {}),
+    # D1 (0.67 post-release): a column of each table compared on the joined
+    # row runs only between kinds that compare as the servers would. 0.67.0
+    # compared a DATE with a DATETIME as days against micros (0 rows, not 2),
+    # MySQL `_ai_ci` text by its bytes ('ABC' <> 'abc': 2 rows, MySQL says 0),
+    # and an INT with text by dropping every row.
+    ("cross_date_date", "SELECT COUNT(*) AS n FROM pg.shp_xa a JOIN my.shp_xb b ON a.k = b.k WHERE a.d > b.dd",
+     ROWS, [(2,)], False, {}),
+    ("cross_date_datetime", "SELECT COUNT(*) AS n FROM pg.shp_xa a JOIN my.shp_xb b ON a.k = b.k WHERE a.d > b.ts",
+     REFUSED, "a comparison of", False, {}),
+    ("cross_text_ci", "SELECT COUNT(*) AS n FROM pg.shp_xa a JOIN my.shp_xb b ON a.k = b.k WHERE a.t <> b.s",
+     REFUSED, "a comparison of", False, {}),
+    ("cross_int_text", "SELECT COUNT(*) AS n FROM pg.shp_xa a JOIN my.shp_xb b ON a.k = b.k WHERE a.n <> b.c",
+     REFUSED, "a comparison of", False, {}),
     ("derived_fetch", "SELECT COUNT(*) AS n FROM (SELECT a FROM pg.shp_t6 FETCH FIRST 1 ROWS ONLY) d", REFUSED, "FETCH", False, {}),
 ]
 

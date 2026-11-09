@@ -18,7 +18,8 @@ container. apitap.sql() runs the join + aggregate itself:
   4  a WHERE comparing a column of each table (`l.shipdate > o.orderdate`) is checked on
      each joined row, equal to the answer computed here; what does not run is
      refused before any read, naming it: a LEFT JOIN without GROUP BY, an
-     expression over both tables (`l.discount * 100 > o.key`), SELECT *
+     expression over both tables (`l.discount * 100 > o.key`), a date compared
+     with a number across tables (D1: compared as raw integers), SELECT *
   7  a GROUP BY side whose join key repeats (lineitem grouped by l_shipdate,
      counting orders): every match counts, equal to the server's own join (B5)
   5  a build past its budget (APITAP_SQL_BUILD_BYTES=2K, below the 2500-key direct array) is split by key range
@@ -350,6 +351,8 @@ def main():
             ("LEFT JOIN without GROUP BY", f"SELECT COUNT(*) FROM pg.{TL} l LEFT JOIN my.{TO} o ON l.l_orderkey = o.o_orderkey", "LEFT JOIN"),
             ("an expression naming both tables", f"SELECT o_orderpriority, COUNT(*) FROM pg.{TL} l JOIN my.{TO} o "
              f"ON l.l_orderkey = o.o_orderkey WHERE l.l_discount * 100 > o.o_orderkey GROUP BY 1", "more than one table"),
+            ("a date compared with a number across tables", f"SELECT COUNT(*) FROM pg.{TL} l JOIN my.{TO} o "
+             f"ON l.l_orderkey = o.o_orderkey WHERE l.l_shipdate > o.o_orderkey", "a comparison of"),
             ("SELECT *", f"SELECT * FROM pg.{TL}", "SELECT *"),
         ):
             try:

@@ -1874,6 +1874,29 @@ fn ident_name(i: &Ident) -> String {
     i.value.clone()
 }
 
+/// A column of each table compared on the joined row: only kinds whose
+/// values compare as the servers would. The check compares the group-key
+/// encoding, where a date, an integer and a timestamp are all one i64 and
+/// text is raw bytes; so a date against a timestamp (days against micros),
+/// a date against a number, a number against text, and text under a
+/// collation (MySQL `_ci`/`_ai`, a non-C Postgres locale) would answer
+/// silently wrong. Those are refused, naming both columns.
+fn comparable(sides: &[Side], a: (usize, usize), b: (usize, usize)) -> Result<()> {
+    use ArrowKind as K;
+    let (ka, kb) = (&sides[a.0].schema[a.1].kind, &sides[b.0].schema[b.1].kind);
+    let num = |k: &K| matches!(k, K::Int16 | K::Int32 | K::Int64 | K::Decimal { .. } | K::Float32 | K::Float64);
+    let ok = (num(ka) && num(kb))
+        || matches!((ka, kb), (K::Date32, K::Date32) | (K::TimestampUtc, K::TimestampUtc) | (K::TimestampNaive, K::TimestampNaive));
+    if ok {
+        return Ok(());
+    }
+    Err(unsupported(format!(
+        "a comparison of {}.{} ({ka:?}) with {}.{} ({kb:?}) across tables (numbers, two dates or two timestamps of one kind \
+         compare there; text, whose collation may differ, and mixed kinds do not)",
+        sides[a.0].name, sides[a.0].schema[a.1].name, sides[b.0].name, sides[b.0].schema[b.1].name
+    )))
+}
+
 /// The (side, schema column) an expression names, if it is a column.
 fn column_of(sides: &[Side], e: &Expr) -> Result<Option<(usize, usize)>> {
     match e {
@@ -2400,6 +2423,7 @@ fn plan_with(
             if let Some(o) = star::Op::of(op).filter(|o| *o != star::Op::Eq) {
                 if let (Some(a), Some(b)) = (column_of(&sides, left)?, column_of(&sides, right)?) {
                     if a.0 != b.0 {
+                        comparable(&sides, a, b)?;
                         cmps.push((a, b, o));
                         continue;
                     }
@@ -7150,6 +7174,24 @@ mod tests {
         ] {
             let e = plan(q, &srcs(), &mut schemas()).err().map(|e| e.to_string()).unwrap_or_default();
             assert!(e.contains(want), "{q}: {e}");
+        }
+    }
+
+    /// A comparison of a column of each table runs only between kinds that
+    /// compare as the servers would: numbers (exact or float), two dates,
+    /// two timestamps of one kind. A date against an integer, or text under
+    /// collations apitap does not apply here, is refused by name.
+    #[test]
+    fn a_cross_table_compare_of_unlike_kinds_is_refused() {
+        let j = "SELECT COUNT(*) FROM pg.lineitem l JOIN my.orders o ON l.l_orderkey = o.o_orderkey WHERE ";
+        for c in ["l.l_shipdate > o.o_orderkey", "l.l_shipmode <> o.o_orderpriority", "l.l_shipmode < o.o_orderpriority",
+                  "l.l_suppkey <> o.o_orderpriority", "o.o_orderdate < l.l_extendedprice"] {
+            let e = plan(&format!("{j}{c}"), &srcs(), &mut schemas()).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("a comparison of") && e.contains("is not supported"), "{c}: {e}");
+        }
+        for c in ["l.l_shipdate > o.o_orderdate", "l.l_extendedprice > o.o_totalprice", "l.l_suppkey <> o.o_custkey",
+                  "l.l_quantity < o.o_shippriority"] {
+            assert!(plan(&format!("{j}{c}"), &srcs(), &mut schemas()).is_ok(), "{c}");
         }
     }
 
