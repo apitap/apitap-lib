@@ -24,13 +24,13 @@ print(f"{report.rows:,} rows in {report.elapsed_ms} ms over {report.parallel} pi
 
 ## Try it before you install it
 
-**[apitap.dev/lab](https://apitap.dev/lab)** runs this exact wheel — alongside
-ingestr and dlt, each pip-installed next to it — against a seeded Postgres and
-ClickHouse, in your browser. Pick a tool, pick the container it runs in
-(1 GB / 2 vCPU or **256 MB / 0.5 vCPU**), press run, and watch the engine's own
-output. Every result is row-count-verified before a number appears.
+**[apitap.dev/extract](https://apitap.dev/extract)** runs a published apitap
+wheel (it can trail the newest release) against sandbox databases in your
+browser, each run in its own **256 MB / 0.5 vCPU** container, and can race the
+same plan through dlt and ingestr next to it.
 
-That box picker is the point — it limits the **tool**, not the databases:
+The container limits the **tool**, not the databases. Measured 2026-07 on 0.13
+wheels, PG → ClickHouse:
 
 | PG → ClickHouse, 5M rows | tool in 256 MB / 0.5 vCPU | tool in 1 GB / 2 vCPU |
 |---|---|---|
@@ -342,7 +342,7 @@ troubleshooting:
       ([docs/design](https://github.com/apitap/apitap-lib/tree/main/docs/design))
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
 - [ ] Snowflake destination
-- [ ] aarch64 + macOS wheels
+- [x] aarch64 + macOS arm64 wheels, plus an sdist (0.67.1)
 
 ## License
 

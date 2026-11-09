@@ -67,9 +67,9 @@ apitap.sql("""SELECT o_orderpriority, SUM(l_extendedprice * (1 - l_discount)) AS
 | **Modes** | `replace` (default, atomic swap) · `append` · `merge` (Postgres, Iceberg) · `log_based` batch CDC from Postgres and MySQL/MariaDB into Postgres, ClickHouse, MySQL, BigQuery, Iceberg |
 | **SQL** | `apitap.sql()` joins and aggregates tables of different databases (all 22 TPC-H queries across Postgres × MySQL: CTEs, correlated subqueries, HAVING, LEFT JOIN) in apitap's own Rust engine, exact, in a 256 MB container; into a DataFrame (streamed), a destination, or an incremental view |
 | **DataFrames** | `apitap.read()` → polars, pyarrow, duckdb, pandas through the Arrow C stream protocol, zero-copy, no pyarrow dependency |
-| **Runtime** | CPython ≥ 3.9, one `abi3` wheel (`manylinux_x86_64`); the engine is Rust, nothing in the data path is Python |
+| **Runtime** | CPython ≥ 3.9, `abi3` wheels: `manylinux_x86_64` (the PGO build every gate leg and number here ran on), `manylinux_aarch64` and macOS `arm64` (built and unit-tested in CI, not PGO, not gated), and an sdist; the engine is Rust, nothing in the data path is Python |
 | **Memory** | bounded by *pipes × buffers*, planned from the container's cgroup limits — never by table size; a 256 MB container moves 100 GB |
-| **Version** | 0.67.0 — pin exactly while pre-1.0 (`apitap==0.67.0`) |
+| **Version** | 0.67.1 — pin exactly while pre-1.0 (`apitap==0.67.1`). **Upgrade from 0.67.0** (yanked): its `apitap.sql()` could answer a `WHERE` comparing a column of each table wrongly, without an error, when the two were text or of unlike kinds (a date against a datetime, an integer against text); 0.67.1 refuses those by name |
 | **License** | MIT |
 
 ## Why apitap
@@ -803,7 +803,7 @@ and collation included.
       functions, UNION, outer joins beyond LEFT JOIN by key
 - [ ] `query=` for `read()` (arbitrary SQL, not just tables)
 - [ ] Snowflake destination
-- [ ] aarch64 and macOS wheels, plus an sdist
+- [x] aarch64 and macOS arm64 wheels, plus an sdist (0.67.1)
 
 ## Development
 

@@ -1,15 +1,20 @@
-# Publish the committed release wheel to PyPI via Trusted Publishing (OIDC — no token).
-# Triggered by pushing a v* tag. The wheel in dist/ is the PGO release build produced
-# by benchmarks/pgo-build.sh (see that script for the build provenance).
+# Publish a release to PyPI via Trusted Publishing (OIDC — no token).
+# Triggered by pushing a v* tag. dist/ holds the manylinux x86_64 PGO wheel, built
+# by benchmarks/pgo-build.sh — the build every gate leg and published number ran on.
+# The macOS arm64 and manylinux aarch64 wheels and the sdist are built here, each
+# platform's unit tests run on that platform first, and each wheel is installed
+# and driven once before anything publishes. A push to the ci-wheels branch runs
+# everything except the publish, so the platform builds are proven before a tag.
 name: publish
 
 on:
   push:
     tags: ["v*"]
+    branches: ["ci-wheels"]
 
 jobs:
-  # The wheel is abi3 built once on a NEW Python — nothing else ever imports it
-  # on 3.9, so the floor claim must be proven here before anything publishes.
+  # The x86_64 wheel is abi3 built once on a NEW Python — nothing else ever imports
+  # it on 3.9, so the floor claim must be proven here before anything publishes.
   # Runs inside the official python:3.9 image, not setup-python: from
   # 2026-10-19 ubuntu-latest is Ubuntu 26.04, which setup-python has no 3.9
   # build for, and that failed the v0.64.0 publish before anything shipped.
@@ -41,8 +46,76 @@ jobs:
           fi
           echo "PyPI README covers every route scheme:"; echo "$schemes" | tr '\n' ' '; echo
 
+  wheels:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2014"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The engine's own tests on this platform before its wheel exists: the
+      # Linux-only paths (glibc malloc tuning, posix_fadvise, cgroup limits) are
+      # compiled out elsewhere, and this is where that is proven to build and pass.
+      - name: Unit tests (${{ matrix.name }})
+        run: cargo test -p apitap-core --lib
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release -m py-apitap/Cargo.toml -o wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Installed, imported, and driven into the native runtime once: a transfer
+      # to a closed port must come back as a named Python error, not a crash.
+      - name: Wheel installs and runs (${{ matrix.name }})
+        run: |
+          python -m pip install wheelhouse/*.whl
+          python - <<'EOF'
+          import apitap
+          print("import ok", apitap.__version__)
+          try:
+              apitap.transfer("postgres://u:p@127.0.0.1:1/db", "postgres://u:p@127.0.0.1:1/db", table="t")
+          except Exception as e:
+              print("named error ok:", type(e).__name__, str(e)[:120])
+          else:
+              raise SystemExit("a transfer to a closed port returned without an error")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: -m py-apitap/Cargo.toml -o wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: wheelhouse/*.tar.gz
+          if-no-files-found: error
+
   pypi:
-    needs: smoke-py39
+    needs: [smoke-py39, wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -50,8 +123,20 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Show what will be published
-        run: ls -la dist/
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+      # Every file must carry the tag's version: a stale wheel left in dist/
+      # would otherwise publish beside the new ones.
+      - name: Every file is this release's
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          ls -la dist/
+          bad=$(ls dist/ | grep -v -- "apitap-${v}[-.]" || true)
+          if [ -n "$bad" ]; then echo "not version $v: $bad"; exit 1; fi
+          [ "$(ls dist/*x86_64*.whl | wc -l)" = 1 ] || { echo "want exactly one x86_64 wheel"; exit 1; }
+          [ "$(ls dist/*.whl | wc -l)" = 3 ] && [ "$(ls dist/*.tar.gz | wc -l)" = 1 ] || { echo "want 3 wheels + 1 sdist"; exit 1; }
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
