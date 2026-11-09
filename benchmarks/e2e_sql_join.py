@@ -15,8 +15,10 @@ container. apitap.sql() runs the join + aggregate itself:
   2  MIN, MAX, AVG and COUNT(col) over the join, with a NULL in the
      aggregated column
   3  one table with GROUP BY, no join
-  4  what v1 does not run is refused before any read, naming it: LEFT JOIN, a
-     WHERE naming both tables, SELECT *
+  4  a WHERE comparing a column of each table (`l.shipdate > o.orderdate`) is checked on
+     each joined row, equal to the answer computed here; what does not run is
+     refused before any read, naming it: a LEFT JOIN without GROUP BY, an
+     expression over both tables (`l.discount * 100 > o.key`), SELECT *
   7  a GROUP BY side whose join key repeats (lineitem grouped by l_shipdate,
      counting orders): every match counts, equal to the server's own join (B5)
   5  a build past its budget (APITAP_SQL_BUILD_BYTES=2K, below the 2500-key direct array) is split by key range
@@ -326,10 +328,28 @@ def main():
         got = [(p, str(n)) for p, n in rows(apitap.sql(q3, sources=SRC))]
         case("3: one table with GROUP BY", got == want, f"got {got} want {want}")
 
+        # A WHERE comparing a column of each table is checked on the joined row.
+        od = {int(k): (d, p) for k, d, p in
+              (x.split("\t") for x in my(f"SELECT o_orderkey, o_orderdate, o_orderpriority FROM {TO}").splitlines())}
+        cnt, total = defaultdict(int), defaultdict(int)
+        for x in pg(f"SELECT l_orderkey, l_shipdate FROM {TL} WHERE l_orderkey IS NOT NULL").splitlines():
+            k, ship = x.split("|")
+            if int(k) in od:
+                total[od[int(k)][1]] += 1
+                if ship > od[int(k)][0]:
+                    cnt[od[int(k)][1]] += 1
+        want = sorted(cnt.items())
+        q4 = (f"SELECT o_orderpriority, COUNT(*) FROM pg.{TL} l JOIN my.{TO} o ON l.l_orderkey = o.o_orderkey "
+              f"WHERE l.l_shipdate > o.o_orderdate GROUP BY 1 ORDER BY 1")
+        got = [(p, int(n)) for p, n in rows(apitap.sql(q4, sources=SRC))]
+        case("4: a WHERE comparing a column of each table is checked per joined row",
+             got == want and len(want) == 5 and want != sorted(total.items()),
+             f"got {got[:2]} want {want[:2]} of {sorted(total.items())[:2]} joined")
+
         for label, bad, frag in (
-            ("LEFT JOIN", f"SELECT COUNT(*) FROM pg.{TL} l LEFT JOIN my.{TO} o ON l.l_orderkey = o.o_orderkey", "INNER JOIN"),
-            ("a WHERE naming both tables", f"SELECT o_orderpriority, COUNT(*) FROM pg.{TL} l JOIN my.{TO} o "
-             f"ON l.l_orderkey = o.o_orderkey WHERE l.l_discount > o.o_orderkey GROUP BY 1", "more than one table"),
+            ("LEFT JOIN without GROUP BY", f"SELECT COUNT(*) FROM pg.{TL} l LEFT JOIN my.{TO} o ON l.l_orderkey = o.o_orderkey", "LEFT JOIN"),
+            ("an expression naming both tables", f"SELECT o_orderpriority, COUNT(*) FROM pg.{TL} l JOIN my.{TO} o "
+             f"ON l.l_orderkey = o.o_orderkey WHERE l.l_discount * 100 > o.o_orderkey GROUP BY 1", "more than one table"),
             ("SELECT *", f"SELECT * FROM pg.{TL}", "SELECT *"),
         ):
             try:
