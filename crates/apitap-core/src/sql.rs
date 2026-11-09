@@ -1699,6 +1699,11 @@ fn collate(p: &Plan, g: Groups, a: Vec<Acc>, h: Vec<bool>) -> Result<(Groups, Ve
 /// [`collate`] over borrowed groups (`keep`: the groups that are rows;
 /// `None`: all); `None` when no GROUP BY column folds.
 fn collated(p: &Plan, g: &Groups, a: &[Acc], keep: Option<&[bool]>) -> Result<Option<(Groups, Vec<Acc>, Vec<bool>)>> {
+    // A plain SELECT staged as GROUP BY every output (`stage`): its rows are
+    // rows, not groups, and 'a' and 'A' are both returned.
+    if GROUPS_EXACT.try_with(|_| ()).is_ok() {
+        return Ok(None);
+    }
     let folds: Vec<(usize, Coll)> = p
         .gcoll
         .iter()
@@ -1927,6 +1932,20 @@ fn sides_of(sides: &[Side], e: &Expr, out: &mut Vec<usize>) -> Result<()> {
 /// A conjunct for one side, rendered for its source: qualifiers dropped,
 /// column names spelled as that side's schema spells them.
 fn render_for(sides: &[Side], s: usize, e: &Expr) -> Result<String> {
+    // A subquery left inside a condition (under OR, NOT, CASE …) would go to
+    // the server as text naming tables it does not have (a stage table:
+    // `relation "__s.st1_a0" does not exist`): only a top-level IN/EXISTS
+    // conjunct is a subquery here.
+    let mut sub = false;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        if matches!(x, Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }) {
+            sub = true;
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    if sub {
+        return Err(unsupported(format!("the WHERE condition {e}: a subquery under OR, NOT or an expression (an IN or EXISTS of its own conjunct only)")));
+    }
     let mut e = e.clone();
     let mut err = None;
     let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
@@ -2570,8 +2589,8 @@ fn plan_with(
                 let no = |what: &str| unsupported(format!("the subquery in {c}: {what}"));
                 let SetExpr::Select(ss) = q.body.as_ref() else { return Err(no("not a plain SELECT")) };
                 let [f] = ss.from.as_slice() else { return Err(no("not one table")) };
-                if !f.joins.is_empty() || ss.distinct.is_some() || q.limit.is_some() || q.order_by.is_some() {
-                    return Err(no("a join, DISTINCT, LIMIT or ORDER BY"));
+                if !f.joins.is_empty() || ss.distinct.is_some() || q.limit.is_some() || q.order_by.is_some() || q.offset.is_some() || q.fetch.is_some() || !q.limit_by.is_empty() {
+                    return Err(no("a join, DISTINCT, LIMIT, OFFSET, FETCH, LIMIT BY or ORDER BY"));
                 }
                 let mut inner = Vec::new();
                 add(&f.relation, &mut inner)?;
@@ -2810,7 +2829,7 @@ fn plan_with(
     }
     // HAVING: a conjunction of `aggregate op number`, filtered on the final
     // groups (`order_rows`) — a staged plan's grouping keeps only the groups
-    // that pass (TPC-H Q11 sf10: 2M groups, a few thousand kept).
+    // that pass (TPC-H Q11 10g seed: 2M groups, a few thousand kept).
     let mut having = Vec::new();
     if let Some(h) = &sel.having {
         let mut hc = Vec::new();
@@ -3053,8 +3072,8 @@ fn flatten(sel: &sqlparser::ast::Select) -> Result<Option<sqlparser::ast::Select
     if *lateral || !f.joins.is_empty() {
         return Err(no("LATERAL or a join beside it"));
     }
-    if subquery.with.is_some() || subquery.order_by.is_some() || subquery.limit.is_some() || subquery.offset.is_some() {
-        return Err(no("WITH, ORDER BY, LIMIT or OFFSET"));
+    if subquery.with.is_some() || subquery.order_by.is_some() || subquery.limit.is_some() || subquery.offset.is_some() || subquery.fetch.is_some() || !subquery.limit_by.is_empty() {
+        return Err(no("WITH, ORDER BY, LIMIT, OFFSET, FETCH or LIMIT BY"));
     }
     let SetExpr::Select(inner) = subquery.body.as_ref() else { return Err(no("a set operation")) };
     let grouped = !matches!(&inner.group_by, GroupByExpr::Expressions(es, _) if es.is_empty());
@@ -3338,8 +3357,12 @@ pub(crate) async fn key_indexed(side: &Side, col: &str) -> bool {
         Dialect::Pg => {
             let Ok(src) = crate::source::postgres::PgSource::connect(&side.url, 1).await else { return false };
             sqlx::query_scalar::<_, bool>(
+                // A valid, whole-table btree led by the column: what a range
+                // read can use (not a partial, invalid or hash index).
                 "SELECT EXISTS (SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid \
-                   AND a.attnum = i.indkey[0] WHERE i.indrelid = $1::regclass AND a.attname = $2)",
+                   AND a.attnum = i.indkey[0] JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am m ON m.oid = c.relam \
+                   WHERE i.indrelid = $1::regclass AND a.attname = $2 AND i.indisvalid AND i.indpred IS NULL \
+                   AND m.amname = 'btree')",
             )
             .bind(quote(Dialect::Pg, &side.table))
             .bind(col)
@@ -3350,8 +3373,10 @@ pub(crate) async fn key_indexed(side: &Side, col: &str) -> bool {
         Dialect::My => {
             let Ok(src) = crate::source::mysql::MySqlSource::connect(&side.url, 1).await else { return false };
             sqlx::query_scalar::<_, i64>(
+                // A whole-column BTREE led by it (not a prefix or a hash one).
                 "SELECT COUNT(*) FROM information_schema.STATISTICS \
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? AND SEQ_IN_INDEX = 1",
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? AND SEQ_IN_INDEX = 1 \
+                 AND SUB_PART IS NULL AND INDEX_TYPE = 'BTREE'",
             )
             .bind(&t)
             .bind(col)
@@ -4010,7 +4035,14 @@ fn probe_pipe_cap(cores: f64, side: &Side, held: u64, density: f64) -> usize {
     // at 4; Q10 30.1 → 23.3 s). A heavy decode beside a large map keeps two:
     // the T2 join (a quarter through, 64 MiB held) peaked at 243 MB of 256
     // at four.
-    let floor = if density <= 1.0 / 8.0 || held <= 32 << 20 { PROBE_MIN_PIPES } else { 2 };
+    // 40 MiB: the statement's pinned Postgres snapshots hold their
+    // connections from the start (~7 MiB resident), and at 32 a light read
+    // beside them (TPC-H Q22's orders keys, 34 MiB held) fell to two pipes,
+    // 15 s → 26 s. Far under the 64 MiB that peaked at 243 MB with four.
+    // A stage table (no server) keeps 32: more pipes over local rows bought
+    // TPC-H Q20 nothing and held 14-29 MB more.
+    let light = if side.dialect == Dialect::Other { 32 << 20 } else { 40 << 20 };
+    let floor = if density <= 1.0 / 8.0 || held <= light { PROBE_MIN_PIPES } else { 2 };
     let cap = ((cores.ceil() as usize) * 2).max(floor);
     if (!side.conj.is_empty() && held <= 48 << 20) || (density <= 1.0 / 16.0 && held <= 96 << 20) {
         cap.max(SERVER_SCAN_PIPES)
@@ -4165,8 +4197,18 @@ pub async fn run_into(
     if opts.mode != crate::Mode::Replace {
         return Err(bad("apitap.sql(dest=...) lands with mode='replace' (the answer is recomputed whole)"));
     }
-    let res = run(query, sources).await?;
-    let reg = crate::source::sqlresult::register(res);
+    // The answer as it comes: a stage table past its budget lands a chunk at
+    // a time (an answer of millions of rows held whole was OOM-killed in a
+    // 256 MB cage before a destination saw a row).
+    let (srcs, held) = pin_statement(query, sources).await?;
+    let a = stage::run_answer(query, &srcs).await;
+    for h in held {
+        h.close().await;
+    }
+    let reg = match a? {
+        Answer::Rows(r) => crate::source::sqlresult::register(r),
+        Answer::Table(t) => crate::source::sqlresult::register_table(t),
+    };
     let r = crate::transfer(&reg.url, dst_url, table, opts).await;
     drop(reg);
     r
@@ -4251,7 +4293,92 @@ fn rewrite_args(p: &mut Plan) -> bool {
 
 /// Run `query` against `sources` (name → URL).
 pub async fn run(query: &str, sources: &HashMap<String, String>) -> Result<SqlResult> {
-    stage::run(query, sources).await
+    // One snapshot per Postgres server for the whole statement: its stages,
+    // a LEFT JOIN's two halves, the parts of a GROUP BY past its budget and
+    // a run again all read the same rows (each pinned its own before, so an
+    // UPDATE between two of them could count a row twice or not at all).
+    // `pin_snapshots` leaves a URL that carries one as it is. MySQL sources
+    // have no exported snapshot: each statement there reads its own.
+    let (srcs, held) = pin_statement(query, sources).await?;
+    let r = stage::run(query, &srcs).await;
+    for h in held {
+        h.close().await;
+    }
+    r
+}
+
+/// [`run`] as a read stream: a large answer (past the stage budget, on disk)
+/// goes out a chunk at a time instead of whole in memory (`apitap.sql()`'s
+/// Arrow stream). The snapshots close once the answer is computed; its rows
+/// are already the stage's.
+pub async fn run_stream(query: &str, sources: &HashMap<String, String>) -> Result<ReadHandle> {
+    let (srcs, held) = pin_statement(query, sources).await?;
+    let r = stage::run_answer(query, &srcs).await;
+    for h in held {
+        h.close().await;
+    }
+    match r? {
+        Answer::Rows(r) => Ok(ReadHandle::ready(r.schema, vec![r.batch])),
+        // In memory (under the stage budget): handed on as it is, no copy.
+        Answer::Table(t) if t.in_memory() => {
+            let schema = t.schema.clone();
+            Ok(ReadHandle::ready(schema, vec![t.into_batch()?]))
+        }
+        Answer::Table(t) => t.into_stream(),
+    }
+}
+
+/// The Postgres sources the query names (`name.` in its text), each pinned
+/// to a snapshot held until the statement ends.
+async fn pin_statement(query: &str, sources: &HashMap<String, String>) -> Result<(HashMap<String, String>, Vec<crate::source::postgres::HeldSnapshot>)> {
+    let mut srcs = sources.clone();
+    let mut held: Vec<crate::source::postgres::HeldSnapshot> = Vec::new();
+    if std::env::var("APITAP_SQL_SNAPSHOT").is_ok_and(|v| v == "0") {
+        return Ok((srcs, held));
+    }
+    // The sources the statement's tables name (`<source>.<table>`, at any
+    // depth), not every source whose name appears in its text: `a.x` may be
+    // an alias's column. Unparsable: none pinned, the parse error comes next.
+    let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(stmts) = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, query) {
+        let _ = sqlparser::ast::visit_relations(&stmts, |r| {
+            if r.0.len() >= 2 {
+                if let Some(ObjectNamePart::Identifier(i)) = r.0.first() {
+                    named.insert(i.value.to_ascii_lowercase());
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+    }
+    let mut pinned: Vec<(String, String)> = Vec::new();
+    for (name, url) in sources {
+        let pg = url.starts_with("postgres://") || url.starts_with("postgresql://");
+        if !pg || url.contains("__apitap_snapshot=") || !named.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        let to = match pinned.iter().find(|(u, _)| u == url) {
+            Some((_, t)) => t.clone(),
+            None => match crate::source::postgres::HeldSnapshot::open(url).await {
+                Ok(h) => {
+                    let t = format!("{url}{}__apitap_snapshot={}", if url.contains('?') { '&' } else { '?' }, h.id);
+                    held.push(h);
+                    pinned.push((url.clone(), t.clone()));
+                    t
+                }
+                Err(e) => {
+                    for h in held {
+                        h.close().await;
+                    }
+                    return Err(e);
+                }
+            },
+        };
+        srcs.insert(name.clone(), to);
+    }
+    if dbg() && !held.is_empty() {
+        eprintln!("[sql] {} snapshot(s) pinned for the statement", held.len());
+    }
+    Ok((srcs, held))
 }
 
 /// One SELECT the engine answers in one pass (`stage` splits the others).
@@ -4305,11 +4432,21 @@ impl Answer {
             Answer::Table(t) => t.for_each(f),
         }
     }
+
+    /// No rows, the columns' shapes: what `for_each` skips for an empty
+    /// stage table (`None` when there are rows).
+    pub(crate) fn empty_batch(&self) -> Option<ArrowBatch> {
+        match self {
+            Answer::Rows(r) if r.batch.rows == 0 => Some(ArrowBatch { rows: 0, cols: r.batch.cols.clone() }),
+            Answer::Rows(_) => None,
+            Answer::Table(t) => t.empty_batch(),
+        }
+    }
 }
 
 /// A build [`join_pass`] made under [`partitioned`], kept for the next part:
 /// the build side's statement is the same in every part when the part's
-/// column is the probe side's (TPC-H Q16 sf10 read part_10g, 7.6 s, in each
+/// column is the probe side's (TPC-H Q16 10g seed read part_10g, 7.6 s, in each
 /// of its 16 parts). Keyed by [`build_sig`]; one entry, the last build.
 struct CachedBuild {
     sig: String,
@@ -4317,6 +4454,12 @@ struct CachedBuild {
     groups: Groups,
     lo: i64,
     hi: i64,
+}
+
+tokio::task_local! {
+    /// Under a plain SELECT's rewrite as GROUP BY every output (`stage`):
+    /// the groups are not folded by collation ([`collated`]).
+    pub(crate) static GROUPS_EXACT: ();
 }
 
 tokio::task_local! {
@@ -4380,7 +4523,7 @@ tokio::task_local! {
 pub(crate) async fn run_one_out(query: &str, sources: &HashMap<String, String>) -> Result<Answer> {
     // The subqueries' key sets live as long as the plan that read them; held
     // here they outlive a run that broke the group budget, and its parts
-    // take them instead of reading them again (TPC-H Q13 sf10: the anti
+    // take them instead of reading them again (TPC-H Q13 10g seed: the anti
     // join's 69M orders keys, read by the first run and again by the parts).
     let go = BUILD_CACHE.scope(std::cell::RefCell::new((false, None)), run_one_keyed(query, sources));
     if semi::KEY_CACHE.try_with(|_| ()).is_ok() {
@@ -4427,7 +4570,7 @@ const GROUPS_OVER: &str = "groups past their memory budget";
 /// `APITAP_SQL_GROUP_BYTES` (a test lever), else an eighth of the memory
 /// limit, else 512 MiB. An eighth: the finalize copies the groups up to
 /// three times (`combine`, `strip`, `collate`), and a key-range pass holds
-/// its own groups beside the kept ones (TPC-H Q13/Q16 sf10 died at a quarter).
+/// its own groups beside the kept ones (TPC-H Q13/Q16 10g seed died at a quarter).
 fn group_budget() -> u64 {
     if let Some(b) = std::env::var("APITAP_SQL_GROUP_BYTES")
         .ok()
@@ -4482,7 +4625,7 @@ async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Erro
         })
         .collect();
     // Integer columns only: a text column's `%` is the server's to coerce
-    // (MySQL takes 'Brand#45' as 0, every row in part 0: TPC-H Q16 sf10
+    // (MySQL takes 'Brand#45' as 0, every row in part 0: TPC-H Q16 10g seed
     // spent 300 s on p_brand and p_type before ps_suppkey). The finest
     // last: a GROUP BY lists its coarse columns first, as Q16 does.
     let p = plan_probed(query, sources).await?;
@@ -4552,8 +4695,12 @@ async fn parts(
             let mut out: Option<mem::Writer> = None;
             for i in 0..n {
                 let mut q2 = q.clone();
-                q2.order_by = None;
-                q2.limit = None;
+                // With a LIMIT each part keeps its own first rows (the parts'
+                // groups are disjoint, so the answer's are among them): at most
+                // LIMIT × parts rows are merged below, not every group.
+                if q.limit.is_none() {
+                    q2.order_by = None;
+                }
                 let SetExpr::Select(s2) = q2.body.as_mut() else { unreachable!() };
                 let part = if i == 0 { format!("(ABS({col} % {n}) = 0 OR {col} IS NULL)") } else { format!("ABS({col} % {n}) = {i}") };
                 let pe = sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {})
@@ -4626,7 +4773,10 @@ fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], e
             };
             v.as_ref().is_none_or(|b| b[i / 8] & (1 << (i % 8)) != 0)
         };
-        let cmp1 = |c: &FinishedCol, a: usize, b: usize| -> O {
+        // Text by its column's collation, as the engine orders it (a MySQL
+        // _ci column's 'B' after 'a', not before).
+        let colls: Vec<Coll> = r.schema.iter().map(Coll::of).collect();
+        let cmp1 = |c: &FinishedCol, coll: Coll, a: usize, b: usize| -> O {
             match (valid(c, a), valid(c, b)) {
                 (false, false) => return O::Equal,
                 (false, true) => return O::Greater,
@@ -4637,10 +4787,15 @@ fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], e
                 FinishedCol::I16 { data, .. } => data[a].cmp(&data[b]),
                 FinishedCol::I32 { data, .. } => data[a].cmp(&data[b]),
                 FinishedCol::I64 { data, .. } => data[a].cmp(&data[b]),
-                FinishedCol::F32 { data, .. } => data[a].partial_cmp(&data[b]).unwrap_or(O::Equal),
-                FinishedCol::F64 { data, .. } => data[a].partial_cmp(&data[b]).unwrap_or(O::Equal),
+                // A total order: NaN beside `partial_cmp` broke the sort's.
+                FinishedCol::F32 { data, .. } => data[a].total_cmp(&data[b]),
+                FinishedCol::F64 { data, .. } => data[a].total_cmp(&data[b]),
                 FinishedCol::Dec128 { data, .. } => data[a].cmp(&data[b]),
                 FinishedCol::Bool { data, .. } => (data[a / 8] >> (a % 8) & 1).cmp(&(data[b / 8] >> (b % 8) & 1)),
+                FinishedCol::Utf8 { offsets, data, .. } if !coll.plain() => {
+                    let (x, y) = (&data[offsets[a] as usize..offsets[a + 1] as usize], &data[offsets[b] as usize..offsets[b + 1] as usize]);
+                    coll.fold(x).cmp(&coll.fold(y)).then_with(|| x.cmp(y))
+                }
                 FinishedCol::Utf8 { offsets, data, .. } | FinishedCol::Bin { offsets, data, .. } => {
                     data[offsets[a] as usize..offsets[a + 1] as usize].cmp(&data[offsets[b] as usize..offsets[b + 1] as usize])
                 }
@@ -4649,7 +4804,7 @@ fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], e
         let cols = &r.batch.cols;
         idx.sort_by(|&a, &b| {
             for &(c, asc) in &keys {
-                let o = cmp1(&cols[c], a, b);
+                let o = cmp1(&cols[c], colls[c], a, b);
                 let o = if asc { o } else { o.reverse() };
                 if o != O::Equal {
                     return o;
@@ -4679,6 +4834,8 @@ async fn run_engine(query: &str, sources: &HashMap<String, String>) -> Result<Sq
             if dbg() {
                 eprintln!("[sql] a pushed aggregate argument overflowed int8 ({e}); running again without the pushdown");
             }
+            // Passes the failed run streamed are not this run's rows.
+            let _ = PASS_SINK.try_with(|w| w.borrow_mut().take());
             execute(plan_probed(query, sources).await?, t0).await
         }
         r => r,
@@ -4796,6 +4953,50 @@ struct PassCtx<'a> {
     /// Grace spill: probe rows an earlier pass read for a later range, on
     /// disk under that range.
     spill: &'a std::cell::RefCell<Vec<((i64, i64), mem::MemTable)>>,
+    /// The grace spill is on for this join ([`grace_wanted`]).
+    grace: bool,
+}
+
+/// Whether a join split into key ranges reads its probe once and spills the
+/// later ranges' rows (`grace_on`), or reads each range from its server.
+///
+/// Read again, a range costs the server a scan and this side a decode the
+/// build's keys gate (only matching rows decode). Spilled, it costs this
+/// side the whole probe's decode (no gate: the rows of every range pass),
+/// the routing, the disk writes and their page cache in the cage. So the
+/// spill only where a pass is a slow server scan: a MySQL table whose key no
+/// index leads (TPC-H Q13's o_custkey: 69M rows, one connection, 60-100 s a
+/// pass). A Postgres side is read as parallel page spans (`ctid`), a pass
+/// in seconds: there the spill cost TPC-H Q3 41 → 61 s and 176 → 262 MB and
+/// had Q9 OOM-killed at 256 MB (lineitem, 60M rows, no index at all). A
+/// side with no server (a stage table) is read whole each pass: spilled.
+/// Known limit: a Postgres view or partitioned table is not split by `ctid`,
+/// so each of its passes is a full scan on fewer connections: right
+/// answers, slow (`APITAP_SQL_GRACE` cannot turn the spill on for it).
+/// The re-read passes see one set of rows only through the statement's
+/// snapshot (`pin_statement`): the two go together.
+async fn grace_wanted(p: &Plan, names: &[String]) -> bool {
+    if !grace_on() {
+        return false;
+    }
+    let ps = p.agg_side;
+    let Some(i) = p.keys.and_then(|k| k.iter().position(|x| x.0 == ps)) else { return false };
+    let side = &p.sides[ps];
+    let (on, why) = match side.dialect {
+        Dialect::Pg => (false, "Postgres, each range read again as parallel page spans"),
+        Dialect::Other => (true, "no server, read once and spilled by range (grace)"),
+        Dialect::My => {
+            if key_indexed(side, &side.schema[side.read[p.keys.expect("keyed")[i].1]].name).await {
+                (false, "an index leads it, each range read from its server")
+            } else {
+                (true, "no index leads it, read once and spilled by range (grace)")
+            }
+        }
+    };
+    if dbg() {
+        eprintln!("[sql] probe {} key {}: {why}", side.name, names[i]);
+    }
+    on
 }
 
 /// `APITAP_SQL_GRACE=0` turns the grace spill off (every pass reads its
@@ -4826,6 +5027,15 @@ fn build_cost(pairs_cap: usize, n: usize, groups: usize, lo: i64, hi: i64) -> u6
 /// probe the other side into the accumulators. `false` = the build outgrew
 /// the budget and nothing was probed; the caller splits the range.
 /// A probe side's key range still being asked of its server.
+/// A spawned task aborted when its handle is dropped (tokio's detaches).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 type PendingKr<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Kr, Vec<Part>)>> + 'a>>;
 
 /// Keys a build reads per statement while the probe side's range is not
@@ -5089,12 +5299,32 @@ async fn join_pass(
                 }
                 pairs.push((key, g));
             }
-            let cost = match &direct {
+            // The build's groups against the build budget (where a build's
+            // memory is counted): a GROUP BY of a build-side column that is
+            // not the key (orders' o_custkey over a join on o_orderkey, 70M
+            // orders) grew past the cage and was killed instead of answered
+            // in parts by that column. Not the group budget: a part by a
+            // probe-side column (TPC-H Q16's ps_suppkey) leaves the build's
+            // groups whole, and they fit the build's share. A GROUP BY on
+            // the key (`key_groups`) is bounded by the key ranges instead.
+            // Past three quarters of the build's share, parts by a GROUP BY
+            // column: a range split cannot shrink the groups (the passes
+            // share them), only the map, and with the groups near the whole
+            // share the map's passes would run to 64 or to one key. Under
+            // it the groups count in `cost` with the pairs and the map, so
+            // together they stay in the share, a quarter at least for the
+            // map. (Half the share sent TPC-H Q10's 550K customer groups,
+            // 50 MB of 97 beside a 5 MB map, through four parts: 24.5 → 78 s.)
+            let gb = if p.key_groups { 0 } else { groups_bytes(groups, groups.keys.len() * na, groups.keys.len()) };
+            if gb > c.budget / 4 * 3 {
+                return Err(bad(format!("{} build groups ({gb} B): {GROUPS_OVER} ({} B, 3/4 of the build's)", groups.keys.len(), c.budget / 4 * 3)));
+            }
+            let cost = gb + match &direct {
                 Some(a) => a.len() as u64,
                 None => build_cost(pairs.capacity(), pairs.len(), groups.keys.len(), lo, hi),
             } + if p.key_groups {
                 // A pass's groups and their accumulators, all held through
-                // its probe (TPC-H Q13 sf10 priced the keys alone, and the
+                // its probe (TPC-H Q13 10g seed priced the keys alone, and the
                 // 64 MiB of accumulators beside them left the probe of 69M
                 // orders one pipe).
                 groups.bytes + groups.keys.len() as u64 * (na * std::mem::size_of::<Acc>() + 1) as u64
@@ -5209,14 +5439,14 @@ async fn join_pass(
     // Grace spill (the grace hash join): with key ranges still to come, the
     // probe is read once for all of them and the rows of the later ranges
     // go to disk, each under its range; their passes read the disk, not the
-    // server again (TPC-H Q13 sf10: six passes each scanned 69M orders on
+    // server again (TPC-H Q13 10g seed: six passes each scanned 69M orders on
     // the server, 60-80 s apiece). A pass whose rows an earlier one spilled
     // reads them, and spills on for the ranges a split left inside them.
     let src = {
         let i = c.spill.borrow().iter().position(|(r, _)| r.0 <= lo && hi <= r.1);
         i.map(|i| c.spill.borrow_mut().remove(i))
     };
-    let mut others: Vec<(i64, i64)> = if grace_on() {
+    let mut others: Vec<(i64, i64)> = if c.grace {
         c.rest.iter().copied().filter(|r| r.0 > hi && src.as_ref().is_none_or(|(s, _)| s.0 <= r.0 && r.1 <= s.1)).collect()
     } else {
         Vec::new()
@@ -5261,8 +5491,15 @@ async fn join_pass(
     // and the probe dimensions' keys. A probe row they drop is one the fold
     // would drop, before its other columns decode.
     let mut gates = Vec::new();
-    if filter.is_none() && plain {
-        gates.extend(gate_of(&p.sides[ps], pkey, lo, hi, map.keys() as u64, |g| map.for_each_key(|k| g.set(k))));
+    if filter.is_none() {
+        // The build's keys gate this range's rows only; under the grace
+        // spill the read carries later ranges' rows too, so that gate is
+        // the plain read's. The dimensions' gates hold for every range: a
+        // row they drop is dropped in whichever range it falls (TPC-H Q9's
+        // part gate drops 96% of lineitem, which grace spilled to disk).
+        if plain {
+            gates.extend(gate_of(&p.sides[ps], pkey, lo, hi, map.keys() as u64, |g| map.for_each_key(|k| g.set(k))));
+        }
         if let Some(st) = &p.star {
             let of: Vec<(usize, &star::DimMap)> = st.pkids.iter().filter(|&&k| st.dims[k].key2.is_none()).map(|&k| (st.dims[k].fk, &c.dims[k])).collect();
             gates.extend(dim_gates(&p.sides[ps], &of));
@@ -5523,9 +5760,12 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
         if bside.dialect != Dialect::Other && pside.dialect != Dialect::Other && !std::env::var("APITAP_SQL_OVERLAP").is_ok_and(|v| v == "0") {
             // Its own task: a future only moves when polled, and the build
             // polls it between chunks only.
-            let task = tokio::spawn(key_range_of(pside.dialect, pside.name.clone(), pside.url.clone(), pside.table.clone(), names[1 - bi].clone()));
+            // Aborted when the query is done with it: a range still running
+            // (an unindexed MIN/MAX, 30 s for Q13's o_custkey) no longer
+            // outlives the query, nor runs once per part.
+            let mut task = AbortOnDrop(tokio::spawn(key_range_of(pside.dialect, pside.name.clone(), pside.url.clone(), pside.table.clone(), names[1 - bi].clone())));
             let mut f: PendingKr<'_> = Box::pin(async move {
-                task.await.map_err(|e| Error::Transfer(format!("sql: key range task: {e}")))?
+                (&mut task.0).await.map_err(|e| Error::Transfer(format!("sql: key range task: {e}")))?
             });
             let rb = key_range(bside, &names[bi]).await?;
             match rb {
@@ -5594,7 +5834,7 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
         let mut kept: (Groups, Vec<Acc>, Vec<bool>) = (Groups::default(), Vec::new(), Vec::new());
         let pgroup = p.star.as_ref().is_some_and(|st| !st.pgroup.is_empty());
         // Unordered and unlimited, under `run_one_out`: each pass's rows go
-        // straight to a stage table (TPC-H Q13 sf10: 9.9M customers' groups
+        // straight to a stage table (TPC-H Q13 10g seed: 9.9M customers' groups
         // kept across the passes broke the group budget, and the query ran
         // again in 16 parts, each reading 69M orders).
         let stream = p.key_groups
@@ -5603,11 +5843,13 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
             && p.star.as_ref().is_none_or(|st| st.late.is_empty())
             && PASS_SINK.try_with(|_| ()).is_ok();
         let mut todo = vec![(lo, hi)];
+        // Asked once, when the build first splits.
+        let mut grace: Option<bool> = None;
         let spill = std::cell::RefCell::new(Vec::new());
         let mut passes = 0u32;
         while let Some(mut rg) = todo.pop() {
             let rest = todo.clone();
-            let ctx = PassCtx { p: &p, parts: &probe_parts, dims: &dims, k, names: &key_names, budget, t0, over: std::cell::Cell::new(0.0), rest: &rest, spill: &spill };
+            let ctx = PassCtx { p: &p, parts: &probe_parts, dims: &dims, k, names: &key_names, budget, t0, over: std::cell::Cell::new(0.0), rest: &rest, spill: &spill, grace: grace.unwrap_or(false) };
             let done = join_pass(&ctx, &mut rg, &mut pending, &mut groups, &mut cgroups, &mut kb, &mut accs, &mut hit).await?;
             if p.key_groups {
                 // This pass's groups are final: the rows the answer can
@@ -5658,6 +5900,20 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
             match done {
                 true => passes += 1,
                 false if a > b => passes += 1,
+                false if a < b && p.sides[p.group_side].dialect == Dialect::Other => {
+                    // A build side with no server reads every row each pass
+                    // (no BETWEEN to push): a narrower range would read and
+                    // overflow again, about log2(span) times. Its groups
+                    // count in the cost (under 3/4 of the share, beside the
+                    // map): parts by a GROUP BY column shrink both, so that
+                    // is tried first (GROUPS_OVER), unless the GROUP BY is
+                    // the key itself (no column to part by but the key).
+                    let parts = if p.key_groups { String::new() } else { format!(": {GROUPS_OVER}") };
+                    return Err(bad(format!(
+                        "the build side {} outgrew the build budget ({budget} B) and has no server to read it by key range{parts}; raise the memory limit",
+                        p.sides[p.group_side].name
+                    )));
+                }
                 false if a < b => {
                     // As many even key ranges as the projected cost needs at
                     // 60% of the budget each (halving re-read most of the
@@ -5672,10 +5928,13 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
                     // first read the disk, so one more costs a build's
                     // statement, and the first range's probe reads the whole
                     // side from its server with the pipes a smaller build
-                    // leaves (TPC-H Q13 sf10: ranges of 990K customers held
+                    // leaves (TPC-H Q13 10g seed: ranges of 990K customers held
                     // 68 MiB and read 69M orders on 2 pipes in 70 s; of 550K,
                     // 38 MiB and 6 pipes, 47 s).
-                    let share = if grace_on() { 0.4 } else { 0.6 };
+                    if grace.is_none() {
+                        grace = Some(grace_wanted(&p, &key_names).await);
+                    }
+                    let share = if grace == Some(true) { 0.4 } else { 0.6 };
                     let n = ((proj / (share * budget.max(1) as f64)).ceil() as i128).clamp(2, 64).min(span);
                     if dbg() {
                         eprintln!("[sql] build of {a}..{b} past {budget} B (whole range ~{} B): {n} ranges", proj as u64);
@@ -6097,7 +6356,7 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
     for (c, (name, oc)) in p.out.iter().enumerate() {
         // Only the vector this column's kind reads is filled: five per row
         // (an empty Vec among them) cost ~57 bytes a cell, and 2M groups of
-        // a staged GROUP BY died in the 256 MiB cage here (TPC-H Q11 sf10).
+        // a staged GROUP BY died in the 256 MiB cage here (TPC-H Q11 10g seed).
         let k = kinds[c];
         let (wi, wf, wd, ws) = match k {
             ArrowKind::Float32 | ArrowKind::Float64 => (false, true, false, false),
@@ -6195,7 +6454,14 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
             }
         };
         cols.push(col);
-        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: false, ci: false, ai: false });
+        // A GROUP BY text output keeps its column's collation: a stage of it
+        // groups and orders as the source column does, and so does the sort
+        // of an answer put together from parts (`order_limit`).
+        let coll = match oc {
+            OutCol::Group(g) if matches!(k, ArrowKind::Utf8) => p.gcoll.get(*g).copied().unwrap_or_default(),
+            _ => Coll::default(),
+        };
+        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: coll.pad, ci: coll.ci, ai: coll.ai });
     }
     Ok(SqlResult { schema, batch: ArrowBatch { rows: rows.len(), cols } })
 }

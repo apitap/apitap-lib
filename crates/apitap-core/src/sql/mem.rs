@@ -14,11 +14,27 @@ use std::sync::{Arc, Mutex};
 pub(crate) const SCHEME: &str = "mem://";
 
 /// One stage's answer: in memory, or past [`stage_budget`] on disk in
-/// chunks a reader takes one at a time (TPC-H Q13 sf10 staged 9.9M rows).
+/// chunks a reader takes one at a time (TPC-H Q13 10g seed staged 9.9M rows).
 pub(crate) struct MemTable {
     pub schema: Vec<ArrowField>,
     rows: usize,
     chunks: Chunks,
+    /// The bytes of `chunks` counted in [`STAGE_HELD`] (memory chunks).
+    held: u64,
+}
+
+/// The bytes every stage table and writer of the process holds in memory:
+/// the stage budget bounds them all together, not each stage alone (nine
+/// CTEs of 14 MB each under a 16 MB budget held 126 MB, the run peaked at
+/// 193 MB of 256).
+static STAGE_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn held_add(n: u64) -> u64 {
+    STAGE_HELD.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n
+}
+
+fn held_sub(n: u64) {
+    let _ = STAGE_HELD.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |v| Some(v.saturating_sub(n)));
 }
 
 enum Chunks {
@@ -29,6 +45,7 @@ enum Chunks {
 
 impl Drop for MemTable {
     fn drop(&mut self) {
+        held_sub(std::mem::take(&mut self.held));
         if let Chunks::Disk(path, _) = &self.chunks {
             let _ = std::fs::remove_file(path);
         }
@@ -37,6 +54,9 @@ impl Drop for MemTable {
 
 /// Rows per chunk of a stage on disk.
 const CHUNK: usize = 65536;
+
+/// About the most bytes a chunk on disk (or a repeated piece) holds.
+const CHUNK_BYTES: usize = 8 << 20;
 
 /// The bytes a stage may hold in memory: `APITAP_SQL_STAGE_BYTES` (a test
 /// lever), else a sixteenth of the memory limit, else 256 MiB.
@@ -63,6 +83,55 @@ impl MemTable {
         self.rows
     }
 
+    /// Whether the table's rows are in memory (under the stage budget).
+    pub(crate) fn in_memory(&self) -> bool {
+        matches!(self.chunks, Chunks::Mem(_))
+    }
+
+    /// How many chunks `chunk` reads (1 for a table in memory).
+    pub(crate) fn n_chunks(&self) -> usize {
+        match &self.chunks {
+            Chunks::Mem(_) => 1,
+            Chunks::Disk(_, at) => at.len(),
+        }
+    }
+
+    /// Chunk `i`, every column: borrowed in memory, read from disk otherwise.
+    pub(crate) fn chunk(&self, i: usize) -> Result<std::borrow::Cow<'_, ArrowBatch>> {
+        match &self.chunks {
+            Chunks::Mem(b) => Ok(std::borrow::Cow::Borrowed(b)),
+            Chunks::Disk(path, at) => {
+                use std::io::{Read as _, Seek as _};
+                let io = |e: std::io::Error| Error::Transfer(format!("sql: stage file {}: {e}", path.display()));
+                let (off, len) = at[i];
+                let mut file = std::fs::File::open(path).map_err(io)?;
+                let mut buf = vec![0u8; len as usize];
+                file.seek(std::io::SeekFrom::Start(off)).and_then(|_| file.read_exact(&mut buf)).map_err(io)?;
+                let all: Vec<usize> = (0..self.schema.len()).collect();
+                let b = decode(&buf, &all)?;
+                drop_cache(&file, off + len);
+                Ok(std::borrow::Cow::Owned(b))
+            }
+        }
+    }
+
+    /// The table as a read stream, a chunk at a time: a query's answer handed
+    /// on without its rows in memory at once (`sql::run_stream`).
+    pub(crate) fn into_stream(self) -> Result<crate::read::ReadHandle> {
+        let run = Run::new();
+        run.put("answer", self);
+        // The stream holds the table; the run's name goes with `run`.
+        start(&run.url, "answer", &crate::read::ReadOptions::default())
+    }
+
+    /// An empty table's columns, no rows (`None` past zero rows).
+    pub(crate) fn empty_batch(&self) -> Option<ArrowBatch> {
+        match &self.chunks {
+            Chunks::Mem(b) if b.rows == 0 => Some(ArrowBatch { rows: 0, cols: b.cols.clone() }),
+            _ => None,
+        }
+    }
+
     /// Each chunk in order, every column, read one at a time.
     pub(crate) fn for_each(&self, f: &mut dyn FnMut(ArrowBatch) -> Result<()>) -> Result<()> {
         match &self.chunks {
@@ -74,10 +143,19 @@ impl MemTable {
                 let mut file = std::fs::File::open(path).map_err(io)?;
                 let all: Vec<usize> = (0..self.schema.len()).collect();
                 let mut buf = Vec::new();
+                let mut read = 0u64;
                 for &(off, len) in at {
                     buf.resize(len as usize, 0);
                     file.seek(std::io::SeekFrom::Start(off)).and_then(|_| file.read_exact(&mut buf)).map_err(io)?;
                     f(decode(&buf, &all)?)?;
+                    read += len;
+                    if read >= WRITE_OUT {
+                        drop_cache(&file, off + len);
+                        read = 0;
+                    }
+                }
+                if let Some(&(off, len)) = at.last() {
+                    drop_cache(&file, off + len);
                 }
                 Ok(())
             }
@@ -100,7 +178,7 @@ impl MemTable {
 
 /// A stage written a batch at a time (a query answered in parts, a LEFT
 /// JOIN's two halves): in memory up to [`stage_budget`], then chunks on
-/// disk, so the whole never sits in memory (TPC-H Q13 sf10: 9.9M groups
+/// disk, so the whole never sits in memory (TPC-H Q13 10g seed: 9.9M groups
 /// in 16 parts died concatenating them).
 pub(crate) struct Writer {
     schema: Vec<ArrowField>,
@@ -118,10 +196,69 @@ struct Spill {
     at: Vec<(u64, u64)>,
     off: u64,
     buf: Vec<u8>,
+    /// Bytes written since the last [`write_out`].
+    since: u64,
+}
+
+/// Bytes a stage file takes before its pages are written out and dropped.
+const WRITE_OUT: u64 = 16 << 20;
+
+/// A file's written pages to disk now, and out of the page cache: the cache
+/// counts against the cgroup (TPC-H Q13 on the 10g seed spilled 69M orders:
+/// cgroup 260 MB of 256, 213 MB of it page cache, 108 MB dirty, beside
+/// 167 MB anonymous). A data-only range flush, no journal commit; the same
+/// recipe as a view's bulk files (`view::start_writeback`).
+/// A failed writeback (EIO, ENOSPC) is returned: the pages it lost would
+/// read back as zeros.
+fn write_out(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: a valid open descriptor; the calls only do I/O and advise.
+        let r = unsafe {
+            libc::sync_file_range(
+                f.as_raw_fd(),
+                0,
+                0,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            )
+        };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            // A file system without the call (EINVAL, ENOSYS, ESPIPE,
+            // EOPNOTSUPP) is no failure: the pages stay to the kernel.
+            if !matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::ESPIPE | libc::EOPNOTSUPP)) {
+                return Err(e);
+            }
+        }
+        // SAFETY: as above; advice only.
+        unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = f;
+    Ok(())
+}
+
+/// A file's pages before `end` out of the page cache once read (advice
+/// only): behind the read position, so the readahead ahead of it stays.
+fn drop_cache(f: &std::fs::File, end: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: a valid open descriptor; advice only.
+        unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), 0, end as libc::off_t, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (f, end);
 }
 
 impl Drop for Writer {
     fn drop(&mut self) {
+        held_sub(std::mem::take(&mut self.mem_bytes));
         if let Some(s) = &self.disk {
             let _ = std::fs::remove_file(&s.path);
         }
@@ -146,27 +283,44 @@ impl Writer {
     }
 
     pub(crate) fn push(&mut self, b: ArrowBatch) -> Result<()> {
-        if self.like.is_none() {
-            self.like = Some(b.cols.iter().map(empty_like).collect());
-        } else if b.rows == 0 {
-            return Ok(());
-        }
         if b.cols.len() != self.schema.len() {
             return Err(Error::InvalidInput("sql: internal: a stage part differs in columns".into()));
         }
+        match &self.like {
+            None => self.like = Some(b.cols.iter().map(empty_like).collect()),
+            // Every part of one kind per column: a chunk of another would be
+            // concatenated or read back as the first's.
+            Some(like) if like.iter().zip(&b.cols).any(|(l, c)| std::mem::discriminant(l) != std::mem::discriminant(c)) => {
+                return Err(Error::InvalidInput("sql: internal: a stage part differs in column kinds".into()));
+            }
+            Some(_) if b.rows == 0 => return Ok(()),
+            Some(_) => {}
+        }
         self.rows += b.rows;
         if self.disk.is_none() {
-            self.mem_bytes += b.bytes() as u64;
+            let n = b.bytes() as u64;
+            self.mem_bytes += n;
+            let empty = b.rows == 0;
             self.mem.push(b);
-            if self.mem_bytes <= self.budget {
+            // A part of no rows stays: on disk it would leave no chunk, and
+            // the stage no columns.
+            if held_add(n) <= self.budget || empty {
                 return Ok(());
             }
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!("apitap-stage-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-            let file = std::fs::File::create(&path).map_err(|e| Error::Transfer(format!("sql: stage file {}: {e}", path.display())))?;
-            self.disk = Some(Spill { path, file: std::io::BufWriter::new(file), at: Vec::new(), off: 0, buf: Vec::new() });
-            self.mem_bytes = 0;
+            // A name no other process or run can hold (a container's pid 1
+            // is every container's), created new: never truncating, never
+            // through a link someone left at that path.
+            use std::hash::{BuildHasher as _, Hasher as _};
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u64(self.rows as u64);
+            let path = std::env::temp_dir().join(format!("apitap-stage-{}-{:016x}", std::process::id(), h.finish()));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| Error::Transfer(format!("sql: stage file {}: {e}", path.display())))?;
+            self.disk = Some(Spill { path, file: std::io::BufWriter::new(file), at: Vec::new(), off: 0, buf: Vec::new(), since: 0 });
+            held_sub(std::mem::take(&mut self.mem_bytes));
             for b in std::mem::take(&mut self.mem) {
                 self.write(&b)?;
             }
@@ -179,9 +333,13 @@ impl Writer {
         use std::io::Write as _;
         let s = self.disk.as_mut().expect("spilling");
         let io = |e: std::io::Error| Error::Transfer(format!("sql: stage file {}: {e}", s.path.display()));
+        // At most CHUNK rows and about CHUNK_BYTES a chunk: a reader decodes
+        // one chunk at a time, and 64K rows of 5 KB text were 320 MB.
+        let per_row = (b.bytes() / b.rows.max(1)).max(1);
+        let rows_cap = (CHUNK_BYTES / per_row).clamp(1, CHUNK);
         let mut r = 0;
         while r < b.rows {
-            let n = CHUNK.min(b.rows - r);
+            let n = rows_cap.min(b.rows - r);
             s.buf.clear();
             if r == 0 && n == b.rows {
                 encode(b, &mut s.buf);
@@ -192,6 +350,12 @@ impl Writer {
             s.file.write_all(&s.buf).map_err(io)?;
             s.at.push((s.off, s.buf.len() as u64));
             s.off += s.buf.len() as u64;
+            s.since += s.buf.len() as u64;
+            if s.since >= WRITE_OUT {
+                s.file.flush().map_err(io)?;
+                write_out(s.file.get_ref()).map_err(io)?;
+                s.since = 0;
+            }
             r += n;
         }
         Ok(())
@@ -202,11 +366,11 @@ impl Writer {
         let rows = self.rows;
         if let Some(mut s) = self.disk.take() {
             use std::io::Write as _;
-            if let Err(e) = s.file.flush() {
+            if let Err(e) = s.file.flush().and_then(|()| write_out(s.file.get_ref())) {
                 let _ = std::fs::remove_file(&s.path);
                 return Err(Error::Transfer(format!("sql: stage file {}: {e}", s.path.display())));
             }
-            return Ok(MemTable { schema, rows, chunks: Chunks::Disk(s.path, s.at) });
+            return Ok(MemTable { schema, rows, chunks: Chunks::Disk(s.path, s.at), held: 0 });
         }
         let parts = std::mem::take(&mut self.mem);
         let batch = match parts.len() {
@@ -214,7 +378,8 @@ impl Writer {
             1 => parts.into_iter().next().expect("one part"),
             _ => concat_all(&parts.iter().collect::<Vec<_>>())?,
         };
-        Ok(MemTable { schema, rows, chunks: Chunks::Mem(batch) })
+        let held = std::mem::take(&mut self.mem_bytes);
+        Ok(MemTable { schema, rows, chunks: Chunks::Mem(batch), held })
     }
 }
 
@@ -276,6 +441,11 @@ fn decode(r: &[u8], want: &[usize]) -> Result<ArrowBatch> {
     };
     let rows = u64_at(&mut i)? as usize;
     let ncols = u64_at(&mut i)? as usize;
+    // A chunk read back wrong (pages lost, zeros) must fail here, not index
+    // past its columns: every column takes a byte at least.
+    if ncols > r.len() || want.iter().any(|&c| c >= ncols) {
+        return Err(Error::Transfer(format!("sql: a stage chunk of {ncols} columns read for column(s) {want:?}")));
+    }
     let mut cols: Vec<Option<FinishedCol>> = (0..ncols).map(|_| None).collect();
     fn opt(r: &[u8], i: &mut usize) -> Result<Option<Vec<u8>>> {
         let short = || Error::Transfer("sql: a stage chunk ended early".into());
@@ -286,7 +456,7 @@ fn decode(r: &[u8], want: &[usize]) -> Result<ArrowBatch> {
         }
         let n = u64::from_le_bytes(r.get(*i..*i + 8).ok_or_else(short)?.try_into().expect("8")) as usize;
         *i += 8;
-        let v = r.get(*i..*i + n).ok_or_else(short)?.to_vec();
+        let v = r.get(*i..i.checked_add(n).ok_or_else(short)?).ok_or_else(short)?.to_vec();
         *i += n;
         Ok(Some(v))
     }
@@ -294,8 +464,9 @@ fn decode(r: &[u8], want: &[usize]) -> Result<ArrowBatch> {
         ($t:ty, $w:expr, $i:ident) => {{
             let n = u64::from_le_bytes(r.get($i..$i + 8).ok_or_else(short)?.try_into().expect("8")) as usize;
             $i += 8;
-            let b = r.get($i..$i + n * $w).ok_or_else(short)?;
-            $i += n * $w;
+            let len = n.checked_mul($w).ok_or_else(short)?;
+            let b = r.get($i..$i.checked_add(len).ok_or_else(short)?).ok_or_else(short)?;
+            $i += len;
             b.chunks_exact($w).map(|x| <$t>::from_le_bytes(x.try_into().expect("width"))).collect::<Vec<$t>>()
         }};
     }
@@ -433,6 +604,9 @@ pub(crate) fn start(url: &str, table: &str, opts: &ReadOptions) -> Result<ReadHa
                         return;
                     }
                 };
+                // The page cache dropped behind the read every 16 MiB, as
+                // `for_each` does: a large answer streamed out is read once.
+                let mut read = 0u64;
                 for &(off, len) in at {
                     let mut buf = vec![0u8; len as usize];
                     let r = f
@@ -440,10 +614,18 @@ pub(crate) fn start(url: &str, table: &str, opts: &ReadOptions) -> Result<ReadHa
                         .and_then(|_| f.read_exact(&mut buf))
                         .map_err(|e| Error::Transfer(format!("sql: stage file {}: {e}", path.display())))
                         .and_then(|_| decode(&buf, &idx));
+                    read += len;
+                    if read >= WRITE_OUT {
+                        drop_cache(&f, off + len);
+                        read = 0;
+                    }
                     let stop = r.is_err();
                     if tx.send(r).await.is_err() || stop {
                         return;
                     }
+                }
+                if let Some(&(off, len)) = at.last() {
+                    drop_cache(&f, off + len);
                 }
             }
         }
@@ -533,6 +715,62 @@ fn empty_like(c: &FinishedCol) -> FinishedCol {
 
 /// Each row repeated by its count (`counts[r]`), up to `limit` rows; the
 /// validity bitmaps come out sized to the rows (or `None` when all valid).
+/// Row `r` of `b` repeated `counts[r]` times, in order, at most `left` rows
+/// in all (counted down), handed to `f` in pieces of at most [`CHUNK`]
+/// rows: a plain SELECT's rows rebuilt from its groups' counts never sit in
+/// memory whole (TPC-H lineitem's 60M rows from 4 (flag, status) groups at
+/// 10g seed were OOM-killed in a 256 MB cage).
+pub(crate) fn repeat_chunks(b: &ArrowBatch, counts: &[usize], left: &mut Option<usize>, f: &mut dyn FnMut(ArrowBatch) -> Result<()>) -> Result<()> {
+    let fresh = || -> Vec<FinishedCol> { b.cols.iter().map(empty_like).collect() };
+    let mut cols = fresh();
+    let mut rows = 0usize;
+    // The bytes already in the piece: rows of other widths before this one.
+    let mut held = 0usize;
+    for (r, &n) in counts.iter().enumerate() {
+        let mut n = left.map_or(n, |l| n.min(l));
+        if let Some(l) = left.as_mut() {
+            *l -= n;
+        }
+        // The row's width, so a piece stays near CHUNK_BYTES (and its i32
+        // text offsets far from wrapping).
+        let width: usize = b
+            .cols
+            .iter()
+            .map(|c| match c {
+                FinishedCol::Utf8 { offsets, .. } | FinishedCol::Bin { offsets, .. } => (offsets[r + 1] - offsets[r]) as usize + 4,
+                _ => 16,
+            })
+            .sum::<usize>()
+            .max(1);
+        while n > 0 {
+            let room = (CHUNK_BYTES.saturating_sub(held) / width).max(1);
+            let take = n.min(CHUNK - rows).min(room);
+            for (o, c) in cols.iter_mut().zip(&b.cols) {
+                let mut at = rows;
+                push_rep(o, c, r, take, &mut at);
+            }
+            rows += take;
+            held += take * width;
+            n -= take;
+            if rows == CHUNK || held >= CHUNK_BYTES {
+                let mut full = std::mem::replace(&mut cols, fresh());
+                tidy(&mut full, rows);
+                f(ArrowBatch { rows, cols: full })?;
+                rows = 0;
+                held = 0;
+            }
+        }
+        if *left == Some(0) {
+            break;
+        }
+    }
+    if rows > 0 {
+        tidy(&mut cols, rows);
+        f(ArrowBatch { rows, cols })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn repeat(b: &ArrowBatch, counts: &[usize], limit: Option<usize>) -> ArrowBatch {
     let mut cols: Vec<FinishedCol> = b.cols.iter().map(empty_like).collect();
     let mut rows = 0usize;
@@ -627,6 +865,19 @@ pub(crate) fn take_rows(b: &ArrowBatch, idx: &[usize]) -> ArrowBatch {
 pub(crate) fn concat_all(bs: &[&ArrowBatch]) -> Result<ArrowBatch> {
     let Some(first) = bs.first() else { return Err(Error::InvalidInput("sql: internal: nothing to concatenate".into())) };
     let mut cols: Vec<FinishedCol> = first.cols.iter().map(empty_like).collect();
+    // Text and binary offsets are i32: past 2 GiB in one column they wrap.
+    for c in 0..cols.len() {
+        let total: usize = bs
+            .iter()
+            .map(|b| match b.cols.get(c) {
+                Some(FinishedCol::Utf8 { data, .. } | FinishedCol::Bin { data, .. }) => data.len(),
+                _ => 0,
+            })
+            .sum();
+        if total > i32::MAX as usize {
+            return Err(Error::InvalidInput(format!("sql: a text column of {total} bytes in one result (past 2 GiB); narrow the query")));
+        }
+    }
     let mut rows = 0usize;
     for b in bs {
         if b.cols.len() != cols.len() {
@@ -692,6 +943,193 @@ mod tests {
         ArrowBatch { rows: n, cols: vec![FinishedCol::I64 { validity: None, data: keys }, FinishedCol::Utf8 { validity: None, offsets: off, data }] }
     }
 
+    fn kt_schema() -> Vec<ArrowField> {
+        vec![
+            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
+            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
+        ]
+    }
+
+    /// The stage budget bounds every stage held in memory together: a
+    /// second stage that fits the budget alone goes to disk beside a first
+    /// one still held (other tests' stages only add to the count).
+    #[test]
+    fn stage_budget_is_shared_by_the_stages_held() {
+        let one = part(0, 1000).bytes() as u64;
+        let mut w1 = Writer::new(kt_schema());
+        w1.budget = one * 3 / 2;
+        w1.push(part(0, 1000)).unwrap();
+        let t1 = w1.finish().unwrap();
+        let mut w2 = Writer::new(kt_schema());
+        w2.budget = one * 3 / 2;
+        w2.push(part(0, 1000)).unwrap();
+        let t2 = w2.finish().unwrap();
+        // Only when the first stayed in memory (another test's stages may
+        // have sent it to disk, and gone before the second was written).
+        if matches!(&t1.chunks, Chunks::Mem(_)) {
+            assert!(matches!(&t2.chunks, Chunks::Disk(..)), "the second stage spilled: the first still holds its bytes");
+        }
+        drop((t1, t2));
+    }
+
+    /// A chunk on disk holds about CHUNK_BYTES, not 64K rows of any width.
+    #[test]
+    fn stage_chunks_are_bounded_by_bytes() {
+        let wide = "x".repeat(4096);
+        let n = 5000;
+        let mut off = vec![0i32];
+        let mut data = Vec::new();
+        for _ in 0..n {
+            data.extend_from_slice(wide.as_bytes());
+            off.push(data.len() as i32);
+        }
+        let b = ArrowBatch { rows: n, cols: vec![FinishedCol::I64 { validity: None, data: (0..n as i64).collect() }, FinishedCol::Utf8 { validity: None, offsets: off, data }] };
+        let mut w = Writer::on_disk(kt_schema());
+        w.push(b).unwrap();
+        let t = w.finish().unwrap();
+        let Chunks::Disk(_, at) = &t.chunks else { panic!("on disk") };
+        assert!(at.len() >= 2, "20 MB of rows in more than one chunk");
+        assert!(at.iter().all(|&(_, len)| len <= (CHUNK_BYTES as u64) * 2), "each chunk near CHUNK_BYTES");
+        let mut rows = 0;
+        t.for_each(&mut |x| {
+            rows += x.rows;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, n);
+    }
+
+    /// A disk-backed answer streamed out: a consumer that stops after the
+    /// first batch leaves no stage file and no task behind; one whose file
+    /// goes away mid-stream gets an error, not a hang.
+    #[tokio::test]
+    async fn stream_stops_and_errors_clean_up() {
+        let disk_table = || {
+            let mut w = Writer::on_disk(kt_schema());
+            for i in 0..4 {
+                w.push(part(i * 70000, 70000)).unwrap();
+            }
+            w.finish().unwrap()
+        };
+        let path_of = |t: &MemTable| match &t.chunks {
+            Chunks::Disk(p, _) => p.clone(),
+            Chunks::Mem(_) => panic!("on disk"),
+        };
+        // Stops after the first batch.
+        let t = disk_table();
+        let path = path_of(&t);
+        let mut h = t.into_stream().unwrap();
+        assert!(h.recv().await.unwrap().is_some());
+        drop(h);
+        for _ in 0..50 {
+            if !path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!path.exists(), "the stage file goes when the consumer stops");
+        // The file is cut short mid-stream: an error arrives, no hang.
+        let t = disk_table();
+        let path = path_of(&t);
+        let mut h = t.into_stream().unwrap();
+        assert!(h.recv().await.unwrap().is_some());
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        let mut errored = false;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), h.recv()).await.expect("no hang") {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        assert!(errored, "a cut stage file is an error to the consumer");
+        drop(h);
+        for _ in 0..50 {
+            if !path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!path.exists(), "the stage file goes after an error too");
+    }
+
+    /// A table read by `chunk(i)` gives the rows `for_each` gives, in order,
+    /// from disk or from memory.
+    #[test]
+    fn chunks_read_back_as_written() {
+        for on_disk in [true, false] {
+            let mut w = if on_disk { Writer::on_disk(kt_schema()) } else { Writer::new(kt_schema()) };
+            if !on_disk {
+                w.budget = u64::MAX;
+            }
+            for p in [part(0, 70000), part(70000, 5)] {
+                w.push(p).unwrap();
+            }
+            let t = w.finish().unwrap();
+            assert_eq!(t.in_memory(), !on_disk);
+            let mut a = Vec::new();
+            for i in 0..t.n_chunks() {
+                a.push(t.chunk(i).unwrap().into_owned());
+            }
+            let mut b = Vec::new();
+            t.for_each(&mut |x| {
+                b.push(x);
+                Ok(())
+            })
+            .unwrap();
+            let a = concat_all(&a.iter().collect::<Vec<_>>()).unwrap();
+            let b = concat_all(&b.iter().collect::<Vec<_>>()).unwrap();
+            assert_eq!(a, b, "on disk: {on_disk}");
+            assert_eq!(a.rows, 70005);
+        }
+    }
+
+    /// Repeated rows come in pieces bounded by rows and bytes, in order, and
+    /// the limit counts across pieces.
+    #[test]
+    fn repeat_chunks_streams_in_bounded_pieces() {
+        let b = part(0, 2);
+        let mut pieces = Vec::new();
+        let mut left = None;
+        repeat_chunks(&b, &[100_000, 3], &mut left, &mut |x| {
+            pieces.push(x);
+            Ok(())
+        })
+        .unwrap();
+        assert!(pieces.len() >= 2 && pieces.iter().all(|p| p.rows <= CHUNK));
+        assert_eq!(pieces.iter().map(|p| p.rows).sum::<usize>(), 100_003);
+        let all = concat_all(&pieces.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(all, repeat(&b, &[100_000, 3], None));
+        let mut left = Some(5);
+        let mut n = 0;
+        repeat_chunks(&b, &[3, 3], &mut left, &mut |x| {
+            n += x.rows;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((n, left), (5, Some(0)));
+        // NULLs keep their place through the pieces.
+        let nb = ArrowBatch {
+            rows: 2,
+            cols: vec![
+                FinishedCol::I64 { validity: Some(vec![0b10]), data: vec![0, 7] },
+                FinishedCol::Utf8 { validity: Some(vec![0b01]), offsets: vec![0, 1, 1], data: b"a".to_vec() },
+            ],
+        };
+        let mut pieces = Vec::new();
+        let mut left = None;
+        repeat_chunks(&nb, &[70_000, 2], &mut left, &mut |x| {
+            pieces.push(x);
+            Ok(())
+        })
+        .unwrap();
+        let all = concat_all(&pieces.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(all, repeat(&nb, &[70_000, 2], None), "NULLs placed as one repeat places them");
+    }
+
     /// Parts written past the budget land on disk and read back as the
     /// rows written, in order; under it they stay one batch in memory.
     #[test]
@@ -728,5 +1166,83 @@ mod tests {
                 assert!(!p.exists(), "the stage file goes with its table");
             }
         }
+    }
+
+    fn kt_empty() -> ArrowBatch {
+        ArrowBatch { rows: 0, cols: vec![FinishedCol::I64 { validity: None, data: vec![] }, FinishedCol::Utf8 { validity: None, offsets: vec![0], data: vec![] }] }
+    }
+
+    /// C7: a stage of no rows keeps its columns even when the stages held
+    /// together are past the budget (a 0-row batch never goes to disk).
+    #[test]
+    fn a_stage_of_no_rows_keeps_its_columns_past_the_budget() {
+        held_add(1);
+        let mut w = Writer::on_disk(kt_schema());
+        let r = w.push(kt_empty());
+        held_sub(1);
+        r.unwrap();
+        let b = w.finish().unwrap().into_batch().unwrap();
+        assert_eq!((b.rows, b.cols.len()), (0, 2), "the columns of the stage");
+    }
+
+    /// C8: a chunk asked for a column it does not hold is an error, not a
+    /// panic.
+    #[test]
+    fn a_chunk_asked_for_a_column_past_its_own_is_an_error() {
+        let b = ArrowBatch { rows: 1, cols: vec![FinishedCol::I64 { validity: None, data: vec![7] }] };
+        let mut w = Vec::new();
+        encode(&b, &mut w);
+        let r = std::panic::catch_unwind(|| decode(&w, &[3]));
+        assert!(matches!(r, Ok(Err(_))), "an error, not a panic or a batch");
+        // A zeroed chunk (pages never written back) reads as an error too.
+        let r = std::panic::catch_unwind(|| decode(&vec![0u8; 64], &[0]));
+        assert!(matches!(r, Ok(Err(_))), "zeros read as an error");
+    }
+
+    /// C9: a piece of repeated rows stays near CHUNK_BYTES counting every
+    /// row already in it, not the current row's width alone.
+    #[test]
+    fn repeat_pieces_count_the_bytes_already_in_them() {
+        let wide = "w".repeat(4 << 20);
+        let narrow = "n".repeat(100);
+        let mut data = wide.clone().into_bytes();
+        data.extend_from_slice(narrow.as_bytes());
+        let b = ArrowBatch {
+            rows: 2,
+            cols: vec![FinishedCol::I64 { validity: None, data: vec![1, 2] }, FinishedCol::Utf8 { validity: None, offsets: vec![0, wide.len() as i32, (wide.len() + narrow.len()) as i32], data }],
+        };
+        let mut left = None;
+        let mut sizes = Vec::new();
+        // The bytes the piece's rows hold (lengths; `bytes()` counts the
+        // buffers' capacities, whose growth slack is not the rows' width).
+        let held = |x: &ArrowBatch| -> usize {
+            x.cols
+                .iter()
+                .map(|c| match c {
+                    FinishedCol::I64 { data, .. } => data.len() * 8,
+                    FinishedCol::Utf8 { offsets, data, .. } => offsets.len() * 4 + data.len(),
+                    _ => 0,
+                })
+                .sum()
+        };
+        repeat_chunks(&b, &[1, 200_000], &mut left, &mut |x| {
+            sizes.push((x.rows, held(&x)));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sizes.iter().map(|s| s.0).sum::<usize>(), 200_001);
+        for &(rows, bytes) in &sizes {
+            assert!(rows == 1 || bytes <= CHUNK_BYTES + (64 << 10), "a piece of {rows} rows holds {bytes} B");
+        }
+    }
+
+    /// C10: a batch whose column kinds differ from the first one's is
+    /// refused at the push, in memory as on disk.
+    #[test]
+    fn a_batch_of_other_column_kinds_is_refused() {
+        let mut w = Writer::new(kt_schema());
+        w.push(ArrowBatch { rows: 1, cols: vec![FinishedCol::I64 { validity: None, data: vec![1] }, FinishedCol::Utf8 { validity: None, offsets: vec![0, 1], data: b"a".to_vec() }] }).unwrap();
+        let r = w.push(ArrowBatch { rows: 1, cols: vec![FinishedCol::Utf8 { validity: None, offsets: vec![0, 1], data: b"b".to_vec() }, FinishedCol::Utf8 { validity: None, offsets: vec![0, 1], data: b"a".to_vec() }] });
+        assert!(r.is_err(), "column kinds checked per push");
     }
 }

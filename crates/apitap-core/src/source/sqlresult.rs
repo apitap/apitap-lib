@@ -25,7 +25,44 @@ use crate::SqlResult;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-static REGISTRY: Mutex<Option<HashMap<String, Arc<SqlResult>>>> = Mutex::new(None);
+static REGISTRY: Mutex<Option<HashMap<String, Arc<Held>>>> = Mutex::new(None);
+
+/// A registered answer: rows in memory, or a stage table (on disk past its
+/// budget) read a chunk at a time as it lands.
+pub(crate) enum Held {
+    Rows(SqlResult),
+    Table(crate::sql::mem::MemTable),
+}
+
+impl Held {
+    fn schema(&self) -> &[crate::read::ArrowField] {
+        match self {
+            Held::Rows(r) => &r.schema,
+            Held::Table(t) => &t.schema,
+        }
+    }
+
+    fn rows(&self) -> usize {
+        match self {
+            Held::Rows(r) => r.batch.rows,
+            Held::Table(t) => t.rows(),
+        }
+    }
+
+    fn n_chunks(&self) -> usize {
+        match self {
+            Held::Rows(_) => 1,
+            Held::Table(t) => t.n_chunks(),
+        }
+    }
+
+    fn chunk(&self, i: usize) -> Result<std::borrow::Cow<'_, crate::ArrowBatch>> {
+        match self {
+            Held::Rows(r) => Ok(std::borrow::Cow::Borrowed(&r.batch)),
+            Held::Table(t) => t.chunk(i),
+        }
+    }
+}
 
 /// Keeps the result reachable as `apitap-sql://<token>` while it lives.
 pub(crate) struct Registered {
@@ -44,6 +81,15 @@ impl Drop for Registered {
 }
 
 pub(crate) fn register(r: SqlResult) -> Registered {
+    register_held(Held::Rows(r))
+}
+
+/// [`register`] for a stage table: its chunks land one at a time.
+pub(crate) fn register_table(t: crate::sql::mem::MemTable) -> Registered {
+    register_held(Held::Table(t))
+}
+
+fn register_held(h: Held) -> Registered {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let token = format!(
@@ -58,7 +104,7 @@ pub(crate) fn register(r: SqlResult) -> Registered {
         .lock()
         .expect("sql result registry")
         .get_or_insert_with(HashMap::new)
-        .insert(token.clone(), Arc::new(r));
+        .insert(token.clone(), Arc::new(h));
     Registered {
         url: format!("apitap-sql://{token}"),
         token,
@@ -66,7 +112,7 @@ pub(crate) fn register(r: SqlResult) -> Registered {
 }
 
 pub(crate) struct SqlResultSource {
-    res: Arc<SqlResult>,
+    res: Arc<Held>,
 }
 
 impl SqlResultSource {
@@ -133,7 +179,7 @@ impl Source for SqlResultSource {
     }
 
     async fn probe(&self, _table: &str) -> Result<TablePlan> {
-        if let Some(f) = self.res.schema.iter().find(|f| f.kind == ArrowKind::Binary) {
+        if let Some(f) = self.res.schema().iter().find(|f| f.kind == ArrowKind::Binary) {
             return Err(Error::InvalidInput(format!(
                 "apitap.sql(dest=...): the result column {} is binary, which v1 does not land",
                 f.name
@@ -143,7 +189,7 @@ impl Source for SqlResultSource {
             engine: "apitap.sql",
             cols: self
                 .res
-                .schema
+                .schema()
                 .iter()
                 .map(|f| {
                     let (u, p, s) = udt(f.kind);
@@ -165,7 +211,7 @@ impl Source for SqlResultSource {
     }
 
     async fn catalog(&self, _schema: Option<&str>, tables: Option<&[String]>) -> Result<Vec<(String, i64)>> {
-        let n = self.res.batch.rows as i64;
+        let n = self.res.rows() as i64;
         Ok(match tables {
             Some(ts) => ts.iter().map(|t| (t.clone(), n)).collect(),
             None => vec![("result".to_string(), n)],
@@ -183,7 +229,7 @@ impl Source for SqlResultSource {
             push_where: None,
             cols: self
                 .res
-                .schema
+                .schema()
                 .iter()
                 .map(|f| LaneCol {
                     delivered: delivered(f.kind),
@@ -219,7 +265,7 @@ impl Source for SqlResultSource {
 }
 
 struct ResBody<'a> {
-    res: &'a SqlResult,
+    res: &'a Held,
     format: WireFormat,
     chunk: usize,
 }
@@ -352,12 +398,14 @@ fn binary_cell(c: &FinishedCol, k: ArrowKind, r: usize, out: &mut Vec<u8>) -> Re
 impl<L: Loader> PipeBody<L> for ResBody<'_> {
     async fn run(self, pipe: &mut Pipe<L>, spans: Spans) -> Result<Rows> {
         let _ = spans.next()?;
-        let b = &self.res.batch;
-        let kinds: Vec<ArrowKind> = self.res.schema.iter().map(|f| f.kind).collect();
+        let kinds: Vec<ArrowKind> = self.res.schema().iter().map(|f| f.kind).collect();
         let mut out: Vec<u8> = Vec::with_capacity(self.chunk.min(1 << 20) + 4096);
         if self.format == WireFormat::PgCopyBinary {
             pgc::header(&mut out);
         }
+        // A chunk of the answer at a time (one, for rows in memory).
+        for ci in 0..self.res.n_chunks() {
+        let b = self.res.chunk(ci)?;
         for r in 0..b.rows {
             match self.format {
                 WireFormat::PgCopyBinary => {
@@ -389,13 +437,14 @@ impl<L: Loader> PipeBody<L> for ResBody<'_> {
                 pipe.send(buf).await?;
             }
         }
+        }
         if self.format == WireFormat::PgCopyBinary {
             pgc::trailer(&mut out);
         }
         if !out.is_empty() {
             pipe.send(out).await?;
         }
-        Ok(Rows::LoaderElseOwn(b.rows as u64))
+        Ok(Rows::LoaderElseOwn(self.res.rows() as u64))
     }
 }
 

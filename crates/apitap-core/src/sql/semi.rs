@@ -49,8 +49,16 @@ impl KeySet {
         let words = self.bits.len() as i128;
         let kw = (k as i128).div_euclid(64);
         let (lo_w, hi_w) = if words == 0 { (kw, kw + 1) } else { ((self.lo as i128).div_euclid(64), (self.lo as i128).div_euclid(64) + words) };
+        // At least double, but never past the cap while the keys themselves
+        // fit under it: doubling alone jumped from 268M bits to past 512M
+        // and fell to a hash set (75M keys: ~1.2 GB against a 37 MB bitmap).
+        let cap = (BITS_MAX / 64) as i128;
         let grow = words.max(1024);
-        let (nlo, nhi) = if kw < lo_w { ((kw).min(lo_w - grow), hi_w) } else { (lo_w, (kw + 1).max(hi_w + grow)) };
+        let (nlo, nhi) = if kw < lo_w {
+            ((kw).min(lo_w - grow).max(hi_w - cap).min(kw), hi_w)
+        } else {
+            (lo_w, (kw + 1).max(hi_w + grow).min(lo_w + cap).max(kw + 1))
+        };
         let fits = (nhi - nlo) * 64 <= BITS_MAX as i128 && nlo * 64 >= i64::MIN as i128 && nhi * 64 <= i64::MAX as i128;
         if !fits {
             let mut h: std::collections::HashSet<i64, foldhash::fast::RandomState> = Default::default();
@@ -298,7 +306,7 @@ async fn keys(sub: &Sub, not_in: bool, cmp: Option<usize>) -> Result<KeySet> {
     let tys = side_tys(&sub.side);
     // Pipes for what the memory leaves beside what the process holds now
     // (the sets read before this one among it): an automatic pick prices
-    // the whole cgroup as free, and TPC-H Q21 sf10 was OOM-killed reading
+    // the whole cgroup as free, and TPC-H Q21 10g seed was OOM-killed reading
     // l3's least and greatest l_suppkey per order beside l2's.
     // The decoder's gate: the keys of the subqueries narrowing this one
     // (TPC-H Q21's l2 and l3 by the 700K orders of l1's magic set, of 15M):
@@ -309,7 +317,7 @@ async fn keys(sub: &Sub, not_in: bool, cmp: Option<usize>) -> Result<KeySet> {
         let m = crate::pipeline::mem_limit_bytes()?;
         let held = rss_bytes().unwrap_or(m / 4);
         let mut n = crate::read_impl::read_pipes_for(m.saturating_sub(held + PROBE_HEADROOM));
-        // As a probe's: no more pipes than the cores decode (Q21 sf10 at
+        // As a probe's: no more pipes than the cores decode (Q21 10g seed at
         // four beside 93 MiB was OOM-killed, the sockets' kernel memory
         // charged to the cage too).
         if let Some(c) = crate::pipeline::cpu_limit_cores() {
@@ -385,6 +393,16 @@ async fn keys(sub: &Sub, not_in: bool, cmp: Option<usize>) -> Result<KeySet> {
     // 12 bytes a key (an i64 sum, widened to i128 the moment one does not
     // fit, and a u32 count): TPC-H Q18's 60M keys took twelve passes at 20.
     let per = (build_budget() / 12).clamp(1 << 16, 1 << 30) as i64;
+    // One pass per range, each a read of the subquery's table: a key span
+    // past this many (a key near 9e18 beside small ones) is refused before
+    // any range is listed, instead of a Vec of 1e12 of them.
+    let span = hi as i128 - lo as i128 + 1;
+    if span > i128::from(per) * 4096 {
+        return Err(unsupported(format!(
+            "IN (SELECT … GROUP BY {} HAVING …) over a key span of {span}: past {} passes of {per} keys",
+            sub.side.schema[sub.side.read[sub.key]].name, 4096
+        )));
+    }
     let mut ranges = Vec::new();
     let mut a = lo;
     while a <= hi {
@@ -515,7 +533,13 @@ fn narrowing_gates(side: &Side) -> Vec<Arc<KeyGate>> {
 pub(super) fn rss_bytes() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
-    Some(pages * 4096)
+    // The page size of this machine (64 KiB on some arm64 kernels).
+    #[cfg(unix)]
+    // SAFETY: sysconf reads a constant; it takes no pointers.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    #[cfg(not(unix))]
+    let page = 4096i64;
+    Some(pages * if page > 0 { page as u64 } else { 4096 })
 }
 
 /// The anonymous part of [`rss_bytes`] (heap, stacks), for the debug lines.
@@ -581,7 +605,7 @@ fn load_one(s: &Semi) -> std::pin::Pin<Box<dyn std::future::Future<Output = Resu
 tokio::task_local! {
     /// Under one statement (`run_one_out`), its runs and its parts
     /// (`partitioned`): the key sets read once, kept for a run again or the
-    /// next part, whose subqueries are the same (TPC-H Q13 sf10: 8 parts
+    /// next part, whose subqueries are the same (TPC-H Q13 10g seed: 8 parts
     /// each read 69M orders' keys again, 45 s each).
     pub(super) static KEY_CACHE: std::cell::RefCell<HashMap<String, KeySet>>;
 }
@@ -596,13 +620,18 @@ pub(super) fn sig(s: &Semi) -> Option<String> {
     }
     let side = &sub.side;
     let cols: Vec<&str> = side.read.iter().map(|&c| side.schema[c].name.as_str()).collect();
+    // `local` and `virt` too: a side with no SQL server (a stage table,
+    // github://, gsheets://) keeps its WHERE there, with `conj` empty, and
+    // two IN over one CTE with different filters shared a key set.
     let mut out = format!(
-        "{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}",
+        "{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}",
         super::url_sig(&side.url),
         side.table,
         cols,
         side.conj,
         side.conj_src.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+        side.local,
+        side.virt,
         sub.key,
         s.cmp.map(|c| c.1),
         s.not_in
@@ -622,6 +651,21 @@ mod tests {
     /// A set read with no key range first widens its bitmap both ways as
     /// keys come in any order, and turns into a hash set past the cap,
     /// every key kept and no other.
+    /// Ascending keys over a span past half the cap (300M) stay a bitmap:
+    /// the doubling stops at the cap instead of jumping past it.
+    #[test]
+    fn growing_key_set_stays_a_bitmap_up_to_the_cap() {
+        let mut s = KeySet::growing();
+        let mut k = 0i64;
+        while k < 300_000_000 {
+            s.insert(k).unwrap();
+            k += 1_000_003;
+        }
+        s.insert(300_000_000).unwrap();
+        assert!(s.hash.is_none(), "a 300M span is under BITS_MAX: a bitmap");
+        assert!(s.has(300_000_000) && s.has(0) && !s.has(1));
+    }
+
     #[test]
     fn growing_key_set_holds_every_key() {
         let keys: Vec<i64> = vec![5_000_000, 3, -70_000, 4_999_999, 64, 63, -1, 0, 1 << 20, 12_345_678, -64, 2_000_001];

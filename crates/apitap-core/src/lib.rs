@@ -52,7 +52,7 @@ mod wire;
 
 pub use error::{Error, Result};
 pub use read::{read_schema, read_start, ArrowField, ReadHandle, ReadOptions};
-pub use sql::{run as sql_run, run_into as sql_run_into, run_live as sql_run_live, SqlResult};
+pub use sql::{run as sql_run, run_into as sql_run_into, run_live as sql_run_live, run_stream as sql_run_stream, SqlResult};
 pub use wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, FinishedCol};
 
 /// The memory limit the engine sizes itself from — `APITAP_MEM_BUDGET`, then

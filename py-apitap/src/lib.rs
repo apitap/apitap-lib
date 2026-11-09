@@ -545,10 +545,10 @@ fn sql(
 ) -> PyResult<PgRead> {
     let handle = py
         .detach(|| {
-            rt().block_on(async {
-                let r = apitap_core::sql_run(&query, &sources).await?;
-                Ok::<_, apitap_core::Error>(apitap_core::ReadHandle::ready(r.schema, vec![r.batch]))
-            })
+            // A chunk at a time when the answer is a stage table (past the
+            // stage budget, on disk): a stream consumer (DuckDB, pyarrow's
+            // reader, a parquet writer) never holds the whole answer.
+            rt().block_on(apitap_core::sql_run_stream(&query, &sources))
         })
         .map_err(to_py)?;
     let names = handle.schema.iter().map(|f| f.name.clone()).collect();

@@ -792,6 +792,8 @@ impl DimMap {
     /// The load is over: a sorted store is sorted, and a repeated key
     /// refused, naming the table.
     fn seal(&mut self) -> Result<()> {
+        // The payloads' dedup index is the load's alone.
+        self.ids = HashMap::default();
         if let Store::Sorted(v) = &mut self.store {
             v.sort_unstable_by_key(|x| x.0);
             v.shrink_to_fit();
@@ -946,6 +948,7 @@ async fn load_dim(st: &Star, d: usize, maps: &[Option<Arc<DimMap>>], pipes: Opti
     };
     let mut h = open_gated(&dim.side, None, pipes, None, gates).await?;
     let mut rows = 0u64;
+    let dim_cap = super::build_budget();
     while let Some(b) = h.recv().await? {
         'row: for r in 0..b.rows {
             if !local_ok(&dim.side, &tys, &b, r) {
@@ -1010,6 +1013,18 @@ async fn load_dim(st: &Star, d: usize, maps: &[Option<Arc<DimMap>>], pipes: Opti
             let id = m.pid(&pay)?;
             m.set(k, id)?;
             rows += 1;
+        }
+        // A dimension past the build budget is refused here, not after it
+        // has taken the memory the build and the probe need (the maps are
+        // held through every pass; `ids` is priced as payloads again).
+        let held = m.bytes() + m.payloads.len() as u64 * 24;
+        if held > dim_cap {
+            return Err(unsupported(format!(
+                "the dimension {} ({} MiB held at {rows} rows) is larger than the build budget ({} MiB); raise the memory limit",
+                dim.side.name,
+                held >> 20,
+                dim_cap >> 20
+            )));
         }
     }
     m.seal()?;

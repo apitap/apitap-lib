@@ -29,8 +29,28 @@ pub(super) async fn run(query: &str, sources: &HashMap<String, String>) -> Resul
     let run = mem::Run::new();
     let mut srcs = sources.clone();
     srcs.insert(STAGE_SRC.to_string(), run.url.clone());
-    let mut st = Stager { run, sources: srcs, n: 0, ctes: HashMap::new(), cols: HashMap::new() };
+    let mut st = Stager { run, sources: srcs, n: 0, ctes: HashMap::new(), cols: HashMap::new(), depth: 0, stream_top: false };
     st.answer((**q).clone()).await
+}
+
+/// [`run`], the answer left a stage table when it is one (past the stage
+/// budget on disk), the statement's own plain-SELECT rows streamed into one
+/// too: for a caller that hands the rows on a chunk at a time (a
+/// destination, an Arrow stream) instead of holding them all.
+pub(super) async fn run_answer(query: &str, sources: &HashMap<String, String>) -> Result<Answer> {
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, query)
+        .map_err(|e| bad(format!("parse error: {e}")))?;
+    let [Statement::Query(q)] = stmts.as_slice() else {
+        return Err(bad("expected exactly one SELECT statement"));
+    };
+    if !needs_stages(q) {
+        return super::run_one_out(query, sources).await;
+    }
+    let run = mem::Run::new();
+    let mut srcs = sources.clone();
+    srcs.insert(STAGE_SRC.to_string(), run.url.clone());
+    let mut st = Stager { run, sources: srcs, n: 0, ctes: HashMap::new(), cols: HashMap::new(), depth: 0, stream_top: true };
+    st.answer_out((**q).clone()).await
 }
 
 /// Whether the query has a part the engine cannot answer in one pass.
@@ -40,6 +60,10 @@ fn needs_stages(q: &Query) -> bool {
     }
     let SetExpr::Select(sel) = q.body.as_ref() else { return false };
     if sel.having.is_some() || sel.distinct.is_some() || count_distinct(sel) || !aggregated(sel) {
+        return true;
+    }
+    // A LEFT JOIN is answered as its matched and unmatched halves (`left_join`).
+    if sel.from.iter().flat_map(|f| &f.joins).any(|j| matches!(j.join_operator, JoinOperator::Left(_) | JoinOperator::LeftOuter(_))) {
         return true;
     }
     if sel.from.iter().any(|f| matches!(f.relation, TableFactor::Derived { .. }) && derived_needs_stage(sel)) {
@@ -191,6 +215,12 @@ fn count_distinct(sel: &Select) -> bool {
     any
 }
 
+/// OFFSET, FETCH or LIMIT BY: no path keeps them, so a subquery holding one
+/// is staged, where `answer_at` refuses it (an engine path would drop it).
+fn trims(q: &Query) -> bool {
+    q.offset.is_some() || q.fetch.is_some() || !q.limit_by.is_empty()
+}
+
 /// A derived table the engine's flattener refuses: grouped, joined, aliased
 /// columns, or more than one FROM item.
 fn derived_needs_stage(sel: &Select) -> bool {
@@ -206,6 +236,7 @@ fn derived_needs_stage(sel: &Select) -> bool {
                         || subquery.with.is_some()
                         || subquery.order_by.is_some()
                         || subquery.limit.is_some()
+                        || trims(subquery)
                         || match subquery.body.as_ref() {
                             SetExpr::Select(s) => s.having.is_some() || s.distinct.is_some() || aggregated(s) || count_distinct(s),
                             _ => true,
@@ -220,7 +251,7 @@ fn derived_needs_stage(sel: &Select) -> bool {
 /// table, or subqueries of its own.
 fn in_needs_stage(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else { return true };
-    if q.with.is_some() || s.from.len() != 1 || !s.from[0].joins.is_empty() || !matches!(s.from[0].relation, TableFactor::Table { .. }) {
+    if q.with.is_some() || trims(q) || s.from.len() != 1 || !s.from[0].joins.is_empty() || !matches!(s.from[0].relation, TableFactor::Table { .. }) {
         return true;
     }
     let mut nested = false;
@@ -244,6 +275,10 @@ struct Stager {
     n: usize,
     /// CTE name → stage table name.
     ctes: HashMap<String, String>,
+    /// How deep in `answer_out` (0: the statement's own answer).
+    depth: usize,
+    /// The statement's own answer streams like a stage's (`run_answer`).
+    stream_top: bool,
     /// (source, table) → column names, as probed.
     cols: HashMap<(String, String), Vec<String>>,
 }
@@ -339,15 +374,49 @@ fn literal(r: &SqlResult) -> Result<Expr> {
         }
         (FinishedCol::I16 { validity, data }, _) if valid(validity, 0) => data[0].to_string(),
         (FinishedCol::I32 { validity, data }, _) if valid(validity, 0) => data[0].to_string(),
+        // A timestamp's micros as its text, not as a number (a number
+        // compared with a timestamp column was refused as "arithmetic").
+        // A timestamp has no literal the planner takes (and a timestamptz,
+        // or a MySQL TIMESTAMP, none that means one instant on every
+        // session's time zone): refused here, not as "arithmetic" later.
+        (FinishedCol::I64 { validity, .. }, ArrowKind::TimestampUtc | ArrowKind::TimestampNaive) if valid(validity, 0) => {
+            return Err(unsupported("a scalar subquery's timestamp value used as a literal"));
+        }
         (FinishedCol::I64 { validity, data }, _) if valid(validity, 0) => data[0].to_string(),
         (FinishedCol::Bool { validity, data }, _) if valid(validity, 0) => (data[0] & 1 == 1).to_string().to_uppercase(),
         (FinishedCol::Utf8 { validity, offsets, data }, _) if valid(validity, 0) => {
             let t = String::from_utf8_lossy(&data[offsets[0] as usize..offsets[1] as usize]).replace('\'', "''");
             format!("'{t}'")
         }
-        _ => "NULL".to_string(),
+        (FinishedCol::F32 { validity, data }, _) if valid(validity, 0) => {
+            let v = f64::from(data[0]);
+            if !v.is_finite() {
+                return Err(bad("a scalar subquery gave a non-finite number"));
+            }
+            let t = format!("{v}");
+            if t.contains('.') { t } else { format!("{t}.0") }
+        }
+        // A NULL is NULL; a value of a kind with no literal here is refused,
+        // never read as NULL.
+        (c, _) if !cell_valid(c, 0) => "NULL".to_string(),
+        _ => return Err(unsupported(format!("a scalar subquery's value of type {:?} used as a literal", r.schema[0].kind))),
     };
     parse_expr(&text)
+}
+
+/// Whether row `r` of `c` holds a value (not NULL).
+fn cell_valid(c: &FinishedCol, r: usize) -> bool {
+    match c {
+        FinishedCol::I16 { validity, .. }
+        | FinishedCol::I32 { validity, .. }
+        | FinishedCol::I64 { validity, .. }
+        | FinishedCol::F32 { validity, .. }
+        | FinishedCol::F64 { validity, .. }
+        | FinishedCol::Bool { validity, .. }
+        | FinishedCol::Dec128 { validity, .. }
+        | FinishedCol::Utf8 { validity, .. }
+        | FinishedCol::Bin { validity, .. } => valid(validity, r),
+    }
 }
 
 impl Stager {
@@ -458,7 +527,29 @@ impl Stager {
     }
 
     /// CTE names in FROM → their stage tables (aliased by the CTE's name).
-    fn point_ctes(&self, q: &mut Query) {
+    fn point_ctes(&self, q: &mut Query) -> Result<()> {
+        // A nested WITH that names a CTE already staged would be bound to the
+        // outer stage here, before it runs: refused (shadowing).
+        struct S<'a>(&'a HashMap<String, String>);
+        impl sqlparser::ast::Visitor for S<'_> {
+            type Break = String;
+            fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<String> {
+                if let Some(w) = &q.with {
+                    for c in &w.cte_tables {
+                        let n = c.alias.name.value.to_ascii_lowercase();
+                        if self.0.contains_key(&n) {
+                            return ControlFlow::Break(n);
+                        }
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        if !self.ctes.is_empty() {
+            if let ControlFlow::Break(n) = sqlparser::ast::Visit::visit(&*q, &mut S(&self.ctes)) {
+                return Err(unsupported(format!("a WITH that names {n} again (a CTE shadowing another)")));
+            }
+        }
         struct P<'a>(&'a HashMap<String, String>);
         impl VisitorMut for P<'_> {
             type Break = ();
@@ -482,27 +573,49 @@ impl Stager {
         if !self.ctes.is_empty() {
             let _ = q.visit(&mut P(&self.ctes));
         }
+        Ok(())
     }
 
     /// The answer of `q`, its parts staged as needed.
     /// The answer, left a stage table when it came in parts.
     fn answer_out(&mut self, q: Query) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Answer>> + '_>> {
         Box::pin(async move {
+            let top = self.depth == 0 && !self.stream_top;
+            self.depth += 1;
+            let r = self.answer_at(q, top).await;
+            self.depth -= 1;
+            r
+        })
+    }
+
+    /// [`answer_out`] at a depth: `top` is the statement's own answer,
+    /// returned to the caller whole; deeper ones are stages.
+    fn answer_at(&mut self, q: Query, top: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Answer>> + '_>> {
+        Box::pin(async move {
             let mut q = q;
+            // The staged paths (LEFT JOIN, HAVING, COUNT(DISTINCT)) rebuild
+            // the query from its LIMIT alone: an OFFSET or FETCH would be
+            // dropped there, so none is taken anywhere.
+            if q.offset.is_some() || q.fetch.is_some() || !q.limit_by.is_empty() {
+                return Err(unsupported("OFFSET, FETCH or LIMIT BY"));
+            }
             if let Some(w) = q.with.take() {
                 if w.recursive {
                     return Err(unsupported("WITH RECURSIVE"));
                 }
                 for cte in w.cte_tables {
+                    if self.ctes.contains_key(&cte.alias.name.value.to_ascii_lowercase()) {
+                        return Err(unsupported(format!("a WITH that names {} again (a CTE shadowing another)", cte.alias.name.value)));
+                    }
                     let mut cq = *cte.query;
-                    self.point_ctes(&mut cq);
+                    self.point_ctes(&mut cq)?;
                     let mut r = self.answer_out(cq).await?;
                     rename(r.schema_mut(), &cte.alias)?;
                     let st = self.put(&cte.alias.name.value, r)?;
                     self.ctes.insert(cte.alias.name.value.to_ascii_lowercase(), st);
                 }
             }
-            self.point_ctes(&mut q);
+            self.point_ctes(&mut q)?;
             let SetExpr::Select(sel) = q.body.as_ref() else {
                 return Err(unsupported("anything but a plain SELECT (UNION, VALUES, …)"));
             };
@@ -544,7 +657,7 @@ impl Stager {
             }
             let text = out.to_string();
             // What the stage before freed goes back first: the next reads
-            // price their pipes by what the process holds (TPC-H Q13 sf10
+            // price their pipes by what the process holds (TPC-H Q13 10g seed
             // began its anti join at 89 MiB anonymous, 2 pipes, 56 s; at
             // 20 MiB, 6 pipes, 20 s).
             crate::trim_heap();
@@ -554,8 +667,17 @@ impl Stager {
             if post.repeat.is_none() {
                 return super::run_one_out(&text, &self.sources).await;
             }
-            let r = super::run_one(&text, &self.sources).await?;
-            apply(r, post).map(Answer::Rows)
+            // Rows repeated by their count: equal under a collation is not
+            // the same row ('a' and 'A' of a MySQL _ci column both return).
+            // The statement's own rows go back whole anyway: repeated in
+            // memory, once. A stage's are streamed to its table, a piece at
+            // a time, on disk past the budget.
+            if top {
+                let r = super::GROUPS_EXACT.scope((), super::run_one(&text, &self.sources)).await?;
+                return apply(r, post).map(Answer::Rows);
+            }
+            let a = super::GROUPS_EXACT.scope((), super::run_one_out(&text, &self.sources)).await?;
+            repeat_out(a, post)
         })
     }
 
@@ -611,17 +733,12 @@ impl Stager {
         let mut done: HashMap<String, Expr> = HashMap::new();
         let mut keys: HashMap<String, Query> = HashMap::new();
         let mut joins: Vec<(TableFactor, Vec<Expr>)> = Vec::new();
-        let in_where: Vec<String> = {
-            let mut v = Vec::new();
-            if let Some(w) = &sel.selection {
-                let _ = top_exprs(w, &mut |x| {
-                    if let Expr::Subquery(q) = x {
-                        v.push(q.to_string());
-                    }
-                });
-            }
-            v
-        };
+        // A correlated scalar becomes an inner join, which drops the outer
+        // rows the subquery has no rows for. That is the answer only where
+        // its NULL drops the row anyway: an operand of a comparison in a
+        // top-level conjunct, through arithmetic at most (not under IS NULL,
+        // COALESCE, OR, NOT, CASE …).
+        let in_where: Vec<String> = sel.selection.as_ref().map(null_rejecting_subqueries).unwrap_or_default();
         for (text, q, is_in) in subs {
             if done.contains_key(&text) || keys.contains_key(&text) {
                 continue;
@@ -1067,6 +1184,11 @@ impl Stager {
             }
         }
         let (pk, nk) = key.ok_or_else(|| unsupported("a LEFT JOIN without a key equality"))?;
+        // The halves are answered apart: a HAVING or a DISTINCT would hold
+        // on the matched half only.
+        if sel.having.is_some() || sel.distinct.is_some() {
+            return Err(unsupported("HAVING or DISTINCT over a LEFT JOIN"));
+        }
         if let Some(w) = &sel.selection {
             if mask(w) & !1 != 0 {
                 return Err(unsupported("a WHERE over the LEFT JOIN's joined table (it would make the join inner)"));
@@ -1084,6 +1206,14 @@ impl Stager {
         if gby.iter().any(|g| mask(g) != 1) {
             return Err(unsupported("a LEFT JOIN grouped by the joined table's columns"));
         }
+        // The matched and the unmatched halves are put side by side, not
+        // merged: their groups are disjoint only when the GROUP BY holds the
+        // preserved table's join key (each key value is matched or not, in
+        // whole). Grouped by anything coarser a group would come out twice.
+        let pk_col = col_name(&pk);
+        if pk_col.is_none() || !gby.iter().any(|g| col_name(g) == pk_col) {
+            return Err(unsupported(format!("a LEFT JOIN whose GROUP BY does not hold its key {pk}")));
+        }
         // Per output: the unmatched rows' value.
         enum Fill {
             Group(usize),
@@ -1100,12 +1230,21 @@ impl Stager {
             let Expr::Function(f) = e else { return Err(unsupported(format!("the output {e} of a LEFT JOIN (GROUP BY columns and aggregates)"))) };
             let fname = f.name.to_string().to_ascii_lowercase();
             let star = matches!(&f.args, FunctionArguments::List(l) if matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]));
+            // The unmatched rows hold NULL in every joined-table column, so
+            // the fill is known from the function only when its argument is
+            // one of those columns as it is: an expression of them can turn
+            // the NULL into a value (`SUM(CASE WHEN o.st = 'F' THEN 1 ELSE 0
+            // END)` is 0 there, `COUNT(CASE WHEN o.id IS NULL THEN 1 END)`
+            // the row count). No FILTER, OVER or WITHIN GROUP either.
+            let bare = matches!(&f.args, FunctionArguments::List(l)
+                if l.clauses.is_empty() && matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(_) | Expr::CompoundIdentifier(_)))]));
+            let plain = f.filter.is_none() && f.over.is_none() && f.within_group.is_empty() && f.null_treatment.is_none();
             let m = mask(e);
-            fills.push(match (fname.as_str(), star, m) {
-                ("count", true, _) => Fill::Rows,
-                ("count", false, 2) => Fill::Zero,
-                ("sum" | "avg" | "min" | "max", false, 2) => Fill::Null,
-                _ => return Err(unsupported(format!("the aggregate {e} of a LEFT JOIN (over the joined table's columns, or COUNT(*))"))),
+            fills.push(match (fname.as_str(), star, bare && plain, m) {
+                ("count", true, _, _) if plain => Fill::Rows,
+                ("count", false, true, 2) => Fill::Zero,
+                ("sum" | "avg" | "min" | "max", false, true, 2) => Fill::Null,
+                _ => return Err(unsupported(format!("the aggregate {e} of a LEFT JOIN (a joined table's column as it is, or COUNT(*))"))),
             });
         }
         // The inner join: the same SELECT with an inner join.
@@ -1127,14 +1266,31 @@ impl Stager {
         let b = self.answer_out(bq).await?;
         let cnt = b.schema().len() - 1;
         // Both halves into one stage table, a batch at a time (TPC-H Q13
-        // sf10: 6.6M matched and 3.3M unmatched customers).
+        // 10g seed: 6.6M matched and 3.3M unmatched customers).
         let mut w = mem::Writer::new(a.schema().to_vec());
+        // A matched half of no rows: its empty columns, for the shapes.
+        let empty = a.empty_batch();
         a.for_each(&mut |x| w.push(x))?;
+        if w.like().is_none() {
+            if let Some(e) = empty {
+                w.push(e)?;
+            }
+        }
         let like: Vec<FinishedCol> = w.like().ok_or_else(|| bad("internal: the LEFT JOIN's matched half has no columns"))?.to_vec();
+        // A group column output more than once is copied but the last time.
+        let last_use: Vec<usize> = fills
+            .iter()
+            .enumerate()
+            .map(|(k, f)| match f {
+                Fill::Group(g) => fills.iter().rposition(|h| matches!(h, Fill::Group(x) if x == g)).unwrap_or(k),
+                _ => k,
+            })
+            .collect();
         b.for_each(&mut |mut x| {
             let mut cols = Vec::new();
             for (k, f) in fills.iter().enumerate() {
                 cols.push(match f {
+                    Fill::Group(g) if last_use[k] != k => x.cols[*g].clone(),
                     Fill::Group(g) => std::mem::replace(&mut x.cols[*g], mem::zeros_like(&like[k], 0)),
                     Fill::Rows => std::mem::replace(&mut x.cols[cnt], mem::zeros_like(&like[k], 0)),
                     Fill::Zero => mem::zeros_like(&like[k], x.rows),
@@ -1248,11 +1404,8 @@ impl Stager {
         let mut g1 = gby.clone();
         g1.push(x.clone());
         s1.group_by = GroupByExpr::Expressions(g1, Vec::new());
-        let notnull = parse_expr(&format!("({x}) IS NOT NULL"))?;
-        s1.selection = Some(match s1.selection.take() {
-            Some(w) => Expr::BinaryOp { left: Box::new(Expr::Nested(Box::new(w))), op: BinaryOperator::And, right: Box::new(notnull) },
-            None => notnull,
-        });
+        // NULL values stay (as their own (g, NULL) row) and the count below
+        // skips them: a group whose values are all NULL counts 0, not absent.
         let r = self.answer_out(Query { body: Box::new(SetExpr::Select(Box::new(s1))), ..empty_query() }).await?;
         let st = self.put("distinct", r)?;
         let mut items = Vec::new();
@@ -1260,7 +1413,7 @@ impl Stager {
             let mut e2 = e.clone();
             top_exprs_mut(&mut e2, &mut |y| {
                 if is_count_distinct(y) {
-                    *y = parse_expr("COUNT(*)").expect("COUNT(*)");
+                    *y = parse_expr("COUNT(__x)").expect("COUNT(__x)");
                 } else if let Some(i) = gby.iter().position(|g| g == y) {
                     *y = Expr::Identifier(Ident::new(gnames[i].clone()));
                 }
@@ -1287,6 +1440,43 @@ fn engine_having(h: &Expr) -> bool {
         }
         _ => false,
     })
+}
+
+/// A column reference's name (the last part, lower case).
+fn col_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Identifier(i) => Some(i.value.to_ascii_lowercase()),
+        Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.to_ascii_lowercase()),
+        Expr::Nested(x) => col_name(x),
+        _ => None,
+    }
+}
+
+/// The scalar subqueries of a WHERE whose NULL drops the row: operands of a
+/// comparison that is a top-level conjunct, reached through parentheses,
+/// unary signs and arithmetic only.
+fn null_rejecting_subqueries(w: &Expr) -> Vec<String> {
+    fn walk(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Subquery(q) => out.push(q.to_string()),
+            Expr::Nested(x) | Expr::UnaryOp { expr: x, op: sqlparser::ast::UnaryOperator::Minus | sqlparser::ast::UnaryOperator::Plus } => walk(x, out),
+            Expr::BinaryOp { left, op: BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide, right } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            _ => {}
+        }
+    }
+    let mut conj = Vec::new();
+    super::conjuncts(w, &mut conj);
+    let mut out = Vec::new();
+    for c in &conj {
+        if let Expr::BinaryOp { left, op: BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Lt | BinaryOperator::LtEq | BinaryOperator::Gt | BinaryOperator::GtEq, right } = c {
+            walk(left, &mut out);
+            walk(right, &mut out);
+        }
+    }
+    out
 }
 
 fn quote_ident(n: &str) -> String {
@@ -1342,6 +1532,44 @@ fn apply(mut r: SqlResult, post: Post) -> Result<SqlResult> {
         r.batch = mem::repeat(&r.batch, &counts, limit);
     }
     Ok(r)
+}
+
+/// A plain SELECT's rows from its groups: each group's row repeated by its
+/// count column (then dropped), streamed a piece at a time into a stage
+/// table, on disk past its budget.
+fn repeat_out(a: Answer, post: Post) -> Result<Answer> {
+    let Some((col, limit)) = post.repeat else { return Ok(a) };
+    let i = a.schema().iter().position(|f| f.name == col).ok_or_else(|| bad("internal: the repeat count went missing"))?;
+    let mut schema = a.schema().to_vec();
+    schema.remove(i);
+    let mut w = mem::Writer::new(schema);
+    let empty = a.empty_batch();
+    let mut left = limit;
+    // The first batch's columns, empty: a LIMIT 0 (the usual schema probe)
+    // stops before any piece is pushed, and the answer keeps its columns.
+    let mut shape: Option<ArrowBatch> = None;
+    a.for_each(&mut |mut b| {
+        let counts: Vec<usize> = match &b.cols[i] {
+            FinishedCol::I64 { data, .. } => data.iter().map(|&n| usize::try_from(n).unwrap_or(0)).collect(),
+            FinishedCol::I32 { data, .. } => data.iter().map(|&n| usize::try_from(n).unwrap_or(0)).collect(),
+            _ => return Err(bad("internal: the repeat count is not an integer")),
+        };
+        b.cols.remove(i);
+        if shape.is_none() {
+            shape = Some(ArrowBatch { rows: 0, cols: b.cols.iter().map(|c| mem::zeros_like(c, 0)).collect() });
+        }
+        mem::repeat_chunks(&b, &counts, &mut left, &mut |x| w.push(x))
+    })?;
+    if w.like().is_none() {
+        // No rows: the columns' shapes still.
+        if let Some(mut e) = empty {
+            e.cols.remove(i);
+            w.push(e)?;
+        } else if let Some(e) = shape {
+            w.push(e)?;
+        }
+    }
+    Ok(Answer::Table(w.finish()?))
 }
 
 #[cfg(test)]
@@ -1405,5 +1633,21 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(mem::repeat(&b, &[2, 1, 0], Some(1)).rows, 1);
+    }
+
+    /// C3: `LIMIT 0` over a plain SELECT (the usual schema probe) keeps the
+    /// answer's columns: no rows, but every column of the schema.
+    #[test]
+    fn limit_zero_keeps_the_columns() {
+        let f = |n: &str| ArrowField { name: n.into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false };
+        let mut w = mem::Writer::new(vec![f("a"), f("b"), f("__n")]);
+        let col = |v: Vec<i64>| FinishedCol::I64 { validity: None, data: v };
+        w.push(ArrowBatch { rows: 3, cols: vec![col(vec![1, 2, 3]), col(vec![4, 5, 6]), col(vec![1, 2, 1])] }).unwrap();
+        let a = Answer::Table(w.finish().unwrap());
+        let r = repeat_out(a, Post { repeat: Some(("__n".into(), Some(0))) }).unwrap();
+        assert_eq!(r.schema().len(), 2);
+        let Answer::Table(t) = r else { panic!("a table") };
+        let b = t.into_batch().unwrap();
+        assert_eq!((b.rows, b.cols.len()), (0, 2), "no rows, both columns");
     }
 }

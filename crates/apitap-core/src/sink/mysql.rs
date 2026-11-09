@@ -1447,11 +1447,27 @@ impl crate::sink::Sink for MySqlSink {
         // OFF, and the refused LOAD DATA used to leave the producer blocked on
         // a full channel nobody would ever read — a transfer that hung with no
         // error (2026-11-08, lab_my on stock mysql:8.4). Refused here, by name.
-        let (conn_id, infile): (u64, Option<i64>) = conn
-            .query_first::<(u64, Option<i64>), _>("SELECT CONNECTION_ID(), @@GLOBAL.local_infile")
+        let conn_id: u64 = conn
+            .query_first::<u64, _>("SELECT CONNECTION_ID()")
             .await
             .map_err(|e| Error::Transfer(format!("mysql loader connection id: {e}")))?
             .ok_or_else(|| Error::Transfer("mysql loader got no CONNECTION_ID()".into()))?;
+        // Asked apart, read as any value: a proxy or a compatible server
+        // without the variable (an error) or with it as text is "unknown",
+        // and the load goes ahead; only a plain OFF is refused up front.
+        let infile: Option<i64> = match conn.query_first::<mysql_async::Row, _>("SELECT @@GLOBAL.local_infile").await {
+            Ok(Some(row)) => match row.as_ref(0) {
+                Some(mysql_async::Value::Int(i)) => Some(*i),
+                Some(mysql_async::Value::UInt(u)) => i64::try_from(*u).ok(),
+                Some(mysql_async::Value::Bytes(b)) => match std::str::from_utf8(b).map(|t| t.trim().to_ascii_uppercase()) {
+                    Ok(t) if t == "0" || t == "OFF" => Some(0),
+                    Ok(t) if t == "1" || t == "ON" => Some(1),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
         if infile == Some(0) {
             self.registry.lock().expect("infile registry").remove(&id);
             return Err(Error::Transfer(LOCAL_INFILE_OFF.into()));
@@ -1916,26 +1932,38 @@ impl MySqlLoader {
     }
 }
 
+impl MySqlLoader {
+    /// The error of a load that ended under us (refused, killed, a lost
+    /// connection), not "stream closed". The task waits to be released
+    /// before it ends: released here first (closed, not pooled), or the join
+    /// waits on it forever.
+    async fn ended(&mut self) -> Error {
+        if let Some(r) = self.release.take() {
+            let _ = r.send(false);
+        }
+        match self.join.join().await {
+            Some(Ok(Err(e))) => e,
+            Some(Err(e)) => Error::Transfer(format!("mysql loader join: {e}")),
+            _ => Error::Transfer("mysql LOAD DATA stream closed early".into()),
+        }
+    }
+}
+
 impl Loader for MySqlLoader {
     async fn send(&mut self, buf: Vec<u8>) -> Result<()> {
         if self.tx.send(Msg::Buf(Bytes::from(buf))).await.is_ok() {
             return Ok(());
         }
-        // The load ended under us (refused, killed, a lost connection): its
-        // own error is the one worth reporting, not "stream closed".
-        match self.join.join().await {
-            Some(Ok(Err(e))) => Err(e),
-            Some(Err(e)) => Err(Error::Transfer(format!("mysql loader join: {e}"))),
-            _ => Err(Error::Transfer("mysql LOAD DATA stream closed early".into())),
-        }
+        Err(self.ended().await)
     }
 
     async fn finish(mut self) -> Result<u64> {
         // `Finish` then close: the server sees a clean EOF and LOAD DATA commits.
-        self.tx
-            .send(Msg::Finish)
-            .await
-            .map_err(|_| Error::Transfer("mysql LOAD DATA stream closed early".into()))?;
+        // A load that ended first (refused before it read the file) is
+        // reported by its own error, as in `send`.
+        if self.tx.send(Msg::Finish).await.is_err() {
+            return Err(self.ended().await);
+        }
         self.tx.close_channel();
         if let Some(r) = self.release.take() {
             let _ = r.send(true);
@@ -1995,6 +2023,35 @@ impl Loader for MySqlLoader {
         cause
     }
 }
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    /// C6: a load that ended before `finish` (refused before it read the
+    /// file) reports its own error from `finish`, not "stream closed early".
+    #[tokio::test]
+    async fn finish_reports_the_load_error_when_the_load_ended_first() {
+        let (tx, rx) = mpsc::channel::<Msg<Bytes>>(2);
+        drop(rx);
+        let (release, released) = tokio::sync::oneshot::channel::<bool>();
+        let join = pipe::JoinOnce::new(tokio::spawn(async move {
+            let _ = released.await;
+            Err::<u64, Error>(Error::Transfer("LOAD DATA: refused for its own reason".into()))
+        }));
+        let l = MySqlLoader {
+            tx,
+            join,
+            id: 0,
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            conn_id: 0,
+            pool: Pool::new("mysql://u:p@127.0.0.1:1/x"),
+            release: Some(release),
+        };
+        let e = tokio::time::timeout(std::time::Duration::from_secs(5), l.finish()).await.expect("no hang").unwrap_err();
+        assert!(e.to_string().contains("refused for its own reason"), "{e}");
+    }
+}
+
 #[cfg(test)]
 mod abort_tests {
 

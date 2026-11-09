@@ -115,7 +115,7 @@ pub enum FinishedCol {
 }
 
 /// One sealed batch: `rows` rows across `cols` (parallel to the schema).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArrowBatch {
     pub rows: usize,
     pub cols: Vec<FinishedCol>,
