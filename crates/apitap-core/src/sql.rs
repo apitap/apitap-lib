@@ -2459,7 +2459,7 @@ fn plan_with(
                         let untyped = ["github://", "github+api://", "gsheets://"].iter().any(|p| sides[s].url.starts_with(p));
                         if sides[s].schema[k].kind == ArrowKind::Utf8 && !untyped {
                             return Err(unsupported(format!(
-                                "a join key that is text on its server ({}.{}; join on an integer column)",
+                                "a join key that is text ({}.{}, from a database or a CTE; join on an integer column)",
                                 sides[s].name, sides[s].schema[k].name
                             )));
                         }
