@@ -2449,6 +2449,20 @@ fn plan_with(
                                 sides[s].name, sides[s].schema[k].name, sides[s].schema[k].kind
                             )));
                         }
+                        // A text key is read as an integer only from a source
+                        // with no types of its own (a sheet, a CSV, the GitHub
+                        // API). A server's text column would be matched as an
+                        // integer range — the server's own `text >= integer`
+                        // error, or no row at all (D2) — and a stage table's
+                        // text column came from a server, where '010' <> '10'
+                        // (D2b): both are refused.
+                        let untyped = ["github://", "github+api://", "gsheets://"].iter().any(|p| sides[s].url.starts_with(p));
+                        if sides[s].schema[k].kind == ArrowKind::Utf8 && !untyped {
+                            return Err(unsupported(format!(
+                                "a join key that is text on its server ({}.{}; join on an integer column)",
+                                sides[s].name, sides[s].schema[k].name
+                            )));
+                        }
                     }
                     eqs.push((a, b));
                     continue;
@@ -7193,6 +7207,20 @@ mod tests {
                   "l.l_quantity < o.o_shippriority"] {
             assert!(plan(&format!("{j}{c}"), &srcs(), &mut schemas()).is_ok(), "{c}");
         }
+    }
+
+    /// A join key is an integer on a server's side: a text key there was
+    /// matched as an integer range (0 rows, or the server's own `text >=
+    /// integer` error) — D2. Text keys from a source without a server (a
+    /// sheet, a CSV) are read as integers and stay allowed.
+    #[test]
+    fn a_text_join_key_on_a_server_is_refused() {
+        let j = "SELECT COUNT(*) FROM pg.lineitem l JOIN my.orders o ON ";
+        for on in ["l.l_shipmode = o.o_orderpriority", "l.l_orderkey = o.o_orderpriority", "o.o_orderpriority = l.l_orderkey"] {
+            let e = plan(&format!("{j}{on}"), &srcs(), &mut schemas()).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("a join key") && e.contains("is not supported"), "{on}: {e}");
+        }
+        assert!(plan(&format!("{j}l.l_orderkey = o.o_orderkey"), &srcs(), &mut schemas()).is_ok());
     }
 
     /// Decimal arithmetic is exact: 1234.56 * (1 - 0.07) = 1148.1408 at scale 4.

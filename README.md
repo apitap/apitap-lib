@@ -423,7 +423,7 @@ table already joined. Then:
 
 | piece | supported |
 |---|---|
-| joins | `INNER JOIN … ON a.k = b.k` or the comma form with the equalities in `WHERE` |
+| joins | `INNER JOIN … ON a.k = b.k` or the comma form with the equalities in `WHERE`; the key is an integer column on a database, while a sheet's, CSV's or GitHub API table's text key is read as an integer (`'010'` equals `'10'`, spaces are trimmed, an empty cell is NULL, a value that is not an integer is refused); a text column from a database, directly or through a CTE or derived table, is refused as a key |
 | `WHERE` | per-table conditions (comparisons, `BETWEEN`, `IN`, `LIKE`, `IS NULL`, `AND`/`OR`/`NOT`, date literals, folded constants) are pushed to that table's server; an `OR` across tables (TPC-H Q19) is checked here per matched row, its single-table parts implied to each server too; a comparison of a column of each table is checked on each joined row when both are numbers, both dates or both timestamps of one kind (`l.shipdate > o.orderdate`) |
 | subqueries | `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS (SELECT …)`, including `IN (SELECT k … GROUP BY k HAVING SUM/COUNT/AVG(…) > x)` (TPC-H Q18) |
 | expressions | arithmetic in aggregates, `CASE WHEN … THEN … END` over one table, `EXTRACT(YEAR FROM col)`, derived tables `FROM (SELECT … ) AS t` without GROUP BY |
@@ -439,7 +439,7 @@ correlated subquery in any other place, a CTE shadowing another, a timestamp
 scalar subquery used as a literal, a `WHERE` expression over two tables'
 columns (`l.a * 2 > o.b`), a comparison of two tables' text columns (their
 collations may differ) or of unlike kinds (a date against a timestamp or a
-number), joins on non-integer keys.
+number), joins on non-integer keys (a database's text column as a join key included).
 
 **How it runs.** Each server only scans and sends: its table's conditions and
 columns go into its own `SELECT`, never a join, aggregate or another table's

@@ -26,7 +26,8 @@ PG_DUCK = "host=127.0.0.1 port=5544 dbname=apitap_bench_src user=postgres passwo
 MY_DUCK = "host=127.0.0.1 port=3307 database=bench user=root password=bench"
 
 PG_SETUP = """
-DROP TABLE IF EXISTS shp_c, shp_o, shp_t6, shp_s6, shp_cust, shp_ord, shp_dx, shp_tt, shp_ut, shp_nl, shp_lk, shp_dt, shp_tz, shp_g1, shp_g2, shp_lo, shp_g3, shp_g4, shp_xa;
+DROP TABLE IF EXISTS shp_c, shp_o, shp_t6, shp_s6, shp_cust, shp_ord, shp_dx, shp_tt, shp_ut, shp_nl, shp_lk, shp_dt, shp_tz, shp_g1, shp_g2, shp_lo, shp_g3, shp_g4, shp_xa, shp_ka;
+CREATE TABLE shp_ka(k text, n bigint); INSERT INTO shp_ka SELECT g::text, g FROM generate_series(1, 20) g; INSERT INTO shp_ka VALUES ('99', 999);
 CREATE TABLE shp_xa(k int, d date, n int, t text); INSERT INTO shp_xa VALUES (1,'2024-01-01',1,'abc'),(2,'2024-01-02',2,'ABC'),(3,'2024-01-03',3,'abc'),(4,'2024-01-04',4,'ABC');
 CREATE TABLE shp_g3(id bigint primary key, grp int); INSERT INTO shp_g3 SELECT i::bigint * 1000003, 100000 + i FROM generate_series(1, 5000) i;
 CREATE TABLE shp_g4(gid bigint); INSERT INTO shp_g4 SELECT (1 + i % 5000)::bigint * 1000003 FROM generate_series(1, 20000) i; ANALYZE shp_g3;
@@ -50,7 +51,9 @@ ANALYZE shp_cust; ANALYZE shp_ord;
 """
 
 MY_SETUP = [
-    "DROP TABLE IF EXISTS shp_n, shp_ci, shp_xb",
+    "DROP TABLE IF EXISTS shp_n, shp_ci, shp_xb, shp_kb",
+    "CREATE TABLE shp_kb(k varchar(10) primary key, n bigint)",
+    "INSERT INTO shp_kb VALUES ('1',1),('2',2),('3',3),('10',10),('099',99)",
     "CREATE TABLE shp_xb(k int primary key, ts datetime, dd date, s varchar(10) COLLATE utf8mb4_0900_ai_ci, c varchar(10))",
     "INSERT INTO shp_xb VALUES (1,'2024-01-02 12:00:00','2024-01-02','abc','1'),(2,'2024-01-02 12:00:00','2024-01-02','abc','2'),"
     "(3,'2024-01-02 12:00:00','2024-01-02','abc','3'),(4,'2024-01-02 12:00:00','2024-01-02','abc','4')",
@@ -176,6 +179,21 @@ CASES = [
      REFUSED, "a comparison of", False, {}),
     ("cross_int_text", "SELECT COUNT(*) AS n FROM pg.shp_xa a JOIN my.shp_xb b ON a.k = b.k WHERE a.n <> b.c",
      REFUSED, "a comparison of", False, {}),
+    # D2 (0.67.1 post-release): a join key that is text on its server was
+    # matched as an integer range — 0 rows where the servers give 4, or the
+    # server's own `text >= integer` error. Refused now; an integer key pair
+    # still runs. D2b: a stage table's text key is refused the same way.
+    ("join_key_text", "SELECT COUNT(*) AS n FROM pg.shp_ka a JOIN my.shp_kb b ON a.k = b.k",
+     REFUSED, "a join key", False, {}),
+    ("join_key_int_text", "SELECT COUNT(*) AS n FROM pg.shp_ka a JOIN my.shp_kb b ON a.n = b.k",
+     REFUSED, "a join key", False, {}),
+    ("join_key_int", "SELECT COUNT(*) AS n FROM pg.shp_ka a JOIN my.shp_kb b ON a.n = b.n",
+     ROWS, [(4,)], False, {}),
+    # D2b: a text key carried through a stage table was read as an integer,
+    # so MySQL's '099' met Postgres' '99' (5 rows where text equality gives 4).
+    ("join_key_stage_text", "WITH a AS (SELECT k, COUNT(*) AS c FROM pg.shp_ka GROUP BY k), "
+     "b AS (SELECT k, COUNT(*) AS c FROM my.shp_kb GROUP BY k) SELECT COUNT(*) AS n FROM a JOIN b ON a.k = b.k",
+     REFUSED, "a join key", False, {}),
     ("derived_fetch", "SELECT COUNT(*) AS n FROM (SELECT a FROM pg.shp_t6 FETCH FIRST 1 ROWS ONLY) d", REFUSED, "FETCH", False, {}),
 ]
 
