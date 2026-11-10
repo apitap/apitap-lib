@@ -44,7 +44,7 @@ never silently.
 Pin exactly while we are pre-1.0:
 
 ```
-apitap==0.59.0
+apitap==0.67.1
 ```
 
 Not `>=`. The surface above is committed, but the release cadence is fast enough
