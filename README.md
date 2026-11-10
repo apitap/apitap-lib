@@ -828,7 +828,7 @@ the fast lanes *are* the product. A new destination is one `sink/<name>.rs`
 (plus a `logbased/dest_<name>.rs` for CDC) and its route-table arms; it then
 works with every source whose wire format it accepts.
 
-The release gate runs 87 end-to-end legs against live servers (Postgres with
+The release gate runs 243 end-to-end legs against live servers (Postgres with
 logical replication, MySQL 8.4, MariaDB, ClickHouse, MinIO and a REST Iceberg
 catalog, BigQuery, two older wheels for upgrade and rollback legs) and prints
 one verdict; a skipped leg is a reported leg. Longer write-ups — the benchmark
