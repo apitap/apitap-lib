@@ -69,7 +69,7 @@ apitap.sql("""SELECT o_orderpriority, SUM(l_extendedprice * (1 - l_discount)) AS
 | **DataFrames** | `apitap.read()` → polars, pyarrow, duckdb, pandas through the Arrow C stream protocol, zero-copy, no pyarrow dependency |
 | **Runtime** | CPython ≥ 3.9, `abi3` wheels: `manylinux_x86_64` (the PGO build every gate leg and number here ran on), `manylinux_aarch64` and macOS `arm64` (built and unit-tested in CI, not PGO, not gated), and an sdist; the engine is Rust, nothing in the data path is Python |
 | **Memory** | bounded by *pipes × buffers*, planned from the container's cgroup limits — never by table size; a 256 MB container moves 100 GB |
-| **Version** | 0.67.1 — pin exactly while pre-1.0 (`apitap==0.67.1`). **Upgrade from 0.67.0** (yanked): its `apitap.sql()` could answer a `WHERE` comparing a column of each table wrongly, without an error, when the two were text or of unlike kinds (a date against a datetime, an integer against text); 0.67.1 refuses those by name |
+| **Version** | 0.67.2 — pin exactly while pre-1.0 (`apitap==0.67.2`). **Upgrade from 0.66.0–0.67.1** if you use `apitap.sql()`: a join on a database's text column (`ON a.code = b.code` with both `varchar`, or an integer against text) answered 0 rows, or through a CTE matched `'099'` with `'99'`, without an error; 0.67.0 also mis-compared a `WHERE` across tables of text or unlike kinds. 0.67.2 refuses all of these by name |
 | **License** | MIT |
 
 ## Why apitap
