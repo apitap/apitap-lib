@@ -686,14 +686,14 @@ fn find_sorted(v: &[(i64, u32)], k: i64) -> Option<usize> {
     }
 }
 
-/// Key ranges this wide are held as a direct array (a byte per key while
-/// the payloads are fewer than 255).
-const DIM_DIRECT_MAX: u64 = 64 << 20;
+// Key ranges as wide as `ledger::dim_direct_max()` (a quarter of the
+// limit: 64M keys at 256 MiB) are held as a direct array (a byte per key
+// while the payloads are fewer than 255).
 
 impl DimMap {
     fn new(name: &str, key: &str, kr: Kr) -> DimMap {
         let store = match kr {
-            Kr::Known(lo, hi) if u64::try_from(hi as i128 - lo as i128 + 1).is_ok_and(|n| n <= DIM_DIRECT_MAX) => {
+            Kr::Known(lo, hi) if u64::try_from(hi as i128 - lo as i128 + 1).is_ok_and(|n| n <= super::ledger::dim_direct_max()) => {
                 Store::D8(lo, vec![u8::MAX; (hi as i128 - lo as i128 + 1) as usize])
             }
             _ => Store::Sorted(Vec::new()),
@@ -857,6 +857,13 @@ impl DimMap {
         !matches!(self.store, Store::Sorted(_))
     }
 
+    /// What the map holds while it loads and through every pass: its
+    /// [`bytes`](Self::bytes) and its payload index (`ids`, priced as the
+    /// payloads again: 24 B each). One metric for every budget check.
+    pub(super) fn held(&self) -> u64 {
+        self.bytes() + self.payloads.len() as u64 * 24
+    }
+
     pub(super) fn bytes(&self) -> u64 {
         let st = match &self.store {
             Store::D8(_, a) => a.len() as u64,
@@ -885,7 +892,12 @@ pub(super) async fn load(st: &Star) -> Result<Vec<DimMap>> {
     let mut running = FuturesUnordered::new();
     let mut done = 0;
     while done < n {
-        let ready: Vec<usize> = (0..n).filter(|&d| !started[d] && deps(d).iter().all(|&e| maps[e].is_some())).collect();
+        let mut ready: Vec<usize> = (0..n).filter(|&d| !started[d] && deps(d).iter().all(|&e| maps[e].is_some())).collect();
+        // A source with few connections free (W1 round P, p5): one dimension
+        // at a time, so the statement never waits on itself for one.
+        if super::serial_cap().is_some() {
+            ready.truncate(usize::from(running.is_empty()));
+        }
         let pipes = cap.map(|c| (c / (ready.len() + running.len()).max(1)).max(1));
         for d in ready {
             started[d] = true;
@@ -897,6 +909,21 @@ pub(super) async fn load(st: &Star) -> Result<Vec<DimMap>> {
                 let (d, m) = r?;
                 maps[d] = Some(Arc::new(m));
                 done += 1;
+                // The dimensions are held together through every pass: their
+                // sum is priced against the build budget (W1 B4), but a plan
+                // 0.67.2 answered is never refused for it (each dimension
+                // alone against the whole budget, as 0.67.2 did: W1 review
+                // R6); past the sum the debug line says so.
+                let total: u64 = maps.iter().flatten().map(|m| m.held()).sum();
+                let cap = super::build_budget();
+                if total > cap && dbg() {
+                    eprintln!(
+                        "[sql] the dimensions together hold {} MiB (the last {}), past the build budget ({} MiB): each is held to the budget alone, as 0.67.2 did",
+                        total >> 20,
+                        st.dims[d].side.name,
+                        cap >> 20
+                    );
+                }
             }
             None => return Err(bad("a dimension that waits on itself")),
         }
@@ -939,16 +966,21 @@ async fn load_dim(st: &Star, d: usize, maps: &[Option<Arc<DimMap>>], pipes: Opti
     // 8 s of CPU at two pipes), so up to the scan pipes a filtered probe
     // takes, within the memory the maps held so far leave.
     let pipes = if selective(&gates) {
-        let held: u64 = maps.iter().flatten().map(|m| m.bytes()).sum::<u64>() + gates.iter().map(|g| g.bytes()).sum::<u64>();
+        let held: u64 = maps.iter().flatten().map(|m| m.held()).sum::<u64>() + gates.iter().map(|g| g.bytes()).sum::<u64>();
         crate::pipeline::mem_limit_bytes()
-            .map(|m| crate::read_impl::read_pipes_for(m.saturating_sub(held + PROBE_HEADROOM)).clamp(1, SERVER_SCAN_PIPES))
+            .map(|m| crate::read_impl::read_pipes_for(m.saturating_sub(held + super::ledger::probe_headroom())).clamp(1, SERVER_SCAN_PIPES))
             .or(pipes)
     } else {
         pipes
     };
     let mut h = open_gated(&dim.side, None, pipes, None, gates).await?;
     let mut rows = 0u64;
+    // The dimensions loaded before this one stay held beside it; this one is
+    // still refused only past the whole budget alone (0.67.2's rule), so the
+    // sum never refuses what 0.67.2 answered (W1 review R6).
+    let others: u64 = maps.iter().flatten().map(|m| m.held()).sum();
     let dim_cap = super::build_budget();
+    let mut past_sum = false;
     while let Some(b) = h.recv().await? {
         'row: for r in 0..b.rows {
             if !local_ok(&dim.side, &tys, &b, r) {
@@ -1017,7 +1049,7 @@ async fn load_dim(st: &Star, d: usize, maps: &[Option<Arc<DimMap>>], pipes: Opti
         // A dimension past the build budget is refused here, not after it
         // has taken the memory the build and the probe need (the maps are
         // held through every pass; `ids` is priced as payloads again).
-        let held = m.bytes() + m.payloads.len() as u64 * 24;
+        let held = m.held();
         if held > dim_cap {
             return Err(unsupported(format!(
                 "the dimension {} ({} MiB held at {rows} rows) is larger than the build budget ({} MiB); raise the memory limit",
@@ -1025,6 +1057,16 @@ async fn load_dim(st: &Star, d: usize, maps: &[Option<Arc<DimMap>>], pipes: Opti
                 held >> 20,
                 dim_cap >> 20
             )));
+        }
+        if !past_sum && held + others > dim_cap && dbg() {
+            past_sum = true;
+            eprintln!(
+                "[sql] dimension {}: {} MiB beside {} MiB of the dimensions loaded before it, past the build budget ({} MiB): held to the budget alone, as 0.67.2 did",
+                dim.side.name,
+                held >> 20,
+                others >> 20,
+                dim_cap >> 20
+            );
         }
     }
     m.seal()?;
@@ -1193,7 +1235,7 @@ pub(super) async fn read_late(st: &Star, groups: Groups, accs: Vec<Acc>, na: usi
     // The answer's rows only, before the read: the other groups (hundreds of
     // thousands under a LIMIT 20) are let go, so the read has their memory.
     let keys: Vec<Box<[u8]>> = rows.iter().map(|&r| Box::<[u8]>::from(&groups.keys[r])).collect();
-    let racc: Vec<Acc> = rows.iter().flat_map(|&r| accs[r * na..(r + 1) * na].iter().copied()).collect();
+    let racc: Vec<Acc> = rows.iter().flat_map(|&r| accs[r * na..(r + 1) * na].iter().cloned()).collect();
     drop(groups);
     drop(accs);
     // Per late read: the keys wanted, then their columns' encoded values.

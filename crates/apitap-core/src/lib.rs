@@ -42,6 +42,7 @@ mod pipeline;
 mod plan;
 mod progress;
 mod read;
+mod rcvbuf;
 mod read_impl;
 pub mod shutdown;
 mod sink;
@@ -139,6 +140,13 @@ impl std::str::FromStr for Mode {
             ))),
         }
     }
+}
+
+/// The tuning environment a run reads, checked before it starts: a value
+/// that is set but not what the knob takes is refused by name, not ignored
+/// (QA p13: `APITAP_RECV_BUF_BYTES=junk` ran on the default, silently).
+pub fn check_env() -> Result<()> {
+    rcvbuf::check_env()
 }
 
 /// `APITAP_RUNTIME_WORKERS`: unset/junk/0 -> `None` (the quota decides);

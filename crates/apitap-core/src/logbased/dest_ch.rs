@@ -845,6 +845,20 @@ async fn apply_unit(
     // re-land a stale TOAST value (deep review 2, N2). A key the general path
     // has rewritten keeps only its new row, so FINAL is right for both.
     let versioned = insert_only || u.tombstone_shape(dest_table).await;
+    // Whether this apply is a replay (an attempt at this window journalled
+    // already): asked once, before the bulk, which it now shapes.
+    let replay = !c.residue.is_empty() && u.journal_live(dest_table, id.start()).await?;
+    // The residue tail in sets (W1 round P, L6): on an insert-only table's
+    // first attempt the tail's keys leave the bulk phase, the tail runs in
+    // memory (one readback for every key it needs, in batches), and its
+    // final images land as one INSERT, each key's newest version once: no
+    // per-key DELETE (400-440 ms each with its lease check), no per-op
+    // readback. A replay keeps the serial path its journal rules describe.
+    let batched = insert_only && !c.residue.is_empty() && !replay;
+    let rkeys: std::collections::HashSet<Vec<Vec<u8>>> = if batched { residue_keys(&c.residue, pk_idx) } else { Default::default() };
+    // The images the bulk would have landed for the tail's keys (None: its
+    // tombstone): the tail starts from them.
+    let mut tail_start: std::collections::HashMap<Vec<Vec<u8>>, Option<Vec<Cell>>> = std::collections::HashMap::new();
 
     if !insert_only && (!c.deletes.is_empty() || !c.upserts.is_empty()) {
         let kt = u.key_table_reset(dest_table, pk_cols).await?;
@@ -880,17 +894,35 @@ async fn apply_unit(
         let ver = id.ver();
         if !c.upserts.is_empty() {
             let mut buf = Vec::with_capacity(4 << 20);
+            let upserts: Vec<&crate::wire::pgoutput::Tuple> = c
+                .upserts
+                .iter()
+                .filter(|row| {
+                    if !batched {
+                        return true;
+                    }
+                    let k: Vec<Vec<u8>> = row_key_refs(row, pk_idx).iter().map(|x| x.to_vec()).collect();
+                    if rkeys.contains(&k) {
+                        tail_start.insert(k, Some(row.to_cells()));
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
             match &rb_types {
-                Some(rt) => {
-                    for row in &c.upserts {
+                Some(rt) if !upserts.is_empty() => {
+                    for row in &upserts {
                         render_ch_row_rb(row, rt, &mut buf)?;
                         insert_only_suffix_rb(&mut buf, ver, false);
                     }
                     u.insert_owned_rb(dest_table, &insert_only_cols(wal_cols), buf)
                         .await?;
                 }
+                Some(_) => {}
+                None if upserts.is_empty() => {}
                 None => {
-                    for row in &c.upserts {
+                    for row in &upserts {
                         if binary {
                             render_ch_row_binary_as_text(row, oids, &mut buf)?;
                         } else {
@@ -919,6 +951,14 @@ async fn apply_unit(
                 .deletes
                 .iter()
                 .filter(|k| !live.contains(&k.iter().map(|c| c.as_slice()).collect::<Vec<_>>()))
+                .filter(|k| {
+                    if batched && rkeys.contains(*k) {
+                        tail_start.entry((*k).clone()).or_insert(None);
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .collect();
             if !deletes.is_empty() {
                 let mut buf = Vec::with_capacity(1 << 20);
@@ -994,12 +1034,14 @@ async fn apply_unit(
             c.residue_at.len()
         )));
     }
-    let replay = !c.residue.is_empty() && u.journal_live(dest_table, id.start()).await?;
+    if batched {
+        apply_residue_batched(u, dest_table, c, pk_cols, pk_idx, &pk_oids, oids, wal_cols, binary, id, tail_start).await?;
+    }
     // 0.62.0's key counts from the dead attempt's start, so it is good only
     // in the first window this run applies for the table: a later window
     // counting `1|pred` again took another op's image (R16). Its rows are
     // dropped once that window has used them.
-    let legacy_ok = replay && u.first_residue_window(dest_table);
+    let legacy_ok = !batched && replay && u.first_residue_window(dest_table);
     if dbg && !c.residue.is_empty() {
         eprintln!(
             "[residue] {dest_table} window {}..{} ops={} replay={replay}",
@@ -1022,7 +1064,8 @@ async fn apply_unit(
         *l += 1;
         (format!("{pos}|{n}|{pred}"), format!("{l}|{pred}"))
     };
-    for (op, &pos) in c.residue.iter().zip(&c.residue_at) {
+    for (op, &pos) in c.residue.iter().zip(&c.residue_at).filter(|_| !batched) {
+        crate::progress::add_applied(1);
         match op {
             ResidueOp::MaskedUpdate { key, row } => {
                 let mut full = row.clone();
@@ -1323,6 +1366,303 @@ async fn apply_unit(
         );
     }
     Ok((c.events, set(c.events)))
+}
+
+/// Every key the residue tail touches (a re-key's both).
+fn residue_keys(residue: &[ResidueOp], pk_idx: &[usize]) -> std::collections::HashSet<Vec<Vec<u8>>> {
+    let mut out = std::collections::HashSet::new();
+    for op in residue {
+        match op {
+            ResidueOp::MaskedUpdate { key, .. } | ResidueOp::Delete { key } => {
+                out.insert(key.clone());
+            }
+            ResidueOp::Upsert { row } => {
+                out.insert(row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect());
+            }
+            ResidueOp::Rekey { old_key, new_key, .. } => {
+                out.insert(old_key.clone());
+                out.insert(new_key.clone());
+            }
+        }
+    }
+    out
+}
+
+/// A key's image in the batched tail: its cells, and which of them came back
+/// from the destination (already its dialect: escaped, not translated).
+#[derive(Clone)]
+struct TailImg {
+    cells: Vec<Cell>,
+    verbatim: Vec<usize>,
+}
+
+/// Keys per batched tail readback statement (its bytes are capped too, by
+/// [`READBACK_PRED_BYTES`]: long text keys stay under max_query_size).
+const TAIL_READBACK_KEYS: usize = 500;
+
+/// The live newest image of each of `keys` at the destination, every column,
+/// in batched statements (`… WHERE (pk) IN (…) … LIMIT 1 BY pk`). A row whose
+/// key text does not match a key asked (a type that prints otherwise than it
+/// is written) is read again alone, as the serial path reads it.
+#[allow(clippy::too_many_arguments)]
+async fn readback_many(
+    u: &mut ChUnit<'_>,
+    ft: &str,
+    pk_cols: &[String],
+    wal_cols: &[String],
+    keys: &[Vec<Vec<u8>>],
+    pk_oids: &[u32],
+    binary: bool,
+) -> Result<std::collections::HashMap<Vec<Vec<u8>>, TailImg>> {
+    let mut found = std::collections::HashMap::new();
+    let pklist = pk_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
+    let all = wal_cols.iter().map(|k| ch_ident(k)).collect::<Vec<_>>().join(", ");
+    let npk = pk_cols.len();
+    let mut all_lits = Vec::with_capacity(keys.len());
+    for key in keys {
+        let l = key_literals(key, pk_oids, binary)?;
+        all_lits.push(if npk == 1 { l[0].clone() } else { format!("({})", l.join(", ")) });
+    }
+    let lens: Vec<usize> = all_lits.iter().map(|l| l.len() + 2).collect();
+    for r in chunk_by_bytes(&lens, READBACK_PRED_BYTES, TAIL_READBACK_KEYS) {
+        let chunk = &keys[r.clone()];
+        let mut want: std::collections::HashMap<Vec<u8>, &Vec<Vec<u8>>> = std::collections::HashMap::new();
+        let lits = &all_lits[r];
+        for key in chunk {
+            let refs: Vec<&[u8]> = key.iter().map(|k| k.as_slice()).collect();
+            let mut line = Vec::new();
+            if binary {
+                render_ch_key_binary(&refs, pk_oids, &mut line)?;
+            } else {
+                render_ch_key(&refs, pk_oids, &mut line)?;
+            }
+            want.insert(line, key);
+        }
+        let lhs = if npk == 1 { pklist.clone() } else { format!("({pklist})") };
+        let body = u
+            .read(&format!(
+                "SELECT {pklist}, {all} FROM {ft} FINAL WHERE {lhs} IN ({}) AND _apitap_deleted = 0 \
+                 ORDER BY _apitap_ver DESC LIMIT 1 BY {pklist} FORMAT TabSeparated",
+                lits.join(", ")
+            ))
+            .await?;
+        for line in body.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() != npk + wal_cols.len() {
+                return Err(Error::Transfer("log_based: batched readback column count mismatch".into()));
+            }
+            let mut k = fields[..npk].join("\t").into_bytes();
+            k.push(b'\n');
+            let Some(key) = want.remove(&k) else { continue };
+            let cells = fields[npk..]
+                .iter()
+                .map(|f| match tsv_unescape(f) {
+                    None => Cell::Null,
+                    Some(v) => Cell::Text(bytes::Bytes::from(v)),
+                })
+                .collect();
+            found.insert(key.clone(), TailImg { cells, verbatim: (0..wal_cols.len()).collect() });
+        }
+        // Keys whose row did not come back under their own spelling: alone.
+        for key in want.into_values() {
+            let pred = key_pred(pk_cols, key, pk_oids, binary)?;
+            let body = u
+                .read(&format!(
+                    "SELECT {all} FROM {ft} FINAL WHERE {pred} AND _apitap_deleted = 0 \
+                     ORDER BY _apitap_ver DESC LIMIT 1 FORMAT TabSeparated"
+                ))
+                .await?;
+            if let Some(line) = body.lines().next() {
+                let fields: Vec<&str> = line.split('\t').collect();
+                if fields.len() != wal_cols.len() {
+                    return Err(Error::Transfer("log_based: readback column count mismatch".into()));
+                }
+                let cells = fields
+                    .iter()
+                    .map(|f| match tsv_unescape(f) {
+                        None => Cell::Null,
+                        Some(v) => Cell::Text(bytes::Bytes::from(v)),
+                    })
+                    .collect();
+                found.insert(key.clone(), TailImg { cells, verbatim: (0..wal_cols.len()).collect() });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The residue tail of an insert-only table's first attempt, in sets: the
+/// ops run in order over images in memory (each key's first image from the
+/// bulk the tail kept back, else from one batched readback), every op's
+/// image is journalled in one INSERT (the replay rule reads them as the
+/// serial path wrote them), and each key's final image or tombstone lands
+/// once, at the window's version.
+#[allow(clippy::too_many_arguments)]
+async fn apply_residue_batched(
+    u: &mut ChUnit<'_>,
+    dest_table: &str,
+    c: &Collapsed,
+    pk_cols: &[String],
+    pk_idx: &[usize],
+    pk_oids: &[u32],
+    oids: &[u32],
+    wal_cols: &[String],
+    binary: bool,
+    id: &WindowId,
+    start: std::collections::HashMap<Vec<Vec<u8>>, Option<Vec<Cell>>>,
+) -> Result<()> {
+    let ft = ch_ident(dest_table);
+    let missing_of = |row: &[Cell]| -> Vec<usize> {
+        row.iter().enumerate().filter(|(_, c)| matches!(c, Cell::UnchangedToast)).map(|(i, _)| i).collect()
+    };
+    // Images per key; `None` is a deleted key.
+    let mut cur: std::collections::HashMap<Vec<Vec<u8>>, Option<TailImg>> =
+        start.into_iter().map(|(k, v)| (k, v.map(|cells| TailImg { cells, verbatim: Vec::new() }))).collect();
+    // The keys whose first touch needs the destination's row.
+    let mut seen: std::collections::HashSet<Vec<Vec<u8>>> = cur.keys().cloned().collect();
+    let mut need = Vec::new();
+    for op in &c.residue {
+        match op {
+            ResidueOp::MaskedUpdate { key, row } => {
+                if seen.insert(key.clone()) && !missing_of(row).is_empty() {
+                    need.push(key.clone());
+                }
+            }
+            ResidueOp::Upsert { row } => {
+                seen.insert(row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect());
+            }
+            ResidueOp::Delete { key } => {
+                seen.insert(key.clone());
+            }
+            ResidueOp::Rekey { old_key, new_key, row } => {
+                if seen.insert(old_key.clone()) && !missing_of(row).is_empty() {
+                    need.push(old_key.clone());
+                }
+                seen.insert(new_key.clone());
+            }
+        }
+    }
+    let mut base = readback_many(u, &ft, pk_cols, wal_cols, &need, pk_oids, binary).await?;
+    let nread = need.len();
+    for k in need {
+        if let Some(img) = base.remove(&k) {
+            cur.insert(k, Some(img));
+        }
+    }
+    let fill = |row: &[Cell], b: &TailImg, missing: &[usize]| -> TailImg {
+        let mut full = row.to_vec();
+        let mut verbatim = Vec::new();
+        for &i in missing {
+            full[i] = b.cells[i].clone();
+            if b.verbatim.contains(&i) {
+                verbatim.push(i);
+            }
+        }
+        TailImg { cells: full, verbatim }
+    };
+    let mut ordinal: std::collections::HashMap<(u64, String), u32> = std::collections::HashMap::new();
+    let mut journal: Vec<(String, Vec<u8>, u64)> = Vec::new();
+    for (op, &pos) in c.residue.iter().zip(&c.residue_at) {
+        match op {
+            ResidueOp::MaskedUpdate { key, row } => {
+                let missing = missing_of(row);
+                let pred = key_pred(pk_cols, key, pk_oids, binary)?;
+                let n = ordinal.entry((pos, pred.clone())).or_insert(0);
+                *n += 1;
+                let jk = format!("{pos}|{n}|{pred}");
+                let img = if missing.is_empty() {
+                    TailImg { cells: row.clone(), verbatim: Vec::new() }
+                } else {
+                    match cur.get(key) {
+                        Some(Some(b)) => fill(row, b, &missing),
+                        _ => {
+                            return Err(Error::Transfer(
+                                "log_based: masked update for a row missing at the destination \
+                                 and not in the residue journal — window replay out of order?"
+                                    .into(),
+                            ))
+                        }
+                    }
+                };
+                let mut buf = Vec::new();
+                render_residue_row(&img.cells, oids, &img.verbatim, binary, &mut buf)?;
+                journal.push((jk, buf, pos));
+                cur.insert(key.clone(), Some(img));
+            }
+            ResidueOp::Upsert { row } => {
+                let k: Vec<Vec<u8>> = row_key_refs_cells(row, pk_idx).into_iter().map(|k| k.to_vec()).collect();
+                cur.insert(k, Some(TailImg { cells: row.clone(), verbatim: Vec::new() }));
+            }
+            ResidueOp::Delete { key } => {
+                cur.insert(key.clone(), None);
+            }
+            ResidueOp::Rekey { old_key, new_key, row } => {
+                let missing = missing_of(row);
+                let old_pred = key_pred(pk_cols, old_key, pk_oids, binary)?;
+                let n = ordinal.entry((pos, old_pred.clone())).or_insert(0);
+                *n += 1;
+                let jk = format!("{pos}|{n}|{old_pred}");
+                let img = if missing.is_empty() {
+                    TailImg { cells: row.clone(), verbatim: Vec::new() }
+                } else {
+                    match cur.get(old_key) {
+                        Some(Some(b)) => fill(row, b, &missing),
+                        // The old key gone on a first attempt: an attempt from
+                        // before the journal moved the row (the serial rule).
+                        _ => continue,
+                    }
+                };
+                if !missing.is_empty() {
+                    let mut buf = Vec::new();
+                    render_residue_row(&img.cells, oids, &img.verbatim, binary, &mut buf)?;
+                    journal.push((jk, buf, pos));
+                }
+                cur.insert(old_key.clone(), None);
+                cur.insert(new_key.clone(), Some(img));
+            }
+        }
+    }
+    u.journal_put_many(dest_table, &journal, id.start()).await?;
+    let ver = id.ver();
+    let (mut rows, mut tombs) = (Vec::new(), Vec::new());
+    let (mut nrows, mut ntombs) = (0u64, 0u64);
+    for (k, img) in &cur {
+        match img {
+            Some(img) => {
+                render_residue_row(&img.cells, oids, &img.verbatim, binary, &mut rows)?;
+                insert_only_suffix(&mut rows, ver, false);
+                nrows += 1;
+            }
+            None => {
+                let refs: Vec<&[u8]> = k.iter().map(|x| x.as_slice()).collect();
+                if binary {
+                    render_ch_key_binary(&refs, pk_oids, &mut tombs)?;
+                } else {
+                    render_ch_key(&refs, pk_oids, &mut tombs)?;
+                }
+                insert_only_suffix(&mut tombs, ver, true);
+                ntombs += 1;
+            }
+        }
+    }
+    if nrows > 0 {
+        u.insert_owned(dest_table, &insert_only_cols(wal_cols), rows).await?;
+    }
+    if ntombs > 0 {
+        u.insert_owned(dest_table, &insert_only_cols(pk_cols), tombs).await?;
+    }
+    crate::progress::add_applied(nrows + ntombs);
+    if std::env::var_os("APITAP_DEBUG").is_some() {
+        eprintln!(
+            "[residue] {dest_table} window {}..{} batched: {} ops, {} keys read back, {nrows} rows and {ntombs} tombstones landed, {} journalled",
+            id.start(),
+            id.end(),
+            c.residue.len(),
+            nread,
+            journal.len()
+        );
+    }
+    Ok(())
 }
 
 /// Everything that reaches the server. See the module doc.
@@ -2498,6 +2838,29 @@ mod store {
             let cols = ["dest_table", "k", "row", "ver"].map(String::from);
             self.insert_owned(JOURNAL.trim_matches('`'), &cols, body)
                 .await
+        }
+
+        /// [`journal_put`](Self::journal_put) for many ops in one INSERT.
+        pub(crate) async fn journal_put_many(&mut self, table: &str, entries: &[(String, Vec<u8>, u64)], after: u64) -> Result<()> {
+            if entries.is_empty() {
+                return Ok(());
+            }
+            self.s.ensure_journal_table().await?;
+            if self.s.first_time(&format!("\u{1}jsweep\u{1}{table}")) {
+                let w = format!("dest_table = '{}' AND ver <= {after}", ch_str(table));
+                self.delete_where(JOURNAL.trim_matches('`'), &w).await?;
+            }
+            let mut body = Vec::with_capacity(entries.iter().map(|e| e.1.len() * 2 + e.0.len() + 64).sum());
+            for (k, row, ver) in entries {
+                for f in [table.as_bytes(), k.as_bytes()] {
+                    crate::wire::mytsv::tsv_escape(f, &mut body);
+                    body.push(b'\t');
+                }
+                body.extend_from_slice(hex::encode(row).as_bytes());
+                body.extend_from_slice(format!("\t{ver}\n").as_bytes());
+            }
+            let cols = ["dest_table", "k", "row", "ver"].map(String::from);
+            self.insert_owned(JOURNAL.trim_matches('`'), &cols, body).await
         }
 
         /// The journalled row for the op `k`, if an attempt wrote one and no

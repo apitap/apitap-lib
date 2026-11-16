@@ -14,7 +14,7 @@
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Profile};
 use crate::plan::{Delivered, WireFormat};
-use crate::read::{ArrowField, ReadHandle, ReadOptions};
+use crate::read::{ArrowField, BatchTx, ReadHandle, ReadOptions};
 use crate::sink::Loader;
 use crate::source::{
     github::GithubSource, github_api::GithubApiSource, gsheets::GsheetsSource, mysql::MySqlSource,
@@ -80,16 +80,27 @@ fn read_dialect(src_url: &str) -> Result<ReadDialect> {
 pub(crate) async fn schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>> {
     let dialect = read_dialect(src_url)?;
     match dialect {
-        ReadDialect::Pg => schema_with(PgSource::connect(src_url, 1).await?, table, dialect).await,
+        ReadDialect::Pg => schema_with(&PgSource::connect(src_url, 1).await?, table, dialect).await,
         ReadDialect::My => {
-            schema_with(MySqlSource::connect(src_url, 1).await?, table, dialect).await
+            schema_with(&MySqlSource::connect(src_url, 1).await?, table, dialect).await
         }
-        ReadDialect::Gh => schema_with(GithubSource::connect(src_url).await?, table, dialect).await,
+        ReadDialect::Gh => schema_with(&GithubSource::connect(src_url).await?, table, dialect).await,
         ReadDialect::GhApi => {
-            schema_with(GithubApiSource::connect(src_url).await?, table, dialect).await
+            schema_with(&GithubApiSource::connect(src_url).await?, table, dialect).await
         }
-        ReadDialect::Gs => schema_with(GsheetsSource::connect(src_url).await?, table, dialect).await,
+        ReadDialect::Gs => schema_with(&GsheetsSource::connect(src_url).await?, table, dialect).await,
     }
+}
+
+/// [`schema`] on a connection the caller holds (apitap.sql()'s planning
+/// connection, one per source a statement: W1 round P, p8).
+pub(crate) async fn schema_on_pg(src: &PgSource, table: &str) -> Result<Vec<ArrowField>> {
+    schema_with(src, table, ReadDialect::Pg).await
+}
+
+/// [`schema_on_pg`] for MySQL.
+pub(crate) async fn schema_on_my(src: &MySqlSource, table: &str) -> Result<Vec<ArrowField>> {
+    schema_with(src, table, ReadDialect::My).await
 }
 
 /// The schema the read will deliver — decided by `column_kind`, the same
@@ -97,7 +108,7 @@ pub(crate) async fn schema(src_url: &str, table: &str) -> Result<Vec<ArrowField>
 /// Postgres column the reader casts to text (time, an unconstrained
 /// NUMERIC, …) was announced as its native type to the lazy frame.
 async fn schema_with<S: Source>(
-    src: S,
+    src: &S,
     table: &str,
     dialect: ReadDialect,
 ) -> Result<Vec<ArrowField>> {
@@ -117,6 +128,9 @@ async fn schema_with<S: Source>(
                 padded: padded_text(kind, &pc.udt, pc.native_ddl.as_deref()),
                 ci: ci_text(kind, pc.native_ddl.as_deref()),
                 ai: ai_text(kind, pc.native_ddl.as_deref()),
+                locale: locale_text(kind, pc.native_ddl.as_deref()),
+                nulls_low: matches!(dialect, ReadDialect::My),
+                origin: None,
             }
         })
         .collect())
@@ -141,6 +155,16 @@ fn padded_text(kind: Option<ArrowKind>, udt: &str, native: Option<&str>) -> bool
         || collation_of(native).is_some_and(|c| !c.contains("0900") && !c.contains("nopad") && c != "binary")
 }
 
+/// A MySQL text column's collation when it does not order by bytes (all but
+/// `_bin` and `binary`): [`ArrowField::locale`]. Postgres DDL carries no
+/// collation here; apitap.sql() probes it (`sql::order::pg_collations`).
+fn locale_text(kind: Option<ArrowKind>, native: Option<&str>) -> Option<String> {
+    if !matches!(kind, Some(ArrowKind::Utf8)) {
+        return None;
+    }
+    collation_of(native).filter(|c| !c.ends_with("_bin") && c != "binary")
+}
+
 /// Text under an accent-insensitive collation ([`ArrowField::ai`]).
 fn ai_text(kind: Option<ArrowKind>, native: Option<&str>) -> bool {
     ci_text(kind, native) && collation_of(native).is_some_and(|c| !c.contains("_as_"))
@@ -148,7 +172,12 @@ fn ai_text(kind: Option<ArrowKind>, native: Option<&str>) -> bool {
 
 /// Text under a case-insensitive collation ([`ArrowField::ci`]).
 fn ci_text(kind: Option<ArrowKind>, native: Option<&str>) -> bool {
-    matches!(kind, Some(ArrowKind::Utf8)) && collation_of(native).is_some_and(|c| c.ends_with("_ci"))
+    // Postgres `citext` compares case-insensitively too: its GROUP BY,
+    // DISTINCT and `=` fold case on the server (W1 round P: grouped by bytes,
+    // 'a' and 'A' were two groups where Postgres has one).
+    // (citext is read as text: no Arrow kind of its own.)
+    (matches!(kind, Some(ArrowKind::Utf8)) && collation_of(native).is_some_and(|c| c.ends_with("_ci")))
+        || (matches!(kind, Some(ArrowKind::Utf8) | None) && native.is_some_and(|n| n.trim().eq_ignore_ascii_case("citext")))
 }
 
 fn read_as_text(kind: Option<ArrowKind>, udt: &str) -> bool {
@@ -245,43 +274,106 @@ pub(crate) async fn start(src_url: &str, table: &str, opts: &ReadOptions) -> Res
             }
         }
     }
-
-    match dialect {
-        ReadDialect::Pg => {
-            let src = PgSource::connect(src_url, parallel + 1).await?;
-            let rp = plan_read(&src, dialect, table, opts, parallel).await?;
-            Ok(launch_loaders(src, rp, chunk))
+    // The receive buffers the pipes' sockets will hold, by the law at the
+    // longest round trip seen: past their share of the limit, fewer pipes
+    // (each keeps the law's window).
+    if matches!(dialect, ReadDialect::Pg | ReadDialect::My) {
+        let within = crate::rcvbuf::pipes_within(parallel, pipeline::mem_limit_bytes(), &crate::rcvbuf::endpoint_of(src_url));
+        // An explicit parallel= lowered by the receive buffers is said, as
+        // the memory clamp says it (W1 review R7).
+        if within < parallel && opts.parallel.is_some() {
+            crate::progress::note(&format!(
+                "read: parallel={parallel} would hold receive buffers past their share of the {} MiB memory limit \
+                 at this server's round trip; reading with {within} pipe(s)",
+                pipeline::mem_limit_bytes().unwrap_or(0) >> 20
+            ));
         }
-        ReadDialect::My => {
-            let src = MySqlSource::connect(src_url, parallel + 1).await?;
-            let rp = plan_read(&src, dialect, table, opts, parallel).await?;
-            // Direct-Arrow lane by default: cells decode straight into the
-            // column builders (one dispatch, one copy). APITAP_MY_ARROW=0
-            // keeps the COPY lane — the same A/B-and-escape-hatch pattern
-            // as the pg raw plane's APITAP_RAW_COPY.
-            if std::env::var("APITAP_MY_ARROW").is_ok_and(|v| v == "0") {
+        parallel = within;
+    }
+    // Reads open at once are priced together: this one's pipes beside what
+    // the reads open now planned for theirs (W1b: TPC-H SF50 Q9's three
+    // dimension reads and partsupp's seven pipes were each planned as if
+    // alone in the cage). The claim and the count are one step.
+    let planned = match (pipeline::mem_limit_bytes(), dialect) {
+        (Some(m), ReadDialect::Pg | ReadDialect::My) => {
+            let (fits, claim) = claim_read_pipes(parallel, m);
+            if fits < parallel && std::env::var_os("APITAP_DEBUG").is_some() {
+                eprintln!("[read] {fits} pipe(s) of {parallel}: the reads open beside it planned {} MiB of the {} MiB limit", (READ_PLANNED.load(Ordering::Relaxed) - claim.0) >> 20, m >> 20);
+            }
+            parallel = fits;
+            Some(claim)
+        }
+        _ => None,
+    };
+
+    let started: Result<ReadHandle> = async {
+        match dialect {
+            ReadDialect::Pg => {
+                let src = PgSource::connect(src_url, parallel + 1).await?;
+                let rp = plan_read(&src, dialect, table, opts, parallel).await?;
                 Ok(launch_loaders(src, rp, chunk))
-            } else {
-                Ok(launch_my_arrow(src, rp))
+            }
+            ReadDialect::My => {
+                let src = MySqlSource::connect(src_url, parallel + 1).await?;
+                let rp = plan_read(&src, dialect, table, opts, parallel).await?;
+                // Direct-Arrow lane by default: cells decode straight into the
+                // column builders (one dispatch, one copy). APITAP_MY_ARROW=0
+                // keeps the COPY lane — the same A/B-and-escape-hatch pattern
+                // as the pg raw plane's APITAP_RAW_COPY.
+                if std::env::var("APITAP_MY_ARROW").is_ok_and(|v| v == "0") {
+                    Ok(launch_loaders(src, rp, chunk))
+                } else {
+                    Ok(launch_my_arrow(src, rp))
+                }
+            }
+            // One stream each: the API or the file serves a table front to back.
+            ReadDialect::Gh => {
+                let src = GithubSource::connect(src_url).await?;
+                let rp = plan_read(&src, dialect, table, opts, 1).await?;
+                Ok(launch_loaders(src, rp, chunk))
+            }
+            ReadDialect::GhApi => {
+                let src = GithubApiSource::connect(src_url).await?;
+                let rp = plan_read(&src, dialect, table, opts, 1).await?;
+                Ok(launch_loaders(src, rp, chunk))
+            }
+            ReadDialect::Gs => {
+                let src = GsheetsSource::connect(src_url).await?;
+                let rp = plan_read(&src, dialect, table, opts, 1).await?;
+                Ok(launch_loaders(src, rp, chunk))
             }
         }
-        // One stream each: the API or the file serves a table front to back.
-        ReadDialect::Gh => {
-            let src = GithubSource::connect(src_url).await?;
-            let rp = plan_read(&src, dialect, table, opts, 1).await?;
-            Ok(launch_loaders(src, rp, chunk))
-        }
-        ReadDialect::GhApi => {
-            let src = GithubApiSource::connect(src_url).await?;
-            let rp = plan_read(&src, dialect, table, opts, 1).await?;
-            Ok(launch_loaders(src, rp, chunk))
-        }
-        ReadDialect::Gs => {
-            let src = GsheetsSource::connect(src_url).await?;
-            let rp = plan_read(&src, dialect, table, opts, 1).await?;
-            Ok(launch_loaders(src, rp, chunk))
-        }
     }
+    .await;
+    started.map(|h| h.with_planned(planned))
+}
+
+/// What the reads open now planned for their pipes (`PipeCost::READ`'s per
+/// pipe price, the reserve aside): a read's pipes are priced beside them.
+static READ_PLANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A read's claim on [`READ_PLANNED`], given back when its handle drops.
+#[derive(Debug)]
+pub(crate) struct ReadPlanned(u64);
+
+impl Drop for ReadPlanned {
+    fn drop(&mut self) {
+        let n = self.0;
+        let _ = READ_PLANNED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(n)));
+    }
+}
+
+/// `want` pipes under limit `m`, beside the reads already open: as many as
+/// fit what they leave (one at least), claimed in the same step.
+fn claim_read_pipes(want: usize, m: u64) -> (usize, ReadPlanned) {
+    let per = pipeline::READ_PIPE;
+    let mut got = want.max(1);
+    let _ = READ_PLANNED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |planned| {
+        let room = m.saturating_sub(pipeline::READ_RESERVE + planned);
+        got = usize::try_from(room / per).unwrap_or(usize::MAX).clamp(1, want.max(1));
+        Some(planned + got as u64 * per)
+    });
+    (got, ReadPlanned(got as u64 * per))
 }
 
 /// `read(where=...)`: exactly one SQL expression in the source's dialect,
@@ -357,6 +449,10 @@ struct ReadPlan {
     used: usize,
     cap: usize,
     batch_bytes: usize,
+    /// The byte gate on the read's sealed batches ([`BatchTx`]): what its
+    /// pipes reserved for them. None outside a memory limit, or when the
+    /// batch size is pinned.
+    gate_bytes: Option<u64>,
     gates: Vec<std::sync::Arc<crate::wire::arrowcol::KeyGate>>,
 }
 
@@ -495,6 +591,9 @@ async fn plan_read<S: Source>(
             padded: padded_text(Some(kind), &pc.udt, pc.native_ddl.as_deref()),
             ci: ci_text(Some(kind), pc.native_ddl.as_deref()),
             ai: ai_text(Some(kind), pc.native_ddl.as_deref()),
+            locale: locale_text(Some(kind), pc.native_ddl.as_deref()),
+            nulls_low: matches!(dialect, ReadDialect::My),
+            origin: None,
         });
     }
 
@@ -510,6 +609,13 @@ async fn plan_read<S: Source>(
         Some(m) if m < 128 << 20 => 1,
         _ => 2,
     };
+    // The batches a read holds (one per pipe, sealed or filling; the
+    // channel's; the consumer's) come out of what its pipes reserved for
+    // them ([`crate::rcvbuf::PIPE_BATCHES`] each). The cage-wide share
+    // below ignores the pipe count: two pipes beside a large map sealed
+    // 10 MiB batches and held ~24 MiB a pipe against 16 reserved.
+    let pipes_share = (used as u64 * crate::rcvbuf::PIPE_BATCHES) as usize;
+    let mut gate_bytes = None;
     let batch_bytes = match opts.batch_bytes {
         Some(b) => {
             // Materialize fast path: one giant batch per worker.
@@ -531,8 +637,12 @@ async fn plan_read<S: Source>(
                 // 56 MiB reserve (was 40): the raw COPY plane carries ~8 MB of
                 // per-worker read buffers, and 250 MB peaks in a 256 MB cgroup
                 // were two pages from the OOM killer. Headroom is a feature.
-                Some(m) => ((m.saturating_sub(56 << 20) as usize) / (4 * (used + cap + 1)))
-                    .clamp(1 << 20, 32 << 20),
+                Some(m) => {
+                    gate_bytes = Some(pipes_share as u64);
+                    ((m.saturating_sub(56 << 20) as usize) / (4 * (used + cap + 1)))
+                        .min(pipes_share / (used + cap + 1))
+                        .clamp(1 << 20, 32 << 20)
+                }
                 None => 16 << 20,
             },
         },
@@ -547,6 +657,7 @@ async fn plan_read<S: Source>(
         used,
         cap,
         batch_bytes,
+        gate_bytes,
         gates: opts.gates.clone(),
     })
 }
@@ -563,9 +674,12 @@ fn launch_loaders<S: Source + 'static>(src: S, rp: ReadPlan, chunk: usize) -> Re
         used,
         cap,
         batch_bytes,
+        gate_bytes,
         gates,
     } = rp;
     let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);
+    let tx = BatchTx::new(tx, gate_bytes);
+    let gate = tx.gate();
     let completed = Arc::new(AtomicBool::new(false));
     let loaders: Vec<ArrowLoader> = (0..used)
         .map(|_| {
@@ -587,7 +701,7 @@ fn launch_loaders<S: Source + 'static>(src: S, rp: ReadPlan, chunk: usize) -> Re
         drop(tx);
     });
 
-    ReadHandle::new(schema, rx, supervisor, completed)
+    ReadHandle::new(schema, rx, supervisor, completed).with_gate(gate)
 }
 
 /// The MySQL direct-Arrow lane: workers append decoded cells straight into
@@ -601,9 +715,12 @@ fn launch_my_arrow(src: MySqlSource, rp: ReadPlan) -> ReadHandle {
         used,
         cap,
         batch_bytes,
+        gate_bytes,
         ..
     } = rp;
     let (tx, rx) = mpsc::channel::<Result<ArrowBatch>>(cap);
+    let tx = BatchTx::new(tx, gate_bytes);
+    let gate = tx.gate();
     let completed = Arc::new(AtomicBool::new(false));
 
     let done = completed.clone();
@@ -619,7 +736,7 @@ fn launch_my_arrow(src: MySqlSource, rp: ReadPlan) -> ReadHandle {
         drop(tx);
     });
 
-    ReadHandle::new(schema, rx, supervisor, completed)
+    ReadHandle::new(schema, rx, supervisor, completed).with_gate(gate)
 }
 
 /// One per worker: parses the worker's COPY stream into columnar builders
@@ -627,7 +744,7 @@ fn launch_my_arrow(src: MySqlSource, rp: ReadPlan) -> ReadHandle {
 /// (the same zero-steady-state-allocation contract every sink honors).
 struct ArrowLoader {
     b: BatchBuilder,
-    tx: mpsc::Sender<Result<ArrowBatch>>,
+    tx: BatchTx,
     spare: Option<Vec<u8>>,
 }
 
@@ -703,6 +820,24 @@ fn pg_send_decodable(udt: &str, precision: Option<i32>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Reads open at once share the limit: a second read's pipes are priced
+    /// beside the first's, and come back when it drops (W1b: SF50 Q9's
+    /// partsupp read took seven pipes beside three other reads, each planned
+    /// alone).
+    #[test]
+    fn reads_open_at_once_share_the_limit() {
+        let m = 256u64 << 20;
+        let (a, ca) = super::claim_read_pipes(7, m);
+        assert_eq!(a, 7, "alone, seven fit (16 MiB + 7 x 22)");
+        let (b, cb) = super::claim_read_pipes(7, m);
+        assert_eq!(b, ((m - (16 << 20) - 7 * (22 << 20)) / (22 << 20)) as usize, "beside it, what is left");
+        let (c, cc) = super::claim_read_pipes(7, m);
+        assert_eq!(c, 1, "one pipe at least");
+        drop((ca, cb, cc));
+        let (d, _cd) = super::claim_read_pipes(7, m);
+        assert_eq!(d, 7, "the claims went back");
+    }
+
     #[test]
     fn collations_set_padded_and_ci() {
         use crate::wire::arrowcol::ArrowKind;
@@ -718,6 +853,9 @@ mod tests {
         assert!(super::padded_text(u, "bpchar", Some("character(10)")), "Postgres CHAR");
         assert!(!super::padded_text(u, "varchar", Some("character varying(10)")) && !super::ci_text(u, Some("character varying(10)")));
         assert!(!super::ci_text(Some(ArrowKind::Int64), ddl("utf8mb4_0900_ai_ci").as_deref()));
+        assert!(super::ci_text(None, Some("citext")) && super::ci_text(u, Some("citext")), "Postgres citext folds case");
+        assert!(!super::ai_text(None, Some("citext")) && !super::padded_text(u, "citext", Some("citext")));
+        assert!(!super::ci_text(None, Some("text")));
     }
 
 

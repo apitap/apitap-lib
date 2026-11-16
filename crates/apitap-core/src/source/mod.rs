@@ -19,6 +19,14 @@ pub(crate) mod mysql;
 pub(crate) mod postgres;
 pub(crate) mod sqlresult;
 
+/// How long apitap.sql()'s key-range probe waits for connections to a server
+/// it has already reached: one that refuses new connections for now (`too
+/// many clients`, which sqlx retries for its 30 s without saying so) or a
+/// process too busy to open them. 30 s failed a statement among twelve at
+/// once (W1 round P, L4). The pool keeps its 30 s for the first connect, so
+/// a server that is down still fails then.
+pub(crate) const ACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub(crate) trait Source: Sized + Send + Sync {
     /// Probe the table: columns, native types, PK facts. Must work on empty tables.
     fn probe(&self, table: &str) -> impl Future<Output = Result<TablePlan>> + Send;

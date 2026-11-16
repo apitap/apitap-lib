@@ -393,8 +393,8 @@ const THIN_CHUNK: usize = 2 << 20;
 /// single pipe the 44 MB floor needs. The cap stays at 8 because past the knee
 /// memory buys nothing: at 256 MB, 12 pipes is no faster than 8 and 16 is SLOWER
 /// at 99% of the cage.
-const READ_RESERVE: u64 = 16 << 20;
-const READ_PIPE: u64 = 22 << 20;
+pub(crate) const READ_RESERVE: u64 = 16 << 20;
+pub(crate) const READ_PIPE: u64 = 22 << 20;
 pub(crate) const READ_PIPE_CAP: usize = 8;
 
 /// One price function for every lane: the reserve the whole process keeps, the

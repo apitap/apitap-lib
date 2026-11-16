@@ -43,6 +43,9 @@ static EST_ROWS: AtomicI64 = AtomicI64::new(UNSET_EST);
 const UNSET_EST: i64 = -2;
 static PIPES: AtomicU64 = AtomicU64::new(0);
 static WINDOW: AtomicU64 = AtomicU64::new(0);
+/// Keys the current CDC window has applied so far (its changes count only
+/// when it commits): a long window shows it is moving.
+static APPLYING: AtomicU64 = AtomicU64::new(0);
 /// Set once per run: cheap enough that the counters cost nothing when off.
 static ON: AtomicBool = AtomicBool::new(false);
 /// True while a reporter thread is alive; cleared to stop it.
@@ -176,6 +179,8 @@ pub(crate) fn add_rows(n: u64) {
     if ON.load(Relaxed) {
         ROWS.fetch_add(n, Relaxed);
         ROWS_EXACT.store(true, Relaxed);
+        // A CDC window's changes counted: its in-window key count is done.
+        APPLYING.store(0, Relaxed);
     }
 }
 
@@ -278,6 +283,17 @@ fn warn_or_note(msg: &str, always: bool) {
 /// CDC drains in windows; the window number says where a long catch-up is.
 pub(crate) fn next_window() {
     WINDOW.fetch_add(1, Relaxed);
+    APPLYING.store(0, Relaxed);
+}
+
+/// Keys a CDC window's apply has landed so far, before the window commits
+/// (W1 round P, L6: a slow window read `changes=0` for twenty minutes and
+/// looked hung).
+#[inline]
+pub(crate) fn add_applied(n: u64) {
+    if ON.load(Relaxed) {
+        APPLYING.fetch_add(n, Relaxed);
+    }
 }
 
 /// Name the table the readout is currently about. Deliberately does NOT touch
@@ -508,6 +524,10 @@ fn render(
             }
             if window > 0 {
                 s.push_str(&format!(" window={window}"));
+            }
+            let applying = APPLYING.load(Relaxed);
+            if applying > 0 && !done {
+                s.push_str(&format!(" window_keys_applied={applying}"));
             }
             if pipes > 0 {
                 s.push_str(&format!(" pipes={pipes}"));

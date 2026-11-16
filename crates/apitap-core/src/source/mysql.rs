@@ -12,7 +12,7 @@ use crate::pipe::{Pipe, PipeBody, Pipes, Rows, Spans};
 use crate::plan::{ColumnPlan, Delivered, Delta, Lane, LaneCol, TablePlan, WireFormat};
 use crate::sink::Loader;
 use crate::source::Source;
-use crate::wire::arrowcol::{ArrowBatch, ArrowKind, BatchBuilder, CellVal};
+use crate::wire::arrowcol::{ArrowKind, BatchBuilder, CellVal};
 use crate::wire::mytsv::tsv_escape;
 use crate::wire::mywire::{self, MyWire};
 use crate::wire::pgcopy as pgc;
@@ -870,18 +870,42 @@ impl MySqlSource {
         // mapping lives in `dialect::mysql::secure_url` now — one copy.
         let url = crate::dialect::mysql::secure_url(url);
         let url = url.as_str();
-        let pool = MySqlPoolOptions::new()
-            .max_connections(max_conns as u32)
-            .after_connect(|conn, _| {
-                Box::pin(async move {
-                    // TIMESTAMP columns then arrive as UTC wall time.
-                    sqlx::Executor::execute(conn, "SET time_zone = '+00:00'").await?;
-                    Ok(())
+        // An account at its MAX_USER_CONNECTIONS (1226) or a server at
+        // max_connections (1040) for now is waited for, within the bound the
+        // reads wait, then named (W1 round P, p5: a connection the statement
+        // just closed is not yet gone on the server).
+        let t0 = std::time::Instant::now();
+        let pool = loop {
+            let r = MySqlPoolOptions::new()
+                .max_connections(max_conns as u32)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        // TIMESTAMP columns then arrive as UTC wall time.
+                        sqlx::Executor::execute(conn, "SET time_zone = '+00:00'").await?;
+                        Ok(())
+                    })
                 })
-            })
-            .connect(url)
-            .await
-            .map_err(|e| {
+                .connect(url)
+                .await;
+            match r {
+                Err(sqlx::Error::Database(d)) if matches!(d.code().as_deref(), Some("42000") | Some("08004") | Some("HY000"))
+                    && (d.message().contains("max_user_connections") || d.message().contains("Too many connections")) =>
+                {
+                    if t0.elapsed() >= crate::source::ACQUIRE_WAIT {
+                        return Err(Error::Connect(format!(
+                            "mysql source: no connection within {} s: the account's MAX_USER_CONNECTIONS or the server's \
+                             max_connections stayed in use ({}); run fewer statements at once or raise the limit",
+                            t0.elapsed().as_secs(),
+                            d.message()
+                        )));
+                    }
+                    let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |x| x.subsec_nanos()) % 1000;
+                    tokio::time::sleep(std::time::Duration::from_millis(300 + u64::from(jitter))).await;
+                }
+                r => break r,
+            }
+        }
+        .map_err(|e| {
                 let base = crate::urlerr::connect_err("mysql source", url, e);
                 if crate::dialect::mysql::host_is_loopback(url) {
                     base
@@ -1628,7 +1652,7 @@ impl MySqlSource {
         stmts: Vec<String>,
         kinds: Vec<ArrowKind>,
         batch_bytes: usize,
-        tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+        tx: crate::read::BatchTx,
         workers: usize,
     ) -> Result<u64> {
         let encs: std::sync::Arc<Vec<MyAr>> = std::sync::Arc::new(
@@ -1653,6 +1677,8 @@ impl MySqlSource {
                 }
             }
         }
+        // The read's sockets planned once, before any opens (W1 review R8).
+        let sockets = crate::rcvbuf::Sockets::plan(workers);
         let bodies: Vec<ArrowBody> = (0..workers)
             .map(|_| {
                 let bb = BatchBuilder::new(kinds.clone(), batch_bytes);
@@ -1663,6 +1689,7 @@ impl MySqlSource {
                         encs: encs.clone(),
                         bb,
                         tx: tx.clone(),
+                        sockets: sockets.clone(),
                     }
                 } else {
                     ArrowBody::Row {
@@ -1687,14 +1714,17 @@ enum ArrowBody {
         pool: MySqlPool,
         encs: std::sync::Arc<Vec<MyAr>>,
         bb: BatchBuilder,
-        tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+        tx: crate::read::BatchTx,
     },
     Raw {
         url: std::sync::Arc<str>,
         snap: Option<String>,
         encs: std::sync::Arc<Vec<MyAr>>,
         bb: BatchBuilder,
-        tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+        tx: crate::read::BatchTx,
+        /// The read's sockets: each one's receive buffer is sized for its
+        /// share of the round trip and of the room ([`crate::rcvbuf`]).
+        sockets: crate::rcvbuf::Sockets,
     },
 }
 
@@ -1704,8 +1734,8 @@ impl crate::pipe::SpanBody for ArrowBody {
             ArrowBody::Row { pool, encs, bb, tx } => {
                 arrow_row_worker(pool, spans, encs, bb, tx).await
             }
-            ArrowBody::Raw { url, snap, encs, bb, tx } => {
-                raw_arrow_worker(url, snap, spans, encs, bb, tx).await
+            ArrowBody::Raw { url, snap, encs, bb, tx, sockets } => {
+                raw_arrow_worker(url, snap, spans, encs, bb, tx, sockets).await
             }
         }
     }
@@ -1793,7 +1823,8 @@ async fn raw_arrow_worker(
     spans: Spans,
     encs: std::sync::Arc<Vec<MyAr>>,
     mut bb: BatchBuilder,
-    tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+    tx: crate::read::BatchTx,
+    sockets: crate::rcvbuf::Sockets,
 ) -> Result<u64> {
     let dbg = row_timers();
     let (mut t_dec, mut t_send) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
@@ -1801,6 +1832,14 @@ async fn raw_arrow_worker(
     let mut w = match &snap {
         Some(t) => take_snapshot_conn(t)?,
         None => MyWire::connect(&url).await?,
+    };
+    // An explicit receive buffer by the law (autotuning grew each socket to
+    // tcp_rmem's 6 MiB behind a 0.5-core reader), held in the account while
+    // the worker lives.
+    let _rcv = if w.raw_fd() >= 0 {
+        crate::rcvbuf::apply(w.raw_fd(), sockets, crate::rcvbuf::Plane::My, &crate::rcvbuf::endpoint_of(&url))
+    } else {
+        crate::rcvbuf::unsized_pipe(crate::rcvbuf::Plane::My)
     };
     while let Some(sql) = spans.next()? {
         let (sid, ncols) = w.prepare(&sql).await?;
@@ -1861,7 +1900,7 @@ async fn arrow_row_worker(
     spans: Spans,
     encs: std::sync::Arc<Vec<MyAr>>,
     mut bb: BatchBuilder,
-    tx: tokio::sync::mpsc::Sender<Result<ArrowBatch>>,
+    tx: crate::read::BatchTx,
 ) -> Result<u64> {
     use futures::TryStreamExt;
     let dbg = row_timers();
@@ -1871,6 +1910,8 @@ async fn arrow_row_worker(
         std::time::Duration::ZERO,
     );
     let cancelled = || Error::Transfer("read cancelled by consumer".into());
+    // A sqlx connection: the pipe is in the account at its unsized price.
+    let _rcv = crate::rcvbuf::unsized_pipe(crate::rcvbuf::Plane::My);
     let mut since_seal = 0u32;
     while let Some(sql) = spans.next()? {
         let mut rows = sqlx::query(&sql).fetch(&pool);

@@ -79,6 +79,9 @@ pub(crate) struct Walsender {
     /// The lsn the last standby status reported; a keepalive request
     /// repeats it so a ping never confirms anything new.
     reported: u64,
+    /// The socket's descriptor (-1 off Unix): a read-lane connection sizes
+    /// its receive buffer after the startup exchange ([`crate::rcvbuf`]).
+    fd: i32,
 }
 
 /// The CopyBoth read half, scanned synchronously over one owned window
@@ -310,14 +313,11 @@ fn connect_timeout_secs() -> u64 {
 }
 
 fn recv_buffer_bytes() -> usize {
-    match std::env::var("APITAP_RECV_BUF_BYTES") {
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
-        Ok(v) => v
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .unwrap_or(RECV_BUF_BYTES),
-        Err(_) => RECV_BUF_BYTES,
+    // One parser for every plane (`crate::rcvbuf::env_buf`).
+    match crate::rcvbuf::env_buf() {
+        crate::rcvbuf::EnvBuf::Autotune => 0,
+        crate::rcvbuf::EnvBuf::Bytes(n) => n,
+        crate::rcvbuf::EnvBuf::Unset => RECV_BUF_BYTES,
     }
 }
 
@@ -957,6 +957,25 @@ impl Walsender {
         Self::connect_with(url, None, false).await
     }
 
+    /// [`Self::connect_sql`] for a read lane (`read()`, `sql()`): the socket
+    /// is not given the transfer planes' fixed 4 MiB receive buffer; the
+    /// caller sizes it by [`crate::rcvbuf::apply`] once the round trip is
+    /// known.
+    pub(crate) async fn connect_read(url: &str) -> Result<Self> {
+        let secs = connect_timeout_secs();
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), Self::connect_inner_buf(url, None, false, false)).await {
+            Ok(r) => r,
+            Err(_) => Err(Error::Transfer(format!(
+                "walsender connect: no startup answer in {secs} s (APITAP_PG_CONNECT_TIMEOUT_SECS)"
+            ))),
+        }
+    }
+
+    /// The socket's descriptor (-1 where there is none to give).
+    pub(crate) fn raw_fd(&self) -> i32 {
+        self.fd
+    }
+
     /// Connect, TLS and startup (auth included) under one deadline. None of
     /// them had one: a server that accepted the socket and then stalled (a
     /// pooler queue, an auth hook) parked the run forever — keepalive only
@@ -978,6 +997,10 @@ impl Walsender {
     }
 
     async fn connect_inner(url: &str, options: Option<&str>, replication: bool) -> Result<Self> {
+        Self::connect_inner_buf(url, options, replication, true).await
+    }
+
+    async fn connect_inner_buf(url: &str, options: Option<&str>, replication: bool, fixed_rcvbuf: bool) -> Result<Self> {
         let ci = parse_url(url)?;
         let stream = TcpStream::connect((ci.host.as_str(), ci.port))
             .await
@@ -987,7 +1010,7 @@ impl Walsender {
         stream.set_nodelay(true).ok();
         // Bursts land in fewer, larger reads with a bigger receive buffer
         // (inventory #6, design §14.26). `0` leaves the kernel default.
-        let rcvbuf = recv_buffer_bytes();
+        let rcvbuf = if fixed_rcvbuf { recv_buffer_bytes() } else { 0 };
         if rcvbuf > 0 {
             use socket2::SockRef;
             SockRef::from(&stream).set_recv_buffer_size(rcvbuf).ok();
@@ -1004,6 +1027,13 @@ impl Walsender {
                 .with_interval(std::time::Duration::from_secs(10));
             SockRef::from(&stream).set_tcp_keepalive(&ka).ok();
         }
+        #[cfg(unix)]
+        let fd = {
+            use std::os::fd::AsRawFd as _;
+            stream.as_raw_fd()
+        };
+        #[cfg(not(unix))]
+        let fd = -1;
         // TLS is negotiated BEFORE the startup message, so it happens here or
         // not at all.
         let (r, w) = match ci.ssl {
@@ -1078,6 +1108,7 @@ impl Walsender {
             scan: None,
             stream_binary: false,
             reported: 0,
+            fd,
         };
         ws.startup(&ci, options, replication).await?;
         Ok(ws)
@@ -2223,6 +2254,7 @@ mod tests {
     /// bump off (untried-levers inventory #6).
     #[test]
     fn recv_buffer_bytes_defaults_disables_and_rejects_junk() {
+        let _g = crate::dialect::postgres::env_guard();
         std::env::remove_var("APITAP_RECV_BUF_BYTES");
         assert_eq!(super::recv_buffer_bytes(), super::RECV_BUF_BYTES);
         std::env::set_var("APITAP_RECV_BUF_BYTES", "0");

@@ -37,6 +37,10 @@ use sqlx::{PgPool, Row};
 // Source
 // ---------------------------------------------------------------------------------
 
+/// The words a connect that found no free connection fails with (the
+/// key-range probe waits on them: `sql::key_range_of`).
+pub(crate) const NO_CONNECTION: &str = "no connection within 30 s";
+
 async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
     // TLS by default off-loopback (review P0-3); explicit modes honoured.
     let user_url = url;
@@ -58,7 +62,60 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
         })
         .connect(&url)
         .await
-        .map_err(|e| crate::dialect::postgres::connect_error("postgres source", user_url, e))
+        .map_err(|e| match e {
+            // sqlx retries "too many clients" until its acquire wait ends and
+            // then says only "pool timed out" (W1 round P, L4): name it.
+            sqlx::Error::PoolTimedOut => crate::error::Error::Connect(format!(
+                "postgres source: {NO_CONNECTION}: the server kept refusing new connections (its \
+                 max_connections, or the role's CONNECTION LIMIT, in use) or did not answer; run fewer statements \
+                 at once or raise the server's limit"
+            )),
+            e => crate::dialect::postgres::connect_error("postgres source", user_url, e),
+        })
+}
+
+/// A planning query's connection, put back in the pool before the next
+/// planning query asks for one (W1 round P, p8). sqlx returns a dropped
+/// connection from a spawned task: a query right after the last one found the
+/// pool with no idle connection yet and dialled a second, which a role with
+/// one connection free refused until sqlx's 30 s acquire wait ended
+/// ("probing primary key of …: pool timed out", e2e_sql_pool_low).
+async fn planning_conn(pool: &PgPool) -> std::result::Result<Settled, sqlx::Error> {
+    Ok(Settled(Some(pool.acquire().await?)))
+}
+
+/// [`planning_conn`]'s connection; [`Settled::done`] puts it back and waits.
+struct Settled(Option<sqlx::pool::PoolConnection<sqlx::Postgres>>);
+
+impl Settled {
+    fn c(&mut self) -> &mut sqlx::PgConnection {
+        self.0.as_mut().expect("a settled connection used after done")
+    }
+
+    async fn done(mut self) {
+        if let Some(mut c) = self.0.take() {
+            c.return_to_pool().await;
+        }
+    }
+}
+
+/// `fetch_one` on a [`planning_conn`], the connection back in the pool
+/// before the answer returns.
+trait FetchOneSettled<O> {
+    async fn fetch_one_settled(self, pool: &PgPool) -> std::result::Result<O, sqlx::Error>;
+}
+
+impl<'q, O, A> FetchOneSettled<O> for sqlx::query::QueryAs<'q, sqlx::Postgres, O, A>
+where
+    O: Send + Unpin + for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow>,
+    A: 'q + Send + sqlx::IntoArguments<'q, sqlx::Postgres>,
+{
+    async fn fetch_one_settled(self, pool: &PgPool) -> std::result::Result<O, sqlx::Error> {
+        let mut c = planning_conn(pool).await?;
+        let r = self.fetch_one(c.c()).await;
+        c.done().await;
+        r
+    }
 }
 
 pub(crate) struct PgSource {
@@ -193,6 +250,15 @@ impl Source for PgSource {
         // so a Postgres sink can mirror the schema byte-faithfully; NUMERIC
         // precision/scale unpack from atttypmod.
         let t = quote_ident_path(table);
+        // Both catalog queries on ONE connection (W1 round P, p8): on a pool
+        // of 2+, the second query's acquire ran before sqlx's spawned task had
+        // put the first connection back, so the pool dialled a second one; on
+        // a role with one connection free the server refused it and sqlx
+        // retried until its 30 s acquire wait ended ("probing primary key of
+        // …: pool timed out", e2e_sql_pool_low).
+        let mut conn = planning_conn(&self.pool)
+            .await
+            .map_err(|e| Error::InvalidInput(format!("probing {table}: {e}")))?;
         let rows = sqlx::query(
             "SELECT a.attname AS name, t.typname AS udt, \
                     format_type(a.atttypid, a.atttypmod) AS native, \
@@ -207,7 +273,7 @@ impl Source for PgSource {
              ORDER BY a.attnum",
         )
         .bind(&t)
-        .fetch_all(&self.pool)
+        .fetch_all(conn.c())
         .await
         .map_err(|e| Error::InvalidInput(format!("probing {table}: {e}")))?;
         if rows.is_empty() {
@@ -226,9 +292,10 @@ impl Source for PgSource {
              ORDER BY array_position(i.indkey, a.attnum)",
         )
         .bind(&t)
-        .fetch_all(&self.pool)
+        .fetch_all(conn.c())
         .await
         .map_err(|e| Error::InvalidInput(format!("probing primary key of {table}: {e}")))?;
+        conn.done().await;
         let pk_cols: Vec<String> = pk.iter().map(|r| r.get::<String, _>("name")).collect();
         let int_pk_name: Option<String> = if pk.len() == 1 {
             let name: String = pk[0].get("name");
@@ -407,7 +474,7 @@ impl Source for PgSource {
                     "SELECT min({qcol})::int8, max({qcol})::int8 FROM {src_t} \
                      WHERE true{dprobe}"
                 ))
-                .fetch_one(&self.pool)
+                .fetch_one_settled(&self.pool)
                 .await
                 .map_err(|e| {
                     Error::InvalidInput(format!(
@@ -447,7 +514,7 @@ impl Source for PgSource {
                             (pg_relation_size($1::regclass) / current_setting('block_size')::int8)::int8",
                 )
                 .bind(&src_t)
-                .fetch_one(&self.pool)
+                .fetch_one_settled(&self.pool)
                 .await
                 .map_err(|e| Error::InvalidInput(format!("sizing {table}: {e}")))?;
                 if ver >= 140_000 && npages > 0 {
@@ -535,6 +602,14 @@ impl Source for PgSource {
             }
             None => (None, None),
         };
+        // The read's sockets planned once, before any opens (their room in
+        // the receive buffers' share: W1 review R8).
+        // Only the read lane sizes its sockets; a transfer holds nothing.
+        let sockets = if matches!(mode, PgReadMode::FrameRaw) {
+            crate::rcvbuf::Sockets::plan(pipes.len())
+        } else {
+            crate::rcvbuf::Sockets::unplanned(pipes.len())
+        };
         let rows = pipes
             .run(stmts, move |_| PgBody {
                 pool: self.pool.clone(),
@@ -542,6 +617,7 @@ impl Source for PgSource {
                 mode: mode.clone(),
                 chunk,
                 snapshot: snapshot.clone(),
+                sockets: sockets.clone(),
             })
             .await;
         if let Some(conn) = holder {
@@ -563,7 +639,12 @@ pub(crate) struct HeldSnapshot {
 impl HeldSnapshot {
     pub(crate) async fn open(url: &str) -> Result<Self> {
         let src = PgSource::connect(url, 1).await?;
-        let (id, conn) = export_snapshot(&src.pool).await?;
+        // The pool's own connection goes before the holder's opens: one
+        // connection for the holder, never two at once (W1 round P, p5: on a
+        // role with one connection free the pin waited on itself).
+        let opts = src.pool.connect_options();
+        src.pool.close().await;
+        let (id, conn) = export_snapshot_with(&opts).await?;
         Ok(Self { id, conn })
     }
 
@@ -595,19 +676,48 @@ impl PgSource {
     }
 }
 
+/// "too many connections" / "too many clients" (SQLSTATE 53300): the server
+/// is full for now, not refusing the role.
+fn too_many_connections(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("53300"))
+}
+
 /// A snapshot every span of one read can pin itself to, and the connection
 /// that keeps it alive: an exported snapshot lives only as long as the
 /// transaction that exported it.
 async fn export_snapshot(pool: &PgPool) -> Result<(std::sync::Arc<str>, sqlx::PgConnection)> {
+    export_snapshot_with(&pool.connect_options()).await
+}
+
+async fn export_snapshot_with(opts: &sqlx::postgres::PgConnectOptions) -> Result<(std::sync::Arc<str>, sqlx::PgConnection)> {
     use sqlx::{Connection as _, Executor as _};
     let err = |e: sqlx::Error| {
         Error::Transfer(format!(
             "export a read snapshot for the parallel spans: {e}"
         ))
     };
-    let mut conn = sqlx::PgConnection::connect_with(&pool.connect_options())
-        .await
-        .map_err(err)?;
+    // A server (or role) full for now is waited for, within the bound the
+    // read's own connections wait (W1 round P, L4: "too many connections"
+    // failed the statement at once).
+    let t0 = std::time::Instant::now();
+    let mut conn = loop {
+        match sqlx::PgConnection::connect_with(opts).await {
+            Ok(c) => break c,
+            Err(e) if too_many_connections(&e) && t0.elapsed() < crate::source::ACQUIRE_WAIT => {
+                let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) % 1000;
+                tokio::time::sleep(std::time::Duration::from_millis(500 + u64::from(jitter))).await;
+            }
+            Err(e) if too_many_connections(&e) => {
+                return Err(Error::Transfer(format!(
+                    "export a read snapshot for the parallel spans: {NO_CONNECTION} (waited {} s): the server kept refusing \
+                     new connections (its max_connections, or the role's CONNECTION LIMIT, in use); run fewer statements \
+                     at once or raise the server's limit",
+                    t0.elapsed().as_secs()
+                )))
+            }
+            Err(e) => return Err(err(e)),
+        }
+    };
     // The holder sends nothing until the last span is done, so on the server
     // it sits idle in transaction for the whole read. A role or database
     // idle_in_transaction_session_timeout (common on managed servers) killed
@@ -643,6 +753,9 @@ struct PgBody {
     mode: PgReadMode,
     chunk: usize,
     snapshot: Option<std::sync::Arc<str>>,
+    /// The read's sockets: a read-lane socket's receive buffer is sized for
+    /// its share of the round trip and of the room ([`crate::rcvbuf`]).
+    sockets: crate::rcvbuf::Sockets,
 }
 
 impl<L: Loader> PipeBody<L> for PgBody {
@@ -655,6 +768,7 @@ impl<L: Loader> PipeBody<L> for PgBody {
             pipe,
             self.chunk,
             self.snapshot,
+            self.sockets,
         )
         .await
     }
@@ -767,6 +881,38 @@ impl SpanState {
 /// ~`chunk` bytes — sqlx yields one piece per COPY message (≈ one row), and per-row
 /// sends are pure protocol overhead.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+// The read lane's receive-buffer plan (`sockets`) rides beside the six the
+// worker took before it; bundling them would only rename them.
+#[allow(clippy::too_many_arguments)]
+/// A connection of the read's pool for a worker that holds a span: on a
+/// server (or role) with no connection free it waits, up to
+/// `source::ACQUIRE_WAIT`, then fails by name (W1 round P, L4: the pinned
+/// read failed with sqlx's "pool timed out" after 30 s). It cannot hold a
+/// statement up for good: a worker of the same read that has a connection
+/// finishes its span and its connection returns to this pool for the next,
+/// and a read with none waits for other statements to end theirs.
+async fn acquire_waiting(pool: &PgPool, what: &str) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    let t0 = std::time::Instant::now();
+    loop {
+        match pool.acquire().await {
+            Ok(c) => return Ok(c),
+            Err(sqlx::Error::PoolTimedOut) if t0.elapsed() < crate::source::ACQUIRE_WAIT => {
+                let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) % 1000;
+                tokio::time::sleep(std::time::Duration::from_millis(200 + u64::from(jitter))).await;
+            }
+            Err(sqlx::Error::PoolTimedOut) => {
+                return Err(Error::Transfer(format!(
+                    "{what}: {NO_CONNECTION} (waited {} s): the server kept refusing new connections (its \
+                     max_connections, or the role's CONNECTION LIMIT, in use); run fewer statements at once or raise \
+                     the server's limit",
+                    t0.elapsed().as_secs()
+                )))
+            }
+            Err(e) => return Err(Error::Transfer(format!("{what}: {e}"))),
+        }
+    }
+}
+
 async fn copy_out_worker<L: Loader>(
     pool: PgPool,
     url: std::sync::Arc<str>,
@@ -775,6 +921,7 @@ async fn copy_out_worker<L: Loader>(
     pipe: &mut Pipe<L>,
     chunk: usize,
     snapshot: Option<std::sync::Arc<str>>,
+    sockets: crate::rcvbuf::Sockets,
 ) -> Result<Rows> {
     let mut out: Vec<u8> = Vec::with_capacity(chunk + 64 * 1024);
     if matches!(mode, PgReadMode::FrameStrip) {
@@ -803,13 +950,31 @@ async fn copy_out_worker<L: Loader>(
         Some("1") => !matches!(mode, PgReadMode::Text),
         _ => matches!(mode, PgReadMode::FrameRaw | PgReadMode::Transcode(_)),
     };
+    // The read lane (FrameRaw: read(), sql()) sizes its receive buffer by
+    // the law once the connection's round trip is known, and holds it in
+    // the memory account while the worker lives; the transfer planes keep
+    // the fixed 4 MiB `connect_sql` asks for.
+    let read_lane = matches!(mode, PgReadMode::FrameRaw);
+    let mut _rcv = crate::rcvbuf::Reservation::default();
     let mut raw = if raw_wanted {
-        crate::wire::walsender::Walsender::connect_sql(&url)
-            .await
-            .ok()
+        let c = if read_lane {
+            crate::wire::walsender::Walsender::connect_read(&url).await
+        } else {
+            crate::wire::walsender::Walsender::connect_sql(&url).await
+        };
+        c.ok().inspect(|ws| {
+            if read_lane && ws.raw_fd() >= 0 {
+                _rcv = crate::rcvbuf::apply(ws.raw_fd(), sockets.clone(), crate::rcvbuf::Plane::Pg, &crate::rcvbuf::endpoint_of(&url));
+            }
+        })
     } else {
         None
     };
+    // The read lane on sqlx (no raw plane, or its connect failed): the pipe
+    // is in the account all the same, at its unsized price.
+    if read_lane && raw.as_ref().is_none_or(|ws| ws.raw_fd() < 0) {
+        _rcv = crate::rcvbuf::unsized_pipe(crate::rcvbuf::Plane::Pg);
+    }
     let mut piece: Vec<u8> = Vec::new();
     while let Some(sql) = spans.next()? {
         if let Some(ws) = raw.as_mut() {
@@ -956,10 +1121,7 @@ async fn copy_out_worker<L: Loader>(
         let mut pinned_conn = match &snapshot {
             None => None,
             Some(snap) => {
-                let mut conn = match pool.acquire().await {
-                    Ok(c) => c,
-                    Err(e) => return Err(Error::Transfer(format!("pin acquire: {e}"))),
-                };
+                let mut conn = acquire_waiting(&pool, "pin acquire").await?;
                 let pin = async {
                     use sqlx::Executor as _;
                     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -981,9 +1143,13 @@ async fn copy_out_worker<L: Loader>(
                 Some(conn)
             }
         };
-        let mut stream = match match &mut pinned_conn {
-            Some(conn) => conn.copy_out_raw(&sql).await,
-            None => pool.copy_out_raw(&sql).await,
+        let mut plain_conn = match &pinned_conn {
+            Some(_) => None,
+            None => Some(acquire_waiting(&pool, "read").await?),
+        };
+        let mut stream = match match (&mut pinned_conn, &mut plain_conn) {
+            (Some(conn), _) | (None, Some(conn)) => conn.copy_out_raw(&sql).await,
+            (None, None) => unreachable!("one connection is held"),
         } {
             Ok(s) => s,
             Err(e) => return Err(Error::Transfer(format!("COPY OUT: {e}"))),

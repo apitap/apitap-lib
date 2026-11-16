@@ -87,6 +87,9 @@ pub(crate) struct MyWire {
     buf: Vec<u8>,
     /// Negotiated: server honors DEPRECATE_EOF (OK-terminated resultsets).
     deprecate_eof: bool,
+    /// The socket's descriptor (-1 off Unix, or no socket): a read-lane
+    /// worker sizes its receive buffer by [`crate::rcvbuf::apply`].
+    fd: i32,
 }
 
 pub(crate) struct MyConnInfo {
@@ -532,6 +535,11 @@ fn set_keepalive(tcp: &TcpStream) {
 }
 
 impl MyWire {
+    /// The socket's descriptor (-1 where there is none to give).
+    pub(crate) fn raw_fd(&self) -> i32 {
+        self.fd
+    }
+
     pub(crate) async fn connect(url: &str) -> Result<Self> {
         let info = parse_my_url(url)?;
         tokio::time::timeout(
@@ -548,6 +556,13 @@ impl MyWire {
             .map_err(io_err)?;
         tcp.set_nodelay(true).map_err(io_err)?;
         set_keepalive(&tcp);
+        #[cfg(unix)]
+        let fd = {
+            use std::os::fd::AsRawFd as _;
+            tcp.as_raw_fd()
+        };
+        #[cfg(not(unix))]
+        let fd = -1;
 
         let mut seq = 0u8;
         let hs = parse_handshake(&read_packet_raw(&mut tcp, &mut seq).await?)?;
@@ -620,6 +635,7 @@ impl MyWire {
             seq,
             buf: Vec::with_capacity(64 << 10),
             deprecate_eof: use_caps & CLIENT_DEPRECATE_EOF != 0,
+            fd,
         };
         me.authenticate(info, &hs, use_caps, use_tls).await?;
         // TIMESTAMP columns then arrive as UTC wall time — the same session
@@ -1089,6 +1105,7 @@ mod tests {
             seq: 0,
             buf: Vec::new(),
             deprecate_eof: true,
+            fd: -1,
         }
     }
 

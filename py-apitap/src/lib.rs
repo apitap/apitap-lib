@@ -201,6 +201,7 @@ fn transfer(
     changelog: bool,
     slots: Option<pyo3::Bound<'_, pyo3::PyAny>>,
 ) -> PyResult<(u64, u64, usize)> {
+    apitap_core::check_env().map_err(to_py)?;
     let mode: apitap_core::Mode = mode
         .parse()
         .map_err(|e: apitap_core::Error| PyValueError::new_err(e.to_string()))?;
@@ -266,6 +267,7 @@ fn transfer_many(
     changelog: bool,
     slots: Option<pyo3::Bound<'_, pyo3::PyAny>>,
 ) -> PyResult<(u64, usize, Vec<(String, u64, u64, usize, Option<String>)>)> {
+    apitap_core::check_env().map_err(to_py)?;
     let mode: apitap_core::Mode = mode
         .parse()
         .map_err(|e: apitap_core::Error| PyValueError::new_err(e.to_string()))?;
@@ -506,6 +508,7 @@ fn read(
     push_where: Option<String>,
     where_sql: Option<String>,
 ) -> PyResult<PgRead> {
+    apitap_core::check_env().map_err(to_py)?;
     let table = table.unwrap_or_default();
     let opts = apitap_core::ReadOptions {
         parallel,
@@ -543,6 +546,7 @@ fn sql(
     query: String,
     sources: std::collections::HashMap<String, String>,
 ) -> PyResult<PgRead> {
+    apitap_core::check_env().map_err(to_py)?;
     let handle = py
         .detach(|| {
             // A chunk at a time when the answer is a stage table (past the
@@ -570,6 +574,7 @@ fn sql_into(
     dst: String,
     table: String,
 ) -> PyResult<(u64, u64, usize)> {
+    apitap_core::check_env().map_err(to_py)?;
     let opts = apitap_core::TransferOptions {
         mode: apitap_core::Mode::Replace,
         ..Default::default()
@@ -591,6 +596,7 @@ fn sql_live(
     dst: String,
     table: String,
 ) -> PyResult<(u64, u64, usize)> {
+    apitap_core::check_env().map_err(to_py)?;
     let opts = apitap_core::TransferOptions {
         mode: apitap_core::Mode::Replace,
         ..Default::default()

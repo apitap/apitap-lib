@@ -33,6 +33,11 @@ fn held_add(n: u64) -> u64 {
     STAGE_HELD.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n
 }
 
+/// [`STAGE_HELD`] now (the ledger's `Stage` class).
+pub(super) fn stage_held() -> u64 {
+    STAGE_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn held_sub(n: u64) {
     let _ = STAGE_HELD.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |v| Some(v.saturating_sub(n)));
 }
@@ -143,16 +148,12 @@ impl MemTable {
                 let mut file = std::fs::File::open(path).map_err(io)?;
                 let all: Vec<usize> = (0..self.schema.len()).collect();
                 let mut buf = Vec::new();
-                let mut read = 0u64;
                 for &(off, len) in at {
                     buf.resize(len as usize, 0);
                     file.seek(std::io::SeekFrom::Start(off)).and_then(|_| file.read_exact(&mut buf)).map_err(io)?;
+                    // The chunk read leaves the page cache before its rows fold.
+                    drop_cache(&file, off + len);
                     f(decode(&buf, &all)?)?;
-                    read += len;
-                    if read >= WRITE_OUT {
-                        drop_cache(&file, off + len);
-                        read = 0;
-                    }
                 }
                 if let Some(&(off, len)) = at.last() {
                     drop_cache(&file, off + len);
@@ -196,12 +197,103 @@ struct Spill {
     at: Vec<(u64, u64)>,
     off: u64,
     buf: Vec<u8>,
-    /// Bytes written since the last [`write_out`].
+    /// Bytes written since the last write-out step.
     since: u64,
+    /// The range whose writeback was started and not yet waited for.
+    pending: Option<(u64, u64)>,
+    /// Where the next write-out step's range starts.
+    out: u64,
+    /// This writer counted in [`DISK_WRITERS`] while it lives.
+    _count: DiskWriter,
 }
 
-/// Bytes a stage file takes before its pages are written out and dropped.
+/// Bytes a stage file takes before its pages are written out and dropped,
+/// at most (without a memory limit, the share of every writer).
 const WRITE_OUT: u64 = 16 << 20;
+
+/// The least a writer's share of the write-out budget falls to.
+const WRITE_FLOOR: u64 = 1 << 20;
+
+/// Spill writers with a file open now: they share [`write_budget`].
+static DISK_WRITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One writer in [`DISK_WRITERS`], released when its spill is dropped.
+struct DiskWriter;
+
+impl DiskWriter {
+    fn new() -> DiskWriter {
+        DISK_WRITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DiskWriter
+    }
+}
+
+impl Drop for DiskWriter {
+    fn drop(&mut self) {
+        DISK_WRITERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The bytes every spill writer together may hold written but not yet
+/// out of the page cache: a sixteenth of the memory limit (16 MiB at
+/// 256 MiB). Each writer took 16 MiB on its own: TPC-H Q13's grace spill
+/// (a writer per later key range) held 61-64 MiB of page cache at its peak
+/// and the cgroup sat at 257-261 MiB of 256 (W1 phase A).
+fn write_budget() -> Option<u64> {
+    crate::pipeline::mem_limit_bytes().map(|m| m / 16)
+}
+
+/// One writer's share: the budget over the writers on disk, between
+/// [`WRITE_FLOOR`] and [`WRITE_OUT`]; also the most a chunk it writes holds
+/// (the encode buffer is a chunk).
+fn write_share() -> u64 {
+    share_of(write_budget(), DISK_WRITERS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The spill writers' encode buffers now (a chunk each, a share at most),
+/// for the memory account.
+pub(super) fn spill_reserved() -> u64 {
+    let n = DISK_WRITERS.load(std::sync::atomic::Ordering::Relaxed);
+    n * (write_share() + (8 << 10))
+}
+
+fn share_of(budget: Option<u64>, writers: u64) -> u64 {
+    match budget {
+        None => WRITE_OUT,
+        Some(b) => (b / writers.max(1)).clamp(WRITE_FLOOR, WRITE_OUT),
+    }
+}
+
+/// Bytes `[off, off + len)` of a file to disk: started (`wait` false) or
+/// waited for and then dropped from the page cache (`wait` true). Linux
+/// only; a file system without the call leaves the pages to the kernel.
+fn range_out(f: &std::fs::File, off: u64, len: u64, wait: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let flags = if wait {
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER
+        } else {
+            libc::SYNC_FILE_RANGE_WRITE
+        };
+        // SAFETY: a valid open descriptor; the calls only do I/O and advise.
+        let r = unsafe { libc::sync_file_range(f.as_raw_fd(), off as libc::off64_t, len as libc::off64_t, flags) };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            if !matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::ESPIPE | libc::EOPNOTSUPP)) {
+                return Err(e);
+            }
+        }
+        if wait {
+            // SAFETY: as above; advice only.
+            unsafe {
+                libc::posix_fadvise(f.as_raw_fd(), off as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (f, off, len, wait);
+    Ok(())
+}
 
 /// A file's written pages to disk now, and out of the page cache: the cache
 /// counts against the cgroup (TPC-H Q13 on the 10g seed spilled 69M orders:
@@ -319,7 +411,17 @@ impl Writer {
                 .create_new(true)
                 .open(&path)
                 .map_err(|e| Error::Transfer(format!("sql: stage file {}: {e}", path.display())))?;
-            self.disk = Some(Spill { path, file: std::io::BufWriter::new(file), at: Vec::new(), off: 0, buf: Vec::new(), since: 0 });
+            self.disk = Some(Spill {
+                path,
+                file: std::io::BufWriter::new(file),
+                at: Vec::new(),
+                off: 0,
+                buf: Vec::new(),
+                since: 0,
+                pending: None,
+                out: 0,
+                _count: DiskWriter::new(),
+            });
             held_sub(std::mem::take(&mut self.mem_bytes));
             for b in std::mem::take(&mut self.mem) {
                 self.write(&b)?;
@@ -336,7 +438,9 @@ impl Writer {
         // At most CHUNK rows and about CHUNK_BYTES a chunk: a reader decodes
         // one chunk at a time, and 64K rows of 5 KB text were 320 MB.
         let per_row = (b.bytes() / b.rows.max(1)).max(1);
-        let rows_cap = (CHUNK_BYTES / per_row).clamp(1, CHUNK);
+        // The chunk (and the encode buffer) within this writer's share.
+        let share = write_share();
+        let rows_cap = (CHUNK_BYTES.min(share as usize) / per_row).clamp(1, CHUNK);
         let mut r = 0;
         while r < b.rows {
             let n = rows_cap.min(b.rows - r);
@@ -351,9 +455,16 @@ impl Writer {
             s.at.push((s.off, s.buf.len() as u64));
             s.off += s.buf.len() as u64;
             s.since += s.buf.len() as u64;
-            if s.since >= WRITE_OUT {
+            if s.since >= share {
+                // This range's writeback starts; the one before it is waited
+                // for and leaves the page cache: at most two shares a writer.
                 s.file.flush().map_err(io)?;
-                write_out(s.file.get_ref()).map_err(io)?;
+                let new = (s.out, s.off - s.out);
+                range_out(s.file.get_ref(), new.0, new.1, false).map_err(io)?;
+                if let Some((o, l)) = s.pending.replace(new) {
+                    range_out(s.file.get_ref(), o, l, true).map_err(io)?;
+                }
+                s.out = s.off;
                 s.since = 0;
             }
             r += n;
@@ -604,9 +715,8 @@ pub(crate) fn start(url: &str, table: &str, opts: &ReadOptions) -> Result<ReadHa
                         return;
                     }
                 };
-                // The page cache dropped behind the read every 16 MiB, as
+                // The page cache dropped behind the read, chunk by chunk, as
                 // `for_each` does: a large answer streamed out is read once.
-                let mut read = 0u64;
                 for &(off, len) in at {
                     let mut buf = vec![0u8; len as usize];
                     let r = f
@@ -614,11 +724,7 @@ pub(crate) fn start(url: &str, table: &str, opts: &ReadOptions) -> Result<ReadHa
                         .and_then(|_| f.read_exact(&mut buf))
                         .map_err(|e| Error::Transfer(format!("sql: stage file {}: {e}", path.display())))
                         .and_then(|_| decode(&buf, &idx));
-                    read += len;
-                    if read >= WRITE_OUT {
-                        drop_cache(&f, off + len);
-                        read = 0;
-                    }
+                    drop_cache(&f, off + len);
                     let stop = r.is_err();
                     if tx.send(r).await.is_err() || stop {
                         return;
@@ -900,6 +1006,20 @@ pub(crate) fn concat_all(bs: &[&ArrowBatch]) -> Result<ArrowBatch> {
 
 #[cfg(test)]
 mod tests {
+    /// W1 B3: the spill writers share one write-out budget: at 256 MiB
+    /// (16 MiB) one writer keeps 16 MiB, five keep 3.2 MiB each, sixty-four
+    /// the floor; without a limit each keeps the old 16 MiB.
+    #[test]
+    fn spill_writers_share_one_write_out_budget() {
+        let b = Some(16u64 << 20);
+        assert_eq!(super::share_of(b, 1), 16 << 20);
+        assert_eq!(super::share_of(b, 0), 16 << 20);
+        assert_eq!(super::share_of(b, 5), (16 << 20) / 5);
+        assert_eq!(super::share_of(b, 64), super::WRITE_FLOOR);
+        assert_eq!(super::share_of(None, 9), super::WRITE_OUT);
+        assert_eq!(super::share_of(Some(8 << 30), 1), super::WRITE_OUT);
+    }
+
     use super::*;
 
     /// A chunk written to a stage file reads back the same, every column
@@ -945,8 +1065,8 @@ mod tests {
 
     fn kt_schema() -> Vec<ArrowField> {
         vec![
-            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
-            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
+            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
+            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
         ]
     }
 
@@ -1135,8 +1255,8 @@ mod tests {
     #[test]
     fn stage_writer_spills_parts_in_order() {
         let schema = vec![
-            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
-            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false },
+            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
+            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
         ];
         let want = concat_all(&[&part(0, 3), &part(3, 0), &part(3, 70000), &part(70003, 5)]).unwrap();
         for budget in [u64::MAX, 1024] {

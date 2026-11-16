@@ -216,15 +216,20 @@ mod why_tests {
     /// A refused connection names the refusal, not just "error sending".
     #[tokio::test]
     async fn a_refused_connection_says_refused() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        drop(l);
+        // The port stays bound but never listens while the request runs: the
+        // kernel refuses the connect, and no other test or process can take
+        // the port in between (bind-then-close raced one, round P p8: the
+        // port was taken and reset, "Connection reset by peer").
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = sock.local_addr().unwrap();
         let e = super::client()
             .get(format!("http://{addr}/"))
             .send()
             .await
             .unwrap_err();
         let m = super::why(e);
+        drop(sock);
         assert!(m.to_lowercase().contains("refused"), "{m}");
     }
 }

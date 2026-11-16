@@ -64,7 +64,7 @@ async fn plan_view(query: &str, sources: &HashMap<String, String>) -> Result<Vie
         match (r, missing) {
             (Ok(v), _) => return Ok(v),
             (Err(_), Some((u, t))) => {
-                let s = crate::read::read_schema(&u, &t).await?;
+                let s = super::sql_schema(&u, &t, query).await?;
                 cache.insert((u, t), s);
             }
             (Err(e), None) => return Err(e),
@@ -97,15 +97,48 @@ fn cells(t: &Tuple, at: &[usize], old: Option<&Tuple>) -> Result<Vec<Option<Vec<
         .collect()
 }
 
-/// A window's signed images of one table, in change order.
-fn images(body: &Changes, cols: &[String], want: &[String], qualified: &str, path: &Path) -> Result<Vec<(i64, Vec<Option<Vec<u8>>>)>> {
+/// Images handed to the view at a time (round P p10, L14): a window's
+/// images were all copied into one vector (a heap value per cell, ~200 B an
+/// image at five columns) beside the window itself, and a drain of 332K
+/// images died in the 256 MiB cage; a chunk is ~1–2 MB.
+const IMAGE_CHUNK: usize = 8192;
+
+/// The bytes one drained window may hold (round P p10, L14), priced with
+/// the view's own state: the state's buckets take up to a fifth of the
+/// memory limit and their pending moves a tenth (`view::bucket_budget`), so
+/// the windows alive at once (`alive`: Postgres drains one, MySQL has one
+/// filling, one queued and one applying) share an eighth, the images
+/// applied from a window a chunk at a time ([`IMAGE_CHUNK`]). A single
+/// transaction still drains whole (the CDC bound: memory follows the
+/// largest transaction, L14c).
+fn view_window_budget(alive: usize) -> usize {
+    let total = crate::pipeline::mem_limit_bytes().map_or(64 << 20, |m| (m / 8) as usize);
+    (total / alive.max(1)).max(1 << 20)
+}
+
+/// A window's signed images of one table, in change order, handed to `f`
+/// [`IMAGE_CHUNK`] at a time; the count of them.
+fn images(
+    body: &Changes,
+    cols: &[String],
+    want: &[String],
+    qualified: &str,
+    path: &Path,
+    f: &mut dyn FnMut(&[(i64, Vec<Option<Vec<u8>>>)]) -> Result<()>,
+) -> Result<u64> {
     let at: Vec<usize> = want
         .iter()
         .map(|c| cols.iter().position(|x| x == c).ok_or_else(|| bad(format!("the column {c} is not in {qualified}'s change stream"))))
         .collect::<Result<_>>()?;
     let olds = body.olds.as_ref().ok_or_else(|| bad("a view window without old images"))?;
-    let mut rows = Vec::with_capacity(body.events.len());
+    let mut rows = Vec::with_capacity(IMAGE_CHUNK.min(2 * body.events.len()) + 1);
+    let mut n = 0u64;
     for (i, ev) in body.events.iter().enumerate() {
+        if rows.len() >= IMAGE_CHUNK {
+            n += rows.len() as u64;
+            f(&rows)?;
+            rows.clear();
+        }
         let row = ev.row.as_ref();
         let need = |what: &str| bad(format!("{what} without its row"));
         match ev.op {
@@ -136,7 +169,11 @@ fn images(body: &Changes, cols: &[String], want: &[String], qualified: &str, pat
             }
         }
     }
-    Ok(rows)
+    n += rows.len() as u64;
+    if !rows.is_empty() {
+        f(&rows)?;
+    }
+    Ok(n)
 }
 
 /// Move side `s` of the view by one drained window, if it holds `qualified`.
@@ -145,9 +182,8 @@ fn apply_window(v: &mut View, s: usize, out: &DrainOutcome, qualified: &str, pat
         return Err(bad("a view drain returned replica bodies"));
     };
     let Some(w) = m.get(qualified) else { return Ok(0) };
-    let rows = images(w.body(), w.layout().cols(), &v.columns(s), qualified, path)?;
-    v.apply(s, &rows)?;
-    Ok(rows.len() as u64)
+    let want = v.columns(s);
+    images(w.body(), w.layout().cols(), &want, qualified, path, &mut |rows| v.apply(s, rows))
 }
 
 /// A Postgres side: its pool, names, and the slot it is kept by.
@@ -162,7 +198,12 @@ struct PgSide {
 }
 
 async fn pg_side(url: &str, table: &str, tag: &str, s: usize) -> Result<PgSide> {
-    let pool = crate::source::postgres::PgSource::connect(url, 2).await?.pool().clone();
+    // One connection: the view's control questions run one after another.
+    // A pool of two dialled a second connection whenever a query came before
+    // sqlx's spawned task had returned the first, and on a role with no
+    // connection free that ended in sqlx's bare "pool timed out" (QA, round P
+    // p7); a connect refused here is named (`NO_CONNECTION`).
+    let pool = crate::source::postgres::PgSource::connect(url, 1).await?.pool().clone();
     let (nsp, rel, partitioned) = crate::logbased::run::resolve_table(&pool, table).await?;
     if partitioned {
         return Err(unsupported(format!("mode=\"log_based\" over the partitioned table {nsp}.{rel} (v1)")));
@@ -1069,6 +1110,30 @@ async fn catch_up(v: &mut View, s: usize, f: &Feed, from: &str, path: &Path) -> 
     match f {
         Feed::Pg(p) => {
             let p0 = lsn_from_string(from.strip_prefix("pg:").ok_or_else(|| bad("a Postgres side without a pg: position"))?)?;
+            // The slot must still stand where this view's state left it: a
+            // slot another consumer confirmed past that position has given
+            // away the changes in between, and the view would land short
+            // with no error (W1 round P, L7). Behind it is fine: the state
+            // is written before the slot is confirmed.
+            let confirmed: Option<(Option<String>,)> = sqlx::query_as("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(&p.slot)
+                .fetch_optional(&p.pool)
+                .await
+                .map_err(db_err)?;
+            if let Some((Some(c),)) = confirmed {
+                let c = lsn_from_string(&c)?;
+                if c > p0 {
+                    return Err(Error::Transfer(format!(
+                        "log_based view: slot {} was advanced past this view's position ({}) to {} by another consumer \
+                         (a copy of this view's state in another state dir or on another host, or a direct use of the slot); \
+                         the changes in between are gone for this view. Rebuild it: remove its state file {}",
+                        p.slot,
+                        lsn_to_string(p0),
+                        lsn_to_string(c),
+                        path.display()
+                    )));
+                }
+            }
             let stop: (String,) = sqlx::query_as(&format!("SELECT {}::text", crate::logbased::run::WAL_END))
                 .fetch_one(&p.pool)
                 .await
@@ -1096,7 +1161,7 @@ async fn catch_up(v: &mut View, s: usize, f: &Feed, from: &str, path: &Path) -> 
             let mut ws = Walsender::connect(&p.url).await?;
             ws.start_replication(&p.slot, p0, &p.publication, false).await?;
             let (_tx, rx) = tokio::sync::watch::channel(p0);
-            let budget = crate::pipeline::mem_limit_bytes().map_or(64 << 20, |m| (m / 8) as usize).max(1 << 20);
+            let budget = view_window_budget(1);
             let (mut cur, mut cur_ver) = (p0, p0);
             loop {
                 let out = drain(&mut ws, &mut sess, cur, stop, &key_cols, 30, budget, &rx, true, None, false).await?;
@@ -1114,8 +1179,10 @@ async fn catch_up(v: &mut View, s: usize, f: &Feed, from: &str, path: &Path) -> 
         }
         Feed::My(m) => {
             let p0: u64 = from.strip_prefix("my:").and_then(|x| x.parse().ok()).ok_or_else(|| bad("a MySQL side without a my: position"))?;
-            let budget = crate::pipeline::mem_limit_bytes().map_or(64 << 20, |m| (m / 8) as usize).max(1 << 20);
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<DrainOutcome>(2);
+            let budget = view_window_budget(3);
+            // Depth 1 (p10, L14): a window queued, one applying, one filling;
+            // two queued held a fourth window's images at once.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<DrainOutcome>(1);
             let ctxs = [crate::logbased::myrun::MyCtx {
                 table_arg: m.ctx.table_arg.clone(),
                 qualified: m.ctx.qualified.clone(),
@@ -1147,6 +1214,146 @@ async fn catch_up(v: &mut View, s: usize, f: &Feed, from: &str, path: &Path) -> 
     }
 }
 
+/// A view's tag (16 hex): its query and sources' fingerprint with its
+/// destination (the URL without credentials or options, and the table).
+fn view_tag(fp: &str, dst_url: &str, table: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let (scheme, rest) = dst_url.split_once("://").unwrap_or(("", dst_url));
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let rest = rest.rsplit_once('@').map_or(rest, |x| x.1);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut h = Sha256::new();
+    h.update(fp.as_bytes());
+    h.update(b"\n");
+    h.update(format!("{}://{}/{}", scheme.to_ascii_lowercase(), host.to_ascii_lowercase(), path).as_bytes());
+    h.update(b"\n");
+    h.update(table.as_bytes());
+    h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The names (tag) a view's Postgres slots and publications carry when they
+/// are not its own tag's: a view adopted from a release that tagged it by
+/// the query alone keeps the slots it had (W1 round P, L7 upgrade).
+fn alias_path(dir: &Path, tag: &str) -> PathBuf {
+    dir.join(format!("{tag}.alias"))
+}
+
+fn read_alias(dir: &Path, tag: &str) -> Option<String> {
+    let s = std::fs::read_to_string(alias_path(dir, tag)).ok()?;
+    let s = s.trim();
+    (s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_string())
+}
+
+/// A state left by a release that tagged views by the query alone (through
+/// 0.67.2): `{fp16}.state` in this state dir. It is adopted, never dropped:
+/// when every Postgres side's old slot and publication are there, the slot
+/// is idle and stands exactly at the position the old state recorded, the
+/// state and its buckets are renamed to this view's tag and an alias file
+/// keeps the old slot names, so the view drains on from where it was (no
+/// rebuild, no second slot). An old state is adopted once (it is renamed):
+/// the state is the query's, so whichever destination first runs the query
+/// takes it, and its answer lands whole (a replace) wherever that is.
+/// Otherwise the old slots that still exist are named in a warning and the
+/// view bootstraps under its own tag.
+/// Returns the adopted tag, and whether `v` holds a loaded state it did not
+/// adopt (the caller plans afresh).
+async fn adopt_old_state(v: &mut View, sides: &[(Dialect, String, String)], dir: &Path, tag: &str, fp16: &str) -> Result<(Option<String>, bool)> {
+    let old = dir.join(format!("{fp16}.state"));
+    // TEST ONLY, never set by default: the upgrade as it was before the
+    // adoption (round P p1), so `e2e_sql_live_upgrade.py` can be seen RED.
+    if std::env::var_os("APITAP_TEST_NO_VIEW_ADOPT").is_some() {
+        return Ok((None, false));
+    }
+    if fp16 == tag || !old.exists() || dir.join(format!("{tag}.state")).exists() {
+        return Ok((None, false));
+    }
+    let dbg = dbg();
+    let positions = match v.load(&old, None) {
+        Ok(ps) if ps.len() == sides.len() => Some(ps),
+        Ok(_) => None,
+        Err(e) => {
+            if dbg {
+                eprintln!("[sql] view {tag}: the older state {} is not usable: {e}", old.display());
+            }
+            None
+        }
+    };
+    let mut why: Vec<String> = Vec::new();
+    let mut existing: Vec<(String, String)> = Vec::new();
+    for (s, (d, url, _)) in sides.iter().enumerate() {
+        if *d != Dialect::Pg {
+            continue;
+        }
+        let name = format!("apitap_v_{fp16}_{s}");
+        let pool = crate::source::postgres::PgSource::connect(url, 1).await?.pool().clone();
+        let slot: Option<(bool, Option<String>)> =
+            sqlx::query_as("SELECT active, confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(&name)
+                .fetch_optional(&pool)
+                .await
+                .map_err(db_err)?;
+        let has_pub: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pg_publication WHERE pubname = $1")
+            .bind(&name)
+            .fetch_optional(&pool)
+            .await
+            .map_err(db_err)?;
+        pool.close().await;
+        let Some((active, confirmed)) = slot else {
+            why.push(format!("slot {name} is gone"));
+            continue;
+        };
+        existing.push((name.clone(), url.clone()));
+        let at = positions.as_ref().and_then(|ps| ps[s].strip_prefix("pg:")).and_then(|p| lsn_from_string(p).ok());
+        let c = confirmed.as_deref().and_then(|c| lsn_from_string(c).ok());
+        if active {
+            why.push(format!("slot {name} is in use by another run"));
+        } else if has_pub.is_none() {
+            why.push(format!("publication {name} is gone"));
+        } else if at.is_none() || c.is_none() || at != c {
+            why.push(format!("slot {name} does not stand at the older state's position"));
+        }
+    }
+    if positions.is_none() {
+        why.push("the older state is not usable".into());
+    }
+    if why.is_empty() {
+        let io = |e: std::io::Error| Error::Transfer(format!("view state {}: {e}", dir.display()));
+        // The alias first, then the buckets, then the manifest: a crash in
+        // between leaves either the old state (adopted again next run) or
+        // the new one naming the old slots.
+        let al = alias_path(dir, tag);
+        {
+            use std::io::Write;
+            let tmp = al.with_extension("alias.tmp");
+            let mut f = std::fs::File::create(&tmp).map_err(io)?;
+            f.write_all(fp16.as_bytes()).map_err(io)?;
+            f.sync_all().map_err(io)?;
+            std::fs::rename(&tmp, &al).map_err(io)?;
+        }
+        let (od, nd) = (old.with_extension("d"), dir.join(format!("{tag}.d")));
+        if od.exists() {
+            let _ = std::fs::remove_dir_all(&nd);
+            std::fs::rename(&od, &nd).map_err(io)?;
+        }
+        std::fs::rename(&old, dir.join(format!("{tag}.state"))).map_err(io)?;
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        crate::progress::note(&format!(
+            "sql: view {tag}: adopted the state and slot(s) an earlier release kept for this query ({fp16}); it drains on from there"
+        ));
+        return Ok((Some(fp16.to_string()), false));
+    }
+    for (name, _) in &existing {
+        crate::progress::warn(&format!(
+            "sql: view {tag}: replication slot {name} (kept by an earlier release for this query) is no longer used by this view \
+             ({}); it holds WAL on its server until dropped: SELECT pg_drop_replication_slot('{name}') if no other view uses it",
+            why.join("; ")
+        ));
+    }
+    Ok((None, true))
+}
+
 /// Run the view: bootstrap it, or move it by the changes since its state.
 pub async fn run_live(
     query: &str,
@@ -1158,21 +1365,36 @@ pub async fn run_live(
     let t0 = std::time::Instant::now();
     let mut v = plan_view(query, sources).await?;
     let fp = v.fp_hex();
-    let tag = fp[..16].to_string();
-    let path = state_dir()?.join(format!("{tag}.state"));
+    // The view's identity names its slots and its state: the query and its
+    // sources, and where it lands. By the query alone, two views of one
+    // query into two tables shared a slot, and the one drained second lost
+    // the changes the first had consumed, silently (W1 round P, L7).
+    let tag = view_tag(&fp, dst_url, table);
+    let dir = state_dir()?;
+    let path = dir.join(format!("{tag}.state"));
     let sides: Vec<(Dialect, String, String)> = v.pl().sides.iter().map(|s| (s.dialect, s.url.clone(), s.table.clone())).collect();
-    let mut feeds = Vec::new();
-    for (s, (d, url, t)) in sides.iter().enumerate() {
-        feeds.push(match d {
-            Dialect::Pg => Feed::Pg(pg_side(url, t, &tag, s).await?),
-            Dialect::My => Feed::My(my_side(url, t).await?),
-            Dialect::Other => return Err(unsupported("a mode=\"log_based\" side without a change stream")),
-        });
+    // The names its slots carry: its own tag's, or an adopted older one's.
+    let mut alias = read_alias(&dir, &tag);
+    let mut dirty = false;
+    if alias.is_none() && !path.exists() {
+        (alias, dirty) = adopt_old_state(&mut v, &sides, &dir, &tag, &fp[..16]).await?;
     }
+    async fn feeds_of(sides: &[(Dialect, String, String)], names: &str) -> Result<Vec<Feed>> {
+        let mut feeds = Vec::new();
+        for (s, (d, url, t)) in sides.iter().enumerate() {
+            feeds.push(match d {
+                Dialect::Pg => Feed::Pg(pg_side(url, t, names, s).await?),
+                Dialect::My => Feed::My(my_side(url, t).await?),
+                Dialect::Other => return Err(unsupported("a mode=\"log_based\" side without a change stream")),
+            });
+        }
+        Ok(feeds)
+    }
+    let mut feeds = feeds_of(&sides, alias.as_deref().unwrap_or(&tag)).await?;
 
     // The state, if it is the one this view left, with every slot it needs.
     let mut positions: Option<Vec<String>> = None;
-    let mut tried = false;
+    let mut tried = dirty;
     let slots_ok = feeds.iter().all(|f| match f {
         Feed::Pg(p) => p.slot_exists,
         Feed::My(_) => true,
@@ -1189,6 +1411,22 @@ pub async fn run_live(
     let Some(from) = positions else {
         // First run, or a state that cannot be trusted.
         let _ = std::fs::remove_file(&path);
+        // A rebuild takes slots of its own tag: the adopted ones are named.
+        if let Some(old) = alias.take() {
+            let _ = std::fs::remove_file(alias_path(&dir, &tag));
+            for f in &feeds {
+                if let Feed::Pg(p) = f {
+                    crate::progress::warn(&format!(
+                        "sql: view {tag}: replication slot {} (adopted from an earlier release, {old}) is no longer used by this view \
+                         (its state is rebuilt); it holds WAL on its server until dropped: SELECT pg_drop_replication_slot('{}') \
+                         if no other view uses it",
+                        p.slot, p.slot
+                    ));
+                }
+            }
+            feeds = feeds_of(&sides, &tag).await?;
+            tried = true;
+        }
         // A load that failed may have left part of a state: plan afresh
         // (a second schema round on both servers, so only then).
         if tried {
@@ -1299,6 +1537,19 @@ async fn land(res: SqlResult, dst_url: &str, table: &str, opts: &crate::Transfer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view's tag names the destination too: one query into two tables (or
+    /// two databases) gets two slots; credentials and options never change it.
+    #[test]
+    fn a_view_tag_names_its_destination() {
+        let fp = "00112233445566778899aabbccddeeff";
+        let a = super::view_tag(fp, "postgres://u:p@Db:5432/x?sslmode=disable", "out");
+        assert_eq!(a.len(), 16);
+        assert_eq!(a, super::view_tag(fp, "postgres://other:secret@db:5432/x", "out"), "credentials and options do not name it");
+        assert_ne!(a, super::view_tag(fp, "postgres://u:p@db:5432/x", "out2"), "another table");
+        assert_ne!(a, super::view_tag(fp, "postgres://u:p@db:5432/y", "out"), "another database");
+        assert_ne!(a, super::view_tag("ff112233445566778899aabbccddeeff", "postgres://u:p@db:5432/x", "out"), "another query");
+    }
 
     /// The text COPY decode: every cut of the stream, the same columns as
     /// the binary one; the general numeric decode as the fast one's oracle;

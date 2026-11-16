@@ -456,7 +456,7 @@ impl<L: Loader> Pipes<L> {
         }
     }
 
-    #[cfg(test)]
+    /// The pipes opened (a read sizes each socket's receive buffer by it).
     pub(crate) fn len(&self) -> usize {
         self.pipes.len()
     }

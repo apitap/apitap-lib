@@ -30,7 +30,19 @@ pub(super) async fn run(query: &str, sources: &HashMap<String, String>) -> Resul
     let mut srcs = sources.clone();
     srcs.insert(STAGE_SRC.to_string(), run.url.clone());
     let mut st = Stager { run, sources: srcs, n: 0, ctes: HashMap::new(), cols: HashMap::new(), depth: 0, stream_top: false };
-    st.answer((**q).clone()).await
+    match limit_leak() {
+        Some(n) => super::ROWS_ENOUGH.scope(n, st.answer((**q).clone())).await,
+        None => st.answer((**q).clone()).await,
+    }
+}
+
+/// TEST ONLY, never set by default: `APITAP_SQL_TEST_LIMIT_LEAK=n` puts the
+/// early stop of a plain LIMIT around the WHOLE statement, so every nested
+/// one-table read under it (a CTE, a derived table) stops at n rows too:
+/// the wrong shape the L1 invariant forbids. It exists so the leg
+/// `e2e_sql_limit.py` can be seen RED (W1 round P, L1).
+fn limit_leak() -> Option<usize> {
+    std::env::var("APITAP_SQL_TEST_LIMIT_LEAK").ok()?.parse().ok()
 }
 
 /// [`run`], the answer left a stage table when it is one (past the stage
@@ -50,7 +62,10 @@ pub(super) async fn run_answer(query: &str, sources: &HashMap<String, String>) -
     let mut srcs = sources.clone();
     srcs.insert(STAGE_SRC.to_string(), run.url.clone());
     let mut st = Stager { run, sources: srcs, n: 0, ctes: HashMap::new(), cols: HashMap::new(), depth: 0, stream_top: true };
-    st.answer_out((**q).clone()).await
+    match limit_leak() {
+        Some(n) => super::ROWS_ENOUGH.scope(n, st.answer_out((**q).clone())).await,
+        None => st.answer_out((**q).clone()).await,
+    }
 }
 
 /// Whether the query has a part the engine cannot answer in one pass.
@@ -289,6 +304,8 @@ struct Post {
     /// Each row repeated by this column's count (then the column dropped),
     /// and at most this many rows kept.
     repeat: Option<(String, Option<usize>)>,
+    /// Each row once, whatever its count (a DISTINCT's groups).
+    once: bool,
 }
 
 fn parse_expr(s: &str) -> Result<Expr> {
@@ -446,7 +463,7 @@ impl Stager {
             return Ok(c.clone());
         }
         let Some(url) = self.sources.get(&key.0).cloned() else { return Ok(Vec::new()) };
-        let schema = crate::read::read_schema(&url, &key.1).await?;
+        let schema = super::read_schema_waiting(&url, &key.1).await?;
         let names: Vec<String> = schema.into_iter().map(|f| f.name.to_ascii_lowercase()).collect();
         self.cols.insert(key, names.clone());
         Ok(names)
@@ -635,6 +652,7 @@ impl Stager {
                 return self.count_distinct(sel, order_by, limit).await;
             }
             let mut post = Post::default();
+            let mut enough: Option<usize> = None;
             let mut out = Query { body: Box::new(SetExpr::Select(Box::new(sel.clone()))), order_by, limit, ..q.clone() };
             if !aggregated(&sel) {
                 // No aggregate: GROUP BY every output, a hidden count of
@@ -643,13 +661,32 @@ impl Stager {
                 let mut s2 = sel.clone();
                 let distinct = s2.distinct.take().is_some();
                 s2.group_by = GroupByExpr::Expressions(items, Vec::new());
-                if !distinct {
-                    s2.projection.push(SelectItem::ExprWithAlias { expr: parse_expr("COUNT(*)")?, alias: Ident::new("__n") });
-                    let lim = match out.limit.take() {
-                        None => None,
-                        Some(e) => Some(e.to_string().parse::<usize>().map_err(|_| unsupported(format!("LIMIT {e}")))?),
-                    };
-                    post.repeat = Some(("__n".to_string(), lim));
+                // The hidden count: each group's rows (a DISTINCT keeps each
+                // group once: `post.once`; through 0.67.2 a DISTINCT with no
+                // aggregate had none and was refused, W1 round P).
+                s2.projection.push(SelectItem::ExprWithAlias { expr: parse_expr("COUNT(*)")?, alias: Ident::new("__n") });
+                let lim_expr = out.limit.take();
+                let lim = match &lim_expr {
+                    None => None,
+                    Some(e) => Some(e.to_string().parse::<usize>().map_err(|_| unsupported(format!("LIMIT {e}")))?),
+                };
+                post.repeat = Some(("__n".to_string(), lim));
+                post.once = distinct;
+                // ORDER BY … LIMIT n over one table: the LIMIT stays on the
+                // grouped statement too, so its read keeps only the first n
+                // rows' groups as it streams (each group is at least one row
+                // of the answer) instead of every row of the table (W1 round
+                // P, L8: `SELECT a, b FROM lineitem ORDER BY a LIMIT 2` was
+                // refused past the group budget at ~470K rows). Over a join
+                // the passes merge groups by key range; that stays as it was.
+                let one_table = sel.from.len() == 1 && sel.from[0].joins.is_empty() && matches!(sel.from[0].relation, TableFactor::Table { .. });
+                if out.order_by.is_some() && !distinct && one_table {
+                    out.limit = lim_expr;
+                }
+                // Any n rows answer a plain LIMIT n with no ORDER BY; n rows
+                // read are not n distinct groups, so a DISTINCT reads on.
+                if out.order_by.is_none() && !distinct {
+                    enough = lim;
                 }
                 out.body = Box::new(SetExpr::Select(Box::new(s2)));
             } else if sel.distinct.is_some() {
@@ -672,11 +709,32 @@ impl Stager {
             // The statement's own rows go back whole anyway: repeated in
             // memory, once. A stage's are streamed to its table, a piece at
             // a time, on disk past the budget.
+            // The early stop (W1 round P, L1) wraps ONLY this run_one of the
+            // final rewritten SELECT: its CTEs, derived tables and subqueries
+            // were answered above, each under its own LIMIT if any. Nothing
+            // under run_one may call back into stage:: or run another
+            // statement's execute_pinned inside this scope (semi key sets load
+            // through semi::load_one, their own reader), or that read would
+            // stop at n rows too and the answer come back short with no
+            // error. execute_pinned also requires one side and no star.
+            // Leg: benchmarks/e2e_sql_limit.py (RED under the test-only
+            // APITAP_SQL_TEST_LIMIT_LEAK).
+            // A DISTINCT's groups ARE its rows: they fold under the column's
+            // collation as a GROUP BY's do (a MySQL `_ci` column's 'a' and
+            // 'A' are one row there), so it runs without GROUPS_EXACT.
             if top {
-                let r = super::GROUPS_EXACT.scope((), super::run_one(&text, &self.sources)).await?;
+                let r = match (enough, post.once) {
+                    (_, true) => super::run_one(&text, &self.sources).await?,
+                    (Some(n), false) => super::ROWS_ENOUGH.scope(n, super::GROUPS_EXACT.scope((), super::run_one(&text, &self.sources))).await?,
+                    (None, false) => super::GROUPS_EXACT.scope((), super::run_one(&text, &self.sources)).await?,
+                };
                 return apply(r, post).map(Answer::Rows);
             }
-            let a = super::GROUPS_EXACT.scope((), super::run_one_out(&text, &self.sources)).await?;
+            let a = match (enough, post.once) {
+                (_, true) => super::run_one_out(&text, &self.sources).await?,
+                (Some(n), false) => super::ROWS_ENOUGH.scope(n, super::GROUPS_EXACT.scope((), super::run_one_out(&text, &self.sources))).await?,
+                (None, false) => super::GROUPS_EXACT.scope((), super::run_one_out(&text, &self.sources)).await?,
+            };
             repeat_out(a, post)
         })
     }
@@ -1527,6 +1585,7 @@ fn apply(mut r: SqlResult, post: Post) -> Result<SqlResult> {
             FinishedCol::I32 { data, .. } => data.iter().map(|&n| usize::try_from(n).unwrap_or(0)).collect(),
             _ => return Err(bad("internal: the repeat count is not an integer")),
         };
+        let counts = if post.once { vec![1; counts.len()] } else { counts };
         r.schema.remove(i);
         r.batch.cols.remove(i);
         r.batch = mem::repeat(&r.batch, &counts, limit);
@@ -1538,6 +1597,7 @@ fn apply(mut r: SqlResult, post: Post) -> Result<SqlResult> {
 /// count column (then dropped), streamed a piece at a time into a stage
 /// table, on disk past its budget.
 fn repeat_out(a: Answer, post: Post) -> Result<Answer> {
+    let once = post.once;
     let Some((col, limit)) = post.repeat else { return Ok(a) };
     let i = a.schema().iter().position(|f| f.name == col).ok_or_else(|| bad("internal: the repeat count went missing"))?;
     let mut schema = a.schema().to_vec();
@@ -1554,6 +1614,7 @@ fn repeat_out(a: Answer, post: Post) -> Result<Answer> {
             FinishedCol::I32 { data, .. } => data.iter().map(|&n| usize::try_from(n).unwrap_or(0)).collect(),
             _ => return Err(bad("internal: the repeat count is not an integer")),
         };
+        let counts = if once { vec![1; counts.len()] } else { counts };
         b.cols.remove(i);
         if shape.is_none() {
             shape = Some(ArrowBatch { rows: 0, cols: b.cols.iter().map(|c| mem::zeros_like(c, 0)).collect() });
@@ -1639,12 +1700,12 @@ mod tests {
     /// answer's columns: no rows, but every column of the schema.
     #[test]
     fn limit_zero_keeps_the_columns() {
-        let f = |n: &str| ArrowField { name: n.into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false };
+        let f = |n: &str| ArrowField { name: n.into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None };
         let mut w = mem::Writer::new(vec![f("a"), f("b"), f("__n")]);
         let col = |v: Vec<i64>| FinishedCol::I64 { validity: None, data: v };
         w.push(ArrowBatch { rows: 3, cols: vec![col(vec![1, 2, 3]), col(vec![4, 5, 6]), col(vec![1, 2, 1])] }).unwrap();
         let a = Answer::Table(w.finish().unwrap());
-        let r = repeat_out(a, Post { repeat: Some(("__n".into(), Some(0))) }).unwrap();
+        let r = repeat_out(a, Post { repeat: Some(("__n".into(), Some(0))), once: false }).unwrap();
         assert_eq!(r.schema().len(), 2);
         let Answer::Table(t) = r else { panic!("a table") };
         let b = t.into_batch().unwrap();
