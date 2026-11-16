@@ -116,7 +116,12 @@ every later run moves the answer by the changes since — no re-read. One
 Postgres table, or a Postgres × MySQL join; `SUM`/`COUNT`/`AVG`
 (`MIN`/`MAX` refused: a delete needs the rest of the group); Postgres tables
 need `REPLICA IDENTITY FULL`. State lives in `APITAP_STATE_DIR` (default
-`~/.apitap/views`), bucketed on disk with a SHA-256 per block.
+`~/.apitap/views`), bucketed on disk with a SHA-256 per block. Dropping the
+destination table does not reset a view: its state file and its replication
+slot stay, and the next run writes the table again from that state moved by
+the new changes (not from a fresh read). To start over, remove the view's state file (errors name its path) and run again; a
+`transfer()` destination keeps its `_apitap_state` row the same way (see the
+usage guide, "Incremental semantics you must know").
 
 ## Measured: all 22 TPC-H queries across two databases
 

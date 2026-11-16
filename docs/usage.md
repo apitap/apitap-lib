@@ -444,6 +444,15 @@ apitap.transfer(src, dst, table="public.events", mode="merge", cursor="updated_a
   precision timestamps under heavy write rates) with append; `merge`'s `>=` re-reads
   the boundary and dedupes instead.
 - **Rows with a NULL cursor are never synced** by incremental modes.
+- **Dropping the destination table does not reset its state.** The table's
+  `_apitap_state` row (its watermark, or a `log_based` log position) stays on the
+  destination, and the next run goes by it: it does not start over on its own, and
+  the run is refused with a message saying what to clear. To start over, delete
+  the row with the bare table name the error names
+  (`DELETE FROM _apitap_state WHERE dest_table = 'orders'`; on ClickHouse
+  `ALTER TABLE _apitap_state DELETE WHERE dest_table = 'orders'`), and for
+  `log_based` on Postgres drop the slot the error names if you want it gone. Then run again:
+  the next run is a full load.
 - **ClickHouse**: incremental requires ClickHouse ≥ 23.6 (the session timezone is
   pinned to UTC so naive-datetime watermarks are frame-exact on any server timezone).
   `merge` on ClickHouse is not supported yet. The state row can't be written
