@@ -353,6 +353,7 @@ LEGS = [
     leg("e2e_sql_live_join.py",     "apitap.sql(mode='log_based') over a Postgres x MySQL join: both streams move the view, equal to a recompute"),
     leg("e2e_sql_snapshot.py",      "apitap.sql(): every pass of a multi-pass join reads one Postgres snapshot, exact under concurrent updates"),
     leg("e2e_sql_tpch.py",          "apitap.sql(): all 22 TPC-H queries across Postgres + MySQL equal DuckDB's answers"),
+    leg("e2e_sql_bounded.py",       "apitap.sql() at 0.5 core / 256 MiB: TPC-H Q13 peaks <= 240 MiB, Q1's socket memory within its reserved receive buffers"),
     leg("e2e_sql_shapes.py",        "apitap.sql(): shapes TPC-H does not cover give the known answer or a named refusal"),
     leg("e2e_pg_identity_nonkey.py", "a Postgres merge and CDC apply land in a table whose ALWAYS identity is not its key", {"pg18"}),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),

@@ -218,3 +218,5 @@ docker run --rm -v "$REPO":/io -v apitap-bench-cargo:/root/.cargo/registry \
     -e RUSTFLAGS="-Cprofile-use=/io/merged.profdata" \
     ghcr.io/pyo3/maturin build --release -m py-apitap/Cargo.toml -o benchmarks/wheels
 echo "PGO wheel: $(ls benchmarks/wheels/*.whl)"
+# Release check: the wheel links nothing its manylinux tag does not allow.
+bash benchmarks/check-wheel-symbols.sh "$(ls benchmarks/wheels/*.whl)"

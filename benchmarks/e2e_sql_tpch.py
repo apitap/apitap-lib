@@ -15,7 +15,15 @@ a large query takes in a small cage (CONFIGS): stages on disk and GROUP BYs
 answered in parts (Q15's parts by an output alias), and joins in many key
 ranges whose later ranges' probe rows are spilled to disk (grace).
 
-Usage: e2e_sql_tpch.py [sf] [q,q,...]
+Last, a star plan under APITAP_MEM_BUDGET=256M whose two dimensions load one
+after the other (b hangs under a; 750K rows each, a payload distinct per
+row): b's map is ~41 MiB, a's ~50 MiB (~67 MiB with its payload index). The
+maps (91 MiB) fit the 102 MiB build budget and leave the groups their room,
+so 0.67.2 answered; a sum check that priced a with its payload index beside
+b's map (67 + 41) refused it (W1 review R6). 0.67.2 answered it; the dimensions'
+sum must never refuse what 0.67.2 answered (W1 review R6).
+
+Usage: e2e_sql_tpch.py [sf] [q,q,...|dims]
 """
 
 import decimal
@@ -130,8 +138,62 @@ def same(a, b):
     return True
 
 
+BIG_DIM_ROWS = 750_000
+# The fact names every key of both dimensions (the dimensions' reads are
+# gated by the fact's keys, so a key it never names is never held).
+BIG_FACT_ROWS = 1_000_000
+BIG_DIM_Q = (
+    "SELECT g_name, sum(f_v * a_pay) AS x, sum(f_v * b_pay) AS y, count(*) AS n "
+    "FROM my.w1_fact JOIN pg.w1_grp ON f_g = g_id JOIN pg.w1_dim_a ON f_a = a_id JOIN pg.w1_dim_b ON a_b = b_id "
+    "GROUP BY g_name ORDER BY g_name"
+)
+
+
+def two_big_dimensions():
+    """The star plan with two dimensions loaded in turn; returns a failure label or None."""
+    con = duckdb.connect()
+    con.execute("LOAD postgres; LOAD mysql;")
+    con.execute(f"ATTACH '{PG_DUCK}' AS pgw (TYPE postgres)")
+    con.execute(f"ATTACH '{MY_DUCK}' AS myw (TYPE mysql)")
+    for side in "ab":
+        con.execute(f"DROP TABLE IF EXISTS pgw.w1_dim_{side}")
+        con.execute(f"CREATE TABLE pgw.w1_dim_{side} AS SELECT i::INTEGER AS {side}_id, "
+                    f"(i * 3 + 1)::BIGINT AS {side}_pay, ((i * 7919) % {BIG_DIM_ROWS})::INTEGER AS {side}_b "
+                    f"FROM range({BIG_DIM_ROWS}) t(i)")
+        con.execute(f"CALL postgres_execute('pgw', 'ALTER TABLE w1_dim_{side} ADD PRIMARY KEY ({side}_id)')")
+    con.execute("DROP TABLE IF EXISTS pgw.w1_grp")
+    con.execute("CREATE TABLE pgw.w1_grp AS SELECT i::INTEGER AS g_id, 'g' || i::VARCHAR AS g_name FROM range(10) t(i)")
+    con.execute("CALL postgres_execute('pgw', 'ALTER TABLE w1_grp ADD PRIMARY KEY (g_id)')")
+    con.execute("DROP TABLE IF EXISTS myw.w1_fact")
+    con.execute(f"CREATE TABLE myw.w1_fact AS SELECT (i % 10)::INTEGER AS f_g, (i % {BIG_DIM_ROWS})::INTEGER AS f_a, "
+                f"((i * 7919) % {BIG_DIM_ROWS})::INTEGER AS f_b, (i % 100)::INTEGER AS f_v FROM range({BIG_FACT_ROWS}) t(i)")
+    truth = con.execute(
+        "SELECT g_name, sum(f_v * a_pay), sum(f_v * b_pay), count(*) FROM myw.w1_fact JOIN pgw.w1_grp ON f_g = g_id "
+        "JOIN pgw.w1_dim_a ON f_a = a_id JOIN pgw.w1_dim_b ON a_b = b_id GROUP BY g_name ORDER BY g_name").fetchall()
+    os.environ["APITAP_MEM_BUDGET"] = "256M"
+    try:
+        got = [tuple(r) for r in apitap.sql(BIG_DIM_Q, sources={"pg": PG, "my": MY}).to_polars().rows()]
+        ok = same([tuple(map(norm, r)) for r in got], [tuple(map(norm, r)) for r in truth])
+        print(f"  == two dimensions loaded in turn (APITAP_MEM_BUDGET=256M): {'OK' if ok else 'WRONG'} {got[:2]}")
+        fail = None if ok else "two big dimensions [wrong]"
+    except Exception as e:  # noqa: BLE001
+        print(f"  == two dimensions loaded in turn (APITAP_MEM_BUDGET=256M): REFUSED {str(e).splitlines()[0][:200]}")
+        fail = "two big dimensions [refused]"
+    finally:
+        os.environ.pop("APITAP_MEM_BUDGET", None)
+        for side in "ab":
+            con.execute(f"DROP TABLE IF EXISTS pgw.w1_dim_{side}")
+        con.execute("DROP TABLE IF EXISTS myw.w1_fact")
+        con.execute("DROP TABLE IF EXISTS pgw.w1_grp")
+    return fail
+
+
 def main():
     sf = float(sys.argv[1]) if len(sys.argv) > 1 else 0.01
+    if len(sys.argv) > 2 and sys.argv[2] == "dims":
+        f = two_big_dimensions()
+        print("SQL TPCH E2E: FAILED" if f else "SQL TPCH E2E: PASSED")
+        sys.exit(1 if f else 0)
     only = {int(x) for x in sys.argv[2].split(",")} if len(sys.argv) > 2 else None
     con = duckdb.connect()
     t0 = time.time()
@@ -168,6 +230,10 @@ def main():
                 print(f"      duckdb {truth[:3]}")
     for k in KNOBS:
         os.environ.pop(k, None)
+    if not only:
+        f = two_big_dimensions()
+        if f:
+            bad.append(f)
     unexpected = [n for n in refused if n.split(" ")[0] not in {str(x) for x in ALLOWED_REFUSALS}]
     print(f"  wrong: {bad or 'none'}; refused: {refused or 'none'}")
     if bad or unexpected:

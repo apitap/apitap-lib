@@ -15,6 +15,12 @@ answer Postgres itself computes at that moment.
   4  a torn state file is not trusted: the view is rebuilt and still equal
   5  refused, naming the cause: MIN with mode="log_based", and a table
      without REPLICA IDENTITY FULL
+  6  the same query viewed into a second table keeps a slot of its own:
+     both views stay equal to the server, drained one after the other
+     (through 0.67.2 they shared one slot, and the view drained second lost
+     the changes the first had consumed, with no error)
+  7  a copy of a view's state (another state dir, another host) whose slot
+     another run has moved past it is refused by name, not answered short
 """
 import os
 import random
@@ -28,11 +34,14 @@ PGD = "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst"
 T = "sql_live_orders"
 T2 = "sql_live_plain"
 OUT = "sql_live_out"
+OUT2 = "sql_live_out2"
 Q = (f"SELECT status, COUNT(*) AS n, SUM(amount) AS amt, SUM(qty) AS q, AVG(amount) AS av "
      f"FROM pg.{T} WHERE qty > 2 GROUP BY 1 ORDER BY 1")
 TRUTH = (f"SELECT status, COUNT(*), SUM(amount), SUM(qty), AVG(amount) FROM {T} "
          f"WHERE qty > 2 GROUP BY 1 ORDER BY 1")
 STATE = tempfile.mkdtemp(prefix="apitap-live-")
+STATE_B = tempfile.mkdtemp(prefix="apitap-live-b-")
+STATE_C = tempfile.mkdtemp(prefix="apitap-live-c-")
 ok = True
 
 
@@ -70,17 +79,17 @@ def truth():
     return norm(src(TRUTH))
 
 
-def landed():
-    return norm(dst(f"SELECT status, n, amt, q, av FROM {OUT} ORDER BY 1"))
+def landed(table=OUT):
+    return norm(dst(f"SELECT status, n, amt, q, av FROM {table} ORDER BY 1"))
 
 
-def view(query=Q, table=OUT):
+def view(query=Q, table=OUT, state=STATE):
     """One run in its own process: stderr carries the debug lines."""
     code = ("import apitap, sys\n"
             f"r = apitap.sql({query!r}, sources={{'pg': {PG!r}}}, dest={PGD!r}, table={table!r}, mode='log_based')\n"
             "print('ROWS', r.rows)\n")
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                       env=dict(os.environ, APITAP_DEBUG="1", APITAP_STATE_DIR=STATE))
+                       env=dict(os.environ, APITAP_DEBUG="1", APITAP_STATE_DIR=state))
     return r
 
 
@@ -94,7 +103,7 @@ def cleanup():
         src(f"SELECT pg_drop_replication_slot('{name}')")
     for name in src("SELECT pubname FROM pg_publication WHERE pubname LIKE 'apitap_v_%'").split():
         src(f'DROP PUBLICATION "{name}"')
-    dst(f"DROP TABLE IF EXISTS {OUT}")
+    dst(f"DROP TABLE IF EXISTS {OUT}; DROP TABLE IF EXISTS {OUT2}")
 
 
 def main():
@@ -153,6 +162,26 @@ def main():
     r = view()
     case("4: a torn state file is rebuilt, not trusted", p is not None and r.returncode == 0 and lines(r, "bootstrap")
          and "content hash" in r.stderr and landed() == truth(), r.stderr[-300:])
+
+    # 6: the same query into a second table, drained after the first.
+    r = view(table=OUT2, state=STATE_B)
+    src(f"UPDATE {T} SET qty = qty + 1 WHERE id % 13 = 5; DELETE FROM {T} WHERE id % 29 = 7")
+    ra = view()
+    rb = view(table=OUT2, state=STATE_B)
+    case("6: the same query into two tables: both equal the server, drained one after the other",
+         r.returncode == 0 and ra.returncode == 0 and rb.returncode == 0 and landed() == truth() and landed(OUT2) == truth(),
+         (rb.stderr[-300:] if rb.returncode else f"second view {len(landed(OUT2))} groups"))
+
+    # 7: a copy of the first view's state, drained after the first moved the slot.
+    import shutil
+    for f in os.listdir(STATE):
+        shutil.copy(os.path.join(STATE, f), os.path.join(STATE_C, f))
+    src(f"UPDATE {T} SET status = 'held' WHERE id % 19 = 2")
+    ra = view()
+    rc = view(state=STATE_C)
+    case("7: a stale copy of a view's state whose slot moved past it is refused by name",
+         ra.returncode == 0 and rc.returncode != 0 and "advanced" in rc.stderr and landed() == truth(),
+         rc.stderr[-300:] if rc.returncode else "the stale copy answered")
 
     bad = Q.replace("AVG(amount) AS av", "MIN(amount) AS av")
     r = view(bad)
