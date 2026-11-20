@@ -69,7 +69,7 @@ apitap.sql("""SELECT o_orderpriority, SUM(l_extendedprice * (1 - l_discount)) AS
 | **DataFrames** | `apitap.read()` → polars, pyarrow, duckdb, pandas through the Arrow C stream protocol, zero-copy, no pyarrow dependency |
 | **Runtime** | CPython ≥ 3.9, `abi3` wheels: `manylinux_x86_64` (the PGO build every gate leg and number here ran on), `manylinux_aarch64` and macOS `arm64` (built and unit-tested in CI, not PGO, not gated), and an sdist; the engine is Rust, nothing in the data path is Python |
 | **Memory** | bounded by *pipes × buffers*, planned from the container's cgroup limits — never by table size; a 256 MB container moves 100 GB |
-| **Version** | 0.67.2 — pin exactly while pre-1.0 (`apitap==0.67.2`). **Upgrade from 0.66.0–0.67.1** if you use `apitap.sql()`: a join on a database's text column (`ON a.code = b.code` with both `varchar`, or an integer against text) answered 0 rows, or through a CTE matched `'099'` with `'99'`, without an error; 0.67.0 also mis-compared a `WHERE` across tables of text or unlike kinds. 0.67.2 refuses all of these by name |
+| **Version** | 0.68.0 — pin exactly while pre-1.0 (`apitap==0.68.0`). **Upgrade from 0.67.2 or earlier:** (1) `log_based` tables from Postgres into a text destination (ClickHouse, files) that carry an `inet`/`cidr` column — or an `interval` column read through a role with a non-default `IntervalStyle` — must be **re-bootstrapped once**: older versions wrote bootstrap rows in a different spelling than the change stream (`10.0.0.2/32` vs `10.0.0.2`), and with such a column as PRIMARY KEY an UPDATE became a duplicate row and a DELETE missed. (2) `apitap.sql()` ordered, took MIN/MAX of, and in part grouped enum, `inet`, `interval`, array, JSON and unconstrained `numeric` columns (MySQL: ENUM, SET, TIME, JSON) by the bytes of their text, without an error; 0.68.0 answers them exactly or refuses by name before reading a row. (3) `inet` host values now print as Postgres displays them (`10.0.0.2`, no `/32`), and a domain over an integer reads as an integer. Incremental views created by 0.66–0.67 are adopted as they are |
 | **License** | MIT |
 
 ## Why apitap
@@ -386,9 +386,13 @@ changes/s (2.29×; every slot decodes the whole WAL and keeps its own tables, so
 gains flatten past 4–16). The source pays one busy core per slot.
 
 **Memory.** Windows are sized from the cgroup; the bootstrap uses the bulk
-planner (divided by `slots`); one source transaction is capped at 256 MiB of
-buffered changes (`APITAP_TX_BUF_BYTES`) and **refused** with its table, size
-and knob rather than OOM-killing the container. Measured: a 2.1M-event backlog
+planner (divided by `slots`); one source transaction is capped at the drain's
+share of the cage (7/8 of the memory limit minus what the process holds and
+what the drain keeps beside it; 256 MiB with no limit; `APITAP_TX_BUF_BYTES`
+sets it, a value above the limit is refused), counted in resident bytes at its
+commit: past it a replica lane spills it to disk and lands it whole, a
+changelog lane or an incremental view **refuses** it with its table, size and
+how the cap was derived rather than OOM-killing the container. Measured: a 2.1M-event backlog
 replays inside a 0.5 vCPU / **44 MB** container (33 MB peak); the 30-table
 group runs under 200 MB.
 
@@ -614,7 +618,7 @@ is off.
 | `APITAP_LEASE_TTL_SECS` | `300` (30–3600) | how long a drain's claim outlives its last renewal |
 | `APITAP_CDC_WINDOW_BYTES` | auto (≤ 24 MiB) | bytes buffered per CDC window; 32 MiB is the measured best at 256 MB |
 | `APITAP_WINDOW_MAX_SECS` | `3600` | wall-clock cap on one window |
-| `APITAP_TX_BUF_BYTES` | 256 MiB | the one-transaction buffer cap behind the refusal |
+| `APITAP_TX_BUF_BYTES` | 7/8 of (memory limit − held − planned); 256 MiB with no limit | the one-transaction buffer cap (resident bytes): spill point of replica lanes, refusal of changelog lanes and views; above the memory limit it is refused |
 | `APITAP_REPLICATION_SILENCE_SECS` | `120` | silence budget on the replication socket (lower only) |
 | `APITAP_READ_COALESCE_US` | `5000` (µs) | how long the plain-TCP replication reader may wait for its window to fill before one `recvfrom` — epoll wakes on the first arrival, so each read otherwise carried ~5 KB; the 5 ms knee measured −6% CPU/change (the 0.59.0 `APITAP_READ_LOWAT` receive watermark was reverted: ET epoll parked the reader past `wal_sender_timeout`); a read that already has data is never delayed, so keepalives still flow; `0`/`off` disables (the A/B control) |
 | `APITAP_DECODE_WORKMEM` | server value | per-session `logical_decoding_work_mem`, ≤ 256 MiB |

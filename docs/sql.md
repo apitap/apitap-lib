@@ -55,8 +55,8 @@ table already joined. Then:
 | joins | `INNER JOIN … ON a.k = b.k` or the comma form with the equalities in `WHERE`; the key is an integer column on a database, while a sheet's, CSV's or GitHub API table's text key is read as an integer (`'010'` equals `'10'`, spaces are trimmed, an empty cell is NULL, a value that is not an integer is refused); a text column from a database, directly or through a CTE or derived table, is refused as a key |
 | `WHERE` | per-table conditions (comparisons, `BETWEEN`, `IN`, `LIKE`, `IS NULL`, `AND`/`OR`/`NOT`, date literals, folded constants) are pushed to that table's server; an `OR` across tables (TPC-H Q19) is checked here per matched row, its single-table parts implied to each server too; a comparison of a column of each table is checked on each joined row when both are numbers, both dates or both timestamps of one kind (`l.shipdate > o.orderdate`) |
 | subqueries | `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS (SELECT …)`, including `IN (SELECT k … GROUP BY k HAVING SUM/COUNT/AVG(…) > x)` (TPC-H Q18) |
-| expressions | arithmetic in aggregates, `CASE WHEN … THEN … END` over one table, `EXTRACT(YEAR FROM col)`, derived tables `FROM (SELECT … ) AS t` without GROUP BY |
-| aggregates | `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `AVG`; decimals exact (i128, digit for digit), integer overflow widened, floats f64 |
+| expressions | arithmetic in aggregates, `CASE WHEN … THEN … END` over one table, `EXTRACT(field FROM col)` (YEAR, QUARTER, MONTH, WEEK, DAY, DOW, ISODOW, DOY, HOUR, MINUTE; each column's own server's definitions) and `date_trunc('unit', col)` as keys, derived tables `FROM (SELECT … ) AS t` without GROUP BY |
+| aggregates | `SUM`, `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX` (numbers, dates and timestamps, and text under a byte collation), `AVG`; decimals exact (i128, digit for digit), integer overflow widened, floats f64 |
 | result | `GROUP BY` (columns of any joined table), `ORDER BY` (exact for decimals), `LIMIT`, `HAVING`, `COUNT(DISTINCT col)`, a plain `SELECT` with no aggregate |
 | staged | `WITH` (CTEs, nested), derived tables with GROUP BY, scalar subqueries, correlated scalar subqueries used as a NULL-rejecting comparison (TPC-H Q2, Q17, Q20, Q22), `EXISTS` comparing two tables' columns (Q21), `LEFT JOIN … GROUP BY` the preserved table's key with `COUNT(*)` or aggregates of a joined-table column (Q13) |
 
@@ -69,6 +69,30 @@ scalar subquery used as a literal, a `WHERE` expression over two tables'
 columns (`l.a * 2 > o.b`), a comparison of two tables' text columns (their
 collations may differ) or of unlike kinds (a date against a timestamp or a
 number), joins on non-integer keys (a database's text column as a join key included).
+
+### Refused today, and what to write instead
+
+Each of these is refused by name before a row is read. Where a rewrite runs
+today, it is given; it was checked against the servers.
+
+| you wrote | why it is refused | what runs instead |
+|---|---|---|
+| `GROUP BY id % 3`, `GROUP BY a + b`, `GROUP BY CASE … END` (arithmetic or CASE as a group key) | the key would be computed here, and only column keys, `EXTRACT(field FROM col)` and `date_trunc('unit', col)` are | a view in the source that computes the key, read as a column. A CTE does **not** work: `WITH x AS (SELECT id % 3 AS r, …)` is refused the same way |
+| aggregates that read both tables of a join (`SELECT m.grp, MIN(p.tc), MAX(m.tb) FROM pg.p JOIN my.m … GROUP BY m.grp`) | a join's aggregates must all read one table | join first in a CTE that selects the columns, then aggregate the CTE: `WITH j AS (SELECT m.grp AS g, p.tc AS x, m.tb AS y FROM pg.p p JOIN my.m m ON p.id = m.id) SELECT g, MIN(x), MAX(y), COUNT(*) FROM j GROUP BY g`. The same as a derived table in `FROM` is still refused (it is inlined) |
+| `MIN`/`MAX` of text under a linguistic or case-insensitive collation (Postgres `en_US`, ICU, `citext`; MySQL `_ci`, `_ai`) | the order is the collation's, which apitap does not apply | MIN/MAX of text under a byte collation (Postgres `COLLATE "C"`/`POSIX`, MySQL `_bin`) runs, padded `CHAR` compared as its server does. Otherwise a view with `COLLATE "C"` / a `_bin` collation |
+| `EXTRACT` / `date_trunc` of a `timestamptz` (or MySQL `TIMESTAMP`) whose server's default time zone is not UTC | the server answers in its own zone, apitap reads the instant in UTC | a view converting it (`col AT TIME ZONE 'Europe/Vilnius'`, `CONVERT_TZ(col, '+00:00', …)`), or a UTC default zone |
+| `EXTRACT(DOW/ISODOW/DOY …)` or `date_trunc('week', …)` of a MySQL column | not MySQL's fields; MySQL's weeks depend on a mode | a view with `DAYOFWEEK()`, `WEEKDAY()`, `DAYOFYEAR()` or the week start you mean; `EXTRACT(WEEK …)` of a MySQL column is MySQL's `WEEK(d, 0)` |
+| `ORDER BY`, `MIN`/`MAX` of an enum (Postgres enum or a domain over one; MySQL `ENUM`) | an enum orders by its declaration, not by its labels, and apitap holds the labels | expose the position as an integer in a source view (`array_position(enum_range(NULL::t), col)`; MySQL `col+0`). `GROUP BY`, `DISTINCT`, and `= / <> / IN 'label'` run |
+| `ORDER BY`, `MIN`/`MAX` of a type held as its text form whose text does not order as the type (inet, cidr, oid, pg_lsn, `"char"`, arrays, MySQL `SET` and `TIME`); `MIN`/`MAX` where the source has none (uuid, macaddr, bit, varbit) | the text's byte order is not the value's (`'10.0.0.10' < '9.0.0.1'`, `'-01:00' < '-02:00'`) | a source view exposing an orderable column (an integer, a timestamp, text). `GROUP BY` and `DISTINCT` run (one text per value); uuid, macaddr, bit, varbit and Postgres `time` also `ORDER BY` |
+| any ordering or grouping of interval, json/jsonb, money, timetz, ranges, composite types, tsvector, xml, geometric types, any type not listed here | two different texts can be one value (`'1 day'` = `'24:00:00'`, `1` = `1.0` in jsonb), or the text has no order | projection runs; compute an orderable column in a source view |
+| a comparison with a literal that apitap evaluates (over a CTE or a stage) on a type held as its text form, other than an enum's `= / <> / IN 'label'` and a numeric | the literal's text need not be the value's own (`'10.0.0.10'` vs `10.0.0.10/32`, an uppercase uuid) | filter in the base table (pushed to the source), or in a source view |
+| `ORDER BY` a text column under a linguistic collation, where the server orders a pair otherwise than its bytes | apitap sorts bytes, and asks the server about each pair it cannot vouch for; a disagreement is refused, naming the pair | `ORDER BY col COLLATE "C"` in a source view, or a `_bin` collation |
+| `SELECT … ORDER BY col LIMIT n` on a big table, `col` text under a glibc or ICU collation (or MySQL `_ci`) | the first n rows cannot be kept as the read streams (a byte cut could drop a row the collation keeps), so every row would be held; past the memory budget it is refused, before the read when the server's statistics already say so | `ORDER BY col COLLATE "C"` in a source view, or a `_bin` collation. On a Postgres server built against musl (the official Alpine images) a libc collation such as `en_US.utf8` orders by bytes, so this streams and answers |
+| `… LIMIT n OFFSET m` (or `FETCH`, `LIMIT BY`), at any depth | not implemented: a skipped prefix of an ordered answer | `LIMIT m + n` here and drop the first `m` rows in the caller (`.slice(m)` on the frame) |
+| `UNION` / `UNION ALL` of two `SELECT`s | set operations are not implemented | one `sql()` call a branch, concatenated in the caller (`pl.concat([...])`); for `UNION`, de-duplicate there (`.unique()`) |
+| `SELECT *`, also inside a subquery, CTE or derived table (`SELECT … FROM (SELECT * FROM pg.t) x`) | the columns to read are named by the statement, so each server reads only those | name the columns: `SELECT a, b FROM (SELECT a, b FROM pg.t) x` |
+| `MIN`/`MAX`/`DISTINCT` under a Postgres nondeterministic collation | equality is the collation's, not bytes | a deterministic collation in a view |
+| two `sql()` statements reading a role with one connection free, each reading a source twice | its reads need one snapshot: one connection to hold it, one to read | raise the role's `CONNECTION LIMIT` by one, or run fewer statements at once |
 
 ## How it runs
 
@@ -119,7 +143,9 @@ need `REPLICA IDENTITY FULL`. State lives in `APITAP_STATE_DIR` (default
 `~/.apitap/views`), bucketed on disk with a SHA-256 per block. Dropping the
 destination table does not reset a view: its state file and its replication
 slot stay, and the next run writes the table again from that state moved by
-the new changes (not from a fresh read). To start over, remove the view's state file (errors name its path) and run again; a
+the new changes (not from a fresh read). To start over, remove the view's state file (errors name its path), drop its
+replication slot and run again: a first run that finds a slot under the view's own name and no state for it refuses,
+naming the slot, because another state dir or host may own that view (it never drops it); a
 `transfer()` destination keeps its `_apitap_state` row the same way (see the
 usage guide, "Incremental semantics you must know").
 

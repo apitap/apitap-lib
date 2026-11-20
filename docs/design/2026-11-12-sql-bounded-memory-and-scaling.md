@@ -841,3 +841,404 @@ variants, largest-transaction sweep), and SF50 on GCP on the owner's word.
   ledger-priced windows. **L15:** live-view path gives raw sqlx pool timeout under
   connection exhaustion (fold into p9). Docs: dropping a destination does not reset its
   _apitap_state row.
+- **QA on p8 MIN/MAX:** class a NEW in p8 — PG char(n) compared padded (MIN '' vs E'\t'
+  wrong). p10: Pad per source (PG bpchar strip-trailing-spaces; MySQL PAD SPACE pad-shorter)
+  through MIN/MAX, ORDER BY/top-N, parts order_limit, WHERE, GROUP BY/DISTINCT fold. Audit
+  found a pre-existing wrong answer: the equality fold trimmed all trailing ASCII whitespace,
+  grouping 'a\t' with 'a' (both servers) — fixed to spaces only. Leg e2e_sql_pad_order.py.
+  Refusal text shows collations by their human name. **L16 (next round):** aggregates over
+  both sides of a join (two-sided aggregation, 1–2 d); today refused with an accurate message
+  and a CTE workaround (QA to confirm the workaround answers).
+- **p10 (ed59b2de) = release candidate (2026-11-16 16:36).** chainP10: every leg PASSED —
+  pad (RED p8 12/16 wrong → 14/14), live drain p10 peaks 47/87/107 MB (p7 73/204/161; p7 did
+  not OOM in this leg — QA's case M is the L14 proof), date buckets incl. a non-UTC role
+  refused, minmax incl. the M9 remedy shape, pool_low 5/5, collation/nulls/order_locale/live.
+  Q4/Q12 n=5 vs p7: +2% / −8% (walls inflated by a concurrent QA scan, interleaved). Q12
+  "creep" = noise: perf CPU p7 4.5 s vs p9 4.6 s, same symbols. Next: QA verdict on ed59b2de
+  and release chain R (PGO wheel vs pgoI, full gate, cages, WAN, CDC A/B, Q7/Q21).
+- **p11 (2026-11-16 ~17:00):** MIN/MAX on date/timestamp/timestamptz (PG) and
+  DATE/DATETIME/TIMESTAMP (MySQL) was refused on 0.67.2 and p10 (class c, pre-existing).
+  Folded as the integer (days / µs) through the Int path, answered in the column's own kind;
+  refused inside arithmetic/HAVING. Leg e2e_sql_minmax_dates.py (RED p10). Release chain
+  (chainRel1, PGO) moved to the p11 source, gated on p11's legs; the p10 PGO attempt was
+  stopped on purpose (log ~/w1/chainRel1.p10-stopped.log). docs/sql.md "Refused today" table
+  written (uncommitted).
+- **QA regression on p10 (class a, introduced by p10's Pad change):** PAD SPACE keys got their
+  own sort key K::P, and the pair guard only matched (K::B, K::B), so MySQL utf8mb4_general_ci
+  (and 0900 _ci PAD SPACE) ORDER BY skipped the guard and answered byte order silently (p8
+  refused correctly). p11: guard matches K::P pairs too, padding applied inside the compare.
+  Leg e2e_sql_order_locale.py case 10 (QA's 4-row case, all rows, DESC LIMIT 5), RED p10.
+  Lesson: a new sort-key variant must be added to every match on the old one — audit by grep.
+- **QA case M on p10 (L14 NOT closed):** QA's view shape (qa_li, one ~166K-row UPDATE) at
+  256m/0.5: exit 137 OOM on wheel I and on p10 (anon 246 / 254 MiB); 202K+ rows → named
+  refusal at ~200 MiB RSS. Cause: APITAP_TX_BUF_BYTES defaults to the whole cage and counts
+  less than resident bytes, so the named refusal races the OOM killer. Class b. **p12:** tx
+  buffer default from the ledger's drain budget (cage minus planned non-buffer memory),
+  accounting in resident bytes of decoded images, same rule for log_based CDC transfers;
+  RED legs = QA's case-M shape and a pg→ch single-transaction ladder at 256m; never exit 137.
+- **p12 (building 2026-11-18 19:2x):** tx cap default = 7/8 × (cage − RssAnon at drain start
+  − planned 2× window − 4 MiB), env wins, above cage refused by name; tx charge in resident
+  bytes at commit; changelog key compare without alloc, moved_from kept only for masked rows,
+  old image moved; view masked key move now takes the unchanged-TOAST cell from its D's old
+  image (refused "no old image" through p11 — found while writing the leg); musl + libc → byte
+  order; top-N up-front refusal from n_distinct/index cardinality (no WHERE only); human
+  refusal text. Legs: e2e_txcap_cage.py, e2e_changelog_key_move.py, order_locale case 11;
+  control wheel chainP12x with masked moves broken must turn key_move RED.
+- **p12 (1ed47f4b) early results:** txcap case-M shape at 256m: p11 50K exact 131 MB, 100K
+  exact at 247 MB (unsafe), 166K exit 137; p12 50K exact 85 MB, 100K refused by name at 92 MB
+  ("cap 153 MiB = 7/8 of (256 − 12 held − 68 planned)"). Never 137, conservative; real peak
+  past the cap measured to tighten in p13. key_move RED p11 → 4/4 exact p12; QA masked PK
+  move via view RED p11 → exact p12. order_locale case 11c refused before reading on p12.
+- **Slot ownership (decision):** test legs dropped every apitap_v_% slot (8 legs fixed for
+  p13: only slots publishing their own tables). Product: a first run that finds an inactive
+  slot with its own derived name and no state of its own will REFUSE by name (another state
+  dir/host may own it) instead of dropping it — p13, CDC lane and view lane; RED/GREEN leg
+  with two state dirs. Full gate runs only with QA's view/CDC work idle (19 old CDC legs drop
+  apitap_% slots).
+- **p13 scope:** above + 2-table view refusal message + tx-cap charge tuned toward measured
+  resident bytes (goal: largest exact with zero 137s).
+- **Top-N pricing undercounts (class b, found via QA L8j2):** p12 LIMIT 200K → exact with
+  anon 217 MiB (not page cache) in QA's runner; a lean polars runner with debug → exit 137 at
+  anon 223 MiB. Priced against a 32 MiB group budget; real ≈ 2n groups before a cut + the
+  cut's copy + pipes. p13: up-front price counts resident bytes of the worst concurrent set,
+  so such a LIMIT is refused up front at 256m (or answered within budget if the cut gets
+  cheaper). Also p13: view first-run refusal of an own-name slot it has no record of;
+  remedy texts name the slot; e2e_sql_live case 8 (RED p12).
+- **p12 (1ed47f4b) final, 2026-11-18 21:49 — not a candidate, six items open.** Closed: every
+  exit 137 in the ladders (QA case M p11 137 → p12 named refusal at 88/90 MB with/without
+  debug; pg→ch 1M-row transaction p11 137 → p12 plain lane exact, changelog 200K exact, 400K
+  named), key_move, musl top-N (QA L8d/d2 exact). Open → p13: (1) tx charge over-counts
+  1.7–2× (100K drains exactly at a real 158 MB under an explicit 240M cap; default refuses);
+  (2) env above cage not refused on a bootstrap run; (3) top-N up-front refusal over-refuses
+  the shape the parts path answered on p11; (4) top-N LIMIT 200K anon 217 MiB / 137 with
+  debug — pipes 128 MiB reserved beside 30 MiB of groups; plan must price both; (5) Q1
+  82.2 → 91.4 s p11→p12 (CPU +11%), profile before code; (6) key-move control build not run.
+  Team from p13 on: engineer and QA on Opus effort medium, architect on Fable 5.2.
+- **p13 (2fc1e7df, cargo test 690/0/4), 2026-11-18 23:0x.** Tx charge calibrated to measured
+  anon (view ~1450 B/row real → 1672 charged; changelog 470 → 578; plain 600 → 612; p12 had
+  under-charged the plain lane), pinned by a unit test to [measured, 1.3×]. env cap above the
+  cage refused at every log_based entry. Top-N: up-front refusal uses the parts path's own
+  predicate + column statistics; guarded refusal falls to the parts path again (p12 had
+  dropped the marker); pipes + state priced together. Key-move control wheel RED, p13 GREEN.
+  All regression legs PASSED. Q1 p11→p12 "regression" = host variance (identical symbol
+  profiles; rerun p12 faster).
+- **Case M closed on evidence:** the 166K-row view drain really peaks at 245 MiB anon (QA's
+  "113–118" was anon at a page-cache peak), so it cannot fit 256m; named refusal is correct
+  (p13 6/6, no 137). Release-note bound from the p14 ladder (est. ~110K rows).
+- **QA on p13:** L8j2 LIMIT 200K exact ×3 + debug, max anon 166–167 MiB (GREEN). Finding:
+  top-N price ~2.5–3× high — refuses `ORDER BY tc, id LIMIT 200000` that p12 answered at
+  162 MiB. **p14:** topn_price rebuilt from the real key encoding (610/512 B per kept row vs
+  measured 469/414), unit-pinned; guard refusal says the rows had to be read to know.
+  Ladders n=3 for release notes run on p14.
+- **p13 gates (chainP13 done 2026-11-19 01:17):** F gate n=3 interleaved non-PGO — Q1
+  81.8 / 83.0 / 80.6 s (p11/p12/p13), Q9 80.0/78.9/79.5, Q10 25.7/25.2/25.4, Q20
+  19.0/18.8/19.2: no regression. QA on p13: own-name slot case (two state dirs) and
+  TX_BUF above cage both RED p12 → GREEN p13; case M 6/6 named refusal, max anon 118–123.
+- **p14 (086dbb59) not the candidate:** top-N price calibrated (text LIMIT 200K–300K, int to
+  400K answer at 256m; larger refused up front; no 137 in ~25 runs) but the plan fills the
+  cage to the brim (state 116 + pipes 139 of 256 MiB; anon max 228–230). **p15:** top-N
+  state + pipes ≤ 7/8 × (cage − measured anon) (`topn_room`), ladders at 256m/512m/1g n=3
+  with/without debug reporting memory.peak per rung; gate: peak ≤ ~90% of cage, zero 137,
+  scales with the cage. Release chains repointed to p15; go-files stay with the architect.
+- **p15 (10081e73, test 691/0/4), chainP15 done 2026-11-19 05:21.** topn_room: kept rows +
+  pipes ≤ 7/8 × (cage − measured anon). 18 regression legs PASSED; L8j2 exact ×6 at 88–90%;
+  10g p13 vs p15 n=3 flat (Q17 30.6 → 33.1 overlapping spreads; recheck on the PGO wheel).
+  **Release-note bounds (n=3, p15; CDC/view code unchanged after):** largest single UPDATE
+  exact at 256m — view 110K (120K named; QA independently: 107K exact, 130K named),
+  pg→ch changelog 350K (400K named), pg→ch plain 1M, my→ch changelog 200K (250K named),
+  my→ch plain 1M. env cap above cage: RED p12 → GREEN p15.
+- **QA FINDING 3 on p15 (blocker for top-N):** N1 `ORDER BY k2 DESC, id LIMIT 500K` at 256m
+  exact 6/6 but bimodal peak 216 vs 241 MiB (94%). Cause (engineer, from QA's tsv + mallinfo):
+  identical in-use and mmap; +37 MiB of freed heap glibc keeps, from the kept set's doubling
+  reallocs. **p16:** reserve the kept set for 2·n_eff up front, refill a reused n-row spare
+  at each cut (no realloc after start), per-row cut check, n_eff = min(n, 1.25 × row
+  estimate + 1024); price = that layout, unit test asserts no realloc. Gate: QA's boundary
+  sizes n=6 ≤ 90% of cage at 256m and 512m.
+- **90% rule, precise form:** counts memory that cannot be reclaimed (anon + kernel + sock);
+  spill-file page cache on the plain CDC lanes is excluded (reclaimable), so those lanes are
+  judged on max anon.
+- **Backlog L17:** guarded (ICU) top-N through the parts path could ask the oracle about
+  cross-part pairs instead of refusing after the read at small cages.
+- **p16 (d931fa1a, test 692/0/4):** FINDING 3 fixed — kept set reserved up front, peaks
+  deterministic (N1 256m: 300K 62%, 400K 73%, 6/6, one population; 512m N1 1M 78%, N5 600K
+  75%). State prices re-measured on the new layout: text 568 B/row (price 628, 1.11×), int
+  456 (532, 1.17×), N1 351 (380, 1.08×). Over-refusal (N1 500K, N5 300K at 256m) came from
+  the plan charging each read pipe 38 MiB = process reserve counted twice.
+- **p17 (building 2026-11-19 06:16):** one pipe = 22 MiB beside the kept rows; pins re-set to
+  p16's measurements. Predicted largest exact at 256m: N5 ≈ 320K, N1 ≈ 530K. Gate: boundary
+  rungs n=6 at 256m/512m ≤ 90% in every run, else lower the boundary. chainP16 cut short at
+  a leg boundary (its remaining legs rerun on p17); 10g compare is p15 vs p17. Release
+  chains point to p17; go-files with the architect.
+- **p17 (c9083082):** pipe charge 22 MiB. QA gate 84 runs (14 sizes × 6): exact or refused up
+  front, no 137, ≤ 87% of cage, one population per size. Largest exact: 256m N1 500K (82%),
+  N5 320K (87%); 512m N1 1.0M (80%), N5 690K (70%).
+- **QA FINDING 4 on p16:** a grossly stale row estimate (reltuples 1000 vs 4M rows; also
+  never-ANALYZEd tables) shrank the top-N budget to 1 MiB and refused an answerable query
+  with "ask for fewer rows". **p18 (2bdfc42d, test 693/0/4):** unknown estimate → n;
+  admission also prices the full n and keeps its pipes; one priced growth when rows pass the
+  estimate; a refusal caused by the estimate names it and says ANALYZE. Engineer: p17 RED →
+  p18 6/6 answered. QA: 4000×-stale PG, never-ANALYZEd PG, MySQL TABLE_ROWS 1000/4M — all
+  6/6 exact at 256m and 512m, ≤ 83%, one population; boundary gate 84 runs ≤ 86%.
+- **chainP18 done 2026-11-19 10:42:** 11 regression legs PASSED; L8j2 exact ×6 at 78–81%;
+  10g n=3 p15 vs p18 flat except Q20 18.8 → 20.2 s (overlapping spreads; recheck on PGO).
+  **Rel.go created 10:42:52** (architect): chainRel1 = PGO wheel of p18 + 22 queries vs
+  pgoI. Rel2.go (full gate, cages, WAN, CDC A/B) waits for Rel1's table and QA's final
+  verdict (slot/CDC items on p13 2fc1e7df, SQL items on p18 2bdfc42d).
+- **Release chain part 1 (chainRel1, done 2026-11-19 12:52):** PGO wheel of p18 = pgoP18
+  .so 20bfbc41 (PGO_EXIT 0, 0 profile errors, one wheel, md5 differs from pgoI and p18).
+  22/22 ok vs pgoI. n=3 medians: Q1 65.1 → 66.3, Q2 33.1 → 33.1, Q3 39.3 → 39.9, Q4
+  14.0 → 14.3, Q13 166.6 → 170.8, Q17 30.5 → 30.0, Q19 12.4 → 12.6, Q22 18.6 → 18.4,
+  Q20 18.7 → 19.3, Q12 13.1 → 14.2. Follow-up n=5: Q20 18.2 → 18.4 (+1.1%); Q12 12.7 → 13.1
+  (+3.1%, CPU 3.4 → 3.4, pgoP18's spread inside pgoI's 12.6–13.8); perf by symbol identical
+  (decode 22/23%, probe 19/20%; Coll::fold 16 → 12 samples). **Architect: speed gate
+  passed** — Q12's 0.4 s is wall without CPU, inside the old wheel's own spread; no code
+  cause. Wheel still labelled 0.67.2: version bump + rebuild + short recheck before publish.
+- **Known, accepted for this release (next round):** top-N pipe plan charge 22 MiB vs
+  measured 26–37 MiB at the boundary (absorbed by the 7/8 share; worst run 88%); ICU-guarded
+  top-N at small cages reads before refusing (L17).
+- **QA final verdict (2026-11-19 ~13:30, reports/round-p/qa-verdict-final-p18.md):** p18
+  passes. Own build md5-identical (693/0/4). SQL items GREEN on 2bdfc42d (estimates, top-N
+  boundary 84 runs ≤ 86%, full sets 256m/512m/1g, L8, L1, collation, MIN/MAX, dates);
+  slot/CDC items GREEN on 2fc1e7df. Open: FINDING 2 only (ICU top-N late named refusal,
+  accepted, L17). **Rel2.go created 13:25** — full gate, 2c/8c cages, WAN, CDC A/B, Q7/Q21
+  on pgoP18; QA idle for its duration.
+- **Owner decisions 2026-11-19:** version = **0.68.0**; GROUP BY on arithmetic/CASE (L13b/c)
+  deferred to the next round, documented as a named refusal. BigQuery is NOT untested: the
+  key is on the VPS (~/apitap.json); the gate skipped bq legs only because BQ_SA was unset.
+  chainUp reruns every skipped leg (bq + old-wheel upgrade 0.55.1/0.56.0) on pgoP18 after
+  chainRel2. BigQuery cleanup: only new tables in apitap_cdc_e2e with a leg-owned name
+  prefix are dropped; never a dataset; anything else new is reported.
+- **Release chain part 2 (chainRel2 + chainUp, 2026-11-19):** full gate on pgoP18 228/1/33,
+  then the 33 skipped legs with BQ_SA and the 0.55.1/0.56.0/0.62.x wheels 32/1/0. Both reds
+  closed without an engine change: e2e_sql_join = leg check bug (`"1 pass" in` matched 11/21;
+  fixed, ×3 green; case-5 pass counts are random on every wheel, n=5); e2e_guard_matrix bq =
+  one BigQuery `backendError` on the control replace (×3 green on rerun, pgoP18 and pgoI).
+  **Every one of the 262 legs has a pass on pgoP18.** Cages 2c/8c flat (Q1@2c, Q17@8c
+  rechecked n=3); pg→ch CDC flat; Q7/Q21 pass. Open speed flags: WAN Q6 +0.7 s (gate 0.3),
+  my→ch +7.6% at n=3.
+- **Pre-existing, found by the gate:** bulk load/copy jobs to BigQuery are not retried on a
+  retryable errorResult (bigquery.rs:2038, :2643; `retryable()` covers only state rows,
+  session start, CDC scripts). Architect: not a blocker (named failure, nothing committed,
+  rerun succeeds); include the 40–60 line fix only if another build is needed anyway, else
+  release note + first item next round.
+- **Release checks on pgoP18 complete (2026-11-19 ~18:30):** my→ch n=5 flat (32.56 vs
+  32.65 s, CPU 15.35 vs 15.37) — the n=3 +7.6% was noise, flag closed. WAN Q6 +0.6 s is real
+  and explained from the server log: 3 extra Postgres round trips before the first COPY
+  (160 → 163 statements; first statement → first COPY 2.64 → 3.27 s; the read 3.88 vs 3.89 s):
+  `headroom()` asked twice per statement (p5) and `order::pg_collations` for every table
+  even with no text column named (p3). Disk: bench-my binlogs before 2026-11-14 purged
+  (66 → 34 GB), 70 GB free.
+- **Architect decision — build p19 = the 0.68.0 candidate**, one build, version bumped in it:
+  (1) cache the headroom answer per statement+URL; (2) gate the collation probe on "the
+  statement names a text column of this table" (conservative: any reference anywhere,
+  incl. join keys, GROUP BY, DISTINCT, MIN/MAX, ORDER BY through an alias, `*`) — QA attacks
+  this gate, a wrong skip is class (a); (3) BigQuery bulk load/copy job retried under a fresh
+  job id on a retryable errorResult (same backoff as load_rows), fault-injected leg;
+  (4) e2e_pg_hardening.py:156 exact-number check; (5) version 0.68.0. Gates: WAN Q6 ≤ pgoI
+  + 0.3 s n=3; collation/order/pad/minmax/nulls/pool legs green with their REDs intact;
+  then PGO wheel labelled 0.68.0, full gate ONCE on that wheel with BQ_SA and the four old
+  wheels from the start, 22 queries vs pgoI, CDC A/B, QA verdict on the final md5.
+- **p19 (fc23a380, version 0.68.0, test 700/0/4):** headroom once per statement; collation
+  probe gated by `collation_probe_needed` (word match on possibly-text columns; always on
+  `*`, NATURAL, column-list alias, U&, unparsable, quoted-quote names); BigQuery
+  `job_with_retry` for the copy job and single-PUT load files (≤ 8 MiB) — multi-part
+  streamed files stay un-retried (architect: accepted for 0.68.0, release note). RED p18 →
+  GREEN p19 on e2e_sql_probe_count and e2e_bq_job_retry; WAN Q6 statements 163 → 161,
+  first statement → first COPY 3.30 → 2.90 s. **RelF.go created 2026-11-19 ~19:30**: PGO
+  wheel pgoP19 → 22 queries → WAN → one full gate (BQ + old wheels from the start) → CDC
+  A/B, cages. QA (own build, then attack on the collation gate) runs in parallel.
+- **QA FINDING 5 on p19 (class a, 2026-11-19 ~19:40; chainRelF stopped before it started):**
+  source types that arrive as `(col)::text` but do not order/compare like text are ordered,
+  MIN/MAXed and in part grouped by the bytes of their text form. Postgres: 19 types wrong
+  (enum, inet/cidr, interval, timetz, arrays, unconstrained numeric 1.0/1.00, float NaN/-0,
+  jsonb, money, pg_lsn, oid, domain over int, ranges, composite, tsvector; json/xml/point
+  answered where the server refuses). MySQL: ENUM, SET, TIME, JSON. MIN/MAX and DISTINCT on
+  them are NEW in round P (0.67.2 refused); ORDER BY and some GROUP BY wrongs exist in
+  0.67.2. Also engine-evaluated predicates over a CTE column (`e > 'alpha'` 3 vs 1).
+  The p19 probe gate itself passed QA (39 cases).
+- **p20 design (architect, approved plan of engineer #5):** `ArrowField.ord` by allowlist at
+  schema time — Collated / ByteExact / EqOnly / Opaque, default Opaque; ORDER BY, top-N,
+  MIN/MAX, engine `< >` need Collated or ByteExact; GROUP BY, DISTINCT, COUNT(DISTINCT)
+  need EqOnly; refusals up front by one shared helper (column, type, use, remedy);
+  projection always works. Native fixes: domains → base type (domain over int becomes Int;
+  release note), unconstrained numeric decimal-text comparator + normalised keys (not a
+  refusal — ordinary data), float -0/NaN per source. Deferred with a named refusal: native
+  enum order, oid unsigned decode, MySQL TIME unless the native decode is small. PG enum
+  `=`/`IN` against a literal stays allowed. inet '/32' rendering unchanged (same in 0.67.2).
+  Size ~600–700 lines + leg e2e_sql_type_order.py (RED p19 / GREEN p20).
+- **QA on p19 (2026-11-19 ~21:00):** item B headroom-once GREEN (L4 mix 17/17 and 26/26
+  twice, wheel I RED; role limits 1–3 with held and mid-statement sessions exact or named;
+  observation: at limit 2 a star query is refused at 1 free but waits and answers at 0 free).
+  Item C BigQuery retry GREEN (append/replace with injected backendError exact, 0
+  duplicates; non-retryable refused by name; exhausted → named, target untouched; kill -9
+  at 3/6/9/12 s then rerun exact, 0 duplicates; Ctrl-C releases the lease). Two findings
+  outside the retry: **C1** SIGTERM on a bulk run exits 143 without cleanup, lock + staging
+  stay, next run refused by name (pre-existing by design, shutdown.rs — the signal
+  Airflow/K8s/systemd/docker stop send; same gap the Cloud Run study found); **C2** the
+  remedy names one residue table per failed run (lock, staging_0, staging_1 → three runs).
+  Architect: neither blocks 0.68.0 (named refusal with a working remedy, no wrong data);
+  C2 goes into the next p-build if one is needed anyway, else release note; C1 = first item
+  next round (bulk SIGTERM → discard + release_lock), also the Cloud Run prerequisite.
+- **p20 (f4b6352f, test 704/0/4):** FINDING 5 fix as designed; e2e_sql_type_order RED p19
+  (120 XX) → GREEN p20 (371/0); 26/26 SQL regression legs. QA on p20: all type sweeps incl.
+  types off the list and 18 hostile numerics exact or refused by name, binary/NULL siblings
+  exact, B and C verdicts carry (code identical). **One defect, class b:** behind a CTE the
+  class refusal comes after the stage was read (ORDER BY enum; `e > 'alpha'`,
+  `ip = '…'`, `iv = '1 day'`). p20 will not ship.
+- **p21 = p20 + (1) every class check before any read** — engineer's design: a dry pass
+  plans the whole stage chain over empty stage answers (task-local SQL_DRY, stops after
+  plan_probed, per-statement schema/estimate cache so no extra round trips) and returns
+  only class refusals; architect's conditions: no side effects (dest DDL, slots, lease,
+  spill, state), no connection the real run then lacks, run-time checks stay as a second
+  line with a debug assertion, a dry-pass failure can only fall through, planning overhead
+  measured; **(2) QA C2:** one refusal lists all residue of a dead bulk run
+  (naming.rs blocker_error_all). chainRelF1 on p20 cut after the PGO build so p21 is not
+  delayed; timed checks run on pgoP21 only.
+- **QA D1/D2 on p20 (pre-existing, same on p18; 2026-11-19 ~22:10):** **D1 class a** — an
+  incremental view whose Postgres source table was dropped and recreated keeps answering
+  "ok, 0 change image(s)" forever (publication silently lost the table and is reused), even
+  after the documented reset. **D2 class b** — a view grouped by inet dies on the first
+  UPDATE/DELETE ("state out of step"): bootstrap key is COPY `::text` '10.0.0.2/32', stream
+  key is the output text '10.0.0.2'. Architect: **p22 = p21 + dry-pass contract (B1/B4) +
+  D1 + D2.** D1: every run verifies publication coverage and table identity (pg_class oid
+  kept in state; old state adopted); first run adds the table before the snapshot; a drain
+  with a hole takes the lost-position path (named refusal or on_lost="rebootstrap"), never
+  "ok". D2: one shared normalisation for bootstrap and stream spellings; unprovable types
+  refused as view keys. QA is extending both to log_based CDC and MySQL (drop+recreate,
+  rename swap, inet as PK, role-level DateStyle/IntervalStyle/bytea_output).
+- **p21 (b932b14e, test 705/0/4; 2026-11-19 ~23:20):** type_order RED p20 (13 XX) → GREEN
+  (14 shapes refused with 0 reads, PG log + MySQL general_log); residue list RED → GREEN on
+  pg/my/ch; QA: dry pass refuses with 0 reads on its own harness, no side effects (16
+  refusals, full catalog diff), C2 GREEN on pg/my/ch/bq, plim3 22/22 as p19, COL/C10/MMP/DT/
+  L1 verdicts as p20, statement counts identical (one extra collation probe on a refused
+  nondeterministic GROUP BY — class c, next round). **Defect (engineer's leg):** pool_many
+  623 s vs 360 s bound — the dry pass waited ACQUIRE_WAIT for a planning connection, then
+  the run waited again. D1 confirmed views-only (CDC already guards oid + publication;
+  QA: 8 DDL variants pg, and MySQL/MariaDB drop+recreate/rename swap, all exact or named).
+  D2 confirmed pre-existing on 0.67.2/p18/p20: inet PK (any role) and interval PK under
+  IntervalStyle ≠ postgres diverge pg→ch (2 source rows → 4).
+- **p22 = release candidate:** p21 + dry pass never waits for a connection and is skipped
+  without stages + views use CDC's ensure_publication and carry `#oid=` in the position
+  (old positions adopted) + catalog-driven output-function rendering (pg_cast castmethod
+  'f') + read connections pin intervalstyle/datestyle/extra_float_digits/bytea_output in
+  the existing SET + TRUNCATE-under-view message. Behaviour changes for the notes: inet
+  prints as Postgres displays it; log_based tables with inet/cidr (or interval under a
+  non-default IntervalStyle) bootstrapped before 0.68.0 → re-bootstrap once; domain over
+  int reads as Int. Known next-round items: bulk SIGTERM cleanup (C1), schema probe sent
+  twice per table, pool_many 300 s wait at limit 4, MySQL TIME native decode, native enum
+  order, limit-2 refuse-at-1-free vs wait-at-0-free.
+- **p22 (fcbd9c51, test 707/0/4; 2026-11-20 ~00:20):** QA own build identical; D2 keys 68/68
+  (17 PK types × pg→ch/pg→pg × 2 roles) exact, plain columns one spelling, changelog lane
+  consistent; views D1/D2 GREEN (drop+recreate / rename swap / unpublished → named; reset
+  re-adds the table; 0.67.2 and p18 views adopted; inet group EQUAL); output change
+  confined to inet host values; refusal-before-read 27/27, side effects clean. Engineer:
+  live_recreate RED p21 → GREEN p22, 31/32 legs (1 leg bug), pool_many 329 s (p21: 623 s),
+  BYTEDIFF identical over 28 non-inet types, trivial single-stage statements flat.
+  **Not shipping:** timed m23 — Q21 opens 30 vs 28 Postgres connections; WAN 50 ms 2-stage
+  pg×my CTE 6.5 → 6.8 s every round (first statement → first COPY 2.85 → 3.46 s): the dry
+  pass opens/closes its own planning connections and the run reconnects. Q6/Q9 equal, Q15
+  faster on wall with a later first COPY.
+- **p23 = p22 + dry pass hands its planning connections to the run + nondeterministic
+  refusal returned from the dry pass + APITAP_TEST_DRY_NO_CONN lever.** Gates: connections
+  per statement ≤ p20 on both sources; WAN CTE2/Q9/Q15/Q21 ≤ p20 + 0.1 s; refused
+  statement leaves zero connections; role-limit legs and QA's shortage runs unchanged.
+- **p23 (0872ff5a): wrong by construction** — the dry pass's kept connections went into
+  stage 1's planning scope and its close_planning closed them all, so stage 2 reconnected
+  (WAN CTE2 still +0.3 s, Q21 +2.4 s). Never shipped, never QA'd.
+- **p23b (db70fe0e, test 715/0/4, sql.rs only) = release candidate (2026-11-20 ~04:00):**
+  kept connections live in STMT_PLAN.conns, a stage takes its source's connection on first
+  use, execute_scoped closes only its own sources, statement_scope closes the rest; 8 unit
+  tests count connects per statement. m23c (dedicated user, quiet rig): connections per
+  statement ≤ p20 on Postgres everywhere; MySQL equal except Q21 55 → 58 (in p22 too;
+  timeline pending, not blocking unless a connection is held or left). WAN 50 ms n=3 walls
+  p20 → p23b: CTE2 6.5 → 6.5, Q9 119.8 → 119.4, Q15 44.2 → 42.2, Q21 155.8 → 155.7, Q6
+  same. First COPY later on staged statements (CTE2 +0.6 s, Q15 +0.75 s, Q21 +2.3 s:
+  the dry pass plans every stage first) at equal or better wall — accepted, documented.
+  Rig rule learned: counts and WAN walls only with a dedicated user and QA fully idle
+  (two contaminated measurements this night).
+- **p23b fails QA (2026-11-20 ~05:40): hold-and-wait under connection shortage.** Role limit
+  2, 10 concurrent statements in one process: max wall 48 s (p22) → 342 s (p23b), 3
+  answerable statements refused "no connection within 30 s" (p22: 1). Each statement keeps
+  its dry pass's planning connections while waiting for more. No wrong answers; everything
+  else clean (own build identical 715/0/4, plim3 22/22, connections per statement ≤ p20,
+  zero sessions left, Q21's +2–3 MySQL connections short-lived: none idle > 0.21 s →
+  Q21 question closed, not blocking). Engineer's 32 legs 31/32: e2e_sql_live case 7 failed
+  once in four (stale copy refused correctly; the failing condition — owner drain exit or
+  destination ≠ Postgres — was not printed). Not accepted as "flaky": N=20 p23b / 20 p20 /
+  10 rel0672 with all four conditions printed, before any release chain.
+- **p23c rule (architect): a statement never holds a kept planning connection while it
+  waits for another connection** — every waiting acquire first releases all kept
+  connections; kept connections count as held in headroom; none idle across a long read.
+  Unit test with a pool hook (RED on p23b's behaviour), registered shortage leg (limit 2/3,
+  10 concurrent, bound 120 s), m23c again for the WAN gain. Fallback if the rule kills the
+  gain: p22 behaviour (close after the dry pass) and accept +1 connect per extra source on
+  staged statements — decided with numbers.
+- **p23c decision (architect, 2026-11-20 ~06:10):** engineer's "never hold while waiting"
+  design (process-wide registry, 2 s timers, bounded quick attempts, three more files)
+  REJECTED as too much machinery for 0.3 s. My replacement premise (make the run's planning
+  connection lazy) was wrong: planning is already lazy; p22's extra connect is the LIVE
+  headroom question of each source whose first stage is a later one (CTE2: MySQL +1; Q21:
+  Postgres +2). Chosen: **p23c = p22 + nondeterministic refusal from the dry pass +
+  APITAP_TEST_DRY_NO_CONN lever + shortage leg e2e_sql_pool_staged.py + connect-count unit
+  tests; nothing kept, all p23/p23b handover code removed.** Gate relaxed knowingly:
+  connections ≤ p20 + one per later-stage source; WAN CTE2 ≤ p20 + 0.4 s, Q21 ≤ +2%,
+  Q9/Q15 ≤ +0.1 s, Q6 unchanged. Release note: refusing before any read costs one planning
+  connect per source first read by a later stage. Next round: the dry pass asks headroom
+  on its open connection (stale-answer trade-off, own shortage test).
+- **QA stall-frequency study (2026-11-20 06:13–07:22, limit 2, 10 concurrent, N=10 per
+  wheel interleaved, fresh role per round, pg_stat_activity sampled):** stalled rounds
+  (wall > 120 s) p20 3/10, p22 4/10, **p23b 1/10**; rel0672 0/10 because it never waits
+  (30 s, raw "pool timed out" on 61/100 statements). All 8 stalls on every wheel: both role
+  connections idle in transaction 294–340 s (snapshot holders: each statement pins, then
+  waits for a read connection); no persistent plain-idle session → kept planning
+  connections not implicated. 39 rounds: no wrong answer, no raw pool error. My earlier
+  "p23b regressed, hold-and-wait on kept connections" was WRONG (one round, no control);
+  QA's back-to-back control on p22 (334.5 s) overturned it.
+- **FINAL DECISION: p23b (db70fe0e) is the 0.68.0 candidate, unchanged.** p23c shelved
+  (reports/round-p/p23c-work/). e2e_sql_pool_staged.py unregistered for this release
+  (would fail at random on the pre-existing stall); matrix back to 310. Next round, with
+  that leg as RED: (b) snapshot holder + first read connection all-or-none, (a) release
+  kept connections before the per-stage pin, (c) no pin for a read-once source below
+  headroom 3; plus the dry pass asking headroom on its open connection. Documented limit
+  for 0.68.0: role limit 2 with ~10 concurrent statements may wait ~5 min before a named
+  refusal or an exact late answer (0.67.2: raw failure at 30 s).
+- **REVERSAL (2026-11-20 ~09:00): p23b is OUT.** QA insisted on limit 3 after the
+  favourable limit-2 table: at role limit 3 (N=15 per wheel, interleaved, fresh roles)
+  p22 stalled 0/15 (max 95 s), p23b 8/15 (max 359 s, median 314 s; 19 answerable
+  statements refused vs 4). All stalls = three snapshot holders idle in transaction; no
+  plain-idle kept session visible at 0.25 s sampling — the handover shifts WHEN statements
+  pin (limit 2: 1/10 vs 4/10; limit 3: 8/15 vs 0/15). Rule fixed before the data (≥ p22+4
+  → handover implicated) applied. My "pooled 4/15 vs 4/15, one common rate" reading was
+  wrong. No wrong answers anywhere.
+- **Candidate: p23c = p22 behaviour (nothing kept) + nondeterministic refusal from the dry
+  pass + APITAP_TEST_DRY_NO_CONN + connect-count unit tests.** Cost accepted and to be
+  documented: +1 planning connect per source first read by a later stage (WAN 50 ms: 2-stage
+  pg×my CTE 6.5 → 6.8 s). Gates: QA stall study p22 vs p23c (limit 3 N=15, limit 2 N=10:
+  ≤ p22 + 2), m23c with revised bounds, 32 legs. Handover (p23/p23b) rejected on
+  evidence; not to be retried before the snapshot-holder all-or-none fix.
+- **Open correctness question (blocks the chain on any wheel):** e2e_sql_live case 8 failed
+  once in 20 on p20 with the owner's drain exiting 0 (either a silent re-bootstrap or
+  destination ≠ Postgres); case 7 clean 40/40. Code reading finds no gap in the drain's
+  upper bound nor any way a refused run touches the owner's slot. Instrumented loop running.
+- **SIMPLIFICATION (2026-11-20 ~09:15, after the owner asked why it got longer): the
+  candidate is p22 (fcbd9c51) AS BUILT — no p23c build.** p23c = p22 + one saved round trip
+  on a refused nondeterministic statement behind a CTE + a test lever; p22 is built, QA's
+  own build is identical, and it is verified almost end to end (D2 68/68, views, spelling,
+  refusal-before-read, side effects, 31/32 legs, stall study 0/15 at limit 3). Its only
+  reason for rejection was the +0.3 s WAN cost on staged multi-source statements, now
+  accepted. Next round: the doubled collation probe behind a CTE, the dry-pass lever
+  (code in reports/round-p/p23c-work/), and everything listed above. Remaining before the
+  chain: the case-8 question; QA's gaps on p22 (plim3, quiet statement counts, pstale).
+- **QA FINAL VERDICT on p22 (2026-11-20 ~09:25): shippable** — 13 items, no wrong answer, no
+  unnamed refusal (reports/round-p/qa-verdict-final-p22.md). Limit 4: p22 0/5, p23b 0/5.
+- **Case 7/8 status:** one failure captured with full evidence (p20, 09:04 UTC): the view's
+  slot was dropped by our own benchmarks/pgo-build.sh (lines 77/102 sweep every inactive
+  apitap_% slot); the owner re-bootstrapped honestly; destination = Postgres. Two earlier
+  failures (gate on p23b ~04:40, p20-16 at 08:09) stay UNEXPLAINED: QA dropped no slot
+  then, no cron/timer exists, the leg did not yet print the slot state. No evidence of
+  wrong data anywhere; QA's independent harness 20/20 clean on p22. Carried to the owner
+  as the one open item at publish time. Next round: pgo-build.sh drops only its own slot;
+  leg gets an independent bootstrap signal.
+- **Release chain on p22 (pgoP22):** first PGO build failed at training on residue of the
+  PGO build killed 2026-11-19 22:04 (staging table on my-dst → LockedError; = QA's C1
+  biting our own tooling); dropped by exact name, destinations swept, rebuilt from 09:01.
