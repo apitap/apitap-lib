@@ -131,7 +131,9 @@ jobs:
       # would otherwise publish beside the new ones.
       - name: Every file is this release's
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          # The version is the tag up to its first "-": a publish that has to be
+          # run again gets a fresh tag name (v0.68.0-pypi), never a re-pushed one.
+          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
           ls -la dist/
           bad=$(ls dist/ | grep -v -- "apitap-${v}[-.]" || true)
           if [ -n "$bad" ]; then echo "not version $v: $bad"; exit 1; fi
