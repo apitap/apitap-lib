@@ -55,8 +55,17 @@ async fn connect_pool(url: &str, max: u32) -> Result<PgPool> {
                 // for every lane.
                 sqlx::Executor::execute(&mut *conn, "SET timezone = 'UTC'").await?;
                 // A text-mode bytea is `\x` hex everywhere apitap reads it,
-                // whatever the role or database sets (deep review D33).
-                sqlx::Executor::execute(conn, "SET bytea_output = 'hex'").await?;
+                // whatever the role or database sets (deep review D33). And
+                // every value rendered as text spells as a logical
+                // replication subscriber's walsender renders it (p22, QA: a
+                // role with IntervalStyle = postgres_verbose bootstrapped
+                // '@ 1 day' while the stream sent '1 day'): the same
+                // round trip, one simple-query batch.
+                sqlx::Executor::execute(
+                    conn,
+                    "SET bytea_output = 'hex'; SET intervalstyle = 'postgres'; SET datestyle = 'ISO'; SET extra_float_digits = 3",
+                )
+                .await?;
                 Ok(())
             })
         })
@@ -266,9 +275,25 @@ impl Source for PgSource {
                     CASE WHEN t.typname = 'numeric' AND a.atttypmod >= 4 \
                          THEN (((a.atttypmod - 4) >> 16) & 65535) END AS p, \
                     CASE WHEN t.typname = 'numeric' AND a.atttypmod >= 4 \
-                         THEN ((((a.atttypmod - 4) & 2047) # 1024) - 1024) END AS s \
+                         THEN ((((a.atttypmod - 4) & 2047) # 1024) - 1024) END AS s, \
+                    b.udt AS b_udt, b.typtype AS b_typtype, b.cat AS b_cat, \
+                    CASE WHEN EXISTS (SELECT 1 FROM pg_cast pc WHERE pc.castsource = b.toid \
+                                      AND pc.casttarget = 'text'::regtype AND pc.castmethod = 'f') \
+                         THEN (SELECT bt2.typoutput::text FROM pg_type bt2 WHERE bt2.oid = b.toid) END AS b_out, \
+                    CASE WHEN b.udt = 'numeric' AND b.tm >= 4 THEN (((b.tm - 4) >> 16) & 65535) END AS b_p, \
+                    CASE WHEN b.udt = 'numeric' AND b.tm >= 4 THEN ((((b.tm - 4) & 2047) # 1024) - 1024) END AS b_s \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
+             LEFT JOIN LATERAL ( \
+               WITH RECURSIVE d(toid, typtype, typbasetype, typname, typcategory, tm, lvl) AS ( \
+                 SELECT t.oid, t.typtype, t.typbasetype, t.typname, t.typcategory, \
+                        CASE WHEN a.atttypmod >= 0 THEN a.atttypmod ELSE t.typtypmod END, 0 \
+                 UNION ALL \
+                 SELECT bt.oid, bt.typtype, bt.typbasetype, bt.typname, bt.typcategory, \
+                        CASE WHEN d.tm >= 0 THEN d.tm ELSE bt.typtypmod END, d.lvl + 1 \
+                 FROM pg_type bt JOIN d ON bt.oid = d.typbasetype WHERE d.typtype = 'd' AND d.lvl < 32) \
+               SELECT toid, typname AS udt, typtype::text AS typtype, typcategory::text AS cat, tm \
+               FROM d ORDER BY lvl DESC LIMIT 1) b ON true \
              WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
         )
@@ -317,6 +342,18 @@ impl Source for PgSource {
                     scale: r.get("s"),
                     nullable: r.get("nullable"),
                     name,
+                    // Past every domain (p20): what a read decodes and
+                    // apitap.sql() classifies.
+                    base: r.get::<Option<String>, _>("b_udt").map(|udt| {
+                        Box::new(crate::plan::BaseType {
+                            udt,
+                            typtype: r.get::<Option<String>, _>("b_typtype").unwrap_or_default(),
+                            category: r.get::<Option<String>, _>("b_cat").unwrap_or_default(),
+                            precision: r.get("b_p"),
+                            scale: r.get("b_s"),
+                            text_out: r.get("b_out"),
+                        })
+                    }),
                 }
             })
             .collect();
@@ -409,7 +446,7 @@ impl Source for PgSource {
                         // Anything else rides as text — lossless, if not the tightest type.
                         _ => LaneCol {
                             delivered: Delivered::Text,
-                            select: format!("{pq}::text"),
+                            select: pg_text_expr(&pq, c),
                         },
                     },
                 }
@@ -776,6 +813,18 @@ impl<L: Loader> PipeBody<L> for PgBody {
 
 /// Nominal delivery for a Postgres type (what a NON-Postgres sink would declare when
 /// the value arrives through a binary lane).
+/// A column as text the way the type's OUTPUT function spells it — what
+/// pgoutput sends — where `::text` is a cast function of its own (p22:
+/// inet's `text(inet)` keeps the /32 that `inet_out` drops, so a log_based
+/// bootstrap and its stream spelled one key two ways). Every other type
+/// keeps `::text` byte for byte (its cast IS the I/O conversion).
+pub(crate) fn pg_text_expr(pq: &str, c: &ColumnPlan) -> String {
+    match c.base.as_deref().and_then(|b| b.text_out.as_deref()) {
+        Some(out) if out.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => format!("(pg_catalog.{out}({pq}))::text"),
+        _ => format!("{pq}::text"),
+    }
+}
+
 fn delivered_of_udt(c: &ColumnPlan) -> Delivered {
     match c.udt.as_str() {
         "int2" => Delivered::Int {

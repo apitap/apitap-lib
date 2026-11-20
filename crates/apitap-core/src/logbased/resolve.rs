@@ -283,7 +283,11 @@ impl Source<'_> {
                 if oid == BYTEA_OID {
                     format!("'\\x' || encode({q}, 'hex')")
                 } else {
-                    format!("{q}::text")
+                    // The type's output function, as pgoutput renders it
+                    // (p22: `::text` is a cast of its own for inet, which
+                    // keeps a /32 the WAL drops). A masked (unchanged TOAST)
+                    // cell is never NULL, so `format` is exact here.
+                    format!("format('%s', {q})")
                 }
             })
             .collect::<Vec<_>>()

@@ -1111,6 +1111,7 @@ impl Source for MySqlSource {
                     .try_get::<Option<u64>, _>("s")
                     .unwrap_or(None)
                     .map(|v| v as i32),
+                    base: None,
             };
             // Fail fast, with the type name, instead of at lane planning.
             my_rb(&col)?;
@@ -2100,6 +2101,7 @@ mod tests {
             udt: udt.into(),
             precision: p,
             scale: s,
+            base: None,
         };
         let mut cases: Vec<ColumnPlan> = Vec::new();
         for udt in [
@@ -2239,6 +2241,7 @@ mod tests {
             udt: udt.into(),
             precision: p,
             scale: s,
+            base: None,
         }
     }
 

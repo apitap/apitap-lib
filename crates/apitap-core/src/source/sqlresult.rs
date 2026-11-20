@@ -201,6 +201,7 @@ impl Source for SqlResultSource {
                         udt: u.into(),
                         precision: p,
                         scale: s,
+                        base: None,
                     }
                 })
                 .collect(),

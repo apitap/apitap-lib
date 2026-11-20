@@ -135,42 +135,62 @@ impl Changes {
     /// replaying the log sees the old key die before the new one appears —
     /// the same ordering the collapsed path encodes as delete-then-upsert —
     /// and its `U` names the old key in `moved_from`.
-    pub(crate) fn update(&mut self, old: Option<&Tuple>, row: Tuple) {
+    pub(crate) fn update(&mut self, old: Option<Tuple>, row: Tuple) {
         self.count += 1;
         // An out-of-line key the UPDATE left alone arrives unchanged-TOAST;
         // read as `[""]` it made every such update a move, and the carry of
         // the row's resolved cells went under the wrong key (D7).
-        let row = match old {
+        let row = match &old {
             Some(o) => crate::logbased::collapse::key_from_old(self.layout.key_idx(), o, row),
             None => row,
         };
         self.note_mask(&row);
-        let mut moved_from = None;
         let pk_idx = self.layout.key_idx();
-        if let Some(old) = old {
-            let from = key_of(old, pk_idx);
-            if from != key_of(&row, pk_idx) {
+        match old {
+            Some(old) if !key_eq(&old, &row, pk_idx) => {
+                // The old key dies first, carrying the old image (moved, not
+                // cloned: round P, L14b — a view of a table without a primary
+                // key moves on every update, and a copy a row doubled the
+                // body at the commit).
+                //
+                // The U names where the row was (`moved_from`). Only mask
+                // resolution reads that key's bytes, and only for a row with
+                // unchanged-TOAST cells; any other move keeps an empty
+                // marker, which every reader takes as "moved" (round P, L14b:
+                // the key a cell at a time was 16 allocations a row on a
+                // 16-column identity).
+                let masked = (0..row.len()).any(|i| matches!(row.view(i), Cellv::UnchangedToast));
+                let from = if masked { key_of(&old, pk_idx) } else { CKey::new() };
                 self.push(
                     Change {
                         op: ChangeOp::Delete,
-                        row: Some(old.clone()),
+                        row: Some(old),
                         moved_from: None,
                     },
                     None,
                 );
-                moved_from = Some(Box::new(from));
+                // The old image rides with the U only when no D carried it.
+                self.push(
+                    Change {
+                        op: ChangeOp::Update,
+                        row: Some(row),
+                        moved_from: Some(Box::new(from)),
+                    },
+                    None,
+                );
+            }
+            old => {
+                let old_img = if self.olds.is_some() { old } else { None };
+                self.push(
+                    Change {
+                        op: ChangeOp::Update,
+                        row: Some(row),
+                        moved_from: None,
+                    },
+                    old_img,
+                );
             }
         }
-        // The old image rides with the U only when no D carried it.
-        let old_img = if moved_from.is_none() && self.olds.is_some() { old.cloned() } else { None };
-        self.push(
-            Change {
-                op: ChangeOp::Update,
-                row: Some(row),
-                moved_from,
-            },
-            old_img,
-        );
     }
 
     pub(crate) fn delete(&mut self, old: Tuple) {
@@ -353,6 +373,19 @@ impl Changes {
 /// wire shape, not a bug, so this reads through `get` and treats a missing or
 /// non-text cell as empty — the same shape the collapse path's typed error
 /// path produces, without the panic.
+/// Whether two images hold the same key, as [`key_of`] would read them
+/// (text cells by their bytes, anything else as empty), without building
+/// either key.
+fn key_eq(a: &Tuple, b: &Tuple, pk_idx: &[usize]) -> bool {
+    fn cell(r: &Tuple, i: usize) -> &[u8] {
+        match r.get(i) {
+            Some(Cellv::Text(t)) => t,
+            _ => &[],
+        }
+    }
+    pk_idx.iter().all(|&i| cell(a, i) == cell(b, i))
+}
+
 fn key_of(row: &Tuple, pk_idx: &[usize]) -> CKey {
     pk_idx
         .iter()
@@ -407,23 +440,42 @@ mod tests {
     #[test]
     fn pk_change_emits_delete_of_the_old_identity_first() {
         let mut c = two();
-        c.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("9"), t("a")]));
+        c.update(Some(row(&[t("1"), Cell::Null])), row(&[t("9"), t("a")]));
         let ops: Vec<ChangeOp> = c.events.iter().map(|e| e.op).collect();
         assert_eq!(ops, vec![ChangeOp::Delete, ChangeOp::Update]);
         // …but it is ONE source event.
         assert_eq!(c.count, 1);
-        // The U half names where the row was; the D half is that key itself.
+        // The U half is marked as moved; the D half is that key itself and
+        // carries the old image. With no unchanged-TOAST cell nothing reads
+        // the old key's bytes, so the marker is empty (round P, L14b).
         assert_eq!(c.events[0].moved_from, None);
-        assert_eq!(
-            c.events[1].moved_from.as_deref(),
-            Some(&vec![b"1".to_vec()])
-        );
+        assert_eq!(c.events[0].row.as_ref().map(|r| r.view(0)), Some(Cellv::Text(&b"1"[..])));
+        assert_eq!(c.events[1].moved_from.as_deref(), Some(&Vec::<Vec<u8>>::new()));
+    }
+
+    /// A key move of a masked row keeps the old key's bytes: mask
+    /// resolution reads the untouched cells there (round P, L14b).
+    #[test]
+    fn a_masked_key_move_keeps_the_old_key() {
+        let mut c = three();
+        c.update(Some(row(&[t("1"), Cell::Null, Cell::Null])), row(&[t("9"), t("a"), Cell::UnchangedToast]));
+        assert_eq!(c.events[1].moved_from.as_deref(), Some(&vec![b"1".to_vec()]));
+    }
+
+    /// The comparison without building keys agrees with `key_of`.
+    #[test]
+    fn key_eq_reads_keys_as_key_of_does() {
+        let a = row(&[t("1"), t("x"), Cell::Null]);
+        let b = row(&[t("1"), t("y"), Cell::UnchangedToast]);
+        for idx in [&[0usize][..], &[0, 1], &[0, 2], &[2], &[0, 5]] {
+            assert_eq!(key_eq(&a, &b, idx), key_of(&a, idx) == key_of(&b, idx), "{idx:?}");
+        }
     }
 
     #[test]
     fn same_key_update_does_not_emit_a_delete() {
         let mut c = two();
-        c.update(Some(&row(&[t("1"), Cell::Null])), row(&[t("1"), t("z")]));
+        c.update(Some(row(&[t("1"), Cell::Null])), row(&[t("1"), t("z")]));
         assert_eq!(c.events.len(), 1);
         assert_eq!(c.events[0].op, ChangeOp::Update);
         assert_eq!(c.events[0].moved_from, None);
@@ -481,9 +533,9 @@ mod tests {
         // REPLICA IDENTITY FULL); (b) only the destination holds it, at key 1.
         let mut a = three();
         a.insert(big());
-        a.update(Some(&big()), masked("9", "b"));
+        a.update(Some(big()), masked("9", "b"));
         let mut b = three();
-        b.update(Some(&key_only("1")), masked("9", "b"));
+        b.update(Some(key_only("1")), masked("9", "b"));
         assert_eq!(
             [bodies(&a, &[]), bodies(&b, &[("1", "OLD")])],
             [
@@ -502,7 +554,7 @@ mod tests {
         // reads next.
         let mut d = three();
         d.insert(big());
-        d.update(Some(&key_only("1")), masked("9", "b"));
+        d.update(Some(key_only("1")), masked("9", "b"));
         assert_eq!(bodies(&d, &[]), Ok(vec![(2, "BIG".to_string())]));
 
         // (e) after an in-window TRUNCATE, neither the destination's row nor
@@ -520,8 +572,8 @@ mod tests {
         // (f) a chain 1→9→5, then a masked update at 5: each event finds the
         // body resolved where the row now is, the destination read at 1 only.
         let mut f = three();
-        f.update(Some(&key_only("1")), masked("9", "b")); // D 0, U 1
-        f.update(Some(&key_only("9")), masked("5", "c")); // D 2, U 3
+        f.update(Some(key_only("1")), masked("9", "b")); // D 0, U 1
+        f.update(Some(key_only("9")), masked("5", "c")); // D 2, U 3
         f.update(None, masked("5", "d")); // U 4
         assert_eq!(
             bodies(&f, &[("1", "OLD")]),
@@ -540,9 +592,9 @@ mod tests {
     fn an_unchanged_out_of_line_key_is_not_a_move() {
         let mut c = three();
         let old = row(&[t("K"), Cell::Null, Cell::Null]);
-        c.update(Some(&old), row(&[Cell::UnchangedToast, t("t1"), t("NEW")]));
+        c.update(Some(old.clone()), row(&[Cell::UnchangedToast, t("t1"), t("NEW")]));
         c.update(
-            Some(&old),
+            Some(old),
             row(&[Cell::UnchangedToast, t("t2"), Cell::UnchangedToast]),
         );
         assert_eq!(c.events.len(), 2, "an unchanged key made a D half");

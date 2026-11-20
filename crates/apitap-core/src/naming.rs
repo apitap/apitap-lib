@@ -791,6 +791,39 @@ pub(crate) fn blocker_error(
     }
 }
 
+/// [`blocker_error`] naming EVERY object of the blocker's run in one
+/// refusal (p21, QA C2): a dead bulk run leaves its lock and each worker's
+/// staging, and one name per refusal had the operator remove them one run
+/// at a time. Only objects under the SAME run token are listed, so another
+/// run's objects are never offered for removal; nothing is collected.
+pub(crate) fn blocker_error_all(
+    dest: &str,
+    b: &Blocker,
+    all: &[Blocker],
+    now: u64,
+    lease: Option<&crate::lease::Lease>,
+) -> crate::error::Error {
+    let Blocker::Live { peer, mine, .. } = b else {
+        return blocker_error(dest, b, now, lease);
+    };
+    let mut names: Vec<&str> = Vec::new();
+    for x in all {
+        if let Blocker::Live { name, peer: p, .. } = x {
+            if p.token == peer.token && !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+    }
+    if names.len() <= 1 {
+        return blocker_error(dest, b, now, lease);
+    }
+    let listed = match names.split_last() {
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    locked_error(dest, &listed, mine, peer, now, lease)
+}
+
 /// May `mine` proceed while `peer` is running?
 ///
 /// The matrix, and the reasoning for each cell:
@@ -1862,6 +1895,36 @@ mod tests {
             None => Ok(()),
             Some(b) => Err(blocker_error("public.orders", b, now_unix(), None)),
         }
+    }
+
+    /// p21 (QA C2): a dead run's lock and every one of its staging objects
+    /// are named in the FIRST refusal, and another run's objects are not.
+    #[test]
+    fn one_refusal_names_every_object_of_the_dead_run() {
+        let mine = RunId::mint_token(LandKind::Swap, "postgres://h:5432/db");
+        let dead = RunId::mint_token(LandKind::Incremental, "postgres://other:5432/db");
+        let other = RunId::mint_token(LandKind::Incremental, "postgres://third:5432/db");
+        let lock = artifact_ident_run("orders", Artifact::Lock, PG_IDENT_MAX, &dead);
+        let staging = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &dead);
+        let theirs = artifact_ident_run("orders", Artifact::Staging, PG_IDENT_MAX, &other);
+        let scan = blockers(
+            "orders",
+            PG_IDENT_MAX,
+            &mine,
+            GUARDED,
+            [lock.as_str(), staging.as_str(), theirs.as_str()].into_iter().map(|n| (n, n)),
+        );
+        let first = scan.blockers.iter().find(|b| matches!(b, Blocker::Live { peer, .. } if peer.token == dead.token())).expect("the dead run blocks");
+        let msg = blocker_error_all("public.orders", first, &scan.blockers, now_unix(), None).to_string();
+        assert!(msg.contains(&lock) && msg.contains(&staging), "every object of the dead run: {msg}");
+        assert!(!msg.contains(&theirs), "never another run's object: {msg}");
+        assert!(msg.contains(" and "), "{msg}");
+        // One object: the refusal reads exactly as before.
+        let one = blockers("orders", PG_IDENT_MAX, &mine, GUARDED, std::iter::once((lock.as_str(), lock.as_str())));
+        assert_eq!(
+            blocker_error_all("public.orders", &one.blockers[0], &one.blockers, 7, None).to_string(),
+            blocker_error("public.orders", &one.blockers[0], 7, None).to_string()
+        );
     }
 
     #[test]

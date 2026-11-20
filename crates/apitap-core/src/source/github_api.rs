@@ -844,6 +844,7 @@ impl Source for GithubApiSource {
                     udt: col.udt.into(),
                     precision: None,
                     scale: None,
+                    base: None,
                 })
                 .collect(),
             cursor: None,

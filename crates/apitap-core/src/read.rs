@@ -93,6 +93,110 @@ pub struct ArrowField {
     /// an ORDER BY on it can ask that server how its collation orders a pair
     /// (`sql::order::verify`). `None` for a source table's own columns.
     pub origin: Option<String>,
+    /// apitap.sql() (p20): how this column's values compare as the text (or
+    /// number) apitap holds them in, against how the source compares them
+    /// (`TypeOrder`). Text proper is `Collated`; a type read as its text
+    /// form (an enum, inet, interval, json, …) is only as good as its class,
+    /// and a use it cannot carry is refused by name before any read.
+    pub tord: TypeOrder,
+}
+
+/// How a column's values compare in apitap.sql() against how its source
+/// compares them (p20, QA type sweep): an ALLOWLIST keyed on how the value
+/// arrives; anything not listed is `Opaque`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TClass {
+    /// Text proper (text, varchar, char, name, citext; MySQL's text types),
+    /// or a native Arrow kind: compared as today (collation path).
+    #[default]
+    Collated,
+    /// The text form's byte order is the type's own, and the source has
+    /// MIN/MAX for it (Postgres `time`).
+    ByteMinMax,
+    /// The text form's byte order is the type's own, but the source has no
+    /// MIN/MAX for it (uuid, macaddr, bit, varbit).
+    Byte,
+    /// An enum: equal labels are equal values, and a label literal is the
+    /// value itself (`= 'active'`); its order is the declaration's, not the
+    /// label's.
+    Enum,
+    /// One text form per value (equality and grouping exact), not ordered
+    /// as the value (inet, cidr, oid, pg_lsn, "char", arrays of those
+    /// element types, a MySQL SET or TIME).
+    EqOnly,
+    /// An unconstrained Postgres numeric or a MySQL DECIMAL past 38 digits
+    /// read as decimal text: compared and grouped as a decimal
+    /// (`sql::dec`), shown as the source wrote it.
+    Decimal,
+    /// Neither (interval, json/jsonb, money, timetz, ranges, composite,
+    /// tsvector, xml, geometric, anything unknown): projection only.
+    Opaque,
+}
+
+/// [`TClass`] with the source type a refusal names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypeOrder {
+    pub class: TClass,
+    pub ty: Option<std::sync::Arc<str>>,
+}
+
+impl TypeOrder {
+    pub fn new(class: TClass, ty: &str) -> TypeOrder {
+        TypeOrder { class, ty: Some(ty.into()) }
+    }
+    /// ORDER BY, top-N, an engine-evaluated `<`/`>`/BETWEEN.
+    pub fn order_ok(&self) -> bool {
+        matches!(self.class, TClass::Collated | TClass::ByteMinMax | TClass::Byte | TClass::Decimal)
+    }
+    /// MIN/MAX: ordered, and the source has the aggregate.
+    pub fn minmax_ok(&self) -> bool {
+        matches!(self.class, TClass::Collated | TClass::ByteMinMax | TClass::Decimal)
+    }
+    /// GROUP BY, DISTINCT, COUNT(DISTINCT), a join key.
+    pub fn eq_ok(&self) -> bool {
+        !matches!(self.class, TClass::Opaque)
+    }
+    /// `=` / `<>` / IN against a string literal evaluated by apitap: the
+    /// literal must be the value's own text form.
+    pub fn literal_eq_ok(&self) -> bool {
+        matches!(self.class, TClass::Collated | TClass::Enum | TClass::Decimal)
+    }
+}
+
+/// The class of a column apitap holds as Utf8, from its source type
+/// (`udt`, a Postgres domain already resolved to its base) and the
+/// Postgres type kind (`typtype`: 'e' enum, 'r'/'m' ranges, 'c'
+/// composite) and category ('A' array). Non-Utf8 columns are native.
+pub fn text_class(mysql: bool, udt: &str, typtype: &str, category: &str) -> TClass {
+    let u = udt.to_ascii_lowercase();
+    if mysql {
+        return match u.as_str() {
+            "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext" => TClass::Collated,
+            "enum" => TClass::Enum,
+            "set" | "time" => TClass::EqOnly,
+            "decimal" | "newdecimal" => TClass::Decimal,
+            _ => TClass::Opaque,
+        };
+    }
+    if typtype == "e" {
+        return TClass::Enum;
+    }
+    if category == "A" {
+        // An array of a type whose text form is one per value: equal
+        // arrays are equal texts. Order is element-wise: not the text's.
+        return match u.as_str() {
+            "_text" | "_varchar" | "_name" | "_int2" | "_int4" | "_int8" | "_uuid" | "_bool" | "_date" | "_oid" => TClass::EqOnly,
+            _ => TClass::Opaque,
+        };
+    }
+    match u.as_str() {
+        "text" | "varchar" | "bpchar" | "name" | "citext" => TClass::Collated,
+        "time" => TClass::ByteMinMax,
+        "uuid" | "macaddr" | "macaddr8" | "bit" | "varbit" => TClass::Byte,
+        "inet" | "cidr" | "oid" | "pg_lsn" | "char" => TClass::EqOnly,
+        "numeric" => TClass::Decimal,
+        _ => TClass::Opaque,
+    }
 }
 
 /// The running read: a schema and a pull side. `next_batch` blocks the
@@ -353,16 +457,27 @@ mod gate_tests {
         });
         drop(tx);
         let mut h = ReadHandle::new(Vec::new(), rx, tokio::spawn(async {}), Arc::new(AtomicBool::new(true))).with_gate(gate);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // What the producer has sent, once it reached `want` (polled with a
+        // 10 s bound, not a fixed sleep: on a loaded box the producer task
+        // may not run within 100 ms, and the test failed on the timing, not
+        // on the gate — round P p12 build). The "still waits" checks below
+        // stay a settle-then-look: a gate that leaked would show there.
+        async fn reach(sent: &AtomicUsize, want: usize) -> usize {
+            let t0 = std::time::Instant::now();
+            while sent.load(Ordering::SeqCst) < want && t0.elapsed() < std::time::Duration::from_secs(10) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            sent.load(Ordering::SeqCst)
+        }
         // 40 + 40 fit in 100 KiB; the third waits although the channel has room.
-        assert_eq!(sent.load(Ordering::SeqCst), 2);
+        assert_eq!(reach(&sent, 2).await, 2);
         assert_eq!(h.recv().await.unwrap().unwrap().rows, 40 * 128);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // In hand (40) + queued (40) still fill the gate: the third waits on.
         assert_eq!(sent.load(Ordering::SeqCst), 2);
         h.recv().await.unwrap().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(sent.load(Ordering::SeqCst), 3, "the first batch was given back");
+        assert_eq!(reach(&sent, 3).await, 3, "the first batch was given back");
         // The oversized batch waits until the gate is whole, then passes alone.
         h.recv().await.unwrap().unwrap();
         let big = h.recv().await.unwrap().unwrap();
@@ -370,5 +485,48 @@ mod gate_tests {
         assert_eq!(h.recv().await.unwrap().unwrap().rows, 10 * 128);
         producer.await.unwrap();
         assert!(h.recv().await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod type_order_tests {
+    use super::{text_class, TClass};
+
+    /// p20 (QA type sweep): the allowlist, keyed on how a value arrives.
+    /// Anything not listed is Opaque; arrays only of one-spelling element
+    /// types are EqOnly; an enum (also past a domain) is Enum.
+    #[test]
+    fn the_classification_is_an_allowlist() {
+        let pg = |u: &str| text_class(false, u, "b", "");
+        for u in ["text", "varchar", "bpchar", "name", "citext"] {
+            assert_eq!(pg(u), TClass::Collated, "{u}");
+        }
+        assert_eq!(pg("time"), TClass::ByteMinMax);
+        for u in ["uuid", "macaddr", "bit", "varbit"] {
+            assert_eq!(pg(u), TClass::Byte, "{u}");
+        }
+        for u in ["inet", "cidr", "oid", "pg_lsn", "char"] {
+            assert_eq!(pg(u), TClass::EqOnly, "{u}");
+        }
+        assert_eq!(pg("numeric"), TClass::Decimal);
+        for u in ["interval", "jsonb", "json", "money", "timetz", "tsvector", "xml", "point", "some_new_type"] {
+            assert_eq!(pg(u), TClass::Opaque, "{u}");
+        }
+        assert_eq!(text_class(false, "qa_pr_enum", "e", "E"), TClass::Enum);
+        assert_eq!(text_class(false, "int4range", "r", "R"), TClass::Opaque);
+        assert_eq!(text_class(false, "qa_ty_comp", "c", "C"), TClass::Opaque);
+        assert_eq!(text_class(false, "_text", "b", "A"), TClass::EqOnly);
+        assert_eq!(text_class(false, "_int4", "b", "A"), TClass::EqOnly);
+        assert_eq!(text_class(false, "_numeric", "b", "A"), TClass::Opaque, "1.0 and 1.00 in an array");
+        let my = |u: &str| text_class(true, u, "", "");
+        for u in ["varchar", "char", "text", "longtext"] {
+            assert_eq!(my(u), TClass::Collated, "{u}");
+        }
+        assert_eq!(my("enum"), TClass::Enum);
+        assert_eq!(my("set"), TClass::EqOnly);
+        assert_eq!(my("time"), TClass::EqOnly, "a signed duration: -01:00 and 100:00 do not order as text");
+        assert_eq!(my("json"), TClass::Opaque);
+        assert_eq!(my("decimal"), TClass::Decimal);
+        assert_eq!(my("geometry"), TClass::Opaque);
     }
 }

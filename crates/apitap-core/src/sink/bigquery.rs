@@ -1241,6 +1241,10 @@ enum ScriptErr {
     /// The job finished with an error (which committed nothing), or cannot
     /// be ours, or is still running after the poll's deadline.
     Failed(String),
+    /// Never tried again under any id: a resubmission whose own upload
+    /// failed on the way may have started a job, and a second one beside it
+    /// would load the file twice.
+    Final(String),
 }
 
 impl ScriptErr {
@@ -1253,19 +1257,19 @@ impl ScriptErr {
 
     fn message(&self) -> &str {
         match self {
-            ScriptErr::Transport(m) | ScriptErr::Failed(m) => m,
+            ScriptErr::Transport(m) | ScriptErr::Failed(m) | ScriptErr::Final(m) => m,
         }
     }
 
     fn into_error(self) -> Error {
         match self {
-            ScriptErr::Transport(m) | ScriptErr::Failed(m) => Error::Transfer(m),
+            ScriptErr::Transport(m) | ScriptErr::Failed(m) | ScriptErr::Final(m) => Error::Transfer(m),
         }
     }
 }
 
 /// What the next attempt at a job is submitted under.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Retry {
     /// The same id: this asks about the job the failed attempt may have
     /// started, and runs it only if it never started.
@@ -1295,6 +1299,7 @@ fn next_try(e: &ScriptErr, attempt: u32) -> Option<Retry> {
             _ => None,
         },
         ScriptErr::Failed(m) => (script_error_class(m) == ErrClass::Retry).then_some(Retry::NewId),
+        ScriptErr::Final(_) => None,
     }
 }
 
@@ -1340,6 +1345,191 @@ fn retryable(msg: &str) -> bool {
         || m.contains("502 ")
         || m.contains("503 ")
         || m.contains("504 ")
+}
+
+/// One bulk job (a file's load job, the copy into the final table) run to
+/// DONE under the rule every job of this sink follows (`next_try`): a
+/// transport failure asks about the SAME job again — its fate is unknown, it
+/// may have committed — and a job that finished with a transient error
+/// (`retryable`: backendError, internalError, 5xx, rate limits), which
+/// committed nothing, runs again as a NEW job, with `load_rows`' backoff and
+/// limit (5 retries, 800 ms doubling). Before 0.68.0 a bulk job was polled
+/// once and one `backendError` failed the whole replace.
+///
+/// `once(how)` makes one attempt; `can_resubmit()` says whether a new job
+/// can be started at all (a load job whose file was not kept cannot): when
+/// it cannot, the job's own failure is the answer. A non-retryable failure
+/// is never tried again.
+async fn job_with_retry<'a, T>(
+    backoff_ms: u64,
+    can_resubmit: impl Fn() -> bool,
+    mut once: impl FnMut(Retry) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<T, ScriptErr>> + Send + 'a>>,
+) -> std::result::Result<T, ScriptErr> {
+    let mut attempt = 0u32;
+    let mut how = Retry::SameId;
+    loop {
+        let e = match once(how).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        match next_try(&e, attempt) {
+            Some(Retry::NewId) if !can_resubmit() => return Err(e),
+            Some(r) => {
+                attempt += 1;
+                crate::progress::note(&format!(
+                    "bigquery bulk job: {}, retry {attempt}/5 {}",
+                    if r == Retry::NewId { "transient failure" } else { "no answer" },
+                    if r == Retry::NewId { "as a new job" } else { "asking about the same job" },
+                ));
+                if backoff_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms << attempt)).await;
+                }
+                how = r;
+            }
+            None => return Err(e),
+        }
+    }
+}
+
+/// Which bulk job `APITAP_TEST_BQ_FAIL` fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkJob {
+    Load,
+    Copy,
+}
+
+/// Test lever `APITAP_TEST_BQ_FAIL=<load|copy>:<reason>:<n>`: the next `n`
+/// bulk jobs of that kind finish as if BigQuery had answered DONE with
+/// `errorResult.reason = <reason>` — without starting them, so nothing is
+/// committed, exactly as a real failed job. A load job is failed only when
+/// its file went out in one PUT (the files a retry can send again). For the
+/// fault-injected gate leg; refused by name when set to anything else.
+fn test_fail_spec(v: &str) -> Option<(BulkJob, String, u32)> {
+    let mut it = v.trim().splitn(3, ':');
+    let kind = match it.next()? {
+        "load" => BulkJob::Load,
+        "copy" => BulkJob::Copy,
+        _ => return None,
+    };
+    let reason = it.next()?;
+    if reason.is_empty() || !reason.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let n = it.next()?.parse::<u32>().ok()?;
+    Some((kind, reason.to_string(), n))
+}
+
+/// `APITAP_TEST_BQ_FAIL` set but not `<load|copy>:<reason>:<n>` (`check_env`).
+pub(crate) fn check_test_fail_env() -> Result<()> {
+    match std::env::var("APITAP_TEST_BQ_FAIL") {
+        Ok(v) if !v.is_empty() && test_fail_spec(&v).is_none() => Err(Error::InvalidInput(format!(
+            "APITAP_TEST_BQ_FAIL='{v}' is not <load|copy>:<reason>:<n> (e.g. copy:backendError:1): unset it"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The injected failure for the next bulk job of `kind`, if the lever has
+/// one left (one budget per process).
+fn injected(kind: BulkJob, job_id: &str) -> Option<ScriptErr> {
+    static SPEC: std::sync::OnceLock<Option<(BulkJob, String, std::sync::atomic::AtomicU32)>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var("APITAP_TEST_BQ_FAIL")
+            .ok()
+            .and_then(|v| test_fail_spec(&v))
+            .map(|(k, r, n)| (k, r, std::sync::atomic::AtomicU32::new(n)))
+    });
+    let (k, reason, left) = spec.as_ref()?;
+    if *k != kind {
+        return None;
+    }
+    left.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+        .ok()?;
+    Some(ScriptErr::Failed(format!(
+        "bigquery job {job_id} failed: {{\"reason\":\"{reason}\",\"message\":\"injected by APITAP_TEST_BQ_FAIL\"}}"
+    )))
+}
+
+/// `adopt_existing` for the copy job: the same destination and sources.
+fn adopt_existing_copy(job: &Value, body: &Value) -> bool {
+    let (got, want) = (&job["configuration"]["copy"], &body["configuration"]["copy"]);
+    let t = |v: &Value| (v["projectId"].clone(), v["datasetId"].clone(), v["tableId"].clone());
+    let srcs = |v: &Value| v["sourceTables"].as_array().map(|a| a.iter().map(t).collect::<Vec<_>>());
+    t(&got["destinationTable"]) == t(&want["destinationTable"]) && srcs(got).is_some() && srcs(got) == srcs(want)
+}
+
+/// Open a resumable load session for `job_config` (its Location URI).
+async fn resumable_begin_once(conn: &BqConn, job_config: &Value) -> Result<String> {
+    let url = format!("{BQ_UPLOAD}/projects/{}/jobs?uploadType=resumable", conn.project);
+    let resp = conn
+        .client
+        .post(&url)
+        .bearer_auth(conn.bearer().await?)
+        .header("X-Upload-Content-Type", "application/octet-stream")
+        .json(job_config)
+        .send()
+        .await
+        .map_err(|e| Error::Transfer(format!("bigquery resumable begin: {}", crate::http::why(e))))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Transfer(format!("bigquery resumable begin {status}: {}", body.trim())));
+    }
+    resp.headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| Error::Transfer("bigquery resumable begin: no session Location header".into()))
+}
+
+/// Send a kept file again as a NEW load job (its first job finished with a
+/// transient error and committed nothing): a fresh session, its bytes in one
+/// final PUT, re-PUT on a throttle or a lost answer (idempotent within the
+/// session). The new job's resource. Any failure here is final for the file
+/// (`ScriptErr::Final` at the caller): the session may already have made a
+/// job, and a second session would load the rows twice.
+async fn upload_whole(conn: &BqConn, job_config: &Value, bytes: &[u8]) -> Result<Value> {
+    let mut attempt = 0u32;
+    let uri = loop {
+        match resumable_begin_once(conn, job_config).await {
+            Ok(u) => break u,
+            // No session yet: nothing to reason about (`begin_session`).
+            Err(Error::Transfer(m)) if attempt < 5 && retryable(&m) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let total = bytes.len() as u64;
+    let range = if total == 0 { "bytes */0".to_string() } else { format!("bytes 0-{}/{total}", total - 1) };
+    for attempt in 0..5u32 {
+        let r = conn
+            .client
+            .put(&uri)
+            .bearer_auth(conn.bearer().await?)
+            .header("Content-Range", range.clone())
+            .header("Content-Length", bytes.len().to_string())
+            .body(bytes.to_vec())
+            .send()
+            .await;
+        match r {
+            Ok(r) if attempt < 4 && throttled_or_transient(&r) => {}
+            Ok(r) if matches!(r.status().as_u16(), 200 | 201) => {
+                let body = body_text(r, "upload chunk").await?;
+                return serde_json::from_str(&body).map_err(|e| Error::Transfer(format!("bigquery job response: {e}")));
+            }
+            Ok(r) => {
+                let status = r.status().as_u16();
+                let body = r.text().await.unwrap_or_default();
+                return Err(Error::Transfer(format!("bigquery upload chunk unexpected status {status}: {}", body.trim())));
+            }
+            Err(_) if attempt < 4 => {}
+            Err(e) => return Err(upload_err(e)),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
+    }
+    Err(Error::Transfer("bigquery upload chunk: retries exhausted".into()))
 }
 
 #[cfg(test)]
@@ -1412,9 +1602,97 @@ mod staging_name_tests {
 #[cfg(test)]
 mod retry_tests {
     use super::{
-        adopt_existing, adopt_existing_load, fresh_job_id, next_try, retryable, script_body,
-        script_error_class, ErrClass, Retry, ScriptErr,
+        adopt_existing, adopt_existing_copy, adopt_existing_load, fresh_job_id, job_with_retry, next_try, retryable,
+        script_body, script_error_class, test_fail_spec, BulkJob, ErrClass, Retry, ScriptErr,
     };
+
+    /// Drive `job_with_retry` through a scripted sequence of attempt
+    /// outcomes; the `Retry` each attempt was made under, and the result.
+    fn drive(outcomes: Vec<std::result::Result<u32, ScriptErr>>, can_resubmit: bool) -> (Vec<Retry>, std::result::Result<u32, ScriptErr>) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let script = std::sync::Mutex::new(std::collections::VecDeque::from(outcomes));
+        let r = rt.block_on(job_with_retry(
+            0,
+            || can_resubmit,
+            |how| {
+                seen.lock().unwrap().push(how);
+                let next = script.lock().unwrap().pop_front().expect("an attempt past the script");
+                Box::pin(async move { next })
+            },
+        ));
+        (seen.into_inner().unwrap(), r)
+    }
+
+    fn backend() -> ScriptErr {
+        ScriptErr::Failed(r#"bigquery job j failed: {"reason":"backendError","message":"injected"}"#.into())
+    }
+
+    /// The 0.67.2 gap (gate, e2e_guard_matrix bq): one bulk job that
+    /// finished with `backendError` failed the replace. Now it runs again as
+    /// a NEW job, once, and the second answer is the run's.
+    #[test]
+    fn a_transient_job_failure_runs_again_as_a_new_job() {
+        let (seen, r) = drive(vec![Err(backend()), Ok(7)], true);
+        assert_eq!(seen, vec![Retry::SameId, Retry::NewId]);
+        assert_eq!(r.unwrap(), 7);
+    }
+
+    /// A lost answer asks about the SAME job (it may have committed): a copy
+    /// with WRITE_APPEND run twice would land its rows twice.
+    #[test]
+    fn a_transport_failure_keeps_the_job() {
+        let (seen, r) = drive(vec![Err(ScriptErr::Transport("bigquery 503 Service Unavailable on x".into())), Ok(1)], true);
+        assert_eq!(seen, vec![Retry::SameId, Retry::SameId]);
+        assert_eq!(r.unwrap(), 1);
+    }
+
+    /// Never retried: a non-transient failure, a final one, and a transient
+    /// one whose job cannot be started again (a file streamed in parts).
+    #[test]
+    fn what_is_never_tried_again() {
+        let invalid = || ScriptErr::Failed(r#"bigquery job j failed: {"reason":"invalid","message":"x"}"#.into());
+        let (seen, r) = drive(vec![Err(invalid())], true);
+        assert_eq!(seen.len(), 1);
+        assert!(r.unwrap_err().message().contains("invalid"), "named");
+        let (seen, r) = drive(vec![Err(ScriptErr::Final("bigquery upload chunk: lost".into()))], true);
+        assert_eq!(seen.len(), 1);
+        assert!(r.is_err());
+        let (seen, r) = drive(vec![Err(backend())], false);
+        assert_eq!(seen.len(), 1, "nothing to send again: the job's own failure is the answer");
+        assert!(r.unwrap_err().message().contains("backendError"));
+    }
+
+    /// Bounded: five retries (`load_rows`' limit), then the sixth failure by
+    /// name.
+    #[test]
+    fn transient_failures_are_bounded() {
+        let (seen, r) = drive((0..6).map(|_| Err(backend())).collect(), true);
+        assert_eq!(seen.len(), 6);
+        assert!(r.unwrap_err().message().contains("backendError"));
+    }
+
+    #[test]
+    fn the_fail_lever_takes_one_shape() {
+        assert_eq!(test_fail_spec("copy:backendError:1"), Some((BulkJob::Copy, "backendError".into(), 1)));
+        assert_eq!(test_fail_spec("load:invalid:6"), Some((BulkJob::Load, "invalid".into(), 6)));
+        for bad in ["", "copy", "copy:backendError", "copy:backendError:x", "query:backendError:1", "copy::1", "copy:a b:1", "copy:a\"}:1"] {
+            assert_eq!(test_fail_spec(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_copy_is_adopted_only_when_it_is_this_copy() {
+        let t = |x: &str| serde_json::json!({"projectId": "p", "datasetId": "d", "tableId": x});
+        let body = serde_json::json!({"configuration": {"copy": {"sourceTables": [t("s0"), t("s1")], "destinationTable": t("f")}}});
+        assert!(adopt_existing_copy(&body, &body));
+        let other = serde_json::json!({"configuration": {"copy": {"sourceTables": [t("s0")], "destinationTable": t("f")}}});
+        assert!(!adopt_existing_copy(&other, &body));
+        let other = serde_json::json!({"configuration": {"copy": {"sourceTables": [t("s0"), t("s1")], "destinationTable": t("g")}}});
+        assert!(!adopt_existing_copy(&other, &body));
+        let query = serde_json::json!({"configuration": {"query": {"query": "SELECT 1"}}});
+        assert!(!adopt_existing_copy(&query, &body));
+    }
 
     #[test]
     fn lost_mark_is_never_retried() {
@@ -1697,8 +1975,11 @@ use crate::wire::csvout::tsv_to_csv;
 /// disconnected.
 #[derive(Debug)]
 struct PendingJob {
-    id: String,
-    location: Option<String>,
+    /// The file's job now (id, location): a job retried after a transient
+    /// failure runs under a new id, and `quiesce` cancels the live one.
+    job: Arc<std::sync::Mutex<(String, Option<String>)>>,
+    /// Set by `quiesce`: no new job is started for the file after it.
+    stop: Arc<std::sync::atomic::AtomicBool>,
     handle: pipe::JoinOnce<Result<u64>>,
 }
 
@@ -1864,38 +2145,7 @@ impl BqLoader {
             self.conn.table_delete(&self.staging_table).await?;
             self.stale_dropped = true;
         }
-        let url = format!(
-            "{BQ_UPLOAD}/projects/{}/jobs?uploadType=resumable",
-            self.conn.project
-        );
-        let resp = self
-            .conn
-            .client
-            .post(&url)
-            .bearer_auth(self.conn.bearer().await?)
-            .header("X-Upload-Content-Type", "application/octet-stream")
-            .json(&self.job_config)
-            .send()
-            .await
-            .map_err(|e| {
-                Error::Transfer(format!("bigquery resumable begin: {}", crate::http::why(e)))
-            })?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Transfer(format!(
-                "bigquery resumable begin {status}: {}",
-                body.trim()
-            )));
-        }
-        let uri = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                Error::Transfer("bigquery resumable begin: no session Location header".into())
-            })?;
+        let uri = resumable_begin_once(&self.conn, &self.job_config).await?;
         self.session_uri = Some(uri);
         Ok(())
     }
@@ -2018,24 +2268,79 @@ impl BqLoader {
             .map_err(|e| Error::Transfer(format!("gzip finish: {e}")))?,
         };
         let total = self.offset + tail.len() as u64;
-        let job = self
-            .put_chunk(tail, Some(total))
-            .await?
-            .ok_or_else(|| Error::Transfer("bigquery final chunk returned no job".into()))?;
-        let job_id = job["jobReference"]["jobId"]
-            .as_str()
-            .ok_or_else(|| Error::Transfer("bigquery job response missing jobId".into()))?
-            .to_string();
-        let location = job["jobReference"]["location"].as_str().map(str::to_string);
+        // A file sent in ONE PUT (nothing of it went out before; at most
+        // SEND_THRESHOLD bytes: a small load, or the last file) is kept until
+        // its job is DONE, so a job that finishes with a transient error can
+        // be sent again as a new one (`job_with_retry`). A file streamed in
+        // parts is not held (up to 96 MiB a file): its job's failure stays the
+        // run's, by name.
+        let keep = (self.offset == 0 && tail.len() <= SEND_THRESHOLD).then(|| tail.clone());
+        let injected_err = if keep.is_some() { injected(BulkJob::Load, "apitap_injected_load") } else { None };
+        let (job_id, location) = if injected_err.is_some() {
+            // The lever fails this job without starting it: no final PUT, the
+            // session (if one began) discarded. The stale staging drop that
+            // `begin_session` does once per worker still happens.
+            if !self.stale_dropped {
+                self.conn.table_delete(&self.staging_table).await?;
+                self.stale_dropped = true;
+            }
+            if let Some(uri) = self.session_uri.take() {
+                if let Ok(token) = self.conn.bearer().await {
+                    let _ = self.conn.client.delete(uri).bearer_auth(token).send().await;
+                }
+            }
+            ("apitap_injected_load".to_string(), None)
+        } else {
+            let job = self
+                .put_chunk(tail, Some(total))
+                .await?
+                .ok_or_else(|| Error::Transfer("bigquery final chunk returned no job".into()))?;
+            let job_id = job["jobReference"]["jobId"]
+                .as_str()
+                .ok_or_else(|| Error::Transfer("bigquery job response missing jobId".into()))?
+                .to_string();
+            (job_id, job["jobReference"]["location"].as_str().map(str::to_string))
+        };
         let conn = self.conn.clone();
+        let job_config = self.job_config.clone();
         let expect_rows = self.file_rows;
-        // Clone id/location BEFORE the task moves them: `abort` needs both to
-        // cancel and re-ask the job after its task is gone.
+        // Shared with `quiesce` BEFORE the task starts: it cancels and
+        // re-asks whichever job the file has when it runs.
+        let live = Arc::new(std::sync::Mutex::new((job_id, location)));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (task_live, task_stop) = (live.clone(), stop.clone());
         let pending = PendingJob {
-            id: job_id.clone(),
-            location: location.clone(),
+            job: live,
+            stop,
             handle: pipe::JoinOnce::new(tokio::spawn(async move {
-                let done = conn.poll_job(&job_id, location.as_deref()).await?;
+                let mut first = injected_err;
+                let (conn, live, keep, job_config) = (&conn, &task_live, &keep, &job_config);
+                let done = job_with_retry(
+                    400,
+                    || keep.is_some() && !task_stop.load(std::sync::atomic::Ordering::SeqCst),
+                    |how| {
+                        let first = first.take();
+                        Box::pin(async move {
+                            if let Some(e) = first {
+                                return Err(e);
+                            }
+                            if how == Retry::NewId {
+                                let bytes = keep.as_deref().unwrap_or_default();
+                                let job = upload_whole(conn, job_config, bytes).await.map_err(|e| ScriptErr::Final(e.to_string()))?;
+                                let id = job["jobReference"]["jobId"]
+                                    .as_str()
+                                    .ok_or_else(|| ScriptErr::Final("bigquery job response missing jobId".into()))?
+                                    .to_string();
+                                *live.lock().expect("job lock") = (id, job["jobReference"]["location"].as_str().map(str::to_string));
+                            }
+                            let (id, loc) = live.lock().expect("job lock").clone();
+                            conn.poll(&id, loc.as_deref()).await
+                        })
+                    },
+                )
+                .await
+                .map_err(ScriptErr::into_error)?;
+                let job_id = live.lock().expect("job lock").0.clone();
                 let out_rows: u64 = done["statistics"]["load"]["outputRows"]
                     .as_str()
                     .and_then(|s| s.parse().ok())
@@ -2146,8 +2451,11 @@ impl BqLoader {
         // and re-creating a dropped table (CREATE_IF_NEEDED), so every job is
         // cancelled and then awaited to DONE before this returns.
         for mut p in std::mem::take(&mut self.pending_jobs) {
-            let loc = p
-                .location
+            // No new job for the file from here on (a retry after a
+            // transient failure would start one this cancel never saw).
+            p.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (id, location) = p.job.lock().expect("job lock").clone();
+            let loc = location
                 .as_deref()
                 .map(|l| format!("?location={l}"))
                 .unwrap_or_default();
@@ -2158,7 +2466,7 @@ impl BqLoader {
                     reqwest::Method::POST,
                     format!(
                         "{BQ_BASE}/projects/{}/jobs/{}/cancel{loc}",
-                        self.conn.project, p.id
+                        self.conn.project, id
                     ),
                     None,
                 )
@@ -2168,7 +2476,10 @@ impl BqLoader {
             let _ = p.handle.join().await;
             // One extra poll: a transient error in the background task, or a
             // task aborted with the runtime, must not leave the end unproven.
-            let _ = self.conn.poll_job(&p.id, p.location.as_deref()).await;
+            // The file's job as it stands now (a retry may have replaced it
+            // between the cancel and the join).
+            let (id, location) = p.job.lock().expect("job lock").clone();
+            let _ = self.conn.poll_job(&id, location.as_deref()).await;
         }
         // Cancel the resumable session so BigQuery DISCARDS the partial upload —
         // never finalize it into a load job. Google's cancel verb is a DELETE on
@@ -2605,6 +2916,11 @@ impl BqSink {
         })
     }
 
+    /// One copy job from the workers' stagings into the final table, under a
+    /// client job id (as `run_job`): asked again under the same id after a
+    /// lost answer — a WRITE_APPEND copy run twice would land the rows twice
+    /// — and run again under a new one only when it finished with a
+    /// transient error, which copied nothing (`job_with_retry`).
     async fn copy_stagings_into_final(&self, sources: &[String], disposition: &str) -> Result<()> {
         let source_tables: Vec<Value> = sources
             .iter()
@@ -2615,7 +2931,42 @@ impl BqSink {
                 })
             })
             .collect();
+        let loc = self.conn.job_location().await?;
+        let id = std::sync::Mutex::new(fresh_job_id());
+        let (id, loc, source_tables) = (&id, &loc, &source_tables);
+        job_with_retry(
+            400,
+            || true,
+            |how| {
+                Box::pin(async move {
+                    let job_id = {
+                        let mut g = id.lock().expect("job id");
+                        if how == Retry::NewId {
+                            *g = fresh_job_id();
+                        }
+                        g.clone()
+                    };
+                    if let Some(e) = injected(BulkJob::Copy, &job_id) {
+                        return Err(e);
+                    }
+                    self.copy_once(source_tables, disposition, &job_id, loc).await
+                })
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(ScriptErr::into_error)
+    }
+
+    async fn copy_once(
+        &self,
+        source_tables: &[Value],
+        disposition: &str,
+        job_id: &str,
+        loc: &str,
+    ) -> std::result::Result<Value, ScriptErr> {
         let body = json!({
+            "jobReference": {"projectId": self.conn.project, "jobId": job_id, "location": loc},
             "configuration": { "copy": {
                 "sourceTables": source_tables,
                 "destinationTable": {
@@ -2626,23 +2977,26 @@ impl BqSink {
                 "createDisposition": "CREATE_IF_NEEDED",
             }}
         });
-        let v = self
+        match self
             .conn
-            .api(
-                reqwest::Method::POST,
-                format!("{BQ_BASE}/projects/{}/jobs", self.conn.project),
-                Some(&body),
-            )
-            .await?;
-        let job_id = v["jobReference"]["jobId"]
-            .as_str()
-            .ok_or_else(|| Error::Transfer("bigquery copy job missing jobId".into()))?
-            .to_string();
-        let loc = v["jobReference"]["location"].as_str().map(str::to_string);
-        self.conn
-            .poll_job(&job_id, loc.as_deref())
+            .api(reqwest::Method::POST, format!("{BQ_BASE}/projects/{}/jobs", self.conn.project), Some(&body))
             .await
-            .map(|_| ())
+        {
+            Ok(_) => {}
+            // The id already names a job: this copy's earlier POST landed.
+            Err(Error::Transfer(m)) if m.contains("bigquery 409 ") => {
+                let job = self
+                    .conn
+                    .api(reqwest::Method::GET, self.conn.job_url(job_id, loc), None)
+                    .await
+                    .map_err(ScriptErr::transport)?;
+                if !adopt_existing_copy(&job, &body) {
+                    return Err(ScriptErr::Failed(format!("bigquery job id {job_id} belongs to another job")));
+                }
+            }
+            Err(e) => return Err(ScriptErr::transport(e)),
+        }
+        self.conn.poll(job_id, Some(loc)).await
     }
 }
 
@@ -3467,6 +3821,7 @@ mod tests {
             udt: udt.into(),
             precision: None,
             scale: None,
+            base: None,
         };
         for udt in ["binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "bit"] {
             assert!(super::bq_bytes_col("mysql", &col(udt)), "{udt}");
@@ -3571,8 +3926,8 @@ mod tests {
     /// A job task that resolves to `rows`, for the ownership tests below.
     fn job(id: &str, r: Result<u64>) -> PendingJob {
         PendingJob {
-            id: id.to_string(),
-            location: None,
+            job: Arc::new(std::sync::Mutex::new((id.to_string(), None))),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handle: pipe::JoinOnce::new(tokio::spawn(async move { r })),
         }
     }
@@ -3603,7 +3958,7 @@ mod tests {
             "the un-awaited handle must still be owned by the loader: {jobs:?}"
         );
         assert_eq!(
-            jobs[0].id, "third",
+            jobs[0].job.lock().unwrap().0, "third",
             "and it is the one that had not been awaited"
         );
         // Still live: awaiting it now is what `quiesce` does. A detached handle

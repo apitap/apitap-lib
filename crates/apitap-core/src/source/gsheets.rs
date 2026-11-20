@@ -247,6 +247,7 @@ impl Source for GsheetsSource {
                 udt: "text".into(),
                 precision: None,
                 scale: None,
+                base: None,
             });
         }
         Ok(TablePlan {

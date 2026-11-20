@@ -950,6 +950,10 @@ async fn run_group(
         return Err(Error::InvalidInput("tables list is empty".into()));
     }
     precheck_changelog(dst_url, opts)?;
+    // A transaction cap the cage cannot honour is refused before anything is
+    // read: a bootstrap run never reaches a drain, and passed a 1G cap in a
+    // 256 MiB cage silently (round P, p13).
+    crate::logbased::drain::check_tx_env()?;
     if scheme(src_url) == "mysql" {
         return run_group_mysql(src_url, dst_url, tables, opts).await;
     }
@@ -982,8 +986,13 @@ async fn run_group(
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 sqlx::Executor::execute(&mut *conn, "SET lock_timeout = '30s'").await?;
-                // The TOAST refetch reads bytea as text (D33).
-                sqlx::Executor::execute(conn, "SET bytea_output = 'hex'").await?;
+                // The TOAST refetch reads bytea as text (D33), and every
+                // text value as the walsender renders it (p22).
+                sqlx::Executor::execute(
+                    conn,
+                    "SET bytea_output = 'hex'; SET intervalstyle = 'postgres'; SET datestyle = 'ISO'; SET extra_float_digits = 3",
+                )
+                .await?;
                 Ok(())
             })
         })
@@ -1800,6 +1809,14 @@ async fn bootstrap_group(
     let (dest, run) = (tenure.dest(), tenure.run());
     // A slot with no matching state is a leftover from an aborted bootstrap —
     // start fresh (refuse if something is actively draining it).
+    //
+    // Dropping it is right HERE and wrong for an incremental view (round P,
+    // p13: sql/live.rs refuses instead). This lane's ownership record is the
+    // destination's _apitap_state row, which every host running this lane
+    // reads: no row there means no run owns the slot, and a second host that
+    // is live holds the destination's lease and is refused before this point.
+    // A view's record is a file in one state dir on one host, so another
+    // host's live view looks exactly like a leftover. Do not harmonise them.
     let stale: Option<(bool,)> =
         sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
             .bind(slot)
@@ -3014,7 +3031,7 @@ pub(crate) fn recreated(qualified: &str, dest_table: &str, a: u32, b: u32) -> Er
 /// changes since it left were never published, and the DROP that removed it
 /// emitted nothing. Re-added and drained on, the destination kept the old
 /// table's rows and lost the new one's first changes (deep review D17).
-async fn ensure_publication(
+pub(crate) async fn ensure_publication(
     src: &PgPool,
     publication: &str,
     qualified_tables: &[&str],

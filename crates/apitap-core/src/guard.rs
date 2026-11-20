@@ -205,7 +205,7 @@ pub(crate) async fn check_peers(
         .iter()
         .find(|b| naming::collectable(b).is_none())
     {
-        return Err(naming::blocker_error(&dest, b, now, None));
+        return Err(naming::blocker_error_all(&dest, b, &scan.blockers, now, None));
     }
     // 2. One decision per TOKEN: a dead drain has two markers, one claim.
     let mut by_tok: std::collections::BTreeMap<String, Vec<&naming::Blocker>> = Default::default();
@@ -216,12 +216,12 @@ pub(crate) async fn check_peers(
     for (tok, bs) in by_tok {
         let lease = s.lease_get(&dest, &tok).await?;
         let Some(l) = lease.as_ref().filter(|l| l.lapsed()) else {
-            return Err(naming::blocker_error(&dest, bs[0], now, lease.as_ref()));
+            return Err(naming::blocker_error_all(&dest, bs[0], &scan.blockers, now, lease.as_ref()));
         };
         match s.lease_claim(&dest, &tok).await? {
             Claim::Taken => {}
-            Claim::Refused => return Err(naming::blocker_error(&dest, bs[0], now, Some(l))),
-            Claim::Absent => return Err(naming::blocker_error(&dest, bs[0], now, None)),
+            Claim::Refused => return Err(naming::blocker_error_all(&dest, bs[0], &scan.blockers, now, Some(l))),
+            Claim::Absent => return Err(naming::blocker_error_all(&dest, bs[0], &scan.blockers, now, None)),
         }
         // Scratch before markers. If the sweep fails the markers still stand,
         // the lease stays collected (a claim reads `collected` as lapsed), and

@@ -963,12 +963,29 @@ impl Walsender {
     /// known.
     pub(crate) async fn connect_read(url: &str) -> Result<Self> {
         let secs = connect_timeout_secs();
-        match tokio::time::timeout(std::time::Duration::from_secs(secs), Self::connect_inner_buf(url, None, false, false)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), Self::connect_inner_buf(url, None, false, false, false)).await {
             Ok(r) => r,
             Err(_) => Err(Error::Transfer(format!(
                 "walsender connect: no startup answer in {secs} s (APITAP_PG_CONNECT_TIMEOUT_SECS)"
             ))),
         }
+    }
+
+    /// The time zone a session of this URL's role and database starts in
+    /// when its client sets none: the role's, the database's or the
+    /// server's setting (round P p10). Every apitap connection pins UTC at
+    /// startup (sqlx sends `TimeZone=UTC` itself), so `pg_settings.reset_val`
+    /// read there says UTC whatever the server's default is.
+    pub(crate) async fn default_timezone(url: &str) -> Result<String> {
+        let secs = connect_timeout_secs();
+        let mut ws = match tokio::time::timeout(std::time::Duration::from_secs(secs), Self::connect_inner_buf(url, None, false, false, true)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(Error::Transfer(format!("walsender connect: no startup answer in {secs} s (APITAP_PG_CONNECT_TIMEOUT_SECS)"))),
+        };
+        let rows = ws.simple_query("SHOW TimeZone").await?;
+        rows.first()
+            .and_then(|r| r.first().cloned().flatten())
+            .ok_or_else(|| Error::Transfer("SHOW TimeZone returned no row".into()))
     }
 
     /// The socket's descriptor (-1 where there is none to give).
@@ -997,10 +1014,10 @@ impl Walsender {
     }
 
     async fn connect_inner(url: &str, options: Option<&str>, replication: bool) -> Result<Self> {
-        Self::connect_inner_buf(url, options, replication, true).await
+        Self::connect_inner_buf(url, options, replication, true, false).await
     }
 
-    async fn connect_inner_buf(url: &str, options: Option<&str>, replication: bool, fixed_rcvbuf: bool) -> Result<Self> {
+    async fn connect_inner_buf(url: &str, options: Option<&str>, replication: bool, fixed_rcvbuf: bool, bare: bool) -> Result<Self> {
         let ci = parse_url(url)?;
         let stream = TcpStream::connect((ci.host.as_str(), ci.port))
             .await
@@ -1110,7 +1127,7 @@ impl Walsender {
             reported: 0,
             fd,
         };
-        ws.startup(&ci, options, replication).await?;
+        ws.startup(&ci, options, replication, bare).await?;
         Ok(ws)
     }
 
@@ -1119,6 +1136,7 @@ impl Walsender {
         ci: &ConnInfo,
         options: Option<&str>,
         replication: bool,
+        bare: bool,
     ) -> Result<()> {
         // StartupMessage: no tag; length + protocol 3.0 + kv pairs.
         let mut body = Vec::with_capacity(128);
@@ -1162,6 +1180,11 @@ impl Walsender {
             // set after connecting, where the version is known.
             ("idle_in_transaction_session_timeout", "0"),
         ];
+        if bare {
+            // Only who and where: the session then starts in the role's,
+            // database's or server's own settings ([`Walsender::default_timezone`]).
+            params.truncate(3);
+        }
         if replication {
             params.push(("replication", "database"));
         }

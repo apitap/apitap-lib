@@ -626,6 +626,16 @@ impl View {
         schemas: &mut dyn FnMut(&str, &str) -> Result<Vec<ArrowField>>,
     ) -> Result<View> {
         let mut p = plan(query, sources, schemas)?;
+        // p20: a view keys its groups as the text arrives; decimal text
+        // (an unconstrained numeric) would split 1.0 from 1.00.
+        if let Some(t) = p.gord.iter().find(|t| t.class == crate::read::TClass::Decimal) {
+            return Err(bad(format!(
+                "mode=\"log_based\" grouping by a column of type {} is refused: an incremental view keys its groups by the text \
+                 the source sends, and 1.0 and 1.00 are one value there; declare it numeric(p,s) in a view on the source \
+                 (a run without mode= takes it)",
+                t.ty.as_deref().unwrap_or("numeric")
+            )));
+        }
         if p.out.iter().any(|o| matches!(o.1, OutCol::Expr(_))) {
             return Err(unsupported("mode=\"log_based\" with arithmetic over aggregates in SELECT (a run without mode= takes it)"));
         }
@@ -641,10 +651,18 @@ impl View {
         if p.sides.iter().any(|s| !s.semis.is_empty()) {
             return Err(unsupported("mode=\"log_based\" with EXISTS or IN (subquery) (a run without mode= takes them)"));
         }
-        if p.star.is_some() {
-            return Err(unsupported(
-                "mode=\"log_based\" over three or more tables (a run without mode= joins them; an incremental view keeps two)",
-            ));
+        if let Some(st) = &p.star {
+            // Two tables take the star plan too (QA, round P p12: the refusal
+            // said "three or more tables" for them): GROUP BY columns of both
+            // tables, or more than the one join equality, or a comparison
+            // of the two.
+            return Err(unsupported(if st.dims.is_empty() {
+                "mode=\"log_based\" over a two-table join that groups by columns of both tables, or joins or compares them \
+                 on more than one column (a run without mode= takes it; an incremental view groups by one table's columns \
+                 and joins on one equality)"
+            } else {
+                "mode=\"log_based\" over three or more tables (a run without mode= joins them; an incremental view keeps two)"
+            }));
         }
         let mm: Vec<&str> = p
             .aggs
@@ -2435,7 +2453,7 @@ mod tests {
     use super::*;
 
     fn f(name: &str, kind: ArrowKind) -> ArrowField {
-        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None }
+        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() }
     }
 
     fn schemas() -> impl FnMut(&str, &str) -> Result<Vec<ArrowField>> {
@@ -3001,6 +3019,9 @@ mod tests {
             ("SELECT COUNT(*) FROM gh.issues", "no change stream"),
             ("SELECT o.prio, COUNT(*) FROM my.ord o WHERE o.flag + 1 > 2 GROUP BY 1", "re-checked on each change"),
             ("SELECT o.prio, COUNT(*) FROM my.ord o WHERE o.ts IS NOT NULL GROUP BY 1", "TimestampUtc"),
+            // Two tables grouped on columns of both: named as such, not as
+            // "three or more tables" (QA, round P p12).
+            ("SELECT o.prio, l.d, COUNT(*) FROM pg.li l JOIN my.ord o ON l.k = o.k GROUP BY o.prio, l.d", "groups by columns of both tables"),
         ] {
             let mut sc = schemas();
             let mut s2 = |u: &str, t: &str| -> Result<Vec<ArrowField>> {

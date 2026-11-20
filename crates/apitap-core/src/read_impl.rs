@@ -112,7 +112,10 @@ async fn schema_with<S: Source>(
     table: &str,
     dialect: ReadDialect,
 ) -> Result<Vec<ArrowField>> {
-    let plan = src.probe(table).await?;
+    let mut plan = src.probe(table).await?;
+    if dialect == ReadDialect::Pg {
+        resolve_domains(&mut plan);
+    }
     let lane = src.plan_lane(&plan, WireFormat::PgCopyBinary);
     Ok(lane
         .cols
@@ -120,6 +123,7 @@ async fn schema_with<S: Source>(
         .zip(plan.cols.iter())
         .map(|(lc, pc)| {
             let kind = column_kind(dialect, lc, pc);
+            let tord = type_order(dialect, kind.unwrap_or(ArrowKind::Utf8), pc);
             ArrowField {
                 name: pc.name.clone(),
                 kind: kind.unwrap_or(ArrowKind::Utf8),
@@ -131,6 +135,7 @@ async fn schema_with<S: Source>(
                 locale: locale_text(kind, pc.native_ddl.as_deref()),
                 nulls_low: matches!(dialect, ReadDialect::My),
                 origin: None,
+                tord,
             }
         })
         .collect())
@@ -178,6 +183,50 @@ fn ci_text(kind: Option<ArrowKind>, native: Option<&str>) -> bool {
     // (citext is read as text: no Arrow kind of its own.)
     (matches!(kind, Some(ArrowKind::Utf8)) && collation_of(native).is_some_and(|c| c.ends_with("_ci")))
         || (matches!(kind, Some(ArrowKind::Utf8) | None) && native.is_some_and(|n| n.trim().eq_ignore_ascii_case("citext")))
+}
+
+/// A Postgres domain reads as the type past every domain over it (p20, QA
+/// type sweep: a domain over int arrived as text and ordered '10' < '9').
+/// Base types only: an enum, array, range or composite base keeps its own
+/// text path. Read paths only (apitap.sql/read); a transfer's probe keeps
+/// the domain's own udt.
+fn resolve_domains(plan: &mut crate::plan::TablePlan) {
+    for c in plan.cols.iter_mut().chain(plan.cursor_col.iter_mut()) {
+        let Some(b) = c.base.as_deref() else { continue };
+        if b.udt != c.udt && b.typtype == "b" && b.category != "A" {
+            c.udt = b.udt.clone();
+            c.precision = b.precision;
+            c.scale = b.scale;
+        }
+    }
+}
+
+/// How apitap.sql() may compare a column (`crate::read::TypeOrder`): native
+/// kinds and text proper as today; a type read as its text form by its
+/// class (`crate::read::text_class`), naming the source type.
+fn type_order(dialect: ReadDialect, kind: ArrowKind, pc: &crate::plan::ColumnPlan) -> crate::read::TypeOrder {
+    use crate::read::{text_class, TClass, TypeOrder};
+    if kind != ArrowKind::Utf8 {
+        return TypeOrder::default();
+    }
+    let ty = pc.native_ddl.clone().unwrap_or_else(|| pc.udt.clone());
+    let class = match dialect {
+        ReadDialect::Pg => {
+            let (typtype, cat) = pc.base.as_deref().map_or(("b", ""), |b| (b.typtype.as_str(), b.category.as_str()));
+            let udt = pc.base.as_deref().map_or(pc.udt.as_str(), |b| b.udt.as_str());
+            text_class(false, udt, typtype, cat)
+        }
+        ReadDialect::My => text_class(true, &pc.udt, "", ""),
+        _ => TClass::Collated,
+    };
+    if class == TClass::Collated {
+        return TypeOrder::default();
+    }
+    let shown = match pc.base.as_deref() {
+        Some(b) if b.udt != pc.udt && !ty.eq_ignore_ascii_case(&b.udt) => format!("{ty}, a domain over {}", b.udt),
+        _ => ty,
+    };
+    TypeOrder::new(class, &shown)
 }
 
 fn read_as_text(kind: Option<ArrowKind>, udt: &str) -> bool {
@@ -464,6 +513,9 @@ async fn plan_read<S: Source>(
     parallel: usize,
 ) -> Result<ReadPlan> {
     let mut plan = src.probe(table).await?;
+    if dialect == ReadDialect::Pg {
+        resolve_domains(&mut plan);
+    }
     plan.cursor = opts.cursor.clone().or_else(|| plan.single_int_pk());
     let mut lane = src.plan_lane(&plan, WireFormat::PgCopyBinary);
     if dialect == ReadDialect::Pg {
@@ -511,6 +563,7 @@ async fn plan_read<S: Source>(
                 udt: "int8".into(),
                 precision: None,
                 scale: None,
+                base: None,
             });
             lane.cols.push(crate::plan::LaneCol {
                 delivered: Delivered::Int { bytes: 8, unsigned: false },
@@ -556,12 +609,14 @@ async fn plan_read<S: Source>(
     for (lc, pc) in lane.cols.iter_mut().zip(plan.cols.iter_mut()) {
         let native_kind = column_kind(dialect, lc, pc);
         let rewritten = read_as_text(native_kind, &pc.udt);
+        // Before MySQL's text rewrite below renames the udt.
+        let tord = type_order(dialect, native_kind.unwrap_or(ArrowKind::Utf8), pc);
         let kind = match native_kind {
             Some(k) => k,
             None => {
                 match dialect {
                     ReadDialect::Pg => {
-                        lc.select = format!("({})::text", lc.select);
+                        lc.select = crate::source::postgres::pg_text_expr(&format!("({})", lc.select), pc);
                     }
                     ReadDialect::My => {
                         pc.udt = "longtext".into();
@@ -594,6 +649,7 @@ async fn plan_read<S: Source>(
             locale: locale_text(Some(kind), pc.native_ddl.as_deref()),
             nulls_low: matches!(dialect, ReadDialect::My),
             origin: None,
+            tord,
         });
     }
 

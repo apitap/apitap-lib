@@ -669,8 +669,13 @@ pub(crate) async fn drain_binlog(
     // so one big transaction buffered without bound and a 2 GB UPDATE was
     // OOM-killed, re-run from the same watermark, and killed again (P1-3).
     // It restarts whenever tx_buf is empty — every clear and drain empties it.
-    let tx_limit = crate::logbased::drain::tx_buf_limit();
+    // The cap is the drain's share of the cage, compared with resident
+    // bytes at the commit (round P, L14b; `drain::tx_budget`): beside the
+    // transaction the window's others, one window applying, the reader.
+    let tx_limit = crate::logbased::drain::tx_budget(2 * max_buf_bytes + (4 << 20), 0)?;
+    // This transaction's charge, and its bytes in the window budget's measure.
     let mut tx_bytes = 0usize;
+    let mut tx_win = 0usize;
     let mut hit_budget = false;
     // The open transaction's ops past `tx_limit`, on disk (A2).
     let mut tx_spill: Option<TxSpill> = None;
@@ -920,8 +925,10 @@ pub(crate) async fn drain_binlog(
                 let ev = bl::parse_rows(body, t, &map)?;
                 if tx_buf.is_empty() {
                     tx_bytes = 0;
+                    tx_win = 0;
                 }
                 let before = buf_bytes;
+                let first = tx_buf.len();
                 for msg in bl::to_messages(&mut sess.st, t, ev)? {
                     match msg {
                         // The layout came from the TABLE_MAP; bodies are built
@@ -950,14 +957,19 @@ pub(crate) async fn drain_binlog(
                         _ => {}
                     }
                 }
-                tx_bytes += buf_bytes - before;
-                if tx_bytes > tx_limit {
+                tx_win += buf_bytes - before;
+                tx_bytes += tx_buf[first..]
+                    .iter()
+                    .map(|(t, op)| tx_charge(op, changelog, sess.keep_old, sess.layouts.get(&**t).map(|l| l.key_idx())))
+                    .sum::<usize>();
+                if tx_bytes > tx_limit.limit {
                     if changelog {
-                        return Err(crate::logbased::drain::tx_too_big(&q, tx_bytes, tx_limit));
+                        return Err(crate::logbased::drain::tx_too_big(&q, tx_bytes, &tx_limit));
                     }
                     spill_tx(&mut tx_buf, &mut tx_spill)?;
-                    buf_bytes = buf_bytes.saturating_sub(tx_bytes);
+                    buf_bytes = buf_bytes.saturating_sub(tx_win);
                     tx_bytes = 0;
+                    tx_win = 0;
                 }
             }
             bl::TYPE_QUERY => {
@@ -1097,7 +1109,7 @@ pub(crate) async fn drain_binlog(
                              cannot replay under the layouts the DDL changes. Raise \
                              APITAP_TX_BUF_BYTES so it fits in memory, or COMMIT before the DDL \
                              on the source",
-                            tx_limit >> 20,
+                            tx_limit.limit >> 20,
                             crate::sink::char_excerpt(head, 120),
                             sess.file,
                             h.log_pos
@@ -1304,6 +1316,22 @@ enum TxOp {
     Truncate,
 }
 
+/// What one buffered binlog op holds at its transaction's commit, in
+/// resident bytes ([`crate::logbased::drain::row_charge`]): the buffer's
+/// entry (the table name's `Arc` is shared, a refcount, not a copy), the
+/// images, and what the commit builds from them (`key`: the table's key
+/// positions, for the replica lane's collapse).
+fn tx_charge(op: &TxOp, changelog: bool, keep_old: bool, key: Option<&[usize]>) -> usize {
+    use crate::logbased::drain::{row_charge, Lane};
+    let entry = std::mem::size_of::<(Arc<str>, TxOp)>();
+    let lane = Lane { changelog, keep_old, key: if changelog { None } else { key } };
+    match op {
+        TxOp::Insert(t) | TxOp::Delete(t) => row_charge(entry, None, Some(t), false, lane),
+        TxOp::Update(old, new) => row_charge(entry, old.as_ref(), Some(new), true, lane),
+        TxOp::Truncate => row_charge(entry, None, None, false, lane),
+    }
+}
+
 fn cells_bytes(row: &Tuple) -> usize {
     std::iter::once(row.frame.len() + row.cells.len() * 12).sum::<usize>() + 48
 }
@@ -1383,7 +1411,7 @@ fn drain_tx(
                 .expect("changelog just ensured");
             match op {
                 TxOp::Insert(row) => c.insert(row),
-                TxOp::Update(old, row) => c.update(old.as_ref(), row),
+                TxOp::Update(old, row) => c.update(old, row),
                 TxOp::Delete(old) => c.delete(old),
                 TxOp::Truncate => c.truncate(),
             }

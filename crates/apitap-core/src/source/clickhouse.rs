@@ -383,6 +383,7 @@ impl crate::source::Source for ChSource {
                 udt: inner,
                 precision,
                 scale,
+                base: None,
             });
         }
         if cols.is_empty() {

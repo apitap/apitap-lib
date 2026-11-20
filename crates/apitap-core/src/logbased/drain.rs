@@ -44,44 +44,150 @@ pub(crate) fn silence_budget() -> std::time::Duration {
 /// protocol ships a transaction whole after its commit, so a giant write (an
 /// UPDATE over a whole table) cannot be landed in parts — past this cap the
 /// honest end is a refusal that names the cause, not an OOM (system review
-/// 2026-10-07, G0.1). `APITAP_TX_BUF_BYTES` raises or lowers it.
+/// 2026-10-07, G0.1). `APITAP_TX_BUF_BYTES` sets it. With no memory limit
+/// this is the default; under one the default is the drain's own budget
+/// ([`tx_budget`]).
 const TX_BUF_LIMIT: usize = 256 << 20;
 
-pub(crate) fn tx_buf_limit() -> usize {
+/// The cgroup/`APITAP_MEM_BUDGET` limit, read once: the drain asks per
+/// window and the binlog reader per event, and the walk reads /proc.
+fn cage() -> Option<u64> {
+    static CAGE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAGE.get_or_init(crate::pipeline::mem_limit_bytes)
+}
+
+/// `APITAP_TX_BUF_BYTES` as set (zero and junk: unset).
+fn env_tx() -> Option<usize> {
     std::env::var("APITAP_TX_BUF_BYTES")
         .ok()
         .and_then(|v| crate::logbased::run::parse_size(&v))
         .and_then(|n| usize::try_from(n).ok())
         .filter(|n| *n > 0)
-        .unwrap_or(TX_BUF_LIMIT)
+}
+
+/// The static cap, for the binlog reader's one-event bound: the knob, else
+/// 7/8 of the cage (an event that size cannot be held with anything else),
+/// else [`TX_BUF_LIMIT`].
+pub(crate) fn tx_buf_limit() -> usize {
+    env_tx().unwrap_or_else(|| cage().map_or(TX_BUF_LIMIT, |c| usize::try_from(c / 8 * 7).unwrap_or(usize::MAX).min(TX_BUF_LIMIT)))
+}
+
+/// This process's anonymous resident bytes (`RssAnon`), the memory a drain
+/// starts from: the interpreter, the runtime, a view's loaded state. `None`
+/// off Linux.
+fn anon_now() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let l = s.lines().find(|l| l.starts_with("RssAnon:"))?;
+    let kb: u64 = l.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb << 10)
+}
+
+/// What a drain's buffered-transaction cap is and where it came from: the
+/// refusal states it so a user can reproduce or raise it (round P, L14b).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TxBudget {
+    pub(crate) limit: usize,
+    /// `Some((cage, held at the drain's start, planned beside the buffer))`
+    /// when the cap is derived; `None` when `APITAP_TX_BUF_BYTES` set it or
+    /// there is no memory limit.
+    derived: Option<(u64, u64, u64)>,
+    from_env: bool,
+}
+
+impl TxBudget {
+    fn how(&self) -> String {
+        match (self.derived, self.from_env) {
+            (_, true) => format!("APITAP_TX_BUF_BYTES = {} MiB", self.limit >> 20),
+            (Some((cage, held, planned)), false) => format!(
+                "cap {} MiB = 7/8 of (memory limit {} MiB - {} MiB this process held when the drain began - {} MiB \
+                 planned beside the transaction)",
+                self.limit >> 20,
+                cage >> 20,
+                held >> 20,
+                planned >> 20
+            ),
+            (None, false) => format!("cap {} MiB, the default with no memory limit", self.limit >> 20),
+        }
+    }
+}
+
+/// The buffered-transaction cap for one drain (round P, L14b): a changelog
+/// lane refuses past it, the other lanes spill to disk past it (A2).
+///
+/// The cap is the drain's share of the cage, not the cage: 7/8 (allocator
+/// slack) of the memory limit, minus the anonymous memory this process
+/// already holds when the drain begins (measured), minus `planned` — what
+/// the caller keeps beside the transaction (the window's other
+/// transactions, an apply that overlaps the drain, the reader). The charge
+/// it is compared with is resident bytes at the commit's peak ([`op_charge`]).
+/// Through p11 the default was 256 MiB counted against a 256 MiB cage, so the
+/// named refusal raced the OOM killer and lost (QA case M: exit 137).
+///
+/// `APITAP_TX_BUF_BYTES` still wins, but a value above the memory limit
+/// cannot be honoured and is refused by name before anything is read.
+///
+/// `charged`: bytes the session already charges for buffered streamed
+/// transactions that outlived an earlier window — they are in the measured
+/// resident set, and counted again by the cap, so they are given back.
+pub(crate) fn tx_budget(planned: usize, charged: usize) -> Result<TxBudget> {
+    let cage = cage();
+    if let Some(n) = check_tx_env()? {
+        return Ok(TxBudget { limit: n, derived: None, from_env: true });
+    }
+    let Some(c) = cage else {
+        return Ok(TxBudget { limit: TX_BUF_LIMIT, derived: None, from_env: false });
+    };
+    let held = anon_now().unwrap_or(0).saturating_sub(charged as u64);
+    let room = c.saturating_sub(held).saturating_sub(planned as u64);
+    let limit = usize::try_from(room / 8 * 7).unwrap_or(usize::MAX).max(1 << 20);
+    Ok(TxBudget { limit, derived: Some((c, held, planned as u64)), from_env: false })
+}
+
+/// `APITAP_TX_BUF_BYTES` as set, refused by name when it is above this
+/// process's memory limit: a transaction that large would be OOM-killed
+/// before the cap could refuse it. Every log_based entry asks this when it
+/// starts (round P, p13: a bootstrap run never reached a drain, so a 1G cap
+/// in a 256 MiB cage passed silently and only the first drain refused it).
+pub(crate) fn check_tx_env() -> Result<Option<usize>> {
+    let Some(n) = env_tx() else { return Ok(None) };
+    if let Some(c) = cage().filter(|c| n as u64 > *c) {
+        return Err(Error::Transfer(format!(
+            "log_based: APITAP_TX_BUF_BYTES = {} MiB is above this process's memory limit ({} MiB): a \
+             transaction that large would be OOM-killed before the cap could refuse it. Set it below the \
+             limit (bytes, or a K/M/G suffix), or give the process more memory",
+            n >> 20,
+            c >> 20
+        )));
+    }
+    Ok(Some(n))
 }
 
 /// The streamed-transaction cap is the sum over every open stream (the
 /// honest memory bound), so its refusal says so: it named one table and "one
 /// transaction" for the combined size of several (P2).
-fn streams_too_big(open: usize, bytes: usize, limit: usize) -> Error {
+fn streams_too_big(open: usize, bytes: usize, b: &TxBudget) -> Error {
     Error::Transfer(format!(
         "log_based: {open} streamed transaction(s) in flight on the source hold {} MiB of \
-         changes together (APITAP_TX_BUF_BYTES = {} MiB) — each stays buffered until it \
+         changes together ({}) — each stays buffered until it \
          commits, and continuing would OOM. Commit or split the long transactions on the \
          source, or raise APITAP_TX_BUF_BYTES (bytes, or a K/M/G suffix) if this process \
          really has that much memory. The watermark is untouched: the next run re-reads them. \
          (A changelog=True lane cannot spill a transaction to disk yet; replica lanes do.)",
         bytes >> 20,
-        limit >> 20
+        b.how()
     ))
 }
 
-pub(crate) fn tx_too_big(table: &str, bytes: usize, limit: usize) -> Error {
+pub(crate) fn tx_too_big(table: &str, bytes: usize, b: &TxBudget) -> Error {
     Error::Transfer(format!(
-        "log_based: one transaction's changes for {table} have buffered {} MiB \
-         (APITAP_TX_BUF_BYTES = {} MiB) — the source ships a transaction whole, so it \
+        "log_based: one transaction's changes for {table} would hold {} MiB \
+         ({}) — the source ships a transaction whole, so it \
          cannot land in parts, and continuing would OOM. Split the write on the \
          source, or raise APITAP_TX_BUF_BYTES (bytes, or a K/M/G suffix) if this \
          process really has that much memory. The watermark is untouched: the next run re-reads the transaction. \
          (A changelog=True lane cannot spill a transaction to disk yet; replica lanes do.)",
         bytes >> 20,
-        limit >> 20
+        b.how()
     ))
 }
 
@@ -140,6 +246,10 @@ pub(crate) struct DrainSession {
     /// drain starts. The memory it holds does not go anywhere, so the budget
     /// that is supposed to bound this process's RSS has to keep counting it.
     stream_bytes: usize,
+    /// The same buffers in resident bytes at their commit's peak
+    /// ([`op_charge`]): what the transaction cap compares (round P, L14b).
+    /// `stream_bytes` stays the window budget's measure.
+    stream_charge: usize,
     /// Streamed transactions past `APITAP_TX_BUF_BYTES`, their ops so far on
     /// local disk by xid (A2); `streams` keeps only what arrived since the
     /// last spill. Before 0.66 the drain refused here.
@@ -165,6 +275,10 @@ pub(crate) struct DrainSession {
     /// Incremental views: changelog bodies also keep each update's old image
     /// (`Changes::olds`).
     pub(crate) keep_old: bool,
+    /// The caller applies a window only after `drain` returns it (a Postgres
+    /// view): no applying window beside the buffer, so the transaction cap
+    /// plans one window, not two (round P, p13).
+    pub(crate) apply_after: bool,
 }
 
 impl DrainSession {
@@ -283,16 +397,18 @@ fn stream_push(
     x: u32,
     op: (u16, StreamOp, u32),
     n: usize,
-    limit: usize,
+    b: &TxBudget,
     changelog: bool,
 ) -> Result<()> {
+    let c = op_charge(&op.1, lane(sess, op.0, changelog));
+    sess.stream_charge += c;
     sess.stream_bytes += n;
     open_stream(sess, x)?.push(op);
-    if sess.stream_bytes <= limit {
+    if sess.stream_charge <= b.limit {
         return Ok(());
     }
     if changelog {
-        return Err(streams_too_big(sess.streams.len(), sess.stream_bytes, limit));
+        return Err(streams_too_big(sess.streams.len(), sess.stream_charge, b));
     }
     for (xid, ops) in sess.streams.iter_mut() {
         if ops.is_empty() {
@@ -309,32 +425,36 @@ fn stream_push(
         }
     }
     sess.stream_bytes = 0;
+    sess.stream_charge = 0;
     Ok(())
 }
 
-/// A non-streamed transaction's op lands in `tx_buf`; past `limit` the buffer
+/// A non-streamed transaction's op lands in `tx_buf`; past the cap the buffer
 /// moves to the transaction's spill file (A2). changelog=True still refuses.
-/// `acct` is (this transaction's bytes, the window's buffered bytes).
+/// `acct` is (this transaction's charge in resident bytes, its bytes in the
+/// window budget's measure, the window's buffered bytes); `n` and `c` are
+/// the op's in those two measures.
 #[allow(clippy::too_many_arguments)]
 fn tx_push(
     sess: &DrainSession,
     tx_buf: &mut TxOps,
     tx_spill: &mut Option<crate::logbased::spill::SpillFile>,
-    acct: &mut (&mut usize, &mut usize),
+    acct: (&mut usize, &mut usize, &mut usize),
     op: (u16, StreamOp),
     n: usize,
-    limit: usize,
+    b: &TxBudget,
     changelog: bool,
 ) -> Result<()> {
-    *acct.0 += n;
+    *acct.0 += op_charge(&op.1, lane(sess, op.0, changelog));
     *acct.1 += n;
+    *acct.2 += n;
     let t = op.0;
     tx_buf.push(op);
-    if *acct.0 <= limit {
+    if *acct.0 <= b.limit {
         return Ok(());
     }
     if changelog {
-        return Err(tx_too_big(&sess.slots[usize::from(t)].table, *acct.0, limit));
+        return Err(tx_too_big(&sess.slots[usize::from(t)].table, *acct.0, b));
     }
     if tx_spill.is_none() {
         *tx_spill = Some(crate::logbased::spill::SpillFile::create()?);
@@ -343,7 +463,8 @@ fn tx_push(
     for (t, o) in tx_buf.drain(..) {
         f.push(t, &o, 0)?;
     }
-    *acct.1 = acct.1.saturating_sub(*acct.0);
+    *acct.2 = acct.2.saturating_sub(*acct.1);
+    *acct.1 = 0;
     *acct.0 = 0;
     Ok(())
 }
@@ -354,6 +475,131 @@ fn tx_push(
 /// streamed-transaction accounting measures the same thing the window's does.
 fn cells_bytes(row: &Tuple) -> usize {
     row.frame.len() + row.cells.len() * 12 + 48
+}
+
+/// A malloc chunk's header and rounding, charged once per allocation.
+const ALLOC: usize = 16;
+
+/// Resident bytes a buffered tuple adds: its cells' allocation, and its
+/// frame unless an earlier tuple of the same message already pins it.
+pub(crate) fn tuple_resident(t: &Tuple, frame_seen: Option<&Tuple>) -> usize {
+    let cells = t.cells.capacity() * std::mem::size_of::<pgoutput::CellR>() + ALLOC;
+    let shared = frame_seen.is_some_and(|o| o.frame.as_ptr() == t.frame.as_ptr() && o.frame.len() == t.frame.len());
+    cells + if shared { 0 } else { t.frame.len() + ALLOC }
+}
+
+/// What a lane builds from a buffered transaction at its commit, for
+/// [`row_charge`]: a changelog body (`changelog`, with each update's old
+/// image when `keep_old`: an incremental view), else the replica lane's
+/// collapse, whose map is keyed by the table's key columns (`key`, their
+/// positions; `None` when the layout is not known yet).
+#[derive(Clone, Copy)]
+pub(crate) struct Lane<'a> {
+    pub(crate) changelog: bool,
+    pub(crate) keep_old: bool,
+    pub(crate) key: Option<&'a [usize]>,
+}
+
+/// The table's key positions for the replica lane's charge (the changelog
+/// lanes do not key a map, so they skip the lookup).
+fn lane(sess: &DrainSession, t: u16, changelog: bool) -> Lane<'_> {
+    lane_of(&sess.slots, &sess.layouts, sess.keep_old, t, changelog)
+}
+
+/// [`lane`] from the session's fields, for a caller holding another field
+/// mutably.
+fn lane_of<'a>(slots: &'a [RelState], layouts: &'a HashMap<String, Arc<Layout>>, keep_old: bool, t: u16, changelog: bool) -> Lane<'a> {
+    let key = if changelog { None } else { slots.get(usize::from(t)).and_then(|s| layouts.get(&*s.table)).map(|l| l.key_idx()) };
+    Lane { changelog, keep_old, key }
+}
+
+/// What one op holds at its transaction's commit, in resident bytes (round
+/// P, L14b; tuned p13 against the cgroup's anon in the 256 MiB cage): the
+/// buffer's entry, the tuples' cells and frames (a frame once per message:
+/// pgoutput's old and new images are ranges of one frame), and what the
+/// commit builds while the buffer is still allocated ([`row_charge`]).
+pub(crate) fn op_charge(op: &StreamOp, lane: Lane<'_>) -> usize {
+    let entry = std::mem::size_of::<(u16, StreamOp, u32)>();
+    match op {
+        StreamOp::Insert(t) | StreamOp::Delete(t) => row_charge(entry, None, Some(t), false, lane),
+        StreamOp::Update(old, new, _) => row_charge(entry, old.as_ref(), Some(new), true, lane),
+        StreamOp::Truncate => row_charge(entry, None, None, false, lane),
+    }
+}
+
+/// A replica lane's map key for a row: one integer column is held inline
+/// (`K::I64`), any other key is its columns' bytes, a `Vec` a column.
+fn key_heap(t: &Tuple, key: &[usize]) -> usize {
+    use pgoutput::Cellv;
+    if let [i] = key {
+        if let Some(Cellv::Text(v)) = t.get(*i) {
+            if crate::logbased::collapse::parse_i64_key(v).is_some() {
+                return 0;
+            }
+        }
+    }
+    let cells: usize = key
+        .iter()
+        .map(|&i| match t.get(i) {
+            Some(Cellv::Text(v)) => v.len() + ALLOC,
+            _ => ALLOC,
+        })
+        .sum();
+    cells + key.len() * std::mem::size_of::<Vec<u8>>() + ALLOC
+}
+
+/// [`op_charge`] for any lane's buffer: `entry` is the buffer's element
+/// size for the op, `row` the new image (an insert's or a delete's only
+/// one), `old` an update's old image.
+///
+/// Measured (p12, case M at 250 MiB, the view lane): ~0.93 KB a row
+/// buffered and ~1.45 KB at the commit's peak against a charge of ~1.8 KB;
+/// the pg→ClickHouse changelog lane 470 B a row at the peak against ~770;
+/// the replica lane ~600 B a row at the peak against ~480 (its collapse was
+/// not charged: a transaction just under the cap peaked at 240 MiB anon).
+/// So: a `Vec` element at 1.5 entries (it doubles, and its peak is the copy;
+/// 2 was the worst instant of every element at once), two changelog events
+/// only for an update that carries an old image (a key that can move; one
+/// otherwise), no copy of the old image's cells (p12 moves it into the
+/// body), and the replica lane's map entry, its key's bytes and its upsert
+/// slot.
+pub(crate) fn row_charge(entry: usize, old: Option<&Tuple>, row: Option<&Tuple>, update: bool, lane: Lane<'_>) -> usize {
+    let slot = entry * 3 / 2;
+    let o = old.map_or(0, |o| tuple_resident(o, None));
+    let n = row.map_or(0, |r| tuple_resident(r, old));
+    // An update with an old image may move its key: a D and a U.
+    let moves = update && old.is_some();
+    let body = if lane.changelog {
+        let events = if moves { 2 } else { 1 };
+        let ev = 2 * events * std::mem::size_of::<crate::logbased::changelog::Change>();
+        // A view keeps an old-image slot an event (the image itself is moved
+        // into the body, not copied).
+        let olds = if lane.keep_old { 2 * events * std::mem::size_of::<Option<Tuple>>() } else { 0 };
+        // A key move's marker (`Change::moved_from`): a boxed empty key, or
+        // the old key's bytes when the row has unchanged-TOAST cells (mask
+        // resolution reads them there): at most the old frame, a Vec a cell.
+        let moved = match (moves, old, row) {
+            (true, Some(o), Some(r)) => {
+                let masked = r.cells.iter().any(|c| matches!(c, pgoutput::CellR::UnchangedToast));
+                2 * ALLOC
+                    + std::mem::size_of::<crate::logbased::changelog::CKey>()
+                    + if masked { o.frame.len() + o.cells.len() * (std::mem::size_of::<Vec<u8>>() + ALLOC) } else { 0 }
+            }
+            _ => 0,
+        };
+        ev + olds + moved
+    } else if row.is_some() {
+        // The collapse: a map entry a key (a hashbrown slot and its control
+        // byte, at twice for growth and load), the key's bytes, and the
+        // upsert's slot. A moving update also keys its old identity.
+        let map = 2 * (std::mem::size_of::<(crate::logbased::collapse::K, u64)>() + 1);
+        let keys = |t: &Tuple| map + lane.key.map_or(0, |k| key_heap(t, k));
+        let up = 2 * std::mem::size_of::<Option<Tuple>>();
+        row.map_or(0, keys) + up + if moves { old.map_or(0, keys) } else { 0 }
+    } else {
+        0
+    };
+    slot + o + n + body
 }
 
 /// Bytes a buffered streamed op holds — the same measure `cells_bytes` takes
@@ -423,8 +669,18 @@ pub(crate) async fn drain(
     // The current transaction's ops past `tx_limit`, on disk (A2): replayed
     // in window-sized chunks after its commit instead of refused.
     let mut tx_spill: Option<crate::logbased::spill::SpillFile> = None;
+    // This transaction's charge (resident bytes at its commit) and its bytes
+    // in the window budget's measure.
     let mut tx_bytes = 0usize;
-    let tx_limit = tx_buf_limit();
+    let mut tx_win = 0usize;
+    // The cap (round P, L14b): the drain's share of the cage. Beside the
+    // transaction the drain keeps the window's other transactions (up to the
+    // window budget) and, on the lanes whose apply overlaps the drain, one
+    // more window being applied; plus the reader's refill and the apply's
+    // chunk (4 MiB). A lane that applies after its drain returns
+    // (`apply_after`: a Postgres view) plans the one window (p13).
+    let windows = if sess.apply_after { 1 } else { 2 };
+    let tx_limit = tx_budget(windows * max_buf_bytes + (4 << 20), sess.stream_charge)?;
     let mut end_lsn = start_lsn;
     // Approximate bytes buffered across tx_buf + collapsers. Collapse dedup
     // (last-write-wins) makes true memory smaller — the count is conservative.
@@ -625,6 +881,7 @@ pub(crate) async fn drain(
                         tx_buf.clear();
                         tx_spill = None;
                         tx_bytes = 0;
+                        tx_win = 0;
                     }
                     PgoMessage::Commit { end_lsn: e, .. } => {
                         if let Some(f) = tx_spill.take() {
@@ -654,6 +911,7 @@ pub(crate) async fn drain(
                         )?;
                         t_flush += t_ph.elapsed();
                         tx_bytes = 0;
+                        tx_win = 0;
                         end_lsn = e;
                         if e >= stop_line {
                             break;
@@ -673,7 +931,9 @@ pub(crate) async fn drain(
                         // The ops leave the session's buffer and land in this
                         // window's collapsers, so the charge moves with them.
                         let n: usize = ops.iter().map(|(_, o, _)| op_bytes(o)).sum();
+                        let c: usize = ops.iter().map(|(t, o, _)| op_charge(o, lane(sess, *t, changelog))).sum();
                         sess.stream_bytes = sess.stream_bytes.saturating_sub(n);
+                        sess.stream_charge = sess.stream_charge.saturating_sub(c);
                         if let Some(f) = sess.stream_spill.remove(&xid) {
                             // Spilled (A2): its head is on disk, `ops` is the
                             // tail still in memory. It replays from the next
@@ -726,6 +986,7 @@ pub(crate) async fn drain(
                         } else if sess.stream_spill.contains_key(&xid) {
                             sess.stream_aborted.entry(xid).or_default().insert(sub_xid);
                         }
+                        let (slots, layouts, keep_old) = (&sess.slots, &sess.layouts, sess.keep_old);
                         if let Some(ops) = sess.streams.get_mut(&xid) {
                             let before = ops.len();
                             let freed: usize = ops
@@ -733,12 +994,18 @@ pub(crate) async fn drain(
                                 .filter(|(_, _, sx)| *sx == sub_xid || sub_xid == xid)
                                 .map(|(_, o, _)| op_bytes(o))
                                 .sum();
+                            let freed_c: usize = ops
+                                .iter()
+                                .filter(|(_, _, sx)| *sx == sub_xid || sub_xid == xid)
+                                .map(|(t, o, _)| op_charge(o, lane_of(slots, layouts, keep_old, *t, changelog)))
+                                .sum();
                             if sub_xid == xid {
                                 ops.clear();
                             } else {
                                 ops.retain(|(_, _, sx)| *sx != sub_xid);
                             }
                             sess.stream_bytes = sess.stream_bytes.saturating_sub(freed);
+                            sess.stream_charge = sess.stream_charge.saturating_sub(freed_c);
                             if dbg_stream && before != ops.len() {
                                 eprintln!(
                                     "[log_based] stream {xid}: subtransaction {sub_xid} \
@@ -824,12 +1091,11 @@ pub(crate) async fn drain(
                                     x,
                                     (t, op, sub.unwrap_or(x)),
                                     n,
-                                    tx_limit,
+                                    &tx_limit,
                                     changelog,
                                 )?,
                                 None => {
-                                    let mut acct = (&mut tx_bytes, &mut buf_bytes);
-                                    tx_push(sess, &mut tx_buf, &mut tx_spill, &mut acct, (t, op), n, tx_limit, changelog)?
+                                    tx_push(sess, &mut tx_buf, &mut tx_spill, (&mut tx_bytes, &mut tx_win, &mut buf_bytes), (t, op), n, &tx_limit, changelog)?
                                 }
                             }
                         }
@@ -847,12 +1113,11 @@ pub(crate) async fn drain(
                                     x,
                                     (t, op, sub.unwrap_or(x)),
                                     n,
-                                    tx_limit,
+                                    &tx_limit,
                                     changelog,
                                 )?,
                                 None => {
-                                    let mut acct = (&mut tx_bytes, &mut buf_bytes);
-                                    tx_push(sess, &mut tx_buf, &mut tx_spill, &mut acct, (t, op), n, tx_limit, changelog)?
+                                    tx_push(sess, &mut tx_buf, &mut tx_spill, (&mut tx_bytes, &mut tx_win, &mut buf_bytes), (t, op), n, &tx_limit, changelog)?
                                 }
                             }
                         }
@@ -868,12 +1133,11 @@ pub(crate) async fn drain(
                                     x,
                                     (t, op, sub.unwrap_or(x)),
                                     n,
-                                    tx_limit,
+                                    &tx_limit,
                                     changelog,
                                 )?,
                                 None => {
-                                    let mut acct = (&mut tx_bytes, &mut buf_bytes);
-                                    tx_push(sess, &mut tx_buf, &mut tx_spill, &mut acct, (t, op), n, tx_limit, changelog)?
+                                    tx_push(sess, &mut tx_buf, &mut tx_spill, (&mut tx_bytes, &mut tx_win, &mut buf_bytes), (t, op), n, &tx_limit, changelog)?
                                 }
                             }
                         }
@@ -1003,7 +1267,7 @@ fn flush_ops(
             let c = changelogs[i].as_mut().expect("changelog just ensured");
             match op {
                 StreamOp::Insert(row) => c.insert(row),
-                StreamOp::Update(old, row, _) => c.update(old.as_ref(), row),
+                StreamOp::Update(old, row, _) => c.update(old, row),
                 StreamOp::Delete(old) => c.delete(old),
                 StreamOp::Truncate => c.truncate(),
             }
@@ -1077,6 +1341,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::wire::pgoutput::Cell;
 
     /// L4 (§4.2): relations resolve to dense slots — a repeat resolution
     /// rides the last-rel cache, an unknown oid is a protocol error, an
@@ -1126,7 +1391,8 @@ mod tests {
     /// P2: the streamed cap names how many transactions share it.
     #[test]
     fn the_stream_cap_names_every_open_stream() {
-        let e = streams_too_big(2, 300 << 20, 256 << 20).to_string();
+        let b = TxBudget { limit: 256 << 20, derived: None, from_env: true };
+        let e = streams_too_big(2, 300 << 20, &b).to_string();
         assert!(
             e.contains("2 streamed transaction(s)") && !e.contains("one transaction"),
             "{e}"
@@ -1149,23 +1415,132 @@ mod tests {
     }
 
     /// The transaction cap may be tuned but not silently disabled: zero
-    /// falls back to the default (system review 2026-10-07, G0.1).
+    /// falls back to the default (system review 2026-10-07, G0.1); a value
+    /// above the memory limit is refused by name (round P, L14b).
     #[test]
     fn a_zero_tx_cap_falls_back_to_the_default() {
+        let dflt = cage().map_or(TX_BUF_LIMIT, |c| usize::try_from(c / 8 * 7).unwrap_or(usize::MAX).min(TX_BUF_LIMIT));
         std::env::remove_var("APITAP_TX_BUF_BYTES");
-        assert_eq!(tx_buf_limit(), TX_BUF_LIMIT);
+        assert_eq!(tx_buf_limit(), dflt);
+        assert!(!tx_budget(0, 0).unwrap().from_env);
         std::env::set_var("APITAP_TX_BUF_BYTES", "0");
-        assert_eq!(tx_buf_limit(), TX_BUF_LIMIT);
+        assert_eq!(tx_buf_limit(), dflt);
         std::env::set_var("APITAP_TX_BUF_BYTES", "512M");
         assert_eq!(tx_buf_limit(), 512 << 20);
+        match cage() {
+            Some(c) if c < 512 << 20 => {
+                let e = tx_budget(0, 0).unwrap_err().to_string();
+                assert!(e.contains("above this process's memory limit"), "{e}");
+            }
+            _ => assert_eq!(tx_budget(0, 0).unwrap().limit, 512 << 20),
+        }
         std::env::remove_var("APITAP_TX_BUF_BYTES");
+    }
+
+    /// The derived cap is 7/8 of what the cage leaves, and its refusal says
+    /// how it was derived so a user can reproduce it (round P, L14b).
+    #[test]
+    fn the_derived_cap_says_how_it_was_derived() {
+        let b = TxBudget { limit: 140 << 20, derived: Some((256 << 20, 20 << 20, 68 << 20)), from_env: false };
+        let s = tx_too_big("public.qa_li", 150 << 20, &b).to_string();
+        assert!(s.contains("cap 140 MiB") && s.contains("memory limit 256 MiB") && s.contains("20 MiB this process held"), "{s}");
+        assert!(s.contains("68 MiB planned") && s.contains("APITAP_TX_BUF_BYTES"), "{s}");
+    }
+
+    /// The charge is resident bytes at the commit: one frame per message
+    /// (old and new images share it), a buffer element at 1.5 entries, and
+    /// what the commit builds on top.
+    #[test]
+    fn the_charge_counts_a_shared_frame_once_and_the_body() {
+        let frame = bytes::Bytes::from(vec![b'x'; 1000]);
+        let tup = |o: u32| Tuple { frame: frame.clone(), cells: vec![pgoutput::CellR::Text(o, 10); 16] };
+        let op = StreamOp::Update(Some(tup(0)), tup(500), true);
+        let none = Lane { changelog: false, keep_old: false, key: None };
+        let plain = op_charge(&op, none);
+        let cells = 2 * (16 * std::mem::size_of::<pgoutput::CellR>() + ALLOC);
+        let buf = std::mem::size_of::<(u16, StreamOp, u32)>() * 3 / 2 + cells + 1000 + ALLOC;
+        assert!(plain > buf, "the collapse is charged on top of the buffer");
+        let view = op_charge(&op, Lane { changelog: true, keep_old: true, key: None });
+        assert!(view > buf + 2 * std::mem::size_of::<crate::logbased::changelog::Change>());
+    }
+
+    /// p13: an update without an old image cannot move its key, so its
+    /// changelog body is one event, not a D and a U; with one it may move.
+    #[test]
+    fn an_update_without_an_old_image_is_charged_one_event() {
+        let t = Tuple::from_cells(&[Cell::Text(bytes::Bytes::from_static(b"7")), Cell::Text(bytes::Bytes::from_static(b"abc"))]);
+        let cl = Lane { changelog: true, keep_old: false, key: None };
+        let one = op_charge(&StreamOp::Update(None, t.clone(), false), cl);
+        let two = op_charge(&StreamOp::Update(Some(t.clone()), t.clone(), false), cl);
+        let ev = std::mem::size_of::<crate::logbased::changelog::Change>();
+        assert!(two >= one + 2 * ev + tuple_resident(&t, None), "{one} {two}");
+    }
+
+    /// p13: the replica lane's collapse is charged (a key's map entry, and a
+    /// text key's bytes); a single integer key is held inline.
+    #[test]
+    fn the_replica_lane_charges_its_collapse_and_text_keys() {
+        let int = Tuple::from_cells(&[Cell::Text(bytes::Bytes::from_static(b"123456")), Cell::Text(bytes::Bytes::from(vec![b'v'; 64]))]);
+        let txt = Tuple::from_cells(&[Cell::Text(bytes::Bytes::from(vec![b'k'; 40])), Cell::Text(bytes::Bytes::from(vec![b'v'; 64]))]);
+        let k = [0usize];
+        let lane = Lane { changelog: false, keep_old: false, key: Some(&k) };
+        let unknown = Lane { key: None, ..lane };
+        let i = op_charge(&StreamOp::Insert(int.clone()), lane);
+        assert_eq!(i, op_charge(&StreamOp::Insert(int), unknown), "an integer key is inline");
+        let t = op_charge(&StreamOp::Insert(txt.clone()), lane);
+        assert!(t >= op_charge(&StreamOp::Insert(txt), unknown) + 40, "a text key's bytes");
+    }
+
+    /// p13 calibration against the cgroup's anon in the 256 MiB cage (p12,
+    /// explicit 250 MiB cap, no debug): the case-M view row (a 16-column
+    /// REPLICA IDENTITY FULL lineitem update, ~480 B frame) peaked at
+    /// ~1.45 KB a row; a 5-column pg→ClickHouse update (~150 B frame, int
+    /// key) at ~470 B on the changelog lane and ~600 B on the replica lane.
+    /// The charge stays at or above each, and within 1.3x (p12 charged the
+    /// view 1.8 KB and the replica lane 480 B: refused early there, and an
+    /// OOM risk here).
+    #[test]
+    fn the_charge_tracks_the_measured_peak() {
+        let cells = |n: usize, w: &[u32]| -> Vec<pgoutput::CellR> { (0..n).map(|i| pgoutput::CellR::Text(0, w[i % w.len()])).collect() };
+        let f = |n: usize| bytes::Bytes::from(vec![b'x'; n]);
+        let li = f(480);
+        let m = StreamOp::Update(
+            Some(Tuple { frame: li.clone(), cells: cells(16, &[8, 6, 4, 1, 5, 8, 4, 4, 1, 1, 10, 10, 10, 25, 10, 27]) }),
+            Tuple { frame: li, cells: cells(16, &[8]) },
+            true,
+        );
+        let view = op_charge(&m, Lane { changelog: true, keep_old: true, key: None });
+        assert!((1450..=1885).contains(&view), "view row {view}");
+        let c = StreamOp::Update(None, Tuple { frame: f(150), cells: cells(5, &[6, 7, 9, 65, 10]) }, false);
+        let cl = op_charge(&c, Lane { changelog: true, keep_old: false, key: None });
+        assert!((470..=611).contains(&cl), "changelog row {cl}");
+        let k = [0usize];
+        let mut fr = b"123456".to_vec();
+        fr.resize(150, b'x');
+        let row = Tuple {
+            frame: bytes::Bytes::from(fr),
+            cells: [(0, 6), (6, 7), (13, 9), (22, 65), (87, 10)].iter().map(|&(o, l)| pgoutput::CellR::Text(o, l)).collect(),
+        };
+        let c = StreamOp::Update(None, row, false);
+        let rep = op_charge(&c, Lane { changelog: false, keep_old: false, key: Some(&k) });
+        eprintln!(
+            "charge: view {view} changelog {cl} replica {rep}; sizes: entry {} Change {} Option<Tuple> {} CKey {} CellR {} K {}",
+            std::mem::size_of::<(u16, StreamOp, u32)>(),
+            std::mem::size_of::<crate::logbased::changelog::Change>(),
+            std::mem::size_of::<Option<Tuple>>(),
+            std::mem::size_of::<crate::logbased::changelog::CKey>(),
+            std::mem::size_of::<pgoutput::CellR>(),
+            std::mem::size_of::<(crate::logbased::collapse::K, u64)>()
+        );
+        assert!((600..=780).contains(&rep), "replica row {rep}");
     }
 
     /// The refusal must be actionable: it names the table, the size, and the
     /// knob that changes the cap (system review 2026-10-07, G0.1).
     #[test]
     fn the_refusal_names_the_table_the_size_and_the_knob() {
-        let s = tx_too_big("public.big", 300 << 20, TX_BUF_LIMIT).to_string();
+        let b = TxBudget { limit: TX_BUF_LIMIT, derived: None, from_env: false };
+        let s = tx_too_big("public.big", 300 << 20, &b).to_string();
         assert!(s.contains("public.big"), "{s}");
         assert!(s.contains("300 MiB"), "{s}");
         assert!(s.contains("APITAP_TX_BUF_BYTES"), "{s}");

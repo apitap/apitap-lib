@@ -52,6 +52,26 @@ pub(crate) struct ColumnPlan {
     pub udt: String,
     pub precision: Option<i32>,
     pub scale: Option<i32>,
+    /// Postgres: the type the column's values are, past every domain, with
+    /// its kind (`typtype`: 'e' enum, 'r' range, 'c' composite, …) and
+    /// category ('A' array), and a numeric's precision/scale from the
+    /// domain's own typmod (p20). Read paths (apitap.sql/read) decode a
+    /// domain as this type; transfers keep `udt` as it is.
+    pub base: Option<Box<BaseType>>,
+}
+
+/// [`ColumnPlan::base`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BaseType {
+    pub udt: String,
+    pub typtype: String,
+    pub category: String,
+    pub precision: Option<i32>,
+    pub scale: Option<i32>,
+    /// The base type's output function when its `::text` is a cast function
+    /// of its own (`pg_cast.castmethod = 'f'`, e.g. inet): text renderings
+    /// use it so a bootstrap spells a value as the stream does (p22).
+    pub text_out: Option<String>,
 }
 
 /// A probed source table with the resolved range-split cursor.
@@ -446,6 +466,7 @@ mod wm_tests {
             udt: udt.into(),
             precision: None,
             scale: None,
+            base: None,
         };
         let mut plan = super::TablePlan {
             engine: "mysql",
@@ -479,6 +500,7 @@ mod wm_tests {
                 udt: "int4".into(),
                 precision: None,
                 scale: None,
+                base: None,
             }],
             cursor: Some("c".into()),
             pk_cols: vec![],
@@ -663,6 +685,7 @@ mod auto_cursor_tests {
             udt: if int_pk { "int" } else { "varchar" }.into(),
             precision: None,
             scale: None,
+            base: None,
         }
     }
 

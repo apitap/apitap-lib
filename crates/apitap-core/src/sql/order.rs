@@ -289,7 +289,9 @@ pub(super) fn shown(v: &[u8]) -> String {
 pub(super) fn refuse(col: &str, coll: &str, a: &[u8], b: &[u8]) -> crate::Error {
     crate::Error::InvalidInput(format!(
         "sql: ORDER BY {col}: the column's collation {coll} may order {} and {} otherwise than apitap's byte order \
-         (case, punctuation, accents or the language's rules), so the answer could differ from the source's. \
+         (case, punctuation, accents or the language's rules), so the answer could differ from the source's \
+         (found after reading: whether the two orders agree depends on the values, so the rows had to be read and \
+         sorted to know). \
          Order by it under a byte collation in the source (Postgres: ORDER BY {col} COLLATE \"C\" in a view, or a \
          column with COLLATE \"C\"; MySQL: a _bin collation or BINARY), or order by a column that is not text",
         shown(a),
@@ -313,6 +315,28 @@ fn pg_bytes(provider: &str, locale: &str, name: &str) -> bool {
         || (provider != "i" && (l == "c" || l == "posix" || l.starts_with("c.")))
 }
 
+/// Whether `version()` names a server built against musl
+/// (`… on x86_64-pc-linux-musl, compiled by gcc …`: the official Alpine
+/// images).
+fn musl_build(version: &str) -> bool {
+    version.contains("-linux-musl")
+}
+
+/// Whether a column on a musl-built server orders by bytes (round P, QA
+/// L8d): musl's `strcoll`/`strcoll_l` is `strcmp` whatever the locale (musl
+/// has no collation tables: `src/locale/strcoll.c` returns `strcmp(l, r)`,
+/// and `strxfrm` copies), so a libc-provider (`c`) collation there, the
+/// database default `en_US.utf8` included, compares UTF-8 by its bytes — the
+/// order apitap sorts in — and its ORDER BY … LIMIT can stream with no
+/// guard. ICU (`i`) collations carry their own tables and keep the guard,
+/// as does `citext`, which folds case before it compares. glibc servers
+/// never take this path: the triple says `-linux-gnu`. The leg
+/// e2e_sql_order_locale checks the premise against the server itself ('B' <
+/// 'a' under the default collation on the rig's musl Postgres).
+fn musl_bytes(provider: &str, citext: bool) -> bool {
+    provider == "c" && !citext
+}
+
 /// [`PgColl`] for `table` on the server at `url`: one catalog query (each
 /// column's collation with the database's default), read as JSON so it runs
 /// on every version (`collisdeterministic` is 12+, `datlocprovider` 15+,
@@ -321,7 +345,7 @@ pub(super) async fn pg_collations(src: &crate::source::postgres::PgSource, table
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT a.attname AS name, format_type(a.atttypid, NULL) AS ty, to_jsonb(co)::text AS co, \
-                (SELECT to_jsonb(d)::text FROM pg_database d WHERE d.datname = current_database()) AS db \
+                (SELECT to_jsonb(d)::text FROM pg_database d WHERE d.datname = current_database()) AS db, version() AS v \
          FROM pg_attribute a JOIN pg_collation co ON co.oid = a.attcollation \
          WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped",
     )
@@ -330,6 +354,9 @@ pub(super) async fn pg_collations(src: &crate::source::postgres::PgSource, table
     .await
     .map_err(|e| crate::Error::Transfer(format!("sql: probing the collations of {table}: {e}")))?;
     let mut out = PgColl { locale: Vec::new(), nondet: Vec::new() };
+    // A server built against musl: its libc collations order by bytes (see
+    // [`musl_bytes`]). `version()` names the build's target triple.
+    let musl = rows.first().is_some_and(|r| musl_build(&r.get::<String, _>("v")));
     for r in rows {
         let name: String = r.get("name");
         let co: serde_json::Value = serde_json::from_str(&r.get::<String, _>("co")).unwrap_or_default();
@@ -362,7 +389,7 @@ pub(super) async fn pg_collations(src: &crate::source::postgres::PgSource, table
         if co.get("collisdeterministic").and_then(|x| x.as_bool()) == Some(false) {
             out.nondet.push((name.clone(), Locale::shown(&shown)));
         }
-        if !pg_bytes(&provider, &locale, &cname) {
+        if !pg_bytes(&provider, &locale, &cname) && !(musl && musl_bytes(&provider, citext)) {
             out.locale.push((name, shown));
         }
     }
@@ -410,6 +437,15 @@ mod tests {
         assert!(pg_bytes("c", "C", "default") && pg_bytes("c", "POSIX", "x") && pg_bytes("c", "C.UTF-8", "x") && pg_bytes("b", "C.UTF-8", "x"));
         assert!(pg_bytes("c", "en_US.utf8", "C") && pg_bytes("i", "und", "ucs_basic"));
         assert!(!pg_bytes("c", "en_US.utf8", "default") && !pg_bytes("i", "und", "und-x-icu") && !pg_bytes("i", "C", "x"));
+    }
+
+    #[test]
+    fn musl_libc_collations_order_by_bytes() {
+        assert!(musl_build("PostgreSQL 16.4 on x86_64-pc-linux-musl, compiled by gcc (Alpine 13.2.1_git20240309) 13.2.1 20240309, 64-bit"));
+        assert!(!musl_build("PostgreSQL 16.4 (Debian 16.4-1.pgdg120+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14) 12.2.0, 64-bit"));
+        assert!(musl_bytes("c", false));
+        assert!(!musl_bytes("i", false), "ICU keeps its tables on musl");
+        assert!(!musl_bytes("c", true), "citext folds case first");
     }
 
     #[test]

@@ -617,6 +617,7 @@ fn read_schema(
     src: String,
     table: String,
 ) -> PyResult<Vec<(String, String, bool)>> {
+    apitap_core::check_env().map_err(to_py)?;
     let fields = py
         .detach(|| rt().block_on(apitap_core::read_schema(&src, &table)))
         .map_err(|e| match e {

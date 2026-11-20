@@ -1065,8 +1065,8 @@ mod tests {
 
     fn kt_schema() -> Vec<ArrowField> {
         vec![
-            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
-            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
+            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() },
+            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() },
         ]
     }
 
@@ -1255,8 +1255,8 @@ mod tests {
     #[test]
     fn stage_writer_spills_parts_in_order() {
         let schema = vec![
-            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
-            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None },
+            ArrowField { name: "k".into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() },
+            ArrowField { name: "t".into(), kind: crate::wire::arrowcol::ArrowKind::Utf8, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() },
         ];
         let want = concat_all(&[&part(0, 3), &part(3, 0), &part(3, 70000), &part(70003, 5)]).unwrap();
         for budget in [u64::MAX, 1024] {

@@ -146,10 +146,114 @@ impl std::str::FromStr for Mode {
 /// that is set but not what the knob takes is refused by name, not ignored
 /// (QA p13: `APITAP_RECV_BUF_BYTES=junk` ran on the default, silently).
 pub fn check_env() -> Result<()> {
-    rcvbuf::check_env()
+    rcvbuf::check_env()?;
+    sink::bigquery::check_test_fail_env()?;
+    for &(name, kind) in ENV_NUMBERS {
+        match std::env::var(name) {
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(v)) => return Err(bad_env_number(name, &v.to_string_lossy(), kind)),
+            Ok(v) if !env_number_ok(&v, kind) => return Err(bad_env_number(name, &v, kind)),
+            Ok(_) => {}
+        }
+    }
+    Ok(())
 }
 
-/// `APITAP_RUNTIME_WORKERS`: unset/junk/0 -> `None` (the quota decides);
+/// How an `APITAP_*` number is read where it is used (each site's own parse).
+#[derive(Clone, Copy)]
+enum EnvNum {
+    /// A whole number as written (`"42"`; `" 42"` is not one there).
+    Int,
+    /// A whole number, spaces around it ignored.
+    IntTrim,
+    /// A byte count with an optional K/M/G suffix (`logbased::run::parse_size`).
+    Size,
+    /// A byte count with an optional M/G suffix (`APITAP_MEM_BUDGET`).
+    SizeMG,
+    /// Seconds as a decimal number.
+    Float,
+    /// A whole number, or `0`/`off`.
+    IntOrOff,
+}
+
+/// Every `APITAP_*` knob that takes a number (W1 round P review: a typo in one
+/// fell back to its default in silence, as `APITAP_RECV_BUF_BYTES=junk` did,
+/// so a run looked tuned and was not). A value its site cannot read is refused
+/// by name before anything starts; an empty value counts as unset. Lenient on
+/// purpose, not listed: `APITAP_DEBUG` (its presence is the switch), the on/off
+/// switches compared with `0`/`1`, and the test levers
+/// `APITAP_SQL_PROBE_RANGE_DELAY_MS`, `APITAP_SQL_TEST_LIMIT_LEAK`,
+/// `APITAP_LEDGER_RAW`, `APITAP_TEST_SECS`. `APITAP_DECODE_WORKMEM` refuses
+/// junk where it is read; the test lever `APITAP_TEST_BQ_FAIL`
+/// (`<load|copy>:<reason>:<n>`) is checked by its own shape in `check_env`.
+const ENV_NUMBERS: &[(&str, EnvNum)] = &[
+    ("APITAP_RUNTIME_WORKERS", EnvNum::Int),
+    ("APITAP_BATCH_BYTES", EnvNum::Int),
+    ("APITAP_BQ_APPLY_LANES", EnvNum::Int),
+    ("APITAP_CDC_APPLY_LANES", EnvNum::Int),
+    ("APITAP_CDC_WINDOW_BYTES", EnvNum::Int),
+    ("APITAP_FOLLOW_SECS", EnvNum::Int),
+    ("APITAP_GSHEETS_PAGE_ROWS", EnvNum::Int),
+    ("APITAP_S3_COPY_PART_BYTES", EnvNum::Int),
+    ("APITAP_WINDOW_DEPTH", EnvNum::Int),
+    ("APITAP_WINDOW_MAX_SECS", EnvNum::Int),
+    ("APITAP_SQL_PROBE_PIPES", EnvNum::Int),
+    ("APITAP_REPLICATION_SILENCE_SECS", EnvNum::Int),
+    ("APITAP_CH_SYNC_TIMEOUT_S", EnvNum::IntTrim),
+    ("APITAP_GITHUB_MAX_PAGES", EnvNum::IntTrim),
+    ("APITAP_HTTP_POOL_IDLE_MS", EnvNum::IntTrim),
+    ("APITAP_HTTP_READ_TIMEOUT", EnvNum::IntTrim),
+    ("APITAP_HTTP_CONNECT_TIMEOUT", EnvNum::IntTrim),
+    ("APITAP_HTTP_REQUEST_TIMEOUT", EnvNum::IntTrim),
+    ("APITAP_LEASE_TTL_SECS", EnvNum::IntTrim),
+    ("APITAP_MY_WINDOW_SECS", EnvNum::IntTrim),
+    ("APITAP_PG_CONNECT_TIMEOUT_SECS", EnvNum::IntTrim),
+    ("APITAP_SLOT_WAL_WARN", EnvNum::Size),
+    ("APITAP_SQL_BUILD_BYTES", EnvNum::Size),
+    ("APITAP_SQL_GROUP_BYTES", EnvNum::Size),
+    ("APITAP_SQL_OVERLAP_CHUNK", EnvNum::Size),
+    ("APITAP_SQL_STAGE_BYTES", EnvNum::Size),
+    ("APITAP_SQL_VIEW_BUCKET_BYTES", EnvNum::Size),
+    ("APITAP_TX_BUF_BYTES", EnvNum::Size),
+    ("APITAP_CH_MAX_BODY", EnvNum::Size),
+    ("APITAP_MEM_BUDGET", EnvNum::SizeMG),
+    ("APITAP_PROGRESS_INTERVAL", EnvNum::Float),
+    ("APITAP_READ_COALESCE_US", EnvNum::IntOrOff),
+];
+
+fn env_number_ok(v: &str, kind: EnvNum) -> bool {
+    if v.is_empty() {
+        return true;
+    }
+    match kind {
+        EnvNum::Int => v.parse::<u64>().is_ok(),
+        EnvNum::IntTrim => v.trim().parse::<u64>().is_ok(),
+        EnvNum::Size => logbased::run::parse_size(v).is_some(),
+        EnvNum::SizeMG => {
+            let t = v.trim();
+            let num = t.strip_suffix(['M', 'm', 'G', 'g']).unwrap_or(t);
+            num.trim().parse::<u64>().is_ok()
+        }
+        EnvNum::Float => v.trim().parse::<f64>().is_ok_and(|x| x.is_finite()),
+        EnvNum::IntOrOff => v == "0" || v.eq_ignore_ascii_case("off") || v.parse::<u64>().is_ok(),
+    }
+}
+
+fn bad_env_number(name: &str, v: &str, kind: EnvNum) -> Error {
+    let want = match kind {
+        EnvNum::Int | EnvNum::IntTrim => "a whole number (e.g. 4)",
+        EnvNum::Size => "a byte count, optionally with K, M or G (e.g. 64M)",
+        EnvNum::SizeMG => "a byte count, optionally with M or G (e.g. 96M)",
+        EnvNum::Float => "a number of seconds (e.g. 2.5)",
+        EnvNum::IntOrOff => "a whole number, or 0/off",
+    };
+    Error::InvalidInput(format!(
+        "{name}='{v}' is not {want}: it would have been ignored and the default used. Fix it, or unset it for the default"
+    ))
+}
+
+/// `APITAP_RUNTIME_WORKERS`: unset/0 -> `None` (the quota decides; junk is
+/// refused by [`check_env`] at every entry);
 /// `1` -> `Some(1)` (current_thread); N -> N worker threads. Exists so the
 /// regime-B question can be re-measured at the half-core tier.
 pub fn runtime_workers_override() -> Option<usize> {

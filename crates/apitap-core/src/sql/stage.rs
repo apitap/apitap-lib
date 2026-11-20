@@ -1700,7 +1700,7 @@ mod tests {
     /// answer's columns: no rows, but every column of the schema.
     #[test]
     fn limit_zero_keeps_the_columns() {
-        let f = |n: &str| ArrowField { name: n.into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None };
+        let f = |n: &str| ArrowField { name: n.into(), kind: crate::wire::arrowcol::ArrowKind::Int64, nullable: false, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() };
         let mut w = mem::Writer::new(vec![f("a"), f("b"), f("__n")]);
         let col = |v: Vec<i64>| FinishedCol::I64 { validity: None, data: v };
         w.push(ArrowBatch { rows: 3, cols: vec![col(vec![1, 2, 3]), col(vec![4, 5, 6]), col(vec![1, 2, 1])] }).unwrap();

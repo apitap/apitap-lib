@@ -151,22 +151,23 @@ fn images(
                         rows.push((-1, cells(o, &at, None)?));
                         rows.push((1, cells(new, &at, Some(o))?));
                     }
-                    // A key move: its D carried the old image.
-                    (None, Some(_)) => rows.push((1, cells(new, &at, None)?)),
+                    // A key move: its D, the event just before, carried the
+                    // old image, and an unchanged-TOAST cell of the new one
+                    // is that image's value (round P, p12: through p11 the
+                    // view refused such a move as having no old image).
+                    (None, Some(_)) => {
+                        let d = i.checked_sub(1).and_then(|j| body.events.get(j)).filter(|e| e.op == ChangeOp::Delete).and_then(|e| e.row.as_ref());
+                        rows.push((1, cells(new, &at, d)?))
+                    }
                     (None, None) => {
                         return Err(Error::Transfer(format!(
-                            "log_based view: an update of {qualified} arrived without its old image; delete {} to rebuild",
+                            "log_based view: an update of {qualified} arrived without its old image; delete {} and the view's replication slot (the next run names it) to rebuild",
                             path.display()
                         )))
                     }
                 }
             }
-            ChangeOp::Truncate => {
-                return Err(unsupported(format!(
-                    "a TRUNCATE of {qualified} under a mode=\"log_based\" view; delete {} to rebuild it",
-                    path.display()
-                )))
-            }
+            ChangeOp::Truncate => return Err(truncate_refused(qualified, path)),
         }
     }
     n += rows.len() as u64;
@@ -184,6 +185,37 @@ fn apply_window(v: &mut View, s: usize, out: &DrainOutcome, qualified: &str, pat
     let Some(w) = m.get(qualified) else { return Ok(0) };
     let want = v.columns(s);
     images(w.body(), w.layout().cols(), &want, qualified, path, &mut |rows| v.apply(s, rows))
+}
+
+/// A TRUNCATE in a view's change stream (Postgres or MySQL), in two
+/// sentences: what is not supported, then the remedy (QA p20: the remedy
+/// was spliced into the "… is not supported" template).
+fn truncate_refused(qualified: &str, path: &Path) -> Error {
+    bad(format!(
+        "a TRUNCATE of {qualified} under a mode=\"log_based\" view is not supported (apitap.sql() v1). To rebuild the \
+         view, delete {} and the view's replication slot (the next run names it)",
+        path.display()
+    ))
+}
+
+/// p22: a saved position and the relation oid its Postgres side was built
+/// from (`pg:<lsn>#oid=<relid>`); `None` for a position saved before 0.68.0.
+fn split_relid(pos: &str) -> (&str, Option<u32>) {
+    match pos.rsplit_once("#oid=") {
+        Some((at, oid)) => (at, oid.parse().ok()),
+        None => (pos, None),
+    }
+}
+
+/// Each Postgres side's position with its relation oid ([`split_relid`]).
+fn with_relids(feeds: &[Feed], ps: &mut [String]) {
+    for (f, p) in feeds.iter().zip(ps.iter_mut()) {
+        if let Feed::Pg(side) = f {
+            if !p.contains("#oid=") {
+                p.push_str(&format!("#oid={}", side.relid));
+            }
+        }
+    }
 }
 
 /// A Postgres side: its pool, names, and the slot it is kept by.
@@ -223,19 +255,20 @@ async fn pg_side(url: &str, table: &str, tag: &str, s: usize) -> Result<PgSide> 
         )));
     }
     let name = format!("apitap_v_{tag}_{s}");
-    let has_pub: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pg_publication WHERE pubname = $1")
-        .bind(&name)
-        .fetch_optional(&pool)
-        .await
-        .map_err(db_err)?;
-    if has_pub.is_none() {
-        sqlx::query(&format!("CREATE PUBLICATION \"{name}\" FOR TABLE {quoted}")).execute(&pool).await.map_err(db_err)?;
-    }
     let row: Option<(bool,)> = sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
         .bind(&name)
         .fetch_optional(&pool)
         .await
         .map_err(db_err)?;
+    // p22 (QA D1): the publication must carry the table — the CDC lane's own
+    // guard, shared. A first run (no slot yet) creates it or adds a missing
+    // member before the slot's snapshot; with a slot, a missing member is a
+    // hole in the stream (the table was dropped and recreated, or removed),
+    // refused by name instead of draining "ok, 0 changes" for ever.
+    let drained: Vec<&str> = if row.is_some() { vec![qualified.as_str()] } else { Vec::new() };
+    crate::logbased::run::ensure_publication(&pool, &name, &[qualified.as_str()], &drained, false)
+        .await
+        .map_err(|e| Error::Transfer(format!("log_based view: {e}. For a view: drop its slot ({name}), remove its state file and run again")))?;
     if row.is_some_and(|r| r.0) {
         return Err(Error::Transfer(format!("log_based view: slot {name} is active: another run of this view is in progress")));
     }
@@ -1126,7 +1159,7 @@ async fn catch_up(v: &mut View, s: usize, f: &Feed, from: &str, path: &Path) -> 
                     return Err(Error::Transfer(format!(
                         "log_based view: slot {} was advanced past this view's position ({}) to {} by another consumer \
                          (a copy of this view's state in another state dir or on another host, or a direct use of the slot); \
-                         the changes in between are gone for this view. Rebuild it: remove its state file {}",
+                         the changes in between are gone for this view. Rebuild it: remove its state file {} and drop the slot",
                         p.slot,
                         lsn_to_string(p0),
                         lsn_to_string(c),
@@ -1158,6 +1191,8 @@ async fn catch_up(v: &mut View, s: usize, f: &Feed, from: &str, path: &Path) -> 
             let key_cols = HashMap::from([(p.qualified.clone(), key)]);
             let mut sess = DrainSession::expecting(HashMap::from([(p.qualified.clone(), (p.relid, p.qualified.clone()))]));
             sess.keep_old = true;
+            // A window is applied after `drain` returns it, never beside it.
+            sess.apply_after = true;
             let mut ws = Walsender::connect(&p.url).await?;
             ws.start_replication(&p.slot, p0, &p.publication, false).await?;
             let (_tx, rx) = tokio::sync::watch::channel(p0);
@@ -1363,6 +1398,9 @@ pub async fn run_live(
     opts: &crate::TransferOptions,
 ) -> Result<crate::TransferReport> {
     let t0 = std::time::Instant::now();
+    // A transaction cap the cage cannot honour is refused before anything is
+    // read, a first run's bootstrap included (round P, p13).
+    crate::logbased::drain::check_tx_env()?;
     let mut v = plan_view(query, sources).await?;
     let fp = v.fp_hex();
     // The view's identity names its slots and its state: the query and its
@@ -1410,6 +1448,36 @@ pub async fn run_live(
     let dbg = dbg();
     let Some(from) = positions else {
         // First run, or a state that cannot be trusted.
+        //
+        // A first run (no state of this view in this state dir) that finds a
+        // slot under the view's own name refuses instead of dropping it
+        // (round P, p13). A view's ownership record is its state FILE, which
+        // lives in one state dir on one host: the same query into the same
+        // destination from another state dir or another host derives the same
+        // tag and slot name, and dropping that slot silently threw away the
+        // other view's position (it then had to rebuild). Nothing on the
+        // server can tell the owner from a crashed first run, so the user
+        // decides. Not the same as the CDC lane (logbased/run.rs
+        // bootstrap_group), which keeps dropping an inactive slot of its own
+        // name when the destination has no state: there the destination's
+        // _apitap_state is the one ownership record every host shares, and a
+        // live second host is refused by the lease. Do not harmonise the two.
+        if !path.exists() && alias.is_none() {
+            if let Some(p) = feeds.iter().find_map(|f| match f {
+                Feed::Pg(p) if p.slot_exists => Some(p),
+                _ => None,
+            }) {
+                return Err(Error::Transfer(format!(
+                    "log_based view: replication slot {} already exists on its server and this state dir ({}) has no \
+                     record of it: another state dir or another host may own this view. If it is a leftover of an aborted \
+                     first run, drop it and run again: SELECT pg_drop_replication_slot('{}'); DROP PUBLICATION \"{}\";",
+                    p.slot,
+                    dir.display(),
+                    p.slot,
+                    p.publication
+                )));
+            }
+        }
         let _ = std::fs::remove_file(&path);
         // A rebuild takes slots of its own tag: the adopted ones are named.
         if let Some(old) = alias.take() {
@@ -1455,6 +1523,8 @@ pub async fn run_live(
             }
             r => r?,
         };
+        let mut ps = ps;
+        with_relids(&feeds, &mut ps);
         v.save(&path, &ps)?;
         if dbg {
             eprintln!("[sql] view {tag}: state saved, {} bucket(s), in {:.1}s", v.buckets(), t0.elapsed().as_secs_f64());
@@ -1465,7 +1535,23 @@ pub async fn run_live(
     let mut confirm = Vec::new();
     let mut total = 0u64;
     for (s, f) in feeds.iter().enumerate() {
-        let (pos, n, open) = catch_up(&mut v, s, f, &from[s], &path).await?;
+        // p22: the table a Postgres side was built from, by relation oid; a
+        // position without one (before 0.68.0) is adopted as it is.
+        let (at, was) = split_relid(&from[s]);
+        if let (Feed::Pg(p), Some(was)) = (f, was) {
+            if was != p.relid {
+                return Err(Error::Transfer(format!(
+                    "log_based view: source table {} is not the table this view was built from (relation oids {was} and {}): \
+                     it was dropped and recreated, and its changes in between are not in the stream. Reset the view: drop its \
+                     slot ({}), remove its state file ({}) and run again",
+                    p.qualified,
+                    p.relid,
+                    p.slot,
+                    path.display()
+                )));
+            }
+        }
+        let (pos, n, open) = catch_up(&mut v, s, f, at, &path).await?;
         if dbg {
             eprintln!("[sql] view {tag}: side {s} {n} change image(s) {} -> {pos}", from[s]);
         }
@@ -1473,6 +1559,7 @@ pub async fn run_live(
         ps.push(pos);
         confirm.extend(open);
     }
+    with_relids(&feeds, &mut ps);
     v.save(&path, &ps)?;
     let rep = land(v.answer()?, dst_url, table, opts).await?;
     for (mut ws, at) in confirm {
@@ -1614,5 +1701,18 @@ mod tests {
                 assert_eq!(data[0], dec_text(f.as_bytes(), sc).unwrap(), "{f} at scale {sc}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod truncate_text_tests {
+    #[test]
+    fn a_truncate_refusal_reads_as_two_sentences() {
+        let e = super::truncate_refused("bench.t", std::path::Path::new("/s/abc.state")).to_string();
+        assert_eq!(
+            e,
+            "invalid input: sql: a TRUNCATE of bench.t under a mode=\"log_based\" view is not supported (apitap.sql() v1). To rebuild the \
+             view, delete /s/abc.state and the view's replication slot (the next run names it)"
+        );
     }
 }

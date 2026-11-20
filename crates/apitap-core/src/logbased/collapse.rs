@@ -54,7 +54,7 @@ impl K {
 /// materialising the i64 reproduces the source text byte for byte, so
 /// `+7`, `007` and whitespace fall back to the owned form (which is always
 /// correct) — the round trip is guarded, not assumed.
-fn parse_i64_key(t: &[u8]) -> Option<i64> {
+pub(crate) fn parse_i64_key(t: &[u8]) -> Option<i64> {
     let s = std::str::from_utf8(t).ok()?;
     let v: i64 = s.parse().ok()?;
     (v.to_string().as_bytes() == t).then_some(v)

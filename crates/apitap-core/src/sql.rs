@@ -334,9 +334,11 @@ struct Agg {
     arg: Option<VExpr>,
     ty: Option<Ty>,
     /// MIN/MAX of a text column whose source orders by bytes (round P,
-    /// p8): `Some(pad)`, `pad` when trailing spaces do not count (MySQL PAD
-    /// SPACE `_bin`, Postgres `bpchar`). Its accumulator is [`Acc::T`].
-    txt: Option<bool>,
+    /// p8): how its values compare ([`Pad`]). Its accumulator is [`Acc::T`].
+    txt: Option<Pad>,
+    /// MIN/MAX of a date or timestamp column (round P p11): folded as its
+    /// integer (days, microseconds; `ty` Int) and answered as this kind.
+    when: Option<ArrowKind>,
 }
 
 /// One output column, in SELECT order.
@@ -398,8 +400,8 @@ fn oexpr(sides: &mut [Side], e: &Expr, side: &mut Option<usize>, aggs: &mut Vec<
         Expr::Nested(x) => oexpr(sides, x, side, aggs)?,
         Expr::Function(_) => {
             let a = aggregate(sides, e, side)?.ok_or_else(|| unsupported(format!("the SELECT expression {e}")))?;
-            if a.txt.is_some() {
-                return Err(unsupported(format!("{e} in arithmetic (MIN/MAX of text is a text value)")));
+            if a.txt.is_some() || a.when.is_some() {
+                return Err(unsupported(format!("{e} in arithmetic (MIN/MAX of text, a date or a timestamp is not a number)")));
             }
             aggs.push(a);
             OExpr::Agg(aggs.len() - 1)
@@ -950,6 +952,29 @@ enum Lit {
     /// ([`ArrowField::padded`], [`ArrowField::ci`]).
     Coll(String, Coll),
     Bool(bool),
+    /// A number (or a string spelling one) against decimal text: compared
+    /// as numbers ([`dec_cmp_text`], p20).
+    DecText(String),
+}
+
+/// A literal as decimal text for a decimal-text column: a number, `-` a
+/// number, or a string that spells one (Postgres casts it).
+fn dectext_lit(x: &Expr) -> Option<Lit> {
+    let t = match x {
+        Expr::Nested(y) => return dectext_lit(y),
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n.clone(),
+            Value::SingleQuotedString(t) => t.clone(),
+            _ => return None,
+        },
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match dectext_lit(expr)? {
+            Lit::DecText(t) if !t.starts_with('-') => format!("-{t}"),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    dec_parse(t.as_bytes())?;
+    Some(Lit::DecText(t))
 }
 
 /// How a text column compares: trailing spaces ignored (`pad`), case
@@ -958,6 +983,9 @@ enum Lit {
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 struct Coll {
     pad: bool,
+    /// MySQL's (its fields sort NULLs low): padded text orders PAD SPACE
+    /// there, stripped on Postgres ([`Pad`]).
+    my: bool,
     ci: bool,
     ai: bool,
     /// A MySQL `_ci` collation from before 0900 (`general_ci`,
@@ -966,16 +994,19 @@ struct Coll {
     /// so only ASCII folds here; a GROUP BY or DISTINCT meeting a value
     /// that is not ASCII is refused by name (W1 round P, QA C10).
     legacy: bool,
+    /// Decimal text (p20): values equal as numbers are one group, kept
+    /// under the first spelling met (`1.0` and `1.00`: [`dec_norm`]).
+    dec: bool,
 }
 
 impl Coll {
     fn of(f: &ArrowField) -> Coll {
         let legacy = f.ci && f.nulls_low && f.locale.as_deref().is_some_and(|c| !c.contains("0900"));
-        Coll { pad: f.padded, ci: f.ci, ai: f.ai, legacy }
+        Coll { pad: f.padded, my: f.nulls_low, ci: f.ci, ai: f.ai, legacy, dec: f.tord.class == crate::read::TClass::Decimal }
     }
 
     fn plain(self) -> bool {
-        !self.pad && !self.ci
+        !self.pad && !self.ci && !self.dec
     }
 
     /// The bytes two values are equal by under this collation: padding off,
@@ -983,7 +1014,12 @@ impl Coll {
     /// (`ß` = `ss`, `æ` = `ae`, `ø` = `o`, …) folded. ASCII folds in place.
     fn fold<'a>(self, t: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
         use std::borrow::Cow;
-        let t = if self.pad { t.trim_ascii_end() } else { t };
+        if self.dec {
+            return dec_norm(t);
+        }
+        // Spaces only: a trailing tab or newline counts under both rules
+        // (it was trimmed too, which made 'a\t' one group with 'a').
+        let t = if self.pad { strip_spaces(t) } else { t };
         if !self.ci {
             return Cow::Borrowed(t);
         }
@@ -1024,7 +1060,16 @@ impl Coll {
         if self.plain() {
             return t.cmp(y);
         }
-        self.fold(t).cmp(&self.fold(y))
+        txt_cmp(&self.fold(t), &self.fold(y), self.pad_rule())
+    }
+
+    /// The padding rule its order follows ([`Pad`]).
+    fn pad_rule(self) -> Pad {
+        match (self.pad, self.my) {
+            (false, _) => Pad::No,
+            (true, true) => Pad::Space,
+            (true, false) => Pad::Strip,
+        }
     }
 
     /// The value a LIKE matches (the pattern was folded the same way at
@@ -1078,6 +1123,7 @@ fn peval(e: &PExpr, b: &ArrowBatch, r: usize, tys: &[Option<Ty>]) -> Option<bool
             // (PG's bpchar): TPC-H's l_shipmode arrives padded.
             (Cv::Text(t), Lit::Str(y)) => Some(t.cmp(y.as_bytes())),
             (Cv::Text(t), Lit::Coll(y, c)) => Some(c.cmp(t, y.as_bytes())),
+            (Cv::Text(t), Lit::DecText(y)) => Some(dec_cmp_text(t, y.as_bytes())),
             (Cv::Text(t), Lit::Num(y)) => std::str::from_utf8(t).ok()?.trim().parse::<f64>().ok()?.partial_cmp(y),
             (Cv::Bool(x), Lit::Bool(y)) => Some(x.cmp(y)),
             (Cv::Text(t), Lit::Bool(y)) => Some(matches!(t, b"true" | b"t" | b"1").cmp(y)),
@@ -1097,7 +1143,12 @@ fn peval(e: &PExpr, b: &ArrowBatch, r: usize, tys: &[Option<Ty>]) -> Option<bool
         },
         PExpr::Not(a) => peval(a, b, r, tys).map(|x| !x),
         PExpr::IsNull(i, neg) => {
-            let null = matches!(cv(&b.cols[*i], r, tys[*i]), Cv::Null);
+            // The cell's own validity (p20): a binary cell has no value `cv`
+            // reads, so COUNT(DISTINCT varbinary) counted none (0 vs 3).
+            let null = match &b.cols[*i] {
+                FinishedCol::Bin { validity, .. } => !valid(validity, r),
+                c => matches!(cv(c, r, tys[*i]), Cv::Null),
+            };
             Some(null != *neg)
         }
         PExpr::Cmp(i, op, l) => {
@@ -1241,6 +1292,50 @@ fn part_of<'a>(left: &'a Expr, right: &Expr) -> Option<(&'a Expr, i64, i64)> {
     Some((x.as_ref(), n, k))
 }
 
+/// The words every class refusal carries ([`type_refusal`]): how the dry
+/// pass knows one (p21).
+const TYPE_REFUSED: &str = " is refused: ";
+
+/// What a refused use of a column needs from its type (p20).
+#[derive(Clone, Copy)]
+enum TypeUse {
+    Order,
+    MinMax,
+    Group,
+    Literal,
+}
+
+/// One wording for every type refusal (p20, QA type sweep): the column, its
+/// source type, the use, why, and the remedy. Up front, before any read.
+fn type_refusal(col: &str, t: &crate::read::TypeOrder, u: TypeUse) -> Error {
+    use crate::read::TClass;
+    // p21: every class check runs in the dry pass, before any read; one
+    // that fires after a read is a check the dry pass missed (B3).
+    debug_assert!(
+        SQL_DRY.try_with(|_| ()).is_ok() || !STMT_PLAN.try_with(|m| m.borrow().read).unwrap_or(false),
+        "a class refusal after a read: {col}"
+    );
+    let ty = t.ty.as_deref().unwrap_or("this type");
+    let what = match u {
+        TypeUse::Order => "ORDER BY",
+        TypeUse::MinMax => "MIN/MAX",
+        TypeUse::Group => "GROUP BY / DISTINCT / COUNT(DISTINCT)",
+        TypeUse::Literal => "a comparison with a literal evaluated by apitap",
+    };
+    let why = match (t.class, u) {
+        (TClass::Enum, TypeUse::Order | TypeUse::MinMax) => "an enum orders by its declaration, not by its labels".to_string(),
+        (TClass::Byte, TypeUse::MinMax) => format!("the source has no MIN/MAX for {ty}"),
+        (_, TypeUse::Literal) => format!("apitap holds it as the text the source sends, and a literal's text need not be the value's own (as {ty} spells it)"),
+        (_, TypeUse::Group) => format!("apitap holds it as the text the source sends, and two different texts can be one {ty} value"),
+        _ => format!("apitap holds it as the text the source sends, which does not order as {ty} does"),
+    };
+    let remedy = match t.class {
+        TClass::Enum => "expose its position as an integer column in a view on the source (array_position(enum_range(NULL::<type>), col) on Postgres, col+0 on MySQL), or order by another column",
+        _ => "expose it in a view on the source as a type apitap compares natively (an integer, numeric(p,s), a timestamp or text), or leave it out of this use",
+    };
+    bad(format!("{what} on {col} ({ty}){TYPE_REFUSED}{why}; {remedy}"))
+}
+
 /// Compile a conjunct of side `s` for per-row evaluation.
 /// A per-row condition for side `s` ([`pexpr_inner`]); each text column it
 /// compares under a MySQL pre-0900 `_ci` collation is wrapped so a value
@@ -1280,10 +1375,28 @@ fn pexpr_inner(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
     };
     let side_name = sides[s].name.clone();
     // A string literal compares under its column's collation (`Lit::Coll`).
-    let padl = |sides: &[Side], c: usize, l: Lit| match l {
-        Lit::Str(t) if !Coll::of(&sides[s].schema[sides[s].read[c]]).plain() => Lit::Coll(t, Coll::of(&sides[s].schema[sides[s].read[c]])),
-        l => l,
+    // p20: a column held as its type's text form compares with a literal
+    // only where the literal's text is the value's own: decimal text as a
+    // number (`Lit::DecText`), an enum's label for = / <> / IN; any other
+    // class is refused by name.
+    let padl = |sides: &[Side], c: usize, l: Lit, x: &Expr, eq: bool| -> Result<Lit> {
+        let f = &sides[s].schema[sides[s].read[c]];
+        if f.kind == ArrowKind::Utf8 {
+            match f.tord.class {
+                crate::read::TClass::Collated => {}
+                crate::read::TClass::Decimal => {
+                    return dectext_lit(x).ok_or_else(|| type_refusal(&f.name, &f.tord, TypeUse::Literal));
+                }
+                crate::read::TClass::Enum if eq => {}
+                _ => return Err(type_refusal(&f.name, &f.tord, TypeUse::Literal)),
+            }
+        }
+        Ok(match l {
+            Lit::Str(t) if !Coll::of(f).plain() => Lit::Coll(t, Coll::of(f)),
+            l => l,
+        })
     };
+    let eqop = |o: &BinaryOperator| matches!(o, BinaryOperator::Eq | BinaryOperator::NotEq);
     let no = || unsupported(format!("the WHERE condition {e} on {side_name} (comparisons of a column with a literal, IN, IS NULL, AND/OR/NOT)"));
     Ok(match e {
         Expr::Nested(x) => pexpr_inner(sides, s, x)?,
@@ -1300,6 +1413,10 @@ fn pexpr_inner(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
             Expr::Value(v) => match &v.value {
                 Value::SingleQuotedString(pt) => {
                     let c = col(sides, expr)?.ok_or_else(no)?;
+                    let f = &sides[s].schema[sides[s].read[c]];
+                    if f.kind == ArrowKind::Utf8 && f.tord.class != crate::read::TClass::Collated {
+                        return Err(type_refusal(&f.name, &f.tord, TypeUse::Literal));
+                    }
                     let co = Coll::of(&sides[s].schema[sides[s].read[c]]);
                     let pt = if co.ci { String::from_utf8_lossy(&Coll { pad: false, ..co }.fold(pt.as_bytes())).into_owned() } else { pt.clone() };
                     PExpr::Like(c, pt, *negated, co)
@@ -1310,7 +1427,7 @@ fn pexpr_inner(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
         },
         Expr::Between { expr, negated, low, high } => {
             let c = col(sides, expr)?.ok_or_else(no)?;
-            let (lo, hi) = (padl(sides, c, lit(low).ok_or_else(no)?), padl(sides, c, lit(high).ok_or_else(no)?));
+            let (lo, hi) = (padl(sides, c, lit(low).ok_or_else(no)?, low, false)?, padl(sides, c, lit(high).ok_or_else(no)?, high, false)?);
             let both = PExpr::And(Box::new(PExpr::Cmp(c, BinaryOperator::GtEq, lo)), Box::new(PExpr::Cmp(c, BinaryOperator::LtEq, hi)));
             if *negated {
                 PExpr::Not(Box::new(both))
@@ -1321,7 +1438,7 @@ fn pexpr_inner(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
         Expr::InList { expr, list, negated } => {
             let c = col(sides, expr)?.ok_or_else(no)?;
             let ls = list.iter().map(lit).collect::<Option<Vec<_>>>().ok_or_else(no)?;
-            PExpr::In(c, ls.into_iter().map(|l| padl(sides, c, l)).collect(), *negated)
+            PExpr::In(c, ls.into_iter().zip(list).map(|(l, x)| padl(sides, c, l, x, true)).collect::<Result<Vec<_>>>()?, *negated)
         }
         Expr::BinaryOp { left, op: BinaryOperator::Eq, right } if part_of(left, right).is_some() => {
             let (x, n, k) = part_of(left, right).expect("matched");
@@ -1334,7 +1451,7 @@ fn pexpr_inner(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
             ) =>
         {
             if let (Some(c), Some(l)) = (col(sides, left)?, lit(right)) {
-                PExpr::Cmp(c, op.clone(), padl(sides, c, l))
+                PExpr::Cmp(c, op.clone(), padl(sides, c, l, right, eqop(op))?)
             } else if let (Some(l), Some(c)) = (lit(left), col(sides, right)?) {
                 let flipped = match op {
                     BinaryOperator::Lt => BinaryOperator::Gt,
@@ -1343,7 +1460,7 @@ fn pexpr_inner(sides: &mut [Side], s: usize, e: &Expr) -> Result<PExpr> {
                     BinaryOperator::GtEq => BinaryOperator::LtEq,
                     o => o.clone(),
                 };
-                PExpr::Cmp(c, flipped, padl(sides, c, l))
+                PExpr::Cmp(c, flipped, padl(sides, c, l, left, eqop(op))?)
             } else {
                 return Err(no());
             }
@@ -1467,6 +1584,146 @@ fn local_ok(side: &Side, tys: &[Option<Ty>], b: &ArrowBatch, r: usize) -> bool {
     side.local.iter().all(|p| peval(p, b, r, tys) == Some(true)) && side.semis.iter().all(|s| s.pass(b, r))
 }
 
+/// A float as a group, DISTINCT or join key (p20): -0 is 0 and every NaN
+/// is one value, as Postgres groups them (MySQL has no NaN).
+#[inline]
+fn f_key(x: f64) -> f64 {
+    if x.is_nan() {
+        f64::NAN
+    } else if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
+}
+
+/// Floats in the source's order (p20): NaN above every number, NaN = NaN,
+/// -0 = 0 (Postgres; MySQL has no NaN).
+fn f_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering as O;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => O::Equal,
+        (true, false) => O::Greater,
+        (false, true) => O::Less,
+        _ => a.partial_cmp(&b).unwrap_or(O::Equal),
+    }
+}
+
+/// MAX of floats: NaN is the greatest (Postgres).
+fn f_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// MIN of floats: NaN only when every value is.
+fn f_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else {
+        a.min(b)
+    }
+}
+
+/// A decimal text's parts (p20): Postgres' and MySQL's numeric output
+/// (`-12.340`, `0`, `NaN`, `Infinity`, `-Infinity`; no exponent).
+/// `None` for text that is none of these.
+enum DecText<'a> {
+    NegInf,
+    /// Sign (true: negative), integer digits with no leading zeros, fraction
+    /// digits with no trailing zeros. Zero is `(false, "", "")`.
+    Fin(bool, &'a [u8], &'a [u8]),
+    PosInf,
+    NaN,
+}
+
+fn dec_parse(t: &[u8]) -> Option<DecText<'_>> {
+    let t = t.trim_ascii();
+    if t.eq_ignore_ascii_case(b"nan") {
+        return Some(DecText::NaN);
+    }
+    let (neg, rest) = match t.first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    if rest.eq_ignore_ascii_case(b"infinity") || rest.eq_ignore_ascii_case(b"inf") {
+        return Some(if neg { DecText::NegInf } else { DecText::PosInf });
+    }
+    let (int, frac) = match rest.iter().position(|&c| c == b'.') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, &rest[rest.len()..]),
+    };
+    if (int.is_empty() && frac.is_empty()) || !int.iter().chain(frac).all(u8::is_ascii_digit) {
+        return None;
+    }
+    let int = &int[int.iter().position(|&c| c != b'0').unwrap_or(int.len())..];
+    let frac = &frac[..frac.iter().rposition(|&c| c != b'0').map_or(0, |i| i + 1)];
+    Some(DecText::Fin(neg && !(int.is_empty() && frac.is_empty()), int, frac))
+}
+
+/// Two decimal texts compared as numbers (p20): no float, no precision
+/// limit; NaN = NaN above +Infinity (Postgres). Text that is not a decimal
+/// compares by bytes, after every decimal.
+fn dec_cmp_text(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering as O;
+    let rank = |d: &DecText| match d {
+        DecText::NegInf => 0,
+        DecText::Fin(true, ..) => 1,
+        DecText::Fin(false, i, f) if i.is_empty() && f.is_empty() => 2,
+        DecText::Fin(false, ..) => 3,
+        DecText::PosInf => 4,
+        DecText::NaN => 5,
+    };
+    match (dec_parse(a), dec_parse(b)) {
+        (Some(x), Some(y)) => match rank(&x).cmp(&rank(&y)) {
+            O::Equal => match (x, y) {
+                (DecText::Fin(neg, ia, fa), DecText::Fin(_, ib, fb)) => {
+                    let mag = ia.len().cmp(&ib.len()).then_with(|| ia.cmp(ib)).then_with(|| fa.cmp(fb));
+                    if neg { mag.reverse() } else { mag }
+                }
+                _ => O::Equal,
+            },
+            o => o,
+        },
+        (Some(_), None) => O::Less,
+        (None, Some(_)) => O::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
+/// A decimal text's one spelling per value (p20): what a GROUP BY, DISTINCT
+/// or COUNT(DISTINCT) key holds, so `1.0` and `1.00` are one group.
+fn dec_norm(t: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    match dec_parse(t) {
+        Some(DecText::NaN) => Cow::Borrowed(b"NaN"),
+        Some(DecText::PosInf) => Cow::Borrowed(b"Infinity"),
+        Some(DecText::NegInf) => Cow::Borrowed(b"-Infinity"),
+        Some(DecText::Fin(neg, i, f)) => {
+            let mut v = Vec::with_capacity(i.len() + f.len() + 3);
+            if neg {
+                v.push(b'-');
+            }
+            if i.is_empty() {
+                v.push(b'0');
+            } else {
+                v.extend_from_slice(i);
+            }
+            if !f.is_empty() {
+                v.push(b'.');
+                v.extend_from_slice(f);
+            }
+            Cow::Owned(v)
+        }
+        None => Cow::Borrowed(t),
+    }
+}
+
 /// Append group column `c`'s row `r` to the group-key encoding `kb`.
 fn encode_group(c: &FinishedCol, r: usize, kb: &mut Vec<u8>) {
     let put = |kb: &mut Vec<u8>, tag: u8, bytes: &[u8]| {
@@ -1478,8 +1735,8 @@ fn encode_group(c: &FinishedCol, r: usize, kb: &mut Vec<u8>) {
         FinishedCol::I16 { validity, data } if valid(validity, r) => put(kb, 1, &i64::from(data[r]).to_le_bytes()),
         FinishedCol::I32 { validity, data } if valid(validity, r) => put(kb, 1, &i64::from(data[r]).to_le_bytes()),
         FinishedCol::I64 { validity, data } if valid(validity, r) => put(kb, 1, &data[r].to_le_bytes()),
-        FinishedCol::F32 { validity, data } if valid(validity, r) => put(kb, 2, &f64::from(data[r]).to_le_bytes()),
-        FinishedCol::F64 { validity, data } if valid(validity, r) => put(kb, 2, &data[r].to_le_bytes()),
+        FinishedCol::F32 { validity, data } if valid(validity, r) => put(kb, 2, &f_key(f64::from(data[r])).to_le_bytes()),
+        FinishedCol::F64 { validity, data } if valid(validity, r) => put(kb, 2, &f_key(data[r]).to_le_bytes()),
         FinishedCol::Dec128 { validity, data } if valid(validity, r) => put(kb, 3, &data[r].to_le_bytes()),
         FinishedCol::Bool { validity, data } if valid(validity, r) => {
             put(kb, 4, &[u8::from(data[r / 8] & (1 << (r % 8)) != 0)])
@@ -1562,6 +1819,37 @@ struct Groups {
 const GROUPS_LINEAR: usize = 16;
 
 impl Groups {
+    /// Room for `n` groups of about `key` bytes each, reserved up front (a
+    /// streaming top-N, round P p16): reserved, not touched, so a LIMIT the
+    /// rows never reach costs address space, not resident memory, except the
+    /// index's control bytes (one a slot).
+    fn with_capacity(n: usize, key: usize) -> Groups {
+        Groups {
+            ids: hashbrown::HashTable::with_capacity(n),
+            hasher: Default::default(),
+            keys: KeyArena { data: Vec::with_capacity(n.saturating_mul(key)), ends: Vec::with_capacity(n) },
+            bytes: 0,
+        }
+    }
+
+    /// Room for `n` groups in all (p18: one growth past a row estimate).
+    fn reserve_to(&mut self, n: usize, key: usize) {
+        use std::hash::BuildHasher as _;
+        let Groups { ids, hasher, keys, .. } = self;
+        let add = n.saturating_sub(keys.len());
+        ids.reserve(add, |&x| hasher.hash_one(&keys[x as usize]));
+        keys.ends.reserve(add);
+        keys.data.reserve(n.saturating_mul(key).saturating_sub(keys.data.len()));
+    }
+
+    /// Empty, keeping every allocation (a top-N cut refills it).
+    fn clear(&mut self) {
+        self.ids.clear();
+        self.keys.data.clear();
+        self.keys.ends.clear();
+        self.bytes = 0;
+    }
+
     #[inline]
     fn id(&mut self, kb: &[u8]) -> Result<u32> {
         use std::hash::BuildHasher as _;
@@ -1888,13 +2176,54 @@ impl Drop for Txt {
     }
 }
 
-/// Two text values in their column's byte order: `pad`, trailing spaces do
-/// not count (the shorter compares as if padded with spaces, as a PAD SPACE
-/// collation and `bpchar` compare).
-fn txt_cmp(a: &[u8], b: &[u8], pad: bool) -> std::cmp::Ordering {
+/// How trailing spaces count when a text column's values are ordered
+/// (round P p10, QA: `bpchar` and MySQL PAD SPACE differ below a space).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum Pad {
+    /// They count: bytes as they are.
+    #[default]
+    No,
+    /// MySQL PAD SPACE (`CHAR`, every collation but the NO PAD ones): the
+    /// shorter value compares as if padded with spaces, so `'a\t' < 'a'`.
+    Space,
+    /// Postgres `bpchar`: trailing spaces are dropped, then bytes compare,
+    /// so `'' < '\t'` and `'a' < 'a\t'`.
+    Strip,
+    /// Decimal text (an unconstrained Postgres numeric, a MySQL DECIMAL past
+    /// 38 digits): compared as the number it spells ([`dec_cmp_text`]).
+    Dec,
+}
+
+impl Pad {
+    /// A column's rule: padded text on MySQL (its fields sort NULLs low)
+    /// pads, on Postgres strips.
+    fn of(f: &ArrowField) -> Pad {
+        if f.tord.class == crate::read::TClass::Decimal {
+            return Pad::Dec;
+        }
+        match (f.padded, f.nulls_low) {
+            (false, _) => Pad::No,
+            (true, true) => Pad::Space,
+            (true, false) => Pad::Strip,
+        }
+    }
+}
+
+/// Trailing spaces (not tabs, not newlines) off: the value padded text is
+/// equal by under either rule.
+fn strip_spaces(t: &[u8]) -> &[u8] {
+    let n = t.iter().rposition(|&c| c != b' ').map_or(0, |i| i + 1);
+    &t[..n]
+}
+
+/// Two text values in their column's byte order under its [`Pad`] rule.
+fn txt_cmp(a: &[u8], b: &[u8], pad: Pad) -> std::cmp::Ordering {
     use std::cmp::Ordering as O;
-    if !pad {
-        return a.cmp(b);
+    match pad {
+        Pad::No => return a.cmp(b),
+        Pad::Strip => return strip_spaces(a).cmp(strip_spaces(b)),
+        Pad::Dec => return dec_cmp_text(a, b),
+        Pad::Space => {}
     }
     let n = a.len().min(b.len());
     match a[..n].cmp(&b[..n]) {
@@ -1911,7 +2240,7 @@ fn txt_cmp(a: &[u8], b: &[u8], pad: bool) -> std::cmp::Ordering {
 /// Fold one text value into a MIN/MAX of text (`v` None: a NULL, skipped).
 /// Ties under the collation keep the value met first.
 #[inline]
-fn fold_text(a: &mut Acc, f: AggFn, pad: bool, v: Option<&[u8]>) -> Result<()> {
+fn fold_text(a: &mut Acc, f: AggFn, pad: Pad, v: Option<&[u8]>) -> Result<()> {
     let Some(v) = v else { return Ok(()) };
     match a {
         Acc::None => *a = Acc::T(Txt::new(v)),
@@ -1939,7 +2268,7 @@ fn text_at<'b>(a: &Agg, b: &'b ArrowBatch, r: usize) -> Result<Option<&'b [u8]>>
 fn merge_acc(a: &mut Acc, b: Acc, ag: &Agg) -> Result<()> {
     let f = ag.f;
     if let (Acc::T(x), Acc::T(y)) = (&mut *a, &b) {
-        let o = txt_cmp(&y.v, &x.v, ag.txt.unwrap_or(false));
+        let o = txt_cmp(&y.v, &x.v, ag.txt.unwrap_or_default());
         if (f == AggFn::Min && o == std::cmp::Ordering::Less) || (f == AggFn::Max && o == std::cmp::Ordering::Greater) {
             *a = b;
         }
@@ -1962,8 +2291,8 @@ fn merge_acc(a: &mut Acc, b: Acc, ag: &Agg) -> Result<()> {
         }),
         (Acc::F(x), Acc::F(y)) => Acc::F(match f {
             AggFn::Sum => x + y,
-            AggFn::Min => x.min(y),
-            _ => x.max(y),
+            AggFn::Min => f_min(x, y),
+            _ => f_max(x, y),
         }),
         _ => return Err(bad("two accumulators of one aggregate of different kinds")),
     };
@@ -2148,8 +2477,8 @@ fn fold(a: &mut Acc, f: AggFn, ty: Option<Ty>, v: Num) -> Result<()> {
                 }),
                 (&Acc::F(s), Num::Float(x)) => Acc::F(match f {
                     AggFn::Sum => s + x,
-                    AggFn::Min => s.min(x),
-                    _ => s.max(x),
+                    AggFn::Min => f_min(s, x),
+                    _ => f_max(s, x),
                 }),
                 _ => return Err(bad("aggregate type invariant")),
             };
@@ -2196,6 +2525,9 @@ struct Plan {
     /// Each GROUP BY column's source server (a table read from one), which
     /// orders the pairs the check cannot vouch for (`order::verify`).
     gsrc: Vec<Option<String>>,
+    /// Each GROUP BY column's [`crate::read::TypeOrder`] (p20): a stage of
+    /// it keeps the class, and a decimal-text key compares as a decimal.
+    gord: Vec<crate::read::TypeOrder>,
     /// Per output column: NULL sorts lowest at its source (MySQL).
     nlow: Vec<bool>,
     /// Per ORDER BY key: NULLs first (explicit NULLS FIRST/LAST, else the
@@ -2398,7 +2730,7 @@ fn vexpr(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<VExpr
             let i = match sides[1].schema.iter().position(|f| f.name == name) {
                 Some(i) => i,
                 None => {
-                    sides[1].schema.push(ArrowField { name, kind: k, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None });
+                    sides[1].schema.push(ArrowField { name, kind: k, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() });
                     let i = sides[1].schema.len() - 1;
                     sides[1].lookups.push((i, s, c));
                     i
@@ -2603,9 +2935,34 @@ fn aggregate(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<O
             arg: None,
             ty: None,
             txt: None,
+            when: None,
         })),
         FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => {
-            let v = vexpr(sides, x, side)?;
+            // An argument over the other table than an earlier aggregate's is
+            // named as that (QA M9: `MIN(p.tc), MAX(m.tb)` was called "an
+            // aggregate argument mixing both tables' columns").
+            let before = *side;
+            let v = match vexpr(sides, x, side) {
+                Err(e0) if before.is_some() && e0.to_string().contains("mixing both tables") => {
+                    let mut on = Vec::new();
+                    sides_of(sides, x, &mut on)?;
+                    match (before, on.as_slice()) {
+                        (Some(a), [b]) if *b != a => {
+                            return Err(unsupported(format!(
+                                "{e} reads {} while another aggregate reads {}: the aggregates of a join must all \
+                                 read one table here. Join first in a CTE that selects the columns, then aggregate \
+                                 the CTE (a derived table in FROM does not do it): WITH j AS (SELECT {}.<group col> \
+                                 AS g, {}.<col> AS x, {}.<col> AS y FROM … JOIN … ON …) SELECT g, MIN(x), MAX(y), \
+                                 COUNT(*) FROM j GROUP BY g",
+                                sides[*b].name, sides[a].name, sides[a].name, sides[*b].name, sides[a].name
+                            )));
+                        }
+                        _ => return Err(e0),
+                    }
+                }
+                r => r?,
+            };
+            let own = *side;
             fn nested_caseb(e: &VExpr) -> bool {
                 match e {
                     VExpr::CaseB { .. } => true,
@@ -2628,7 +2985,7 @@ fn aggregate(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<O
                 if let VExpr::Col(i, k) = &v {
                     if kind_ty(*k).is_none() {
                         let one = VExpr::Case { arms: vec![(PExpr::IsNull(*i, true), VExpr::Int(1))], els: None, tys: vec![None; *i + 1] };
-                        return Ok(Some(Agg { f: func, arg: Some(one), ty: Some(Ty::Int), txt: None }));
+                        return Ok(Some(Agg { f: func, arg: Some(one), ty: Some(Ty::Int), txt: None, when: None }));
                     }
                 }
             }
@@ -2638,16 +2995,31 @@ fn aggregate(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<O
             // in the group budget). Under any other collation the order is
             // the collation's, which apitap does not apply: refused by name
             // (L12). Dates and other kinds: refused, not arithmetic.
+            // MIN/MAX of a date or timestamp: its integer (days since the
+            // epoch, microseconds) orders as the value does, so it folds as an
+            // integer and is answered in its own kind (round P p11: MIN/MAX of
+            // a date was refused as "arithmetic", an ordinary query).
+            if matches!(func, AggFn::Min | AggFn::Max) {
+                if let VExpr::Col(_, k) = &v {
+                    if matches!(k, ArrowKind::Date32 | ArrowKind::TimestampUtc | ArrowKind::TimestampNaive) {
+                        return Ok(Some(Agg { f: func, arg: Some(v.clone()), ty: Some(Ty::Int), txt: None, when: Some(*k) }));
+                    }
+                }
+            }
             if matches!(func, AggFn::Min | AggFn::Max) {
                 if let VExpr::Col(i, k) = &v {
                     if kind_ty(*k).is_none() {
-                        let fld = side.and_then(|s| sides.get(s)).and_then(|sd| sd.read.get(*i).and_then(|&c| sd.schema.get(c)));
+                        let fld = own.and_then(|s| sides.get(s)).and_then(|sd| sd.read.get(*i).and_then(|&c| sd.schema.get(c)));
                         match fld {
+                            Some(fl) if *k == ArrowKind::Utf8 && !fl.tord.minmax_ok() => {
+                                return Err(type_refusal(&x.to_string(), &fl.tord, TypeUse::MinMax));
+                            }
                             Some(fl) if *k == ArrowKind::Utf8 && fl.locale.is_none() && !fl.ci => {
-                                return Ok(Some(Agg { f: func, arg: Some(v), ty: None, txt: Some(fl.padded) }));
+                                return Ok(Some(Agg { f: func, arg: Some(v), ty: None, txt: Some(Pad::of(fl)), when: None }));
                             }
                             Some(fl) if *k == ArrowKind::Utf8 => {
-                                let coll = fl.locale.clone().unwrap_or_else(|| "case-insensitive".into());
+                                // The collation as a person names it, not as it is carried.
+                                let coll = fl.locale.as_deref().map_or_else(|| "case-insensitive".into(), order::Locale::shown);
                                 return Err(unsupported(format!(
                                     "{}({x}): the column's collation {coll} does not order text by its bytes, and apitap \
                                      answers MIN and MAX of text only where it does. Take MIN/MAX under a byte collation in \
@@ -2667,7 +3039,7 @@ fn aggregate(sides: &mut [Side], e: &Expr, side: &mut Option<usize>) -> Result<O
                 }
             }
             let ty = Some(type_of(&v)?);
-            Ok(Some(Agg { f: func, arg: Some(v), ty, txt: None }))
+            Ok(Some(Agg { f: func, arg: Some(v), ty, txt: None, when: None }))
         }
         _ => Err(unsupported(format!("the argument of {}", f.name))),
     }
@@ -3300,8 +3672,8 @@ fn plan_with(
                     aggs.len() - 1
                 }
             };
-            if aggs[i].txt.is_some() {
-                return Err(unsupported(format!("the HAVING condition {c} (MIN/MAX of text against a number)")));
+            if aggs[i].txt.is_some() || aggs[i].when.is_some() {
+                return Err(unsupported(format!("the HAVING condition {c} (MIN/MAX of text, a date or a timestamp against a number)")));
             }
             having.push((i, o, le));
         }
@@ -3309,6 +3681,8 @@ fn plan_with(
     // Each GROUP BY column's collation (before a star layout reorders sides).
     let gcoll: Vec<Coll> = group_cols.iter().map(|&(s, c)| Coll::of(&sides[s].schema[c])).collect();
     let gloc: Vec<Option<String>> = group_cols.iter().map(|&(s, c)| sides[s].schema[c].locale.clone()).collect();
+    let gord: Vec<crate::read::TypeOrder> = group_cols.iter().map(|&(s, c)| sides[s].schema[c].tord.clone()).collect();
+    let gname: Vec<String> = group_cols.iter().map(|&(s, c)| sides[s].schema[c].name.clone()).collect();
     let gsrc: Vec<Option<String>> = group_cols
         .iter()
         .map(|&(s, c)| match sides[s].dialect {
@@ -3471,7 +3845,7 @@ fn plan_with(
             schema: group_cols
                 .iter()
                 .enumerate()
-                .map(|(i, &(s, c))| ArrowField { name: format!("__g{i}"), kind: sides[s].schema[c].kind, nullable: true, rewritten: false, padded: sides[s].schema[c].padded, ci: sides[s].schema[c].ci, ai: sides[s].schema[c].ai, locale: sides[s].schema[c].locale.clone(), nulls_low: sides[s].schema[c].nulls_low, origin: sides[s].schema[c].origin.clone() })
+                .map(|(i, &(s, c))| ArrowField { name: format!("__g{i}"), kind: sides[s].schema[c].kind, nullable: true, rewritten: false, padded: sides[s].schema[c].padded, ci: sides[s].schema[c].ci, ai: sides[s].schema[c].ai, locale: sides[s].schema[c].locale.clone(), nulls_low: sides[s].schema[c].nulls_low, origin: sides[s].schema[c].origin.clone(), tord: sides[s].schema[c].tord.clone() })
                 .collect(),
             read: Vec::new(),
             conj: Vec::new(),
@@ -3535,12 +3909,30 @@ fn plan_with(
             (Vec::new(), Some(st))
         }
     };
+    // p20: a column held as its type's text form groups and orders only as
+    // far as its class carries; anything past it is refused here, before
+    // any read. A plain SELECT's GROUP BY every output (`GROUPS_EXACT`)
+    // keeps rows apart that the source might call equal, never merges
+    // them: only its ORDER BY keys need an order.
+    let explicit = GROUPS_EXACT.try_with(|_| ()).is_err();
+    for (g, t) in gord.iter().enumerate() {
+        if explicit && !t.eq_ok() {
+            return Err(type_refusal(&gname[g], t, TypeUse::Group));
+        }
+    }
+    for &(c, _) in &order {
+        if let OutCol::Group(g) = &out[c].1 {
+            if !gord[*g].order_ok() {
+                return Err(type_refusal(&gname[*g], &gord[*g], TypeUse::Order));
+            }
+        }
+    }
     let key_groups = keys.is_some_and(|k| {
         let (bs, bk) = k.into_iter().find(|x| x.0 == group_side).expect("keyed");
         let bcol = sides[bs].read[bk];
         group_cols.iter().any(|&(s, c)| s == bs && c == bcol)
     });
-    Ok(Plan { sides, keys, group_side, groups, agg_side, aggs, out, order, limit, star, key_groups, residual, orx, gcoll, gloc, gsrc, nlow, onull, having })
+    Ok(Plan { sides, keys, group_side, groups, agg_side, aggs, out, order, limit, star, key_groups, residual, orx, gcoll, gloc, gsrc, gord, nlow, onull, having })
 }
 
 /// `FROM (SELECT exprs AS a, … FROM … WHERE …) AS t` with no GROUP BY,
@@ -3654,7 +4046,7 @@ fn years_to_virtual(sides: &mut [Side], e: &mut Expr) -> Result<()> {
             let from = from.unwrap_or(1);
             let name = format!("__substr_{}_{}_{}", base.name, from, len.map_or("end".to_string(), |l| l.to_string()));
             if !side.schema.iter().any(|f| f.name == name) {
-                side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Utf8, nullable: true, rewritten: false, padded: base.padded, ci: base.ci, ai: base.ai, locale: base.locale.clone(), nulls_low: base.nulls_low, origin: base.origin.clone() });
+                side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Utf8, nullable: true, rewritten: false, padded: base.padded, ci: base.ci, ai: base.ai, locale: base.locale.clone(), nulls_low: base.nulls_low, origin: base.origin.clone(), tord: base.tord.clone() });
                 let vi = side.schema.len() - 1;
                 side.virt.push((vi, c.1, Virt::Substr(from, len)));
                 side.want(c.1);
@@ -3761,7 +4153,7 @@ fn years_to_virtual(sides: &mut [Side], e: &mut Expr) -> Result<()> {
                 (true, p) => (format!("__trunc_{p:?}_{}", base.name).to_ascii_lowercase(), base.kind, Virt::Trunc(p)),
             };
             if !side.schema.iter().any(|f| f.name == name) {
-                side.schema.push(ArrowField { name: name.clone(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: base.nulls_low, origin: None });
+                side.schema.push(ArrowField { name: name.clone(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: base.nulls_low, origin: None, tord: Default::default() });
                 let vi = side.schema.len() - 1;
                 side.virt.push((vi, c.1, how));
                 side.want(c.1);
@@ -4874,11 +5266,18 @@ pub async fn run_into(
     // The answer as it comes: a stage table past its budget lands a chunk at
     // a time (an answer of millions of rows held whole was OOM-killed in a
     // 256 MB cage before a destination saw a row).
-    let (srcs, held) = pin_statement(query, sources).await?;
-    let a = stage::run_answer(query, &srcs).await;
-    for h in held {
-        h.close().await;
-    }
+    let a = statement_scope(async {
+        let (srcs, held) = pin_statement(query, sources).await?;
+        let a = match dry_pass(query, &srcs).await {
+            Ok(()) => stage::run_answer(query, &srcs).await,
+            Err(e) => Err(e),
+        };
+        for h in held {
+            h.close().await;
+        }
+        a
+    })
+    .await;
     let reg = match a? {
         Answer::Rows(r) => crate::source::sqlresult::register(r),
         Answer::Table(t) => crate::source::sqlresult::register_table(t),
@@ -4953,7 +5352,7 @@ fn rewrite_args(p: &mut Plan) -> bool {
     for (i, (a, sq)) in p.aggs.iter_mut().zip(sqls).enumerate() {
         let Some((sql, sc)) = sq else { continue };
         let name = format!("_apitap_a{i}");
-        side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int64, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None });
+        side.schema.push(ArrowField { name: name.clone(), kind: ArrowKind::Int64, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() });
         side.read.push(side.schema.len() - 1);
         side.computed.push((name, sql));
         let col = VExpr::Col(side.read.len() - 1, ArrowKind::Int64);
@@ -4973,12 +5372,18 @@ pub async fn run(query: &str, sources: &HashMap<String, String>) -> Result<SqlRe
     // UPDATE between two of them could count a row twice or not at all).
     // `pin_snapshots` leaves a URL that carries one as it is. MySQL sources
     // have no exported snapshot: each statement there reads its own.
-    let (srcs, held) = pin_statement(query, sources).await?;
-    let r = stage::run(query, &srcs).await;
-    for h in held {
-        h.close().await;
-    }
-    r
+    statement_scope(async {
+        let (srcs, held) = pin_statement(query, sources).await?;
+        let r = match dry_pass(query, &srcs).await {
+            Ok(()) => stage::run(query, &srcs).await,
+            Err(e) => Err(e),
+        };
+        for h in held {
+            h.close().await;
+        }
+        r
+    })
+    .await
 }
 
 /// [`run`] as a read stream: a large answer (past the stage budget, on disk)
@@ -4986,11 +5391,18 @@ pub async fn run(query: &str, sources: &HashMap<String, String>) -> Result<SqlRe
 /// Arrow stream). The snapshots close once the answer is computed; its rows
 /// are already the stage's.
 pub async fn run_stream(query: &str, sources: &HashMap<String, String>) -> Result<ReadHandle> {
-    let (srcs, held) = pin_statement(query, sources).await?;
-    let r = stage::run_answer(query, &srcs).await;
-    for h in held {
-        h.close().await;
-    }
+    let r = statement_scope(async {
+        let (srcs, held) = pin_statement(query, sources).await?;
+        let r = match dry_pass(query, &srcs).await {
+            Ok(()) => stage::run_answer(query, &srcs).await,
+            Err(e) => Err(e),
+        };
+        for h in held {
+            h.close().await;
+        }
+        r
+    })
+    .await;
     match r? {
         Answer::Rows(r) => Ok(ReadHandle::ready(r.schema, vec![r.batch])),
         // In memory (under the stage budget): handed on as it is, no copy.
@@ -5038,8 +5450,12 @@ async fn pin_statement(query: &str, sources: &HashMap<String, String>) -> Result
         // source the statement reads once needs no shared snapshot (its one
         // read, one span at one pipe, is one statement); one it reads more
         // than once does, and the holder would take the only connection.
-        if !pinned.iter().any(|(u, _)| u == url) && headroom(url).await.is_some_and(|h| h < 2) {
+        let free = if pinned.iter().any(|(u, _)| u == url) { None } else { headroom(url).await };
+        if free.is_some_and(|h| h < 2) {
             if reads.get(&name.to_ascii_lowercase()).copied().unwrap_or(0) < 2 {
+                // Unpinned: the statement's first plan reads this answer
+                // (`headroom_once`) instead of asking again.
+                headroom_keep(url, free);
                 continue;
             }
             for h in held {
@@ -5058,6 +5474,9 @@ async fn pin_statement(query: &str, sources: &HashMap<String, String>) -> Result
                     let t = format!("{url}{}__apitap_snapshot={}", if url.contains('?') { '&' } else { '?' }, h.id);
                     held.push(h);
                     pinned.push((url.clone(), t.clone()));
+                    // The holder now takes one of the connections the probe
+                    // counted free: what a probe after it would have answered.
+                    headroom_keep(&t, free.map(|f| f - 1));
                     t
                 }
                 Err(e) => {
@@ -5074,6 +5493,141 @@ async fn pin_statement(query: &str, sources: &HashMap<String, String>) -> Result
         eprintln!("[sql] {} snapshot(s) pinned for the statement", held.len());
     }
     Ok((srcs, held))
+}
+
+tokio::task_local! {
+    /// The connection headroom `pin_statement` asked each Postgres source
+    /// for, by the URL the statement's plan reads it under (W1 round P,
+    /// p19): handed to the statement's first plan (`headroom_once`) instead
+    /// of a second identical round trip — 50 ms each on a WAN. Taken once:
+    /// a later stage of the statement asks the server again.
+    static STMT_HEADROOM: std::cell::RefCell<Vec<(String, i64)>>;
+}
+
+tokio::task_local! {
+    /// The statement's schema and row-estimate answers by (URL, table)
+    /// (p21): the dry pass ([`SQL_DRY`]) and the run ask each once. The
+    /// schema carries whether its collations were asked.
+    static STMT_PLAN: std::cell::RefCell<StmtPlan>;
+    /// p21: the statement's dry pass — every stage planned (each class
+    /// check run) over empty stage answers, no row read, before the run
+    /// reads anything: a class refusal never comes after a data read.
+    pub(crate) static SQL_DRY: ();
+}
+
+#[derive(Default)]
+struct StmtPlan {
+    schemas: HashMap<(String, String), (Vec<ArrowField>, bool)>,
+    rows: HashMap<(String, String), Option<f64>>,
+    /// A plan of this statement has started reading ([`execute`]).
+    read: bool,
+}
+
+/// Run one statement with its own [`STMT_HEADROOM`] and [`STMT_PLAN`].
+async fn statement_scope<T>(f: impl std::future::Future<Output = T>) -> T {
+    STMT_PLAN.scope(std::cell::RefCell::new(StmtPlan::default()), STMT_HEADROOM.scope(std::cell::RefCell::new(Vec::new()), f)).await
+}
+
+/// p21: plan every stage of `query` over empty stage answers (no row
+/// read), and hand back a class refusal (`type_refusal`) if one fires; any
+/// other outcome of the dry pass is the run's to meet.
+///
+/// Its contract (architect, p21 B1-B5): it opens no destination, slot,
+/// publication, lease, snapshot or file — it ends in `run_engine_scoped`
+/// right after planning, before the headroom question and every read
+/// (`execute` asserts it in debug builds); the only connection it may open
+/// is the planning one, for the schema/collation/estimate questions the run
+/// would ask anyway (cached in [`STMT_PLAN`], so the run does not ask
+/// again), and it closes that before it returns. A panic or any error that
+/// is not a class refusal falls through to the real run.
+async fn dry_pass(query: &str, srcs: &HashMap<String, String>) -> Result<()> {
+    use futures::FutureExt;
+    // A statement with no stage plans every class check before its one read
+    // already (`plan_with` runs before `execute`): nothing to plan ahead.
+    if !has_stages(query) {
+        return Ok(());
+    }
+    let t = std::time::Instant::now();
+    let r = std::panic::AssertUnwindSafe(SQL_DRY.scope((), stage::run_answer(query, srcs))).catch_unwind().await;
+    if dbg() {
+        eprintln!("[sql] dry pass: {:.3} ms (planning probes included)", t.elapsed().as_secs_f64() * 1e3);
+    }
+    match r {
+        Ok(Err(e)) if e.to_string().contains(TYPE_REFUSED) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `query` has a stage that runs before another plans: a CTE, a
+/// subquery (IN / EXISTS / scalar) or a derived table (p22: the dry pass is
+/// skipped for the rest). An unparsable statement has none (its run fails
+/// on the parse, before any read).
+fn has_stages(query: &str) -> bool {
+    let Ok(stmts) = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, query) else {
+        return false;
+    };
+    let tree = format!("{stmts:?}");
+    tree.contains("with: Some(") || tree.contains("Subquery") || tree.contains("Derived {") || tree.contains("Exists {")
+}
+
+/// [`sql_schema`] asked once a statement (p21); asked again only when this
+/// query needs the collations an earlier ask skipped.
+async fn sql_schema_once(url: &str, table: &str, query: &str) -> Result<Vec<ArrowField>> {
+    let key = (url.to_string(), table.to_string());
+    let pg = url.starts_with("postgres://") || url.starts_with("postgresql://");
+    let hit = STMT_PLAN.try_with(|m| m.borrow().schemas.get(&key).cloned()).ok().flatten();
+    if let Some((s, probed)) = hit {
+        if probed || !pg || !collation_probe_needed(&s, query) {
+            return Ok(s);
+        }
+    }
+    let s = sql_schema(url, table, query).await?;
+    let probed = pg && collation_probe_needed(&s, query);
+    let _ = STMT_PLAN.try_with(|m| m.borrow_mut().schemas.insert(key, (s.clone(), probed)));
+    Ok(s)
+}
+
+/// [`row_estimate`] asked once a statement (p21).
+async fn row_estimate_once(url: &str, table: &str) -> Option<f64> {
+    let key = (url.to_string(), table.to_string());
+    if let Ok(Some(r)) = STMT_PLAN.try_with(|m| m.borrow().rows.get(&key).copied()) {
+        return r;
+    }
+    let r = row_estimate(url, table).await;
+    let _ = STMT_PLAN.try_with(|m| m.borrow_mut().rows.insert(key, r));
+    r
+}
+
+fn headroom_keep(url: &str, free: Option<i64>) {
+    if let Some(f) = free {
+        let _ = STMT_HEADROOM.try_with(|m| m.borrow_mut().push((url.to_string(), f)));
+    }
+}
+
+/// The source's headroom: `pin_statement`'s answer if this statement has
+/// one for `url` not yet used, else asked of the server now.
+async fn headroom_once(url: &str) -> Option<i64> {
+    let kept = STMT_HEADROOM
+        .try_with(|m| {
+            let mut m = m.borrow_mut();
+            let i = m.iter().position(|x| x.0 == url)?;
+            Some(m.swap_remove(i).1)
+        })
+        .ok()
+        .flatten();
+    if let Some(h) = kept {
+        if dbg() {
+            eprintln!("[sql] headroom: {h} connection(s) free on a source (asked once for the statement)");
+        }
+        return Some(h);
+    }
+    let h = headroom(url).await;
+    if dbg() {
+        if let Some(h) = h {
+            eprintln!("[sql] headroom: {h} connection(s) free on a source (asked)");
+        }
+    }
+    h
 }
 
 /// One SELECT the engine answers in one pass (`stage` splits the others).
@@ -5290,6 +5844,157 @@ async fn run_one_keyed(query: &str, sources: &HashMap<String, String>) -> Result
 /// the query again in parts instead.
 const GROUPS_OVER: &str = "groups past their memory budget";
 
+/// A streaming top-N's price (round P p14), from the group key's columns
+/// (`kinds`, as `encode_group` lays them out: an integer, float or date 13
+/// bytes, a decimal 21, a bool 6, text its bytes and 5, guessed at 32 bytes),
+/// its accumulators (`na`) and its ORDER BY keys (`order_text`: a text key
+/// each), for `n` rows kept: (the kept rows' bytes as `groups_bytes` counts
+/// them, the resident bytes at a cut's peak).
+///
+/// The peak, per kept row: the 2n candidate groups (key, its end offset, its
+/// index slot at 7/8 load, its accumulators), the n rows' copy, and the cut's
+/// sort over the 2n (row and index lists, a 32-byte value per ORDER BY key,
+/// and a text key's copy of its bytes). Calibrated against the cgroup's anon
+/// at a fixed pipe count (1 GiB cage, 8 pipes, 4M rows shaped like QA's
+/// qa_tn, LIMIT 10 .. 400K): 469 B a kept row ordered by text and an
+/// integer, 414 B by two integers; p13 priced ~1220 B (three times the
+/// guessed key, doubled) and refused a LIMIT 200K that p12 answered exactly
+/// at 256 MiB (QA, p13).
+fn topn_price(kinds: &[Option<ArrowKind>], na: usize, order_text: &[bool], n: u64) -> (u64, u64, u64) {
+    let key: u64 = kinds
+        .iter()
+        .map(|k| match k {
+            Some(ArrowKind::Utf8 | ArrowKind::Binary) => 5 + 32,
+            Some(ArrowKind::Decimal { .. }) => 21,
+            Some(ArrowKind::Bool) => 6,
+            _ => 13,
+        })
+        .sum();
+    let acc = (na * std::mem::size_of::<Acc>()) as u64;
+    // As `groups_bytes` counts a group: its key and 24, its index entry, its
+    // accumulators.
+    let counted = key + 24 + 5 + acc;
+    // p16: the kept set is reserved up front for 2n (`Groups::with_capacity`)
+    // and its n-row spare reused at every cut, so nothing reallocates after
+    // the start and glibc keeps no freed blocks (QA N1 on p15: +37 MiB of
+    // kept free heap in one run of three, 241 of 256 MiB). A group: its key,
+    // its end offset, its index slot and control byte at up to twice the
+    // slots (hashbrown rounds to a power of two past 7/8), its accumulators.
+    let resident = key + 4 + 12 + acc;
+    let sort: u64 = 16 + order_text.iter().map(|&t| if t { 32 + 48 } else { 32 }).sum::<u64>();
+    let per = 3 * resident + 2 * sort;
+    (counted.saturating_mul(n), per.saturating_mul(n.max(64)), key)
+}
+
+/// A streaming top-N's share of the cage and what it leaves the read's
+/// pipes: (7/8 of the limit `m` past the process's anonymous `floor`, that
+/// less the kept rows' `peak`). The transaction cap's rule (round P p14).
+fn topn_room(m: u64, floor: u64, peak: u64) -> (u64, u64) {
+    let share = m.saturating_sub(floor) / 8 * 7;
+    (share, share.saturating_sub(peak))
+}
+
+/// The read pipes `room` holds beside a streaming top-N (round P p17): the
+/// read's price per pipe (`READ_PIPE`), without its process reserve
+/// (`READ_RESERVE`), which the measured anonymous floor in `topn_room`
+/// already is. Charged twice, one pipe cost 38 MiB against ~10 measured
+/// (1 GiB cage, 8 pipes: ~8.5 MiB a pipe), and p16 refused QA's N1 500K and
+/// N5 300K at 256 MiB, which peak at ~80% of it.
+fn topn_pipes(room: u64) -> usize {
+    crate::read_impl::read_pipes_for(room + crate::pipeline::READ_RESERVE)
+}
+
+/// The rows a streaming top-N reserves for at first (round P p16/p18): the
+/// LIMIT, or the server's row estimate a quarter over and a little when that
+/// is smaller. No estimate, or none worth the name (a never-analyzed table:
+/// Postgres reltuples -1 or 0, NaN): the LIMIT.
+fn topn_n_eff(n: usize, est: Option<f64>) -> usize {
+    match est {
+        Some(r) if r.is_finite() && r > 0.0 => n.min((r * 1.25) as usize + 1024),
+        _ => n,
+    }
+    .max(64)
+}
+
+/// The refusal when the rows passed a stale estimate and the full LIMIT does
+/// not fit (p18): it names the estimate, not the LIMIT, as the cause.
+fn topn_stale(n: usize, rows_est: Option<f64>, table: &str, seen: usize, peak_full: u64, share: u64) -> String {
+    format!(
+        "ORDER BY … LIMIT {n}: the server estimates {} rows for {table}, and it holds more ({seen} read so far): keeping \
+         the first {n} rows as the read streams needs about {} MiB at its peak, past this statement's share of the memory \
+         limit ({} MiB). Run ANALYZE on {table} (MySQL: ANALYZE TABLE) so the plan sees its size, or ask for fewer rows",
+        rows_est.map_or(-1, |r| r.round() as i64),
+        peak_full >> 20,
+        share >> 20
+    )
+}
+
+/// A growth the kept set may still need: reserved for `n_eff` rows from the
+/// server's estimate (`rows_est`), with the full LIMIT admitted (`full_ok`:
+/// its price fit beside the pipes the read took) or not.
+struct TopGrow {
+    n_eff: usize,
+    key: usize,
+    full_ok: bool,
+    tb_full: u64,
+    peak_full: u64,
+    share: u64,
+    rows_est: Option<f64>,
+}
+
+/// The rows passed the estimate (p18): when the full LIMIT was admitted,
+/// the kept set grows once to its reservation for n (one priced step), and
+/// the counted cap becomes n's; else the refusal says the estimate was wrong,
+/// not the LIMIT.
+#[allow(clippy::too_many_arguments)]
+fn topn_grow(
+    p: &Plan,
+    n: usize,
+    g: &TopGrow,
+    seen: usize,
+    groups: &mut Groups,
+    accs: &mut Vec<Acc>,
+    spare: &mut Groups,
+    spare_accs: &mut Vec<Acc>,
+) -> Result<u64> {
+    let na = p.aggs.len();
+    let side = &p.sides[p.group_side];
+    if !g.full_ok {
+        return Err(bad(topn_stale(n, g.rows_est, &side.table, seen, g.peak_full, g.share)));
+    }
+    let c = 2 * n.max(64) + 1;
+    groups.reserve_to(c, g.key);
+    accs.reserve(c * na - accs.len().min(c * na));
+    *spare = Groups::with_capacity(n.max(64), g.key);
+    *spare_accs = Vec::with_capacity(n.max(64) * na);
+    if dbg() {
+        eprintln!("[sql] top {n}: {seen} rows passed the estimate ({} rows): kept set grown once to {n}", g.rows_est.map_or(-1, |r| r.round() as i64));
+    }
+    Ok(g.tb_full)
+}
+
+/// A streaming top-N's cut (round P p16): the first n rows by the ORDER BY
+/// stay, in `groups`/`accs`, whose reserved room is kept; `spare` (reserved
+/// for n) carries them across. Nothing is allocated past the sort's own
+/// lists, so the run's memory is what the plan priced, every run.
+fn topn_cut(p: &Plan, groups: &mut Groups, accs: &mut Vec<Acc>, spare: &mut Groups, spare_accs: &mut Vec<Acc>) -> Result<()> {
+    let na = p.aggs.len();
+    let rows = order_rows(p, groups, accs, None, true)?;
+    spare.clear();
+    spare_accs.clear();
+    for r in rows {
+        spare.id(&groups.keys[r])?;
+        spare_accs.extend_from_slice(&accs[r * na..(r + 1) * na]);
+    }
+    groups.clear();
+    accs.clear();
+    for i in 0..spare.keys.len() {
+        groups.id(&spare.keys[i])?;
+    }
+    accs.extend_from_slice(spare_accs);
+    Ok(())
+}
+
 /// The bytes a GROUP BY's groups may hold (keys, index, accumulators):
 /// `APITAP_SQL_GROUP_BYTES` (a test lever), else an eighth of the memory
 /// limit, else 512 MiB. An eighth: the finalize copies the groups up to
@@ -5318,6 +6023,24 @@ fn groups_check(g: &Groups, accs: usize, hit: usize) -> Result<()> {
     }
     Ok(())
 }
+
+/// The parts path's test of a GROUP BY column ([`partitioned`]): group `g`
+/// is a column of integers. One function for the parts path and for the
+/// top-N up-front refusal ([`topn_upfront`]), which must refuse only what
+/// the parts path cannot take (round P, p13).
+fn part_group(p: &Plan, g: usize) -> bool {
+    let kind = match &p.star {
+        Some(st) => st.gkind.get(g).copied(),
+        None => {
+            let gs = &p.sides[p.group_side];
+            p.groups.get(g).and_then(|&r| gs.read.get(r)).and_then(|&c| gs.schema.get(c)).map(|f| f.kind)
+        }
+    };
+    matches!(kind, Some(ArrowKind::Int16 | ArrowKind::Int32 | ArrowKind::Int64))
+}
+
+/// The most parts [`parts`] splits a statement into.
+const PARTS_MAX: u32 = 64;
 
 /// A query whose groups outgrew [`group_budget`], answered in N parts by a
 /// GROUP BY column of integers (`ABS(col % N) = i`, NULLs in part 0): the
@@ -5362,14 +6085,7 @@ async fn partitioned(query: &str, sources: &HashMap<String, String>, first: Erro
     let int_col = |c: &Expr| -> bool {
         let Some(i) = output(c) else { return false };
         let Some((_, OutCol::Group(g))) = p.out.get(i) else { return false };
-        let kind = match &p.star {
-            Some(st) => st.gkind[*g],
-            None => {
-                let gs = &p.sides[p.group_side];
-                gs.schema[gs.read[p.groups[*g]]].kind
-            }
-        };
-        matches!(kind, ArrowKind::Int16 | ArrowKind::Int32 | ArrowKind::Int64)
+        part_group(&p, *g)
     };
     let cands: Vec<Expr> = cands
         .into_iter()
@@ -5414,10 +6130,17 @@ async fn parts(
     osrc: &[Option<String>],
     first: Error,
 ) -> Result<Answer> {
+    // A guarded ORDER BY … LIMIT that fell here keeps its own explanation
+    // (the collation), and the refusal says what the parts did too.
+    let guarded_first = match &first {
+        Error::InvalidInput(m) if m.contains("does not order by bytes") => Some(m.clone()),
+        _ => None,
+    };
+    let mut tried: Vec<(String, u32)> = Vec::new();
     let mut last = first;
     'cand: for col in cands {
         let mut n = 4u32;
-        'size: while n <= 64 {
+        'size: while n <= PARTS_MAX {
             // The parts go to a stage table as they come (on disk past
             // its budget): the whole answer is never in memory twice.
             let mut out: Option<mem::Writer> = None;
@@ -5446,6 +6169,10 @@ async fn parts(
                     }
                     Err(e) if e.to_string().contains(GROUPS_OVER) => {
                         last = e;
+                        match tried.last_mut() {
+                            Some(t) if t.0 == col.to_string() => t.1 = n,
+                            _ => tried.push((col.to_string(), n)),
+                        }
                         n *= 2;
                         continue 'size;
                     }
@@ -5473,7 +6200,17 @@ async fn parts(
             return Ok(Answer::Rows(r));
         }
     }
-    Err(last)
+    match guarded_first {
+        Some(g) if last.to_string().contains(GROUPS_OVER) && !tried.is_empty() => {
+            let g = g.replace(&format!(" [{GROUPS_OVER}]"), "");
+            let how: Vec<String> = tried.iter().map(|(c, n)| format!("by {c} into {n} parts")).collect();
+            Err(Error::InvalidInput(format!(
+                "{g}; and splitting {} still left a part past the budget: ask for fewer rows, a larger memory limit, or COLLATE \"C\"",
+                how.join(", then ")
+            )))
+        }
+        _ => Err(last),
+    }
 }
 
 /// ORDER BY (an output's alias, its expression or its ordinal) and LIMIT
@@ -5513,8 +6250,14 @@ fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], e
         // Text by its column's collation, as the engine orders it (a MySQL
         // _ci column's 'B' after 'a', not before).
         let colls: Vec<Coll> = r.schema.iter().map(Coll::of).collect();
+        let decs: Vec<bool> = r.schema.iter().map(|f| f.tord.class == crate::read::TClass::Decimal).collect();
+        for &(c, _) in &keys {
+            if !r.schema[c].tord.order_ok() {
+                return Err(type_refusal(&r.schema[c].name, &r.schema[c].tord, TypeUse::Order));
+            }
+        }
         // Values only: NULLs are placed by the caller (`nfirst`).
-        let cmp1 = |c: &FinishedCol, coll: Coll, a: usize, b: usize| -> O {
+        let cmp1 = |c: &FinishedCol, coll: Coll, dec: bool, a: usize, b: usize| -> O {
             match (valid(c, a), valid(c, b)) {
                 (false, false) => return O::Equal,
                 (false, true) => return O::Greater,
@@ -5525,14 +6268,18 @@ fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], e
                 FinishedCol::I16 { data, .. } => data[a].cmp(&data[b]),
                 FinishedCol::I32 { data, .. } => data[a].cmp(&data[b]),
                 FinishedCol::I64 { data, .. } => data[a].cmp(&data[b]),
-                // A total order: NaN beside `partial_cmp` broke the sort's.
-                FinishedCol::F32 { data, .. } => data[a].total_cmp(&data[b]),
-                FinishedCol::F64 { data, .. } => data[a].total_cmp(&data[b]),
+                // A total order: NaN beside `partial_cmp` broke the sort's;
+                // NaN above every number and -0 = 0, as Postgres (p20).
+                FinishedCol::F32 { data, .. } => f_cmp(f64::from(data[a]), f64::from(data[b])),
+                FinishedCol::F64 { data, .. } => f_cmp(data[a], data[b]),
                 FinishedCol::Dec128 { data, .. } => data[a].cmp(&data[b]),
                 FinishedCol::Bool { data, .. } => (data[a / 8] >> (a % 8) & 1).cmp(&(data[b / 8] >> (b % 8) & 1)),
+                FinishedCol::Utf8 { offsets, data, .. } if dec => {
+                    dec_cmp_text(&data[offsets[a] as usize..offsets[a + 1] as usize], &data[offsets[b] as usize..offsets[b + 1] as usize])
+                }
                 FinishedCol::Utf8 { offsets, data, .. } if !coll.plain() => {
                     let (x, y) = (&data[offsets[a] as usize..offsets[a + 1] as usize], &data[offsets[b] as usize..offsets[b + 1] as usize]);
-                    coll.fold(x).cmp(&coll.fold(y)).then_with(|| x.cmp(y))
+                    coll.cmp(x, y).then_with(|| x.cmp(y))
                 }
                 FinishedCol::Utf8 { offsets, data, .. } | FinishedCol::Bin { offsets, data, .. } => {
                     data[offsets[a] as usize..offsets[a + 1] as usize].cmp(&data[offsets[b] as usize..offsets[b + 1] as usize])
@@ -5547,7 +6294,7 @@ fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], e
                     (false, true) => if nfirst[j] { O::Less } else { O::Greater },
                     (true, false) => if nfirst[j] { O::Greater } else { O::Less },
                     _ => {
-                        let o = cmp1(&cols[c], colls[c], a, b);
+                        let o = cmp1(&cols[c], colls[c], decs[c], a, b);
                         if asc { o } else { o.reverse() }
                     }
                 };
@@ -5560,7 +6307,7 @@ fn order_limit(r: &mut SqlResult, q: &sqlparser::ast::Query, names: &[String], e
         // A text key under a locale: every adjacent pair it decides is
         // checked over the whole sorted list, before the LIMIT cut (`order`).
         for w in idx.windows(2) {
-            let Some(&(c, asc)) = keys.iter().find(|&&(c, _)| cmp1(&cols[c], colls[c], w[0], w[1]) != O::Equal) else { continue };
+            let Some(&(c, asc)) = keys.iter().find(|&&(c, _)| cmp1(&cols[c], colls[c], decs[c], w[0], w[1]) != O::Equal) else { continue };
             let (Some(coll), FinishedCol::Utf8 { offsets, data, .. }) = (r.schema[c].locale.as_deref(), &cols[c]) else { continue };
             if !(valid(&cols[c], w[0]) && valid(&cols[c], w[1])) {
                 continue;
@@ -5685,6 +6432,11 @@ async fn run_engine_inner(query: &str, sources: &HashMap<String, String>) -> Res
 async fn run_engine_scoped(query: &str, sources: &HashMap<String, String>) -> Result<SqlResult> {
     let t0 = std::time::Instant::now();
     let p = plan_probed(query, sources).await?;
+    if SQL_DRY.try_with(|_| ()).is_ok() {
+        // p21: planned, every class check run; no read. An empty answer
+        // with the plan's own output schema (each column's class too).
+        return result(&p, &Groups::default(), &[], None);
+    }
     // Connections free on each source (W1 round P, p5): few -> serial.
     let mut urls: Vec<String> = p.sides.iter().filter(|s| matches!(s.dialect, Dialect::Pg | Dialect::My)).map(|s| s.url.clone()).collect();
     if let Some(st) = &p.star {
@@ -5694,7 +6446,7 @@ async fn run_engine_scoped(query: &str, sources: &HashMap<String, String>) -> Re
     urls.dedup();
     let mut free: Option<i64> = None;
     for u in &urls {
-        if let Some(h) = headroom(u).await {
+        if let Some(h) = headroom_once(u).await {
             free = Some(free.map_or(h, |f| f.min(h)));
         }
     }
@@ -5758,15 +6510,20 @@ async fn plan_probed(query: &str, sources: &HashMap<String, String>) -> Result<P
         );
         match (r, missing, missing_rows) {
             (Ok(mut p), _, _) => {
-                tz_check(&mut p).await?;
+                // The dry pass needs the plan's class checks only (they ran
+                // in `plan_with`); these two ask servers about the run.
+                if SQL_DRY.try_with(|_| ()).is_err() {
+                    tz_check(&mut p).await?;
+                    topn_upfront(&p).await?;
+                }
                 return Ok(p);
             }
             (Err(_), Some((u, t)), _) => {
-                let s = sql_schema(&u, &t, query).await?;
+                let s = sql_schema_once(&u, &t, query).await?;
                 cache.insert((u, t), s);
             }
             (Err(_), None, Some((u, t))) => {
-                let r = row_estimate(&u, &t).await;
+                let r = row_estimate_once(&u, &t).await;
                 est.insert((u, t), r);
             }
             (Err(e), None, None) => return Err(e),
@@ -5848,12 +6605,12 @@ async fn tz_check(p: &mut Plan) -> Result<()> {
     for (url, dialect, col) in need {
         let zone: String = match dialect {
             Dialect::Pg => {
-                let src = planning_pg(&url).await?;
-                // reset_val: the session's default (server, database, role),
-                // not apitap's own `SET timezone = 'UTC'`.
-                let r: std::result::Result<(String,), _> =
-                    sqlx::query_as("SELECT reset_val FROM pg_settings WHERE name = 'TimeZone'").fetch_one(src.pool()).await;
-                r.map_err(|e| bad(format!("asking {col}'s server its time zone: {e}")))?.0
+                // A session that sets no zone of its own (every apitap
+                // connection pins UTC at startup, sqlx's too, so reset_val
+                // read there says UTC: QA, round P p9).
+                crate::wire::walsender::Walsender::default_timezone(&url)
+                    .await
+                    .map_err(|e| bad(format!("asking {col}'s server its default time zone: {e}")))?
             }
             _ => {
                 let src = planning_my(&url).await?;
@@ -5888,17 +6645,19 @@ async fn tz_check(p: &mut Plan) -> Result<()> {
 /// refused by name when the statement names the column.
 pub(crate) async fn sql_schema(url: &str, table: &str, query: &str) -> Result<Vec<ArrowField>> {
     let mut s = read_schema_waiting(url, table).await?;
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+    if (url.starts_with("postgres://") || url.starts_with("postgresql://")) && !collation_probe_needed(&s, query) {
+        // Nothing the probe answers can reach this statement (p19: one
+        // round trip a table, 50 ms each on a WAN).
+        if dbg() {
+            eprintln!("[sql] collation probe of {table}: skipped (no text column named)");
+        }
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        if dbg() {
+            eprintln!("[sql] collation probe of {table}: asked");
+        }
         let c = order::pg_collations(&*planning_pg(url).await?, table).await?;
         let q = query.to_ascii_lowercase();
-        let named = |col: &str| {
-            let col = col.to_ascii_lowercase();
-            let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-            q.match_indices(&col).any(|(i, _)| {
-                let (before, after) = (q.as_bytes().get(i.wrapping_sub(1)).copied(), q.as_bytes().get(i + col.len()).copied());
-                !before.is_some_and(ident) && !after.is_some_and(ident)
-            })
-        };
+        let named = |col: &str| word_in(&q, &col.to_ascii_lowercase());
         if let Some((col, coll)) = c.nondet.iter().find(|(col, _)| named(col)) {
             return Err(bad(format!(
                 "{table}.{col} under the nondeterministic collation {coll}: its values compare equal by the collation's rules, \
@@ -5913,6 +6672,76 @@ pub(crate) async fn sql_schema(url: &str, table: &str, query: &str) -> Result<Ve
         }
     }
     Ok(s)
+}
+
+/// Whether `word` occurs in `text` with no identifier character (ASCII
+/// alphanumeric or `_`) on either side.
+fn word_in(text: &str, word: &str) -> bool {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    !word.is_empty()
+        && text.match_indices(word).any(|(i, _)| {
+            let (before, after) = (text.as_bytes().get(i.wrapping_sub(1)).copied(), text.as_bytes().get(i + word.len()).copied());
+            !before.is_some_and(ident) && !after.is_some_and(ident)
+        })
+}
+
+/// Whether `query` may reach a column of a Postgres table (schema `fields`)
+/// whose collation matters, so that its collations must be asked
+/// (`order::pg_collations`: the locale a text column orders, groups and
+/// takes MIN/MAX under, and the refusal of a nondeterministic one). The probe
+/// is skipped (p19) ONLY when no column that could carry a collation can be
+/// referenced: a skip on a text column would be a silent wrong ORDER BY,
+/// GROUP BY or MIN/MAX, so every doubt answers "ask".
+///
+/// * A column is left out only when its type is provably not text:
+///   integer, float, decimal, bool, date, timestamp, bytea. Every collatable
+///   Postgres type (text, varchar, bpchar, name, citext, a domain or an array
+///   over them, a type read as text) is delivered as Utf8, so it stays in.
+/// * A column is referenced when its name occurs as a word anywhere in the
+///   statement's text, case folded both ASCII-only and fully (select list,
+///   WHERE, join keys, USING, GROUP BY, DISTINCT, MIN/MAX, ORDER BY, CTEs and
+///   derived tables, expressions and casts: every reference spells it; a
+///   mention in a literal or a comment only asks needlessly).
+/// * References that do not spell the name ask for every table: `*` and
+///   `t.*` anywhere (in the select list or a function's arguments;
+///   `count(*)` reads no column), NATURAL JOIN, a table alias with a column
+///   list (`AS x(a, b)` renames by position), a `U&` escaped identifier, a
+///   statement that does not parse, and a column whose name holds a `"`.
+fn collation_probe_needed(fields: &[ArrowField], query: &str) -> bool {
+    use ArrowKind as K;
+    let maybe_text: Vec<&str> = fields
+        .iter()
+        .filter(|f| {
+            !matches!(
+                f.kind,
+                K::Int16 | K::Int32 | K::Int64 | K::Float32 | K::Float64 | K::Bool | K::Decimal { .. } | K::Date32 | K::TimestampUtc | K::TimestampNaive | K::Binary
+            )
+        })
+        .map(|f| f.name.as_str())
+        .collect();
+    if maybe_text.is_empty() {
+        return false;
+    }
+    let Ok(stmts) = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, query) else {
+        return true;
+    };
+    // The tree's own spelling of the references that name no column:
+    // `SelectItem::Wildcard(..)`, `Expr::Wildcard(..)`, every
+    // `QualifiedWildcard`, `JoinConstraint::Natural`, and a table alias
+    // that renames its columns (`FROM s.t AS x(a, b)`: `b` may be a text
+    // column under another name). `count(*)`'s argument
+    // is the bare `FunctionArgExpr::Wildcard`, no parenthesis after it.
+    let tree = format!("{stmts:?}");
+    if tree.contains("QualifiedWildcard") || tree.contains("Wildcard(") || tree.contains("Natural") || tree.contains("TableAliasColumnDef") {
+        return true;
+    }
+    let (qa, qu) = (query.to_ascii_lowercase(), query.to_lowercase());
+    if qa.contains("u&") {
+        return true;
+    }
+    maybe_text
+        .iter()
+        .any(|c| c.contains('"') || word_in(&qa, &c.to_ascii_lowercase()) || word_in(&qu, &c.to_lowercase()))
 }
 
 /// [`crate::read::read_schema`], waiting for a server with no connection
@@ -5937,8 +6766,12 @@ pub(crate) async fn read_schema_waiting(url: &str, table: &str) -> Result<Vec<Ar
             crate::read::read_schema(url, table).await
         };
         match r {
+            // The dry pass never waits for a connection (p22, gate p21:
+            // pool_many at role limit 4 waited ACQUIRE_WAIT in the dry pass
+            // and again in the run, 623 s): it gives up, and the run waits.
             Err(e) if (e.to_string().contains("pool timed out") || e.to_string().contains(crate::source::postgres::NO_CONNECTION))
-                && t0.elapsed() < crate::source::ACQUIRE_WAIT =>
+                && t0.elapsed() < crate::source::ACQUIRE_WAIT
+                && SQL_DRY.try_with(|_| ()).is_err() =>
             {
                 let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) % 1500;
                 tokio::time::sleep(std::time::Duration::from_millis(500 + u64::from(jitter))).await;
@@ -5954,6 +6787,136 @@ pub(crate) async fn read_schema_waiting(url: &str, table: &str) -> Result<Vec<Ar
             r => break r?,
         }
     })
+}
+
+/// A plain `SELECT … ORDER BY text LIMIT n` under a collation that does not
+/// order by bytes keeps every row (the guard checks the whole sorted list),
+/// and was refused past the group budget only after reading the table (QA
+/// L8d: 28–41 s). Refused here, before the read, when the server's own
+/// statistics already put it past the budget (round P, p12).
+///
+/// The rewrite groups the rows by every output, so the groups are at least
+/// as many as the distinct values of the most distinct output column — a
+/// LOWER bound, from `pg_stats.n_distinct` (Postgres) or the first-column
+/// index cardinality (MySQL). The bound times the least a group can hold
+/// (its key's headers, accumulators and index entry, no text bytes) past the
+/// budget refuses. A WHERE could shrink the rows, so a side with one is left
+/// to the streaming refusal; so is a table with no statistics, and a
+/// statement with an integer output column (the parts path may answer it).
+async fn topn_upfront(p: &Plan) -> Result<()> {
+    let Some(n) = p.limit else { return Ok(()) };
+    if GROUPS_EXACT.try_with(|_| ()).is_err() || p.order.is_empty() || p.sides.len() != 1 || p.star.is_some() || p.keys.is_some() || !order_guarded(p) {
+        return Ok(());
+    }
+    let side = &p.sides[0];
+    if !side.conj.is_empty() || !side.local.is_empty() || !side.semis.is_empty() || !p.having.is_empty() || p.residual.is_some() {
+        return Ok(());
+    }
+    let cols: Vec<String> = p.groups.iter().filter_map(|&g| side.read.get(g).and_then(|&c| side.schema.get(c)).map(|f| f.name.clone())).collect();
+    // The parts path's columns (`part_group`, its own test): integer GROUP BY
+    // columns, by name.
+    let part: Vec<String> = p
+        .groups
+        .iter()
+        .enumerate()
+        .filter(|&(g, _)| part_group(p, g))
+        .filter_map(|(_, &r)| side.read.get(r).and_then(|&c| side.schema.get(c)).map(|f| f.name.clone()))
+        .collect();
+    // Per column: distinct values (a lower bound) and the NULL share, from
+    // the server's statistics. Postgres: pg_stats; MySQL: the first-column
+    // index cardinality (no NULL share). A column with no statistics is
+    // absent.
+    let stats: Vec<(String, f64, f64)> = if side.url.starts_with("postgres://") || side.url.starts_with("postgresql://") {
+        let Ok(src) = planning_pg(&side.url).await else { return Ok(()) };
+        sqlx::query_as::<_, (String, f64, f64)>(
+            "SELECT s.attname::text, (CASE WHEN s.n_distinct < 0 THEN -s.n_distinct * GREATEST(c.reltuples, 0) ELSE s.n_distinct END)::float8, \
+             s.null_frac::float8 \
+             FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace \
+             JOIN pg_stats s ON s.schemaname = ns.nspname AND s.tablename = c.relname AND NOT s.inherited \
+             WHERE c.oid = $1::regclass AND s.attname = ANY($2)",
+        )
+        .bind(quote(Dialect::Pg, &side.table))
+        .bind(&cols)
+        .fetch_all(src.pool())
+        .await
+        .unwrap_or_default()
+    } else if side.url.starts_with("mysql://") || side.url.starts_with("mariadb://") {
+        let Ok(src) = planning_my(&side.url).await else { return Ok(()) };
+        let (schema, name) = match side.table.rsplit_once('.') {
+            Some((sc, t)) => (Some(sc.to_string()), t.to_string()),
+            None => (None, side.table.clone()),
+        };
+        if cols.is_empty() {
+            return Ok(());
+        }
+        let marks = vec!["?"; cols.len()].join(", ");
+        let sql = format!(
+            "SELECT column_name, CAST(MAX(cardinality) AS DOUBLE), CAST(0 AS DOUBLE) FROM information_schema.statistics \
+             WHERE table_schema = COALESCE(?, DATABASE()) AND table_name = ? AND seq_in_index = 1 AND cardinality IS NOT NULL \
+             AND column_name IN ({marks}) GROUP BY column_name"
+        );
+        let mut q = sqlx::query_as::<_, (String, f64, f64)>(&sql).bind(schema).bind(name);
+        for c in &cols {
+            q = q.bind(c);
+        }
+        q.fetch_all(src.pool()).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let lb: Option<f64> = stats.iter().map(|x| x.1).filter(|x| x.is_finite()).reduce(f64::max);
+    let Some(lb) = lb.filter(|x| *x > n as f64) else { return Ok(()) };
+    let per = (p.groups.len() * 5 + p.aggs.len() * std::mem::size_of::<Acc>() + 5 + 24) as f64;
+    let need = lb * per;
+    let budget = group_budget();
+    if need <= budget as f64 {
+        return Ok(());
+    }
+    // Past the budget the parts path is the one way left: a part holds the
+    // rows of `ABS(col % n) = i` (NULLs in part 0), at most PARTS_MAX parts.
+    // A column splits the rows no finer than its distinct values, and its
+    // NULLs stay together; a column with no statistics may split them, so
+    // the parts path is left to try. Refused here only when every part
+    // column's best split still leaves a part past the budget (QA's L8d ICU
+    // shape answered in 4 parts by id on p11; p12 refused it here).
+    let fits = |c: &String| match stats.iter().find(|x| x.0 == *c) {
+        None => true,
+        Some(&(_, nd, nf)) => {
+            let nf = nf.clamp(0.0, 1.0);
+            let split = nd.clamp(1.0, f64::from(PARTS_MAX));
+            need * (1.0 - nf) / split + need * nf <= budget as f64
+        }
+    };
+    if part.iter().any(fits) {
+        return Ok(());
+    }
+    let (c, coll) = guarded_key(p);
+    Err(bad(format!(
+        "ORDER BY {c} … LIMIT {n}: the column's collation {coll} does not order by bytes, so the first rows cannot be kept \
+         as the read streams and every row would be held: {} holds about {} distinct rows by the server's statistics, \
+         at least {} MiB, past the memory budget ({} MiB){}. Refused before reading. Order under a byte collation in the \
+         source (Postgres: COLLATE \"C\" in a view; MySQL: a _bin collation or BINARY), or by a column that is not text",
+        side.table,
+        lb.round() as u64,
+        (need as u64) >> 20,
+        budget >> 20,
+        if part.is_empty() {
+            String::new()
+        } else {
+            format!(", and no integer column splits it into parts that fit ({}: too few distinct values or too many NULLs)", part.join(", "))
+        }
+    )))
+}
+
+/// The first guarded ORDER BY key: its output name and its collation's
+/// human name.
+fn guarded_key(p: &Plan) -> (String, String) {
+    p.order
+        .iter()
+        .find_map(|&(c, _)| match &p.out[c].1 {
+            OutCol::Group(g) => p.gloc.get(*g).cloned().flatten().map(|l| (p.out[c].0.clone(), order::Locale::shown(&l))),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// A table's row count as its server's catalog estimates it (`None`: no
@@ -6848,6 +7811,11 @@ async fn join_pass(
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn execute(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
+    // p21: the dry pass never reaches a read (it returns after planning);
+    // the statement records that it has started reading, so a class refusal
+    // after this point is a missed plan-time check (`type_refusal`).
+    debug_assert!(SQL_DRY.try_with(|_| ()).is_err(), "a read inside the dry pass");
+    let _ = STMT_PLAN.try_with(|m| m.borrow_mut().read = true);
     // Its own text ledger: the text MIN/MAX values this plan's groups hold.
     TEXT_BYTES.scope(Arc::new(std::sync::atomic::AtomicU64::new(0)), execute_scoped(p, t0)).await
 }
@@ -7211,7 +8179,6 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
         // One table: group and aggregate as it streams.
         let s = p.group_side;
         let tys = side_tys(&p.sides[s]);
-        let mut h = open(&p.sides[s], None, None).await?;
         // The groups seen lately, matched on their encoded key before the
         // map is asked (a GROUP BY of a few groups asks it a few times).
         let mut seen: Vec<(Vec<u8>, usize)> = Vec::new();
@@ -7233,48 +8200,144 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
         let guarded = order_guarded(&p);
         // Up front: n rows' groups priced from the schema (fixed widths as
         // they encode, text at a modest 32 B guess, the group's accumulators
-        // and index): a LIMIT whose rows cannot fit is refused before the
-        // read; one that slips past the guess is refused by the same words
-        // as it streams.
+        // and index), and the read's pipes with them (round P, p13; QA L8j2:
+        // LIMIT 200K at 256 MiB held 217 MiB anon beside 8 pipes, and was
+        // OOM-killed with APITAP_DEBUG). Between cuts the kept set holds up
+        // to 2n rows (`tb`, counted); at a cut's peak, resident: those rows
+        // at twice their count (their arrays and index grow by doubling),
+        // the sort's values and row lists for each, and the n rows' copy.
+        // The pipes get what that leaves (`read_pipes_for`), so a larger
+        // cage reads with more; when not even one pipe fits, the LIMIT is
+        // refused before the read, by name. One that slips past the guess
+        // is refused by the same words as it streams.
+        let mut tb = group_budget();
+        let mut parallel = None;
+        // The kept set's reservation (rows, key bytes), and its spare.
+        let mut reserve: Option<(usize, usize)> = None;
+        // A growth past the row estimate still to come (p18).
+        let mut grow: Option<TopGrow> = None;
         if let Some(n) = top.filter(|_| !guarded) {
             let side = &p.sides[s];
-            let key: u64 = p
-                .groups
-                .iter()
-                .map(|&g| match side.schema.get(side.read.get(g).copied().unwrap_or(usize::MAX)).map(|f| f.kind) {
-                    Some(ArrowKind::Utf8) | Some(ArrowKind::Binary) => 5 + 32,
-                    _ => 5 + 16,
-                })
-                .sum();
-            let per = key + (na * std::mem::size_of::<Acc>()) as u64 + 5 + 24;
-            let est = per.saturating_mul(n as u64);
-            if est > group_budget() {
-                return Err(bad(format!(
-                    "ORDER BY … LIMIT {n}: the first {n} rows would hold about {est} B, past the memory budget ({} B); ask for fewer rows",
-                    group_budget()
-                )));
+            let kind = |g: usize| side.schema.get(side.read.get(g).copied().unwrap_or(usize::MAX)).map(|f| f.kind);
+            let text = |g: usize| matches!(kind(g), Some(ArrowKind::Utf8) | Some(ArrowKind::Binary));
+            let kinds: Vec<Option<ArrowKind>> = p.groups.iter().map(|&g| kind(g)).collect();
+            let order_text: Vec<bool> =
+                p.order.iter().map(|&(c, _)| matches!(&p.out[c].1, OutCol::Group(g) if text(p.groups[*g]))).collect();
+            // A LIMIT past the table's rows keeps the table: reserved at the
+            // server's row estimate (a quarter over, and a little), not at n
+            // (architect, p16: LIMIT 500000 over 1K rows must answer, and
+            // its reservation must not be resident). The estimate sizes the
+            // first reservation only (p18, QA finding 4: 4000x-stale
+            // statistics refused at 512 MiB what fresh ones answer): the
+            // plan is admitted on the full n when that fits, and the kept
+            // set grows once to n if the rows pass the estimate.
+            let rows_est = row_estimate(&side.url, &side.table).await;
+            let n_eff = topn_n_eff(n, rows_est);
+            let (est, peak, key) = topn_price(&kinds, na, &order_text, n_eff as u64);
+            let (est_full, peak_full, _) = topn_price(&kinds, na, &order_text, n as u64);
+            tb = est.saturating_mul(2).max(1 << 20);
+            let n2 = 2 * n_eff as u64;
+            reserve = Some((n_eff, key as usize));
+            let mut full_ok = n_eff >= n;
+            let mut share_seen = 0u64;
+            match crate::pipeline::mem_limit_bytes() {
+                Some(m) => {
+                    // The transaction cap's rule (round P p14, architect): the
+                    // kept rows and the pipes share 7/8 of what the cage leaves
+                    // past this process's measured anonymous memory (allocator
+                    // slack, the kernel's socket buffers and page tables are
+                    // charged to the cage too). Without it the plan filled the
+                    // cage: 116 MiB priced + 5 pipes in 139 = 255 of 256, anon
+                    // up to 230 MiB.
+                    let floor = semi::anon_bytes().unwrap_or(0);
+                    let (share, room) = topn_room(m, floor, peak);
+                    let (_, room_full) = topn_room(m, floor, peak_full);
+                    share_seen = share;
+                    let one = crate::pipeline::READ_PIPE;
+                    if room < one {
+                        return Err(bad(format!(
+                            "ORDER BY … LIMIT {n}: keeping the first {n} rows as the read streams holds about {} MiB at its \
+                             peak (up to {n2} candidate rows, their sort and the kept copy), and the read needs {} MiB beside \
+                             it: past this statement's share of the memory limit ({} MiB = 7/8 of ({} MiB limit - {} MiB \
+                             this process holds)). Refused before reading; ask for fewer rows, or give the process more memory",
+                            peak >> 20,
+                            one >> 20,
+                            share >> 20,
+                            m >> 20,
+                            floor >> 20
+                        )));
+                    }
+                    // Full n admitted: the read takes the pipes it leaves, so
+                    // a growth past the estimate always fits.
+                    full_ok = room_full >= one;
+                    parallel = Some(topn_pipes(if full_ok { room_full } else { room }));
+                    if dbg() {
+                        eprintln!(
+                            "[sql] top {n}: kept rows priced {} MiB at a cut's peak ({} MiB counted between cuts; reserved for {n_eff} \
+                             of {n}, full n {} MiB {}); {} pipe(s)",
+                            peak >> 20,
+                            tb >> 20,
+                            peak_full >> 20,
+                            if full_ok { "admitted" } else { "not admitted" },
+                            parallel.unwrap_or(1)
+                        );
+                    }
+                }
+                None if est_full > group_budget() && est > group_budget() => {
+                    return Err(bad(format!(
+                        "ORDER BY … LIMIT {n}: the first {n} rows would hold about {est} B, past the memory budget ({} B); ask for fewer rows",
+                        group_budget()
+                    )));
+                }
+                None => full_ok = est_full <= group_budget(),
+            }
+            if n_eff < n {
+                grow = Some(TopGrow {
+                    n_eff,
+                    key: key as usize,
+                    full_ok,
+                    tb_full: est_full.saturating_mul(2).max(1 << 20),
+                    peak_full,
+                    share: share_seen,
+                    rows_est,
+                });
+            }
+        }
+        let mut h = open(&p.sides[s], None, parallel).await?;
+        let cut_at = top.filter(|_| !guarded);
+        let mut spare = Groups::default();
+        let mut spare_accs: Vec<Acc> = Vec::new();
+        if let (Some(n), Some((ne, key))) = (top.filter(|_| !guarded), reserve) {
+            let c = 2 * ne.max(64) + 1;
+            groups = Groups::with_capacity(c, key);
+            accs = Vec::with_capacity(c * na);
+            if 2 * n.max(64) < c {
+                spare = Groups::with_capacity(n.max(64), key);
+                spare_accs = Vec::with_capacity(n.max(64) * na);
             }
         }
         'read: while let Some(b) = h.recv().await? {
+            // The rows passed the estimate and their bytes the reservation's
+            // counted cap: grow (p18) before the cap's checks below refuse.
+            if let Some(n) = top.filter(|_| {
+                !guarded
+                    && grow.as_ref().is_some_and(|g| groups.keys.len() > g.n_eff)
+                    && groups_bytes(&groups, accs.len(), 0) > tb
+            }) {
+                let g = grow.take().expect("checked");
+                tb = topn_grow(&p, n, &g, groups.keys.len(), &mut groups, &mut accs, &mut spare, &mut spare_accs)?;
+            }
             if let Some(n) = top.filter(|_| !guarded) {
                 let len = groups.keys.len();
-                if len > 2 * n.max(64) || (len > n && groups_bytes(&groups, accs.len(), 0) > group_budget() / 2) {
-                    let rows = order_rows(&p, &groups, &accs, None, true)?;
-                    let mut ng = Groups::default();
-                    let mut na_ = Vec::with_capacity(rows.len() * na);
-                    for r in rows {
-                        ng.id(&groups.keys[r])?;
-                        na_.extend_from_slice(&accs[r * na..(r + 1) * na]);
-                    }
-                    (groups, accs) = (ng, na_);
+                if len > 2 * n.max(64) || (len > n && groups_bytes(&groups, accs.len(), 0) > tb) {
+                    topn_cut(&p, &mut groups, &mut accs, &mut spare, &mut spare_accs)?;
                     seen.clear();
                     let held = groups_bytes(&groups, accs.len(), 0);
-                    if held > group_budget() {
+                    if held > tb {
                         // Not GROUPS_OVER: answering in parts would not shrink it.
                         return Err(bad(format!(
-                            "ORDER BY … LIMIT {n}: the first {n} rows alone hold {held} B, past the memory budget ({} B); \
-                             ask for fewer rows",
-                            group_budget()
+                            "ORDER BY … LIMIT {n}: the first {n} rows alone hold {held} B, past the memory budget ({tb} B); \
+                             ask for fewer rows"
                         )));
                     }
                 }
@@ -7283,34 +8346,44 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
             // alone cannot fit (named, not GROUPS_OVER: parts would not help).
             if let Some(n) = top.filter(|&n| !guarded && groups.keys.len() <= n) {
                 let held = groups_bytes(&groups, accs.len(), 0);
-                if held > group_budget() {
+                if held > tb {
                     return Err(bad(format!(
-                        "ORDER BY … LIMIT {n}: {} rows already hold {held} B, past the memory budget ({} B), before the first \
+                        "ORDER BY … LIMIT {n}: {} rows already hold {held} B, past the memory budget ({tb} B), before the first \
                          {n}; ask for fewer rows",
-                        groups.keys.len(),
-                        group_budget()
+                        groups.keys.len()
                     )));
                 }
             }
-            groups_check(&groups, accs.len(), 0).map_err(|e| match top {
-                Some(_) if guarded => {
-                    let (c, coll) = p
-                        .order
-                        .iter()
-                        .find_map(|&(c, _)| match &p.out[c].1 {
-                            OutCol::Group(g) => p.gloc.get(*g).cloned().flatten().map(|l| (p.out[c].0.clone(), l)),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    bad(format!(
-                        "ORDER BY {c} … LIMIT: the column's collation {coll} does not order by bytes, so the first rows cannot \
-                         be kept as the read streams and every row would be held ({e}). Order under a byte collation in the \
-                         source (Postgres: COLLATE \"C\" in a view; MySQL: a _bin collation or BINARY), or by a column that \
-                         is not text"
-                    ))
-                }
-                _ => e,
-            })?;
+            // A streaming top-N is bounded by its cuts against `tb` (its own
+            // priced budget, above); every other read by the group budget.
+            if top.is_none() || guarded {
+                // A guarded top-N past the group budget falls to the parts
+                // path when it has a column to part by (`part_group`): its
+                // refusal keeps the GROUPS_OVER marker `run_one` answers in
+                // parts on (p11 did; p12's clean message dropped it, and QA's
+                // G4/G5/G7 — an ICU key beside a unique integer id, G7 with
+                // statistics too stale for the up-front check — were refused
+                // after the read instead of answered; round P p13).
+                let parts = (0..p.groups.len()).any(|g| part_group(&p, g));
+                groups_check(&groups, accs.len(), 0).map_err(|e| match top {
+                    Some(n) if guarded => {
+                        let (c, coll) = guarded_key(&p);
+                        bad(format!(
+                            "ORDER BY {c} … LIMIT {n}: the column's collation {coll} does not order by bytes, so the first rows \
+                             cannot be kept as the read streams and every row would be held: {} rows so far hold {} MiB, past the \
+                             memory budget ({} MiB). Order under a byte collation in the source (Postgres: COLLATE \"C\" in a view; \
+                             MySQL: a _bin collation or BINARY), or by a column that is not text{}",
+                            groups.keys.len(),
+                            groups_bytes(&groups, accs.len(), 0) >> 20,
+                            group_budget() >> 20,
+                            // The marker `run_one` answers in parts on, and
+                            // that `parts` names in its own refusal.
+                            if parts { format!(" [{GROUPS_OVER}]") } else { String::new() }
+                        ))
+                    }
+                    _ => e,
+                })?;
+            }
             let cols = arg_cols(&p, &b);
             for r in 0..b.rows {
                 if !local_ok(&p.sides[s], &tys, &b, r) {
@@ -7323,6 +8396,19 @@ async fn execute_pinned(p: Plan, t0: std::time::Instant) -> Result<SqlResult> {
                 kb.clear();
                 for &g in &p.groups {
                     encode_group(&b.cols[g], r, &mut kb);
+                }
+                // The cut at 2n checked a row at a time (p16): a batch of
+                // narrow rows can hold 100K+ of them, and past the reserved
+                // room the kept set would reallocate.
+                if let Some(n) = cut_at.filter(|_| grow.as_ref().is_some_and(|g| groups.keys.len() >= 2 * g.n_eff.max(64))) {
+                    let g = grow.take().expect("checked");
+                    tb = topn_grow(&p, n, &g, groups.keys.len(), &mut groups, &mut accs, &mut spare, &mut spare_accs)?;
+                }
+                if let Some(n) = cut_at {
+                    if groups.keys.len() >= 2 * n.max(64) {
+                        topn_cut(&p, &mut groups, &mut accs, &mut spare, &mut spare_accs)?;
+                        seen.clear();
+                    }
                 }
                 let g = match seen.iter().find(|x| x.0 == kb) {
                     Some(x) => x.1,
@@ -7614,6 +8700,8 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
         B(Vec<u8>),
         /// Text compared with trailing spaces not counting (PAD SPACE).
         P(Vec<u8>),
+        /// Decimal text, compared as the number (p20).
+        N(Vec<u8>),
     }
     fn kcmp(a: &K, b: &K) -> std::cmp::Ordering {
         use std::cmp::Ordering as O;
@@ -7622,13 +8710,14 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
             (K::Null, _) => O::Greater,
             (_, K::Null) => O::Less,
             (K::I(x), K::I(y)) => x.cmp(y),
-            (K::F(x), K::F(y)) => x.partial_cmp(y).unwrap_or(O::Equal),
+            (K::F(x), K::F(y)) => f_cmp(*x, *y),
             (K::I(x), K::F(y)) => (*x as f64).partial_cmp(y).unwrap_or(O::Equal),
             (K::F(x), K::I(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(O::Equal),
             (K::B(x), K::B(y)) => x.cmp(y),
-            (K::P(x), K::P(y)) => txt_cmp(x, y, true),
-            (K::B(_) | K::P(_), _) => O::Greater,
-            (_, K::B(_) | K::P(_)) => O::Less,
+            (K::P(x), K::P(y)) => txt_cmp(x, y, Pad::Space),
+            (K::N(x), K::N(y)) => dec_cmp_text(x, y),
+            (K::B(_) | K::P(_) | K::N(_), _) => O::Greater,
+            (_, K::B(_) | K::P(_) | K::N(_)) => O::Less,
         }
     }
     let val = |r: usize, c: usize| -> K {
@@ -7640,7 +8729,13 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
                     2 => K::F(f64::from_le_bytes(b.try_into().unwrap_or([0; 8]))),
                     3 => K::I(i128::from_le_bytes(b.try_into().unwrap_or([0; 16]))),
                     4 => K::I(i128::from(b[0])),
-                    5 => K::B(p.gcoll.get(*g).map_or_else(|| b.to_vec(), |c| c.fold(b).into_owned())),
+                    5 if p.gord.get(*g).is_some_and(|t| t.class == crate::read::TClass::Decimal) => K::N(b.to_vec()),
+                    5 => match p.gcoll.get(*g) {
+                        // MySQL PAD SPACE orders as if padded ('a\t' < 'a').
+                        Some(c) if c.pad_rule() == Pad::Space => K::P(c.fold(b).into_owned()),
+                        Some(c) => K::B(c.fold(b).into_owned()),
+                        None => K::B(b.to_vec()),
+                    },
                     _ => K::Null,
                 }
             }
@@ -7656,8 +8751,12 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
                 Acc::Avg(s, n) => K::F(s / n as f64),
                 Acc::N(n) => K::I(n as i128),
                 // A text MIN/MAX: byte order is its column's (`Agg::txt`).
-                Acc::T(ref t) if p.aggs[*a].txt == Some(true) => K::P(t.v.to_vec()),
-                Acc::T(ref t) => K::B(t.v.to_vec()),
+                Acc::T(ref t) => match p.aggs[*a].txt.unwrap_or_default() {
+                    Pad::Space => K::P(t.v.to_vec()),
+                    Pad::Strip => K::B(strip_spaces(&t.v).to_vec()),
+                    Pad::No => K::B(t.v.to_vec()),
+                    Pad::Dec => K::N(t.v.to_vec()),
+                },
             },
         }
     };
@@ -7667,12 +8766,18 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
         // a LIMIT the first rows selected before they are sorted. Ties go by
         // the row's place, as the stable sort had them. NULLs sort last
         // ascending, first descending.
-        let keys: Vec<Vec<K>> = rows.iter().map(|&r| p.order.iter().map(|&(c, _)| val(r, c)).collect()).collect();
+        //
+        // One flat array, a row's values side by side (round P p13): a Vec a
+        // row was a malloc and 40 B a row on top of the values, held beside
+        // the groups at every top-N cut (QA L8j2: 2n rows of it).
+        let nk = p.order.len();
+        let keys: Vec<K> = rows.iter().flat_map(|&r| p.order.iter().map(move |&(c, _)| (r, c))).map(|(r, c)| val(r, c)).collect();
+        let key = |i: usize| &keys[i * nk..(i + 1) * nk];
         let cmp = |x: &usize, y: &usize| {
             use std::cmp::Ordering as O;
             for (j, &(_, asc)) in p.order.iter().enumerate() {
                 let nf = p.onull.get(j).copied().unwrap_or(!asc);
-                let o = match (&keys[*x][j], &keys[*y][j]) {
+                let o = match (&key(*x)[j], &key(*y)[j]) {
                     (K::Null, K::Null) => O::Equal,
                     (K::Null, _) => if nf { O::Less } else { O::Greater },
                     (_, K::Null) => if nf { O::Greater } else { O::Less },
@@ -7698,11 +8803,15 @@ fn order_rows(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>, bu
             // (the keys before it tie) must be ordered the same by the
             // column's collation (`order` module doc: why that is enough).
             for w in idx.windows(2) {
-                let (x, y) = (&keys[w[0]], &keys[w[1]]);
+                let (x, y) = (key(w[0]), key(w[1]));
                 let Some(j) = (0..p.order.len()).find(|&j| kcmp(&x[j], &y[j]) != std::cmp::Ordering::Equal) else { continue };
                 let OutCol::Group(g) = &p.out[p.order[j].0].1 else { continue };
                 let Some(Some(coll)) = p.gloc.get(*g) else { continue };
-                if let (K::B(a), K::B(b)) = (&x[j], &y[j]) {
+                // A PAD SPACE key (`K::P`, MySQL `_ci`/`_bin` CHAR and VARCHAR)
+                // is checked the same: its padding is applied inside the
+                // comparison, never instead of the guard (QA, p10: a
+                // general_ci ORDER BY answered in byte order).
+                if let (K::B(a), K::B(b)) | (K::P(a), K::P(b)) = (&x[j], &y[j]) {
                     if !order::pair_ok(a, b, order::Locale::tailored(coll)) {
                         // Not provable here: the source's server orders the
                         // pair (its values as it holds them), after the sort
@@ -7749,6 +8858,7 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
                 let ag = &p.aggs[*a];
                 match (ag.f, ag.ty) {
                     _ if ag.txt.is_some() => ArrowKind::Utf8,
+                    _ if ag.when.is_some() => ag.when.unwrap_or(ArrowKind::Int64),
                     (AggFn::Count | AggFn::CountStar, _) => ArrowKind::Int64,
                     (AggFn::Avg, _) | (_, Some(Ty::Float)) => ArrowKind::Float64,
                     (_, Some(Ty::Dec(s))) => ArrowKind::Decimal { p: 38, s },
@@ -7874,7 +8984,7 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
         let (coll, locale) = match oc {
             OutCol::Group(g) if matches!(k, ArrowKind::Utf8) => (p.gcoll.get(*g).copied().unwrap_or_default(), p.gloc.get(*g).cloned().flatten()),
             // A text MIN/MAX: its column's byte order, padding as it had.
-            OutCol::Agg(a) if p.aggs[*a].txt == Some(true) => (Coll { pad: true, ..Coll::default() }, None),
+            OutCol::Agg(a) if matches!(p.aggs[*a].txt, Some(Pad::Space | Pad::Strip)) => (Coll { pad: true, ..Coll::default() }, None),
             _ => (Coll::default(), None),
         };
         let nulls_low = p.nlow.get(schema.len()).copied().unwrap_or(false);
@@ -7884,7 +8994,14 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
             OutCol::Group(g) if locale.is_some() => p.gsrc.get(*g).cloned().flatten(),
             _ => None,
         };
-        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: coll.pad, ci: coll.ci, ai: coll.ai, locale, nulls_low, origin });
+        // A GROUP BY output keeps its column's class (a stage of an enum is
+        // still an enum); a text MIN/MAX of decimal text stays decimal.
+        let tord = match oc {
+            OutCol::Group(g) if matches!(k, ArrowKind::Utf8) => p.gord.get(*g).cloned().unwrap_or_default(),
+            OutCol::Agg(a) if matches!(p.aggs[*a].txt, Some(Pad::Dec)) => crate::read::TypeOrder::new(crate::read::TClass::Decimal, "numeric"),
+            _ => crate::read::TypeOrder::default(),
+        };
+        schema.push(ArrowField { name: name.clone(), kind: k, nullable: true, rewritten: false, padded: coll.pad, ci: coll.ci, ai: coll.ai, locale, nulls_low, origin, tord });
     }
     Ok(SqlResult { schema, batch: ArrowBatch { rows: rows.len(), cols } })
 }
@@ -7893,8 +9010,281 @@ fn result(p: &Plan, groups: &Groups, accs: &[Acc], keep: Option<&[bool]>) -> Res
 mod tests {
     use super::*;
 
+    /// p22: the dry pass runs only where a stage plans after another reads.
+    #[test]
+    fn the_dry_pass_runs_only_for_statements_with_stages() {
+        assert!(!has_stages("SELECT id, v FROM pg.t ORDER BY id LIMIT 5"));
+        assert!(!has_stages("SELECT a.k, COUNT(*) AS n FROM pg.a a JOIN my.b b ON a.id = b.id GROUP BY a.k"));
+        assert!(has_stages("WITH w AS (SELECT e FROM pg.t) SELECT e FROM w ORDER BY e"));
+        assert!(has_stages("SELECT x.e FROM (SELECT e FROM pg.t) x ORDER BY 1"));
+        assert!(has_stages("SELECT id FROM pg.t WHERE id IN (SELECT id FROM my.u)"));
+        assert!(has_stages("SELECT id FROM pg.t WHERE EXISTS (SELECT 1 FROM my.u WHERE u.id = t.id)"));
+        assert!(has_stages("SELECT id FROM pg.t WHERE v > (SELECT max(v) FROM my.u)"));
+        assert!(!has_stages("not sql"));
+    }
+
+    /// p20: decimal text (an unconstrained numeric) compares as the number,
+    /// against an independent oracle (the value scaled to an i128) over
+    /// mixed scales, signs, leading/trailing zeros and long digits; the
+    /// specials order -Infinity < numbers < +Infinity < NaN = NaN.
+    #[test]
+    fn decimal_text_compares_as_its_number() {
+        use std::cmp::Ordering as O;
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // (text, value * 10^12) for |value| < 10^20.
+        let mut gen = |next: &mut dyn FnMut() -> u64| -> (String, i128) {
+            let int_digits = (next() % 20) as usize;
+            let frac_digits = (next() % 13) as usize;
+            let mut int = String::new();
+            for _ in 0..int_digits {
+                int.push((b'0' + (next() % 10) as u8) as char);
+            }
+            let mut frac = String::new();
+            for _ in 0..frac_digits {
+                frac.push((b'0' + (next() % 10) as u8) as char);
+            }
+            let neg = next() % 3 == 0;
+            let lead = (next() % 3) as usize; // leading zeros the source would not print, still parsed
+            let trail = (next() % 3) as usize;
+            let mut t = String::new();
+            if neg {
+                t.push('-');
+            }
+            t.push_str(&"0".repeat(lead));
+            t.push_str(if int.is_empty() && lead == 0 { "0" } else { &int });
+            if !frac.is_empty() || trail > 0 {
+                t.push('.');
+                t.push_str(&frac);
+                t.push_str(&"0".repeat(trail));
+            }
+            let iv: i128 = if int.is_empty() { 0 } else { int.parse().unwrap() };
+            let mut fv: i128 = if frac.is_empty() { 0 } else { frac.parse().unwrap() };
+            for _ in frac.len()..12 {
+                fv *= 10;
+            }
+            let v = iv * 1_000_000_000_000 + fv;
+            (t, if neg { -v } else { v })
+        };
+        let mut vals: Vec<(String, i128)> = (0..3000).map(|_| gen(&mut next)).collect();
+        vals.extend([("0".into(), 0), ("-0".into(), 0), ("0.000".into(), 0), ("1.0".into(), 1_000_000_000_000), ("1.00".into(), 1_000_000_000_000), ("10".into(), 10_000_000_000_000), ("9".into(), 9_000_000_000_000)]);
+        for (i, a) in vals.iter().enumerate() {
+            let b = &vals[(i * 7919 + 13) % vals.len()];
+            assert_eq!(dec_cmp_text(a.0.as_bytes(), b.0.as_bytes()), a.1.cmp(&b.1), "{} vs {}", a.0, b.0);
+            // Equal values, one key; different values, different keys.
+            assert_eq!(dec_norm(a.0.as_bytes()) == dec_norm(b.0.as_bytes()), a.1 == b.1, "{} vs {}", a.0, b.0);
+        }
+        assert_eq!(dec_cmp_text(b"10", b"9"), O::Greater, "not by bytes");
+        assert_eq!(&*dec_norm(b"-0.00"), b"0");
+        assert_eq!(&*dec_norm(b"001.2300"), b"1.23");
+        let long = format!("1{}", "0".repeat(200));
+        assert_eq!(dec_cmp_text(long.as_bytes(), b"99999999999999999999999999999999999999"), O::Greater, "no precision limit");
+        let order = ["-Infinity", "-5", "-0.5", "0", "0.5", "5", "Infinity", "NaN"];
+        for w in order.windows(2) {
+            assert_eq!(dec_cmp_text(w[0].as_bytes(), w[1].as_bytes()), O::Less, "{} < {}", w[0], w[1]);
+        }
+        assert_eq!(dec_cmp_text(b"NaN", b"NaN"), O::Equal);
+        let ex = |t: &str| sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {}).try_with_sql(t).unwrap().parse_expr().unwrap();
+        assert!(matches!(dectext_lit(&ex("12.50")), Some(Lit::DecText(t)) if t == "12.50"));
+        assert!(matches!(dectext_lit(&ex("-3")), Some(Lit::DecText(t)) if t == "-3"));
+        assert!(matches!(dectext_lit(&ex("'7.5'")), Some(Lit::DecText(t)) if t == "7.5"));
+        assert!(dectext_lit(&ex("'abc'")).is_none());
+    }
+
+    /// p20: floats group and order as Postgres does: -0 = 0, NaN = NaN and
+    /// above every number; MAX is NaN when one is, MIN only when all are.
+    #[test]
+    fn floats_follow_the_source_with_nan_and_negative_zero() {
+        use std::cmp::Ordering as O;
+        assert_eq!(f_key(-0.0).to_bits(), f_key(0.0).to_bits());
+        assert_eq!(f_key(f64::NAN).to_bits(), f_key(-f64::NAN).to_bits());
+        assert_eq!(f_cmp(f64::NAN, f64::INFINITY), O::Greater);
+        assert_eq!(f_cmp(f64::NAN, f64::NAN), O::Equal);
+        assert_eq!(f_cmp(-0.0, 0.0), O::Equal);
+        assert_eq!(f_cmp(1.0, 2.0), O::Less);
+        assert!(f_max(1.0, f64::NAN).is_nan() && f_max(f64::NAN, 1.0).is_nan());
+        assert_eq!(f_min(1.0, f64::NAN), 1.0);
+        assert_eq!(f_min(f64::NAN, 1.0), 1.0);
+        assert!(f_min(f64::NAN, f64::NAN).is_nan());
+    }
+
+    /// p20: every type refusal reads the same — the use, the column, its
+    /// source type, why, and the remedy.
+    #[test]
+    fn a_type_refusal_names_column_type_use_and_remedy() {
+        use crate::read::{TClass, TypeOrder};
+        let e = type_refusal("e", &TypeOrder::new(TClass::Enum, "qa_pr_enum"), TypeUse::Order).to_string();
+        assert!(e.contains("ORDER BY on e (qa_pr_enum) is refused") && e.contains("declaration") && e.contains("array_position"), "{e}");
+        let g = type_refusal("iv", &TypeOrder::new(TClass::Opaque, "interval"), TypeUse::Group).to_string();
+        assert!(g.contains("GROUP BY") && g.contains("interval") && g.contains("view on the source"), "{g}");
+        let m = type_refusal("u", &TypeOrder::new(TClass::Byte, "uuid"), TypeUse::MinMax).to_string();
+        assert!(m.contains("no MIN/MAX for uuid"), "{m}");
+    }
+
+    /// p19: the collation probe is skipped only when the statement can reach
+    /// no column that may carry a collation. A wrong skip is a silent wrong
+    /// ORDER BY / GROUP BY / MIN-MAX answer, so each reference kind is
+    /// pinned, and the skip itself only for numeric/date-only statements.
+    #[test]
+    fn the_collation_probe_is_skipped_only_when_no_text_column_is_reachable() {
+        let f = |name: &str, kind: ArrowKind| ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() };
+        // lineitem-like: numbers and dates, one text column.
+        let t = vec![
+            f("l_orderkey", ArrowKind::Int64),
+            f("l_quantity", ArrowKind::Decimal { p: 15, s: 2 }),
+            f("l_extendedprice", ArrowKind::Decimal { p: 15, s: 2 }),
+            f("l_discount", ArrowKind::Decimal { p: 15, s: 2 }),
+            f("l_shipdate", ArrowKind::Date32),
+            f("l_ts", ArrowKind::TimestampUtc),
+            f("l_ok", ArrowKind::Bool),
+            f("l_f", ArrowKind::Float64),
+            f("l_raw", ArrowKind::Binary),
+            f("l_comment", ArrowKind::Utf8),
+        ];
+        let skip = |q: &str| assert!(!collation_probe_needed(&t, q), "must skip (no text column reachable): {q}");
+        let ask = |q: &str| assert!(collation_probe_needed(&t, q), "must ask: {q}");
+        // TPC-H Q6 and other numeric/date-only statements: skipped.
+        skip("SELECT sum(l_extendedprice * l_discount) AS revenue FROM pg.lineitem WHERE l_shipdate >= DATE '1994-01-01' \
+              AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24");
+        skip("SELECT count(*) FROM pg.lineitem");
+        skip("SELECT l_orderkey, min(l_shipdate), max(l_ts) FROM pg.lineitem GROUP BY l_orderkey ORDER BY 2 DESC LIMIT 5");
+        skip("SELECT l_ok, count(*) FROM pg.lineitem WHERE l_f > 1 AND l_raw IS NOT NULL GROUP BY l_ok");
+        // Every way a text column is referenced: asked.
+        for q in [
+            "SELECT l_comment FROM pg.lineitem",                                           // select list
+            "SELECT l_orderkey FROM pg.lineitem WHERE l_comment > 'a'",                    // WHERE
+            "SELECT count(*) FROM pg.lineitem a JOIN my.o b ON a.l_comment = b.c",         // join key
+            "SELECT count(*) FROM pg.lineitem JOIN my.o USING (l_comment)",                // USING
+            "SELECT l_orderkey FROM pg.lineitem GROUP BY l_comment, l_orderkey",           // GROUP BY
+            "SELECT DISTINCT l_comment FROM pg.lineitem",                                  // DISTINCT
+            "SELECT count(DISTINCT l_comment) FROM pg.lineitem",                           // DISTINCT aggregate
+            "SELECT min(l_comment), max(l_comment) FROM pg.lineitem",                      // MIN/MAX
+            "SELECT l_orderkey FROM pg.lineitem ORDER BY l_comment",                       // ORDER BY
+            "SELECT l_comment AS c FROM pg.lineitem ORDER BY c",                           // ORDER BY an alias
+            "SELECT l_comment AS c FROM pg.lineitem ORDER BY 1",                           // ORDER BY position
+            "WITH w AS (SELECT l_comment AS c FROM pg.lineitem) SELECT c FROM w ORDER BY c", // CTE output
+            "SELECT c FROM (SELECT l_comment AS c FROM pg.lineitem) d ORDER BY c",         // derived table
+            "SELECT upper(l_comment) FROM pg.lineitem ORDER BY 1",                         // expression
+            "SELECT CAST(l_comment AS varchar(10)) FROM pg.lineitem",                      // cast
+            "SELECT l_comment::text FROM pg.lineitem",                                     // :: cast
+            "SELECT \"L_COMMENT\" FROM pg.lineitem",                                       // quoted, other case
+            "SELECT L_Comment FROM pg.lineitem",                                           // unquoted, other case
+            "SELECT lineitem.l_comment FROM pg.lineitem",                                  // qualified
+            "SELECT * FROM pg.lineitem",                                                   // *
+            "SELECT * EXCLUDE (l_orderkey) FROM pg.lineitem",                              // * with options
+            "SELECT t.* FROM pg.lineitem t",                                               // t.*
+            "SELECT count(*), max(l_orderkey) FROM pg.lineitem t WHERE (t.*) IS NOT NULL", // t.* in an expression
+            "SELECT row_to_json(t.*) FROM pg.lineitem t",                                  // t.* as an argument
+            "SELECT count(*) FROM pg.lineitem NATURAL JOIN my.o",                          // NATURAL JOIN
+            "SELECT b FROM pg.lineitem AS x(a, b) ORDER BY b",                             // alias renames columns
+            "SELECT U&\"l_c\\006Fmment\" FROM pg.lineitem",                                // U& escaped identifier
+            "SELECT not sql at all FROM",                                                  // does not parse
+        ] {
+            ask(q);
+        }
+        // A type that might be text (anything outside the provably non-text
+        // kinds) counts as text.
+        let odd = vec![f("id", ArrowKind::Int64), f("tags", ArrowKind::Utf8)];
+        assert!(collation_probe_needed(&odd, "SELECT max(tags) FROM pg.t"));
+        assert!(!collation_probe_needed(&odd, "SELECT max(id) FROM pg.t"));
+        // A column name with a quote in it: always asked.
+        let quoted = vec![f("id", ArrowKind::Int64), f("we\"ird", ArrowKind::Utf8)];
+        assert!(collation_probe_needed(&quoted, "SELECT max(id) FROM pg.t"));
+        // No text column at all: never asked.
+        let nums = vec![f("id", ArrowKind::Int64), f("d", ArrowKind::Date32)];
+        assert!(!collation_probe_needed(&nums, "SELECT * FROM pg.t ORDER BY d"));
+        // A word, not a substring: `l_comment` inside `l_comments` is not it,
+        // but a mention in a literal asks (needlessly, harmlessly).
+        assert!(!collation_probe_needed(&t, "SELECT count(*) AS l_comments FROM pg.lineitem"));
+        assert!(collation_probe_needed(&t, "SELECT count(*) FROM pg.lineitem WHERE 'l_comment' <> ''"));
+    }
+
+    /// p14 calibration of the streaming top-N price against the cgroup's
+    /// anon (1 GiB cage, 8 pipes, 4M rows shaped like QA's qa_tn: id bigint,
+    /// k2 int, kn int, tc text "C" of 32 bytes; one COUNT accumulator; LIMIT
+    /// 10 .. 400K, the slope over LIMIT 10): ordered by (tc, id) 469 B a kept
+    /// row, by (kn, id) 414 B. The price stays at or above each and within
+    /// 1.3x on p14 (610 B; p16's reserved layout prices 628); p13 priced the text shape at ~1220 B
+    /// and refused QA's LIMIT 200K that fits.
+    /// p16: a reserved kept set fills to its room and clears without
+    /// reallocating (no freed blocks for glibc to keep between cuts).
+    /// p18 (QA finding 4): the row estimate sizes only the first
+    /// reservation; a missing or unusable one (never analyzed: -1, 0, NaN)
+    /// reserves for the LIMIT; a stale one's refusal names the estimate.
+    #[test]
+    fn a_row_estimate_only_sizes_the_first_reservation() {
+        assert_eq!(topn_n_eff(500_000, None), 500_000);
+        for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(topn_n_eff(500_000, Some(bad)), 500_000, "{bad}");
+        }
+        assert_eq!(topn_n_eff(500_000, Some(1000.0)), 2274);
+        assert_eq!(topn_n_eff(500_000, Some(4_000_000.0)), 500_000);
+        assert_eq!(topn_n_eff(10, Some(1000.0)), 64);
+        let m = topn_stale(500_000, Some(1000.0), "public.qa_tns", 381_309, 290 << 20, 215 << 20);
+        assert!(m.contains("estimates 1000 rows for public.qa_tns") && m.contains("381309 read so far") && m.contains("ANALYZE"), "{m}");
+        let mut g = Groups::with_capacity(100, 8);
+        for i in 0..100u64 {
+            g.id(&i.to_le_bytes()).unwrap();
+        }
+        g.reserve_to(1000, 8);
+        assert!(g.keys.ends.capacity() >= 1000 && g.keys.data.capacity() >= 8000);
+        assert_eq!(g.id(&7u64.to_le_bytes()).unwrap(), 7, "the index survives the growth");
+    }
+
+    #[test]
+    fn a_reserved_kept_set_does_not_reallocate() {
+        let mut g = Groups::with_capacity(1000, 16);
+        let (d, e) = (g.keys.data.as_ptr(), g.keys.ends.as_ptr());
+        for round in 0..3u64 {
+            for i in 0..1000u64 {
+                let k = (i + round).to_le_bytes();
+                g.id(&[k.as_slice(), &[0u8; 8]].concat()).unwrap();
+            }
+            assert_eq!(g.keys.len(), 1000);
+            assert!(std::ptr::eq(d, g.keys.data.as_ptr()) && std::ptr::eq(e, g.keys.ends.as_ptr()), "round {round} reallocated");
+            g.clear();
+            assert_eq!((g.keys.len(), g.bytes), (0, 0));
+        }
+    }
+
+    #[test]
+    fn the_topn_price_tracks_the_measured_peak() {
+        let kinds = [Some(ArrowKind::Int64), Some(ArrowKind::Int32), Some(ArrowKind::Int32), Some(ArrowKind::Utf8)];
+        let n = 400_000u64;
+        let (_, text, _) = topn_price(&kinds, 1, &[true, false], n);
+        let (counted, int, _) = topn_price(&kinds, 1, &[false, false], n);
+        let (t, i) = (text / n, int / n);
+        // Re-measured on p16's reserved layout (1 GiB, 8 pipes fixed, anon
+        // against LIMIT 200K..800K, linear fit, residuals <= 10 MiB): text
+        // 568 B a kept row, integer 456, N1 351. Priced 628 / 532 / 380.
+        assert!((568..=738).contains(&t), "text-ordered {t} B a row");
+        assert!((456..=592).contains(&i), "integer-ordered {i} B a row");
+        // QA's N1 (k2 int, id bigint; ORDER BY k2 DESC, id): 432 B a kept row
+        // on p15 at its worst, 37 MiB of it freed heap glibc kept, which the
+        // reserved layout no longer makes; live bytes ~380.
+        let (_, n1, _) = topn_price(&[Some(ArrowKind::Int32), Some(ArrowKind::Int64)], 1, &[false, false], n);
+        assert!((351..=456).contains(&(n1 / n)), "N1 {} B a row", n1 / n);
+        // The plan keeps 1/8 of what the cage leaves as slack (p14): at 256
+        // MiB with 12 held and the text shape at 200K, 97 MiB for pipes (4 at
+        // p17's price; 3 on p16, which charged the process reserve twice),
+        // not the 139 (5) that filled the cage to 255 MiB.
+        let (share, room) = topn_room(256 << 20, 12 << 20, 116 << 20);
+        assert_eq!((share >> 20, room >> 20), (213, 97));
+        assert_eq!(topn_pipes(room), 4);
+        // One pipe needs READ_PIPE beside the kept rows, not READ_RESERVE as
+        // well (p17): 22 MiB left is one pipe.
+        assert_eq!(topn_pipes(22 << 20), 1);
+        // The kept rows' count is groups_bytes' measure: what the cuts hold to.
+        assert!(counted / n >= 76 + 24 + 32, "{}", counted / n);
+    }
+
     fn f(name: &str, kind: ArrowKind) -> ArrowField {
-        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None }
+        ArrowField { name: name.into(), kind, nullable: true, rewritten: false, padded: false, ci: false, ai: false, locale: None, nulls_low: false, origin: None, tord: Default::default() }
     }
 
     fn schemas() -> impl FnMut(&str, &str) -> Result<Vec<ArrowField>> {
@@ -8580,14 +9970,14 @@ mod tests {
         assert_eq!(p.having.len(), 2);
         assert_eq!(p.aggs.len(), 2, "the SUM is hidden; the HAVING COUNT(*) is the SELECT's");
         assert_eq!(p.having[1].0, 0, "COUNT(*) reuses the SELECT's accumulator");
-        let dec = Agg { f: AggFn::Sum, arg: None, ty: Some(Ty::Dec(2)), txt: None };
+        let dec = Agg { f: AggFn::Sum, arg: None, ty: Some(Ty::Dec(2)), txt: None, when: None };
         // 1000.01 > 1000.005 by its last digit; f64 alone would say so too,
         // but 10^20 + 1 vs 10^20 it would not.
         assert!(having_ok(&Acc::D(100001), &dec, star::Op::Gt, &VExpr::Dec(1000005, 3)));
         assert!(!having_ok(&Acc::D(100000), &dec, star::Op::Gt, &VExpr::Dec(1000005, 3)));
         assert!(having_ok(&Acc::D(10i128.pow(22) + 1), &dec, star::Op::Gt, &VExpr::Dec(10i128.pow(20), 0)));
         assert!(!having_ok(&Acc::None, &dec, star::Op::Gt, &VExpr::Int(0)), "NULL fails");
-        let cnt = Agg { f: AggFn::CountStar, arg: None, ty: None, txt: None };
+        let cnt = Agg { f: AggFn::CountStar, arg: None, ty: None, txt: None, when: None };
         assert!(having_ok(&Acc::None, &cnt, star::Op::Eq, &VExpr::Int(0)), "an empty COUNT is 0");
         assert!(plan("SELECT o_orderpriority, COUNT(*) FROM my.orders GROUP BY o_orderpriority HAVING COUNT(*) > o_shippriority", &srcs(), &mut schemas()).is_err());
     }
@@ -8660,32 +10050,39 @@ mod tests {
     #[test]
     fn min_max_of_text_under_a_byte_collation() {
         use std::cmp::Ordering as O;
-        assert_eq!(txt_cmp(b"a", b"a  ", true), O::Equal);
-        assert_eq!(txt_cmp(b"a", b"a  ", false), O::Less);
-        assert_eq!(txt_cmp(b"a\t", b"a", true), O::Less, "below a space: lower");
-        assert_eq!(txt_cmp(b"a", b"a\t", true), O::Greater);
-        assert_eq!(txt_cmp(b"ab", b"a b", true), O::Greater);
-        assert_eq!(txt_cmp(b"B", b"a", false), O::Less, "bytes, not case");
+        assert_eq!(txt_cmp(b"a", b"a  ", Pad::Space), O::Equal);
+        assert_eq!(txt_cmp(b"a", b"a  ", Pad::Strip), O::Equal);
+        assert_eq!(txt_cmp(b"a", b"a  ", Pad::No), O::Less);
+        assert_eq!(txt_cmp(b"a\t", b"a", Pad::Space), O::Less, "MySQL PAD SPACE: below a space is lower");
+        assert_eq!(txt_cmp(b"a", b"a\t", Pad::Space), O::Greater);
+        assert_eq!(txt_cmp(b"a\t", b"a", Pad::Strip), O::Greater, "Postgres bpchar: spaces stripped, then bytes");
+        assert_eq!(txt_cmp(b"", b"\t    ", Pad::Strip), O::Less, "QA: '' before a tab in bpchar");
+        assert_eq!(txt_cmp(b"", b"\t    ", Pad::Space), O::Greater);
+        assert_eq!(txt_cmp(b"ab", b"a b", Pad::Space), O::Greater);
+        assert_eq!(txt_cmp(b"B", b"a", Pad::No), O::Less, "bytes, not case");
+        let c = Coll { pad: true, ..Coll::default() };
+        assert_ne!(c.fold(b"a\t"), c.fold(b"a"), "a trailing tab is not padding");
+        assert_eq!(c.fold(b"a  "), c.fold(b"a"));
         let led = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(TEXT_BYTES.scope(led.clone(), async {
             for (f, want) in [(AggFn::Min, &b"B"[..]), (AggFn::Max, &b"z"[..])] {
                 let mut a = Acc::None;
                 for v in [None, Some(&b"m"[..]), Some(b"z"), None, Some(b"B"), Some(b"a")] {
-                    fold_text(&mut a, f, false, v).unwrap();
+                    fold_text(&mut a, f, Pad::No, v).unwrap();
                 }
                 let Acc::T(t) = &a else { panic!("a text accumulator") };
                 assert_eq!(&*t.v, want);
                 assert_eq!(text_bytes(), txt_cost(1));
                 // Merged with another group's: the lower (higher) wins.
-                let ag = Agg { f, arg: None, ty: None, txt: Some(false) };
+                let ag = Agg { f, arg: None, ty: None, txt: Some(Pad::No), when: None };
                 let mut b = Acc::None;
-                fold_text(&mut b, f, false, Some(b"A")).unwrap();
+                fold_text(&mut b, f, Pad::No, Some(b"A")).unwrap();
                 merge_acc(&mut a, b, &ag).unwrap();
                 let Acc::T(t) = &a else { panic!("a text accumulator") };
                 assert_eq!(&*t.v, if f == AggFn::Min { &b"A"[..] } else { &b"z"[..] });
                 let mut n = Acc::None;
-                fold_text(&mut n, f, false, None).unwrap();
+                fold_text(&mut n, f, Pad::No, None).unwrap();
                 assert!(matches!(n, Acc::None), "only NULLs: NULL");
                 merge_acc(&mut n, a, &ag).unwrap();
                 assert!(matches!(n, Acc::T(_)));
@@ -8702,15 +10099,18 @@ mod tests {
         };
         let src = srcs();
         let p = plan("SELECT k, MIN(s), MAX(s) FROM pg.byt GROUP BY k", &src, &mut schemas).unwrap();
-        assert_eq!(p.aggs[0].txt, Some(false));
+        assert_eq!(p.aggs[0].txt, Some(Pad::No));
         assert_eq!(p.aggs[1].f, AggFn::Max);
+        // MIN/MAX of a date answers in its own kind (p11), not as arithmetic.
+        let p = plan("SELECT k, MIN(d) AS lo, MAX(d) AS hi FROM pg.byt GROUP BY k", &src, &mut schemas).unwrap();
+        assert_eq!((p.aggs[0].when, p.aggs[0].ty), (Some(ArrowKind::Date32), Some(Ty::Int)));
+        assert!(plan("SELECT k, MAX(d) + 1 FROM pg.byt GROUP BY k", &src, &mut schemas).is_err(), "a date is not a number");
         for (q, want) in [
             ("SELECT MIN(s) FROM pg.loc", "en_US.utf8 does not order text by its bytes"),
             ("SELECT MAX(s) FROM pg.ci", "case-insensitive does not order"),
-            ("SELECT MIN(d) FROM pg.byt", "over a Date32 column"),
             ("SELECT k, MIN(s) || 'x' FROM pg.byt GROUP BY k", ""),
             ("SELECT k, MIN(s) + 1 FROM pg.byt GROUP BY k", "in arithmetic"),
-            ("SELECT k, COUNT(*) FROM pg.byt GROUP BY k HAVING MAX(s) > 3", "MIN/MAX of text against a number"),
+            ("SELECT k, COUNT(*) FROM pg.byt GROUP BY k HAVING MAX(s) > 3", "a timestamp against a number"),
         ] {
             let e = plan(q, &src, &mut schemas).err().map(|e| e.to_string()).unwrap_or_default();
             assert!(!e.is_empty() && e.contains(want), "{q}: {e}");
