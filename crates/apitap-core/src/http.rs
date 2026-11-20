@@ -216,13 +216,27 @@ mod why_tests {
     /// A refused connection names the refusal, not just "error sending".
     #[tokio::test]
     async fn a_refused_connection_says_refused() {
-        // The port stays bound but never listens while the request runs: the
-        // kernel refuses the connect, and no other test or process can take
-        // the port in between (bind-then-close raced one, round P p8: the
-        // port was taken and reset, "Connection reset by peer").
-        let sock = tokio::net::TcpSocket::new_v4().unwrap();
-        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = sock.local_addr().unwrap();
+        // Linux: the port stays bound but never listens while the request
+        // runs: the kernel refuses the connect, and no other test or process
+        // can take the port in between (bind-then-close raced one, round P
+        // p8: the port was taken and reset, "Connection reset by peer").
+        #[cfg(target_os = "linux")]
+        let (sock, addr): (tokio::net::TcpSocket, std::net::SocketAddr) = {
+            let sock = tokio::net::TcpSocket::new_v4().unwrap();
+            sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = sock.local_addr().unwrap();
+            (sock, addr)
+        };
+        // Elsewhere (macOS: a bound, non-listening port does not answer the
+        // connect with a refusal; only Linux refuses it): bind a listener,
+        // take its address, close it, and connect to the closed port.
+        #[cfg(not(target_os = "linux"))]
+        let (sock, addr): (Option<std::net::TcpListener>, std::net::SocketAddr) = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            drop(l);
+            (None, addr)
+        };
         let e = super::client()
             .get(format!("http://{addr}/"))
             .send()
