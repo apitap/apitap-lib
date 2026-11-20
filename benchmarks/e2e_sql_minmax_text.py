@@ -66,6 +66,7 @@ def setup():
     pg("DROP TABLE IF EXISTS mm_t, mm_d, mm_big; "
        "CREATE TABLE mm_t (id int PRIMARY KEY, g int, j int, s text COLLATE \"C\", b char(8) COLLATE \"C\", l text, gc text); "
        f"INSERT INTO mm_t VALUES {vals}; "
+       "ALTER TABLE mm_t ADD COLUMN li text COLLATE \"und-x-icu\"; UPDATE mm_t SET li = l; "
        "CREATE TABLE mm_d (id int PRIMARY KEY, grp text COLLATE \"C\"); INSERT INTO mm_d VALUES (1,'x'),(2,'y'),(3,'x'),(4,'z'); "
        "CREATE TABLE mm_big (id int PRIMARY KEY, g int, s text COLLATE \"C\"); "
        "INSERT INTO mm_big SELECT i, i % 600000, md5(i::text) FROM generate_series(1, 1200000) i")
@@ -144,6 +145,13 @@ def main():
          my, "SELECT gc, MIN(s), MAX(s), COUNT(*) FROM mm_t GROUP BY gc ORDER BY MIN(s)",
          lambda rs: ["|".join([r.split("|")[0].lower()] + r.split("|")[1:]) for r in rs]),
     ]
+    # QA M9: aggregates over both tables of a join. Refused, and the shape
+    # the refusal names (join in a CTE, aggregate the CTE) answers.
+    cases.append(("M9 join in a CTE, aggregates over both tables",
+                  "WITH j AS (SELECT m.g AS g, p.s AS ps, m.s AS ms FROM pg.mm_t p JOIN my.mm_t m ON p.id = m.id) "
+                  "SELECT g, MIN(ps) AS a, MAX(ms) AS b, COUNT(*) AS n FROM j GROUP BY g ORDER BY g",
+                  my, "SELECT m.g, MIN(p.s), MAX(m.s), COUNT(*) FROM mm_t p JOIN mm_t m ON p.id = m.id GROUP BY m.g ORDER BY m.g",
+                  None))
     ok = True
     for name, q, srv, truth, norm in cases:
         want = srv(truth)
@@ -159,9 +167,29 @@ def main():
     good, why = parts_case()
     ok &= good
     print(f"  {'ok ' if good else 'BAD'} pg parts path (256m/0.5 cage, 600K groups): {why}", flush=True)
+    # The database default (en_US) on a musl-built server orders by bytes
+    # (musl's strcoll is strcmp; round P p12): there MIN/MAX must equal the
+    # server's; on glibc it must be refused, as an ICU column always is.
+    musl = "-linux-musl" in pg("SELECT version()")[0]
+    q = "SELECT MIN(l) AS a, MAX(l) AS b FROM pg.mm_t"
+    try:
+        got, why = got_rows(q), None
+    except Exception as e:  # noqa: BLE001
+        got, why = None, str(e)
+    want = pg("SELECT MIN(l), MAX(l) FROM mm_t")
+    if musl:
+        good = got == want
+        detail = f"{got} (server {want})" if why is None else f"refused on a musl server: {why[:200]}"
+    else:
+        good = why is not None and "does not order text by its bytes" in why
+        detail = f"refused: {why[:200]}" if why else f"answered {got} (server {want}) under glibc en_US: must be refused"
+    ok &= good
+    print(f"  {'ok ' if good else 'BAD'} pg default en_US ({'musl: equal to the server' if musl else 'glibc: refused'}): {detail}", flush=True)
     for name, q, want in [
-        ("pg en_US refused", "SELECT MIN(l) FROM pg.mm_t", "does not order text by its bytes"),
+        ("pg und-x-icu refused", "SELECT MIN(li) FROM pg.mm_t", "does not order text by its bytes"),
         ("my 0900_ai_ci refused", "SELECT g, MAX(l) FROM my.mm_t GROUP BY g", "does not order text by its bytes"),
+        ("M9 aggregates over both tables refused, naming the CTE shape",
+         "SELECT m.g, MIN(p.s), MAX(m.s), COUNT(*) FROM pg.mm_t p JOIN my.mm_t m ON p.id = m.id GROUP BY m.g", "WITH j AS"),
     ]:
         try:
             r = got_rows(q)

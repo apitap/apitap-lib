@@ -79,13 +79,14 @@ def main():
         print("\n-- change: pg DELETE lineitem id=3 (k=2, 5)")
         run("run 3")
     finally:
+        # Only this demo's view slots: their publication is FOR TABLE demo_li.
+        for p in pg("SELECT DISTINCT pubname FROM pg_publication_tables WHERE pubname LIKE 'apitap_v_%' "
+                    "AND tablename = 'demo_li'").split():
+            pg(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '{p}' AND NOT active")
+            pg(f'DROP PUBLICATION "{p}"')
         pg("DROP TABLE IF EXISTS demo_li")
         my("DROP TABLE IF EXISTS demo_ord")
         pgd("DROP TABLE IF EXISTS demo_out")
-        for s in pg("SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'apitap_v_%'").split():
-            pg(f"SELECT pg_drop_replication_slot('{s}')")
-        for p in pg("SELECT pubname FROM pg_publication WHERE pubname LIKE 'apitap_v_%'").split():
-            pg(f'DROP PUBLICATION "{p}"')
 
 
 if __name__ == "__main__":

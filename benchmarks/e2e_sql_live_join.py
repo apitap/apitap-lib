@@ -59,6 +59,22 @@ def pg(sql):
     return sh(["docker", "exec", "apitap-bench-pg-src", "psql", "-U", "postgres", "-d", "apitap_bench_src",
                "-v", "ON_ERROR_STOP=1", "-Atc"], sql)
 
+def view_slots(run, tables):
+    """The apitap_v_ slots (= their publications' names) of views over `tables`:
+    a view's publication is FOR TABLE its Postgres table. Only these are this
+    leg's to drop; another run's views (QA's, a user's) are never touched.
+    Call before the tables are dropped (that empties the publication)."""
+    tl = ", ".join(f"'{t}'" for t in tables)
+    return set(run(f"SELECT DISTINCT pubname FROM pg_publication_tables WHERE pubname LIKE 'apitap\\_v\\_%' "
+                   f"AND tablename IN ({tl})").split())
+
+
+def drop_view_slots(run, tables):
+    for n in view_slots(run, tables):
+        run(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '{n}' AND NOT active")
+        run(f'DROP PUBLICATION IF EXISTS "{n}"')
+
+
 
 def pgd(sql):
     return sh(["docker", "exec", "apitap-bench-pg-dst", "psql", "-U", "postgres", "-d", "apitap_bench_dst", "-Atc"], sql)
@@ -106,13 +122,10 @@ def lines(r, frag):
 
 
 def cleanup():
+    drop_view_slots(pg, [TL, f"{TL}5"])
     pg(f"DROP TABLE IF EXISTS {TL}, {TL}5")
     my(f"DROP TABLE IF EXISTS {TO}, {TO}5")
     pgd(f"DROP TABLE IF EXISTS {OUT}, {OUT}5")
-    for s in pg("SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'apitap_v_%'").split():
-        pg(f"SELECT pg_drop_replication_slot('{s}')")
-    for p in pg("SELECT pubname FROM pg_publication WHERE pubname LIKE 'apitap_v_%'").split():
-        pg(f'DROP PUBLICATION "{p}"')
 
 
 def main():

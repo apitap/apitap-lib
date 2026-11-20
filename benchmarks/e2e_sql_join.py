@@ -41,6 +41,7 @@ container. apitap.sql() runs the join + aggregate itself:
      'brazil ' apart: NO PAD), each count equal to the server's grouping
 """
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -54,6 +55,13 @@ SRC = {"pg": PG, "my": MY}
 PGD = "postgres://postgres:bench@127.0.0.1:5545/apitap_bench_dst"
 CH = "clickhouse://default:bench@127.0.0.1:8124/default"
 OUT = "sql_join_out"
+
+
+def npasses(line):
+    """The pass count in a "[sql] join done in N pass(es)" line. A substring test for "1 pass" (round P: it read 11 and
+    21 passes as one, and the leg failed on any count ending in 1) is what this replaces."""
+    m = re.search(r"done in (\d+) pass", line)
+    return int(m[1]) if m else 0
 TL, TO = "sql_li", "sql_od"
 ok = True
 
@@ -164,7 +172,7 @@ def main():
         splits = [l for l in r.stderr.splitlines() if "past" in l and "range" in l]
         out = next((l[5:] for l in r.stdout.splitlines() if l.startswith("ROWS ")), "")
         case("5: a build past its budget is split into passes", r.returncode == 0 and len(splits) >= 1
-             and passes and "1 pass" not in passes[-1], f"{len(splits)} split(s), {passes[-1:]} {r.stderr[-200:] if r.returncode else ''}")
+             and passes and npasses(passes[-1]) > 1, f"{len(splits)} split(s), {passes[-1:]} {r.stderr[-200:] if r.returncode else ''}")
         case("5: and the split join still equals the servers' answer", out == repr(want), out[:120])
 
         want_txt = [(p, str(r), str(n)) for p, r, n in want]

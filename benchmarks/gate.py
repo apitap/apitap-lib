@@ -183,6 +183,7 @@ LEGS = [
     leg("e2e_my_cdc_dests.py",     "D8: MySQL binary columns land BYTES in BigQuery, bulk and binlog",
         {"bq"}, argv=["bq"]),
     leg("e2e_bq_numeric.py",       "an unconstrained Postgres numeric lands exact, BIGNUMERIC, in BigQuery", {"bq"}),
+    leg("e2e_bq_job_retry.py",     "a BigQuery bulk job that finished with a transient error runs again as a new job", {"bq"}),
     leg("e2e_bq_bytes.py",         "a Postgres bytea lands BYTES in BigQuery on either lane, bulk and WAL", {"bq"}),
     leg("e2e_bq_bool_lanes.py",    "N19: a Postgres boolean is BOOL in BigQuery on either lane", {"bq"}),
     leg("e2e_bq_cluster_keys.py",  "R22: the CDC bootstrap clusters only on columns BigQuery can cluster", {"bq"}),
@@ -355,6 +356,29 @@ LEGS = [
     leg("e2e_sql_tpch.py",          "apitap.sql(): all 22 TPC-H queries across Postgres + MySQL equal DuckDB's answers"),
     leg("e2e_sql_bounded.py",       "apitap.sql() at 0.5 core / 256 MiB: TPC-H Q13 peaks <= 240 MiB, Q1's socket memory within its reserved receive buffers"),
     leg("e2e_sql_shapes.py",        "apitap.sql(): shapes TPC-H does not cover give the known answer or a named refusal"),
+    # Round P (W1 production round): each a RED-first leg, against the servers.
+    leg("e2e_sql_limit.py",         "apitap.sql(): a plain SELECT … LIMIT n stops reading at n rows; WHERE + LIMIT too"),
+    leg("e2e_sql_topn.py",          "apitap.sql(): ORDER BY … LIMIT n keeps n rows (0.5 core / 256 MiB), too many refused up front"),
+    leg("e2e_sql_collation.py",     "apitap.sql(): GROUP BY / DISTINCT fold as the column's collation does (citext, MySQL _ci)"),
+    leg("e2e_sql_live_recreate.py", "an incremental view over a recreated table is refused by name, and an inet group key moves"),
+    leg("e2e_cdc_type_spelling.py", "log_based: every type spells the same in bootstrap and stream, any role; typed keys hit their rows"),
+    leg("e2e_sql_type_order.py",    "apitap.sql(): a type held as its text form is exact against the server or refused by name, every use"),
+    leg("e2e_sql_probe_count.py",   "apitap.sql(): headroom asked once a statement; collations skipped only when no text column is reachable"),
+    leg("e2e_sql_nulls.py",         "apitap.sql(): NULLs sort where their source sorts them; NULLS FIRST/LAST honoured"),
+    leg("e2e_sql_order_locale.py",  "apitap.sql(): ORDER BY text under a locale equals the server or is refused, ASC and DESC"),
+    leg("e2e_sql_pad_order.py",     "apitap.sql(): padded text (bpchar, MySQL PAD SPACE) compares as its own server does"),
+    leg("e2e_sql_minmax_text.py",   "apitap.sql(): MIN/MAX of text under a byte collation, refused by name under any other"),
+    leg("e2e_sql_minmax_dates.py",  "apitap.sql(): MIN/MAX of dates and timestamps equal the server's"),
+    leg("e2e_sql_date_buckets.py",  "apitap.sql(): EXTRACT / date_trunc keys per source dialect; non-UTC timestamptz refused"),
+    leg("e2e_sql_pool_wait.py",     "apitap.sql(): a statement waits for a busy server's connection, then answers"),
+    leg("e2e_sql_pool_many.py",     "apitap.sql(): ten statements on a tight role: each exact or refused by name, none wrong"),
+    leg("e2e_sql_pool_low.py",      "apitap.sql(): one or two free connections: exact, or the named one-connection refusal"),
+    leg("e2e_sql_live_upgrade.py",  "an incremental view built by the previous wheel keeps its slot after the upgrade", {"old-pkg"}),
+    leg("e2e_sql_live_drain.py",    "an incremental view drains 500K change images inside a 256 MiB cage (Postgres, MySQL)"),
+    leg("e2e_txcap_cage.py",        "one big transaction at 256 MiB: a view and pg->ch CDC land exact or refuse by name, never exit 137"),
+    leg("e2e_changelog_key_move.py", "key moves through changelog bodies (views, changelog=True to ClickHouse), masked and not, equal the server"),
+    leg("e2e_env_knobs.py",         "every numeric APITAP_* knob set to junk is refused by name at every entry"),
+    leg("e2e_ch_toast_burst.py",    "CDC into ClickHouse: unchanged-TOAST updates apply fast, progress counts them"),
     leg("e2e_pg_identity_nonkey.py", "a Postgres merge and CDC apply land in a table whose ALWAYS identity is not its key", {"pg18"}),
     leg("e2e_pg_bytea_escape.py",    "a Postgres CDC drain reads bytea as hex whatever bytea_output the server sets"),
     leg("e2e_my_cdc_hardening.py",   "MySQL 8.4 tagged-GTID transactions drain", argv=["tagged"]),
@@ -479,6 +503,11 @@ def capabilities():
     need("pg18",       "apitap-bench-pg18",
          "docker run -d --name apitap-bench-pg18 -p 127.0.0.1:5547:5432 -e POSTGRES_PASSWORD=bench "
          "-e POSTGRES_DB=apitap_bench_src postgres:18-alpine -c wal_level=logical")
+    old_pkg = os.environ.get("APITAP_OLD_PKG")
+    if old_pkg and os.path.isdir(os.path.join(old_pkg, "apitap")):
+        have.add("old-pkg")
+    else:
+        why["old-pkg"] = "APITAP_OLD_PKG is unset — point it at a dir holding the previous release's apitap/"
     if os.environ.get("BQ_SA"):
         have.add("bq")
     else:
@@ -745,6 +774,8 @@ def main():
         pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", help="substring filter on the leg's script name")
+    ap.add_argument("--labels", help="file of leg labels, one a line, as the gate prints them (e.g. a run's SKIP list): "
+                    "run exactly those legs")
     ap.add_argument("--list", action="store_true", help="show the plan, run nothing")
     ap.add_argument("--timeout", type=int, default=3600, help="per-leg seconds")
     ap.add_argument("--self-test", action="store_true",
@@ -761,6 +792,13 @@ def main():
 
     have, why = capabilities()
     legs = [l for l in LEGS if not args.only or args.only in l.script]
+    if args.labels:
+        want = {x.strip() for x in open(args.labels) if x.strip()}
+        legs = [l for l in legs if label_of(l) in want]
+        unknown = want - {label_of(l) for l in legs}
+        if unknown:
+            print(f"gate: --labels names {len(unknown)} leg(s) the gate does not have: {sorted(unknown)}")
+            return 2
 
     print(f"gate: {len(legs)} legs, python {sys.executable}")
     try:

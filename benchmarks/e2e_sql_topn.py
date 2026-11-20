@@ -54,8 +54,15 @@ def psql(sql):
     return [l for l in o.stdout.splitlines() if l]
 
 
+
+def _pkg_dir():
+    """The dir holding the apitap package: PKG, else the interpreter's own
+    (the release gate runs every leg with the wheel it gates)."""
+    import importlib.util
+    return os.environ.get("PKG") or os.path.dirname(os.path.dirname(importlib.util.find_spec("apitap").origin))
+
 def main():
-    pkg = os.environ["PKG"]
+    pkg = _pkg_dir()
     ok = True
     for name, q, want in CASES:
         r = subprocess.run(["docker", "run", "--rm", "--name", "w1-topn", "--network", "host", "--cpus=0.5", "--memory=256m",

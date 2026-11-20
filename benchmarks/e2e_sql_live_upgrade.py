@@ -38,7 +38,8 @@ Q = f"SELECT status, COUNT(*) AS n, SUM(amount) AS amt FROM pg.{T} GROUP BY 1 OR
 TRUTH = f"SELECT status, COUNT(*), SUM(amount) FROM {T} GROUP BY 1 ORDER BY 1"
 Q3 = f"SELECT status, COUNT(*) AS n, SUM(amount) AS amt FROM pg.{T} WHERE amount > 10 GROUP BY 1 ORDER BY 1"
 TRUTH3 = f"SELECT status, COUNT(*), SUM(amount) FROM {T} WHERE amount > 10 GROUP BY 1 ORDER BY 1"
-OLD, NEW = os.environ["OLD_PKG"], os.environ["NEW_PKG"]
+OLD = os.environ.get("OLD_PKG") or os.environ.get("APITAP_OLD_PKG", "")
+NEW = os.environ.get("NEW_PKG") or os.path.dirname(os.path.dirname(__import__("importlib.util").util.find_spec("apitap").origin))
 ok = True
 
 
@@ -63,6 +64,22 @@ def src(sql):
 def dst(sql):
     return psql("apitap-bench-pg-dst", "apitap_bench_dst", sql)
 
+def view_slots(run, tables):
+    """The apitap_v_ slots (= their publications' names) of views over `tables`:
+    a view's publication is FOR TABLE its Postgres table. Only these are this
+    leg's to drop; another run's views (QA's, a user's) are never touched.
+    Call before the tables are dropped (that empties the publication)."""
+    tl = ", ".join(f"'{t}'" for t in tables)
+    return set(run(f"SELECT DISTINCT pubname FROM pg_publication_tables WHERE pubname LIKE 'apitap\\_v\\_%' "
+                   f"AND tablename IN ({tl})").split())
+
+
+def drop_view_slots(run, tables):
+    for n in view_slots(run, tables):
+        run(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '{n}' AND NOT active")
+        run(f'DROP PUBLICATION IF EXISTS "{n}"')
+
+
 
 def norm(lines):
     out = []
@@ -73,7 +90,9 @@ def norm(lines):
 
 
 def slots():
-    return set(src("SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'apitap_v_%'").split())
+    """This leg's view slots (those publishing its table), present now."""
+    mine = view_slots(src, [T])
+    return {s for s in src("SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'apitap\\_v\\_%'").split() if s in mine}
 
 
 def view(pkg, state, table, query=Q):
@@ -89,11 +108,8 @@ def landed(table):
 
 
 def cleanup():
+    drop_view_slots(src, [T])
     src(f"DROP TABLE IF EXISTS {T}")
-    for name in slots():
-        src(f"SELECT pg_drop_replication_slot('{name}')")
-    for name in src("SELECT pubname FROM pg_publication WHERE pubname LIKE 'apitap_v_%'").split():
-        src(f'DROP PUBLICATION "{name}"')
     for t in OUTS:
         dst(f"DROP TABLE IF EXISTS {t}")
 

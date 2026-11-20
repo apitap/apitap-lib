@@ -61,8 +61,15 @@ def run(pkg, url, q):
     return json.loads(line[7:]) if line else {"err": f"no result (exit {r.returncode}) {r.stderr[-200:]}", "wall": 0}
 
 
+
+def _pkg_dir():
+    """The dir holding the apitap package: PKG, else the interpreter's own
+    (the release gate runs every leg with the wheel it gates)."""
+    import importlib.util
+    return os.environ.get("PKG") or os.path.dirname(os.path.dirname(importlib.util.find_spec("apitap").origin))
+
 def main():
-    pkg = os.environ["PKG"]
+    pkg = _pkg_dir()
     pg(f"DROP TABLE IF EXISTS l5_a; DROP TABLE IF EXISTS l5_b; DROP TABLE IF EXISTS l5_f; DROP TABLE IF EXISTS l5_d1; "
        f"DROP TABLE IF EXISTS l5_d2; DROP ROLE IF EXISTS {PG_USER};"
        "CREATE TABLE l5_f AS SELECT g AS k, g % 50 AS d1, g % 20 AS d2, g % 7 AS v FROM generate_series(1, 300000) g;"

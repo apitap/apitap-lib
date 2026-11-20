@@ -52,13 +52,13 @@ def main():
         apitap.sql(VIEW, **kw)
         print("  view: bootstrap + one window", flush=True)
     finally:
-        slots = con.execute("SELECT * FROM postgres_query('pgw', 'SELECT slot_name FROM pg_replication_slots "
-                            "WHERE slot_name LIKE ''apitap_v_%''')").fetchall()
-        for (s,) in slots:
-            con.execute(f"CALL postgres_execute('pgw', 'SELECT pg_drop_replication_slot(''{s}'')')")
-        pubs = con.execute("SELECT * FROM postgres_query('pgw', 'SELECT pubname FROM pg_publication "
-                           "WHERE pubname LIKE ''apitap_v_%''')").fetchall()
+        # Only this view's slot: its publication is FOR TABLE the lineitem it
+        # reads (another run's views on the same server are left alone).
+        pubs = con.execute("SELECT * FROM postgres_query('pgw', 'SELECT DISTINCT pubname FROM pg_publication_tables "
+                           f"WHERE pubname LIKE ''apitap_v_%'' AND tablename = ''{h.PREFIX}lineitem''')").fetchall()
         for (p,) in pubs:
+            con.execute(f"CALL postgres_execute('pgw', 'SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+                        f"WHERE slot_name = ''{p}'' AND NOT active')")
             con.execute(f"CALL postgres_execute('pgw', 'DROP PUBLICATION \"{p}\"')")
         con.execute("CALL postgres_execute('pgd', 'DROP TABLE IF EXISTS pgo_view')")
         for t in h.ON_PG:

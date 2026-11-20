@@ -23,6 +23,7 @@ Four P2 findings (docs/review/2026-10-18-p2-triage.md), PG16 :5544 / :5545 / CH 
 Usage: e2e_pg_hardening.py notnull|pub|nullcursor|negscale|longname|fkref|keepalive|multigroup
 """
 import os
+import re
 import subprocess
 import time
 import sys
@@ -153,7 +154,8 @@ def longname():
         except Exception as e:  # noqa: BLE001
             m = str(e)
         made = dst(f"SELECT count(*) FROM pg_class WHERE relname = '{long[:63]}'")
-        assert m and "64 bytes" in m, f"a 64-byte destination must be refused, got {m!r} (cut table exists: {made})"
+        # The exact length: `"64 bytes" in m` also matched "164 bytes".
+        assert m and re.search(r"(?<![0-9])64 bytes", m), f"a 64-byte destination must be refused, got {m!r} (cut table exists: {made})"
         assert made == "0", "nothing may be created under the cut name"
         print(f"  dest_table of 64 bytes: refused ({m[:70]}...)")
     finally:

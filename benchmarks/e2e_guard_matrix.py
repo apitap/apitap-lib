@@ -366,6 +366,33 @@ try:
     case("CONTROL: with the plant gone, the replace runs", e is None, e or "ran")
     case("and landed every row", E.count() == "100", f"{E.count()}")
 
+    if ENGINE not in ("s3", "ice"):
+        # p21 (QA C2): a dead bulk run left its lock and its staging; the
+        # FIRST refusal names every one of them (0.68.0 p20: one per attempt,
+        # lock, then staging, then the next worker's), never another run's.
+        print("== E. one refusal names every object a dead bulk run left ==")
+        tok = _rig.fresh_token("r", "dead")
+        left = [f"{T}{tok}__apitap_lock", f"{T}{tok}__apitap_staging{E.staging_decoration or ''}"]
+        if E.staging_decoration == "_0":
+            left.append(f"{T}{tok}__apitap_staging_1")
+        bystander = f"{T}{_rig.fresh_token('i', 'byst')}__apitap_staging{E.staging_decoration or ''}"
+        for n in left:
+            E.plant(n)
+        e = refusal(lambda: apitap.transfer(PG, E.url, table=T, mode="replace"))
+        named = [n for n in left if e and n in e]
+        case("the replace is refused BY TYPE", bool(e) and e.startswith("LockedError"), (e or "it was ALLOWED")[:170])
+        case(f"and the one refusal names all {len(left)} objects of the dead run", len(named) == len(left),
+             f"named {named} of {left}: {(e or '')[:300]}")
+        E.plant(bystander)
+        e2 = refusal(lambda: apitap.transfer(PG, E.url, table=T, mode="replace"))
+        case("another run's object is never listed with them", bool(e2) and not all(n in e2 for n in left + [bystander]),
+             (e2 or "")[:300])
+        E.unplant(bystander)
+        for n in left:
+            E.unplant(n)
+        e = refusal(lambda: apitap.transfer(PG, E.url, table=T, mode="replace"))
+        case("with them removed (in one go), the replace runs", e is None, e or "ran")
+
     # B needs a CDC lane into the engine, which an object store does not have.
     if hasattr(E, "live_lease"):
         print("== B. a live drain's lock (and lease) refuses a drain, and stays ==")

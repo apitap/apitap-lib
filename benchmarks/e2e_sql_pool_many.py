@@ -57,8 +57,15 @@ print("RESULTS " + json.dumps(out))
 """
 
 
+
+def _pkg_dir():
+    """The dir holding the apitap package: PKG, else the interpreter's own
+    (the release gate runs every leg with the wheel it gates)."""
+    import importlib.util
+    return os.environ.get("PKG") or os.path.dirname(os.path.dirname(importlib.util.find_spec("apitap").origin))
+
 def main():
-    pkg = os.environ["PKG"]
+    pkg = _pkg_dir()
     pg(f"DROP TABLE IF EXISTS l4m_a; DROP TABLE IF EXISTS l4m_b; DROP ROLE IF EXISTS {USER}")
     pg("CREATE TABLE l4m_a AS SELECT g AS k, g % 97 AS v FROM generate_series(1, 400000) g;"
        "CREATE TABLE l4m_b AS SELECT g * 2 AS k, g % 13 AS w FROM generate_series(1, 400000) g;"
