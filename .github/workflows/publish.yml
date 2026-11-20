@@ -67,7 +67,12 @@ jobs:
       # Linux-only paths (glibc malloc tuning, posix_fadvise, cgroup limits) are
       # compiled out elsewhere, and this is where that is proven to build and pass.
       - name: Unit tests (${{ matrix.name }})
-        run: cargo test -p apitap-core --lib
+        run: |
+          set -o pipefail
+          cargo test -p apitap-core --lib 2>&1 | tee /tmp/unit.txt || {
+            grep -nE "^test .* FAILED|panicked at|^error(\[|:)|assertion|left:|right:|^failures:|test result" /tmp/unit.txt | head -40 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
       - name: Build the wheel
         uses: PyO3/maturin-action@v1
         with:
